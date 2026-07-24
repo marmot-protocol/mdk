@@ -1112,9 +1112,21 @@ impl TuiApp {
     /// leaving the TUI pointed at a removed account or a stale subscription (the
     /// account-switch and empty-account clearing both live in that refresh path).
     pub(crate) fn logout_account(&mut self, account_id: &str, npub: &str) -> TuiResult<()> {
+        // The wipe is irreversible; its own failure still propagates (nothing was
+        // removed, so `error:` is the honest report). But once it succeeds, the
+        // account is gone whatever the follow-up reload does — reporting a reload
+        // failure as `error:` would mask a completed wipe and leave the removed
+        // account and its stale subscriptions on screen. So report the logout
+        // unconditionally and fold a reload failure into the same status, naming
+        // `/refresh` as the retry.
         self.client.run_json(None, &["logout", account_id])?;
-        self.refresh_or_return_to_login()?;
-        self.status = format!("logged out {}", shorten(&terminal_safe_text(npub), 18));
+        let logged_out = format!("logged out {}", shorten(&terminal_safe_text(npub), 18));
+        self.status = match self.refresh_or_return_to_login() {
+            Ok(()) => logged_out,
+            Err(err) => {
+                format!("{logged_out}; account list reload failed ({err}) — /refresh to retry")
+            }
+        };
         Ok(())
     }
 

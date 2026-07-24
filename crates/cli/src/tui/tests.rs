@@ -870,6 +870,67 @@ fn logout_token_mismatch_is_a_noop_that_keeps_the_popup_open() {
     assert_eq!(app.accounts.len(), 1, "the account is untouched");
 }
 
+#[cfg(unix)]
+#[test]
+fn logout_success_then_refresh_failure_reports_logout_not_error() {
+    use std::os::unix::fs::PermissionsExt;
+    // The wipe is irreversible and succeeds; only the follow-up account-list
+    // reload fails. The status must report the logout as done and point at
+    // `/refresh`, never masking a completed wipe behind `error:` while the
+    // removed account lingers on screen.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = dir.path().join("wn-json");
+    let script = "#!/bin/sh\ncase \" $* \" in\n  *\" account list \"*)\ncat <<'JSON'\n{\"ok\":false,\"error\":{\"message\":\"relays unreachable\"}}\nJSON\n    ;;\n  *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n    ;;\nesac\n";
+    std::fs::write(&exe, script).expect("write fake wn");
+    let mut perms = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&exe, perms).expect("chmod fake wn");
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.logout_account(&account_id, "npub1alice")
+        .expect("a refresh failure after a successful wipe must not propagate");
+
+    assert!(
+        app.status.contains("logged out"),
+        "the completed wipe is reported: {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("/refresh"),
+        "the status points at /refresh to retry the reload: {:?}",
+        app.status
+    );
+    assert!(
+        !app.status.starts_with("error:"),
+        "a completed wipe is never reported as an error: {:?}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_success_with_successful_refresh_reports_only_the_logout() {
+    // The happy path is unchanged: a clean logout + reload reports just the
+    // logged-out account, with no reload-failure suffix.
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.logout_account(&account_id, "npub1alice")
+        .expect("a clean logout succeeds");
+
+    assert_eq!(app.status, "logged out npub1alice");
+}
+
 #[test]
 fn slash_command_parser_handles_daemon_commands() {
     assert_eq!(
@@ -6335,6 +6396,93 @@ fn messages_pane_keys_drive_the_selection_and_composer_focus() {
 }
 
 #[test]
+fn ctrl_u_in_messages_focus_does_not_unreact() {
+    // Ctrl-U is the composer kill-line, never the Messages `u` (unreact)
+    // accelerator. The accelerator must fire only on a plain `u`, so Ctrl-U in
+    // the Messages pane is a no-op: it queues no `messages unreact` subprocess
+    // and leaves the status line untouched. A selected row is present so a fired
+    // unreact WOULD resolve and set "removing reaction..." — proving the no-op is
+    // real, not merely an unresolved-selection error.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id);
+    app.timeline = vec![timeline_row("m1", 1)];
+    assert!(app.status.is_empty(), "precondition: status starts empty");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        .expect("Ctrl-U handled");
+
+    assert!(
+        app.status.is_empty(),
+        "Ctrl-U in Messages must not fire unreact; status: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn ctrl_q_does_not_quit() {
+    // `q` quits only as a bare accelerator. Ctrl-Q is a chord that must not fall
+    // through the modifier-insensitive `q` arm and tear down the session.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    assert!(app.input.is_empty(), "precondition: composer empty");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .expect("Ctrl-Q handled");
+
+    assert!(app.running, "Ctrl-Q must not quit the app");
+}
+
+#[test]
+fn plain_u_in_messages_focus_removes_the_reaction() {
+    // The guard on the `u` accelerator only rejects Ctrl/Alt: a plain `u` still
+    // fires the unreact and enqueues the `messages unreact` effect.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id);
+    app.timeline = vec![timeline_row("m1", 1)];
+
+    app.handle_key(char_key('u')).expect("plain u handled");
+
+    assert_eq!(
+        app.status, "removing reaction...",
+        "a plain u still fires the unreact"
+    );
+}
+
+#[test]
+fn composer_ctrl_u_clears_the_input() {
+    // Ctrl-U in the composer is the readline kill-line and clears the field —
+    // the guard on the Messages accelerators must not shadow it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Composer;
+    app.input.set_value("/react 🔥");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        .expect("Ctrl-U handled");
+
+    assert!(app.input.is_empty(), "Ctrl-U clears the composer");
+}
+
+#[test]
+fn plain_q_quits() {
+    // The plain-keypress guard tolerates Shift/no-modifier: a bare `q` outside
+    // the composer still quits.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('q')).expect("q handled");
+
+    assert!(!app.running, "a bare q quits the app");
+}
+
+#[test]
 fn render_messages_wraps_long_lines_so_the_tail_is_visible() {
     // The height model (`timeline_row_height`) measures with wrapping, so the
     // renderer must wrap too or long lines truncate at the pane edge and the
@@ -8310,6 +8458,57 @@ fn esc_preserves_a_hand_typed_draft() {
             "Esc must preserve a hand-typed draft, not destroy it"
         );
     }
+}
+
+#[test]
+fn a_leading_space_before_a_command_is_still_armed_and_esc_clears_it() {
+    // `parse_slash_command` trims, so a hand-typed leading space (" /react x")
+    // still submits as a reaction. The armed hint and the Esc escape hatch share
+    // `armed_interaction`, so they must agree with what submits: the hint shows
+    // and Esc clears the prefill rather than leaving the user with an invisible
+    // armed command.
+    assert!(
+        armed_interaction_hint(" /react x", None).is_some(),
+        "a leading space before /react is still an armed interaction"
+    );
+
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Composer;
+    app.input.set_value(" /react x");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+
+    assert!(
+        app.input.is_empty(),
+        "Esc clears the armed interaction even with a leading space, left {:?}",
+        app.input.value()
+    );
+}
+
+#[test]
+fn a_leading_space_before_plain_text_is_not_armed_and_esc_preserves_it() {
+    // Trimming for command detection must not turn leading-space plain text into
+    // an armed command: " hello" is a hand-typed draft, so it shows no armed hint
+    // and Esc preserves it (the draft-protection rule).
+    assert_eq!(
+        armed_interaction_hint(" hello", None),
+        None,
+        "leading-space plain text is not an armed interaction"
+    );
+
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Composer;
+    app.input.set_value(" hello");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+
+    assert_eq!(
+        app.input.value(),
+        " hello",
+        "Esc preserves a hand-typed draft with a leading space"
+    );
 }
 
 #[test]

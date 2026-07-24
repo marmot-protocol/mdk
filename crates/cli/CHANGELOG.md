@@ -316,6 +316,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 ### Fixed
 
+- TUI: main-view keyboard accelerators now fire only on a plain keypress and ignore `Ctrl`/`Alt` chords. Previously
+  `Ctrl-U` in the message pane matched the bare `u` (unreact) accelerator and published an unconfirmed reaction
+  removal, and `Ctrl-Q` quit through the bare `q` accelerator. The whole accelerator family (`r`/`u`/`d`/`R`/`o`/`i`
+  and `g`/`G` in the message pane, `q`/`A`/`s`/`p`/`h`/`I` and `j`/`k` list navigation elsewhere) is now guarded, while
+  `Ctrl-U` stays the composer kill-line and `Ctrl-C` still quits. `Shift` is still tolerated, so the uppercase
+  accelerators keep working under the kitty keyboard protocol. No JSON response shapes changed.
+- TUI: logging out now reports the outcome faithfully when the follow-up account-list reload fails. Previously a reload
+  failure after a successful, irreversible wipe was reported with an `error:` prefix while the removed account and its
+  stale subscriptions lingered on screen. The logout is now reported as done and the status names `/refresh` to retry
+  the reload; a failure of the wipe itself is still reported as an error. No JSON response shapes changed.
+- TUI: a message-interaction command typed with a leading space now shows the armed-interaction hint and can be
+  cleared with `Esc`, matching how it submits. `parse_slash_command` already trims the composer text, so `/react`,
+  `/reply`, and `/delete` submit even with surrounding whitespace; the armed hint and the `Esc` escape hatch now trim
+  the same way instead of treating a space-prefixed command as an invisible, un-clearable armed state. Plain text with
+  a leading space is still a hand-typed draft and is preserved by `Esc`. No JSON response shapes changed.
 - `wn relays add/remove --type nip65` now round-trips the complete directional NIP-65 list instead of deleting
   read-only relays or flattening existing role markers. Relay-list JSON adds `read_relays` and `write_relays` alongside
   the existing write-target `relays` view.

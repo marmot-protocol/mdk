@@ -122,6 +122,21 @@ pub(crate) struct TuiApp {
     pub(crate) effects: EffectRunner,
 }
 
+/// True when a keypress carries no Ctrl/Alt modifier, so a bare accelerator (a
+/// letter that fires an action on its own) may fire. Shift is deliberately
+/// tolerated: the uppercase accelerators (`G`/`R`/`A`/`I`/`P`/`L`) arrive with
+/// SHIFT under the kitty keyboard protocol, so an `is_empty()` modifier check
+/// would silently break them if enhancement flags are ever negotiated. Excluding
+/// only Ctrl/Alt lets chords like Ctrl-U (composer kill-line), Ctrl-Q, and
+/// Ctrl-C reach their own handlers — or fall through harmlessly — instead of
+/// being swallowed by the modifier-insensitive accelerator that shares the
+/// letter. Centralizing the policy in one predicate keeps every accelerator arm
+/// consistent and states the intent ("plain keypress") at each call site.
+fn plain(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 impl TuiApp {
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
         let client = WnClient::from_cli(&cli)?;
@@ -477,7 +492,9 @@ impl TuiApp {
             KeyCode::Char('?') if self.focus != Focus::Composer => {
                 self.popup = Some(Popup::help());
             }
-            KeyCode::Char('q') if self.focus != Focus::Composer && self.input.is_empty() => {
+            KeyCode::Char('q')
+                if self.focus != Focus::Composer && self.input.is_empty() && plain(key) =>
+            {
                 self.running = false;
             }
             KeyCode::Tab => self.focus = self.focus.next(),
@@ -497,83 +514,83 @@ impl TuiApp {
             }
             // Reopen the account picker from the chat list (the accounts pane is
             // gone; `A` is its replacement entry point).
-            KeyCode::Char('A') if self.focus == Focus::Chats => {
+            KeyCode::Char('A') if self.focus == Focus::Chats && plain(key) => {
                 self.open_account_picker();
             }
             // Group detail and invites are entered from the chat list.
-            KeyCode::Char('g') if self.focus == Focus::Chats => {
+            KeyCode::Char('g') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_group_detail() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('I') if self.focus == Focus::Chats => {
+            KeyCode::Char('I') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_invites() {
                     self.status = format!("error: {err}");
                 }
             }
             // Full-view screens entered from the chat list (Phase 5b).
-            KeyCode::Char('s') if self.focus == Focus::Chats => {
+            KeyCode::Char('s') if self.focus == Focus::Chats && plain(key) => {
                 self.open_user_search(None);
             }
-            KeyCode::Char('p') if self.focus == Focus::Chats => {
+            KeyCode::Char('p') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_profile() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('h') if self.focus == Focus::Chats => {
+            KeyCode::Char('h') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_relay_health() {
                     self.status = format!("error: {err}");
                 }
             }
             // Messages pane: the message-offset scroll model. `k`/Up and PageUp
             // may reach the oldest loaded row and page in older history.
-            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Messages => {
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Messages && plain(key) => {
                 self.messages_select_up();
             }
-            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Messages => {
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Messages && plain(key) => {
                 self.timeline_scroll.select_down(self.timeline.len());
             }
             KeyCode::PageUp if self.focus == Focus::Messages => self.messages_page_up(),
             KeyCode::PageDown if self.focus == Focus::Messages => {
                 self.timeline_scroll.page_down(self.timeline.len());
             }
-            KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Messages => {
+            KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Messages && plain(key) => {
                 self.timeline_scroll.jump_newest(self.timeline.len());
             }
-            KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Messages => {
+            KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Messages && plain(key) => {
                 self.messages_jump_oldest();
             }
-            KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages => {
+            KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages && plain(key) => {
                 self.focus = Focus::Composer;
             }
             // Message-interaction accelerators (Messages focus, popups are Phase 5).
             // `r` and `d` prefill a slash command in the composer so Enter is the
             // visible action; `u` removes your own reaction immediately (no input).
-            KeyCode::Char('r') if self.focus == Focus::Messages => {
+            KeyCode::Char('r') if self.focus == Focus::Messages && plain(key) => {
                 self.prefill_composer("/react ");
             }
-            KeyCode::Char('u') if self.focus == Focus::Messages => {
+            KeyCode::Char('u') if self.focus == Focus::Messages && plain(key) => {
                 if let Err(err) = self.unreact_selected_message() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('d') if self.focus == Focus::Messages => {
+            KeyCode::Char('d') if self.focus == Focus::Messages && plain(key) => {
                 self.prefill_composer("/delete");
             }
             // `R` prefills `/reply ` (draft-protected, like `r`/`d`) and names the
             // reply target on the status line; the target resolves at submit.
-            KeyCode::Char('R') if self.focus == Focus::Messages => {
+            KeyCode::Char('R') if self.focus == Focus::Messages && plain(key) => {
                 self.begin_reply();
             }
             // Open the selected message's downloaded image full-size.
-            KeyCode::Char('o') if self.focus == Focus::Messages => {
+            KeyCode::Char('o') if self.focus == Focus::Messages && plain(key) => {
                 self.open_selected_image_viewer();
             }
             // Chat list navigation.
-            KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
+            KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer && plain(key) => {
                 self.move_selection(-1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.focus != Focus::Composer => {
+            KeyCode::Down | KeyCode::Char('j') if self.focus != Focus::Composer && plain(key) => {
                 self.move_selection(1);
             }
             KeyCode::Enter => {
@@ -686,6 +703,14 @@ impl TuiApp {
     /// on disk is decrypted plaintext with no reader; clearing it keeps decrypted
     /// media from lingering at rest. Best-effort and non-recursive; see
     /// `sweep_media_cache_dir`.
+    ///
+    /// A concurrent session that shares this `--home` sweeps the same directory,
+    /// so this startup sweep can unlink another live session's in-flight download.
+    /// That is harmless and self-healing: the affected image renders as
+    /// `[<name> failed: ...]` and re-downloads next session, and the
+    /// decrypted-plaintext-at-rest guarantee still holds (an artifact is only ever
+    /// removed, never exposed). Cross-process locking would be over-engineering for
+    /// a rare race that already recovers on its own.
     pub(crate) fn sweep_media_cache(&self) {
         sweep_media_cache_dir(&self.media_cache_dir());
     }

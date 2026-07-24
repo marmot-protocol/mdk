@@ -1912,9 +1912,14 @@ const ARMED_INTERACTIONS: &[ArmedInteraction] = &[
 /// The armed interaction the composer text begins with, if any: `input` is the
 /// command exactly (`/delete`) or the command followed by whitespace (`/react `,
 /// `/reply hello`). Matching on the whole command word (not a bare prefix) keeps
-/// `/refresh` and `/reactor` from counting. Shared by the persistent armed hint
-/// and the `Esc` escape hatch so they agree on what "armed" means.
+/// `/refresh` and `/reactor` from counting. Surrounding whitespace is trimmed
+/// first so this agrees with `parse_slash_command` (which also trims): a
+/// hand-typed leading space (" /react x") still submits as a reaction, so it
+/// must still read as armed here — otherwise the hint and the `Esc` escape hatch
+/// would silently disagree with what Enter sends. Shared by the persistent armed
+/// hint and the `Esc` escape hatch so they agree on what "armed" means.
 fn armed_interaction(input: &str) -> Option<&'static ArmedInteraction> {
+    let input = input.trim();
     ARMED_INTERACTIONS.iter().find(|armed| {
         input
             .strip_prefix(armed.command)
