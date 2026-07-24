@@ -64,7 +64,8 @@ impl Marmot {
                 attachments.into_iter().map(Into::into).collect(),
                 caption,
             )
-            .await?;
+            .await
+            .map_err(media_reference_error)?;
         Ok(summary.into())
     }
 
@@ -94,8 +95,9 @@ impl Marmot {
         let upload = self
             .runtime
             .upload_media(&account_ref, &group_id, request.into())
-            .await?;
-        Ok(upload.try_into()?)
+            .await
+            .map_err(media_reference_error)?;
+        upload.try_into().map_err(media_reference_error)
     }
 
     /// Fetch an encrypted media blob and decrypt it using the group's
@@ -110,7 +112,8 @@ impl Marmot {
         let download = self
             .runtime
             .download_media(&account_ref, &group_id, reference.into())
-            .await?;
+            .await
+            .map_err(media_reference_error)?;
         Ok(download.into())
     }
 

@@ -200,6 +200,18 @@ impl MediaAttachmentReference {
                 expected_version.as_str()
             )));
         }
+        // Ingest still accepts noncanonical V1 `m` values for legacy wire
+        // compatibility, but the checked outbound builder must emit the
+        // canonical stored form exactly (same rule V2 already enforces in
+        // `validate`).
+        if expected_version == EncryptedMediaVersion::V1 {
+            let canonical = canonical_media_type_v1(&self.media_type)?;
+            if canonical != self.media_type {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "media type is not canonical for encrypted-media-v1".into(),
+                ));
+            }
+        }
         for locator in &self.locators {
             if !locator_kind_allowed(&locator.kind, allowed_locator_kinds) {
                 return Err(AppError::InvalidEncryptedMedia(

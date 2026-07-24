@@ -164,6 +164,10 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
+            // Encrypted-media validation failures are always media-boundary
+            // errors; map them to the typed variant so send/upload/download
+            // agree with build/parse even when a call site uses `?`/`From`.
+            AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
@@ -256,6 +260,22 @@ mod tests {
                 );
             }
             other => panic!("expected AccountCatchUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_encrypted_media_crosses_ffi_as_typed_media_reference() {
+        let app_err =
+            AppError::InvalidEncryptedMedia("group requires encrypted-media-v2 references".into());
+        let ffi: MarmotKitError = app_err.into();
+        match ffi {
+            MarmotKitError::InvalidMediaReference { details } => {
+                assert!(
+                    details.contains("encrypted-media-v2"),
+                    "typed InvalidMediaReference should carry the media detail, got: {details}"
+                );
+            }
+            other => panic!("expected InvalidMediaReference, got {other:?}"),
         }
     }
 
