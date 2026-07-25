@@ -39,8 +39,11 @@ including their Media V1 state, but membership additions and re-additions are re
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
-keep warming the cache. The crate also exposes bounded radius search over cached follow edges for future TUI/mobile
-pickers. That search is intentionally cache-backed and bounded; it is not a crawler for the whole Nostr social graph.
+keep warming the cache. The crate exposes two searches over that data for TUI/mobile pickers: `search_user_directory`
+answers offline from cached follow edges, and `search_users` streams matches while traversing the live follow graph,
+ranked by social distance. Live traversal is bounded by construction -- capped radius, batched author-scoped fetches
+under a per-radius timeout, and a per-search lifecycle that ends when its consumer drops the subscription -- and
+strangers it discovers are never promoted into the directory. It is not a crawler for the whole Nostr social graph.
 
 Group creation and invites still take pubkeys at the action boundary. If a member's KeyPackage is not already cached but
 the directory knows where their KeyPackages are published, the app fetches the latest package before building the MLS

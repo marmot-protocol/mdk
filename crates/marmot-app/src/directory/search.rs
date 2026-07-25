@@ -385,7 +385,7 @@ impl SearchEmitter {
         if results.is_empty() {
             return;
         }
-        sort_results_within_batch(&mut results);
+        sort_user_search_results(&mut results);
         self.emit_results(SearchUpdateTrigger::ResultsFound { radius }, results)
             .await;
     }
@@ -415,13 +415,20 @@ impl SearchEmitter {
     }
 }
 
-/// Rank one batch by match strength, then by which field matched, then by
-/// pubkey so equally good matches keep a stable order. Radius is constant
-/// within a batch, so it does not participate.
-fn sort_results_within_batch(results: &mut [UserDirectorySearchResult]) {
+/// Rank results best-first: nearest radius, then match strength, then which
+/// field matched, then pubkey so equally good matches keep a stable order.
+///
+/// Public because a streaming consumer has to re-rank for itself. Updates
+/// arrive pre-sorted *within* a batch, but a search emits several batches per
+/// radius (cached first, then fetched), so anything that accumulates the whole
+/// stream must sort the aggregate to recover this order.
+pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
     results.sort_by(|a, b| {
-        match_quality_rank(&a.match_quality)
-            .cmp(&match_quality_rank(&b.match_quality))
+        a.radius
+            .cmp(&b.radius)
+            .then_with(|| {
+                match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
+            })
             .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
             .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
     });
@@ -632,7 +639,7 @@ mod tests {
             },
         ];
 
-        sort_results_within_batch(&mut results);
+        sort_user_search_results(&mut results);
 
         assert_eq!(
             results

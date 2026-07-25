@@ -144,6 +144,8 @@ pub(crate) enum WnError {
         account_id: String,
         source_relays: Vec<String>,
     },
+    #[error("user search did not complete: {0}")]
+    UserSearch(String),
 }
 
 pub(crate) fn wn_error_json(err: &WnError) -> Value {
@@ -203,6 +205,10 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "repair": {
                 "retry_with_relay": "--relay <relay-that-has-the-current-profile>",
             },
+        }),
+        WnError::UserSearch(_) => json!({
+            "code": "user_search_failed",
+            "message": err.to_string(),
         }),
         WnError::AccountHome(err) => account_home_error_json(err),
         WnError::App(err) => app_error_json(err),

@@ -136,7 +136,7 @@ pub use config::{
 pub use directory::{
     DirectoryKeyPackage, SearchUpdateTrigger, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    UserSearchParams, UserSearchSubscription, UserSearchUpdate,
+    UserSearchParams, UserSearchSubscription, UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
     MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,

@@ -22,13 +22,14 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::directory::records::{
     DirectoryKeyPackage, FetchedFollowList, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    field_rank, follow_list_from_record, latest_follow_list_from_records,
-    latest_fresh_profiles_from_records, match_quality_rank, profile_content_json,
-    profile_from_record, public_directory_user_record, select_newer_directory_entry,
-    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
-    user_record_match,
+    follow_list_from_record, latest_follow_list_from_records, latest_fresh_profiles_from_records,
+    profile_content_json, profile_from_record, public_directory_user_record,
+    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
+    user_directory_record_from_public, user_record_match,
 };
-use crate::directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
+use crate::directory::{
+    DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
+};
 use crate::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
@@ -425,15 +426,7 @@ impl MarmotApp {
                 profile: record.profile.clone(),
             });
         }
-        results.sort_by(|a, b| {
-            a.radius
-                .cmp(&b.radius)
-                .then_with(|| {
-                    match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
-                })
-                .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
-                .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
-        });
+        sort_user_search_results(&mut results);
         if let Some(limit) = search.limit {
             results.truncate(limit);
         }

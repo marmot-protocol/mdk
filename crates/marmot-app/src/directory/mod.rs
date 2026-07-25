@@ -13,5 +13,8 @@ pub use records::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
-pub use search::{SearchUpdateTrigger, UserSearchParams, UserSearchSubscription, UserSearchUpdate};
-pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan, DirectorySyncRunSummary};
+pub use search::{
+    SearchUpdateTrigger, UserSearchParams, UserSearchSubscription, UserSearchUpdate,
+    sort_user_search_results,
+};
+pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};

@@ -2287,6 +2287,105 @@ fn follows_add_refuses_when_selected_relay_has_no_current_list_event() {
 }
 
 #[test]
+fn users_search_finds_a_followed_stranger_whose_profile_only_lives_on_the_relay() {
+    let relay = TestRelay::new();
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+
+    // Bob publishes a distinctive profile from his own home, so nothing about
+    // him was ever cached in Alice's directory.
+    let bob = create_account_on_relay(bob_home.path(), relay.url());
+    run_json_with_relay(
+        bob_home.path(),
+        relay.url(),
+        &["profile", "update", "--about", "marmotneedle"],
+    );
+
+    // Alice's follow list reaches the relay without going through her own
+    // cache, so her only route to Bob is traversing the live graph.
+    let alice = create_account_on_relay(alice_home.path(), relay.url());
+    publish_follow_list(alice_home.path(), &alice, relay.url(), &[&bob]);
+
+    let found = run_json_with_relay(
+        alice_home.path(),
+        relay.url(),
+        &["users", "search", "marmotneedle"],
+    );
+
+    let users = found["users"].as_array().expect("users array");
+    assert_eq!(users.len(), 1, "expected exactly Bob: {found}");
+
+    // Every field here is read by the TUI's `parse_user_search_results`
+    // (crates/cli/src/tui/model.rs), which shells out to this command. The row
+    // shape is a contract, not an implementation detail.
+    let row = &users[0];
+    assert_eq!(row["account_id_hex"], bob);
+    assert_eq!(row["radius"], 1);
+    assert_eq!(row["matched_field"], "about");
+    assert_eq!(row["match_quality"], "exact");
+    assert!(
+        row["npub"]
+            .as_str()
+            .is_some_and(|npub| npub.starts_with("npub1")),
+        "row must carry a renderable npub: {row}"
+    );
+    assert_eq!(row["profile"]["about"], "marmotneedle");
+    assert!(
+        row["profile"]["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "row must carry a display name for the TUI to render: {row}"
+    );
+}
+
+#[test]
+fn users_search_does_not_promote_a_discovered_stranger_into_the_directory() {
+    let relay = TestRelay::new();
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+
+    let bob = create_account_on_relay(bob_home.path(), relay.url());
+    run_json_with_relay(
+        bob_home.path(),
+        relay.url(),
+        &["profile", "update", "--about", "marmotstranger"],
+    );
+
+    let alice = create_account_on_relay(alice_home.path(), relay.url());
+    publish_follow_list(alice_home.path(), &alice, relay.url(), &[&bob]);
+
+    let found = run_json_with_relay(
+        alice_home.path(),
+        relay.url(),
+        &["users", "search", "marmotstranger"],
+    );
+    assert_eq!(
+        found["users"][0]["profile"]["about"], "marmotstranger",
+        "the search must have resolved Bob's profile: {found}"
+    );
+
+    // Resolving a stranger's profile to answer a search must not persist it:
+    // a promoted directory entry becomes a live per-author subscription, which
+    // is exactly the unbounded social-graph crawl the directory forbids.
+    let shown = run_json_error_with_relay(alice_home.path(), relay.url(), &["users", "show", &bob]);
+    assert_eq!(shown["code"], "missing_directory_entry", "got: {shown}");
+
+    // Positive control: `users show` does resolve a genuinely promoted entry,
+    // so the assertion above is about Bob being absent, not about the command
+    // always failing.
+    let alice_entry =
+        run_json_with_relay(alice_home.path(), relay.url(), &["users", "show", &alice]);
+    assert_eq!(alice_entry["user"]["account_id_hex"], alice);
+}
+
+fn create_account_on_relay(home: &std::path::Path, relay: &str) -> String {
+    run_json_with_relay(home, relay, &["account", "create"])["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned()
+}
+
+#[test]
 fn relays_add_fetches_remote_list_before_publishing_replaceable_event() {
     let seed_relay = TestRelay::new();
     let existing_relay = TestRelay::new();
