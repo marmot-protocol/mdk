@@ -129,20 +129,8 @@ impl<S: StorageProvider> Engine<S> {
         policy: &CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
         policy
-            .validate()
-            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
-        policy
-            .ensure_app_window_matches(self.max_past_epochs)
-            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
-        // Release builds may only run the pinned v1 baseline. Debug harnesses may
-        // override for deterministic settlement / rewind-horizon probes (mdk#970).
-        #[cfg(not(debug_assertions))]
-        if !policy.is_pinned_v1() {
-            return Err(OpenMlsProjectionError::InvalidPolicy(
-                crate::canonicalization::CanonicalizationPolicyError::NotPinnedV1.to_string(),
-            ));
-        }
-        Ok(())
+            .ensure_acceptable(self.max_past_epochs)
+            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))
     }
 
     /// Hex-encoded `seen_message_ids` snapshot for the convergence

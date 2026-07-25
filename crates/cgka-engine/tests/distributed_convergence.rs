@@ -5642,32 +5642,22 @@ fn set_convergence_policy_accepts_pinned_v1_baseline() {
 }
 
 #[test]
-fn release_builds_reject_non_pinned_convergence_policy() {
-    // Mirror the CLI/dev-override gate: release code paths must refuse anything
-    // other than the pinned v1 baseline (mdk#970).
+fn non_pinned_policy_fails_ensure_pinned_v1_helper() {
+    // Pure helper coverage. The engine reject arm under
+    // `#[cfg(not(debug_assertions))]` is proven by
+    // `just test-convergence-policy-pin` (tests/convergence_policy_pin.rs).
     let policy = CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     };
-    if cfg!(debug_assertions) {
-        assert!(
-            !policy.is_pinned_v1(),
-            "fixture must differ from the pinned baseline"
-        );
-        assert_eq!(
-            policy.ensure_pinned_v1(),
-            Err(cgka_engine::canonicalization::CanonicalizationPolicyError::NotPinnedV1)
-        );
-    } else {
-        let (mut alice, _storage) = build_client(b"alice");
-        let err = alice
-            .set_convergence_policy(policy)
-            .expect_err("release builds must reject non-v1 policies");
-        assert!(
-            matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
-            "expected InvalidPolicy, got {err:?}"
-        );
-    }
+    assert!(
+        !policy.is_pinned_v1(),
+        "fixture must differ from the pinned baseline"
+    );
+    assert_eq!(
+        policy.ensure_pinned_v1(),
+        Err(cgka_engine::canonicalization::CanonicalizationPolicyError::NotPinnedV1)
+    );
 }
 
 #[tokio::test]

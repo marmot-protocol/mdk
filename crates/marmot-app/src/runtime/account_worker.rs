@@ -1543,7 +1543,6 @@ impl Drop for ScheduledPushRegistrationRetry {
     }
 }
 
-const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 /// Extra delay beyond the engine quiescence window before the first scheduled
 /// convergence tick fires. Avoids off-by-one-ms races where the timer fires
 /// while `ConvergenceStatus` is still `Syncing` (mdk#494).
@@ -1665,9 +1664,9 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     let quiescence_ms = if cfg!(debug_assertions) {
         app.config
             .dev_settlement_quiescence_ms
-            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS)
+            .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS)
     } else {
-        DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS
+        cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
     };
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }

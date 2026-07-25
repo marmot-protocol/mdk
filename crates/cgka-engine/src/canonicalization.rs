@@ -93,6 +93,24 @@ impl CanonicalizationPolicy {
         }
         Ok(())
     }
+
+    /// Same acceptance contract as engine setters and session open (mdk#970).
+    ///
+    /// Always enforces the witness-override bound and app-window alignment.
+    /// Release builds also require the pinned v1 baseline; debug harnesses may
+    /// override for settlement/rewind probes.
+    pub fn ensure_acceptable(
+        &self,
+        max_past_epochs: usize,
+    ) -> Result<(), CanonicalizationPolicyError> {
+        self.validate()?;
+        self.ensure_app_window_matches(max_past_epochs)?;
+        #[cfg(not(debug_assertions))]
+        if !self.is_pinned_v1() {
+            return Err(CanonicalizationPolicyError::NotPinnedV1);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1060,6 +1078,26 @@ mod witness_window_tests {
                 app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
                 max_past_epochs: 1,
             })
+        );
+    }
+
+    #[test]
+    fn ensure_acceptable_requires_app_window_alignment() {
+        let policy = CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        };
+        assert_eq!(
+            policy.ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize),
+            Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: 1,
+                max_past_epochs: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+            })
+        );
+        assert!(
+            CanonicalizationPolicy::default()
+                .ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize)
+                .is_ok()
         );
     }
 

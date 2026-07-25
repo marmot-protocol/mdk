@@ -810,3 +810,33 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
     );
     assert!(advanced.queued.is_empty());
 }
+
+#[test]
+fn open_rejects_invalid_convergence_policy_before_storage_open() {
+    // mdk#970 / PR review: policy must fail closed before durable open work.
+    // A mismatched app window is rejected in every build; use a path that does
+    // not exist so a late failure would be a storage error rather than policy.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never-created.sqlite");
+    assert!(!missing.exists(), "fixture path must not exist before open");
+    let key = SqlCipherKey::new("policy reject key").unwrap();
+    let result = AccountDeviceSession::open(
+        config(&missing, &key, b"policy-reject").convergence_policy(CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        }),
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("invalid policy must fail before storage open"),
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("convergence policy"),
+        "expected policy error, got {message}"
+    );
+    assert!(
+        !missing.exists(),
+        "rejected open must not create the database file"
+    );
+}

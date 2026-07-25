@@ -239,6 +239,14 @@ impl AccountDeviceSession {
             )
             .into());
         }
+        // Fail closed before opening storage or hydrating: a rejected release
+        // policy must not retire key packages or mutate durable group state
+        // (mdk#970 / PR review). Session construction always uses the default
+        // MLS past-epoch window, so validate against that same horizon here.
+        config
+            .convergence_policy
+            .ensure_acceptable(cgka_engine::DEFAULT_MAX_PAST_EPOCHS)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
