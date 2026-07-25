@@ -11837,6 +11837,14 @@ fn every_daemon_start_relay_source_counts_for_the_auto_start_decision() {
         !daemon_start_has_relay_source(None, &[], &[], Some("   ")),
         "a blank WN_RELAY is not a relay source"
     );
+    assert!(
+        !daemon_start_has_relay_source(Some("   "), &[], &[], None),
+        "a blank --relay is not a relay source (it would fail the start with missing_relay_url)"
+    );
+    assert!(
+        !daemon_start_has_relay_source(Some(""), &[], &[], None),
+        "an empty --relay is not a relay source"
+    );
 }
 
 // --- Follow/unfollow from user-search results ---

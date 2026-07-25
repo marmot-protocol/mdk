@@ -4728,25 +4728,6 @@ pub(crate) fn composer_display_text(input: &str) -> String {
 /// flags. `wn daemon start` accepts comma-delimited `--discovery-relays` /
 /// `--default-account-relays`, so each non-empty list is joined and passed as
 /// the same flag the daemon exposes (flag passthrough, no JSON change).
-/// Whether a `daemon start` spawned by this TUI would have a relay to run with.
-/// Mirrors the exact sources `wn daemon start` accepts — the two passthrough
-/// flag lists, the global `--relay`, and the `WN_RELAY` environment fallback —
-/// so the launch auto-start never declines to start a daemon that would in
-/// fact have started, and never attempts one guaranteed to fail with
-/// `missing_relay_url`. The environment value arrives as a parameter so this
-/// stays pure; the caller reads `WN_RELAY` at the composition root.
-pub(crate) fn daemon_start_has_relay_source(
-    relay: Option<&str>,
-    discovery_relays: &[String],
-    default_account_relays: &[String],
-    env_relay: Option<&str>,
-) -> bool {
-    relay.is_some()
-        || !discovery_relays.is_empty()
-        || !default_account_relays.is_empty()
-        || env_relay.is_some_and(|relay| !relay.trim().is_empty())
-}
-
 pub(crate) fn daemon_start_args(
     discovery_relays: &[String],
     default_account_relays: &[String],
@@ -4761,6 +4742,28 @@ pub(crate) fn daemon_start_args(
         args.push(default_account_relays.join(","));
     }
     args
+}
+
+/// Whether a `daemon start` spawned by this TUI would have a relay to run with.
+/// Mirrors the exact sources `wn daemon start` accepts — the two passthrough
+/// flag lists, the global `--relay`, and the `WN_RELAY` environment fallback —
+/// so the launch auto-start never declines to start a daemon that would in
+/// fact have started, and never attempts one guaranteed to fail with
+/// `missing_relay_url`. An empty or whitespace-only `--relay` or `WN_RELAY` is
+/// not a relay source — it would fail the start with `missing_relay_url`, the
+/// exact outcome this predicate exists to avoid. The environment value arrives
+/// as a parameter so this stays pure; the caller reads `WN_RELAY` at the
+/// composition root.
+pub(crate) fn daemon_start_has_relay_source(
+    relay: Option<&str>,
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+    env_relay: Option<&str>,
+) -> bool {
+    relay.is_some_and(|relay| !relay.trim().is_empty())
+        || !discovery_relays.is_empty()
+        || !default_account_relays.is_empty()
+        || env_relay.is_some_and(|relay| !relay.trim().is_empty())
 }
 
 pub(crate) fn message_subscription_args() -> Vec<String> {
