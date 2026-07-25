@@ -2772,13 +2772,15 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
