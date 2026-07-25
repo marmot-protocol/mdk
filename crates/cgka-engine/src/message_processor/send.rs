@@ -27,6 +27,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        let group_id = super::send_intent_group_id(&intent).clone();
         // A local copy marked removed is terminal for outbound work: the spec
         // forbids preparing/publishing anything for it (member-departure.md,
         // "Realizing removal"), and the underlying OpenMLS state would only
@@ -34,12 +35,24 @@ impl<S: StorageProvider> Engine<S> {
         // here (not just `do_send`) so queued-intent drains hit the same
         // deterministic terminal error. Every intent kind is blocked,
         // including `Leave` — there is nothing left to leave.
-        if self.group_record_is_removed(super::send_intent_group_id(&intent))? {
+        if self.group_record_is_removed(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Removed",
                     to: crate::audit_helpers::send_intent_kind_str(&intent),
                     reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
+        // Queued drains call this method directly, bypassing `do_send`.
+        // Recheck the durable lifecycle marker here so no outbound work can
+        // escape an `Unrecoverable` halt after restart.
+        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Unrecoverable",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "group is Unrecoverable pending verified repair",
                 },
             ));
         }

@@ -500,6 +500,7 @@ impl AppClient {
             protocol_profile: group.protocol_profile.into(),
             epoch: group.epoch.0,
             member_count: group.members.len(),
+            unrecoverable: group.unrecoverable,
             required_app_components: group
                 .required_capabilities
                 .app_components

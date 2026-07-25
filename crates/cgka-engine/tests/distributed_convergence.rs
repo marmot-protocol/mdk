@@ -2678,6 +2678,56 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
 }
 
 #[tokio::test]
+async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
+    let (mut alice, storage) = build_client(b"alice");
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "queued-unrecoverable".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"queued-before-durable-halt".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, b"must remain queued"),
+            },
+            created_at_ms: 1,
+        })
+        .unwrap();
+    let mut stored_group = storage.get_group(&group_id).unwrap();
+    stored_group.unrecoverable = true;
+    storage.put_group(&stored_group).unwrap();
+
+    let drained = alice
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("durable halt pauses queued drain");
+    assert!(drained.is_empty());
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "halted queued work must remain available after verified repair"
+    );
+}
+
+#[tokio::test]
 async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     // mdk#971: Unrecoverable must persist across restart; hydration must not
     // silently set_stable over an unrepaired base.
@@ -2728,7 +2778,8 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         })
         .await
         .unwrap();
-    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    alice.confirm_published(alice_pending).await.unwrap();
     let alice_commit = route(alice_commit, &group_id);
     carol
         .buffer_openmls_convergence_message(&group_id, alice_commit, 1_000)
@@ -2771,6 +2822,14 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     restarted
         .hydrate_stable_groups_from_storage()
         .expect("session-open hydration succeeds");
+    let hydration_events = restarted.drain_events();
+    assert!(
+        hydration_events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "restart must re-surface the durable repair requirement; got {hydration_events:?}"
+    );
     assert!(
         carol_storage.get_group(&group_id).unwrap().unrecoverable,
         "durable Unrecoverable marker must survive restart"
@@ -2823,6 +2882,57 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         ),
         "send must report Unrecoverable; got {send_err:?}"
     );
+
+    // A verified replacement Welcome must be able to repair a frozen active
+    // record. Alice removes Carol from the live branch and re-adds her with a
+    // fresh KeyPackage; Carol intentionally never ingests the removal, so her
+    // frozen record still lists herself when the repair Welcome arrives.
+    let repair_kp = restarted.fresh_key_package().await.unwrap();
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![restarted.self_id()],
+        })
+        .await
+        .unwrap();
+    let (_remove_commit, remove_pending) = evolution(remove);
+    alice.confirm_published(remove_pending).await.unwrap();
+    let readd = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![repair_kp],
+        })
+        .await
+        .unwrap();
+    let (repair_pending, repair_welcome) = match readd {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected repair GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(repair_pending).await.unwrap();
+    restarted
+        .join_welcome(repair_welcome)
+        .await
+        .expect("authenticated replacement Welcome repairs Unrecoverable");
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "verified repair must clear the durable marker"
+    );
+    assert_eq!(
+        restarted.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap(),
+        "replacement Welcome must install the verified live state"
+    );
+    restarted
+        .send(SendIntent::AppMessage {
+            group_id,
+            payload: app_payload_for(&restarted, b"send resumes after verified repair"),
+        })
+        .await
+        .expect("verified repair returns the group to Stable");
 }
 
 #[tokio::test]

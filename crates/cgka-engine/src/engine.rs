@@ -1202,6 +1202,14 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(group_id, hydrate_reason);
+        if group.unrecoverable {
+            // The durable lifecycle marker is also an application-facing
+            // repair requirement. Re-emit it on every session open because the
+            // original transition event belonged to the prior process.
+            self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
+                group_id: group_id.clone(),
+            });
+        }
 
         if has_queued_intents || has_convergence_inputs {
             self.schedule_pending_convergence_group(group_id);
