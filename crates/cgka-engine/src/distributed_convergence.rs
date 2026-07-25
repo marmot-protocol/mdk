@@ -155,7 +155,10 @@ impl<S: StorageProvider> Engine<S> {
         snapshot
     }
 
-    pub(crate) fn convergence_policy_for_group(
+    /// Load and accept the group's convergence policy without the live-group
+    /// gate. Used by hydration while a group is still quarantined (it must
+    /// inspect pending convergence work before clearing quarantine).
+    pub(crate) fn convergence_policy_for_group_ungated(
         &self,
         group_id: &GroupId,
     ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
@@ -176,13 +179,37 @@ impl<S: StorageProvider> Engine<S> {
         Ok(policy)
     }
 
+    pub(crate) fn convergence_policy_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
+        // Quarantined groups are hidden from every live surface (mdk#364): do
+        // not read or return a default/stored policy that could drive rewind
+        // retention or branch selection.
+        self.ensure_group_live(group_id).map_err(|e| match e {
+            cgka_traits::error::EngineError::UnknownGroup(_) => {
+                OpenMlsProjectionError::MissingGroup
+            }
+            other => OpenMlsProjectionError::Storage(format!("{other}")),
+        })?;
+        self.convergence_policy_for_group_ungated(group_id)
+    }
+
     pub(crate) fn retain_current_epoch_snapshot_for_group(
         &self,
         group_id: &GroupId,
     ) -> Result<(), cgka_traits::error::EngineError> {
-        let policy = self.convergence_policy_for_group(group_id).map_err(|e| {
-            cgka_traits::error::EngineError::Backend(format!("load convergence policy: {e}"))
-        })?;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|e| match e {
+                // `convergence_policy_for_group` maps quarantine to MissingGroup.
+                OpenMlsProjectionError::MissingGroup => {
+                    cgka_traits::error::EngineError::UnknownGroup(group_id.clone())
+                }
+                other => cgka_traits::error::EngineError::Backend(format!(
+                    "load convergence policy: {other}"
+                )),
+            })?;
         retain_current_group_epoch_snapshot(
             &self.storage,
             group_id,
