@@ -221,6 +221,17 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        // mdk#971: durable Unrecoverable halt — sync into memory and refuse
+        // outbound work until a verified repair path clears the marker.
+        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Unrecoverable",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "group is Unrecoverable pending verified repair",
+                },
+            ));
+        }
         if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
@@ -245,6 +256,12 @@ impl<S: StorageProvider> Engine<S> {
         // Quarantined groups vanish from every live surface; convergence and
         // queued-intent drains must not touch their state (mdk#364).
         self.ensure_group_live(group_id)?;
+        // A drain can be invoked directly without session-open hydration.
+        // Synchronize the durable halt before convergence or queued work can
+        // run so restart never bypasses `Unrecoverable`.
+        if self.sync_unrecoverable_halt_from_storage(group_id)? {
+            return Ok(Vec::new());
+        }
         // Terminal: a removed copy must never publish, and the removed-copy
         // gate in `do_send_ready` would turn every queued record into a
         // permanent drain error that the app retries forever. Discard the

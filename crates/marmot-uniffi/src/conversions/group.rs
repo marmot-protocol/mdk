@@ -42,6 +42,8 @@ pub struct AppGroupRecordFfi {
     pub disappearing_message_secs: u64,
     pub archived: bool,
     pub pending_confirmation: bool,
+    /// Whether this local group copy is frozen pending verified repair.
+    pub unrecoverable: bool,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
     pub self_membership: SelfMembershipFfi,
@@ -83,6 +85,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             disappearing_message_secs,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
+            unrecoverable: value.unrecoverable,
             self_membership: value.self_membership.into(),
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
@@ -371,6 +374,7 @@ pub struct AppGroupMlsStateFfi {
     pub protocol_profile: AppProtocolProfileFfi,
     pub epoch: u64,
     pub member_count: u32,
+    pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
 }
 
@@ -381,6 +385,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             protocol_profile: value.protocol_profile.into(),
             epoch: value.epoch,
             member_count: super::saturating_u32(value.member_count),
+            unrecoverable: value.unrecoverable,
             required_app_components: value.required_app_components,
         }
     }

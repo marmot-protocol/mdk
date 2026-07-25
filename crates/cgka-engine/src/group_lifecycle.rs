@@ -467,6 +467,7 @@ impl<S: StorageProvider> Engine<S> {
             required_capabilities: required_caps,
             protocol_profile: self.new_protocol_profile,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         if self.new_protocol_profile == ProtocolProfile::Legacy {
@@ -875,7 +876,7 @@ impl<S: StorageProvider> Engine<S> {
         // live-state clearing, that store, every Marmot post-check, the
         // discoverable group record, capability cache, and both durable
         // Welcome dispositions in one transaction.
-        let (group_id, mls_group, welcome_sender_id) =
+        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                 let processed = openmls::group::ProcessedWelcome::new_from_welcome(
@@ -892,25 +893,32 @@ impl<S: StorageProvider> Engine<S> {
                         .to_vec(),
                 );
 
-                let local_state_is_stale = match storage.get_group(&group_id) {
-                    Ok(group) => {
-                        if group
-                            .members
-                            .iter()
-                            .any(|member| &member.id == self.identity.self_id())
-                        {
-                            // A distinct transport/content id does not make a
-                            // second normal Welcome for an already-active group
-                            // a rejoin. Reject before OpenMLS staging and let
-                            // the surrounding transaction restore KeyPackage
-                            // consumption and every tentative write.
-                            return Err(EngineError::WelcomeAlreadyProcessed);
+                let (local_state_is_stale, repaired_unrecoverable) =
+                    match storage.get_group(&group_id) {
+                        Ok(group) => {
+                            let self_is_recorded_member = group
+                                .members
+                                .iter()
+                                .any(|member| &member.id == self.identity.self_id());
+                            if self_is_recorded_member && !group.unrecoverable {
+                                // A distinct transport/content id does not make a
+                                // second normal Welcome for an already-active group
+                                // a rejoin. Reject before OpenMLS staging and let
+                                // the surrounding transaction restore KeyPackage
+                                // consumption and every tentative write.
+                                return Err(EngineError::WelcomeAlreadyProcessed);
+                            }
+                            // Unrecoverable is the explicit exception: a fully
+                            // authenticated replacement Welcome is a protocol-defined
+                            // repair even though the frozen record still lists us as
+                            // a member. The surrounding transaction restores the old
+                            // OpenMLS state and KeyPackage on any later validation
+                            // failure, so clearing the live rows remains tentative.
+                            (true, group.unrecoverable)
                         }
-                        true
-                    }
-                    Err(cgka_traits::storage::StorageError::NotFound) => false,
-                    Err(error) => return Err(EngineError::Storage(error)),
-                };
+                        Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
+                        Err(error) => return Err(EngineError::Storage(error)),
+                    };
                 if local_state_is_stale {
                     self.clear_live_openmls_group_on_storage(storage, &group_id)?;
                 }
@@ -1003,6 +1011,7 @@ impl<S: StorageProvider> Engine<S> {
                         crate::capability_manager::required_capabilities_from_group(&mls_group),
                     protocol_profile,
                     removed: false,
+                    unrecoverable: false,
                     join_epoch: EpochId(mls_group.epoch().as_u64()),
                 };
                 mirror_app_components_into_record(&mls_group, &mut group_record);
@@ -1030,7 +1039,12 @@ impl<S: StorageProvider> Engine<S> {
                 storage.put_ingress_dedup_marker(&welcome_id)?;
                 storage.put_ingress_dedup_marker(&content_id)?;
 
-                Ok::<_, EngineError>((group_id, mls_group, welcome_sender_id))
+                Ok::<_, EngineError>((
+                    group_id,
+                    mls_group,
+                    welcome_sender_id,
+                    repaired_unrecoverable,
+                ))
             })?;
 
         // #740: index this joined group's transport routing id for O(1) inbound
@@ -1043,21 +1057,39 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         // 7. State machine: Stable at the post-welcome epoch.
+        // An authenticated Welcome is a verified repair path: if the group was
+        // halted Unrecoverable, exit through `repair_to_stable` rather than a
+        // blind `set_stable` overwrite (mdk#971). The group record written
+        // above already clears the durable `unrecoverable` marker.
         let joined_epoch = EpochId(mls_group.epoch().as_u64());
-        self.epoch_manager
-            .set_stable(group_id.clone(), joined_epoch);
+        let join_reason = if repaired_unrecoverable {
+            if !self.epoch_manager.is_unrecoverable(&group_id) {
+                // Direct join callers are not required to run session-open
+                // hydration first. Recreate the durable prior state so the
+                // explicit repair transition remains the only exit.
+                self.epoch_manager
+                    .restore_unrecoverable(group_id.clone(), joined_epoch);
+            }
+            self.epoch_manager
+                .repair_to_stable(&group_id, joined_epoch)?;
+            "join_welcome_repair"
+        } else {
+            self.epoch_manager
+                .set_stable(group_id.clone(), joined_epoch);
+            "join_welcome"
+        };
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 None,
                 "stable",
                 joined_epoch,
-                "join_welcome",
+                join_reason,
                 None,
                 None,
             ),
         );
-        self.audit_group_context(&group_id, "join_welcome");
+        self.audit_group_context(&group_id, join_reason);
 
         // 9. Emit event + register for in-process dedup.
         self.events_buf

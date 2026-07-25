@@ -719,6 +719,7 @@ fn snapshot_group_and_member() {
             required_capabilities: GroupCapabilities::default(),
             protocol_profile: ProtocolProfile::Current,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(2),
         }
     );
@@ -786,4 +787,22 @@ fn snapshot_create_group_request() {
             }
         )
     );
+}
+
+#[test]
+fn unrecoverable_defaults_false_for_old_records() {
+    let legacy: Group = serde_json::from_value(serde_json::json!({
+        "id": [1, 2, 3, 4],
+        "name": "ops",
+        "description": "",
+        "epoch": 1,
+        "members": [],
+        "required_capabilities": {
+            "proposals": [],
+            "extensions": [],
+            "app_components": { "ids": [] }
+        }
+    }))
+    .unwrap();
+    assert!(!legacy.unrecoverable);
 }

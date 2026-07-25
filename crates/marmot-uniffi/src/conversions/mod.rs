@@ -89,6 +89,7 @@ mod tests {
             disappearing_message_secs: 0,
             archived: false,
             pending_confirmation: false,
+            unrecoverable: false,
             self_membership: SelfMembershipFfi::Member,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
