@@ -255,12 +255,38 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        // A hydration-quarantined group is frozen until explicit repair: no
+        // canonicalization pass may read or mutate its state, and no
+        // set_stable may re-activate it out of band (mdk#364). Check this
+        // before syncing a durable Unrecoverable halt into memory so the
+        // quarantine path cannot mutate `epoch_manager`. Report a blocked run
+        // and leave everything untouched; retained inputs replay once repair
+        // clears the quarantine (hydration then restores any durable halt).
+        if self.quarantined_reason(group_id).is_some() {
+            let epoch = self
+                .epoch_manager
+                .epoch(group_id)
+                .map(|e| e.0)
+                .unwrap_or_default();
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Blocked,
+                    current_tip_epoch: Some(epoch),
+                    retained_anchor_horizon: None,
+                    reason: Some("group_quarantined".to_string()),
+                    error_kind: None,
+                },
+            );
+            return Ok(quarantined_result(epoch));
+        }
+
         // A group that has already entered `Unrecoverable` MUST stop applying
         // group-state changes until a verified repair path
         // (spec/protocol-core/group-state.md:50-51,65). Report the halt and
-        // leave canonical state untouched. Sync from the durable marker first
-        // so a restart (or a path that skipped hydration) cannot skip the halt
-        // (mdk#971).
+        // leave canonical state untouched. Sync from the durable marker so a
+        // restart (or a path that skipped hydration) cannot skip the halt
+        // (mdk#971). Only reached for non-quarantined groups.
         if self
             .sync_unrecoverable_halt_from_storage(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -281,30 +307,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
             );
             return Ok(unrecoverable_result(epoch));
-        }
-
-        // A hydration-quarantined group is frozen until explicit repair: no
-        // canonicalization pass may read or mutate its state, and no
-        // set_stable may re-activate it out of band (mdk#364). Report a
-        // blocked run and leave everything untouched; retained inputs replay
-        // once repair clears the quarantine.
-        if self.quarantined_reason(group_id).is_some() {
-            let epoch = self
-                .epoch_manager
-                .epoch(group_id)
-                .map(|e| e.0)
-                .unwrap_or_default();
-            self.audit_group(
-                group_id,
-                marmot_forensics::AuditEventKind::ConvergenceRunState {
-                    phase: ConvergencePhase::Blocked,
-                    current_tip_epoch: Some(epoch),
-                    retained_anchor_horizon: None,
-                    reason: Some("group_quarantined".to_string()),
-                    error_kind: None,
-                },
-            );
-            return Ok(quarantined_result(epoch));
         }
 
         let previous_group = self
