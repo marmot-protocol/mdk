@@ -31,6 +31,34 @@ versioning through the workspace version in the root `Cargo.toml`.
   pending flag without waiting for an unrelated refresh. `chats list --json` /
   `chat_list_row` rows gain a matching `leave_requested_at_ms` field; no other
   JSON response shapes changed.
+- TUI: the daemon auto-starts at launch when it is down and the TUI holds a relay source to give it (the
+  `--discovery-relays`/`--default-account-relays` passthrough flags, a global `--relay`, or `WN_RELAY`) — exactly as
+  `/daemon start` would, but off the event loop, since `wn daemon start` blocks up to five seconds on its readiness
+  poll. The status line shows `starting daemon...` and then the outcome, the status-bar dot flips green when the start
+  lands, and the daemon-backed live subscriptions attach without any manual action. Without a relay source no start is
+  attempted (it would fail requiring a relay URL): one honest status says so and the login/main flow continues degraded
+  exactly as before. Deliberate divergence from the retired reference client, which killed its auto-started daemon on
+  exit: the TUI never stops the daemon, because other `wn` commands share it — stop it explicitly with `/daemon stop`.
+- TUI: `f`/`x` on a highlighted user-search result follow/unfollow that user directly — the same key letters as the
+  Profile screen's `f`/`x`, but acting directly on the highlighted result (Profile's go through popups) instead of a
+  round-trip through the Profile screen with a pasted pubkey. Both run
+  `follows add`/`follows remove` on the background worker with in-flight feedback, and the outcome folds into a
+  per-row `[following]` badge. Rows an account already follows are badged up front from a `follows list` snapshot (one
+  local directory read per search, not a `follows check` per row). A fold whose search screen was left, whose acting
+  account was switched, or whose user is no longer among the results is dropped rather than badging the wrong row; the
+  results-focus hints line and the help card name the new keys.
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact
+  half-block glyphs (`▀` colored cells) on any image-capable terminal. The fidelity choice is deliberate: half-blocks
+  are ordinary colored cells rather than a native pixel image (iTerm2/Kitty/Sixel), so an image is bounded strictly to
+  its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
+  Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
+  `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
+  image full-size in a dismiss-on-any-key viewer, drawn with the terminal's native pixel protocol when it has one and
+  the same cell-exact rendering otherwise. Decrypted media is held in memory only; the downloaded artifact is removed
+  right after decode rather than cached on disk. No JSON response shapes changed (the existing `media download --json`
+  `output_path` is passed via `--output`).
 
 ### Changed
 
@@ -43,72 +71,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   leaves cannot race past a caller-side precheck and lose the reason. Forensic
   audit records and conformance observations for this case change from
   `invalid_transition` to `leave_already_requested`.
-
-### Security
-
-- `wn-agent import-identity` keeps secret material out of argv, environment,
-  output, and bootstrap/config artifacts; rejects symlinked, shared, or
-  non-regular credential files; verifies the expected public identity before
-  persistence; and makes duplicate or interrupted imports recoverable.
-
-### Fixed
-
-- TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on
-  `chats list`/`subscribe`/`mark-read` rows (and timeline `chat_list_row`
-  updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
-  chats keep their storage position. Equal-activity rows tie-break on ascending
-  `group_id`, matching storage.
-
-## [0.9.7] - 2026-07-26
-
-### Fixed
-
-- Agent text-stream QUIC starts now accept zero broker candidates for durable
-  final-message fallback, validate complete candidate values against the
-  adopted 512-byte authority rules, preserve ordered candidate failover, and
-  durably reserve encrypted publisher sequences so repeated `stream send`,
-  reconnect, or daemon reuse cannot restart at sequence 1 for one start.
-  Zero-candidate daemon compose returns a `streaming` payload with
-  `candidate: ""` for TUI and script consumers instead of failing the start.
-- KeyPackage deletion during sign-out, wipe, and explicit deletion now uses one
-  scoped, account-bound relay connection set for the complete batch instead of
-  cold-connecting a throwaway client for every deletion event. Relay
-  acknowledgement and local-cache removal remain tracked per event.
-- The Hermes plugin now maps explicitly non-final assistant commentary to
-  durable kind-1201 agent activity while retaining kind-9 delivery for final
-  answers and compatibility with Hermes versions that do not yet provide
-  delivery metadata.
-
-### Security
-
-- Updated `quinn-proto` and `crossbeam-epoch` to patched releases, clearing the
-  active RustSec vulnerabilities in the QUIC and OpenMLS dependency paths.
-  Also removed the remaining unsoundness and yanked-package findings without
-  adding audit ignores; unmaintained-only dependencies remain tracked in
-  issue #1116.
-
-## [0.9.6] - 2026-07-26
-
-### Added
-
-- MarmotKit now exposes account-signed public profile-image uploads to Blossom,
-  with validated raster content and returned HTTPS URLs.
-- MarmotKit profile metadata now includes an optional `banner` field while
-  preserving the existing banner when partial updates omit it.
-
-### Fixed
-
-- `keys list` now reports every durably device-owned KeyPackage, including
-  retained private material, and merges relay visibility without losing
-  distinct relay event ids.
-- MarmotKit key-package ownership now reflects durable, Welcome-usable private
-  material across manual publication, automatic maintenance, and runtime
-  restarts; matching relay events merge with their local record.
-
-## [0.9.5] - 2026-07-25
-
-### Changed
-
 - TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
   after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders
   when that pane holds focus or while an interaction is armed — arming `/react`/`/reply`/`/delete` moves focus to the
@@ -162,7 +124,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   sending to, whether it was opened or previewed. `Enter` is unchanged — it opens the highlighted chat and moves focus
   to the message pane, cancelling any pending preview; opening the chat already settled in the pane is a focus move
   only (no redundant reload). No JSON response shapes changed.
-
 - TUI: inline images are no longer pixelated, and `o` now shows the actual image on pixel-capable terminals. Inline
   previews stay cell-exact half-blocks but downscale through a proper resampling filter (Lanczos3) instead of
   `ratatui-image`'s nearest-neighbor default, so the 8-row preview reads as a legible thumbnail. On a terminal whose
@@ -181,6 +142,99 @@ versioning through the workspace version in the root `Cargo.toml`.
   thread and is cached per target size, so
   scrolling never re-resizes; changing the terminal width does re-resize every visible image on that one frame, an
   accepted cost of the sharper preview. Halfblock-only terminals, and evicted images, keep the cell-exact viewer popup.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`), run on the background worker rather than the event
+  loop. Group-invite notifications surface as a status-line notice. Background re-lists and reorders keep the
+  highlighted chat selected by group id. No JSON response shapes changed.
+
+### Security
+
+- `wn-agent import-identity` keeps secret material out of argv, environment,
+  output, and bootstrap/config artifacts; rejects symlinked, shared, or
+  non-regular credential files; verifies the expected public identity before
+  persistence; and makes duplicate or interrupted imports recoverable.
+
+### Fixed
+
+- TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on
+  `chats list`/`subscribe`/`mark-read` rows (and timeline `chat_list_row`
+  updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
+  chats keep their storage position. Equal-activity rows tie-break on ascending
+  `group_id`, matching storage.
+- TUI: main-view keyboard accelerators now fire only on a plain keypress and ignore `Ctrl`/`Alt` chords. Previously
+  `Ctrl-U` in the message pane matched the bare `u` (unreact) accelerator and published an unconfirmed reaction
+  removal, and `Ctrl-Q` quit through the bare `q` accelerator. The whole accelerator family (`r`/`u`/`d`/`R`/`o`/`i`
+  and `g`/`G` in the message pane, `q`/`A`/`s`/`p`/`h`/`I` and `j`/`k` list navigation elsewhere) is now guarded, while
+  `Ctrl-U` stays the composer kill-line and `Ctrl-C` still quits. `Shift` is still tolerated, so the uppercase
+  accelerators keep working under the kitty keyboard protocol. No JSON response shapes changed.
+- TUI: logging out now reports the outcome faithfully when the follow-up account-list reload fails. Previously a reload
+  failure after a successful, irreversible wipe was reported with an `error:` prefix while the removed account and its
+  stale subscriptions lingered on screen. The logout is now reported as done and the status names `/refresh` to retry
+  the reload; a failure of the wipe itself is still reported as an error. No JSON response shapes changed.
+- TUI: a message-interaction command typed with a leading space now shows the armed-interaction hint and can be
+  cleared with `Esc`, matching how it submits. `parse_slash_command` already trims the composer text, so `/react`,
+  `/reply`, and `/delete` submit even with surrounding whitespace; the armed hint and the `Esc` escape hatch now trim
+  the same way instead of treating a space-prefixed command as an invisible, un-clearable armed state. Plain text with
+  a leading space is still a hand-typed draft and is preserved by `Esc`. No JSON response shapes changed.
+
+## [0.9.7] - 2026-07-26
+
+### Fixed
+
+- Agent text-stream QUIC starts now accept zero broker candidates for durable
+  final-message fallback, validate complete candidate values against the
+  adopted 512-byte authority rules, preserve ordered candidate failover, and
+  durably reserve encrypted publisher sequences so repeated `stream send`,
+  reconnect, or daemon reuse cannot restart at sequence 1 for one start.
+  Zero-candidate daemon compose returns a `streaming` payload with
+  `candidate: ""` for TUI and script consumers instead of failing the start.
+- KeyPackage deletion during sign-out, wipe, and explicit deletion now uses one
+  scoped, account-bound relay connection set for the complete batch instead of
+  cold-connecting a throwaway client for every deletion event. Relay
+  acknowledgement and local-cache removal remain tracked per event.
+- The Hermes plugin now maps explicitly non-final assistant commentary to
+  durable kind-1201 agent activity while retaining kind-9 delivery for final
+  answers and compatibility with Hermes versions that do not yet provide
+  delivery metadata.
+
+### Security
+
+- Updated `quinn-proto` and `crossbeam-epoch` to patched releases, clearing the
+  active RustSec vulnerabilities in the QUIC and OpenMLS dependency paths.
+  Also removed the remaining unsoundness and yanked-package findings without
+  adding audit ignores; unmaintained-only dependencies remain tracked in
+  issue #1116.
+
+## [0.9.6] - 2026-07-26
+
+### Added
+
+- MarmotKit now exposes account-signed public profile-image uploads to Blossom,
+  with validated raster content and returned HTTPS URLs.
+- MarmotKit profile metadata now includes an optional `banner` field while
+  preserving the existing banner when partial updates omit it.
+
+### Fixed
+
+- `keys list` now reports every durably device-owned KeyPackage, including
+  retained private material, and merges relay visibility without losing
+  distinct relay event ids.
+- MarmotKit key-package ownership now reflects durable, Welcome-usable private
+  material across manual publication, automatic maintenance, and runtime
+  restarts; matching relay events merge with their local record.
+
+## [0.9.5] - 2026-07-25
+
+### Changed
 
 - TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
   loaded chats list (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), one row per chat in the list's
@@ -268,9 +322,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
   chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
   `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
-  tick (notification events deduplicated by `notification_key`), run on the background worker rather than the event
-  loop. Group-invite notifications surface as a status-line notice. Background re-lists and reorders keep the
-  highlighted chat selected by group id. No JSON response shapes changed.
+  tick (notification events deduplicated by `notification_key`). Group-invite notifications surface as a status-line
+  notice. Background re-lists and reorders keep the highlighted chat selected by group id. No JSON response shapes
+  changed.
 
 ### Added
 
@@ -281,22 +335,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   commands expose the lifecycle. New groups are periodically enrolled by default; existing groups remain manual-only.
   Successful application-send JSON now includes `maintenance_disposition` without blocking sends while post-join
   rotation is pending. ([#1103](https://github.com/marmot-protocol/mdk/pull/1103))
-- TUI: the daemon auto-starts at launch when it is down and the TUI holds a relay source to give it (the
-  `--discovery-relays`/`--default-account-relays` passthrough flags, a global `--relay`, or `WN_RELAY`) — exactly as
-  `/daemon start` would, but off the event loop, since `wn daemon start` blocks up to five seconds on its readiness
-  poll. The status line shows `starting daemon...` and then the outcome, the status-bar dot flips green when the start
-  lands, and the daemon-backed live subscriptions attach without any manual action. Without a relay source no start is
-  attempted (it would fail requiring a relay URL): one honest status says so and the login/main flow continues degraded
-  exactly as before. Deliberate divergence from the retired reference client, which killed its auto-started daemon on
-  exit: the TUI never stops the daemon, because other `wn` commands share it — stop it explicitly with `/daemon stop`.
-- TUI: `f`/`x` on a highlighted user-search result follow/unfollow that user directly — the same key letters as the
-  Profile screen's `f`/`x`, but acting directly on the highlighted result (Profile's go through popups) instead of a
-  round-trip through the Profile screen with a pasted pubkey. Both run
-  `follows add`/`follows remove` on the background worker with in-flight feedback, and the outcome folds into a
-  per-row `[following]` badge. Rows an account already follows are badged up front from a `follows list` snapshot (one
-  local directory read per search, not a `follows check` per row). A fold whose search screen was left, whose acting
-  account was switched, or whose user is no longer among the results is dropped rather than badging the wrong row; the
-  results-focus hints line and the help card name the new keys.
 - TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
   account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
   deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,
@@ -316,10 +354,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
   Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
   `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
-  image full-size in a dismiss-on-any-key viewer, drawn with the terminal's native pixel protocol when it has one and
-  the same cell-exact rendering otherwise. Decrypted media is held in memory only; the downloaded artifact is removed
-  right after decode rather than cached on disk. No JSON response shapes changed (the existing `media download --json`
-  `output_path` is passed via `--output`).
+  image full-size (same cell-exact rendering) in a dismiss-on-any-key viewer. Decrypted files cache under the TUI home
+  in `tui-media-cache/`. No JSON response shapes changed (the existing `media download --json` `output_path` is passed
+  via `--output`).
 - TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
   `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
   accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
@@ -365,21 +402,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 ### Fixed
 
-- TUI: main-view keyboard accelerators now fire only on a plain keypress and ignore `Ctrl`/`Alt` chords. Previously
-  `Ctrl-U` in the message pane matched the bare `u` (unreact) accelerator and published an unconfirmed reaction
-  removal, and `Ctrl-Q` quit through the bare `q` accelerator. The whole accelerator family (`r`/`u`/`d`/`R`/`o`/`i`
-  and `g`/`G` in the message pane, `q`/`A`/`s`/`p`/`h`/`I` and `j`/`k` list navigation elsewhere) is now guarded, while
-  `Ctrl-U` stays the composer kill-line and `Ctrl-C` still quits. `Shift` is still tolerated, so the uppercase
-  accelerators keep working under the kitty keyboard protocol. No JSON response shapes changed.
-- TUI: logging out now reports the outcome faithfully when the follow-up account-list reload fails. Previously a reload
-  failure after a successful, irreversible wipe was reported with an `error:` prefix while the removed account and its
-  stale subscriptions lingered on screen. The logout is now reported as done and the status names `/refresh` to retry
-  the reload; a failure of the wipe itself is still reported as an error. No JSON response shapes changed.
-- TUI: a message-interaction command typed with a leading space now shows the armed-interaction hint and can be
-  cleared with `Esc`, matching how it submits. `parse_slash_command` already trims the composer text, so `/react`,
-  `/reply`, and `/delete` submit even with surrounding whitespace; the armed hint and the `Esc` escape hatch now trim
-  the same way instead of treating a space-prefixed command as an invisible, un-clearable armed state. Plain text with
-  a leading space is still a hand-typed draft and is preserved by `Esc`. No JSON response shapes changed.
 - `wn relays add/remove --type nip65` now round-trips the complete directional NIP-65 list instead of deleting
   read-only relays or flattening existing role markers. Relay-list JSON adds `read_relays` and `write_relays` alongside
   the existing write-target `relays` view.
