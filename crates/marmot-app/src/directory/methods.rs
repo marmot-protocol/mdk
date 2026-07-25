@@ -489,7 +489,7 @@ impl MarmotApp {
             .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
 
-    async fn fetch_follow_list_for_account_id(
+    pub(crate) async fn fetch_follow_list_for_account_id(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
@@ -574,7 +574,7 @@ impl MarmotApp {
         Ok(())
     }
 
-    async fn fetch_events_for_account_ids(
+    pub(crate) async fn fetch_events_for_account_ids(
         &self,
         account_ids: &[String],
         kind: u64,
@@ -1167,7 +1167,7 @@ impl MarmotApp {
         self.clean_future_dated_directory_caches_once(&accounts)
     }
 
-    fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
             npub: npub_for_account_id_lossy(account_id_hex),

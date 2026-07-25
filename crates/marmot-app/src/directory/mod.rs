@@ -1,6 +1,7 @@
 mod cache;
 mod methods;
 pub(crate) mod records;
+mod search;
 mod sync;
 
 pub(crate) use cache::DirectoryCache;
@@ -12,4 +13,5 @@ pub use records::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
-pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};
+pub use search::{SearchUpdateTrigger, UserSearchParams, UserSearchSubscription, UserSearchUpdate};
+pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan, DirectorySyncRunSummary};
