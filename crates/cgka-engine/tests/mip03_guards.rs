@@ -612,13 +612,8 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
 
     let outcome = alice.ingest(spoofed).await.unwrap();
     assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::PeelFailed
-            }
-        ),
-        "terminally invalid same-epoch commits should not remain buffered, got {outcome:?}"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "same-epoch commits are classified against the frozen pass, got {outcome:?}"
     );
     let result = alice
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -722,13 +717,8 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
 
     let outcome = carol.ingest(by_reference_commit).await.unwrap();
     assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::PeelFailed
-            }
-        ),
-        "terminally invalid by-reference Update commits should not remain buffered, got {outcome:?}"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "same-epoch commits are classified against the frozen pass, got {outcome:?}"
     );
     let result = carol
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -816,13 +806,21 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
     );
     let before_epoch = carol.epoch(&group_id).expect("carol has current group");
 
+    let commit_id = canonicalization_message_id(&commit);
     let outcome = carol.ingest(commit).await.unwrap();
-    assert_eq!(
-        outcome,
-        IngestOutcome::Rejected {
-            category: ProposalRejectionCategory::AuthorizationFailed,
-        },
-        "commit-time revalidation must reject a non-admin by-reference Update"
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "same-epoch commits are classified against the frozen pass, got {outcome:?}"
+    );
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence should classify unauthorized by-reference update");
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == commit_id
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "commit-time revalidation must reject a non-admin by-reference Update, got {result:?}"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), before_epoch);
 }
@@ -1439,8 +1437,8 @@ async fn committer_must_not_be_leaver_holds_for_self_proposal() {
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::OwnEcho
+            IngestOutcome::Ignored {
+                category: cgka_traits::ingest::InputRejectionCategory::OwnEcho
             }
         ),
         "bob should classify his own proposal as OwnEcho"

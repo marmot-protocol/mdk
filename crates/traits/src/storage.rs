@@ -10,6 +10,7 @@
 //! methods in `tokio::task::spawn_blocking`.
 
 use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
+use crate::convergence_pass::DurableConvergencePass;
 use crate::engine::SendIntent;
 use crate::group::{Group, Member};
 use crate::maintenance::{
@@ -335,6 +336,20 @@ pub trait MaintenanceStorage {
     ) -> StorageResult<()>;
 }
 
+// ── ConvergencePassStorage ─────────────────────────────────────────────────
+
+/// Account-device-local frozen convergence-pass state.
+///
+/// This is a required part of the engine store because resolving a mutable
+/// re-enumeration after restart would violate the convergence cutoff.
+pub trait ConvergencePassStorage {
+    fn convergence_pass(&self, group_id: &GroupId)
+    -> StorageResult<Option<DurableConvergencePass>>;
+    fn put_convergence_pass(&self, pass: &DurableConvergencePass) -> StorageResult<()>;
+    fn list_convergence_passes(&self) -> StorageResult<Vec<DurableConvergencePass>>;
+    fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -351,6 +366,7 @@ pub trait StorageProvider:
     + WelcomeStorage
     + CapabilityStorage
     + ConvergencePolicyStorage
+    + ConvergencePassStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
     + KeyPackageBundleStorage

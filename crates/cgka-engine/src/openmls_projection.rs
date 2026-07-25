@@ -6,7 +6,7 @@
 //! snapshot-and-replay messages for candidate materialization or apply a
 //! selected canonical branch to retained storage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_event::AppMessageRetentionDecision;
@@ -222,6 +222,12 @@ enum CandidatePathProbeResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReplayProfilePolicy {
     pub(crate) reject_legacy_group_additions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StoredCanonicalizationOptions<'a> {
+    pub(crate) replay_profile: ReplayProfilePolicy,
+    pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -736,7 +742,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
         outbound_intents,
         policy,
         now_ms,
-        ReplayProfilePolicy::default(),
+        StoredCanonicalizationOptions::default(),
     )
 }
 
@@ -747,8 +753,9 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     outbound_intents: Vec<OutboundIntent>,
     policy: CanonicalizationPolicy,
     now_ms: u64,
-    profile_policy: ReplayProfilePolicy,
+    options: StoredCanonicalizationOptions<'_>,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    let profile_policy = options.replay_profile;
     let current_epoch = storage
         .get_group(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -764,6 +771,12 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     let mut own_commits = PrevalidatedOwnCommits::default();
 
     for record in records {
+        if options
+            .admitted_message_ids
+            .is_some_and(|admitted| !admitted.contains(&record.id))
+        {
+            continue;
+        }
         if !record_state_can_contribute_to_openmls_graph(record.state) {
             continue;
         }

@@ -1112,6 +1112,12 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 mirror_app_components_into_record(&mls_group, &mut group_record);
                 storage.put_group(&group_record)?;
+                if local_state_is_stale {
+                    // A verified replacement Welcome establishes a new local
+                    // MLS copy. Frozen-pass membership belongs to the discarded
+                    // copy and must not re-halt the repaired group.
+                    storage.delete_convergence_pass(&group_id)?;
+                }
                 crate::capability_manager::cache_self_capabilities(
                     storage,
                     &group_id,

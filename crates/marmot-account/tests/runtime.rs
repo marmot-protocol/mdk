@@ -111,6 +111,10 @@ impl WallClock for TestWallClock {
     fn now(&self) -> Timestamp {
         Timestamp(self.0.load(Ordering::Relaxed))
     }
+
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::Relaxed).saturating_mul(1_000)
+    }
 }
 
 #[derive(Debug, Default)]

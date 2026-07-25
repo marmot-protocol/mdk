@@ -56,9 +56,10 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel, TransportKind,
 };
+use cgka_traits::convergence_pass::{ConvergenceCutoffCause, ConvergencePassPhase};
 use cgka_traits::engine::{SendIntent, SendResult};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::storage::{GroupStorage, MessageStorage};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
+use cgka_traits::storage::{ConvergencePassStorage, GroupStorage, MessageStorage};
 use cgka_traits::{CgkaEngine, CommitOrderingPriority};
 use proptest::prelude::*;
 
@@ -490,6 +491,7 @@ fn canonical_policy() -> CanonicalizationPolicy {
         },
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
+        max_convergence_pass_ms: 5_000,
     }
 }
 
@@ -1340,6 +1342,19 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
             .ingest(commit)
             .await
             .expect("observer buffers stored convergence input");
+        let mut pre_convergence_pass = clients[2]
+            .storage()
+            .convergence_pass(&group_id)
+            .expect("load pre-convergence durable pass")
+            .expect("ingest opened a durable convergence pass");
+        pre_convergence_pass.phase = ConvergencePassPhase::Frozen;
+        pre_convergence_pass.cutoff_cause = Some(ConvergenceCutoffCause::Quiescence);
+        pre_convergence_pass.frozen_at_wall_ms =
+            Some(pre_convergence_pass.quiescence_deadline_wall_ms);
+        clients[2]
+            .storage()
+            .put_convergence_pass(&pre_convergence_pass)
+            .expect("persist frozen restart boundary");
 
         clients[2]
             .storage()
@@ -1356,6 +1371,13 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
             .storage()
             .rollback_group_to_snapshot(&group_id, "restart-equivalence")
             .expect("rollback to pre-convergence snapshot");
+        // Group epoch snapshots intentionally do not rewind the convergence
+        // pass state. Restore the separately captured pass so both runs begin
+        // from the same durable engine/storage boundary.
+        clients[2]
+            .storage()
+            .put_convergence_pass(&pre_convergence_pass)
+            .expect("restore pre-convergence durable pass");
         let restarted_seed = pad32(b"client-2");
         let restarted_keys = deterministic_nostr_keys(&restarted_seed);
         let restarted_identity = restarted_keys.public_key().to_bytes().to_vec();
@@ -1530,8 +1552,8 @@ fn true_same_id_replay(payload: Vec<u8>) {
             .filter(|o| {
                 matches!(
                     o,
-                    Ok(IngestOutcome::Stale {
-                        reason: StaleReason::AlreadySeen
+                    Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::Duplicate
                     })
                 )
             })

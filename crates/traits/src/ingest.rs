@@ -1,9 +1,8 @@
 //! Typed outcomes from [`crate::engine::CgkaEngine::ingest`] plus the
 //! peeled-message intermediate form.
 //!
-//! `IngestOutcome` separates applied messages from classifiable stale cases.
-//! Hard errors stay in `EngineError`; stale routing, dedupe, and epoch cases
-//! remain ordinary outcomes.
+//! `IngestOutcome` separates pre-convergence exclusions, convergence
+//! dispositions, and canonical local state. Hard errors stay in `EngineError`.
 
 use crate::transport::TransportMessage;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -19,12 +18,35 @@ pub enum IngestOutcome {
     /// publish-before-apply transition. The engine replays buffered messages
     /// when the group returns to `Stable`.
     Buffered { group_id: GroupId, epoch: EpochId },
+    /// Rejected before convergence admission because routing or deduplication
+    /// proved the input cannot affect this account-device's canonical state.
+    Ignored { category: InputRejectionCategory },
+    /// A canonical local condition blocked processing. This is deliberately
+    /// separate from convergence dispositions.
+    LocalState { state: LocalIngestState },
     /// Message was not applied. The variant names why — callers log by
     /// category rather than pattern-matching error strings.
     Stale { reason: StaleReason },
     /// A standalone or commit-carried MLS proposal failed Marmot semantic
     /// admission before it could enter pending state or affect group state.
     Rejected { category: ProposalRejectionCategory },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputRejectionCategory {
+    Duplicate,
+    OwnEcho,
+    WrongRecipient,
+    UnknownGroup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalIngestState {
+    /// Authenticated MLS state records this account-device's removal. The
+    /// engine has already performed the realizing-removal side effects.
+    Removed,
+    /// Hydration validation froze the local group copy pending repair.
+    Quarantined,
 }
 
 /// Stable rejection taxonomy for authenticated MLS proposals that fail

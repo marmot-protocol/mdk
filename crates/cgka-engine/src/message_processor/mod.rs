@@ -4,9 +4,9 @@
 //! buffered for convergence. Outbound intents are checked against local epoch
 //! state and unresolved convergence inputs before any OpenMLS mutation.
 //!
-//! Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`. `Err` is
-//! reserved for storage, peeler, serialization, and OpenMLS failures.
+//! Classifiable ingest exclusions and local-state blocks return typed ordinary
+//! outcomes. `Err` is reserved for storage, peeler, serialization, and
+//! OpenMLS failures.
 
 mod ingest;
 mod send;
@@ -20,7 +20,7 @@ use crate::openmls_projection::{OpenMlsContentKind, decode_openmls_wire_projecti
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -146,8 +146,8 @@ impl<S: StorageProvider> Engine<S> {
         // In-memory fallback for messages produced before the durable record
         // is visible to this path.
         if self.seen_message_ids.contains(&msg.id) {
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
             });
         }
         if self.sent_message_ids.contains(&msg.id) {
@@ -158,8 +158,8 @@ impl<S: StorageProvider> Engine<S> {
                 EpochId(0),
                 MessageState::Sent,
             )?;
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho,
             });
         }
 
@@ -299,10 +299,28 @@ impl<S: StorageProvider> Engine<S> {
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
+        let mut fairness_slot_available =
+            self.storage
+                .convergence_pass(group_id)?
+                .is_some_and(|pass| {
+                    pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                        && pass.fairness_slot_available
+                });
+        if fairness_slot_available && !self.has_unresolved_convergence_inputs(group_id)? {
+            // The slot orders local group-state work before an inbound-only
+            // follow-up pass. With no such inbound work, normal queue draining
+            // proceeds and the dormant slot must not leak into a later pass.
+            self.consume_convergence_fairness_slot(group_id)?;
+            fairness_slot_available = false;
+        }
         for record in queued {
-            if !self
-                .advance_convergence_inputs_until_settled(group_id, now_ms)
-                .await?
+            if fairness_slot_available && !is_admin_group_state_fairness_intent(&record.intent) {
+                continue;
+            }
+            if !fairness_slot_available
+                && !self
+                    .advance_convergence_inputs_until_settled(group_id, now_ms)
+                    .await?
             {
                 break;
             }
@@ -316,7 +334,18 @@ impl<S: StorageProvider> Engine<S> {
             if self.load_leave_request_state(group_id)?.is_some() {
                 break;
             }
-            let result = self.do_send_ready(record.intent.clone()).await?;
+            let result = match self.do_send_ready(record.intent.clone()).await {
+                Ok(result) => result,
+                Err(_) if fairness_slot_available => {
+                    // The protocol grants one preparation attempt, not an
+                    // indefinite reservation. Keep the durable intent queued,
+                    // consume the slot, and let retained inbound work proceed.
+                    self.consume_convergence_fairness_slot(group_id)?;
+                    fairness_slot_available = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             match &result {
                 SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
@@ -332,11 +361,32 @@ impl<S: StorageProvider> Engine<S> {
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
+            if fairness_slot_available {
+                self.consume_convergence_fairness_slot(group_id)?;
+                fairness_slot_available = false;
+                if self.has_unresolved_convergence_inputs(group_id)? {
+                    break;
+                }
+            }
             if pauses_for_pending_publish {
                 break;
             }
         }
+        if fairness_slot_available {
+            // No already-queued admin group-state intent was eligible for the
+            // fairness attempt. Do not let unrelated app/leave/maintenance
+            // work hold the next inbound generation indefinitely.
+            self.consume_convergence_fairness_slot(group_id)?;
+        }
         Ok(drained)
+    }
+
+    fn consume_convergence_fairness_slot(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if let Some(mut pass) = self.storage.convergence_pass(group_id)? {
+            pass.fairness_slot_available = false;
+            self.storage.put_convergence_pass(&pass)?;
+        }
+        Ok(())
     }
 
     async fn should_queue_outbound_intent(
@@ -454,9 +504,12 @@ impl<S: StorageProvider> Engine<S> {
                 {
                     return Ok(false);
                 }
-                if self.has_unresolved_convergence_inputs(group_id)? {
-                    return Ok(false);
-                }
+                // A completed frozen batch grants one queued user intent before
+                // an inbound-only follow-up pass. Retry one deferred-peel sweep
+                // first so newly available canonical context is visible, then
+                // return to the drain rather than opening generation N+1 here.
+                let _ = self.retry_deferred_peels(group_id).await?;
+                return Ok(true);
             }
 
             if self.retry_deferred_peels(group_id).await? == 0 {
@@ -467,7 +520,17 @@ impl<S: StorageProvider> Engine<S> {
         Ok(false)
     }
 
-    fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+    pub(crate) fn has_unresolved_convergence_inputs(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if self
+            .storage
+            .convergence_pass(group_id)?
+            .is_some_and(|pass| pass.is_active())
+        {
+            return Ok(true);
+        }
         // The convergence horizon is bounded on BOTH sides (mdk#736). The past
         // side (`anchor`) drops inputs older than the retained-anchor window.
         // The future side (`ceiling`) is symmetric: a convergence input more
@@ -688,8 +751,8 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(IngestOutcome::Stale {
                     reason: StaleReason::PeelFailed,
                 }) => {}
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::Quarantined,
+                Ok(IngestOutcome::LocalState {
+                    state: LocalIngestState::Quarantined,
                 }) => {
                     // Defense-in-depth: the gate above should keep this loop
                     // from running for a quarantined group at all, but if a
@@ -717,7 +780,12 @@ impl<S: StorageProvider> Engine<S> {
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
-                Ok(IngestOutcome::Stale { .. } | IngestOutcome::Rejected { .. }) => {
+                Ok(
+                    IngestOutcome::Stale { .. }
+                    | IngestOutcome::Ignored { .. }
+                    | IngestOutcome::LocalState { .. }
+                    | IngestOutcome::Rejected { .. },
+                ) => {
                     // Terminal stale classifications are still successful
                     // reclassifications of this raw deferred row. Retire it only
                     // while it is still awaiting retry: the reachable case is
@@ -1012,10 +1080,17 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     }
                 }
-                Ok(IngestOutcome::Stale {
-                    reason:
-                        StaleReason::PeelFailed | StaleReason::Quarantined | StaleReason::UnknownGroup,
-                }) => {
+                Ok(
+                    IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
+                    }
+                    | IngestOutcome::LocalState {
+                        state: LocalIngestState::Quarantined,
+                    }
+                    | IngestOutcome::Ignored {
+                        category: InputRejectionCategory::UnknownGroup,
+                    },
+                ) => {
                     // Leave the row in its retry state so a later pass re-attempts
                     // it. `PeelFailed`: still un-peelable, or already retired to
                     // `Failed` by a terminal-after-peel path inside
@@ -1132,6 +1207,16 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }
+}
+
+fn is_admin_group_state_fairness_intent(intent: &SendIntent) -> bool {
+    matches!(
+        intent,
+        SendIntent::Invite { .. }
+            | SendIntent::RemoveMembers { .. }
+            | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::UpdateGroupData { .. }
+    )
 }
 
 #[cfg(test)]

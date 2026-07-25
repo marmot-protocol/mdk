@@ -29,10 +29,10 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    StoredKeyPackageBundle, WelcomeStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage,
+    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
+    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -361,6 +361,30 @@ impl KeyPackageBundleStorage for FaultStorage {
 
     fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
         self.inner.delete_stored_key_package_bundle(storage_key)
+    }
+}
+
+impl ConvergencePassStorage for FaultStorage {
+    fn convergence_pass(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DurableConvergencePass>> {
+        self.inner.convergence_pass(group_id)
+    }
+
+    fn put_convergence_pass(
+        &self,
+        pass: &cgka_traits::DurableConvergencePass,
+    ) -> StorageResult<()> {
+        self.inner.put_convergence_pass(pass)
+    }
+
+    fn list_convergence_passes(&self) -> StorageResult<Vec<cgka_traits::DurableConvergencePass>> {
+        self.inner.list_convergence_passes()
+    }
+
+    fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_convergence_pass(group_id)
     }
 }
 

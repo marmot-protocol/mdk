@@ -5,7 +5,7 @@ use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
 use cgka_traits::{
     EpochId, MessageId, TransportAdapterError, TransportEndpoint, TransportPublishReport,
 };
@@ -227,8 +227,8 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
         .expect("duplicate delivery should still route to bob");
     assert!(matches!(
         duplicate.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(duplicate.effects.events.is_empty());
@@ -281,8 +281,8 @@ async fn reordered_and_duplicated_group_app_deliveries_preserve_valid_outputs() 
     assert_eq!(message_payloads(&middle), vec![b"one".to_vec()]);
     assert!(matches!(
         duplicate.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(duplicate.effects.events.is_empty());

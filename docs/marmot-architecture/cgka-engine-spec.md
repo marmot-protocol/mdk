@@ -107,9 +107,14 @@ TransportMessage
   -> emit IngestOutcome and later GroupEvent values
 ```
 
-The engine MUST return stale and non-applicable messages as typed `IngestOutcome::Stale` values. Duplicate messages,
-messages for unknown groups, messages addressed to another client, own echoes, and already-applied messages MUST NOT
-require string parsing by the caller.
+The engine MUST keep pre-convergence rejection, convergence disposition, and local canonical state distinct:
+
+- duplicate, own-echo, wrong-recipient, and unknown-group inputs return typed `IngestOutcome::Ignored` categories;
+- stale or invalid convergence candidates use convergence dispositions; and
+- authenticated local removal and quarantine return `IngestOutcome::LocalState`.
+
+Realizing removal remains an engine side effect even though removal is not a stale convergence disposition. None of
+these classifications may require string parsing by the caller.
 
 During `PendingPublish` or `Merging`, inbound group messages MAY be buffered. The engine MUST replay buffered messages
 when the group returns to `Stable`.

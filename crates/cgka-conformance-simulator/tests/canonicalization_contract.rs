@@ -35,6 +35,7 @@ fn policy() -> CanonicalizationPolicy {
         },
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
+        max_convergence_pass_ms: 5_000,
     }
 }
 

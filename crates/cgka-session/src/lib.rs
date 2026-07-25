@@ -801,6 +801,16 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
+    pub fn convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<u64>> {
+        Ok(CgkaEngine::convergence_cutoff_delay_ms(
+            &mut self.engine,
+            group_id,
+        )?)
+    }
+
     pub fn confirm_regenerated_queued_intent(
         &mut self,
         intent: &QueuedIntentRef,
@@ -1108,6 +1118,8 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
+        IngestOutcome::Ignored { .. } => "ignored",
+        IngestOutcome::LocalState { .. } => "local_state",
         IngestOutcome::Stale { .. } => "stale",
         IngestOutcome::Rejected { .. } => "rejected",
     }

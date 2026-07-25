@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-06-24
+updated: 2026-07-25
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -328,25 +328,29 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex `MessageId` of the inbound message. |
-| `outcome_kind` | `processed`, `buffered`, or `stale`. |
-| `stale_reason` | Present only when `outcome_kind == "stale"`. |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `stale`, or `rejected`. |
+| `stale_reason` | Legacy optional category field used by non-processed outcomes. |
 | `epoch` | Present for buffered outcomes and `already_at_epoch` stale outcomes. |
 
 `stale_reason` values:
 
 | Value | Meaning |
 | --- | --- |
-| `already_seen` | Message id was already ingested. |
+| `duplicate` | Message id or content was already ingested. |
 | `already_at_epoch` | Engine is already at or beyond the message epoch; `epoch` records the current epoch. |
-| `not_for_this_client` | Welcome/inbox message was not addressed to this client. |
+| `wrong_recipient` | Welcome/inbox message was not addressed to this client. |
 | `unknown_group` | Message referenced a group the engine does not know. |
 | `own_echo` | Message was produced by this engine and bounced back through ingest. |
 | `peel_failed` | MLS/transport peeling failed or could not be recovered. |
+| `removed` | Authenticated canonical state records this local member's removal. |
+| `quarantined` | Hydration validation froze the local group pending repair. |
 
 Metadata notes:
 
 - This event is not emitted if `do_ingest()` returns an `Err`.
 - It has `group_ref` when the outcome is `buffered`, because that outcome carries the group id.
+- The JSON field remains named `stale_reason` for v1/v2 schema compatibility. Its type and required-field set did not
+  change, so this additive outcome taxonomy does not require a forensic schema-version bump.
 
 ### `ingest_error`
 
@@ -809,8 +813,8 @@ metadata keys for indexing.
 | Category | Values |
 | --- | --- |
 | `envelope_kind` | `welcome`, `group_message` |
-| `outcome_kind` | `processed`, `buffered`, `stale` |
-| `stale_reason` | `already_seen`, `already_at_epoch`, `not_for_this_client`, `unknown_group`, `own_echo`, `peel_failed` |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `stale`, `rejected` |
+| `stale_reason` | `duplicate`, `already_at_epoch`, `wrong_recipient`, `unknown_group`, `own_echo`, `peel_failed`, `removed`, `quarantined` |
 | `engine error_kind` | `unknown_group`, `unknown_pending`, `not_a_member`, `not_group_admin`, `unknown_member`, `invalid_credential_identity`, `admin_cannot_self_remove`, `admin_depletion`, `missing_required_capabilities`, `unsupported_ciphersuite`, `invalid_app_message_payload`, `invalid_account_identity_proof`, `forked_epoch`, `invalid_transition`, `storage`, `peeler`, `serialize`, `backend`, `other` |
 | `peeler error_kind` | `malformed`, `decrypt_failed`, `stale_epoch`, `missing_context`, `wrap_failed`, `backend` |
 | `intent_kind` | `app_message`, `invite`, `remove_members`, `leave`, `update_app_components`, `update_group_data` |

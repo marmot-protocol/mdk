@@ -73,6 +73,7 @@ fn one_rewind_policy() -> CanonicalizationPolicy {
         },
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
+        max_convergence_pass_ms: 5_000,
     }
 }
 
@@ -464,6 +465,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
                 },
                 app_message_past_epoch_limit: 5,
                 settlement_quiescence_ms: 1_000,
+                max_convergence_pass_ms: 5_000,
             },
             now_ms: 2_000,
         },
@@ -570,6 +572,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
                 },
                 app_message_past_epoch_limit: 5,
                 settlement_quiescence_ms: 1_000,
+                max_convergence_pass_ms: 5_000,
             },
             now_ms: 2_000,
         },
@@ -686,6 +689,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
                 },
                 app_message_past_epoch_limit: 5,
                 settlement_quiescence_ms: 1_000,
+                max_convergence_pass_ms: 5_000,
             },
             now_ms: 2_000,
         },
@@ -795,6 +799,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
             },
             app_message_past_epoch_limit: 5,
             settlement_quiescence_ms: 1_000,
+            max_convergence_pass_ms: 5_000,
         },
         2_000,
     )
@@ -901,6 +906,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
             },
             app_message_past_epoch_limit: 5,
             settlement_quiescence_ms: 1_000,
+            max_convergence_pass_ms: 5_000,
         },
         2_000,
     )
@@ -1010,6 +1016,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
             },
             app_message_past_epoch_limit: 5,
             settlement_quiescence_ms: 1_000,
+            max_convergence_pass_ms: 5_000,
         },
         2_000,
     )

@@ -1,10 +1,10 @@
 //! Inbound ingest path for [`Engine`]: peel, classify, apply or buffer.
 //!
 //! Inbound messages are peeled, classified, stored, and either applied or
-//! buffered for convergence. Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })`; authenticated protocol-admission
-//! failures return `Ok(IngestOutcome::Rejected { .. })`. `Err` is reserved for
-//! storage, peeler, serialization, and unclassified OpenMLS failures.
+//! buffered for convergence. Routing/dedup exclusions, local canonical state,
+//! stale convergence input, and authenticated proposal rejection are distinct
+//! typed outcomes. `Err` is reserved for storage, peeler, serialization, and
+//! unclassified OpenMLS failures.
 
 use super::{content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
@@ -24,7 +24,10 @@ use cgka_traits::engine::{
     GroupStateInvalidationReason,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, ProposalRejectionCategory, StaleReason};
+use cgka_traits::ingest::{
+    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
+    ProposalRejectionCategory, StaleReason,
+};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -90,8 +93,8 @@ impl<S: StorageProvider> Engine<S> {
         // member assumption. `NotForThisClient` also makes routing failures
         // easier to distinguish from decryption failures.
         if &recipient != self.identity.self_id() {
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::NotForThisClient,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::WrongRecipient,
             });
         }
 
@@ -107,14 +110,14 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(EngineError::WelcomeAlreadyProcessed) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
+                Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
                 })
             }
             Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::NotForThisClient,
+                Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::WrongRecipient,
                 })
             }
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
@@ -179,8 +182,8 @@ impl<S: StorageProvider> Engine<S> {
                     },
                 );
             }
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::Quarantined,
+            return Ok(IngestOutcome::LocalState {
+                state: LocalIngestState::Quarantined,
             });
         }
 
@@ -215,8 +218,8 @@ impl<S: StorageProvider> Engine<S> {
                         EpochId(0),
                         MessageState::Retryable,
                     )?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::UnknownGroup,
+                    return Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::UnknownGroup,
                     });
                 }
                 Err(e) => {
@@ -244,8 +247,8 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Failed,
                 )?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::SelfEvicted,
+                return Ok(IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed,
                 });
             }
             if !self.epoch_manager.can_ingest(&group_id) {
@@ -580,13 +583,13 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(outcome);
             }
             if self.seen_message_ids.contains(&content_id) {
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
+                return Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
                 });
             }
             if self.sent_message_ids.contains(&content_id) {
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::OwnEcho,
+                return Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::OwnEcho,
                 });
             }
             let content_msg = TransportMessage {
@@ -887,8 +890,8 @@ impl<S: StorageProvider> Engine<S> {
                     // OpenMLS signal itself.
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     self.realize_self_eviction(&group_id, current_epoch)?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::SelfEvicted,
+                    return Ok(IngestOutcome::LocalState {
+                        state: LocalIngestState::Removed,
                     });
                 }
                 Err(e) => {
@@ -1475,8 +1478,8 @@ impl<S: StorageProvider> Engine<S> {
                         "own_echo",
                     )?;
                     self.seen_message_ids.insert(msg.id.clone());
-                    Ok(IngestOutcome::Stale {
-                        reason: StaleReason::OwnEcho,
+                    Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::OwnEcho,
                     })
                 }
                 ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
@@ -1972,8 +1975,11 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<IngestOutcome, EngineError> {
         self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
         self.seen_message_ids.insert(msg_id.clone());
-        Ok(IngestOutcome::Stale {
-            reason: stale_reason,
+        Ok(match stale_reason {
+            StaleReason::NotForThisClient => IngestOutcome::Ignored {
+                category: InputRejectionCategory::WrongRecipient,
+            },
+            other => IngestOutcome::Stale { reason: other },
         })
     }
 
@@ -2389,8 +2395,8 @@ fn convergence_ingest_outcome(
         .iter()
         .any(|seen| seen.message_id == message_id || seen.message_id == content_message_id)
     {
-        return IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen,
+        return IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate,
         };
     }
 

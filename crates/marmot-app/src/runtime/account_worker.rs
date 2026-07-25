@@ -1,7 +1,7 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -518,7 +518,7 @@ async fn run_app_runtime_account_worker(
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-            scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             run_pending_epoch_backfill_reporting_arm(
                 &mut client,
                 &events,
@@ -581,7 +581,7 @@ async fn run_app_runtime_account_worker(
     // the loop, otherwise buffered groups stay stranded until the next unrelated
     // command/event (a liveness gap). `schedule_groups` is an idempotent set
     // insert, so this is safe even when the loop buffered nothing.
-    scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
     let mut maintenance_tick = interval(Duration::from_secs(15));
@@ -604,7 +604,10 @@ async fn run_app_runtime_account_worker(
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                                    scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                                    schedule_pending_convergence_groups(
+                                        &mut scheduled_convergence,
+                                        &mut client,
+                                    );
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
                                         shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                     }
@@ -652,7 +655,10 @@ async fn run_app_runtime_account_worker(
                             &shared,
                         )
                         .await;
-                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                         if may_change_push_registration_work {
                             scheduled_push_retry.observe_pending(
                                 client.has_pending_push_registration_work(),
@@ -676,7 +682,10 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                         run_pending_epoch_backfill_reporting_arm(
                             &mut client,
                             &events,
@@ -758,8 +767,10 @@ async fn run_app_runtime_account_worker(
                                 &account_id_hex,
                                 &account_label,
                             );
-                            scheduled_convergence
-                                .schedule_groups(client.take_pending_convergence_groups());
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
+                            );
                         }
                         Ok(Err(err)) => {
                             publish_app_runtime_account_error(
@@ -798,8 +809,10 @@ async fn run_app_runtime_account_worker(
                             &account_id_hex,
                             &account_label,
                         );
-                        scheduled_convergence
-                            .schedule_groups(client.take_pending_convergence_groups());
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                     }
                     Err(err) => {
                         publish_app_runtime_account_error(
@@ -1691,7 +1704,7 @@ const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 struct ScheduledConvergence {
     delay: Duration,
-    groups: HashSet<GroupId>,
+    deadlines: HashMap<GroupId, TokioInstant>,
     retry_attempts: HashMap<GroupId, u32>,
     unsettled_rearm_attempts: HashMap<GroupId, u32>,
     timer: Pin<Box<Sleep>>,
@@ -1701,7 +1714,7 @@ impl ScheduledConvergence {
     fn new(delay: Duration) -> Self {
         Self {
             delay,
-            groups: HashSet::new(),
+            deadlines: HashMap::new(),
             retry_attempts: HashMap::new(),
             unsettled_rearm_attempts: HashMap::new(),
             timer: Box::pin(sleep(IDLE_CONVERGENCE_TIMER_DELAY)),
@@ -1716,32 +1729,35 @@ impl ScheduledConvergence {
         }
     }
 
+    #[cfg(test)]
     fn schedule_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
-        let mut saw_group = false;
-        for group_id in groups {
-            saw_group = true;
+        let delay = self.normal_delay();
+        self.schedule_groups_with_delays(groups.into_iter().map(|group_id| (group_id, delay)));
+    }
+
+    fn schedule_groups_with_delays(
+        &mut self,
+        groups: impl IntoIterator<Item = (GroupId, Duration)>,
+    ) {
+        let now = TokioInstant::now();
+        for (group_id, delay) in groups {
             self.retry_attempts.remove(&group_id);
             self.unsettled_rearm_attempts.remove(&group_id);
-            self.groups.insert(group_id);
+            self.deadlines
+                .insert(group_id, now + delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY));
         }
-        if saw_group {
-            let delay = self.normal_delay();
-            self.timer.as_mut().reset(TokioInstant::now() + delay);
-        }
+        self.reset_timer_to_earliest();
     }
 
     fn schedule_retry_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
-        let mut delay: Option<Duration> = None;
+        let now = TokioInstant::now();
         for group_id in groups {
             let attempts = self.retry_attempts.entry(group_id.clone()).or_insert(0);
             *attempts = attempts.saturating_add(1);
             let group_delay = retry_delay_for_attempt(*attempts);
-            delay = Some(delay.unwrap_or(group_delay).max(group_delay));
-            self.groups.insert(group_id);
+            self.deadlines.insert(group_id, now + group_delay);
         }
-        if let Some(delay) = delay {
-            self.timer.as_mut().reset(TokioInstant::now() + delay);
-        }
+        self.reset_timer_to_earliest();
     }
 
     /// Re-arm the timer for groups whose scheduled pass did not settle stored
@@ -1749,47 +1765,87 @@ impl ScheduledConvergence {
     /// window). Unlike [`Self::schedule_retry_groups`], this is not an error
     /// backoff — it waits one full settlement delay before retrying.
     fn schedule_unsettled_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
-        let mut normal_delay = false;
-        let mut retry_delay: Option<Duration> = None;
+        let now = TokioInstant::now();
+        let normal_delay = self.normal_delay();
         for group_id in groups {
             let attempts = self
                 .unsettled_rearm_attempts
                 .entry(group_id.clone())
                 .or_insert(0);
             *attempts = attempts.saturating_add(1);
-            self.groups.insert(group_id.clone());
             if *attempts > CONVERGENCE_UNSETTLED_MAX_REARMS {
-                let retry_attempts = self.retry_attempts.entry(group_id).or_insert(0);
+                let retry_attempts = self.retry_attempts.entry(group_id.clone()).or_insert(0);
                 *retry_attempts = retry_attempts.saturating_add(1);
                 let group_delay = retry_delay_for_attempt(*retry_attempts);
-                retry_delay = Some(retry_delay.unwrap_or(group_delay).max(group_delay));
+                self.deadlines.insert(group_id.clone(), now + group_delay);
             } else {
-                normal_delay = true;
+                self.deadlines.insert(group_id.clone(), now + normal_delay);
             }
         }
-        if let Some(delay) = retry_delay {
-            self.timer.as_mut().reset(TokioInstant::now() + delay);
-        } else if normal_delay {
-            let delay = self.normal_delay();
-            self.timer.as_mut().reset(TokioInstant::now() + delay);
-        }
+        self.reset_timer_to_earliest();
     }
 
     fn take_ready(&mut self) -> Vec<GroupId> {
-        self.timer
-            .as_mut()
-            .reset(TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
-        self.groups.drain().collect()
+        let Some(earliest) = self.deadlines.values().copied().min() else {
+            self.reset_timer_to_earliest();
+            return Vec::new();
+        };
+        let ready: Vec<GroupId> = self
+            .deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= earliest)
+            .map(|(group_id, _)| group_id.clone())
+            .collect();
+        for group_id in &ready {
+            self.deadlines.remove(group_id);
+        }
+        self.reset_timer_to_earliest();
+        ready
     }
 
     fn note_success(&mut self, group_id: &GroupId) {
         self.retry_attempts.remove(group_id);
         self.unsettled_rearm_attempts.remove(group_id);
+        self.deadlines.remove(group_id);
+        self.reset_timer_to_earliest();
     }
 
     fn normal_delay(&self) -> Duration {
         self.delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY)
     }
+
+    fn reset_timer_to_earliest(&mut self) {
+        let deadline = self
+            .deadlines
+            .values()
+            .copied()
+            .min()
+            .unwrap_or_else(|| TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
+        self.timer.as_mut().reset(deadline);
+    }
+}
+
+fn schedule_pending_convergence_groups(
+    scheduled: &mut ScheduledConvergence,
+    client: &mut AppClient,
+) {
+    let fallback = scheduled.normal_delay();
+    let groups = client
+        .take_pending_convergence_groups()
+        .into_iter()
+        .map(|group_id| {
+            let delay = client
+                .convergence_cutoff_delay_ms(&group_id)
+                .map(|delay_ms| {
+                    Duration::from_millis(
+                        delay_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+                    )
+                })
+                .unwrap_or(fallback);
+            (group_id, delay)
+        })
+        .collect::<Vec<_>>();
+    scheduled.schedule_groups_with_delays(groups);
 }
 
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
@@ -2132,7 +2188,25 @@ mod tests {
 
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
-        assert!(scheduled.groups.is_empty());
+        assert!(scheduled.deadlines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduling_one_group_never_postpones_an_earlier_group_cutoff() {
+        let first = test_group_id(21);
+        let noisy = test_group_id(22);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+
+        scheduled.schedule_groups_with_delays([
+            (first.clone(), Duration::from_millis(50)),
+            (noisy.clone(), Duration::from_millis(100)),
+        ]);
+        let first_deadline = scheduled.deadlines[&first];
+        scheduled.schedule_groups_with_delays([(noisy.clone(), Duration::from_millis(500))]);
+
+        assert_eq!(scheduled.deadlines[&first], first_deadline);
+        assert_eq!(scheduled.take_ready(), vec![first]);
+        assert!(scheduled.deadlines.contains_key(&noisy));
     }
 
     #[tokio::test]

@@ -18,6 +18,13 @@ pub const POST_JOIN_CONTENTION_JITTER_MAX_MS: u64 = 30_000;
 /// Injectable wall clock for persisted maintenance deadlines.
 pub trait WallClock: Send + Sync {
     fn now(&self) -> Timestamp;
+
+    /// Milliseconds since the Unix epoch.
+    ///
+    /// Persisted sub-second deadlines must use this value directly. Implementors
+    /// must not derive it from [`Self::now`], whose protocol timestamp has
+    /// second precision.
+    fn now_ms(&self) -> u64;
 }
 
 /// Injectable monotonic clock for process-local quiet windows and timeouts.

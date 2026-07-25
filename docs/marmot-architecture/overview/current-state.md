@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-23
+updated: 2026-07-25
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -46,6 +46,11 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 
 The current spec pressure point is commit ordering. MLS wants one ordered commit log; Nostr and other transports may
 deliver unordered, duplicated, delayed input. The engine contract is where that mismatch gets resolved.
+
+MDK now persists a per-group frozen convergence pass around that selector. The pass closes at the earlier of the pinned
+one-second selection-relevant quiescence window and five-second absolute cap, resumes safely across restart, resolves
+only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
+another group.
 
 ## Protocol implementations
 
