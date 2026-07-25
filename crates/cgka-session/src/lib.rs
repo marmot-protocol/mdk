@@ -151,7 +151,7 @@ impl SessionConfig {
     /// Set the session convergence policy.
     ///
     /// Production hosts MUST leave the default (pinned v1). Non-baseline values
-    /// are accepted only in debug/test builds; release `open` rejects them.
+    /// are accepted only by explicit `test-policy-overrides` harness builds.
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
         self

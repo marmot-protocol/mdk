@@ -271,9 +271,10 @@ fn wn(home: &std::path::Path) -> Command {
     // CLI tests connect to an in-process `MockRelay` at loopback, which is the
     // dev/test scenario the loopback-relay gate is for.
     command.env("WN_ALLOW_LOOPBACK_RELAYS", "1");
-    // Instant convergence settlement so multi-client tests do not wait on the
-    // pinned 1000 ms quiescence window (dev/test only).
-    command.env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
+    // Feature-gated instant settlement for the explicit test build only.
+    if cfg!(feature = "test-policy-overrides") {
+        command.env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
+    }
     command
 }
 

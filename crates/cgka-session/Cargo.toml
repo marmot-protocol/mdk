@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+test-policy-overrides = ["cgka-engine/test-policy-overrides"]
+
 [dependencies]
 cgka-engine.workspace = true
 cgka-traits.workspace = true

@@ -389,10 +389,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 required: u16::from(DEFAULT_CIPHERSUITE),
             });
         }
-        // Release builds keep the MLS past-epoch window pinned to the v1
-        // app-message horizon. Debug harnesses may shrink it for decrypt-window
-        // probes (mdk#970).
-        #[cfg(not(debug_assertions))]
+        // Normal builds keep the MLS past-epoch window pinned to the v1
+        // app-message horizon. Only explicit test harness builds may shrink it
+        // for decrypt-window probes (mdk#970).
+        #[cfg(not(feature = "test-policy-overrides"))]
         if self.max_past_epochs != crate::wire_format::DEFAULT_MAX_PAST_EPOCHS {
             return Err(EngineError::Other(
                 "max_past_epochs must equal the pinned v1 app-message window".into(),

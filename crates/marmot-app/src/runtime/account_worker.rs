@@ -1659,9 +1659,9 @@ impl ScheduledConvergence {
 }
 
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
-    // Release builds always schedule against the pinned v1 quiescence window
-    // (mdk#970); the dev override is debug/test-only.
-    let quiescence_ms = if cfg!(debug_assertions) {
+    // Normal builds always schedule against the pinned v1 quiescence window
+    // (mdk#970); the override exists only in explicit test-policy builds.
+    let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
         app.config
             .dev_settlement_quiescence_ms
             .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS)

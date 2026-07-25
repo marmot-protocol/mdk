@@ -81,9 +81,9 @@ type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>)
 impl<S: StorageProvider> Engine<S> {
     /// Install the process-wide convergence policy.
     ///
-    /// Release builds accept only the pinned v1 baseline. Debug/test builds may
-    /// override for harnesses (instant settlement, rewind probes), but still
-    /// require the witness-override bound and
+    /// Normal builds accept only the pinned v1 baseline. Test harnesses built
+    /// with `test-policy-overrides` may override it for instant settlement and
+    /// rewind probes, but still require the witness-override bound and
     /// `app_message_past_epoch_limit == max_past_epochs`.
     pub fn set_convergence_policy(
         &mut self,
@@ -98,7 +98,7 @@ impl<S: StorageProvider> Engine<S> {
     /// Persist a per-group convergence policy.
     ///
     /// Same acceptance rules as [`Self::set_convergence_policy`]. Under v1 the
-    /// policy is not group-negotiated; release builds reject any non-baseline
+    /// policy is not group-negotiated; normal builds reject any non-baseline
     /// value so a stored override cannot fork honest clients.
     pub fn set_group_convergence_policy(
         &mut self,

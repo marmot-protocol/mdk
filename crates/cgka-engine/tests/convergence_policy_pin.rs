@@ -1,20 +1,22 @@
-//! Release-mode convergence policy pin proofs (mdk#970).
+//! Default-build convergence policy pin proofs (mdk#970).
 //!
-//! Normal `cargo test` keeps `debug_assertions`, so the
-//! `#[cfg(not(debug_assertions))]` reject path inside
-//! `CanonicalizationPolicy::ensure_acceptable` / engine setters is never
-//! executed by the regular suite. Run this file with assertions disabled:
+//! This target deliberately runs without the `test-policy-overrides` feature,
+//! proving that ordinary debug and release consumers both reject non-v1 policy:
 //!
 //! ```sh
 //! just test-convergence-policy-pin
 //! ```
 //!
-//! CI and `just fast-ci` / `just ci` invoke that recipe so the production gate
-//! cannot rot unnoticed.
+//! CI and `just fast-ci` / `just ci` invoke that recipe separately from the
+//! feature-enabled integration-test matrix.
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
+#[cfg(not(feature = "test-policy-overrides"))]
+use cgka_engine::openmls_projection::OpenMlsProjectionError;
 use cgka_engine::{DEFAULT_MAX_PAST_EPOCHS, EngineBuilder};
+#[cfg(not(feature = "test-policy-overrides"))]
+use cgka_traits::error::EngineError;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::PeeledMessage;
@@ -22,11 +24,6 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::MemberId;
 use storage_sqlite::SqliteAccountStorage;
-
-#[cfg(not(debug_assertions))]
-use cgka_engine::openmls_projection::OpenMlsProjectionError;
-#[cfg(not(debug_assertions))]
-use cgka_traits::error::EngineError;
 
 mod support;
 use support::proof_signer;
@@ -106,28 +103,25 @@ fn set_convergence_policy_accepts_pinned_v1_baseline() {
         .expect("pinned v1 baseline must be accepted");
 }
 
-// Compiled only when assertions are off so ordinary `cargo test` / nextest do
-// not see an empty reject path. `just test-convergence-policy-pin` rebuilds
-// this binary with `RUSTFLAGS=-C debug-assertions=off`.
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "test-policy-overrides"))]
 #[test]
-fn release_mode_set_convergence_policy_rejects_non_pinned() {
+fn default_build_set_convergence_policy_rejects_non_pinned() {
     let mut engine = build_engine();
     let err = engine
         .set_convergence_policy(CanonicalizationPolicy {
             settlement_quiescence_ms: 0,
             ..CanonicalizationPolicy::default()
         })
-        .expect_err("release builds must reject non-v1 policies");
+        .expect_err("normal builds must reject non-v1 policies");
     assert!(
         matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
         "expected InvalidPolicy, got {err:?}"
     );
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "test-policy-overrides"))]
 #[test]
-fn release_mode_builder_rejects_non_default_max_past_epochs() {
+fn default_build_builder_rejects_non_default_max_past_epochs() {
     let result = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(valid_identity(b"pin-policy-epochs"))
         .account_identity_proof_signer(proof_signer(b"pin-policy-epochs"))
@@ -136,7 +130,7 @@ fn release_mode_builder_rejects_non_default_max_past_epochs() {
         .build();
     match result {
         Err(EngineError::Other(_)) => {}
-        Ok(_) => panic!("release builds must pin max_past_epochs to v1"),
+        Ok(_) => panic!("normal builds must pin max_past_epochs to v1"),
         Err(err) => panic!("expected EngineError::Other, got {err:?}"),
     }
 }

@@ -989,11 +989,11 @@ impl MarmotApp {
         mut config: MarmotAppConfig,
     ) -> Self {
         // These relay-only constructors are dev/test entry points (production
-        // opens through `with_relays_and_account_home*`). In debug builds, default
-        // them to instant settlement so multi-client tests are deterministic and
-        // do not wait on the pinned 1000 ms quiescence window. Release builds
-        // keep the protocol-pinned window (mdk#970).
-        if cfg!(debug_assertions) && config.dev_settlement_quiescence_ms.is_none() {
+        // opens through `with_relays_and_account_home*`). Explicit test-policy
+        // builds default them to instant settlement so multi-client tests are
+        // deterministic. Normal debug and release builds keep the pinned window.
+        if cfg!(feature = "test-policy-overrides") && config.dev_settlement_quiescence_ms.is_none()
+        {
             config.dev_settlement_quiescence_ms = Some(0);
         }
         let root = root.as_ref().to_path_buf();
@@ -2368,10 +2368,10 @@ impl MarmotApp {
         .feature_registry(app_feature_registry())
         .supported_app_components(self.supported_app_component_ids());
         // Production uses the protocol-pinned convergence policy (SessionConfig's
-        // default). Only a debug/test override may change it — release builds
-        // ignore the knob so a host misconfig cannot fork honest clients (mdk#970).
+        // default). Only an explicit test-policy build may change it; normal
+        // debug and release builds ignore the knob (mdk#970).
         if let Some(ms) = self.config.dev_settlement_quiescence_ms {
-            if cfg!(debug_assertions) {
+            if cfg!(feature = "test-policy-overrides") {
                 session_config = session_config.convergence_policy(CanonicalizationPolicy {
                     settlement_quiescence_ms: ms,
                     ..CanonicalizationPolicy::default()
@@ -2380,7 +2380,7 @@ impl MarmotApp {
                 tracing::warn!(
                     target: "marmot_app",
                     method = "open_account",
-                    "ignoring dev_settlement_quiescence_ms in release build; pinned v1 policy required"
+                    "ignoring dev_settlement_quiescence_ms without test-policy-overrides; pinned v1 policy required"
                 );
             }
         }

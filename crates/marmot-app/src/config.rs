@@ -73,9 +73,9 @@ pub struct MarmotAppConfig {
     pub allow_loopback_relay_endpoints: bool,
     /// Dev/test override for the convergence settlement quiescence window, in
     /// milliseconds. `None` (the default) uses the protocol-pinned value
-    /// (`settlement_quiescence_ms = 1000`). Honored only under `debug_assertions`;
-    /// release builds ignore it so hosts cannot fork the pinned v1 baseline
-    /// (mdk#970). Test harnesses set `Some(0)` for deterministic settlement.
+    /// (`settlement_quiescence_ms = 1000`). Honored only when the explicit
+    /// `test-policy-overrides` feature is enabled; normal debug and release
+    /// builds ignore it so hosts cannot fork the pinned v1 baseline (mdk#970).
     pub dev_settlement_quiescence_ms: Option<u64>,
 }
 
@@ -145,8 +145,8 @@ impl MarmotAppConfig {
     }
 
     /// Dev/test override for the convergence settlement quiescence window (ms).
-    /// Off by default (the protocol-pinned `1000` ms is used). Release builds
-    /// ignore this field; test harnesses set `0` for instant settlement.
+    /// Off by default (the protocol-pinned `1000` ms is used). Normal builds
+    /// ignore this field; explicit test harnesses set `0` for instant settlement.
     pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
         self.dev_settlement_quiescence_ms = Some(ms);
         self

@@ -105,10 +105,9 @@ jobs:
       - name: Run clippy with all features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-  # Ordinary cargo/nextest keeps debug_assertions, so the
-  # `#[cfg(not(debug_assertions))]` convergence-policy pin (mdk#970) is
-  # otherwise unexecuted. This job rebuilds the focused binary with
-  # assertions disabled and runs the production reject path.
+  # The broader integration matrix explicitly enables test-policy-overrides.
+  # This focused default-feature job proves ordinary debug/release consumers
+  # reject every non-v1 convergence policy (mdk#970).
   convergence-policy-pin:
     name: Convergence policy pin (release assertions)
     runs-on: ubuntu-latest
@@ -132,9 +131,9 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run release-mode convergence policy pin tests
+      - name: Run default-build convergence policy pin tests
         # Keep in sync with `just test-convergence-policy-pin`.
-        run: RUSTFLAGS='-C debug-assertions=off' cargo test -p cgka-engine --test convergence_policy_pin --locked
+        run: cargo test -p cgka-engine --test convergence_policy_pin --locked
 
   rust-test:
     name: Rust tests (${{ matrix.partition }}/4)
@@ -170,7 +169,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
 
       - name: Run doctests
         if: matrix.partition == 1
@@ -207,7 +206,7 @@ jobs:
         # test-group and the `ci` profile adds retries + a hung-test backstop.
         # The real-relay test self-skips here; it has its own `Relay CLI E2E`
         # job with a docker relay stack.
-        run: cargo nextest run -p wn-cli --test cli --locked --profile ci
+        run: cargo nextest run -p wn-cli --test cli --features test-policy-overrides --locked --profile ci
 
   relay-runtime:
     name: Relay runtime tests
@@ -233,7 +232,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run relay runtime tests serially
-        run: cargo test -p marmot-app --test relay_runtime --locked -- --test-threads=1
+        run: cargo test -p marmot-app --test relay_runtime --features test-policy-overrides --locked -- --test-threads=1
 
   relay-e2e:
     name: Relay CLI E2E
@@ -272,7 +271,7 @@ jobs:
       - name: Run real relay CLI E2E
         env:
           MDK_E2E_REQUIRE_RELAYS: "1"
-        run: cargo nextest run -p wn-cli --test cli --locked --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        run: cargo nextest run -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
 
       - name: Dump local relay logs
         if: failure()

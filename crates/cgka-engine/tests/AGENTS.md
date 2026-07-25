@@ -52,9 +52,9 @@ backend on the same rail.
   - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
 
 - **File:** `convergence_policy_pin.rs`
-  - **Owns:** Release-mode pinned v1 policy reject path (mdk#970). Ordinary `cargo test` keeps
-    `debug_assertions`; run `just test-convergence-policy-pin` (also in `just fast-ci` / CI) so the
-    `#[cfg(not(debug_assertions))]` engine gate is actually executed.
+  - **Owns:** Default-build pinned v1 policy rejection (mdk#970). Run
+    `just test-convergence-policy-pin` without `test-policy-overrides`; the broader integration
+    matrix enables that feature explicitly for settlement/rewind fixtures.
 
 - **File:** `mip03_guards.rs`
   - **Owns:** Phase 4.9 — committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove

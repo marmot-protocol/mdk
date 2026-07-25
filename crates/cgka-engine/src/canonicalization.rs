@@ -97,15 +97,15 @@ impl CanonicalizationPolicy {
     /// Same acceptance contract as engine setters and session open (mdk#970).
     ///
     /// Always enforces the witness-override bound and app-window alignment.
-    /// Release builds also require the pinned v1 baseline; debug harnesses may
-    /// override for settlement/rewind probes.
+    /// Normal builds also require the pinned v1 baseline. Only test harnesses
+    /// built with the explicit `test-policy-overrides` feature may override it.
     pub fn ensure_acceptable(
         &self,
         max_past_epochs: usize,
     ) -> Result<(), CanonicalizationPolicyError> {
         self.validate()?;
         self.ensure_app_window_matches(max_past_epochs)?;
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(feature = "test-policy-overrides"))]
         if !self.is_pinned_v1() {
             return Err(CanonicalizationPolicyError::NotPinnedV1);
         }

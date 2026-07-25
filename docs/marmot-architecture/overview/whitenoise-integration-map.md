@@ -49,7 +49,7 @@ whitenoise-rs should keep owning:
 | Drain side effects | `drain()` |
 | Inspect basic group state | `epoch(&GroupId)`, `members(&GroupId)` |
 | Get local member id | `self_id()` |
-| Convergence policy | Pinned v1 baseline only (`CanonicalizationPolicy::default()`). Hosts MUST NOT tune it; debug harnesses may override under `debug_assertions`. |
+| Convergence policy | Pinned v1 baseline only (`CanonicalizationPolicy::default()`). Hosts MUST NOT tune it; dedicated harness builds may enable `test-policy-overrides`. |
 
 `marmot-account` adds a first coordinator shell:
 

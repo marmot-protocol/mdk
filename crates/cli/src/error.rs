@@ -52,7 +52,7 @@ pub(crate) enum WnError {
     #[error("invalid secret store: {0}")]
     InvalidSecretStore(String),
     #[error(
-        "WN_DEV_SETTLEMENT_QUIESCENCE_MS is only available in debug builds; unset it when running a release binary"
+        "WN_DEV_SETTLEMENT_QUIESCENCE_MS requires a test-policy-overrides build; unset it in normal binaries"
     )]
     DevSettlementOverrideInRelease,
     #[error("stream text is required")]
