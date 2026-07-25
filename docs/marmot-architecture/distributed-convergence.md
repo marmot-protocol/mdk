@@ -1,7 +1,7 @@
 # Distributed Convergence
 
-**Status:** design draft. This is the target model for Marmot clients that need to converge on one MLS group state from
-unordered multi-relay input.
+**Status:** implemented engine architecture. This is the MDK model for converging one MLS group state from unordered
+multi-relay input.
 
 The engine contract that packages this model as a state-machine operation lives in
 [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md).
@@ -104,6 +104,45 @@ against the engine's monotonic clock and, when convergence is settled, returns r
 local work. A regenerated group evolution pauses draining until its publish lifecycle is resolved; timer ticks in that
 pending-publish window return no work.
 
+## Frozen pass boundary
+
+Each group owns an independent durable pass. Retaining a message is not itself admission: the engine opens or extends a
+pass only while that group is stable and the input can participate inside the current replay horizon.
+
+A collecting pass persists:
+
+- its generation and base epoch;
+- its opening time and quiescence deadline in millisecond wall-clock terms;
+- the immutable absolute deadline;
+- every admitted message id and SHA-256 digest of its peeled MLS bytes; and
+- its collecting, frozen, resolving, or completed phase.
+
+Process-local monotonic deadlines are in-memory scheduling state derived from
+those durable wall-clock terms. They are stored only to identify and schedule
+the current clock domain and are never authoritative after restart.
+
+The cutoff is:
+
+```text
+min(last_selection_relevant_input + 1000ms,
+    pass_opened + 5000ms)
+```
+
+At the cutoff, the engine verifies the persisted payload digests and freezes the exact membership set. Candidate
+materialization and replay receive only those members. A message retained after the cutoff remains stored for the next
+generation; it cannot alter the frozen result. Missing dependencies likewise remain eligible for a later generation
+instead of reopening the current one.
+
+Monotonic deadlines are never trusted across process restart. The engine rebases a collecting pass from its persisted
+millisecond wall deadlines. An elapsed deadline becomes immediately due, and a backwards wall-clock discontinuity
+fails closed to an immediate cutoff. Frozen and resolving passes resume their exact persisted membership without
+re-enumerating storage.
+
+The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier
+cutoff. After a completed pass, one persisted, already-queued admin group-state intent receives one preparation attempt
+before an inbound-only follow-up generation. App messages, leave work, and automatic maintenance do not consume that
+slot; a failed preparation cannot hold it indefinitely.
+
 ## Branch Selection
 
 Only eligible branches are scored.
@@ -168,6 +207,7 @@ convergence_policy = {
   max_rewind_commits: 5,
   app_payload_past_epoch_limit: 5,
   settlement_quiescence_ms: 1000,
+  max_convergence_pass_ms: 5000,
   witness_quorum_senders_per_epoch: 2,
   witness_quorum_epochs: 1,
   max_witness_override_depth: 1,

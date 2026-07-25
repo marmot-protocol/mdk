@@ -23,8 +23,8 @@ use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageProvider,
+    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MessageStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -40,6 +40,8 @@ use openmls::prelude::BasicCredential;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
@@ -69,6 +71,27 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 
 struct MockPeeler;
 struct EpochGatePeeler;
+
+#[derive(Clone)]
+struct TestWallClock(Arc<AtomicU64>);
+
+impl cgka_traits::maintenance::WallClock for TestWallClock {
+    fn now(&self) -> cgka_traits::Timestamp {
+        cgka_traits::Timestamp(self.0.load(Ordering::SeqCst) / 1_000)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+struct FixedMaintenanceRandom;
+
+impl cgka_traits::maintenance::MaintenanceRandom for FixedMaintenanceRandom {
+    fn next_u64(&self) -> u64 {
+        0
+    }
+}
 
 fn commit_tiebreak_winner_index(first: &MemberId, second: &MemberId) -> usize {
     if first.as_slice() < second.as_slice() {
@@ -287,6 +310,22 @@ fn build_client_with_storage(
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_client_with_storage_and_clock(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    wall_clock: TestWallClock,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .maintenance_sources(Arc::new(wall_clock), Arc::new(FixedMaintenanceRandom))
         .build()
         .unwrap()
 }
@@ -777,6 +816,50 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .expect("repeated convergence after applying is a no-op");
     assert!(repeated.accepted_commits.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let completed_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("completed witness pass remains durable");
+    assert_eq!(
+        completed_pass.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    let post_race_app = if app_branch_index == 0 {
+        send_app(
+            &mut alice,
+            &group_id,
+            b"ordinary app after settled race".to_vec(),
+        )
+        .await
+    } else {
+        send_app(
+            &mut bob,
+            &group_id,
+            b"ordinary app after settled race".to_vec(),
+        )
+        .await
+    };
+    assert!(matches!(
+        carol.ingest(post_race_app.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert_message_state(&carol_storage, &post_race_app, MessageState::Processed);
+    let pass_after_app = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("ordinary app does not replace the completed pass");
+    assert_eq!(pass_after_app.generation, completed_pass.generation);
+    assert_eq!(
+        pass_after_app.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    assert!(
+        !carol
+            .has_pending_convergence_inputs(&group_id)
+            .expect("pending convergence query succeeds"),
+        "the epoch-invalidated loser must not keep gating ordinary app traffic"
+    );
 }
 
 #[tokio::test]
@@ -1420,7 +1503,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_001_000)
         .expect("sibling rename commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages(&group_id, u64::MAX)
         .expect("reorg over the superseded removal");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
@@ -2038,7 +2121,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
             members: vec![carol_kp],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![carol.self_id()],
         })
         .await
         .unwrap();
@@ -2060,8 +2143,9 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
         })
         .await
         .unwrap();
-    let (_commit_david, pending_david) = evolution(invite_david);
+    let (commit_david, pending_david) = evolution(invite_david);
     alice.confirm_published(pending_david).await.unwrap();
+    let commit_david = route(commit_david, &group_id);
 
     let eve_kp = eve.fresh_key_package().await.unwrap();
     let invite_eve = alice
@@ -2077,6 +2161,19 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     carol
         .buffer_openmls_convergence_message(&group_id, commit_eve.clone(), 1_000)
         .expect("child commit buffered without parent");
+    let queued_intent_id = MessageId::new(b"fairness-before-generation-one".to_vec());
+    carol_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: queued_intent_id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("fairness before generation one".into()),
+                description: None,
+            },
+            created_at_ms: 1_001,
+        })
+        .expect("persist already-queued admin group-state intent");
 
     let result = carol
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -2087,6 +2184,77 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     assert!(result.dropped_messages.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_message_state(&carol_storage, &commit_eve, MessageState::Created);
+    let first_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("first frozen pass persisted");
+    assert_eq!(first_pass.generation, 0);
+    assert_eq!(
+        first_pass.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    assert_eq!(first_pass.members.len(), 1);
+
+    // The missing parent arrives only after generation 0 froze. It must not
+    // mutate that completed membership set; generation 1 seeds both retained
+    // inputs and resolves the fixed batch.
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000_001)
+        .expect("late parent retained for next pass");
+    let fairness_turn = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_002_000)
+        .await
+        .expect("completed pass grants one queued user-intent turn");
+    assert_eq!(fairness_turn.len(), 1);
+    let fairness_pending = match fairness_turn[0] {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        ref other => panic!("expected queued group-state evolution, got {other:?}"),
+    };
+    let after_fairness = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("completed pass remains until its fairness slot is consumed");
+    assert_eq!(after_fairness.generation, 0);
+    assert_eq!(
+        after_fairness.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    assert!(!after_fairness.fairness_slot_available);
+    assert_message_state(&carol_storage, &commit_david, MessageState::Created);
+    carol
+        .confirm_published(fairness_pending)
+        .await
+        .expect("published fairness evolution leaves the durable queue");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .iter()
+            .all(|record| record.id != queued_intent_id)
+    );
+
+    let collecting_second = carol
+        .converge_stored_openmls_messages(&group_id, 1_002_000)
+        .expect("next generation opens only after the fairness turn");
+    assert_eq!(
+        collecting_second.convergence_status,
+        ConvergenceStatus::Syncing
+    );
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 1_003_000)
+        .expect("next frozen generation resolves parent and child");
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        second.accepted_commits,
+        vec![content_hex(&commit_david), content_hex(&commit_eve)]
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    let second_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("second pass persisted");
+    assert_eq!(second_pass.generation, 1);
+    assert!(second_pass.members.len() >= 2);
 }
 
 #[tokio::test]
@@ -3034,7 +3202,7 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
 }
 
 #[tokio::test]
-async fn engine_invalidates_commit_older_than_retained_anchor() {
+async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -3128,18 +3296,21 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
         .buffer_openmls_convergence_message(&group_id, stale_bob_commit.clone(), 4_000)
         .expect("stale bob commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 5_000_000)
-        .expect("stale commit is resolved without historical replay");
+        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .expect("stale commit outside the retained horizon is ignored");
 
-    assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == content_hex(&stale_bob_commit)
-            && dropped.kind == MessageKind::Commit
-            && dropped.reason == DroppedMessageReason::BeyondAnchor
-    }));
-    assert_message_state(
-        &carol_storage,
-        &stale_bob_commit,
-        MessageState::EpochInvalidated,
+    assert!(result.dropped_messages.is_empty());
+    assert_message_state(&carol_storage, &stale_bob_commit, MessageState::Created);
+    assert!(
+        carol_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .is_some_and(|pass| {
+                pass.members
+                    .iter()
+                    .all(|member| member.message_id != content_id(&stale_bob_commit))
+            }),
+        "below-anchor history must not be copied into the durable pass"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
     assert!(
@@ -3152,7 +3323,7 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
 }
 
 #[tokio::test]
-async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
+async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -3253,18 +3424,10 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
         .expect("stale bob commit buffered after restart");
     let result = carol
         .converge_stored_openmls_messages(&group_id, 5_000_000)
-        .expect("rebuilt engine resolves stale commit without historical replay");
+        .expect("rebuilt engine ignores input outside the retained horizon");
 
-    assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == content_hex(&stale_bob_commit)
-            && dropped.kind == MessageKind::Commit
-            && dropped.reason == DroppedMessageReason::BeyondAnchor
-    }));
-    assert_message_state(
-        &carol_storage,
-        &stale_bob_commit,
-        MessageState::EpochInvalidated,
-    );
+    assert!(result.dropped_messages.is_empty());
+    assert_message_state(&carol_storage, &stale_bob_commit, MessageState::Created);
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap().epoch,
         EpochId(3)
@@ -3357,6 +3520,72 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
             )
         }),
         "expected accepted app message event after canonical convergence, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn future_app_without_reachable_commit_is_retained_without_gating_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "future-app-no-candidate".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (_withheld_commit, pending) = evolution(invite);
+    alice.confirm_published(pending).await.unwrap();
+    let future_app = send_app(&mut alice, &group_id, b"waiting for parent".to_vec()).await;
+
+    assert!(matches!(
+        carol.ingest(future_app.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_message_state(&carol_storage, &future_app, MessageState::Created);
+    assert!(
+        carol_storage.convergence_pass(&group_id).unwrap().is_none(),
+        "an app payload without a reachable candidate branch must not open a pass"
+    );
+    assert!(
+        !carol.has_pending_convergence_inputs(&group_id).unwrap(),
+        "an unresolved payload disposition alone must not make group state ambiguous"
+    );
+
+    let sent = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"current branch remains usable"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "future app without a candidate commit must not gate sends, got {sent:?}"
     );
 }
 
@@ -3863,7 +4092,7 @@ async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
         .buffer_openmls_convergence_message(&group_id, apps[winning_index].clone(), 2_000)
         .unwrap();
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .converge_stored_openmls_messages(&group_id, u64::MAX)
         .unwrap();
 
     assert!(second.invalidated_app_messages.iter().any(|invalidated| {
@@ -3936,6 +4165,14 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
         .ingest(route(commit, &group_id))
         .await
         .expect("commit is stored");
+    let mut frozen_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("collecting pass persisted before restart");
+    frozen_pass.phase = cgka_traits::ConvergencePassPhase::Frozen;
+    frozen_pass.frozen_at_wall_ms = Some(frozen_pass.cutoff_wall_ms());
+    frozen_pass.cutoff_cause = Some(cgka_traits::ConvergenceCutoffCause::Quiescence);
+    carol_storage.put_convergence_pass(&frozen_pass).unwrap();
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
         .legacy_compatibility_profile()
@@ -3968,10 +4205,82 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
 }
 
 #[tokio::test]
+async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let wall_ms = Arc::new(AtomicU64::new(10_000));
+    let wall_clock = TestWallClock(wall_ms.clone());
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+    let mut david = build_client(b"david").0;
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-collecting-restart".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _) = evolution(invite);
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .unwrap();
+
+    wall_ms.store(10_400, Ordering::SeqCst);
+    let mut restarted =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+    let remaining = restarted
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+        .expect("collecting pass remains active");
+    assert_eq!(
+        remaining, 600,
+        "restart must preserve the original 600ms remainder"
+    );
+
+    wall_ms.store(9_000, Ordering::SeqCst);
+    let mut backwards =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
+    assert_eq!(
+        backwards
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        Some(0),
+        "a backward wall-clock jump in a new clock domain must make cutoff immediately due"
+    );
+}
+
+#[tokio::test]
 async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let wall_ms = Arc::new(AtomicU64::new(10_000));
+    let wall_clock = TestWallClock(wall_ms.clone());
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -4040,14 +4349,9 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
             .expect("message buffered");
     }
 
-    let mut restarted = EngineBuilder::new(carol_storage.clone())
-        .legacy_compatibility_profile()
-        .identity(pad32(b"carol"))
-        .account_identity_proof_signer(proof_signer(b"carol"))
-        .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
-        .build()
-        .unwrap();
+    wall_ms.store(12_000, Ordering::SeqCst);
+    let mut restarted =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
 
     let result = restarted
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -4361,6 +4665,518 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &commit, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn application_input_does_not_reset_convergence_quiescence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-app-quiescence".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("selection-relevant commit".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = evolution(rename);
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .unwrap();
+    let app = send_app(&mut alice, &group_id, b"ordinary application".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message(&group_id, app, 1_900)
+        .unwrap();
+
+    let pass = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(pass.quiescence_deadline_monotonic_ms, 2_000);
+    assert_eq!(
+        carol
+            .converge_stored_openmls_messages(&group_id, 2_000)
+            .unwrap()
+            .convergence_status,
+        ConvergenceStatus::Settled
+    );
+}
+
+#[tokio::test]
+async fn app_witness_beside_competing_commits_resets_convergence_quiescence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selection-relevant-app-quiescence".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    alice.confirm_published(alice_pending).await.unwrap();
+    let app = send_app(&mut alice, &group_id, b"branch witness".to_vec()).await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(alice_commit, &group_id), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(bob_commit, &group_id), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, app, 1_900)
+        .unwrap();
+
+    let pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("competing commits open a pass");
+    assert_eq!(
+        pass.quiescence_deadline_monotonic_ms, 2_900,
+        "a potential witness that can change the branch score is selection-relevant"
+    );
+    assert_eq!(
+        pass.absolute_deadline_monotonic_ms, 6_000,
+        "witness traffic must never move the absolute pass boundary"
+    );
+}
+
+#[tokio::test]
+async fn far_future_app_is_not_admitted_to_an_active_pass() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "active-pass-future-horizon".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .unwrap();
+
+    let first_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (first_commit, pending) = evolution(first_invite);
+    alice.confirm_published(pending).await.unwrap();
+    let second_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (_withheld_second_commit, pending) = evolution(second_invite);
+    alice.confirm_published(pending).await.unwrap();
+    let far_future_app = send_app(&mut alice, &group_id, b"outside active horizon".to_vec()).await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(first_commit, &group_id), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, far_future_app.clone(), 1_900)
+        .unwrap();
+
+    let pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("first commit opens a pass");
+    assert_eq!(pass.members.len(), 1);
+    assert!(
+        pass.members
+            .iter()
+            .all(|member| member.message_id != content_id(&far_future_app)),
+        "outside-horizon input must be retained outside the active frozen batch"
+    );
+    assert_eq!(pass.quiescence_deadline_monotonic_ms, 2_000);
+    assert_message_state(&carol_storage, &far_future_app, MessageState::Created);
+}
+
+#[tokio::test]
+async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-absolute-cap".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    for (index, now_ms) in [1_000, 1_900, 2_800, 3_700, 4_600, 5_500]
+        .into_iter()
+        .enumerate()
+    {
+        let update = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("continuous selection {index}")),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let (message, pending) = evolution(update);
+        alice.confirm_published(pending).await.unwrap();
+        carol
+            .buffer_openmls_convergence_message(&group_id, route(message, &group_id), now_ms)
+            .unwrap();
+    }
+
+    let pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("collecting pass persisted");
+    assert_eq!(pass.quiescence_deadline_monotonic_ms, 6_500);
+    assert_eq!(pass.absolute_deadline_monotonic_ms, 6_000);
+    assert_eq!(pass.members.len(), 6);
+    assert_eq!(
+        carol
+            .converge_stored_openmls_messages(&group_id, 5_999)
+            .unwrap()
+            .convergence_status,
+        ConvergenceStatus::Syncing
+    );
+    assert_eq!(
+        carol
+            .converge_stored_openmls_messages(&group_id, 6_000)
+            .unwrap()
+            .convergence_status,
+        ConvergenceStatus::Settled
+    );
+    let frozen = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(
+        frozen.cutoff_cause,
+        Some(cgka_traits::ConvergenceCutoffCause::AbsoluteDeadline)
+    );
+}
+
+#[tokio::test]
+async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-exact-cutoff".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let first_update = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("before cutoff".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (first, pending) = evolution(first_update);
+    alice.confirm_published(pending).await.unwrap();
+    let first = route(first, &group_id);
+    let cutoff_update = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("at cutoff".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (at_cutoff, pending) = evolution(cutoff_update);
+    alice.confirm_published(pending).await.unwrap();
+    let at_cutoff = route(at_cutoff, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, first.clone(), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, at_cutoff.clone(), 2_000)
+        .unwrap();
+
+    let collecting = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("generation zero freezes durably at admission cutoff");
+    assert_eq!(collecting.generation, 0);
+    assert_eq!(collecting.phase, cgka_traits::ConvergencePassPhase::Frozen);
+    assert_eq!(
+        collecting.cutoff_cause,
+        Some(cgka_traits::ConvergenceCutoffCause::Quiescence)
+    );
+    assert_eq!(collecting.members.len(), 1);
+    assert_eq!(collecting.members[0].message_id, content_id(&first));
+    assert!(
+        !collecting
+            .members
+            .iter()
+            .any(|member| member.message_id == content_id(&at_cutoff)),
+        "admission at the cutoff must not mutate the frozen generation"
+    );
+
+    carol
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("generation zero freezes and resolves at the exact cutoff");
+    let completed = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(completed.generation, 0);
+    assert_eq!(completed.members.len(), 1);
+    assert_eq!(
+        carol_storage
+            .get_message(&content_id(&at_cutoff))
+            .unwrap()
+            .state,
+        MessageState::Created,
+        "the cutoff input remains durable for the next generation"
+    );
+
+    carol
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .expect("next generation opens")
+        .expect("cutoff input starts the next collecting pass");
+    let next = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("generation one is durable");
+    assert_eq!(next.generation, 1);
+    assert_eq!(next.phase, cgka_traits::ConvergencePassPhase::Collecting);
+    assert!(
+        next.members
+            .iter()
+            .any(|member| member.message_id == content_id(&at_cutoff)),
+        "input retained at generation-zero cutoff must join generation one"
+    );
+}
+
+#[tokio::test]
+async fn frozen_pass_member_tampering_fails_closed_to_unrecoverable() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-member-integrity".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _) = evolution(invite);
+    let commit = route(commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .unwrap();
+
+    let id = content_id(&commit);
+    let mut record = carol_storage.get_message(&id).unwrap();
+    record.payload = vec![0xff];
+    carol_storage.put_message(&record).unwrap();
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("integrity failure is a classified halt");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(carol.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+    )));
+}
+
+#[tokio::test]
+async fn missing_frozen_pass_member_fails_closed_to_unrecoverable() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-missing-member".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _) = evolution(invite);
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .unwrap();
+
+    let mut pass = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    pass.phase = cgka_traits::ConvergencePassPhase::Frozen;
+    pass.frozen_at_wall_ms = Some(pass.cutoff_wall_ms());
+    pass.cutoff_cause = Some(cgka_traits::ConvergenceCutoffCause::Quiescence);
+    pass.members[0].message_id = MessageId::new(b"missing-frozen-member".to_vec());
+    carol_storage.put_convergence_pass(&pass).unwrap();
+
+    let drained = carol
+        .advance_convergence(&group_id)
+        .await
+        .expect("production advance classifies the missing member as a fail-closed halt");
+    assert!(drained.is_empty());
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(carol.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+    )));
 }
 
 #[tokio::test]
@@ -5615,7 +6431,11 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
 async fn queued_outbound_intent_survives_engine_rebuild() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let wall_ms = Arc::new(AtomicU64::new(10_000));
+    let wall_clock = TestWallClock(wall_ms.clone());
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
     let (mut david, _david_storage) = build_client(b"david");
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -5675,14 +6495,9 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         1
     );
 
-    let mut restarted = EngineBuilder::new(carol_storage.clone())
-        .legacy_compatibility_profile()
-        .identity(pad32(b"carol"))
-        .account_identity_proof_signer(proof_signer(b"carol"))
-        .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
-        .build()
-        .unwrap();
+    wall_ms.store(12_000, Ordering::SeqCst);
+    let mut restarted =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
     let drained = restarted
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await

@@ -14,7 +14,7 @@ use cgka_traits::CgkaEngine;
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -117,8 +117,8 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::NotForThisClient
+            IngestOutcome::Ignored {
+                category: cgka_traits::ingest::InputRejectionCategory::WrongRecipient
             }
         ),
         "expected NotForThisClient stale, got {outcome:?}"
@@ -183,8 +183,8 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
             stale_reason,
             ..
         } => {
-            assert_eq!(outcome_kind, "stale");
-            assert_eq!(stale_reason.as_deref(), Some("not_for_this_client"));
+            assert_eq!(outcome_kind, "ignored");
+            assert_eq!(stale_reason.as_deref(), Some("wrong_recipient"));
         }
         _ => unreachable!(),
     }
@@ -311,8 +311,8 @@ async fn engine_without_recorder_is_silent_and_does_not_crash() {
     let outcome = engine.ingest(msg).await.expect("ingest");
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::NotForThisClient
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::WrongRecipient
         }
     ));
 }

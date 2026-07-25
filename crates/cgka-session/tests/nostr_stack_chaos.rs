@@ -7,7 +7,7 @@ use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
 use serde::Serialize;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
@@ -122,8 +122,8 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         .expect("welcome replay should still route to Carol");
     assert!(matches!(
         carol_welcome_replay.outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(carol_welcome_replay.effects.events.is_empty());
@@ -563,8 +563,8 @@ impl ChaosRunState<'_> {
         if self.seen[message_index] {
             if !matches!(
                 ingest.outcome,
-                IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate
                 }
             ) {
                 self.failures.push(format!(
@@ -641,8 +641,8 @@ impl ChaosRunState<'_> {
         let payloads = message_payloads(&ingest);
         if !matches!(
             ingest.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
             }
         ) {
             self.failures.push(format!(
@@ -874,10 +874,10 @@ fn assert_already_seen(effects: &IngestEffects) {
     assert!(
         matches!(
             effects.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
-                    | StaleReason::AlreadyAtEpoch { .. }
-                    | StaleReason::PeelFailed
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
+            } | IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. } | StaleReason::PeelFailed
             }
         ),
         "expected duplicate/stale epoch outcome, got {:?}",

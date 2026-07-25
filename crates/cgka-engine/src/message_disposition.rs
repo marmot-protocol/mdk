@@ -30,7 +30,7 @@ pub(crate) enum MessageDisposition {
     /// undecryptable input cannot grow the durable store unboundedly.
     DeferredCapExceeded,
     /// The group is under hydration quarantine; input is retained for
-    /// post-repair replay (see `StaleReason::Quarantined`).
+    /// post-repair replay (see `LocalIngestState::Quarantined`).
     Quarantined,
 }
 

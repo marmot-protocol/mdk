@@ -4,9 +4,9 @@
 //! buffered for convergence. Outbound intents are checked against local epoch
 //! state and unresolved convergence inputs before any OpenMLS mutation.
 //!
-//! Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`. `Err` is
-//! reserved for storage, peeler, serialization, and OpenMLS failures.
+//! Classifiable ingest exclusions and local-state blocks return typed ordinary
+//! outcomes. `Err` is reserved for storage, peeler, serialization, and
+//! OpenMLS failures.
 
 mod ingest;
 mod send;
@@ -15,12 +15,13 @@ mod store;
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 
+use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
-use crate::openmls_projection::{OpenMlsContentKind, decode_openmls_wire_projection};
+use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -146,8 +147,8 @@ impl<S: StorageProvider> Engine<S> {
         // In-memory fallback for messages produced before the durable record
         // is visible to this path.
         if self.seen_message_ids.contains(&msg.id) {
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
             });
         }
         if self.sent_message_ids.contains(&msg.id) {
@@ -158,8 +159,8 @@ impl<S: StorageProvider> Engine<S> {
                 EpochId(0),
                 MessageState::Sent,
             )?;
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho,
             });
         }
 
@@ -285,38 +286,71 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
-        if self
-            .stage_due_self_remove_auto_commit(group_id, now_ms)
-            .await?
-        {
-            return Ok(Vec::new());
-        }
-
-        self.try_auto_repropose_leave_request(group_id).await;
-        if self.load_leave_request_state(group_id)?.is_some() {
-            return Ok(Vec::new());
-        }
-
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
-        for record in queued {
-            if !self
-                .advance_convergence_inputs_until_settled(group_id, now_ms)
-                .await?
-            {
-                break;
-            }
+        let mut fairness_slot_available =
+            self.storage
+                .convergence_pass(group_id)?
+                .is_some_and(|pass| {
+                    pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                        && pass.fairness_slot_available
+                });
+        if fairness_slot_available && !self.has_unresolved_convergence_inputs(group_id)? {
+            // The slot orders local group-state work before an inbound-only
+            // follow-up pass. With no such inbound work, normal queue draining
+            // proceeds and the dormant slot must not leak into a later pass.
+            self.consume_convergence_fairness_slot(group_id)?;
+            fairness_slot_available = false;
+        }
+        // A persisted fairness slot orders one already-queued administrative
+        // evolution before automatic SelfRemove or leave-maintenance mutation.
+        if !fairness_slot_available {
             if self
                 .stage_due_self_remove_auto_commit(group_id, now_ms)
                 .await?
             {
-                break;
+                return Ok(Vec::new());
             }
             self.try_auto_repropose_leave_request(group_id).await;
             if self.load_leave_request_state(group_id)?.is_some() {
+                return Ok(Vec::new());
+            }
+        }
+        for record in queued {
+            if fairness_slot_available && !is_admin_group_state_fairness_intent(&record.intent) {
+                continue;
+            }
+            if !fairness_slot_available
+                && !self
+                    .advance_convergence_inputs_until_settled(group_id, now_ms)
+                    .await?
+            {
                 break;
             }
-            let result = self.do_send_ready(record.intent.clone()).await?;
+            if !fairness_slot_available {
+                if self
+                    .stage_due_self_remove_auto_commit(group_id, now_ms)
+                    .await?
+                {
+                    break;
+                }
+                self.try_auto_repropose_leave_request(group_id).await;
+                if self.load_leave_request_state(group_id)?.is_some() {
+                    break;
+                }
+            }
+            let result = match self.do_send_ready(record.intent.clone()).await {
+                Ok(result) => result,
+                Err(_) if fairness_slot_available => {
+                    // The protocol grants one preparation attempt, not an
+                    // indefinite reservation. Keep the durable intent queued,
+                    // consume the slot, and let retained inbound work proceed.
+                    self.consume_convergence_fairness_slot(group_id)?;
+                    fairness_slot_available = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             match &result {
                 SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
@@ -332,11 +366,39 @@ impl<S: StorageProvider> Engine<S> {
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
+            if fairness_slot_available {
+                self.consume_convergence_fairness_slot(group_id)?;
+                fairness_slot_available = false;
+                if self.has_unresolved_convergence_inputs(group_id)? {
+                    break;
+                }
+            }
             if pauses_for_pending_publish {
                 break;
             }
         }
+        if fairness_slot_available {
+            // No already-queued admin group-state intent was eligible for the
+            // fairness attempt. Do not let unrelated app/leave/maintenance
+            // work hold the next inbound generation indefinitely.
+            self.consume_convergence_fairness_slot(group_id)?;
+            if self
+                .stage_due_self_remove_auto_commit(group_id, now_ms)
+                .await?
+            {
+                return Ok(drained);
+            }
+            self.try_auto_repropose_leave_request(group_id).await;
+        }
         Ok(drained)
+    }
+
+    fn consume_convergence_fairness_slot(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if let Some(mut pass) = self.storage.convergence_pass(group_id)? {
+            pass.fairness_slot_available = false;
+            self.storage.put_convergence_pass(&pass)?;
+        }
+        Ok(())
     }
 
     async fn should_queue_outbound_intent(
@@ -454,9 +516,22 @@ impl<S: StorageProvider> Engine<S> {
                 {
                     return Ok(false);
                 }
-                if self.has_unresolved_convergence_inputs(group_id)? {
-                    return Ok(false);
+                // A completed frozen batch grants one queued user intent before
+                // an inbound-only follow-up pass. Retry one deferred-peel sweep
+                // first so newly available canonical context is visible. Return
+                // to the drain only when that durable slot actually exists.
+                let _ = self.retry_deferred_peels(group_id).await?;
+                let fairness_slot_available =
+                    self.storage
+                        .convergence_pass(group_id)?
+                        .is_some_and(|pass| {
+                            pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                                && pass.fairness_slot_available
+                        });
+                if fairness_slot_available {
+                    return Ok(true);
                 }
+                continue;
             }
 
             if self.retry_deferred_peels(group_id).await? == 0 {
@@ -467,7 +542,16 @@ impl<S: StorageProvider> Engine<S> {
         Ok(false)
     }
 
-    fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+    pub(crate) fn has_unresolved_convergence_inputs(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if let Some(pass) = self.storage.convergence_pass(group_id)?
+            && pass.is_active()
+            && self.convergence_pass_gates_outbound(&pass)
+        {
+            return Ok(true);
+        }
         // The convergence horizon is bounded on BOTH sides (mdk#736). The past
         // side (`anchor`) drops inputs older than the retained-anchor window.
         // The future side (`ceiling`) is symmetric: a convergence input more
@@ -500,10 +584,14 @@ impl<S: StorageProvider> Engine<S> {
         };
         let records = self.storage.list_messages(group_id, EpochId(anchor))?;
         let mut skipped_non_resolvable: usize = 0;
+        let mut classified = Vec::new();
         for record in records {
             if !matches!(
                 record.state,
-                MessageState::Created | MessageState::Retryable
+                MessageState::Sent
+                    | MessageState::Created
+                    | MessageState::Retryable
+                    | MessageState::Processed
             ) {
                 continue;
             }
@@ -526,26 +614,31 @@ impl<S: StorageProvider> Engine<S> {
             if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
                 continue;
             }
-            // A lone uncommitted Proposal does NOT make canonical state
-            // ambiguous: commits are the consensus log; a proposal only takes
-            // effect once a commit consumes it (convergence.md:7-8). The
-            // SelfRemove send-side rule is enforced earlier: remaining members
-            // that may commit a SelfRemove stage a pending commit, and the
-            // leaver is held by `leaving_groups`.
-            //
-            // The Proposal record stays in its `Created`/`Retryable` state and
-            // continues to contribute to the OpenMLS candidate-path graph, so a
-            // later consuming commit still resolves it through convergence; it
-            // simply does not count as *unresolved convergence work* for the
-            // outbound-send gate. Commits and application messages remain
-            // gating: those genuinely leave canonical state ambiguous until
-            // convergence settles.
-            if matches!(
+            let Some(source_epoch) = projection.source_epoch else {
+                skipped_non_resolvable += 1;
+                continue;
+            };
+            let Some(input) = ClassifiedConvergenceInput::from_projection(
                 projection.kind,
-                OpenMlsContentKind::Commit | OpenMlsContentKind::Application
-            ) {
-                return Ok(true);
-            }
+                source_epoch,
+                record.state,
+                projection.message_digest,
+            ) else {
+                continue;
+            };
+            classified.push(input);
+        }
+        let context = ConvergenceInputContext::from_inputs(classified.iter().copied());
+        // An unresolved commit always gates because it can advance or replace
+        // canonical state. An application message gates only when retained
+        // competing commit edges make it a potential branch-selection witness;
+        // unresolved delivery by itself does not make group state ambiguous.
+        // Proposals remain dependencies and do not gate independently.
+        if classified
+            .into_iter()
+            .any(|input| context.gates_outbound(input))
+        {
+            return Ok(true);
         }
         // Reached only when nothing gates: surface any fail-open skips so an
         // insider spraying undecodable rows (which no longer wedges the gate but
@@ -688,8 +781,8 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(IngestOutcome::Stale {
                     reason: StaleReason::PeelFailed,
                 }) => {}
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::Quarantined,
+                Ok(IngestOutcome::LocalState {
+                    state: LocalIngestState::Quarantined,
                 }) => {
                     // Defense-in-depth: the gate above should keep this loop
                     // from running for a quarantined group at all, but if a
@@ -717,7 +810,12 @@ impl<S: StorageProvider> Engine<S> {
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
-                Ok(IngestOutcome::Stale { .. } | IngestOutcome::Rejected { .. }) => {
+                Ok(
+                    IngestOutcome::Stale { .. }
+                    | IngestOutcome::Ignored { .. }
+                    | IngestOutcome::LocalState { .. }
+                    | IngestOutcome::Rejected { .. },
+                ) => {
                     // Terminal stale classifications are still successful
                     // reclassifications of this raw deferred row. Retire it only
                     // while it is still awaiting retry: the reachable case is
@@ -1012,10 +1110,17 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     }
                 }
-                Ok(IngestOutcome::Stale {
-                    reason:
-                        StaleReason::PeelFailed | StaleReason::Quarantined | StaleReason::UnknownGroup,
-                }) => {
+                Ok(
+                    IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
+                    }
+                    | IngestOutcome::LocalState {
+                        state: LocalIngestState::Quarantined,
+                    }
+                    | IngestOutcome::Ignored {
+                        category: InputRejectionCategory::UnknownGroup,
+                    },
+                ) => {
                     // Leave the row in its retry state so a later pass re-attempts
                     // it. `PeelFailed`: still un-peelable, or already retired to
                     // `Failed` by a terminal-after-peel path inside
@@ -1033,16 +1138,17 @@ impl<S: StorageProvider> Engine<S> {
                     // derived row now carries the real verdict — applied
                     // (`Processed`), a same-epoch fork the incumbent won
                     // (`AlreadyAtEpoch`, content row `EpochInvalidated`), a
-                    // duplicate (`AlreadySeen`), our own echo (`OwnEcho`), or our
-                    // own eviction (`SelfEvicted`). Retire the raw wrapper so it
-                    // leaves the retry lifecycle instead of being re-peeled on
-                    // every subsequent publish-cycle replay — but ONLY while it is
-                    // still awaiting retry. `record.state` is the pre-ingest
-                    // snapshot; `ingest_group_message` may have already committed a
-                    // terminal state to this same row during the call. The
-                    // reachable case is `SelfEvicted`: a buffered peer commit that
-                    // evicts our leaf makes the next buffered row hit `!is_active`,
-                    // which persists that row `Failed` (ingest.rs). That
+                    // duplicate (`Ignored { category: Duplicate }`), our own echo
+                    // (`Ignored { category: OwnEcho }`), or our own eviction
+                    // (`LocalState { state: Removed }`). Retire the raw wrapper so
+                    // it leaves the retry lifecycle instead of being re-peeled on
+                    // every subsequent publish-cycle replay — but ONLY while it
+                    // is still awaiting retry. `record.state` is the pre-ingest
+                    // snapshot; `ingest_group_message` may have already committed
+                    // a terminal state to this same row during the call. The
+                    // reachable removal case is a buffered peer commit that evicts
+                    // our leaf: the next buffered row hits `!is_active`, which
+                    // persists that row `Failed` (ingest.rs). That
                     // ingest-committed verdict is authoritative — relabeling an
                     // evicted-on row `Processed` would sweep it back into
                     // canonicalization (`openmls_projection` /
@@ -1132,6 +1238,16 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }
+}
+
+fn is_admin_group_state_fairness_intent(intent: &SendIntent) -> bool {
+    matches!(
+        intent,
+        SendIntent::Invite { .. }
+            | SendIntent::RemoveMembers { .. }
+            | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::UpdateGroupData { .. }
+    )
 }
 
 #[cfg(test)]

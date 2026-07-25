@@ -30,6 +30,16 @@ impl AppClient {
             .unwrap_or(false)
     }
 
+    pub(crate) fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Option<u64> {
+        self.runtime
+            .prepare_convergence_cutoff_delay_ms(group_id)
+            .ok()
+            .flatten()
+    }
+
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {
         if let IngestOutcome::Buffered { group_id, .. } = outcome {
             self.pending_convergence_groups.insert(group_id.clone());

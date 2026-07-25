@@ -66,6 +66,8 @@ mod migration_0032_encrypted_media_secret_references;
 mod migration_0033_push_registration_gossip_outbox;
 #[path = "migrations/0034_maintenance_publication.rs"]
 mod migration_0034_maintenance_publication;
+#[path = "migrations/0035_durable_convergence_passes.rs"]
+mod migration_0035_durable_convergence_passes;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -247,6 +249,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 34,
         name: "0034_maintenance_publication",
         apply: migration_0034_maintenance_publication::apply,
+    },
+    Migration {
+        version: 35,
+        name: "0035_durable_convergence_passes",
+        apply: migration_0035_durable_convergence_passes::apply,
     },
 ];
 

@@ -32,7 +32,6 @@
 //!   result before and after rebuilding an engine over the same storage.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
@@ -48,18 +47,13 @@ use cgka_conformance_simulator::proptest_support::{
     ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
 };
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
-use cgka_engine::EngineBuilder;
-use cgka_engine::account_identity_proof::{
-    AccountIdentityProofRequest, AccountIdentityProofSigner,
-};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel, TransportKind,
 };
 use cgka_traits::engine::{SendIntent, SendResult};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::storage::{GroupStorage, MessageStorage};
-use cgka_traits::{CgkaEngine, CommitOrderingPriority};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
+use cgka_traits::{CgkaEngine, CommitOrderingPriority, GroupStorage};
 use proptest::prelude::*;
 
 const REACTIONS_PROPOSAL: u16 = 0xF210;
@@ -77,46 +71,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     let n = name.len().min(32);
     out[..n].copy_from_slice(&name[..n]);
     out
-}
-
-fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
-    use sha2::{Digest, Sha256};
-    let mut counter = 0_u64;
-    loop {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-cgka-conformance-nostr-key-v1");
-        hasher.update(seed);
-        hasher.update(counter.to_be_bytes());
-        let secret = hasher.finalize();
-        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
-            return keys;
-        }
-        counter = counter
-            .checked_add(1)
-            .expect("deterministic Nostr key search exhausted");
-    }
-}
-
-#[derive(Clone)]
-struct NostrAccountIdentityProofSigner {
-    keys: nostr::Keys,
-}
-
-impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
-    fn sign_account_identity_proof(
-        &self,
-        request: &AccountIdentityProofRequest,
-    ) -> Result<[u8; 64], String> {
-        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
-            return Err("request account identity does not match proptest key".into());
-        }
-        let event = request.proof_event().and_then(|event| {
-            event
-                .sign_with_keys(&self.keys)
-                .map_err(|err| err.to_string())
-        })?;
-        request.signature_from_signed_event(event)
-    }
 }
 
 fn registry() -> FeatureRegistry {
@@ -490,6 +444,7 @@ fn canonical_policy() -> CanonicalizationPolicy {
         },
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
+        max_convergence_pass_ms: 5_000,
     }
 }
 
@@ -1340,40 +1295,15 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
             .ingest(commit)
             .await
             .expect("observer buffers stored convergence input");
-
-        clients[2]
-            .storage()
-            .create_group_snapshot(&group_id, "restart-equivalence")
-            .expect("pre-convergence snapshot");
-        let live_result = clients[2]
-            .engine
-            .converge_stored_openmls_messages(&group_id, 1_000_000)
-            .expect("live convergence");
+        clients[2].freeze_convergence_pass(&group_id);
+        clients[2].checkpoint_convergence(&group_id, "restart-equivalence");
+        let live_result = clients[2].converge_stored_at(&group_id, 1_000_000);
         let live_epoch = clients[2].epoch().0;
-        let live_group = clients[2].storage().get_group(&group_id).unwrap();
+        let live_name = clients[2].group_name();
+        let live_member_count = clients[2].members().len();
 
-        clients[2]
-            .storage()
-            .rollback_group_to_snapshot(&group_id, "restart-equivalence")
-            .expect("rollback to pre-convergence snapshot");
-        let restarted_seed = pad32(b"client-2");
-        let restarted_keys = deterministic_nostr_keys(&restarted_seed);
-        let restarted_identity = restarted_keys.public_key().to_bytes().to_vec();
-        let restarted_storage = clients[2].storage().clone();
-        let mut restarted = EngineBuilder::new(restarted_storage.clone())
-            .legacy_compatibility_profile()
-            .identity(restarted_identity.clone())
-            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-                keys: restarted_keys,
-            }))
-            .feature_registry(registry())
-            .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::new()))
-            .build()
-            .expect("restarted engine builds");
-        let restarted_result = restarted
-            .converge_stored_openmls_messages(&group_id, 1_000_000)
-            .expect("restarted convergence");
-        let restarted_group = restarted_storage.get_group(&group_id).unwrap();
+        clients[2].restore_convergence_checkpoint("restart-equivalence");
+        let restarted_result = clients[2].converge_stored_at(&group_id, 1_000_000);
 
         prop_assert(
             restarted_result,
@@ -1381,18 +1311,18 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
             "restart should not change stored convergence result",
         );
         prop_assert(
-            restarted.epoch(&group_id).unwrap().0,
+            clients[2].epoch().0,
             live_epoch,
             "restart should not change converged epoch",
         );
         prop_assert(
-            restarted_group.name,
-            live_group.name,
+            clients[2].group_name(),
+            live_name,
             "restart should not change converged group name",
         );
         prop_assert(
-            restarted_group.members.len(),
-            live_group.members.len(),
+            clients[2].members().len(),
+            live_member_count,
             "restart should not change converged membership",
         );
     });
@@ -1530,8 +1460,8 @@ fn true_same_id_replay(payload: Vec<u8>) {
             .filter(|o| {
                 matches!(
                     o,
-                    Ok(IngestOutcome::Stale {
-                        reason: StaleReason::AlreadySeen
+                    Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::Duplicate
                     })
                 )
             })

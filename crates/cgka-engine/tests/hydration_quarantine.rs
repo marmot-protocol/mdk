@@ -13,10 +13,10 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    StoredKeyPackageBundle, WelcomeStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage,
+    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
+    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -553,6 +553,30 @@ impl KeyPackageBundleStorage for FlakyGroupRecordStorage {
     }
 }
 
+impl ConvergencePassStorage for FlakyGroupRecordStorage {
+    fn convergence_pass(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DurableConvergencePass>> {
+        self.inner.convergence_pass(group_id)
+    }
+
+    fn put_convergence_pass(
+        &self,
+        pass: &cgka_traits::DurableConvergencePass,
+    ) -> StorageResult<()> {
+        self.inner.put_convergence_pass(pass)
+    }
+
+    fn list_convergence_passes(&self) -> StorageResult<Vec<cgka_traits::DurableConvergencePass>> {
+        self.inner.list_convergence_passes()
+    }
+
+    fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_convergence_pass(group_id)
+    }
+}
+
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
@@ -1035,8 +1059,8 @@ async fn quarantined_group_rejects_valid_inbound_commit_on_do_ingest() {
     assert!(
         matches!(
             outcome,
-            cgka_traits::ingest::IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::Quarantined
+            cgka_traits::ingest::IngestOutcome::LocalState {
+                state: cgka_traits::ingest::LocalIngestState::Quarantined
             }
         ),
         "expected Stale::Quarantined, got {outcome:?}"
@@ -1170,8 +1194,8 @@ async fn repair_replays_buffered_commit_and_group_catches_up() {
         .expect("ingest classifies");
     assert!(matches!(
         outcome,
-        cgka_traits::ingest::IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::Quarantined
+        cgka_traits::ingest::IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::Quarantined
         }
     ));
 
@@ -1329,8 +1353,8 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
         .expect("quarantine gate classifies");
     assert!(matches!(
         outcome,
-        cgka_traits::ingest::IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::Quarantined
+        cgka_traits::ingest::IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::Quarantined
         }
     ));
     let deferred_before = alice_storage

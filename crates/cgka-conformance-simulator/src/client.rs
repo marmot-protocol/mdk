@@ -7,7 +7,7 @@ use crate::bus::{ClientId, TransportBus};
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
-use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationResult};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -24,8 +24,10 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::{ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -56,6 +58,7 @@ pub struct HarnessClient {
     /// Shared in-memory capture of the engine's forensic audit events, used to
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
+    convergence_checkpoints: HashMap<String, (GroupId, DurableConvergencePass)>,
 }
 
 pub struct ClientBuilder {
@@ -161,6 +164,7 @@ impl ClientBuilder {
             default_group: None,
             app_event_counter: 0,
             audit_capture,
+            convergence_checkpoints: HashMap::new(),
         }
     }
 }
@@ -327,6 +331,66 @@ impl HarnessClient {
             .expect("engine hydrates from storage");
         self.engine = engine;
         self.pending_events.clear();
+    }
+
+    /// Freeze the current durable pass at its quiescence boundary. This is a
+    /// harness-level restart fault operation; scenarios should not reach into
+    /// engine storage to manufacture the boundary themselves.
+    pub fn freeze_convergence_pass(&mut self, group_id: &GroupId) {
+        let mut pass = self
+            .storage
+            .convergence_pass(group_id)
+            .expect("load durable convergence pass")
+            .expect("durable convergence pass exists");
+        pass.phase = ConvergencePassPhase::Frozen;
+        pass.cutoff_cause = Some(ConvergenceCutoffCause::Quiescence);
+        pass.frozen_at_wall_ms = Some(pass.quiescence_deadline_wall_ms);
+        self.storage
+            .put_convergence_pass(&pass)
+            .expect("persist frozen convergence pass");
+    }
+
+    /// Snapshot group state and separately retain the pass row, which group
+    /// epoch snapshots intentionally exclude.
+    pub fn checkpoint_convergence(&mut self, group_id: &GroupId, name: &str) {
+        let pass = self
+            .storage
+            .convergence_pass(group_id)
+            .expect("load convergence pass for checkpoint")
+            .expect("checkpoint requires a convergence pass");
+        self.storage
+            .create_group_snapshot(group_id, name)
+            .expect("create convergence group snapshot");
+        self.convergence_checkpoints
+            .insert(name.to_owned(), (group_id.clone(), pass));
+    }
+
+    /// Restore a harness convergence checkpoint, including the pass row omitted
+    /// from the group epoch snapshot, then rebuild the engine over the restored
+    /// durable state.
+    pub fn restore_convergence_checkpoint(&mut self, name: &str) {
+        let (group_id, pass) = self
+            .convergence_checkpoints
+            .get(name)
+            .cloned()
+            .expect("convergence checkpoint exists");
+        self.storage
+            .with_transaction(|storage| {
+                storage.rollback_group_to_snapshot(&group_id, name)?;
+                storage.put_convergence_pass(&pass)
+            })
+            .expect("atomically restore convergence checkpoint");
+        self.restart();
+    }
+
+    pub fn converge_stored_at(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> CanonicalizationResult {
+        self.engine
+            .converge_stored_openmls_messages(group_id, now_ms)
+            .expect("stored convergence succeeds")
     }
 
     /// Drain the `convergence_decision` events the engine has emitted since the

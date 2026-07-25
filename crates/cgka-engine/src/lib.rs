@@ -22,6 +22,7 @@
 //! - [`group_lifecycle`] - `create_group`, `join_welcome`, group records.
 //! - [`message_processor`] - inbound `ingest` and outbound `send`.
 //! - [`distributed_convergence`] - stored-message convergence entry points.
+//! - `convergence_input` - role-aware convergence scheduling classification.
 //! - [`canonicalization`] and [`convergence`] - executable policy model.
 //! - [`openmls_projection`] - bytes-first bridge between OpenMLS and the model.
 //! - [`epoch_manager`] - per-group state transitions and pending references.
@@ -42,6 +43,7 @@ pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
 pub mod convergence;
+pub(crate) mod convergence_input;
 pub mod distributed_convergence;
 pub mod engine;
 pub mod engine_metrics;

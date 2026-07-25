@@ -4,7 +4,7 @@
 use super::content_dedup_id;
 use crate::engine::Engine;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -16,8 +16,8 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
         if self.storage.has_ingress_dedup_marker(id)? {
-            return Ok(Some(IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen,
+            return Ok(Some(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
             }));
         }
         let record = match self.storage.get_message(id) {
@@ -27,8 +27,8 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let outcome = match record.state {
-            MessageState::Sent => IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho,
+            MessageState::Sent => IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho,
             },
             MessageState::Created | MessageState::Retryable => IngestOutcome::Buffered {
                 group_id: record.group_id,
@@ -36,8 +36,8 @@ impl<S: StorageProvider> Engine<S> {
             },
             MessageState::PeelDeferred => return Ok(None),
             MessageState::Processed | MessageState::Failed | MessageState::EpochInvalidated => {
-                IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
                 }
             }
         };

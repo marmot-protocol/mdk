@@ -20,12 +20,25 @@ use serde::{Deserialize, Serialize};
 pub const V1_APP_MESSAGE_PAST_EPOCH_LIMIT: u64 = 5;
 /// Adopted v1 settlement quiescence window, in milliseconds.
 pub const V1_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
+/// Adopted v1 absolute convergence-pass cap, in milliseconds.
+pub const V1_MAX_CONVERGENCE_PASS_MS: u64 = 5_000;
+
+const fn v1_max_convergence_pass_ms() -> u64 {
+    V1_MAX_CONVERGENCE_PASS_MS
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizationPolicy {
     pub convergence: ConvergencePolicy,
     pub app_message_past_epoch_limit: u64,
     pub settlement_quiescence_ms: u64,
+    /// Immutable upper bound from pass admission to the frozen selection set.
+    ///
+    /// The serde default is only for records written before this field existed;
+    /// policy validation still requires exact equality with the adopted v1
+    /// policy.
+    #[serde(default = "v1_max_convergence_pass_ms")]
+    pub max_convergence_pass_ms: u64,
 }
 
 impl Default for CanonicalizationPolicy {
@@ -34,6 +47,7 @@ impl Default for CanonicalizationPolicy {
             convergence: ConvergencePolicy::default(),
             app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
             settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
+            max_convergence_pass_ms: V1_MAX_CONVERGENCE_PASS_MS,
         }
     }
 }
@@ -1051,6 +1065,7 @@ mod witness_window_tests {
                 },
                 app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
                 settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
+                max_convergence_pass_ms: V1_MAX_CONVERGENCE_PASS_MS,
             }
         );
         assert!(CanonicalizationPolicy::default().ensure_pinned_v1().is_ok());

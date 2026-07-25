@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-23
+updated: 2026-07-25
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -34,6 +34,11 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 - **Encrypted Media V2** — `marmot.group.encrypted-media.v2`, with frozen V1 support for already-joined legacy groups
 - **MIP-05** — Push Notifications
 
+**Implemented engine contracts:**
+
+- **Distributed convergence** — deterministic branch selection for unordered transport input, including the durable
+  frozen-pass boundary, in [`../distributed-convergence.md`](../distributed-convergence.md)
+
 **In PR / design:**
 
 - **MIP-06** — Multi-Device Support
@@ -41,11 +46,14 @@ CGKA engine/convergence workspace here is being shaped into spec text.
   [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
 - **CGKA engine canonicalization** — post-peeling commit/proposal/app-message contract in
   [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
-- **Distributed convergence** — deterministic branch selection for unordered transport input in
-  [`../distributed-convergence.md`](../distributed-convergence.md)
 
 The current spec pressure point is commit ordering. MLS wants one ordered commit log; Nostr and other transports may
 deliver unordered, duplicated, delayed input. The engine contract is where that mismatch gets resolved.
+
+MDK now persists a per-group frozen convergence pass around that selector. The pass closes at the earlier of the pinned
+one-second selection-relevant quiescence window and five-second absolute cap, resumes safely across restart, resolves
+only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
+another group.
 
 ## Protocol implementations
 

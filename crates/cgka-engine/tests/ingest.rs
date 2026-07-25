@@ -11,7 +11,9 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{
+    IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::storage::{MessageStorage, StorageError};
@@ -583,8 +585,8 @@ async fn ingest_unknown_group_message_returns_unknown_group() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::UnknownGroup
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::UnknownGroup
         }
     ));
 }
@@ -605,8 +607,8 @@ async fn ingest_welcome_for_another_client_returns_not_for_this_client() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::NotForThisClient
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient
         }
     ));
 }
@@ -629,8 +631,8 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
     let outcome = engine.ingest(msg).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
 }
@@ -671,8 +673,8 @@ async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
         .expect("poisoned welcome must not hard-error after restart");
     assert!(matches!(
         replay,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
 }
@@ -717,8 +719,8 @@ async fn rewrapped_identical_welcome_uses_content_dedup() {
     let outcome = bob.ingest(rewrapped).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
     assert!(
@@ -874,7 +876,7 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
 
 async fn assert_typed_terminal_transport_rejection(
     rejection: BoundaryRejection,
-    expected_reason: StaleReason,
+    expected_outcome: IngestOutcome,
 ) {
     let mut alice = build_client(b"alice-terminal-rejection");
     let mut bob = build_client_with_peeler(
@@ -921,12 +923,7 @@ async fn assert_typed_terminal_transport_rejection(
         .ingest(rejected.clone())
         .await
         .expect("boundary rejection is terminal input, not a drain failure");
-    assert_eq!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: expected_reason
-        }
-    );
+    assert_eq!(outcome, expected_outcome);
 
     let duplicate = bob
         .ingest(rejected)
@@ -934,8 +931,8 @@ async fn assert_typed_terminal_transport_rejection(
         .expect("redelivery short-circuits after terminal rejection");
     assert!(matches!(
         duplicate,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     ));
 }
@@ -943,7 +940,7 @@ async fn assert_typed_terminal_transport_rejection(
 async fn assert_snapshot_fallback_terminal_transport_rejection(
     rejection: BoundaryRejection,
     initial_failure: InitialPeelFailure,
-    expected_reason: StaleReason,
+    expected_outcome: IngestOutcome,
 ) {
     let mut alice = build_client(b"alice-snapshot-boundary-rejection");
     let live_epoch = 2u64;
@@ -1021,12 +1018,7 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         .ingest(rejected.clone())
         .await
         .expect("snapshot-fallback boundary rejection is terminal, not a drain failure");
-    assert_eq!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: expected_reason
-        }
-    );
+    assert_eq!(outcome, expected_outcome);
 
     let duplicate = bob
         .ingest(rejected)
@@ -1034,8 +1026,8 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         .expect("redelivery short-circuits after snapshot-fallback rejection");
     assert_eq!(
         duplicate,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     );
 }
@@ -1044,7 +1036,9 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
 async fn invalid_transport_signature_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
-        StaleReason::PeelFailed,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        },
     )
     .await;
 }
@@ -1053,7 +1047,9 @@ async fn invalid_transport_signature_is_typed_terminal_input() {
 async fn wrong_transport_recipient_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::WrongRecipient,
-        StaleReason::NotForThisClient,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
     )
     .await;
 }
@@ -1084,8 +1080,8 @@ async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
         .expect("wrong-recipient welcome is terminal input, not a drain failure");
     assert_eq!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::NotForThisClient
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient
         }
     );
 
@@ -1095,8 +1091,8 @@ async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
         .expect("redelivery short-circuits after wrong-recipient welcome");
     assert_eq!(
         duplicate,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
         }
     );
 }
@@ -1106,7 +1102,9 @@ async fn invalid_transport_signature_after_decrypt_failed_fallback_is_terminal()
     assert_snapshot_fallback_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
         InitialPeelFailure::DecryptFailed,
-        StaleReason::PeelFailed,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        },
     )
     .await;
 }
@@ -1116,7 +1114,9 @@ async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
     assert_snapshot_fallback_terminal_transport_rejection(
         BoundaryRejection::WrongRecipient,
         InitialPeelFailure::StaleEpoch,
-        StaleReason::NotForThisClient,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
     )
     .await;
 }
@@ -1268,7 +1268,10 @@ async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_
     alice.publish_failed(staged).await.unwrap();
     let after_replay = alice.ingest(garbage).await.unwrap();
     assert!(
-        matches!(after_replay, IngestOutcome::Stale { .. }),
+        matches!(
+            after_replay,
+            IngestOutcome::Stale { .. } | IngestOutcome::Ignored { .. }
+        ),
         "a malformed message must land terminal once classified — a \
          `Buffered` here means the stored row is still non-terminal and \
          perpetually reported as pending, got {after_replay:?}"
@@ -1460,8 +1463,8 @@ async fn ingest_own_created_message_returns_own_echo() {
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::OwnEcho
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::OwnEcho
         }
     ));
     let _ = (bob, create);
@@ -1658,8 +1661,8 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::OwnEcho
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho
             }
         ),
         "re-wrapped own OpenMLS echo after restart must be OwnEcho, got {outcome:?}"
@@ -2135,8 +2138,8 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
     assert!(
         matches!(
             bob.ingest(rewrapped).await.unwrap(),
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadySeen
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
             }
         ),
         "re-wrapped duplicate MLS message must be classified AlreadySeen"

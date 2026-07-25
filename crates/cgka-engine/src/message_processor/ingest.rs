@@ -1,10 +1,10 @@
 //! Inbound ingest path for [`Engine`]: peel, classify, apply or buffer.
 //!
 //! Inbound messages are peeled, classified, stored, and either applied or
-//! buffered for convergence. Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })`; authenticated protocol-admission
-//! failures return `Ok(IngestOutcome::Rejected { .. })`. `Err` is reserved for
-//! storage, peeler, serialization, and unclassified OpenMLS failures.
+//! buffered for convergence. Routing/dedup exclusions, local canonical state,
+//! stale convergence input, and authenticated proposal rejection are distinct
+//! typed outcomes. `Err` is reserved for storage, peeler, serialization, and
+//! unclassified OpenMLS failures.
 
 use super::{content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
@@ -24,7 +24,10 @@ use cgka_traits::engine::{
     GroupStateInvalidationReason,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, ProposalRejectionCategory, StaleReason};
+use cgka_traits::ingest::{
+    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
+    ProposalRejectionCategory, StaleReason,
+};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -90,8 +93,8 @@ impl<S: StorageProvider> Engine<S> {
         // member assumption. `NotForThisClient` also makes routing failures
         // easier to distinguish from decryption failures.
         if &recipient != self.identity.self_id() {
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::NotForThisClient,
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::WrongRecipient,
             });
         }
 
@@ -107,14 +110,14 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(EngineError::WelcomeAlreadyProcessed) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
+                Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
                 })
             }
             Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::NotForThisClient,
+                Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::WrongRecipient,
                 })
             }
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
@@ -179,8 +182,8 @@ impl<S: StorageProvider> Engine<S> {
                     },
                 );
             }
-            return Ok(IngestOutcome::Stale {
-                reason: StaleReason::Quarantined,
+            return Ok(IngestOutcome::LocalState {
+                state: LocalIngestState::Quarantined,
             });
         }
 
@@ -215,8 +218,8 @@ impl<S: StorageProvider> Engine<S> {
                         EpochId(0),
                         MessageState::Retryable,
                     )?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::UnknownGroup,
+                    return Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::UnknownGroup,
                     });
                 }
                 Err(e) => {
@@ -244,8 +247,8 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Failed,
                 )?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::SelfEvicted,
+                return Ok(IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed,
                 });
             }
             if !self.epoch_manager.can_ingest(&group_id) {
@@ -343,11 +346,11 @@ impl<S: StorageProvider> Engine<S> {
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
-                            return self.terminal_peel_rejection_stale(
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "wrong_recipient_snapshot_fallback",
-                                StaleReason::NotForThisClient,
+                                InputRejectionCategory::WrongRecipient,
                             );
                         }
                         Err(e) => return Err(e),
@@ -454,11 +457,11 @@ impl<S: StorageProvider> Engine<S> {
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
-                            return self.terminal_peel_rejection_stale(
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "wrong_recipient_snapshot_fallback",
-                                StaleReason::NotForThisClient,
+                                InputRejectionCategory::WrongRecipient,
                             );
                         }
                         Err(e) => return Err(e),
@@ -535,11 +538,11 @@ impl<S: StorageProvider> Engine<S> {
                     );
                 }
                 Err(PeelerError::WrongRecipient) => {
-                    return self.terminal_peel_rejection_stale(
+                    return self.terminal_peel_rejection_ignored(
                         &raw_msg_id,
                         &msg.id,
                         "wrong_recipient",
-                        StaleReason::NotForThisClient,
+                        InputRejectionCategory::WrongRecipient,
                     );
                 }
                 Err(e) => return Err(EngineError::Peeler(e)),
@@ -580,13 +583,13 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(outcome);
             }
             if self.seen_message_ids.contains(&content_id) {
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::AlreadySeen,
+                return Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
                 });
             }
             if self.sent_message_ids.contains(&content_id) {
-                return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::OwnEcho,
+                return Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::OwnEcho,
                 });
             }
             let content_msg = TransportMessage {
@@ -696,9 +699,14 @@ impl<S: StorageProvider> Engine<S> {
                     })?;
                     let within_rewind_horizon = current_epoch.0.saturating_sub(msg_epoch.0)
                         <= policy.convergence.max_rewind_commits;
+                    let active_pass = self
+                        .storage
+                        .convergence_pass(&group_id)?
+                        .is_some_and(|pass| pass.is_active());
                     within_rewind_horizon
-                        && !self.epoch_manager.we_committed_from(&group_id, msg_epoch)
-                        && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?
+                        && (active_pass
+                            || (!self.epoch_manager.we_committed_from(&group_id, msg_epoch)
+                                && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?))
                 }
             } else {
                 false
@@ -887,8 +895,8 @@ impl<S: StorageProvider> Engine<S> {
                     // OpenMLS signal itself.
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     self.realize_self_eviction(&group_id, current_epoch)?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::SelfEvicted,
+                    return Ok(IngestOutcome::LocalState {
+                        state: LocalIngestState::Removed,
                     });
                 }
                 Err(e) => {
@@ -1475,8 +1483,8 @@ impl<S: StorageProvider> Engine<S> {
                         "own_echo",
                     )?;
                     self.seen_message_ids.insert(msg.id.clone());
-                    Ok(IngestOutcome::Stale {
-                        reason: StaleReason::OwnEcho,
+                    Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::OwnEcho,
                     })
                 }
                 ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
@@ -1977,6 +1985,18 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    fn terminal_peel_rejection_ignored(
+        &mut self,
+        raw_msg_id: &MessageId,
+        msg_id: &MessageId,
+        reason: &'static str,
+        category: InputRejectionCategory,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        self.seen_message_ids.insert(msg_id.clone());
+        Ok(IngestOutcome::Ignored { category })
+    }
+
     /// Whether `msg_epoch` predates this device's membership in `group_id`
     /// (mdk#339): such a message was never decryptable here by design —
     /// OpenMLS holds no secrets for epochs before the welcome — so it is
@@ -2389,8 +2409,8 @@ fn convergence_ingest_outcome(
         .iter()
         .any(|seen| seen.message_id == message_id || seen.message_id == content_message_id)
     {
-        return IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen,
+        return IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate,
         };
     }
 

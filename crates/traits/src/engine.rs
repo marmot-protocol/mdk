@@ -580,9 +580,10 @@ pub trait CgkaEngine: Send + Sync {
     /// [`IngestOutcome::Buffered`] and replay once the state returns to
     /// `Stable`.
     ///
-    /// **Errors.** `UnknownGroup`, `Peeler`, `ForkedEpoch`, `Backend`. Stale
-    /// / duplicate / not-for-us messages return
-    /// `Ok(IngestOutcome::Stale { .. })`, **not** `Err`.
+    /// **Errors.** `UnknownGroup`, `Peeler`, `ForkedEpoch`, `Backend`.
+    /// Duplicate/routing exclusions return `Ignored`, canonical local blocks
+    /// return `LocalState`, and stale convergence dispositions return `Stale`;
+    /// none are `Err`.
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError>;
 
     /// Drain ordered `GroupEvent`s produced since the last drain. Application
@@ -610,6 +611,19 @@ pub trait CgkaEngine: Send + Sync {
     /// these groups through the same convergence timer they use for
     /// [`IngestOutcome::Buffered`].
     fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId>;
+
+    /// Prepare this group's durable pass and return its remaining process-local
+    /// cutoff delay.
+    ///
+    /// This command may open a pass for eligible retained input, consume a
+    /// dormant fairness slot, or persist restart deadline rebasing. `None`
+    /// means no eligible pass is active. Applications use it only to arm
+    /// independent per-group timers; it is not a diagnostic query or a
+    /// branch-selection input.
+    fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError>;
 
     // ── Outbound ────────────────────────────────────────────────────────────
 

@@ -63,6 +63,15 @@ impl WallClock for SystemWallClock {
                 .as_secs(),
         )
     }
+
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -174,7 +183,7 @@ pub struct Engine<S: StorageProvider> {
     /// and dropped in `do_publish_failed`.
     pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
 
-    /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
+    /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
     /// Bounded hot-process cache in front of the authoritative durable
     /// `MessageRecord` store (checked first in `do_ingest`), so an id that ages
@@ -187,7 +196,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
-    /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
+    /// `invite`. Backs the typed own-echo exclusion when a message we produced
     /// bounces back via ingest before we filter it client-side.
     ///
     /// Bounded hot-process cache; see `seen_message_ids` above.
@@ -226,8 +235,11 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
-    pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
     pub(crate) convergence_clock_started_at: Instant,
+    /// Identifies the process-local monotonic clock domain persisted in active
+    /// convergence passes. A mismatch on hydration forces deadline rebasing
+    /// from the required millisecond wall clock.
+    pub(crate) convergence_clock_instance_id: u64,
 
     /// Diagnostic post-settle reorg telemetry. Recorded at the convergence
     /// apply site and exposed via [`Engine::engine_metrics`]. Never an input to
@@ -497,8 +509,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 app_message_past_epoch_limit: self.max_past_epochs as u64,
                 ..crate::canonicalization::CanonicalizationPolicy::default()
             },
-            last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
+            convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
             audit_operation_counter: 0,
@@ -2268,6 +2280,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId> {
         self.pending_convergence_groups.drain().collect()
+    }
+
+    fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError> {
+        Engine::prepare_convergence_cutoff_delay_ms(self, group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence cutoff: {error}")))
     }
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {

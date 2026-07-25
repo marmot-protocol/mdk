@@ -176,7 +176,7 @@ impl TransportBus {
     /// specific client's mailbox, bypassing the queue + delivery policy.
     /// This is the hook the proptest "true same-id replay" property uses
     /// to deliver an identical message twice and prove the engine's
-    /// `StaleReason::AlreadySeen` dedup fires.
+    /// the typed duplicate exclusion fires.
     pub fn inject(&self, client: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(mb) = inner.mailboxes.get_mut(&client) {

@@ -13,7 +13,7 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, LocalIngestState, PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -1017,8 +1017,8 @@ async fn post_eviction_message_realizes_self_removal_and_returns_self_evicted() 
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::SelfEvicted
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
             }
         ),
         "post-eviction input must classify SelfEvicted; got {outcome:?}"
@@ -1078,8 +1078,8 @@ async fn realization_with_pending_leave_request_attributes_member_left() {
     let outcome = bob.ingest(routed_app).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::SelfEvicted
+        IngestOutcome::LocalState {
+            state: LocalIngestState::Removed
         }
     ));
     let bob_events = bob.drain_events();
@@ -1225,8 +1225,8 @@ async fn drain_on_removed_copy_discards_queued_intents_without_error() {
     let outcome = bob.ingest(routed_app).await.unwrap();
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::SelfEvicted
+        IngestOutcome::LocalState {
+            state: LocalIngestState::Removed
         }
     ));
     assert!(
@@ -1283,8 +1283,8 @@ async fn second_post_eviction_message_is_self_evicted_without_duplicate_notifica
         assert!(
             matches!(
                 outcome,
-                IngestOutcome::Stale {
-                    reason: StaleReason::SelfEvicted
+                IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed
                 }
             ),
             "round {round}: post-eviction input stays SelfEvicted; got {outcome:?}"
@@ -1313,8 +1313,8 @@ async fn missed_removal_commit_without_evidence_is_not_self_evicted() {
     assert!(
         !matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::SelfEvicted
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
             }
         ),
         "undecryptable input without authenticated evidence must not be SelfEvicted; got {outcome:?}"

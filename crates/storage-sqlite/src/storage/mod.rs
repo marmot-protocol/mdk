@@ -1,5 +1,6 @@
 mod account_device_signer;
 mod capabilities;
+mod convergence_passes;
 mod convergence_policy;
 mod groups;
 mod leave_requests;

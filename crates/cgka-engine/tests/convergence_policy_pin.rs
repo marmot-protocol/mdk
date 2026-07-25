@@ -121,6 +121,19 @@ fn default_build_set_convergence_policy_rejects_non_pinned() {
 
 #[cfg(not(feature = "test-policy-overrides"))]
 #[test]
+fn default_build_rejects_non_pinned_absolute_pass_cap() {
+    let mut engine = build_engine();
+    let err = engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            max_convergence_pass_ms: 5_001,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect_err("normal builds must pin the absolute pass cap");
+    assert!(matches!(err, OpenMlsProjectionError::InvalidPolicy(_)));
+}
+
+#[cfg(not(feature = "test-policy-overrides"))]
+#[test]
 fn default_build_builder_rejects_non_default_max_past_epochs() {
     let result = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(valid_identity(b"pin-policy-epochs"))

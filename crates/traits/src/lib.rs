@@ -9,6 +9,7 @@ pub mod agent_text_stream;
 pub mod app_components;
 pub mod app_event;
 pub mod capabilities;
+pub mod convergence_pass;
 pub mod engine;
 pub mod engine_state;
 pub mod error;
@@ -65,6 +66,10 @@ pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
+pub use convergence_pass::{
+    ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
+    DurableConvergencePass,
+};
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
     GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource, SendIntent, SendResult,
@@ -78,7 +83,8 @@ pub use error::{EngineError, PeelerError};
 pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{
-    IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
+    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent, PeeledMessage,
+    ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
@@ -91,9 +97,9 @@ pub use maintenance::{
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
-    CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    CapabilityStorage, ConvergencePassStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
+    MaintenanceStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,

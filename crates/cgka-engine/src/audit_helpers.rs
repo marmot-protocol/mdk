@@ -12,7 +12,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
@@ -65,11 +65,14 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
+        IngestOutcome::Ignored { .. } => "ignored",
+        IngestOutcome::LocalState { .. } => "local_state",
         IngestOutcome::Stale { .. } => "stale",
         IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 
+#[allow(deprecated)]
 pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
     match reason {
         StaleReason::AlreadySeen => "already_seen",
@@ -439,6 +442,22 @@ pub(crate) fn ingest_outcome_event(
         outcome_kind: ingest_outcome_kind_str(outcome).to_string(),
         stale_reason: match outcome {
             IngestOutcome::Stale { reason } => Some(stale_reason_str(reason).to_string()),
+            IngestOutcome::Ignored { category } => Some(
+                match category {
+                    InputRejectionCategory::Duplicate => "duplicate",
+                    InputRejectionCategory::OwnEcho => "own_echo",
+                    InputRejectionCategory::WrongRecipient => "wrong_recipient",
+                    InputRejectionCategory::UnknownGroup => "unknown_group",
+                }
+                .to_string(),
+            ),
+            IngestOutcome::LocalState { state } => Some(
+                match state {
+                    LocalIngestState::Removed => "removed",
+                    LocalIngestState::Quarantined => "quarantined",
+                }
+                .to_string(),
+            ),
             IngestOutcome::Rejected { category } => {
                 Some(crate::app_components::proposal_rejection_category_tag(*category).to_string())
             }
