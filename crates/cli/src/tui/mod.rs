@@ -66,12 +66,20 @@ const MEDIA_IMAGE_ROWS: u16 = 8;
 /// images) would spike process/thread pressure. The remainder stay untracked
 /// and are slotted on later ticks as running downloads complete.
 const MEDIA_MAX_IN_FLIGHT: usize = 3;
-/// How many decoded images stay retained in memory for the full-size viewer on
-/// pixel-capable terminals. Each retained copy is decode-capped (at most
-/// ~11.8 MB RGBA), so four bound the viewer's worst-case footprint at ~47 MB
-/// while comfortably covering the freshest arrivals (`MEDIA_MAX_IN_FLIGHT`
-/// admits three at a time). Opening an evicted image's viewer falls back to
-/// the cell-exact halfblock popup.
+/// How many decoded images stay retained in memory for the full-size viewer, on
+/// every image-capable terminal — pixel or halfblock-only. A halfblock terminal
+/// still needs its own dedicated popup instance (drawing at popup size must not
+/// re-resize the shared inline protocol), so it carries the same pool a pixel
+/// terminal does. Each retained copy is decode-capped (at most ~11.8 MB RGBA),
+/// so four bound the viewer pool's worst-case footprint at ~47 MB while
+/// comfortably covering the freshest arrivals (`MEDIA_MAX_IN_FLIGHT` admits
+/// three at a time). Opening an evicted image's viewer falls back to the
+/// cell-exact halfblock popup. This ~47 MB bounds the viewer pool only: the
+/// inline `protocols`/`statuses` maps (see `media.rs`) retain one decode-capped
+/// entry per image ever scrolled past for the life of the session, so only the
+/// per-image decode cost is bounded, never the aggregate. LRU-bounding that
+/// inline retention needs re-download support (status un-tracking plus
+/// re-entrant downloads) and is a deliberate follow-up, not this change.
 const MEDIA_VIEWER_RETAINED_IMAGES: usize = 4;
 const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
 /// Cap on the notification-key dedup set. Dedup only needs to cover the recent

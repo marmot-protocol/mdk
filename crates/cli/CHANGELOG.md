@@ -173,7 +173,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   decode, so neither the inline preview nor any retained copy ever holds an unbounded camera-photo pixel buffer.
   Separately, viewer pixels are retained in memory only: at most four viewer copies are kept (oldest evicted first,
   worst case ~47 MB), so the decrypted download artifact is still removed right after decode and nothing is written
-  back to disk. The Lanczos3 downscale runs synchronously on the render thread and is cached per target size, so
+  back to disk. That ~47 MB bounds the viewer pool only. The inline image maps are decode-capped per image but not
+  bounded in aggregate: every image scrolled past keeps one decode-capped protocol (at most ~11.8 MB) alive for the
+  life of the session, so the session ceiling is ~47 MB plus that per-image cost times the images ever rendered, not
+  ~47 MB flat. LRU-bounding that inline retention needs re-download support (status un-tracking plus re-entrant
+  downloads) and is a deliberate follow-up, not this change. The Lanczos3 downscale runs synchronously on the render
+  thread and is cached per target size, so
   scrolling never re-resizes; changing the terminal width does re-resize every visible image on that one frame, an
   accepted cost of the sharper preview. Halfblock-only terminals, and evicted images, keep the cell-exact viewer popup.
 

@@ -115,6 +115,15 @@ pub(crate) struct MediaState {
     /// and dropped when it closes. Keyed by hash so a stale popup for another
     /// image can never draw it.
     viewer_protocol: Option<(String, StatefulProtocol)>,
+    /// Per-hash download/decode status and inline half-block protocol for every
+    /// image rendered this session. Both are insert-only: each entry is
+    /// decode-capped (the protocol holds at most a ~11.8 MB decoded image plus
+    /// its encoded payload), but neither map is pruned on chat switch or
+    /// scrollback trim, so inline retention is unbounded in aggregate across a
+    /// session — only the per-image cost is capped, not the total. Bounding it
+    /// needs re-download support (status un-tracking plus re-entrant downloads),
+    /// a deliberate follow-up, so the `MEDIA_VIEWER_RETAINED_IMAGES` ~47 MB bound
+    /// covers the viewer pool only.
     statuses: HashMap<String, MediaStatus>,
     protocols: HashMap<String, StatefulProtocol>,
     tx: Sender<MediaLoad>,
