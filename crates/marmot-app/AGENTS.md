@@ -52,9 +52,13 @@ App runtime bridge for the first real Marmot app surfaces.
   reused by `key_package_records.rs`, and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
-  lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.
-- Keep directory search bounded over cached follow edges. Do not add web-of-trust scoring unless that is reopened as a
-  deliberate product decision.
+  lists, relay lists, and KeyPackages. Web-of-trust search may traverse the live follow graph, but traversal is bounded
+  by construction: a capped search radius, a per-radius candidate cap, a per-radius fetch timeout, batched
+  author-scoped fetches with bounded concurrency, and a per-search lifecycle — traversal runs only while a search
+  subscription is live and stops as soon as its consumer drops. There is no background or open-ended crawl.
+- Keep web-of-trust search results un-promoted. Strangers discovered by search are never written to `directory_users`
+  and must never reach `directory_sync_plan` or live per-author subscriptions (mdk#687); cache them only in the
+  un-promoted `directory_search_graph_users` tier, which directory sync never reads.
 - Keep runtime directory subscriptions chunked and privacy-safe. Subscription identifiers must not embed raw pubkeys.
 - Treat Marmot kind `30443` KeyPackages as cached last-resort packages. Normal publish should reuse the cached valid
   package and stable replaceable d-tag; expired or policy-invalid packages rotate to a fresh package ref.
