@@ -184,6 +184,11 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // mdk#971: sync a durable Unrecoverable halt into memory before the
+        // can_ingest gate so a restart cannot accept group-state changes on an
+        // unrepaired base. Runs before the OpenMLS provider borrow below.
+        let _ = self.sync_unrecoverable_halt_from_storage(&group_id)?;
+
         let mut pending_recovery: Option<(
             EpochId,
             CommitOrderingKey,

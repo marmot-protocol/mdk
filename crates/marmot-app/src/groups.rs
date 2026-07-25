@@ -109,6 +109,11 @@ pub struct AppGroupRecord {
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
     pub self_membership: SelfMembership,
+    /// The engine has frozen this local group copy because it cannot safely
+    /// select canonical state from retained material. Sending and applying
+    /// group traffic remain blocked until a verified repair replaces it.
+    #[serde(default)]
+    pub unrecoverable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcomer_account_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +150,8 @@ pub struct AppGroupMlsState {
     pub protocol_profile: AppProtocolProfile,
     pub epoch: u64,
     pub member_count: usize,
+    #[serde(default)]
+    pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
 }
 
@@ -441,6 +448,7 @@ impl AppGroupRecord {
             archived: false,
             pending_confirmation: false,
             self_membership: SelfMembership::Member,
+            unrecoverable: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
@@ -476,6 +484,7 @@ impl AppGroupRecord {
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
             record.nostr_routing_last_epoch = group.epoch.0;
+            record.unrecoverable = group.unrecoverable;
         }
         record
     }
@@ -513,6 +522,7 @@ impl AppGroupRecord {
         self.profile = projection.profile.clone();
         if let Some(group) = projection.group_metadata {
             self.protocol_profile = group.protocol_profile.into();
+            self.unrecoverable = group.unrecoverable;
         }
     }
 
@@ -676,6 +686,7 @@ mod prior_nostr_route_tests {
             required_capabilities: GroupCapabilities::default(),
             protocol_profile: ProtocolProfile::Current,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(0),
         }
     }
@@ -757,6 +768,27 @@ mod prior_nostr_route_tests {
             record.prior_nostr_routes[0].nostr_group_id_hex,
             hex::encode([2u8; 32])
         );
+    }
+
+    #[test]
+    fn refresh_projects_and_clears_unrecoverable_repair_requirement() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://relay.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let mut halted = group(6);
+        halted.unrecoverable = true;
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &halted));
+        assert!(record.unrecoverable);
+
+        let repaired = group(7);
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &repaired));
+        assert!(!record.unrecoverable);
     }
 
     #[test]
@@ -1514,6 +1546,7 @@ mod delete_moderation_grant_tests {
             required_capabilities: Default::default(),
             protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(0),
         }
     }

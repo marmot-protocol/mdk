@@ -258,8 +258,13 @@ impl<S: StorageProvider> Engine<S> {
         // A group that has already entered `Unrecoverable` MUST stop applying
         // group-state changes until a verified repair path
         // (spec/protocol-core/group-state.md:50-51,65). Report the halt and
-        // leave canonical state untouched.
-        if self.epoch_manager.is_unrecoverable(group_id) {
+        // leave canonical state untouched. Sync from the durable marker first
+        // so a restart (or a path that skipped hydration) cannot skip the halt
+        // (mdk#971).
+        if self
+            .sync_unrecoverable_halt_from_storage(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        {
             let epoch = self
                 .epoch_manager
                 .epoch(group_id)
@@ -405,11 +410,23 @@ impl<S: StorageProvider> Engine<S> {
         // retained-history.md:30-31 — a required retained state missing inside
         // the rollback horizon MUST report `MissingRetainedAnchor`, leave
         // canonical group state unchanged, and move the group to
-        // `Unrecoverable`. Halt before applying anything.
+        // `Unrecoverable`. Halt before applying anything. Persist the marker
+        // on the group record so process restart cannot silently clear it
+        // (mdk#971).
         if result
             .errors
             .contains(&CanonicalizationError::MissingRetainedAnchor)
         {
+            let mut group = self
+                .storage
+                .get_group(group_id)
+                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            if !group.unrecoverable {
+                group.unrecoverable = true;
+                self.storage
+                    .put_group(&group)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            }
             let previous_state = self
                 .epoch_manager
                 .state(group_id)

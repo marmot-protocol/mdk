@@ -62,6 +62,16 @@ async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+#[test]
+fn send_in_progress_has_a_distinct_retry_contract() {
+    let error = crate::ConnectorError::SendInProgress;
+    assert_eq!(error.code(), "send_in_progress");
+    assert_eq!(
+        error.client_message(),
+        "matching send is still in progress; retry with the same idempotency key"
+    );
+}
+
 #[tokio::test]
 async fn control_frame_write_timeout_includes_flush() {
     struct FlushStallingWriter;
@@ -2698,20 +2708,44 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         "a rejected retry must not drop the session"
     );
 
-    // A matching retry completes the durable publish from the frozen transcript
-    // — the compose task was aborted above, so this proves it is not consulted —
-    // and only then removes the session.
-    let finalized = connector
-        .stream_finalize_response(
-            &stream_id_hex,
-            &stream_capability,
-            "frozen final".to_owned(),
-            &hex::encode(transcript_hash),
-            1,
-            Some("frozen-finalize".to_owned()),
-        )
-        .await
-        .expect("frozen-transcript retry finalizes without the compose task");
+    // Two matching retries race the durable publish from the frozen transcript.
+    // The compose task was aborted above, so the leader cannot consult it; the
+    // follower must reuse the leader's result instead of publishing again.
+    let transcript_hash_hex = hex::encode(transcript_hash);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_start = std::sync::Arc::clone(&start);
+    let second_start = std::sync::Arc::clone(&start);
+    let first_finalize = async {
+        first_start.wait().await;
+        connector
+            .stream_finalize_response(
+                &stream_id_hex,
+                &stream_capability,
+                "frozen final".to_owned(),
+                &transcript_hash_hex,
+                1,
+                Some("frozen-finalize".to_owned()),
+            )
+            .await
+    };
+    let second_finalize = async {
+        second_start.wait().await;
+        connector
+            .stream_finalize_response(
+                &stream_id_hex,
+                &stream_capability,
+                "frozen final".to_owned(),
+                &transcript_hash_hex,
+                1,
+                Some("frozen-finalize".to_owned()),
+            )
+            .await
+    };
+    let (first_result, second_result) = tokio::join!(first_finalize, second_finalize);
+    let finalized =
+        first_result.expect("first frozen-transcript retry finalizes without the compose task");
+    let concurrent_retry =
+        second_result.expect("concurrent frozen-transcript retry reuses the leader result");
     let AgentControlResponse::StreamFinalized {
         message_ids_hex, ..
     } = finalized
@@ -2720,6 +2754,17 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     };
     assert_eq!(message_ids_hex.len(), 1);
     assert!(!message_ids_hex[0].is_empty());
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex: concurrent_ids,
+        ..
+    } = concurrent_retry
+    else {
+        panic!("expected concurrent stream finalized response");
+    };
+    assert_eq!(
+        concurrent_ids, message_ids_hex,
+        "a concurrent stream finalize must reuse the leader message ids"
+    );
     assert!(
         connector.streams.get(&stream_id_norm).is_err(),
         "a successful durable finish must remove the session"
@@ -3731,7 +3776,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 }
 
 #[tokio::test]
-async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
+async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
     // GAP-06: a retry that reuses the same idempotency key must return the
     // ORIGINAL durable message ids without re-sending, so a post-write-timeout
     // retry can never double-post an unrecallable encrypted message. Observable
@@ -3772,42 +3817,52 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
     connector.runtime.catch_up_accounts().await.unwrap();
 
     let key = "retry-key-1".to_owned();
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_start = std::sync::Arc::clone(&start);
+    let second_start = std::sync::Arc::clone(&start);
+    let first_send = async {
+        first_start.wait().await;
+        connector
+            .send_final_response(
+                &agent.account.account_id_hex,
+                &group_id_hex.to_uppercase(),
+                "idempotent reply".to_owned(),
+                None,
+                Some(key.clone()),
+            )
+            .await
+    };
+    let second_send = async {
+        second_start.wait().await;
+        connector
+            .send_final_response(
+                &agent.account.account_id_hex,
+                &group_id_hex,
+                "idempotent reply".to_owned(),
+                None,
+                Some(key.clone()),
+            )
+            .await
+    };
+    let (first_result, second_result) = tokio::join!(first_send, second_send);
+
     let AgentControlResponse::FinalSent {
         message_ids_hex: first_ids,
-    } = connector
-        .send_final_response(
-            &agent.account.account_id_hex,
-            &group_id_hex.to_uppercase(),
-            "idempotent reply".to_owned(),
-            None,
-            Some(key.clone()),
-        )
-        .await
-        .unwrap()
+    } = first_result.unwrap()
     else {
         panic!("expected first send to return FinalSent");
     };
     assert!(!first_ids.is_empty(), "a real send returns message ids");
 
-    // Second call with the SAME key returns the cached ids verbatim.
     let AgentControlResponse::FinalSent {
         message_ids_hex: second_ids,
-    } = connector
-        .send_final_response(
-            &agent.account.account_id_hex,
-            &group_id_hex,
-            "idempotent reply".to_owned(),
-            None,
-            Some(key),
-        )
-        .await
-        .unwrap()
+    } = second_result.unwrap()
     else {
-        panic!("expected second send to return cached FinalSent");
+        panic!("expected concurrent retry to return FinalSent");
     };
     assert_eq!(
         second_ids, first_ids,
-        "a repeated idempotency key must return the original ids across equivalent hex casing"
+        "a concurrent retry must return the leader ids across equivalent hex casing"
     );
 
     // Observable proof there was no second underlying send: exactly one copy of
@@ -3859,6 +3914,177 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
         None,
         "an unrelated key stays absent"
     );
+}
+
+async fn wait_for_idempotency_follower(
+    store: &crate::stream_session::SendIdempotencyStore,
+    key: &str,
+    fingerprint: &str,
+) {
+    timeout(Duration::from_secs(1), async {
+        while store.in_flight_participant_count(key, fingerprint) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the follower must join the leader's in-flight gate");
+}
+
+#[tokio::test]
+async fn send_idempotency_store_same_request_waits_for_leader_result() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store.acquire("same-key", "same-fingerprint").await.unwrap() {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("same-key", "same-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "same-key", "same-fingerprint").await;
+    assert!(!follower.is_finished());
+
+    let ids = vec!["aa".repeat(32)];
+    store.record(
+        "same-key".to_owned(),
+        "same-fingerprint".to_owned(),
+        ids.clone(),
+    );
+    leader.complete(ids.clone());
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Leader(_) => {
+            panic!("a follower must reuse the leader's committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store
+        .acquire("retry-key", "retry-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("retry-key", "retry-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "retry-key", "retry-fingerprint").await;
+    assert!(!follower.is_finished());
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("a failed leader has no committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "shared-key".to_owned(),
+        "first-fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+    let leader = match store
+        .acquire("shared-key", "second-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("a new request body must remain a cache miss")
+        }
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("shared-key", "second-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "shared-key", "second-fingerprint").await;
+    assert!(!follower.is_finished());
+
+    let ids = vec!["bb".repeat(32)];
+    store.record(
+        "shared-key".to_owned(),
+        "second-fingerprint".to_owned(),
+        ids.clone(),
+    );
+    assert_eq!(
+        store.get("shared-key", "second-fingerprint"),
+        None,
+        "the original durable key binding remains first-write-wins"
+    );
+    leader.complete(ids.clone());
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Leader(_) => {
+            panic!("a concurrent follower must reuse the transient leader result")
+        }
+    }
+    assert!(matches!(
+        store
+            .acquire("shared-key", "second-fingerprint")
+            .await
+            .unwrap(),
+        SendIdempotencyAcquisition::Leader(_)
+    ));
+}
+
+#[tokio::test]
+async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "shared-key".to_owned(),
+        "first-fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    match store
+        .acquire("shared-key", "different-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("different request bodies must not reuse unrelated message ids")
+        }
+    }
 }
 
 #[test]

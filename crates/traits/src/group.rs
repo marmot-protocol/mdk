@@ -62,6 +62,17 @@ pub struct Group {
     /// persisted before this field existed.
     #[serde(default)]
     pub removed: bool,
+    /// Local copy cannot safely select a canonical branch from retained
+    /// material (e.g. `MissingRetainedAnchor` inside the rollback horizon).
+    /// Canonical state is frozen; the client MUST stop applying and ingesting
+    /// group-state changes until a verified repair path
+    /// (`spec/protocol-core/group-state.md:54-66`). Persisted so process
+    /// restart cannot silently clear the halt (mdk#971). Clears only through
+    /// an authenticated re-join welcome (or another verified repair that
+    /// rebuilds the group record). Defaults to `false` for records persisted
+    /// before this field existed.
+    #[serde(default)]
+    pub unrecoverable: bool,
     /// Epoch at which this device's membership began (welcome-join or group
     /// creation), refreshed on an authenticated re-join. Post-peel
     /// classification lower bound: an application message whose MLS epoch
