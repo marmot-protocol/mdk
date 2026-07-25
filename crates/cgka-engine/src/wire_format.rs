@@ -35,7 +35,11 @@ pub use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 /// Default number of past MLS epochs retained for delayed application
 /// messages. This is intentionally small because it trades away some forward
 /// secrecy for delivery robustness.
-pub const DEFAULT_MAX_PAST_EPOCHS: usize = 5;
+///
+/// Pinned to the adopted convergence-policy v1 app-message window so MLS
+/// decryptability and witness/delivery horizons cannot diverge.
+pub const DEFAULT_MAX_PAST_EPOCHS: usize =
+    crate::canonicalization::V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize;
 
 /// Grep marker: every release checklist item that audits "are we still
 /// shipping pure-plaintext MLS?" should find this. Do NOT remove without

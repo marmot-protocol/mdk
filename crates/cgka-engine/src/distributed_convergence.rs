@@ -79,20 +79,33 @@ fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventC
 type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
 
 impl<S: StorageProvider> Engine<S> {
-    pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+    /// Install the process-wide convergence policy.
+    ///
+    /// Release builds accept only the pinned v1 baseline. Debug/test builds may
+    /// override for harnesses (instant settlement, rewind probes), but still
+    /// require the witness-override bound and
+    /// `app_message_past_epoch_limit == max_past_epochs`.
+    pub fn set_convergence_policy(
+        &mut self,
+        policy: CanonicalizationPolicy,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.accept_convergence_policy(&policy)?;
         self.convergence_policy = policy;
         self.audit_engine_context();
+        Ok(())
     }
 
+    /// Persist a per-group convergence policy.
+    ///
+    /// Same acceptance rules as [`Self::set_convergence_policy`]. Under v1 the
+    /// policy is not group-negotiated; release builds reject any non-baseline
+    /// value so a stored override cannot fork honest clients.
     pub fn set_group_convergence_policy(
         &mut self,
         group_id: &GroupId,
         policy: CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
-        // Fail fast: never persist a policy that violates the witness-override bound.
-        policy
-            .validate()
-            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+        self.accept_convergence_policy(&policy)?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
@@ -107,6 +120,28 @@ impl<S: StorageProvider> Engine<S> {
                 context,
             },
         );
+        Ok(())
+    }
+
+    /// Fail closed before a policy can drive branch selection or be persisted.
+    fn accept_convergence_policy(
+        &self,
+        policy: &CanonicalizationPolicy,
+    ) -> Result<(), OpenMlsProjectionError> {
+        policy
+            .validate()
+            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+        policy
+            .ensure_app_window_matches(self.max_past_epochs)
+            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+        // Release builds may only run the pinned v1 baseline. Debug harnesses may
+        // override for deterministic settlement / rewind-horizon probes (mdk#970).
+        #[cfg(not(debug_assertions))]
+        if !policy.is_pinned_v1() {
+            return Err(OpenMlsProjectionError::InvalidPolicy(
+                crate::canonicalization::CanonicalizationPolicyError::NotPinnedV1.to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -145,12 +180,12 @@ impl<S: StorageProvider> Engine<S> {
             // `set_convergence_policy` fails closed at read rather than driving
             // branch selection.
             let policy = self.convergence_policy.clone();
-            policy
-                .validate()
-                .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+            self.accept_convergence_policy(&policy)?;
             return Ok(policy);
         };
-        decode_convergence_policy(&policy_bytes)
+        let policy = decode_convergence_policy(&policy_bytes)?;
+        self.accept_convergence_policy(&policy)?;
+        Ok(policy)
     }
 
     pub(crate) fn retain_current_epoch_snapshot_for_group(

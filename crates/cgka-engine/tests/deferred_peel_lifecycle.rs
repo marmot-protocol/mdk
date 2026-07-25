@@ -191,10 +191,12 @@ fn build_counting_client(
         .peeler(Box::new(peeler.clone()))
         .build()
         .unwrap();
-    engine.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     (engine, storage, peeler)
 }
 

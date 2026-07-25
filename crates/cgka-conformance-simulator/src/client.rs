@@ -733,8 +733,12 @@ impl HarnessClient {
     }
 
     /// Override the engine-wide convergence policy (quiescence window, etc.).
+    ///
+    /// Debug/test harness escape hatch; release builds reject non-v1 policies.
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
-        self.engine.set_convergence_policy(policy);
+        self.engine
+            .set_convergence_policy(policy)
+            .expect("convergence policy accepted");
     }
 
     /// Run the same convergence entry point the app uses after a scheduled

@@ -57,10 +57,12 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         .confirm_published(invite.pending)
         .await
         .unwrap();
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let commit_event = stack.take_next_published();
     let welcome_event = stack.take_next_published();
@@ -175,10 +177,12 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     let group_id = created.group_id.clone();
     publish_confirm_and_deliver_welcome(&stack, &mut alice, &mut bob, created).await;
     stack.sync_group(&bob, &group_id).await;
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let invite = invite_carol(&mut alice, &mut carol, &group_id).await;
     let commit_report = stack

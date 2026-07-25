@@ -190,10 +190,12 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
     )
     .await;
     stack.sync_group(&bob, &created.group_id).await;
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let app_message = send_app_message(&mut alice, &created.group_id, b"dedupe me").await;
     let report = stack
@@ -347,10 +349,12 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
         .await
         .expect("commit delivery should reach bob");
     assert!(matches!(bob_commit.outcome, IngestOutcome::Buffered { .. }));
-    bob.session.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    bob.session
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     bob.session
         .advance_convergence(&created.group_id)
         .await

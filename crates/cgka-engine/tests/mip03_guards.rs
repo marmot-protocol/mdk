@@ -1115,13 +1115,15 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
     alice.confirm_published(pending).await.unwrap();
     bob.join_welcome(welcomes[0].clone()).await.unwrap();
     carol.join_welcome(welcomes[1].clone()).await.unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice

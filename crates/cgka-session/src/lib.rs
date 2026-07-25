@@ -148,6 +148,10 @@ impl SessionConfig {
         self
     }
 
+    /// Set the session convergence policy.
+    ///
+    /// Production hosts MUST leave the default (pinned v1). Non-baseline values
+    /// are accepted only in debug/test builds; release `open` rejects them.
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
         self
@@ -286,7 +290,9 @@ impl AccountDeviceSession {
             );
         }
         engine.hydrate_stable_groups_from_storage()?;
-        engine.set_convergence_policy(config.convergence_policy);
+        engine
+            .set_convergence_policy(config.convergence_policy)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         engine.audit_recorder_health();
         tracing::debug!(
             target: TRACE_TARGET,
@@ -751,13 +757,18 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
-    pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+    pub fn set_convergence_policy(
+        &mut self,
+        policy: CanonicalizationPolicy,
+    ) -> Result<(), EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "set_convergence_policy",
             "updating convergence policy"
         );
-        self.engine.set_convergence_policy(policy);
+        self.engine
+            .set_convergence_policy(policy)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))
     }
 
     pub fn record_audit_event(

@@ -1,7 +1,7 @@
 ---
 title: "whitenoise-rs Integration Map"
 created: 2026-05-11
-updated: 2026-06-07
+updated: 2026-07-24
 tags: [marmot, overview, cgka, integration, whitenoise]
 status: working-note
 ---
@@ -49,7 +49,7 @@ whitenoise-rs should keep owning:
 | Drain side effects | `drain()` |
 | Inspect basic group state | `epoch(&GroupId)`, `members(&GroupId)` |
 | Get local member id | `self_id()` |
-| Tune convergence policy | `set_convergence_policy(CanonicalizationPolicy)` |
+| Convergence policy | Pinned v1 baseline only (`CanonicalizationPolicy::default()`). Hosts MUST NOT tune it; debug harnesses may override under `debug_assertions`. |
 
 `marmot-account` adds a first coordinator shell:
 

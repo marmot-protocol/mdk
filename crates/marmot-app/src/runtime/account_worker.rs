@@ -1660,12 +1660,16 @@ impl ScheduledConvergence {
 }
 
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
-    Duration::from_millis(
+    // Release builds always schedule against the pinned v1 quiescence window
+    // (mdk#970); the dev override is debug/test-only.
+    let quiescence_ms = if cfg!(debug_assertions) {
         app.config
             .dev_settlement_quiescence_ms
             .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS)
-            .saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
-    )
+    } else {
+        DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS
+    };
+    Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }
 
 fn retry_delay_for_attempt(attempt: u32) -> Duration {

@@ -389,6 +389,15 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 required: u16::from(DEFAULT_CIPHERSUITE),
             });
         }
+        // Release builds keep the MLS past-epoch window pinned to the v1
+        // app-message horizon. Debug harnesses may shrink it for decrypt-window
+        // probes (mdk#970).
+        #[cfg(not(debug_assertions))]
+        if self.max_past_epochs != crate::wire_format::DEFAULT_MAX_PAST_EPOCHS {
+            return Err(EngineError::Other(
+                "max_past_epochs must equal the pinned v1 app-message window".into(),
+            ));
+        }
         let identity_bytes = self
             .identity_bytes
             .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;
@@ -433,7 +442,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_convergence_groups: HashSet::new(),
             queued_intent_by_message: HashMap::new(),
             queued_intent_by_pending: HashMap::new(),
-            convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
+            // Keep the in-memory app-message window aligned with MLS
+            // `max_past_epochs` from construction so the two knobs cannot drift
+            // before the first `set_convergence_policy` call.
+            convergence_policy: crate::canonicalization::CanonicalizationPolicy {
+                app_message_past_epoch_limit: self.max_past_epochs as u64,
+                ..crate::canonicalization::CanonicalizationPolicy::default()
+            },
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
