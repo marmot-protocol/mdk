@@ -355,6 +355,48 @@ async fn delete_group_local_binding_is_public_and_validates_group_hex() {
 }
 
 #[tokio::test]
+async fn group_image_binding_methods_are_public_and_validate_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let empty_upload = kit
+        .update_group_image(
+            "alice".into(),
+            "not-hex".into(),
+            Vec::new(),
+            "image/png".into(),
+        )
+        .await
+        .expect_err("empty image bytes should use the explicit clear method");
+    assert!(matches!(
+        empty_upload,
+        MarmotKitError::InvalidMediaReference { .. }
+    ));
+
+    let upload_error = kit
+        .update_group_image(
+            "alice".into(),
+            "not-hex".into(),
+            vec![0x89, b'P', b'N', b'G'],
+            "image/png".into(),
+        )
+        .await
+        .expect_err("invalid group hex should fail before upload");
+    assert!(format!("{upload_error}").contains("invalid hex"));
+
+    let clear_error = kit
+        .clear_group_image("alice".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before clear");
+    assert!(format!("{clear_error}").contains("invalid hex"));
+}
+
+#[tokio::test]
 async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

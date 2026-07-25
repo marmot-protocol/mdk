@@ -140,6 +140,16 @@ fn ensure_group_admin(
     }
 }
 
+fn validate_group_image_plaintext(plaintext: &[u8]) -> Result<(), MarmotKitError> {
+    if plaintext.is_empty() {
+        Err(MarmotKitError::InvalidMediaReference {
+            details: "group image cannot be empty; use clear_group_image to remove it".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_can_remove_members(
     state: &GroupManagementStateFfi,
     group_id_hex: &str,
@@ -458,6 +468,41 @@ impl Marmot {
         let summary = self
             .runtime
             .update_group_profile(&account_ref, &group_id, name, description)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Encrypt and upload a group avatar to Blossom, then commit the
+    /// `marmot.group.blossom.image.v1` component. `plaintext` must contain the
+    /// decoded image bytes; use `clear_group_image` to remove an existing
+    /// encrypted Blossom avatar.
+    pub async fn update_group_image(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        validate_group_image_plaintext(&plaintext)?;
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_group_image(&account_ref, &group_id, plaintext, media_type)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Clear the group's encrypted Blossom avatar by committing the absent
+    /// `marmot.group.blossom.image.v1` component state.
+    pub async fn clear_group_image(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_group_image(&account_ref, &group_id, Vec::new(), String::new())
             .await?;
         Ok(summary.into())
     }
@@ -894,5 +939,18 @@ mod tests {
             ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
                 .expect_err("non-admin demote should fail");
         assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn group_image_upload_requires_nonempty_plaintext() {
+        let err = validate_group_image_plaintext(&[])
+            .expect_err("empty image bytes must use the explicit clear method");
+        assert!(matches!(
+            err,
+            MarmotKitError::InvalidMediaReference { details }
+                if details.contains("clear_group_image")
+        ));
+        validate_group_image_plaintext(&[0x89, b'P', b'N', b'G'])
+            .expect("nonempty image bytes should reach the runtime");
     }
 }
