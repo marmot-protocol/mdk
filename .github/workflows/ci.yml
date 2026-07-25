@@ -19,6 +19,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Debug OpenMLS group construction plus the composed runtime layers can
+  # exceed the platform-default 2 MiB stack in test and Tokio worker threads.
+  RUST_MIN_STACK: "4194304"
 
 jobs:
   rust-format:
@@ -202,11 +205,6 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run relay runtime tests serially
-        # The debug relay harness composes the account worker, OpenMLS group
-        # creation, maintenance enrollment, and push lifecycle on one thread.
-        # Give libtest the same 4 MiB stack used by the focused unit harnesses.
-        env:
-          RUST_MIN_STACK: "4194304"
         run: cargo test -p marmot-app --test relay_runtime --locked -- --test-threads=1
 
   relay-e2e:
