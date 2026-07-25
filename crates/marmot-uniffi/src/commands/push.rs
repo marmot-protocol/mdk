@@ -2,7 +2,8 @@
 
 use crate::Marmot;
 use crate::conversions::{
-    GroupPushDebugInfoFfi, PushPlatformFfi, PushRegistrationFfi, group_id_from_hex,
+    GroupPushDebugInfoFfi, PushPlatformFfi, PushRegistrationFfi, PushRegistrationShareOutcomeFfi,
+    PushRegistrationSyncResultFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 
@@ -25,7 +26,8 @@ impl Marmot {
         raw_token: String,
         server_pubkey_hex: String,
         relay_hint: Option<String>,
-    ) -> Result<PushRegistrationFfi, MarmotKitError> {
+    ) -> Result<PushRegistrationSyncResultFfi, MarmotKitError> {
+        let raw_token = zeroize::Zeroizing::new(raw_token);
         Ok(self
             .runtime
             .upsert_push_registration(
@@ -39,9 +41,15 @@ impl Marmot {
             .into())
     }
 
-    pub async fn clear_push_registration(&self, account_ref: String) -> Result<(), MarmotKitError> {
-        self.runtime.clear_push_registration(&account_ref).await?;
-        Ok(())
+    pub async fn clear_push_registration(
+        &self,
+        account_ref: String,
+    ) -> Result<PushRegistrationShareOutcomeFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .clear_push_registration(&account_ref)
+            .await?
+            .into())
     }
 
     pub async fn group_push_debug_info(

@@ -184,6 +184,60 @@ pub struct PushRegistration {
     pub last_shared_at_ms: Option<i64>,
 }
 
+/// Whether all durable push-registration update/removal work is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PushRegistrationShareStatus {
+    /// No per-group update or removal work remains.
+    Complete,
+    /// One or more joined groups still need an update or removal.
+    Pending,
+}
+
+/// Per-attempt result for the durable push-registration gossip outbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRegistrationShareOutcome {
+    /// Aggregate completion status after the attempt.
+    pub status: PushRegistrationShareStatus,
+    /// Groups selected for this attempt.
+    pub attempted_groups: u32,
+    /// Selected groups whose publish completed and durable work was cleared.
+    pub succeeded_groups: u32,
+    /// Selected groups whose preparation, publish, or conditional completion failed.
+    pub failed_groups: u32,
+    /// Groups still durably queued after the attempt.
+    pub pending_groups: u32,
+}
+
+impl PushRegistrationShareOutcome {
+    pub(crate) fn from_counts(
+        attempted_groups: usize,
+        succeeded_groups: usize,
+        failed_groups: usize,
+        pending_groups: usize,
+    ) -> Self {
+        Self {
+            status: if pending_groups == 0 {
+                PushRegistrationShareStatus::Complete
+            } else {
+                PushRegistrationShareStatus::Pending
+            },
+            attempted_groups: attempted_groups.try_into().unwrap_or(u32::MAX),
+            succeeded_groups: succeeded_groups.try_into().unwrap_or(u32::MAX),
+            failed_groups: failed_groups.try_into().unwrap_or(u32::MAX),
+            pending_groups: pending_groups.try_into().unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// Stored registration together with the immediate lifecycle gossip outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRegistrationSyncResult {
+    /// The registration revision persisted for the account.
+    pub registration: PushRegistration,
+    /// Result of attempting the new revision and any superseded-registration removals.
+    pub share: PushRegistrationShareOutcome,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredPushRegistration {
     pub registration: PushRegistration,

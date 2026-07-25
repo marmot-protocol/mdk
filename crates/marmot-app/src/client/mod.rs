@@ -808,6 +808,11 @@ impl AppClient {
     /// The live transport route is removed and synced before the DB wipe so the
     /// account stops actively subscribing to the group before local rows vanish.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        // A local wipe removes this group's transport route. Any already-durable
+        // removal must publish first; retaining it after the route disappears
+        // would preserve bytes on disk without preserving liveness.
+        self.drain_existing_push_registration_removals_for_group(group_id)
+            .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let original_groups = self.state.groups.clone();
         let was_live = original_groups
@@ -854,17 +859,40 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
-        self.sync_runtime_groups().await?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::Leave {
-                    group_id: group_id.clone(),
-                },
-                audit_context.clone(),
-            )
+        // Once the MLS leave commits we can no longer author an in-group token
+        // removal. Drain that durable intent first; if the leave later fails,
+        // queue the current registration update as compensation.
+        let removed_registration = self
+            .drain_push_registration_removal_before_departure(group_id)
             .await?;
-        fail_if_publish_failed(&effects)?;
+        let effects = match async {
+            self.sync_runtime_groups().await?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::Leave {
+                        group_id: group_id.clone(),
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            fail_if_publish_failed(&effects)?;
+            Ok::<_, AppError>(effects)
+        }
+        .await
+        {
+            Ok(effects) => effects,
+            Err(err) => {
+                self.compensate_group_push_registration_removal(
+                    group_id,
+                    removed_registration.as_ref(),
+                );
+                let _ = self
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+                return Err(err);
+            }
+        };
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;

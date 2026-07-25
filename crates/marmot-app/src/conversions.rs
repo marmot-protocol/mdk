@@ -23,9 +23,9 @@ use cgka_traits::app_components::{
 };
 use storage_sqlite::{
     AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
-    AccountPushRegistration, AccountStoredPushRegistration, StoredAccountGroup,
-    StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
-    StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
+    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountStoredPushRegistration,
+    StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppEvent,
+    StoredAppMessageRecord, StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -468,6 +468,25 @@ pub(crate) fn stored_push_registration_from_account(
         },
         token_bytes: stored.token_bytes,
     })
+}
+
+pub(crate) fn pending_push_registration_removal_from_account(
+    pending: AccountPendingPushRegistrationRemoval,
+) -> Result<(String, PushRegistration), AppError> {
+    Ok((
+        pending.group_id_hex,
+        PushRegistration {
+            account_ref: pending.registration.account_label,
+            account_id_hex: pending.registration.account_id_hex,
+            platform: PushPlatform::from_platform_byte(pending.registration.platform)?,
+            token_fingerprint: pending.registration.token_fingerprint,
+            server_pubkey_hex: pending.registration.server_pubkey_hex,
+            relay_hint: pending.registration.relay_hint,
+            created_at_ms: pending.registration.created_at_ms,
+            updated_at_ms: pending.registration.updated_at_ms,
+            last_shared_at_ms: None,
+        },
+    ))
 }
 
 pub(crate) fn account_group_push_token_from_app(
