@@ -109,8 +109,37 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     }
 }
 
-#[tokio::test]
-async fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
+/// Run app-runtime integration chains on a stack large enough for debug
+/// OpenMLS group creation. Libtest's default 2 MiB stack is too small once a
+/// test composes the account worker with maintenance and push lifecycle work.
+fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let test_thread = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(body());
+        })
+        .unwrap();
+    test_thread.join().unwrap();
+}
+
+#[test]
+fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
+    run_composed_app_runtime_test(
+        "disable-native-push-removal",
+        disable_native_push_removal_body,
+    );
+}
+
+async fn disable_native_push_removal_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -247,8 +276,15 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
+#[test]
+fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
+    run_composed_app_runtime_test(
+        "push-registration-idle-retry",
+        push_registration_idle_retry_body,
+    );
+}
+
+async fn push_registration_idle_retry_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -302,8 +338,15 @@ async fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_even
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_local_projection_advances_only_after_publish() {
+#[test]
+fn push_registration_local_projection_advances_only_after_publish() {
+    run_composed_app_runtime_test(
+        "push-registration-projection",
+        push_registration_local_projection_body,
+    );
+}
+
+async fn push_registration_local_projection_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -358,8 +401,15 @@ async fn push_registration_local_projection_advances_only_after_publish() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
+#[test]
+fn local_group_wipe_keeps_and_drains_durable_push_removal() {
+    run_composed_app_runtime_test(
+        "local-wipe-push-removal",
+        local_group_wipe_push_removal_body,
+    );
+}
+
+async fn local_group_wipe_push_removal_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -429,21 +479,10 @@ async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
 
 #[test]
 fn failed_leave_restores_push_registration_after_removal_publishes() {
-    // This integration path composes the app runtime, account worker, push
-    // outbox, and MLS leave/compensation futures. Debug builds need more than
-    // libtest's default 2 MiB stack while polling that full chain.
-    let test_thread = std::thread::Builder::new()
-        .name("failed-leave-push-compensation".to_owned())
-        .stack_size(4 * 1024 * 1024)
-        .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            test_runtime.block_on(failed_leave_push_compensation_body());
-        })
-        .unwrap();
-    test_thread.join().unwrap();
+    run_composed_app_runtime_test(
+        "failed-leave-push-compensation",
+        failed_leave_push_compensation_body,
+    );
 }
 
 async fn failed_leave_push_compensation_body() {
@@ -528,8 +567,15 @@ async fn failed_leave_push_compensation_body() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_removal_retry_survives_clear_and_restart() {
+#[test]
+fn push_registration_removal_retry_survives_clear_and_restart() {
+    run_composed_app_runtime_test(
+        "push-registration-removal-retry",
+        push_registration_removal_retry_body,
+    );
+}
+
+async fn push_registration_removal_retry_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")

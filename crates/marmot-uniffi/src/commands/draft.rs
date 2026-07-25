@@ -85,8 +85,26 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn draft_round_trip_crosses_runtime_and_ffi_boundaries() {
+    #[test]
+    fn draft_round_trip_crosses_runtime_and_ffi_boundaries() {
+        // This test composes UniFFI, the app runtime, the account worker, MLS
+        // group creation, and maintenance enrollment. Debug builds need more
+        // than libtest's default 2 MiB stack while polling that chain.
+        let test_thread = std::thread::Builder::new()
+            .name("ffi-draft-runtime-round-trip".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let test_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                test_runtime.block_on(draft_round_trip_body());
+            })
+            .unwrap();
+        test_thread.join().unwrap();
+    }
+
+    async fn draft_round_trip_body() {
         let relay = MockRelay::run().await.expect("start mock relay");
         let relay_url = relay.url().await.to_string();
         let root = tempfile::tempdir().expect("tempdir");

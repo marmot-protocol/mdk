@@ -158,8 +158,26 @@ fn rows_of_kind<'rows>(
         .collect()
 }
 
-#[tokio::test]
-async fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
+#[test]
+fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
+    // This integration path composes three app-runtime boots, MLS group
+    // creation, maintenance enrollment, and cursor recovery. Debug builds
+    // need more than libtest's default 2 MiB stack while polling that chain.
+    let test_thread = std::thread::Builder::new()
+        .name("frozen-cursor-persistence".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(frozen_wake_collection_body());
+        })
+        .unwrap();
+    test_thread.join().unwrap();
+}
+
+async fn frozen_wake_collection_body() {
     let (_relay, url) = mock_relay().await;
 
     // --- bob: the account whose durable cursor is under test (own store) ---
