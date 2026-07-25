@@ -69,6 +69,7 @@ pub enum ProposalRejectionCategory {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaleReason {
     /// The engine has already seen this `MessageId`. Coordinator dedup.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: Duplicate }")]
     AlreadySeen,
     /// The engine is already at or past the message's epoch. Commonly hit
     /// when a commit arrives after a welcome that already advanced the
@@ -79,10 +80,13 @@ pub enum StaleReason {
     },
     /// Input addressed to another member, or whose signed transport routing
     /// metadata conflicts with the envelope presented to the engine.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: WrongRecipient }")]
     NotForThisClient,
     /// No local group matches this message's routing.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: UnknownGroup }")]
     UnknownGroup,
     /// The message is our own commit echoed back by the transport.
+    #[deprecated(note = "use IngestOutcome::Ignored { category: OwnEcho }")]
     OwnEcho,
     /// The peeler rejected the message. The stored message may be terminal or
     /// retryable depending on whether the engine has evidence that another
@@ -98,6 +102,7 @@ pub enum StaleReason {
     /// evidence (the local MLS state records the eviction) maps here — a bare
     /// decrypt failure is a missing-history/repair condition, never
     /// `SelfEvicted`.
+    #[deprecated(note = "use IngestOutcome::LocalState { state: Removed }")]
     SelfEvicted,
     /// The group is under hydration quarantine: it failed session-open
     /// validation and is frozen until explicit repair. The message was not
@@ -107,6 +112,7 @@ pub enum StaleReason {
     /// welcome) clears the quarantine. Terminal for the message until then.
     /// The application can read the quarantine reason from
     /// `quarantined_groups()`.
+    #[deprecated(note = "use IngestOutcome::LocalState { state: Quarantined }")]
     Quarantined,
 }
 

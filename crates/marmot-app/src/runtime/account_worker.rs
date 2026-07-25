@@ -604,6 +604,10 @@ async fn run_app_runtime_account_worker(
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                    scheduled_convergence.schedule_after_pass(
+                                        &group_id,
+                                        client.has_pending_convergence_inputs(&group_id),
+                                    );
                                     schedule_pending_convergence_groups(
                                         &mut scheduled_convergence,
                                         &mut client,
@@ -611,10 +615,6 @@ async fn run_app_runtime_account_worker(
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
                                         shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                     }
-                                    scheduled_convergence.schedule_after_pass(
-                                        &group_id,
-                                        client.has_pending_convergence_inputs(&group_id),
-                                    );
                                 }
                                 Err(err) => {
                                     let mut retry_groups = client.take_pending_convergence_groups();
@@ -1743,8 +1743,7 @@ impl ScheduledConvergence {
         for (group_id, delay) in groups {
             self.retry_attempts.remove(&group_id);
             self.unsettled_rearm_attempts.remove(&group_id);
-            self.deadlines
-                .insert(group_id, now + delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY));
+            self.arm_no_later(group_id, now + delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY));
         }
         self.reset_timer_to_earliest();
     }
@@ -1755,7 +1754,7 @@ impl ScheduledConvergence {
             let attempts = self.retry_attempts.entry(group_id.clone()).or_insert(0);
             *attempts = attempts.saturating_add(1);
             let group_delay = retry_delay_for_attempt(*attempts);
-            self.deadlines.insert(group_id, now + group_delay);
+            self.arm_no_later(group_id, now + group_delay);
         }
         self.reset_timer_to_earliest();
     }
@@ -1777,9 +1776,9 @@ impl ScheduledConvergence {
                 let retry_attempts = self.retry_attempts.entry(group_id.clone()).or_insert(0);
                 *retry_attempts = retry_attempts.saturating_add(1);
                 let group_delay = retry_delay_for_attempt(*retry_attempts);
-                self.deadlines.insert(group_id.clone(), now + group_delay);
+                self.arm_no_later(group_id.clone(), now + group_delay);
             } else {
-                self.deadlines.insert(group_id.clone(), now + normal_delay);
+                self.arm_no_later(group_id.clone(), now + normal_delay);
             }
         }
         self.reset_timer_to_earliest();
@@ -1790,12 +1789,21 @@ impl ScheduledConvergence {
             self.reset_timer_to_earliest();
             return Vec::new();
         };
-        let ready: Vec<GroupId> = self
+        let now = TokioInstant::now();
+        let mut ready: Vec<GroupId> = self
             .deadlines
             .iter()
-            .filter(|(_, deadline)| **deadline <= earliest)
+            .filter(|(_, deadline)| **deadline <= now)
             .map(|(group_id, _)| group_id.clone())
             .collect();
+        if ready.is_empty() {
+            ready.extend(
+                self.deadlines
+                    .iter()
+                    .filter(|(_, deadline)| **deadline == earliest)
+                    .map(|(group_id, _)| group_id.clone()),
+            );
+        }
         for group_id in &ready {
             self.deadlines.remove(group_id);
         }
@@ -1812,6 +1820,13 @@ impl ScheduledConvergence {
 
     fn normal_delay(&self) -> Duration {
         self.delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY)
+    }
+
+    fn arm_no_later(&mut self, group_id: GroupId, deadline: TokioInstant) {
+        self.deadlines
+            .entry(group_id)
+            .and_modify(|current| *current = (*current).min(deadline))
+            .or_insert(deadline);
     }
 
     fn reset_timer_to_earliest(&mut self) {
@@ -1835,7 +1850,7 @@ fn schedule_pending_convergence_groups(
         .into_iter()
         .map(|group_id| {
             let delay = client
-                .convergence_cutoff_delay_ms(&group_id)
+                .prepare_convergence_cutoff_delay_ms(&group_id)
                 .map(|delay_ms| {
                     Duration::from_millis(
                         delay_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
@@ -2207,6 +2222,45 @@ mod tests {
         assert_eq!(scheduled.deadlines[&first], first_deadline);
         assert_eq!(scheduled.take_ready(), vec![first]);
         assert!(scheduled.deadlines.contains_key(&noisy));
+    }
+
+    #[tokio::test]
+    async fn rescheduling_same_group_never_postpones_its_frozen_cutoff() {
+        let group_id = test_group_id(23);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        scheduled.schedule_groups_with_delays([(group_id.clone(), Duration::from_millis(50))]);
+        let frozen_cutoff = scheduled.deadlines[&group_id];
+
+        scheduled.schedule_unsettled_groups([group_id.clone()]);
+        scheduled.schedule_retry_groups([group_id.clone()]);
+
+        assert_eq!(scheduled.deadlines[&group_id], frozen_cutoff);
+    }
+
+    #[tokio::test]
+    async fn take_ready_drains_every_overdue_group_in_one_tick() {
+        let first = test_group_id(24);
+        let second = test_group_id(25);
+        let future = test_group_id(26);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let now = TokioInstant::now();
+        scheduled.deadlines.insert(first.clone(), now);
+        scheduled
+            .deadlines
+            .insert(second.clone(), now - Duration::from_millis(1));
+        scheduled
+            .deadlines
+            .insert(future.clone(), now + Duration::from_secs(10));
+
+        let ready = scheduled.take_ready();
+
+        assert_eq!(ready.len(), 2);
+        assert!(ready.contains(&first));
+        assert!(ready.contains(&second));
+        assert_eq!(
+            scheduled.deadlines.keys().collect::<Vec<_>>(),
+            vec![&future]
+        );
     }
 
     #[tokio::test]

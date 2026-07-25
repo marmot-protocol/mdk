@@ -874,18 +874,9 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
     );
 }
 
-fn expected_transport_rejection_outcome(reason: StaleReason) -> IngestOutcome {
-    match reason {
-        StaleReason::NotForThisClient => IngestOutcome::Ignored {
-            category: InputRejectionCategory::WrongRecipient,
-        },
-        reason => IngestOutcome::Stale { reason },
-    }
-}
-
 async fn assert_typed_terminal_transport_rejection(
     rejection: BoundaryRejection,
-    expected_reason: StaleReason,
+    expected_outcome: IngestOutcome,
 ) {
     let mut alice = build_client(b"alice-terminal-rejection");
     let mut bob = build_client_with_peeler(
@@ -932,10 +923,7 @@ async fn assert_typed_terminal_transport_rejection(
         .ingest(rejected.clone())
         .await
         .expect("boundary rejection is terminal input, not a drain failure");
-    assert_eq!(
-        outcome,
-        expected_transport_rejection_outcome(expected_reason)
-    );
+    assert_eq!(outcome, expected_outcome);
 
     let duplicate = bob
         .ingest(rejected)
@@ -952,7 +940,7 @@ async fn assert_typed_terminal_transport_rejection(
 async fn assert_snapshot_fallback_terminal_transport_rejection(
     rejection: BoundaryRejection,
     initial_failure: InitialPeelFailure,
-    expected_reason: StaleReason,
+    expected_outcome: IngestOutcome,
 ) {
     let mut alice = build_client(b"alice-snapshot-boundary-rejection");
     let live_epoch = 2u64;
@@ -1030,10 +1018,7 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         .ingest(rejected.clone())
         .await
         .expect("snapshot-fallback boundary rejection is terminal, not a drain failure");
-    assert_eq!(
-        outcome,
-        expected_transport_rejection_outcome(expected_reason)
-    );
+    assert_eq!(outcome, expected_outcome);
 
     let duplicate = bob
         .ingest(rejected)
@@ -1051,7 +1036,9 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
 async fn invalid_transport_signature_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
-        StaleReason::PeelFailed,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        },
     )
     .await;
 }
@@ -1060,7 +1047,9 @@ async fn invalid_transport_signature_is_typed_terminal_input() {
 async fn wrong_transport_recipient_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::WrongRecipient,
-        StaleReason::NotForThisClient,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
     )
     .await;
 }
@@ -1113,7 +1102,9 @@ async fn invalid_transport_signature_after_decrypt_failed_fallback_is_terminal()
     assert_snapshot_fallback_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
         InitialPeelFailure::DecryptFailed,
-        StaleReason::PeelFailed,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        },
     )
     .await;
 }
@@ -1123,7 +1114,9 @@ async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
     assert_snapshot_fallback_terminal_transport_rejection(
         BoundaryRejection::WrongRecipient,
         InitialPeelFailure::StaleEpoch,
-        StaleReason::NotForThisClient,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::WrongRecipient,
+        },
     )
     .await;
 }

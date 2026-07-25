@@ -72,6 +72,7 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     }
 }
 
+#[allow(deprecated)]
 pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
     match reason {
         StaleReason::AlreadySeen => "already_seen",

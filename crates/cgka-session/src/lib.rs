@@ -801,11 +801,11 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
-    pub fn convergence_cutoff_delay_ms(
+    pub fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
-        Ok(CgkaEngine::convergence_cutoff_delay_ms(
+        Ok(CgkaEngine::prepare_convergence_cutoff_delay_ms(
             &mut self.engine,
             group_id,
         )?)

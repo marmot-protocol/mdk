@@ -91,6 +91,19 @@ enum FrozenPassVerificationError {
     Integrity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvergenceAdmissionOutcome {
+    Retained,
+    Admitted,
+    Frozen,
+    FrozenIntegrityFailure,
+}
+
+struct ConvergencePassCandidate {
+    member: ConvergencePassMember,
+    kind: OpenMlsContentKind,
+}
+
 impl From<StorageError> for FrozenPassVerificationError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
@@ -98,12 +111,19 @@ impl From<StorageError> for FrozenPassVerificationError {
 }
 
 impl<S: StorageProvider> Engine<S> {
-    pub fn convergence_cutoff_delay_ms(
-        &self,
+    /// Prepare a group's durable pass for runtime scheduling and return its
+    /// remaining process-local cutoff delay.
+    ///
+    /// This is intentionally a command, not a diagnostic query: when eligible
+    /// retained input exists it may open a pass, consume a dormant fairness
+    /// slot, or persist restart deadline rebasing before returning the delay.
+    pub fn prepare_convergence_cutoff_delay_ms(
+        &mut self,
         group_id: &GroupId,
     ) -> Result<Option<u64>, OpenMlsProjectionError> {
-        self.ensure_group_live(group_id)
-            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?;
+        if self.ensure_group_live(group_id).is_err() {
+            return Ok(None);
+        }
         let group = self
             .storage
             .get_group(group_id)
@@ -312,10 +332,30 @@ impl<S: StorageProvider> Engine<S> {
         // The retained row and its pass membership are one durability
         // boundary. A crash may leave an unassigned row only when admission is
         // intentionally blocked by an unstable local mutation owner.
-        self.storage.with_transaction(|storage| {
+        let admission = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
-            self.admit_stored_message_to_convergence_pass(group_id, &content_id, now_ms)
-        })
+            let admission =
+                self.admit_stored_message_to_convergence_pass(group_id, &content_id, now_ms)?;
+            if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
+                let mut group = storage.get_group(group_id)?;
+                group.unrecoverable = true;
+                storage.put_group(&group)?;
+            }
+            Ok::<ConvergenceAdmissionOutcome, OpenMlsProjectionError>(admission)
+        })?;
+        if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
+            let epoch = self
+                .storage
+                .get_group(group_id)
+                .map_err(storage_projection_error)?
+                .epoch;
+            self.realize_group_unrecoverable_for_convergence_pass(
+                group_id,
+                epoch,
+                "frozen_member_integrity",
+            );
+        }
+        Ok(())
     }
 
     fn admit_stored_message_to_convergence_pass(
@@ -323,14 +363,14 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message_id: &MessageId,
         now_ms: u64,
-    ) -> Result<(), OpenMlsProjectionError> {
+    ) -> Result<ConvergenceAdmissionOutcome, OpenMlsProjectionError> {
         let epoch_state = self.epoch_manager.state(group_id);
         let admission_allowed = matches!(epoch_state, Some(EpochState::Stable { .. }))
             || cfg!(feature = "test-policy-overrides") && epoch_state.is_none();
         if !admission_allowed {
             // PendingPublish/Merging retain the row but do not admit it. The
             // first stable scheduler run opens a pass and seeds retained work.
-            return Ok(());
+            return Ok(ConvergenceAdmissionOutcome::Retained);
         }
         let group = self
             .storage
@@ -340,31 +380,72 @@ impl<S: StorageProvider> Engine<S> {
         let Some(mut pass) =
             self.load_or_open_convergence_pass(group_id, group.epoch, &policy, now_ms)?
         else {
-            return Ok(());
+            return Ok(ConvergenceAdmissionOutcome::Retained);
         };
-        if pass.phase != ConvergencePassPhase::Collecting
-            || now_ms >= pass.cutoff_monotonic_ms()
-            || pass
-                .members
-                .iter()
-                .any(|member| &member.message_id == message_id)
+        if pass.phase != ConvergencePassPhase::Collecting {
+            return Ok(ConvergenceAdmissionOutcome::Retained);
+        }
+        if pass
+            .members
+            .iter()
+            .any(|member| &member.message_id == message_id)
         {
-            return Ok(());
+            return Ok(ConvergenceAdmissionOutcome::Retained);
+        }
+        if now_ms >= pass.cutoff_monotonic_ms() {
+            self.freeze_collecting_convergence_pass(&mut pass)?;
+            let outcome = match self.verify_frozen_pass_members(&pass) {
+                Ok(()) => ConvergenceAdmissionOutcome::Frozen,
+                Err(FrozenPassVerificationError::Integrity) => {
+                    ConvergenceAdmissionOutcome::FrozenIntegrityFailure
+                }
+                Err(FrozenPassVerificationError::Storage(error)) => {
+                    return Err(storage_projection_error(error));
+                }
+            };
+            self.storage
+                .put_convergence_pass(&pass)
+                .map_err(storage_projection_error)?;
+            return Ok(outcome);
         }
 
-        let Some(member) = self.convergence_pass_member(message_id)? else {
-            return Ok(());
+        let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
+            return Ok(ConvergenceAdmissionOutcome::Retained);
         };
-        pass.members.push(member);
-        pass.quiescence_deadline_monotonic_ms =
-            now_ms.saturating_add(policy.settlement_quiescence_ms);
-        pass.quiescence_deadline_wall_ms = self
-            .wall_clock
-            .now_ms()
-            .saturating_add(policy.settlement_quiescence_ms);
+        pass.members.push(candidate.member);
+        // Commits are the selection-relevant consensus-log input. Proposals
+        // cannot select a branch until a commit consumes them, and application
+        // messages may witness an already-admitted branch but MUST NOT let a
+        // traffic stream move the pass boundary.
+        if candidate.kind == OpenMlsContentKind::Commit {
+            pass.quiescence_deadline_monotonic_ms =
+                now_ms.saturating_add(policy.settlement_quiescence_ms);
+            pass.quiescence_deadline_wall_ms = self
+                .wall_clock
+                .now_ms()
+                .saturating_add(policy.settlement_quiescence_ms);
+        }
         self.storage
             .put_convergence_pass(&pass)
-            .map_err(storage_projection_error)
+            .map_err(storage_projection_error)?;
+        Ok(ConvergenceAdmissionOutcome::Admitted)
+    }
+
+    fn freeze_collecting_convergence_pass(
+        &self,
+        pass: &mut DurableConvergencePass,
+    ) -> Result<(), OpenMlsProjectionError> {
+        let wall_now_ms = self.wall_clock.now_ms();
+        pass.phase = ConvergencePassPhase::Frozen;
+        pass.frozen_at_wall_ms = Some(wall_now_ms);
+        pass.cutoff_cause = Some(if wall_now_ms < pass.opened_wall_ms {
+            ConvergenceCutoffCause::ClockDiscontinuity
+        } else if pass.absolute_deadline_monotonic_ms <= pass.quiescence_deadline_monotonic_ms {
+            ConvergenceCutoffCause::AbsoluteDeadline
+        } else {
+            ConvergenceCutoffCause::Quiescence
+        });
+        Ok(())
     }
 
     fn load_or_open_convergence_pass(
@@ -418,45 +499,30 @@ impl<S: StorageProvider> Engine<S> {
             if pass.phase == ConvergencePassPhase::Collecting
                 && pass.clock_instance_id != self.convergence_clock_instance_id
             {
-                #[cfg(feature = "test-policy-overrides")]
-                {
-                    pass.clock_instance_id = self.convergence_clock_instance_id;
-                    pass.opened_monotonic_ms = 0;
-                    pass.quiescence_deadline_monotonic_ms = policy.settlement_quiescence_ms;
-                    pass.absolute_deadline_monotonic_ms = policy.max_convergence_pass_ms;
-                    self.storage
-                        .put_convergence_pass(&pass)
-                        .map_err(storage_projection_error)?;
-                    return Ok(Some(pass));
-                }
-                #[cfg(not(feature = "test-policy-overrides"))]
-                {
-                    // A process-local monotonic deadline cannot survive
-                    // restart. Rebase it from persisted millisecond wall
-                    // deadlines. A backwards wall jump fails closed by making
-                    // the cutoff due immediately.
-                    let wall_now_ms = self.wall_clock.now_ms();
-                    let backwards = wall_now_ms < pass.opened_wall_ms;
-                    let quiescence_remaining = if backwards {
-                        0
-                    } else {
-                        pass.quiescence_deadline_wall_ms.saturating_sub(wall_now_ms)
-                    };
-                    let absolute_remaining = if backwards {
-                        0
-                    } else {
-                        pass.absolute_deadline_wall_ms.saturating_sub(wall_now_ms)
-                    };
-                    pass.clock_instance_id = self.convergence_clock_instance_id;
-                    pass.opened_monotonic_ms =
-                        now_ms.saturating_sub(wall_now_ms.saturating_sub(pass.opened_wall_ms));
-                    pass.quiescence_deadline_monotonic_ms =
-                        now_ms.saturating_add(quiescence_remaining);
-                    pass.absolute_deadline_monotonic_ms = now_ms.saturating_add(absolute_remaining);
-                    self.storage
-                        .put_convergence_pass(&pass)
-                        .map_err(storage_projection_error)?;
-                }
+                // A process-local monotonic deadline cannot survive restart.
+                // Rebase every build, including policy-override tests, from the
+                // same persisted millisecond wall deadlines. A backwards wall
+                // jump fails closed by making the cutoff due immediately.
+                let wall_now_ms = self.wall_clock.now_ms();
+                let backwards = wall_now_ms < pass.opened_wall_ms;
+                let quiescence_remaining = if backwards {
+                    0
+                } else {
+                    pass.quiescence_deadline_wall_ms.saturating_sub(wall_now_ms)
+                };
+                let absolute_remaining = if backwards {
+                    0
+                } else {
+                    pass.absolute_deadline_wall_ms.saturating_sub(wall_now_ms)
+                };
+                pass.clock_instance_id = self.convergence_clock_instance_id;
+                pass.opened_monotonic_ms =
+                    now_ms.saturating_sub(wall_now_ms.saturating_sub(pass.opened_wall_ms));
+                pass.quiescence_deadline_monotonic_ms = now_ms.saturating_add(quiescence_remaining);
+                pass.absolute_deadline_monotonic_ms = now_ms.saturating_add(absolute_remaining);
+                self.storage
+                    .put_convergence_pass(&pass)
+                    .map_err(storage_projection_error)?;
             }
             return Ok(Some(pass));
         }
@@ -509,12 +575,15 @@ impl<S: StorageProvider> Engine<S> {
         base_epoch: EpochId,
         policy: &CanonicalizationPolicy,
     ) -> Result<(Vec<ConvergencePassMember>, bool), OpenMlsProjectionError> {
+        let floor = base_epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
         let ceiling = base_epoch
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
         let projected = self
             .storage
-            .list_messages(group_id, EpochId(0))
+            .list_messages(group_id, EpochId(floor))
             .map_err(storage_projection_error)?
             .into_iter()
             .filter(|record| {
@@ -539,7 +608,7 @@ impl<S: StorageProvider> Engine<S> {
                     Err(error) => return Some(Err(error)),
                 };
                 let source_epoch = projection.source_epoch?;
-                if source_epoch > ceiling {
+                if source_epoch < floor || source_epoch > ceiling {
                     return None;
                 }
                 Some(Ok((
@@ -567,10 +636,10 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    fn convergence_pass_member(
+    fn convergence_pass_candidate(
         &self,
         message_id: &MessageId,
-    ) -> Result<Option<ConvergencePassMember>, OpenMlsProjectionError> {
+    ) -> Result<Option<ConvergencePassCandidate>, OpenMlsProjectionError> {
         let record = self
             .storage
             .get_message(message_id)
@@ -580,15 +649,16 @@ impl<S: StorageProvider> Engine<S> {
         let Some(message) = payload.as_openmls_wire() else {
             return Ok(None);
         };
-        if project_mls_message(&message.payload)?
-            .source_epoch
-            .is_none()
-        {
+        let projection = project_mls_message(&message.payload)?;
+        if projection.source_epoch.is_none() {
             return Ok(None);
         }
-        Ok(Some(ConvergencePassMember {
-            message_id: message_id.clone(),
-            payload_digest: Sha256::digest(&message.payload).into(),
+        Ok(Some(ConvergencePassCandidate {
+            member: ConvergencePassMember {
+                message_id: message_id.clone(),
+                payload_digest: projection.message_digest,
+            },
+            kind: projection.kind,
         }))
     }
 
@@ -606,7 +676,10 @@ impl<S: StorageProvider> Engine<S> {
         for member in &pass.members {
             let record = storage
                 .get_message(&member.message_id)
-                .map_err(FrozenPassVerificationError::Storage)?;
+                .map_err(|error| match error {
+                    StorageError::NotFound => FrozenPassVerificationError::Integrity,
+                    other => FrozenPassVerificationError::Storage(other),
+                })?;
             let payload = StoredMessagePayload::decode(&record.payload)
                 .map_err(|_| FrozenPassVerificationError::Integrity)?;
             let message = payload
@@ -625,6 +698,19 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), OpenMlsProjectionError> {
+        self.mark_group_unrecoverable_for_convergence_pass(
+            group_id,
+            epoch,
+            "frozen_member_integrity",
+        )
+    }
+
+    fn mark_group_unrecoverable_for_convergence_pass(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        error_kind: &'static str,
+    ) -> Result<(), OpenMlsProjectionError> {
         let mut group = self
             .storage
             .get_group(group_id)
@@ -635,6 +721,16 @@ impl<S: StorageProvider> Engine<S> {
                 .put_group(&group)
                 .map_err(storage_projection_error)?;
         }
+        self.realize_group_unrecoverable_for_convergence_pass(group_id, epoch, error_kind);
+        Ok(())
+    }
+
+    fn realize_group_unrecoverable_for_convergence_pass(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        error_kind: &'static str,
+    ) {
         self.epoch_manager.mark_unrecoverable(group_id);
         self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
             group_id: group_id.clone(),
@@ -645,11 +741,17 @@ impl<S: StorageProvider> Engine<S> {
                 phase: ConvergencePhase::Unrecoverable,
                 current_tip_epoch: Some(epoch.0),
                 retained_anchor_horizon: None,
-                reason: Some("frozen_pass_integrity_failure".to_string()),
-                error_kind: Some("frozen_member_integrity".to_string()),
+                reason: Some(
+                    if error_kind == "base_epoch_mismatch" {
+                        "convergence_pass_base_changed"
+                    } else {
+                        "frozen_pass_integrity_failure"
+                    }
+                    .to_string(),
+                ),
+                error_kind: Some(error_kind.to_string()),
             },
         );
-        Ok(())
     }
 
     /// Canonicalize retained stored OpenMLS messages and, once the caller's
@@ -762,22 +864,21 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(settled_empty_result(previous_tip.0));
         };
+        if pass.is_active() && pass.base_epoch != previous_tip {
+            self.mark_group_unrecoverable_for_convergence_pass(
+                group_id,
+                previous_tip,
+                "base_epoch_mismatch",
+            )?;
+            return Ok(unrecoverable_result(previous_tip.0));
+        }
+        let mut just_frozen = false;
         if pass.phase == ConvergencePassPhase::Collecting {
             let cutoff = pass.cutoff_monotonic_ms();
             if now_ms < cutoff {
                 return Ok(waiting_result(previous_tip.0));
             }
-            let wall_now_ms = self.wall_clock.now_ms();
-            let cutoff_cause = if wall_now_ms < pass.opened_wall_ms {
-                ConvergenceCutoffCause::ClockDiscontinuity
-            } else if pass.absolute_deadline_monotonic_ms <= pass.quiescence_deadline_monotonic_ms {
-                ConvergenceCutoffCause::AbsoluteDeadline
-            } else {
-                ConvergenceCutoffCause::Quiescence
-            };
-            pass.phase = ConvergencePassPhase::Frozen;
-            pass.frozen_at_wall_ms = Some(wall_now_ms);
-            pass.cutoff_cause = Some(cutoff_cause);
+            self.freeze_collecting_convergence_pass(&mut pass)?;
             let freeze_result = self.storage.with_transaction(|storage| {
                 Self::verify_frozen_pass_members_in(storage, &pass)?;
                 storage.put_convergence_pass(&pass)?;
@@ -793,11 +894,14 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(unrecoverable_result(previous_tip.0));
                 }
             }
+            just_frozen = true;
         }
-        if matches!(
-            pass.phase,
-            ConvergencePassPhase::Frozen | ConvergencePassPhase::Resolving
-        ) {
+        if !just_frozen
+            && matches!(
+                pass.phase,
+                ConvergencePassPhase::Frozen | ConvergencePassPhase::Resolving
+            )
+        {
             match self.verify_frozen_pass_members(&pass) {
                 Ok(()) => {}
                 Err(FrozenPassVerificationError::Storage(error)) => {
@@ -871,6 +975,7 @@ impl<S: StorageProvider> Engine<S> {
             },
         )?;
         let mut result = result;
+        let evaluated_status = result.convergence_status;
         // Missing dependencies stay retained for the next generation. Once a
         // pass is frozen, later arrivals cannot extend or alter this batch.
         if matches!(
@@ -896,7 +1001,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         if matches!(
-            result.convergence_status,
+            evaluated_status,
             ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
         ) {
             self.audit_group_with_context(
@@ -907,7 +1012,7 @@ impl<S: StorageProvider> Engine<S> {
                     current_tip_epoch: Some(previous_tip.0),
                     retained_anchor_horizon: Some(retained_anchor_epoch),
                     reason: Some(
-                        match result.convergence_status {
+                        match evaluated_status {
                             ConvergenceStatus::Resolving => "resolving",
                             _ => "syncing",
                         }
@@ -916,7 +1021,6 @@ impl<S: StorageProvider> Engine<S> {
                     error_kind: None,
                 },
             );
-            return Ok(result);
         }
 
         // retained-history.md:30-31 — a required retained state missing inside
@@ -984,16 +1088,28 @@ impl<S: StorageProvider> Engine<S> {
                     error_kind: None,
                 },
             );
+            pass.phase = ConvergencePassPhase::Completed;
+            pass.fairness_slot_available = false;
+            self.storage
+                .put_convergence_pass(&pass)
+                .map_err(storage_projection_error)?;
             return Ok(result);
         }
 
-        let observations = apply_openmls_canonicalization_result_with_profile_policy(
-            &self.storage,
-            group_id,
-            &result,
-            max_retained_anchor_rewind,
-            replay_profile_policy,
-        )?;
+        let mut completed_pass = pass.clone();
+        completed_pass.phase = ConvergencePassPhase::Completed;
+        completed_pass.fairness_slot_available = true;
+        let observations = self.storage.with_transaction(|storage| {
+            let observations = apply_openmls_canonicalization_result_with_profile_policy(
+                storage,
+                group_id,
+                &result,
+                max_retained_anchor_rewind,
+                replay_profile_policy,
+            )?;
+            storage.put_convergence_pass(&completed_pass)?;
+            Ok::<_, OpenMlsProjectionError>(observations)
+        })?;
         // #740 rotation: a routing-component update commit applied through
         // convergence may have changed this group's nostr_group_id; additively
         // refresh the transport-id index so it resolves on the inbound path
@@ -1063,11 +1179,6 @@ impl<S: StorageProvider> Engine<S> {
         );
 
         self.remember_canonicalization_result_messages(&result);
-        pass.phase = ConvergencePassPhase::Completed;
-        pass.fairness_slot_available = true;
-        self.storage
-            .put_convergence_pass(&pass)
-            .map_err(storage_projection_error)?;
         Ok(result)
     }
 

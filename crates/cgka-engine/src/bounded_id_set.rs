@@ -1,7 +1,7 @@
 //! [`BoundedIdSet`] is a capacity-bounded FIFO membership cache.
 //!
 //! The engine keeps two in-memory dedup caches — `seen_message_ids` and
-//! `sent_message_ids` — that back `StaleReason::AlreadySeen` / `OwnEcho`. The
+//! `sent_message_ids` — that back typed duplicate / own-echo exclusions. The
 //! durable `MessageRecord` store is authoritative (checked first via
 //! `recorded_message_outcome` in `do_ingest`), so these caches are a hot-process
 //! fast path, not history. Backing them with a plain `HashSet` made them

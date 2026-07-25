@@ -612,11 +612,15 @@ pub trait CgkaEngine: Send + Sync {
     /// [`IngestOutcome::Buffered`].
     fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId>;
 
-    /// Remaining process-local delay until this group's durable pass cutoff.
+    /// Prepare this group's durable pass and return its remaining process-local
+    /// cutoff delay.
     ///
-    /// `None` means no eligible pass is active. Applications use this to arm
-    /// independent per-group timers; it is not a branch-selection input.
-    fn convergence_cutoff_delay_ms(
+    /// This command may open a pass for eligible retained input, consume a
+    /// dormant fairness slot, or persist restart deadline rebasing. `None`
+    /// means no eligible pass is active. Applications use it only to arm
+    /// independent per-group timers; it is not a diagnostic query or a
+    /// branch-selection input.
+    fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,
     ) -> Result<Option<u64>, EngineError>;

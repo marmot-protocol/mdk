@@ -30,12 +30,12 @@ impl AppClient {
             .unwrap_or(false)
     }
 
-    pub(crate) fn convergence_cutoff_delay_ms(
+    pub(crate) fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Option<u64> {
         self.runtime
-            .convergence_cutoff_delay_ms(group_id)
+            .prepare_convergence_cutoff_delay_ms(group_id)
             .ok()
             .flatten()
     }

@@ -285,18 +285,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
-        if self
-            .stage_due_self_remove_auto_commit(group_id, now_ms)
-            .await?
-        {
-            return Ok(Vec::new());
-        }
-
-        self.try_auto_repropose_leave_request(group_id).await;
-        if self.load_leave_request_state(group_id)?.is_some() {
-            return Ok(Vec::new());
-        }
-
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
         let mut fairness_slot_available =
@@ -313,6 +301,20 @@ impl<S: StorageProvider> Engine<S> {
             self.consume_convergence_fairness_slot(group_id)?;
             fairness_slot_available = false;
         }
+        // A persisted fairness slot orders one already-queued administrative
+        // evolution before automatic SelfRemove or leave-maintenance mutation.
+        if !fairness_slot_available {
+            if self
+                .stage_due_self_remove_auto_commit(group_id, now_ms)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            self.try_auto_repropose_leave_request(group_id).await;
+            if self.load_leave_request_state(group_id)?.is_some() {
+                return Ok(Vec::new());
+            }
+        }
         for record in queued {
             if fairness_slot_available && !is_admin_group_state_fairness_intent(&record.intent) {
                 continue;
@@ -324,15 +326,17 @@ impl<S: StorageProvider> Engine<S> {
             {
                 break;
             }
-            if self
-                .stage_due_self_remove_auto_commit(group_id, now_ms)
-                .await?
-            {
-                break;
-            }
-            self.try_auto_repropose_leave_request(group_id).await;
-            if self.load_leave_request_state(group_id)?.is_some() {
-                break;
+            if !fairness_slot_available {
+                if self
+                    .stage_due_self_remove_auto_commit(group_id, now_ms)
+                    .await?
+                {
+                    break;
+                }
+                self.try_auto_repropose_leave_request(group_id).await;
+                if self.load_leave_request_state(group_id)?.is_some() {
+                    break;
+                }
             }
             let result = match self.do_send_ready(record.intent.clone()).await {
                 Ok(result) => result,
@@ -377,6 +381,13 @@ impl<S: StorageProvider> Engine<S> {
             // fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
             self.consume_convergence_fairness_slot(group_id)?;
+            if self
+                .stage_due_self_remove_auto_commit(group_id, now_ms)
+                .await?
+            {
+                return Ok(drained);
+            }
+            self.try_auto_repropose_leave_request(group_id).await;
         }
         Ok(drained)
     }
@@ -506,10 +517,20 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 // A completed frozen batch grants one queued user intent before
                 // an inbound-only follow-up pass. Retry one deferred-peel sweep
-                // first so newly available canonical context is visible, then
-                // return to the drain rather than opening generation N+1 here.
+                // first so newly available canonical context is visible. Return
+                // to the drain only when that durable slot actually exists.
                 let _ = self.retry_deferred_peels(group_id).await?;
-                return Ok(true);
+                let fairness_slot_available =
+                    self.storage
+                        .convergence_pass(group_id)?
+                        .is_some_and(|pass| {
+                            pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                                && pass.fairness_slot_available
+                        });
+                if fairness_slot_available {
+                    return Ok(true);
+                }
+                continue;
             }
 
             if self.retry_deferred_peels(group_id).await? == 0 {

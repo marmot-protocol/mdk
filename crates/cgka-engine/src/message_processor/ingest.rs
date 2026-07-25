@@ -346,11 +346,11 @@ impl<S: StorageProvider> Engine<S> {
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
-                            return self.terminal_peel_rejection_stale(
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "wrong_recipient_snapshot_fallback",
-                                StaleReason::NotForThisClient,
+                                InputRejectionCategory::WrongRecipient,
                             );
                         }
                         Err(e) => return Err(e),
@@ -457,11 +457,11 @@ impl<S: StorageProvider> Engine<S> {
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
-                            return self.terminal_peel_rejection_stale(
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "wrong_recipient_snapshot_fallback",
-                                StaleReason::NotForThisClient,
+                                InputRejectionCategory::WrongRecipient,
                             );
                         }
                         Err(e) => return Err(e),
@@ -538,11 +538,11 @@ impl<S: StorageProvider> Engine<S> {
                     );
                 }
                 Err(PeelerError::WrongRecipient) => {
-                    return self.terminal_peel_rejection_stale(
+                    return self.terminal_peel_rejection_ignored(
                         &raw_msg_id,
                         &msg.id,
                         "wrong_recipient",
-                        StaleReason::NotForThisClient,
+                        InputRejectionCategory::WrongRecipient,
                     );
                 }
                 Err(e) => return Err(EngineError::Peeler(e)),
@@ -699,9 +699,14 @@ impl<S: StorageProvider> Engine<S> {
                     })?;
                     let within_rewind_horizon = current_epoch.0.saturating_sub(msg_epoch.0)
                         <= policy.convergence.max_rewind_commits;
+                    let active_pass = self
+                        .storage
+                        .convergence_pass(&group_id)?
+                        .is_some_and(|pass| pass.is_active());
                     within_rewind_horizon
-                        && !self.epoch_manager.we_committed_from(&group_id, msg_epoch)
-                        && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?
+                        && (active_pass
+                            || (!self.epoch_manager.we_committed_from(&group_id, msg_epoch)
+                                && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?))
                 }
             } else {
                 false
@@ -1975,12 +1980,21 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<IngestOutcome, EngineError> {
         self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
         self.seen_message_ids.insert(msg_id.clone());
-        Ok(match stale_reason {
-            StaleReason::NotForThisClient => IngestOutcome::Ignored {
-                category: InputRejectionCategory::WrongRecipient,
-            },
-            other => IngestOutcome::Stale { reason: other },
+        Ok(IngestOutcome::Stale {
+            reason: stale_reason,
         })
+    }
+
+    fn terminal_peel_rejection_ignored(
+        &mut self,
+        raw_msg_id: &MessageId,
+        msg_id: &MessageId,
+        reason: &'static str,
+        category: InputRejectionCategory,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        self.seen_message_ids.insert(msg_id.clone());
+        Ok(IngestOutcome::Ignored { category })
     }
 
     /// Whether `msg_epoch` predates this device's membership in `group_id`

@@ -351,6 +351,7 @@ fn snapshot_encrypted_payload() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn snapshot_ingest_outcomes() {
     insta::assert_json_snapshot!("processed", IngestOutcome::Processed);
     insta::assert_json_snapshot!(

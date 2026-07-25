@@ -183,7 +183,7 @@ pub struct Engine<S: StorageProvider> {
     /// and dropped in `do_publish_failed`.
     pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
 
-    /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
+    /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
     /// Bounded hot-process cache in front of the authoritative durable
     /// `MessageRecord` store (checked first in `do_ingest`), so an id that ages
@@ -196,7 +196,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
-    /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
+    /// `invite`. Backs the typed own-echo exclusion when a message we produced
     /// bounces back via ingest before we filter it client-side.
     ///
     /// Bounded hot-process cache; see `seen_message_ids` above.
@@ -2282,11 +2282,11 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.pending_convergence_groups.drain().collect()
     }
 
-    fn convergence_cutoff_delay_ms(
+    fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,
     ) -> Result<Option<u64>, EngineError> {
-        Engine::convergence_cutoff_delay_ms(self, group_id)
+        Engine::prepare_convergence_cutoff_delay_ms(self, group_id)
             .map_err(|error| EngineError::Backend(format!("load convergence cutoff: {error}")))
     }
 

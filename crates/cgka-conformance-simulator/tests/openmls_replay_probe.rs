@@ -63,10 +63,10 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn one_rewind_policy() -> CanonicalizationPolicy {
+fn base_test_policy() -> CanonicalizationPolicy {
     CanonicalizationPolicy {
         convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
+            max_rewind_commits: 5,
             witness_quorum_senders_per_epoch: 2,
             witness_quorum_epochs: 1,
             max_witness_override_depth: 1,
@@ -74,6 +74,16 @@ fn one_rewind_policy() -> CanonicalizationPolicy {
         app_message_past_epoch_limit: 5,
         settlement_quiescence_ms: 1_000,
         max_convergence_pass_ms: 5_000,
+    }
+}
+
+fn one_rewind_policy() -> CanonicalizationPolicy {
+    CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..base_test_policy().convergence
+        },
+        ..base_test_policy()
     }
 }
 
@@ -456,17 +466,7 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
             pending_messages: vec![],
             outbound_intents: vec![],
             candidate_branches: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-                max_convergence_pass_ms: 5_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
         candidates
@@ -563,17 +563,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
             pending_messages: vec![proposal_msg.clone()],
             already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-                max_convergence_pass_ms: 5_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
     )
@@ -680,17 +670,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
             pending_messages: vec![app_msg.clone()],
             already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
-            policy: CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
-                },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
-                max_convergence_pass_ms: 5_000,
-            },
+            policy: base_test_policy(),
             now_ms: 2_000,
         },
     )
@@ -790,17 +770,7 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-            max_convergence_pass_ms: 5_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");
@@ -897,17 +867,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-            max_convergence_pass_ms: 5_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");
@@ -1007,17 +967,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
             seen_message_ids: BTreeSet::new(),
         },
         vec![],
-        CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 5,
-                witness_quorum_senders_per_epoch: 2,
-                witness_quorum_epochs: 1,
-                max_witness_override_depth: 1,
-            },
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
-            max_convergence_pass_ms: 5_000,
-        },
+        base_test_policy(),
         2_000,
     )
     .expect("stored OpenMLS canonicalization succeeds");

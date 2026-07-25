@@ -100,7 +100,8 @@ impl GroupMessageMetadata {
 ///   maps both to `StaleReason::PeelFailed`, choosing retry or terminal
 ///   storage from the available epoch evidence.
 /// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
-///   local identity — the engine maps that to `StaleReason::NotForThisClient`.
+///   local identity — the engine maps that to
+///   `InputRejectionCategory::WrongRecipient`.
 /// - `wrap_group_message` MUST be deterministic given the same input
 ///   (same `EncryptedPayload` + same `GroupContextSnapshot.epoch` →
 ///   reproducible wire bytes modulo outer-layer nonces/timestamps). The

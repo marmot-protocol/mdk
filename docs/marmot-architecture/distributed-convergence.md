@@ -112,10 +112,14 @@ pass only while that group is stable and the input can participate inside the cu
 A collecting pass persists:
 
 - its generation and base epoch;
-- process-local monotonic and millisecond wall-clock deadlines;
+- its opening time and quiescence deadline in millisecond wall-clock terms;
 - the immutable absolute deadline;
 - every admitted message id and SHA-256 digest of its peeled MLS bytes; and
 - its collecting, frozen, resolving, or completed phase.
+
+Process-local monotonic deadlines are in-memory scheduling state derived from
+those durable wall-clock terms. They are stored only to identify and schedule
+the current clock domain and are never authoritative after restart.
 
 The cutoff is:
 
