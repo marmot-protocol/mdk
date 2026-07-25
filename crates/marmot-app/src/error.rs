@@ -193,6 +193,7 @@ fn account_error_kind(error: &AccountError) -> &'static str {
         AccountError::KeyPackage(_) => "account_key_package",
         AccountError::ClockSkewBlocked => "account_clock_skew_blocked",
         AccountError::WrongAccountDelivery => "account_wrong_delivery",
+        _ => "account_unknown",
     }
 }
 

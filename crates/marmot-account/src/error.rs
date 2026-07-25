@@ -52,6 +52,7 @@ pub enum AccountHomeError {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AccountError {
     #[error(transparent)]
     Session(#[from] SessionError),
