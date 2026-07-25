@@ -27,6 +27,7 @@ use crate::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
     ConvergenceStatus, InvalidatedAppMessageReason,
 };
+use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::Engine;
 use crate::openmls_projection::{
     OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
@@ -101,7 +102,7 @@ enum ConvergenceAdmissionOutcome {
 
 struct ConvergencePassCandidate {
     member: ConvergencePassMember,
-    kind: OpenMlsContentKind,
+    input: ClassifiedConvergenceInput,
 }
 
 impl From<StorageError> for FrozenPassVerificationError {
@@ -412,12 +413,28 @@ impl<S: StorageProvider> Engine<S> {
         let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
             return Ok(ConvergenceAdmissionOutcome::Retained);
         };
+        let floor = pass
+            .base_epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
+        let ceiling = pass
+            .base_epoch
+            .0
+            .saturating_add(policy.convergence.max_rewind_commits);
+        if candidate.input.source_epoch < floor || candidate.input.source_epoch > ceiling {
+            // Retain out-of-horizon input for a later base epoch, but never let
+            // it enter (or enlarge) the immutable batch for this pass.
+            return Ok(ConvergenceAdmissionOutcome::Retained);
+        }
+        let admitted_input = candidate.input;
         pass.members.push(candidate.member);
-        // Commits are the selection-relevant consensus-log input. Proposals
-        // cannot select a branch until a commit consumes them, and application
-        // messages may witness an already-admitted branch but MUST NOT let a
-        // traffic stream move the pass boundary.
-        if candidate.kind == OpenMlsContentKind::Commit {
+        let context =
+            ConvergenceInputContext::from_inputs(self.classified_convergence_pass_inputs(&pass)?);
+        // Restart quiescence only for an input role that can change this
+        // batch's deterministic resolution. Ordinary app delivery never
+        // reaches this path; a future app without competing candidate edges is
+        // retained but does not move the pass boundary.
+        if context.is_potentially_selection_relevant(admitted_input) {
             pass.quiescence_deadline_monotonic_ms =
                 now_ms.saturating_add(policy.settlement_quiescence_ms);
             pass.quiescence_deadline_wall_ms = self
@@ -611,27 +628,28 @@ impl<S: StorageProvider> Engine<S> {
                 if source_epoch < floor || source_epoch > ceiling {
                     return None;
                 }
+                let input = ClassifiedConvergenceInput::from_projection(
+                    projection.kind,
+                    source_epoch,
+                    record.state,
+                    projection.message_digest,
+                )?;
                 Some(Ok((
                     ConvergencePassMember {
                         message_id: record.id,
                         payload_digest: projection.message_digest,
                     },
-                    record.state,
-                    projection.kind,
+                    input,
                 )))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let has_trigger = projected.iter().any(|(_, state, kind)| {
-            matches!(
-                state,
-                MessageState::Sent | MessageState::Created | MessageState::Retryable
-            ) && matches!(
-                kind,
-                OpenMlsContentKind::Commit | OpenMlsContentKind::Application
-            )
-        });
+        let context =
+            ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input)| *input));
+        let has_trigger = projected
+            .iter()
+            .any(|(_, input)| context.opens_pass(*input));
         Ok((
-            projected.into_iter().map(|(member, _, _)| member).collect(),
+            projected.into_iter().map(|(member, _)| member).collect(),
             has_trigger,
         ))
     }
@@ -650,16 +668,53 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         };
         let projection = project_mls_message(&message.payload)?;
-        if projection.source_epoch.is_none() {
+        let Some(source_epoch) = projection.source_epoch else {
             return Ok(None);
-        }
+        };
+        let Some(input) = ClassifiedConvergenceInput::from_projection(
+            projection.kind,
+            source_epoch,
+            record.state,
+            projection.message_digest,
+        ) else {
+            return Ok(None);
+        };
         Ok(Some(ConvergencePassCandidate {
             member: ConvergencePassMember {
                 message_id: message_id.clone(),
                 payload_digest: projection.message_digest,
             },
-            kind: projection.kind,
+            input,
         }))
+    }
+
+    fn classified_convergence_pass_inputs(
+        &self,
+        pass: &DurableConvergencePass,
+    ) -> Result<Vec<ClassifiedConvergenceInput>, OpenMlsProjectionError> {
+        pass.members
+            .iter()
+            .map(|member| {
+                self.convergence_pass_candidate(&member.message_id)?
+                    .map(|candidate| candidate.input)
+                    .ok_or_else(|| {
+                        OpenMlsProjectionError::Serialize(
+                            "convergence pass member is not a classified MLS input".into(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn convergence_pass_gates_outbound(
+        &self,
+        pass: &DurableConvergencePass,
+    ) -> Result<bool, OpenMlsProjectionError> {
+        let inputs = self.classified_convergence_pass_inputs(pass)?;
+        let context = ConvergenceInputContext::from_inputs(inputs.iter().copied());
+        Ok(inputs
+            .into_iter()
+            .any(|input| context.active_pass_member_gates_outbound(input)))
     }
 
     fn verify_frozen_pass_members(

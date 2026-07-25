@@ -138,6 +138,10 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 - **Module:** `convergence.rs`
   - **Owns:** the candidate-state-graph deterministic branch-selection policy
 
+- **Module:** `convergence_input.rs`
+  - **Owns:** role-aware convergence scheduling classification that distinguishes commit edges, proposal
+    dependencies, and potential application-message witnesses for pass opening, quiescence, and outbound gating
+
 - **Module:** `distributed_convergence.rs`
   - **Owns:** the engine entry point for stored-message distributed convergence
 

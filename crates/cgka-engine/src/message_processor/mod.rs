@@ -15,8 +15,9 @@ mod store;
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 
+use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
-use crate::openmls_projection::{OpenMlsContentKind, decode_openmls_wire_projection};
+use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -545,10 +546,13 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
-        if self
-            .storage
-            .convergence_pass(group_id)?
-            .is_some_and(|pass| pass.is_active())
+        if let Some(pass) = self.storage.convergence_pass(group_id)?
+            && pass.is_active()
+            && self
+                .convergence_pass_gates_outbound(&pass)
+                .map_err(|error| {
+                    EngineError::Backend(format!("classify active convergence pass: {error}"))
+                })?
         {
             return Ok(true);
         }
@@ -584,10 +588,14 @@ impl<S: StorageProvider> Engine<S> {
         };
         let records = self.storage.list_messages(group_id, EpochId(anchor))?;
         let mut skipped_non_resolvable: usize = 0;
+        let mut classified = Vec::new();
         for record in records {
             if !matches!(
                 record.state,
-                MessageState::Created | MessageState::Retryable
+                MessageState::Sent
+                    | MessageState::Created
+                    | MessageState::Retryable
+                    | MessageState::Processed
             ) {
                 continue;
             }
@@ -610,26 +618,31 @@ impl<S: StorageProvider> Engine<S> {
             if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
                 continue;
             }
-            // A lone uncommitted Proposal does NOT make canonical state
-            // ambiguous: commits are the consensus log; a proposal only takes
-            // effect once a commit consumes it (convergence.md:7-8). The
-            // SelfRemove send-side rule is enforced earlier: remaining members
-            // that may commit a SelfRemove stage a pending commit, and the
-            // leaver is held by `leaving_groups`.
-            //
-            // The Proposal record stays in its `Created`/`Retryable` state and
-            // continues to contribute to the OpenMLS candidate-path graph, so a
-            // later consuming commit still resolves it through convergence; it
-            // simply does not count as *unresolved convergence work* for the
-            // outbound-send gate. Commits and application messages remain
-            // gating: those genuinely leave canonical state ambiguous until
-            // convergence settles.
-            if matches!(
+            let Some(source_epoch) = projection.source_epoch else {
+                skipped_non_resolvable += 1;
+                continue;
+            };
+            let Some(input) = ClassifiedConvergenceInput::from_projection(
                 projection.kind,
-                OpenMlsContentKind::Commit | OpenMlsContentKind::Application
-            ) {
-                return Ok(true);
-            }
+                source_epoch,
+                record.state,
+                projection.message_digest,
+            ) else {
+                continue;
+            };
+            classified.push(input);
+        }
+        let context = ConvergenceInputContext::from_inputs(classified.iter().copied());
+        // An unresolved commit always gates because it can advance or replace
+        // canonical state. An application message gates only when retained
+        // competing commit edges make it a potential branch-selection witness;
+        // unresolved delivery by itself does not make group state ambiguous.
+        // Proposals remain dependencies and do not gate independently.
+        if classified
+            .into_iter()
+            .any(|input| context.gates_outbound(input))
+        {
+            return Ok(true);
         }
         // Reached only when nothing gates: surface any fail-open skips so an
         // insider spraying undecodable rows (which no longer wedges the gate but
