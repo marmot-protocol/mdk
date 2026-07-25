@@ -7,6 +7,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-07-25
+
 ### Changed
 
 - TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
@@ -173,12 +175,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   ones unread and re-marking never moves it backward; a chat with no messages is a no-op success. The JSON response
   carries `account_id`, `npub`, `group_id`, and the refreshed projection as the same five keys the chat rows expose
   (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
-- MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
-  and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
-  metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.
-- MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
-  profile surfaces can display it without widening the writable profile record.
-
 ### Fixed
 
 - `wn relays add/remove --type nip65` now round-trips the complete directional NIP-65 list instead of deleting
@@ -227,6 +223,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   `tui-media-cache/`, and any files a prior crashed session left behind are swept from that directory at startup. The
   files had no reuse value — the viewer draws the in-memory image and a new session never reads them — so they were
   decrypted plaintext at rest, outliving message deletion, with nothing to gain by keeping them.
+
+## [0.9.4] - 2026-07-10
+
+### Added
+
+- MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
+  and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
+  metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.
+- MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
+  profile surfaces can display it without widening the writable profile record.
 
 ## [0.9.3] - 2026-07-07
 
@@ -687,6 +693,9 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/marmot-protocol/mdk/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/marmot-protocol/mdk/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/marmot-protocol/mdk/releases/tag/v0.9.3
 [0.2.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.2.0
 [0.1.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.1.0

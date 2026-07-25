@@ -359,7 +359,11 @@ install_root="$(mktemp -d)"
 cargo install --path crates/cli --locked --bins --root "$install_root" --force
 "$install_root/bin/wn" --help
 "$install_root/bin/wnd" --help
-WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create
+release_smoke_relay="${WN_RELEASE_SMOKE_RELAY:?set WN_RELEASE_SMOKE_RELAY to a disposable test relay}"
+WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create \
+  --bootstrap-relays "$release_smoke_relay" \
+  --default-relays "$release_smoke_relay" \
+  --publish-missing-relay-lists
 ```
 
 Homebrew release notes live in:
