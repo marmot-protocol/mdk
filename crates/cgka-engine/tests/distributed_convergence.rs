@@ -816,6 +816,50 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .expect("repeated convergence after applying is a no-op");
     assert!(repeated.accepted_commits.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let completed_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("completed witness pass remains durable");
+    assert_eq!(
+        completed_pass.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    let post_race_app = if app_branch_index == 0 {
+        send_app(
+            &mut alice,
+            &group_id,
+            b"ordinary app after settled race".to_vec(),
+        )
+        .await
+    } else {
+        send_app(
+            &mut bob,
+            &group_id,
+            b"ordinary app after settled race".to_vec(),
+        )
+        .await
+    };
+    assert!(matches!(
+        carol.ingest(post_race_app.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert_message_state(&carol_storage, &post_race_app, MessageState::Processed);
+    let pass_after_app = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("ordinary app does not replace the completed pass");
+    assert_eq!(pass_after_app.generation, completed_pass.generation);
+    assert_eq!(
+        pass_after_app.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    assert!(
+        !carol
+            .has_pending_convergence_inputs(&group_id)
+            .expect("pending convergence query succeeds"),
+        "the epoch-invalidated loser must not keep gating ordinary app traffic"
+    );
 }
 
 #[tokio::test]
@@ -4211,9 +4255,9 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
         .prepare_convergence_cutoff_delay_ms(&group_id)
         .unwrap()
         .expect("collecting pass remains active");
-    assert!(
-        remaining <= 600,
-        "restart must preserve at most the original 600ms remainder, got {remaining}"
+    assert_eq!(
+        remaining, 600,
+        "restart must preserve the original 600ms remainder"
     );
 
     wall_ms.store(9_000, Ordering::SeqCst);
@@ -5000,6 +5044,23 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
         MessageState::Created,
         "the cutoff input remains durable for the next generation"
     );
+
+    carol
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .expect("next generation opens")
+        .expect("cutoff input starts the next collecting pass");
+    let next = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("generation one is durable");
+    assert_eq!(next.generation, 1);
+    assert_eq!(next.phase, cgka_traits::ConvergencePassPhase::Collecting);
+    assert!(
+        next.members
+            .iter()
+            .any(|member| member.message_id == content_id(&at_cutoff)),
+        "input retained at generation-zero cutoff must join generation one"
+    );
 }
 
 #[tokio::test]
@@ -5100,13 +5161,17 @@ async fn missing_frozen_pass_member_fails_closed_to_unrecoverable() {
         .unwrap();
 
     let mut pass = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    pass.phase = cgka_traits::ConvergencePassPhase::Frozen;
+    pass.frozen_at_wall_ms = Some(pass.cutoff_wall_ms());
+    pass.cutoff_cause = Some(cgka_traits::ConvergenceCutoffCause::Quiescence);
     pass.members[0].message_id = MessageId::new(b"missing-frozen-member".to_vec());
     carol_storage.put_convergence_pass(&pass).unwrap();
 
-    let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
-        .expect("missing member is a classified fail-closed halt");
-    assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
+    let drained = carol
+        .advance_convergence(&group_id)
+        .await
+        .expect("production advance classifies the missing member as a fail-closed halt");
+    assert!(drained.is_empty());
     assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
     assert!(carol.drain_events().iter().any(|event| matches!(
         event,

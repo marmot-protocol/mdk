@@ -24,7 +24,7 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{ConvergencePassStorage, MessageStorage};
+use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass};
@@ -366,7 +366,8 @@ impl HarnessClient {
     }
 
     /// Restore a harness convergence checkpoint, including the pass row omitted
-    /// from the group epoch snapshot.
+    /// from the group epoch snapshot, then rebuild the engine over the restored
+    /// durable state.
     pub fn restore_convergence_checkpoint(&mut self, name: &str) {
         let (group_id, pass) = self
             .convergence_checkpoints
@@ -374,11 +375,12 @@ impl HarnessClient {
             .cloned()
             .expect("convergence checkpoint exists");
         self.storage
-            .rollback_group_to_snapshot(&group_id, name)
-            .expect("restore convergence group snapshot");
-        self.storage
-            .put_convergence_pass(&pass)
-            .expect("restore durable convergence pass");
+            .with_transaction(|storage| {
+                storage.rollback_group_to_snapshot(&group_id, name)?;
+                storage.put_convergence_pass(&pass)
+            })
+            .expect("atomically restore convergence checkpoint");
+        self.restart();
     }
 
     pub fn converge_stored_at(

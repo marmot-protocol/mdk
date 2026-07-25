@@ -1303,7 +1303,6 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         let live_member_count = clients[2].members().len();
 
         clients[2].restore_convergence_checkpoint("restart-equivalence");
-        clients[2].restart();
         let restarted_result = clients[2].converge_stored_at(&group_id, 1_000_000);
 
         prop_assert(

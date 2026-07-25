@@ -7,31 +7,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use cgka_traits::convergence_pass::{ConvergencePassMember, ConvergencePassMemberRole};
 use cgka_traits::message::MessageState;
 
 use crate::openmls_projection::OpenMlsContentKind;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConvergenceInputRole {
-    CommitEdge,
-    ProposalDependency,
-    AppWitnessCandidate,
-}
-
-impl ConvergenceInputRole {
-    pub(crate) fn for_content_kind(kind: OpenMlsContentKind) -> Option<Self> {
-        match kind {
-            OpenMlsContentKind::Commit => Some(Self::CommitEdge),
-            OpenMlsContentKind::Proposal => Some(Self::ProposalDependency),
-            OpenMlsContentKind::Application => Some(Self::AppWitnessCandidate),
-            OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => None,
-        }
+pub(crate) fn role_for_content_kind(kind: OpenMlsContentKind) -> Option<ConvergencePassMemberRole> {
+    match kind {
+        OpenMlsContentKind::Commit => Some(ConvergencePassMemberRole::CommitEdge),
+        OpenMlsContentKind::Proposal => Some(ConvergencePassMemberRole::ProposalDependency),
+        OpenMlsContentKind::Application => Some(ConvergencePassMemberRole::AppWitnessCandidate),
+        OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => None,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClassifiedConvergenceInput {
-    pub(crate) role: ConvergenceInputRole,
+    pub(crate) role: ConvergencePassMemberRole,
     pub(crate) source_epoch: u64,
     pub(crate) state: MessageState,
     pub(crate) digest: [u8; 32],
@@ -45,7 +37,7 @@ impl ClassifiedConvergenceInput {
         digest: [u8; 32],
     ) -> Option<Self> {
         Some(Self {
-            role: ConvergenceInputRole::for_content_kind(kind)?,
+            role: role_for_content_kind(kind)?,
             source_epoch,
             state,
             digest,
@@ -75,12 +67,28 @@ impl ConvergenceInputContext {
     ) -> Self {
         let mut context = Self::default();
         for input in inputs {
-            if input.role == ConvergenceInputRole::CommitEdge {
+            if input.role == ConvergencePassMemberRole::CommitEdge {
                 context
                     .commit_edges_by_source_epoch
                     .entry(input.source_epoch)
                     .or_default()
                     .insert(input.digest);
+            }
+        }
+        context
+    }
+
+    pub(crate) fn from_pass_members<'a>(
+        members: impl IntoIterator<Item = &'a ConvergencePassMember>,
+    ) -> Self {
+        let mut context = Self::default();
+        for member in members {
+            if member.role == ConvergencePassMemberRole::CommitEdge {
+                context
+                    .commit_edges_by_source_epoch
+                    .entry(member.source_epoch)
+                    .or_default()
+                    .insert(member.payload_digest);
             }
         }
         context
@@ -111,9 +119,9 @@ impl ConvergenceInputContext {
         input: ClassifiedConvergenceInput,
     ) -> bool {
         match input.role {
-            ConvergenceInputRole::CommitEdge => true,
-            ConvergenceInputRole::ProposalDependency => self.has_commit_at(input.source_epoch),
-            ConvergenceInputRole::AppWitnessCandidate => {
+            ConvergencePassMemberRole::CommitEdge => true,
+            ConvergencePassMemberRole::ProposalDependency => self.has_commit_at(input.source_epoch),
+            ConvergencePassMemberRole::AppWitnessCandidate => {
                 self.has_competing_commit_before(input.source_epoch)
             }
         }
@@ -122,9 +130,9 @@ impl ConvergenceInputContext {
     pub(crate) fn opens_pass(&self, input: ClassifiedConvergenceInput) -> bool {
         input.can_start_pass()
             && match input.role {
-                ConvergenceInputRole::CommitEdge => true,
-                ConvergenceInputRole::ProposalDependency => false,
-                ConvergenceInputRole::AppWitnessCandidate => {
+                ConvergencePassMemberRole::CommitEdge => true,
+                ConvergencePassMemberRole::ProposalDependency => false,
+                ConvergencePassMemberRole::AppWitnessCandidate => {
                     self.has_competing_commit_before(input.source_epoch)
                 }
             }
@@ -133,9 +141,9 @@ impl ConvergenceInputContext {
     pub(crate) fn gates_outbound(&self, input: ClassifiedConvergenceInput) -> bool {
         input.can_gate_outbound()
             && match input.role {
-                ConvergenceInputRole::CommitEdge => true,
-                ConvergenceInputRole::ProposalDependency => false,
-                ConvergenceInputRole::AppWitnessCandidate => {
+                ConvergencePassMemberRole::CommitEdge => true,
+                ConvergencePassMemberRole::ProposalDependency => false,
+                ConvergencePassMemberRole::AppWitnessCandidate => {
                     self.has_competing_commit_before(input.source_epoch)
                 }
             }
@@ -147,15 +155,12 @@ impl ConvergenceInputContext {
     /// here. A crash can leave a frozen/resolving pass after an accepted commit
     /// record has already moved to `Processed`; outbound work must still wait
     /// until the durable pass reaches `Completed`.
-    pub(crate) fn active_pass_member_gates_outbound(
-        &self,
-        input: ClassifiedConvergenceInput,
-    ) -> bool {
-        match input.role {
-            ConvergenceInputRole::CommitEdge => true,
-            ConvergenceInputRole::ProposalDependency => false,
-            ConvergenceInputRole::AppWitnessCandidate => {
-                self.has_competing_commit_before(input.source_epoch)
+    pub(crate) fn active_pass_member_gates_outbound(&self, member: &ConvergencePassMember) -> bool {
+        match member.role {
+            ConvergencePassMemberRole::CommitEdge => true,
+            ConvergencePassMemberRole::ProposalDependency => false,
+            ConvergencePassMemberRole::AppWitnessCandidate => {
+                self.has_competing_commit_before(member.source_epoch)
             }
         }
     }
@@ -166,7 +171,7 @@ mod tests {
     use super::*;
 
     fn input(
-        role: ConvergenceInputRole,
+        role: ConvergencePassMemberRole,
         source_epoch: u64,
         state: MessageState,
         digest_byte: u8,
@@ -182,7 +187,7 @@ mod tests {
     #[test]
     fn future_app_without_a_candidate_branch_is_delivery_only_for_scheduling() {
         let app = input(
-            ConvergenceInputRole::AppWitnessCandidate,
+            ConvergencePassMemberRole::AppWitnessCandidate,
             2,
             MessageState::Created,
             1,
@@ -197,19 +202,19 @@ mod tests {
     #[test]
     fn app_after_competing_edges_is_a_selection_relevant_witness_candidate() {
         let first = input(
-            ConvergenceInputRole::CommitEdge,
+            ConvergencePassMemberRole::CommitEdge,
             1,
             MessageState::Created,
             1,
         );
         let second = input(
-            ConvergenceInputRole::CommitEdge,
+            ConvergencePassMemberRole::CommitEdge,
             1,
             MessageState::Created,
             2,
         );
         let app = input(
-            ConvergenceInputRole::AppWitnessCandidate,
+            ConvergencePassMemberRole::AppWitnessCandidate,
             2,
             MessageState::Created,
             3,
@@ -219,19 +224,25 @@ mod tests {
         assert!(context.opens_pass(app));
         assert!(context.gates_outbound(app));
         assert!(context.is_potentially_selection_relevant(app));
-        assert!(context.active_pass_member_gates_outbound(app));
+        let member = ConvergencePassMember {
+            message_id: cgka_traits::MessageId::new(vec![3]),
+            payload_digest: app.digest,
+            role: app.role,
+            source_epoch: app.source_epoch,
+        };
+        assert!(context.active_pass_member_gates_outbound(&member));
     }
 
     #[test]
     fn proposal_only_becomes_potentially_relevant_beside_same_epoch_commit() {
         let commit = input(
-            ConvergenceInputRole::CommitEdge,
+            ConvergencePassMemberRole::CommitEdge,
             4,
             MessageState::Created,
             1,
         );
         let proposal = input(
-            ConvergenceInputRole::ProposalDependency,
+            ConvergencePassMemberRole::ProposalDependency,
             4,
             MessageState::Created,
             2,
@@ -246,7 +257,7 @@ mod tests {
     #[test]
     fn processed_commit_still_gates_while_its_durable_pass_is_active() {
         let commit = input(
-            ConvergenceInputRole::CommitEdge,
+            ConvergencePassMemberRole::CommitEdge,
             7,
             MessageState::Processed,
             1,
@@ -254,6 +265,12 @@ mod tests {
         let context = ConvergenceInputContext::from_inputs([commit]);
 
         assert!(!context.gates_outbound(commit));
-        assert!(context.active_pass_member_gates_outbound(commit));
+        let member = ConvergencePassMember {
+            message_id: cgka_traits::MessageId::new(vec![1]),
+            payload_digest: commit.digest,
+            role: commit.role,
+            source_epoch: commit.source_epoch,
+        };
+        assert!(context.active_pass_member_gates_outbound(&member));
     }
 }

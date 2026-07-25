@@ -548,11 +548,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<bool, EngineError> {
         if let Some(pass) = self.storage.convergence_pass(group_id)?
             && pass.is_active()
-            && self
-                .convergence_pass_gates_outbound(&pass)
-                .map_err(|error| {
-                    EngineError::Backend(format!("classify active convergence pass: {error}"))
-                })?
+            && self.convergence_pass_gates_outbound(&pass)
         {
             return Ok(true);
         }
@@ -1142,16 +1138,17 @@ impl<S: StorageProvider> Engine<S> {
                     // derived row now carries the real verdict — applied
                     // (`Processed`), a same-epoch fork the incumbent won
                     // (`AlreadyAtEpoch`, content row `EpochInvalidated`), a
-                    // duplicate (`AlreadySeen`), our own echo (`OwnEcho`), or our
-                    // own eviction (`SelfEvicted`). Retire the raw wrapper so it
-                    // leaves the retry lifecycle instead of being re-peeled on
-                    // every subsequent publish-cycle replay — but ONLY while it is
-                    // still awaiting retry. `record.state` is the pre-ingest
-                    // snapshot; `ingest_group_message` may have already committed a
-                    // terminal state to this same row during the call. The
-                    // reachable case is `SelfEvicted`: a buffered peer commit that
-                    // evicts our leaf makes the next buffered row hit `!is_active`,
-                    // which persists that row `Failed` (ingest.rs). That
+                    // duplicate (`Ignored { category: Duplicate }`), our own echo
+                    // (`Ignored { category: OwnEcho }`), or our own eviction
+                    // (`LocalState { state: Removed }`). Retire the raw wrapper so
+                    // it leaves the retry lifecycle instead of being re-peeled on
+                    // every subsequent publish-cycle replay — but ONLY while it
+                    // is still awaiting retry. `record.state` is the pre-ingest
+                    // snapshot; `ingest_group_message` may have already committed
+                    // a terminal state to this same row during the call. The
+                    // reachable removal case is a buffered peer commit that evicts
+                    // our leaf: the next buffered row hits `!is_active`, which
+                    // persists that row `Failed` (ingest.rs). That
                     // ingest-committed verdict is authoritative — relabeling an
                     // evicted-on row `Processed` would sweep it back into
                     // canonicalization (`openmls_projection` /

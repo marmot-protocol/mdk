@@ -61,7 +61,8 @@ mod tests {
     use super::*;
     use crate::storage::test_support::{gid, sample_group};
     use cgka_traits::convergence_pass::{
-        ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassPhase,
+        ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole,
+        ConvergencePassPhase,
     };
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::{EpochId, MessageId};
@@ -82,6 +83,8 @@ mod tests {
             members: vec![ConvergencePassMember {
                 message_id: MessageId::new(vec![8]),
                 payload_digest: [9; 32],
+                role: ConvergencePassMemberRole::CommitEdge,
+                source_epoch: 4,
             }],
             frozen_at_wall_ms: Some(1_020),
             cutoff_cause: Some(ConvergenceCutoffCause::Quiescence),

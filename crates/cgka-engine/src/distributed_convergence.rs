@@ -27,7 +27,9 @@ use crate::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
     ConvergenceStatus, InvalidatedAppMessageReason,
 };
-use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
+use crate::convergence_input::{
+    ClassifiedConvergenceInput, ConvergenceInputContext, role_for_content_kind,
+};
 use crate::engine::Engine;
 use crate::openmls_projection::{
     OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
@@ -428,8 +430,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let admitted_input = candidate.input;
         pass.members.push(candidate.member);
-        let context =
-            ConvergenceInputContext::from_inputs(self.classified_convergence_pass_inputs(&pass)?);
+        let context = ConvergenceInputContext::from_pass_members(&pass.members);
         // Restart quiescence only for an input role that can change this
         // batch's deterministic resolution. Ordinary app delivery never
         // reaches this path; a future app without competing candidate edges is
@@ -638,6 +639,8 @@ impl<S: StorageProvider> Engine<S> {
                     ConvergencePassMember {
                         message_id: record.id,
                         payload_digest: projection.message_digest,
+                        role: input.role,
+                        source_epoch,
                     },
                     input,
                 )))
@@ -683,38 +686,18 @@ impl<S: StorageProvider> Engine<S> {
             member: ConvergencePassMember {
                 message_id: message_id.clone(),
                 payload_digest: projection.message_digest,
+                role: input.role,
+                source_epoch,
             },
             input,
         }))
     }
 
-    fn classified_convergence_pass_inputs(
-        &self,
-        pass: &DurableConvergencePass,
-    ) -> Result<Vec<ClassifiedConvergenceInput>, OpenMlsProjectionError> {
+    pub(crate) fn convergence_pass_gates_outbound(&self, pass: &DurableConvergencePass) -> bool {
+        let context = ConvergenceInputContext::from_pass_members(&pass.members);
         pass.members
             .iter()
-            .map(|member| {
-                self.convergence_pass_candidate(&member.message_id)?
-                    .map(|candidate| candidate.input)
-                    .ok_or_else(|| {
-                        OpenMlsProjectionError::Serialize(
-                            "convergence pass member is not a classified MLS input".into(),
-                        )
-                    })
-            })
-            .collect()
-    }
-
-    pub(crate) fn convergence_pass_gates_outbound(
-        &self,
-        pass: &DurableConvergencePass,
-    ) -> Result<bool, OpenMlsProjectionError> {
-        let inputs = self.classified_convergence_pass_inputs(pass)?;
-        let context = ConvergenceInputContext::from_inputs(inputs.iter().copied());
-        Ok(inputs
-            .into_iter()
-            .any(|input| context.active_pass_member_gates_outbound(input)))
+            .any(|member| context.active_pass_member_gates_outbound(member))
     }
 
     fn verify_frozen_pass_members(
@@ -742,6 +725,13 @@ impl<S: StorageProvider> Engine<S> {
                 .ok_or(FrozenPassVerificationError::Integrity)?;
             let actual: [u8; 32] = Sha256::digest(&message.payload).into();
             if actual != member.payload_digest {
+                return Err(FrozenPassVerificationError::Integrity);
+            }
+            let projection = project_mls_message(&message.payload)
+                .map_err(|_| FrozenPassVerificationError::Integrity)?;
+            let role = role_for_content_kind(projection.kind)
+                .ok_or(FrozenPassVerificationError::Integrity)?;
+            if role != member.role || projection.source_epoch != Some(member.source_epoch) {
                 return Err(FrozenPassVerificationError::Integrity);
             }
         }
