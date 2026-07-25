@@ -19,8 +19,8 @@ use crate::quic::{
     resolve_quic_candidate_addr,
 };
 use crate::stream_session::{
-    ActiveStreamSession, FinalizedStream, StreamBeginReceipt, StreamBeginReservation,
-    normalize_stream_capability,
+    ActiveStreamSession, FinalizedStream, SendIdempotencyAcquisition, SendIdempotencyLeader,
+    StreamBeginReceipt, StreamBeginReservation, normalize_stream_capability,
 };
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
@@ -95,6 +95,7 @@ fn stream_finalize_idempotency_key(key: &str) -> String {
 struct StreamFinalizeIdempotency {
     key: String,
     fingerprint: String,
+    _reservation: SendIdempotencyLeader,
 }
 
 impl AgentConnector {
@@ -364,14 +365,25 @@ impl AgentConnector {
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .map(stream_finalize_idempotency_key);
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
-        {
-            return Ok(AgentControlResponse::StreamFinalized {
-                stream_id_hex,
-                message_ids_hex,
-            });
-        }
+        let idempotency = if let Some(key) = idempotency_key {
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                    return Ok(AgentControlResponse::StreamFinalized {
+                        stream_id_hex,
+                        message_ids_hex,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => {
+                    Some(StreamFinalizeIdempotency {
+                        key,
+                        fingerprint,
+                        _reservation: reservation,
+                    })
+                }
+            }
+        } else {
+            None
+        };
         // Clone (not remove) the session: the final text/hash/chunk-count
         // expectation is validated inside the compose task, atomically with
         // its teardown. On mismatch the session stays registered and the
@@ -401,7 +413,7 @@ impl AgentConnector {
                     final_text,
                     transcript_hash,
                     chunk_count,
-                    idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
+                    idempotency,
                 )
                 .await;
         }
@@ -470,7 +482,7 @@ impl AgentConnector {
             final_text,
             transcript_hash,
             chunk_count,
-            idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
+            idempotency,
         )
         .await
     }

@@ -3861,6 +3861,103 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
     );
 }
 
+#[tokio::test]
+async fn send_idempotency_store_same_request_waits_for_leader_result() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store.acquire("same-key", "same-fingerprint").await.unwrap() {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("same-key", "same-fingerprint")
+            .await
+            .unwrap()
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !follower.is_finished(),
+        "a matching follower must wait instead of issuing another send"
+    );
+
+    let ids = vec!["aa".repeat(32)];
+    store.record(
+        "same-key".to_owned(),
+        "same-fingerprint".to_owned(),
+        ids.clone(),
+    );
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Leader(_) => {
+            panic!("a follower must reuse the leader's committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store
+        .acquire("retry-key", "retry-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("retry-key", "retry-fingerprint")
+            .await
+            .unwrap()
+    });
+    tokio::task::yield_now().await;
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("a failed leader has no committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "shared-key".to_owned(),
+        "first-fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    match store
+        .acquire("shared-key", "different-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("different request bodies must not reuse unrelated message ids")
+        }
+    }
+}
+
 #[test]
 fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
     use crate::stream_session::SendIdempotencyStore;

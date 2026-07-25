@@ -12,6 +12,7 @@ use marmot_app::{
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
+use crate::stream_session::SendIdempotencyAcquisition;
 use crate::validation::normalize_hex;
 
 /// Current schema version for persisted `send_final` request fingerprints.
@@ -120,14 +121,18 @@ impl AgentConnector {
             reply_to_message_id_hex.as_deref(),
         );
 
-        // Idempotent durable send: if this key already committed a matching send,
-        // return the original message ids without re-sending so a retry after a
-        // post-write timeout cannot double-post an unrecallable message.
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
-        {
-            return Ok(AgentControlResponse::FinalSent { message_ids_hex });
-        }
+        // Reserve matching requests before the first await so concurrent
+        // same-key retries cannot both miss the cache and both durably send.
+        let idempotency = if let Some(key) = idempotency_key {
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                    return Ok(AgentControlResponse::FinalSent { message_ids_hex });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
+            }
+        } else {
+            None
+        };
 
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -143,7 +148,7 @@ impl AgentConnector {
         // Record only after a successful send so a failed send remains retryable.
         // A key already bound to a different fingerprint is left untouched (first
         // write wins), so this send simply proceeds without caching.
-        if let Some(key) = idempotency_key {
+        if let Some((key, _reservation)) = idempotency {
             self.idempotency
                 .record(key, fingerprint, summary.message_ids.clone());
         }
