@@ -224,6 +224,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                     "agent_text_stream": agent_text_stream,
                 }),
             })
@@ -404,6 +405,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                     "agent_text_stream": agent_text_stream,
                 }),
             })

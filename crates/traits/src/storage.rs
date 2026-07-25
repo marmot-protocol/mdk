@@ -12,6 +12,10 @@
 use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
 use crate::engine::SendIntent;
 use crate::group::{Group, Member};
+use crate::maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
+    MaintenanceObligation, PeriodicMaintenancePolicy,
+};
 use crate::message::{MessageRecord, MessageState};
 use crate::transport_adapter::OutboundFanout;
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
@@ -283,6 +287,54 @@ pub trait KeyPackageBundleStorage {
     fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()>;
 }
 
+// ── MaintenanceStorage ─────────────────────────────────────────────────────
+
+/// Account-device-local maintenance and immutable publication recovery.
+///
+/// Implementations must keep these records in the same encrypted database as
+/// the MLS state.  Multi-record transitions use `StorageProvider::with_transaction`.
+pub trait MaintenanceStorage {
+    fn key_package_lifecycle(&self) -> StorageResult<Option<KeyPackageLifecycleState>>;
+    fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> StorageResult<()>;
+
+    fn group_maintenance(&self, group_id: &GroupId)
+    -> StorageResult<Option<GroupMaintenanceState>>;
+    fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> StorageResult<()>;
+    fn delete_group_maintenance(&self, group_id: &GroupId) -> StorageResult<()>;
+
+    fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> StorageResult<()>;
+    fn maintenance_obligation(
+        &self,
+        id: &MessageId,
+    ) -> StorageResult<Option<MaintenanceObligation>>;
+    fn list_maintenance_obligations(&self) -> StorageResult<Vec<MaintenanceObligation>>;
+    fn list_maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<MaintenanceObligation>>;
+    fn delete_maintenance_obligation(&self, id: &MessageId) -> StorageResult<()>;
+
+    fn put_group_evolution(&self, record: &DurableGroupEvolution) -> StorageResult<()>;
+    fn group_evolution(&self, id: &MessageId) -> StorageResult<Option<DurableGroupEvolution>>;
+    fn list_group_evolutions(&self) -> StorageResult<Vec<DurableGroupEvolution>>;
+    fn list_group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DurableGroupEvolution>>;
+    fn delete_group_evolution(&self, id: &MessageId) -> StorageResult<()>;
+
+    fn put_transport_fanout(&self, record: &DurableTransportFanout) -> StorageResult<()>;
+    fn transport_fanout(&self, id: &MessageId) -> StorageResult<Option<DurableTransportFanout>>;
+    fn list_transport_fanouts(&self) -> StorageResult<Vec<DurableTransportFanout>>;
+    fn delete_transport_fanout(&self, id: &MessageId) -> StorageResult<()>;
+
+    fn periodic_maintenance_policy(&self) -> StorageResult<PeriodicMaintenancePolicy>;
+    fn put_periodic_maintenance_policy(
+        &self,
+        policy: PeriodicMaintenancePolicy,
+    ) -> StorageResult<()>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -311,6 +363,16 @@ pub trait StorageProvider:
     /// Reference to the OpenMLS storage side. Used by the engine to construct
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
+
+    /// Optional account-device maintenance store.
+    ///
+    /// This is accessor composition for the same reason as `mls_storage()`:
+    /// fault-injection and alternate engine stores that predate maintenance
+    /// remain valid `StorageProvider`s, while production SQLCipher storage
+    /// exposes the durable maintenance capability.
+    fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        None
+    }
 
     /// Run a storage operation inside one backend transaction when the backend
     /// supports it. Backends without transactional support use the closure

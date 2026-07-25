@@ -26,6 +26,8 @@ pub struct KeyPackageMetadata {
     pub key_package_ref_hex: String,
     pub credential_identity_hex: String,
     pub protocol_profile: ProtocolProfile,
+    pub not_before: u64,
+    pub not_after: u64,
     pub ciphersuite: u16,
     pub mls_extensions: Vec<u16>,
     pub mls_proposals: Vec<u16>,
@@ -73,6 +75,8 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
         credential_identity_hex: hex::encode(member_id.as_slice()),
         protocol_profile,
+        not_before: key_package.life_time().not_before(),
+        not_after: key_package.life_time().not_after(),
         ciphersuite: u16::from(key_package.ciphersuite()),
         mls_extensions: capabilities.extensions.into_iter().collect(),
         mls_proposals: capabilities.proposals.into_iter().collect(),
@@ -152,11 +156,19 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
+        self.build_fresh_key_package(&self.storage)
+    }
+
+    /// Build + persist a fresh KeyPackage using the supplied storage view.
+    ///
+    /// Maintenance uses this inside `StorageProvider::with_transaction` so the
+    /// OpenMLS private bundle and the lifecycle record become durable together.
+    pub(crate) fn build_fresh_key_package(&self, storage: &S) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
         let leaf_extensions = self
             .identity
             .leaf_extensions(&self.supported_app_components)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)
@@ -262,7 +274,7 @@ fn ensure_key_package_profile(
     Ok(())
 }
 
-fn validate_key_package(
+pub(crate) fn validate_key_package(
     kp_in: openmls::prelude::KeyPackageIn,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<MlsKeyPackage, EngineError> {

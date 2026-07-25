@@ -233,6 +233,7 @@ fn send_summary_json(summary: marmot_app::SendSummary) -> Value {
     json!({
         "published": summary.published,
         "message_ids": summary.message_ids,
+        "maintenance_disposition": summary.maintenance_disposition,
     })
 }
 

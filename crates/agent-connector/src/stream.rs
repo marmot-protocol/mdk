@@ -381,7 +381,7 @@ impl AgentConnector {
             .get_authorized(&stream_id_hex, &stream_capability)?;
         let idempotency = if let Some(key) = idempotency_key {
             match self.idempotency.acquire(&key, &fingerprint).await? {
-                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                SendIdempotencyAcquisition::Completed((message_ids_hex, _)) => {
                     return Ok(AgentControlResponse::StreamFinalized {
                         stream_id_hex,
                         message_ids_hex,
@@ -532,7 +532,10 @@ impl AgentConnector {
                 idempotency.fingerprint,
                 message_ids.clone(),
             );
-            idempotency.reservation.complete(message_ids);
+            idempotency.reservation.complete(
+                message_ids,
+                agent_control::AgentControlSendMaintenanceDisposition::Ready,
+            );
         }
         // Durable final published: it is now safe to drop the session.
         let _ = self.streams.remove_if_same(stream_id_hex, session);

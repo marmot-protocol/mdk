@@ -470,6 +470,13 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
         AgentControlResponse::GroupInfo { .. } => "group_info",
+        AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
+        AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
+            "key_package_maintenance_status"
+        }
+        AgentControlResponse::MaintenanceScheduled { .. } => "maintenance_scheduled",
+        AgentControlResponse::MaintenancePolicy { .. } => "maintenance_policy",
+        AgentControlResponse::MaintenanceRun { .. } => "maintenance_run",
         AgentControlResponse::StreamBegun { .. } => "stream_begun",
         AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",

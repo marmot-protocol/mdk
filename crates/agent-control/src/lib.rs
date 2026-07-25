@@ -183,6 +183,33 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    MaintenanceStatus {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
+    KeyPackageMaintenanceStatus {
+        account_id_hex: String,
+    },
+    MaintenanceScheduleSelfUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
+    MaintenanceGetPolicy {
+        account_id_hex: String,
+    },
+    MaintenanceSetPolicy {
+        account_id_hex: String,
+        enabled_for_new_groups: bool,
+    },
+    MaintenancePause {
+        account_id_hex: String,
+    },
+    MaintenanceResume {
+        account_id_hex: String,
+    },
+    MaintenanceRun {
+        account_id_hex: String,
+    },
     AllowlistList {
         account_id_hex: String,
     },
@@ -285,9 +312,13 @@ pub enum AgentControlResponse {
     },
     FinalSent {
         message_ids_hex: Vec<String>,
+        #[serde(default)]
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
     },
     AppEventSent {
         message_ids_hex: Vec<String>,
+        #[serde(default)]
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
     },
     Allowlist {
         account_id_hex: String,
@@ -302,6 +333,25 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    MaintenanceStatus {
+        status: AgentControlMaintenanceStatus,
+    },
+    KeyPackageMaintenanceStatus {
+        status: Option<AgentControlKeyPackageMaintenanceStatus>,
+    },
+    MaintenanceScheduled {
+        obligation_id_hex: String,
+    },
+    MaintenancePolicy {
+        enabled_for_new_groups: bool,
+    },
+    MaintenanceRun {
+        published: u32,
+        message_ids_hex: Vec<String>,
+        deferred: u32,
+        ambiguous_exposure: u32,
+        failures: u32,
     },
     StreamBegun {
         stream_id_hex: String,
@@ -331,6 +381,14 @@ pub enum AgentControlResponse {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlSendMaintenanceDisposition {
+    #[default]
+    Ready,
+    PostJoinRotationPendingRetryable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlAccount {
     pub account_id_hex: String,
@@ -345,6 +403,63 @@ pub struct AgentControlDebugFinalSend {
     pub text: String,
     pub reply_to_message_id_hex: Option<String>,
     pub message_ids_hex: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMaintenanceObligation {
+    pub id_hex: String,
+    pub trigger: String,
+    pub phase: String,
+    pub created_at: u64,
+    pub operational_target_at: Option<u64>,
+    pub overdue: bool,
+    pub eose_deadline_at: Option<u64>,
+    pub grace_until: Option<u64>,
+    pub quiet_since: Option<u64>,
+    pub sampled_jitter_ms: u64,
+    pub not_before: Option<u64>,
+    pub attempt_count: u32,
+    pub semantic_rearm_count: u32,
+    pub last_failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMaintenanceStatus {
+    pub group_id_hex: String,
+    pub enrolled_at: Option<u64>,
+    pub periodic_enrolled: bool,
+    pub last_own_leaf_rotation_at: Option<u64>,
+    pub next_periodic_rotation_at: Option<u64>,
+    pub obligations: Vec<AgentControlMaintenanceObligation>,
+    pub preparing_evolutions: u32,
+    pub prepared_evolutions: u32,
+    pub attempting_evolutions: u32,
+    pub confirmed_evolutions: u32,
+    pub superseded_evolutions: u32,
+    pub accepted_fanout_targets: u32,
+    pub unattempted_fanout_targets: u32,
+    pub failed_fanout_targets: u32,
+    pub policy_prohibited_fanout_targets: u32,
+    pub paused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlKeyPackageMaintenanceStatus {
+    pub stable_slot_id: String,
+    pub phase: String,
+    pub current_key_package_ref_hex: Option<String>,
+    pub current_not_after: Option<u64>,
+    pub refresh_at: Option<u64>,
+    pub authored_event_id_hex: Option<String>,
+    pub last_consumed_key_package_ref_hex: Option<String>,
+    pub retained_private_material_count: u32,
+    pub accepted_fanout_targets: u32,
+    pub unattempted_fanout_targets: u32,
+    pub failed_fanout_targets: u32,
+    pub policy_prohibited_fanout_targets: u32,
+    pub pending_event_id_hex: Option<String>,
+    pub pending_attempt_count: u32,
+    pub pending_last_failure_code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,8 +628,9 @@ mod tests {
 
     use crate::{
         AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-        AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame,
-        read_envelope, read_frame, write_frame,
+        AgentControlResponse, AgentControlSendMaintenanceDisposition,
+        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
+        write_frame,
     };
 
     #[test]
@@ -619,6 +735,25 @@ mod tests {
         assert_eq!(value["idempotency_key"], "key-1");
         let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn successful_send_response_carries_machine_readable_maintenance_disposition() {
+        let response = AgentControlResponse::FinalSent {
+            message_ids_hex: vec![message()],
+            maintenance_disposition:
+                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "final_sent");
+        assert_eq!(
+            value["maintenance_disposition"],
+            "post_join_rotation_pending_retryable"
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentControlResponse>(value).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -970,6 +1105,57 @@ mod tests {
                     group_id_hex: group(),
                 },
                 "group_info",
+            ),
+            (
+                AgentControlRequest::MaintenanceStatus {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "maintenance_status",
+            ),
+            (
+                AgentControlRequest::KeyPackageMaintenanceStatus {
+                    account_id_hex: account(),
+                },
+                "key_package_maintenance_status",
+            ),
+            (
+                AgentControlRequest::MaintenanceScheduleSelfUpdate {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "maintenance_schedule_self_update",
+            ),
+            (
+                AgentControlRequest::MaintenanceGetPolicy {
+                    account_id_hex: account(),
+                },
+                "maintenance_get_policy",
+            ),
+            (
+                AgentControlRequest::MaintenanceSetPolicy {
+                    account_id_hex: account(),
+                    enabled_for_new_groups: true,
+                },
+                "maintenance_set_policy",
+            ),
+            (
+                AgentControlRequest::MaintenancePause {
+                    account_id_hex: account(),
+                },
+                "maintenance_pause",
+            ),
+            (
+                AgentControlRequest::MaintenanceResume {
+                    account_id_hex: account(),
+                },
+                "maintenance_resume",
+            ),
+            (
+                AgentControlRequest::MaintenanceRun {
+                    account_id_hex: account(),
+                },
+                "maintenance_run",
             ),
             (
                 AgentControlRequest::AllowlistList {

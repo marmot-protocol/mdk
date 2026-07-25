@@ -101,6 +101,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Durable KeyPackage and group self-update maintenance. KeyPackages now rotate under one stable kind-30443 `d` slot
+  with exact signed-event retry, persisted lifetime/refresh/retry state, consumed-key retention until replacement
+  acknowledgement, and no routine kind-5 deletion. New `keys maintenance-status` and `groups maintenance-status`,
+  `schedule-self-update`, `maintenance-policy`, `pause-maintenance`, `resume-maintenance`, and `run-maintenance`
+  commands expose the lifecycle. New groups are periodically enrolled by default; existing groups remain manual-only.
+  Successful application-send JSON now includes `maintenance_disposition` without blocking sends while post-join
+  rotation is pending. ([#1103](https://github.com/marmot-protocol/mdk/pull/1103))
 - TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
   account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
   deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,

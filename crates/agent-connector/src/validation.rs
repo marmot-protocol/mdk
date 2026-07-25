@@ -118,6 +118,16 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
         AgentControlRequest::GroupInfo { .. } => "group_info",
+        AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
+        AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
+        AgentControlRequest::MaintenanceScheduleSelfUpdate { .. } => {
+            "maintenance_schedule_self_update"
+        }
+        AgentControlRequest::MaintenanceGetPolicy { .. } => "maintenance_get_policy",
+        AgentControlRequest::MaintenanceSetPolicy { .. } => "maintenance_set_policy",
+        AgentControlRequest::MaintenancePause { .. } => "maintenance_pause",
+        AgentControlRequest::MaintenanceResume { .. } => "maintenance_resume",
+        AgentControlRequest::MaintenanceRun { .. } => "maintenance_run",
         AgentControlRequest::AllowlistList { .. } => "allowlist_list",
         AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",

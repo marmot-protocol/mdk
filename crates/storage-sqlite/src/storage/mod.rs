@@ -3,6 +3,7 @@ mod capabilities;
 mod convergence_policy;
 mod groups;
 mod leave_requests;
+mod maintenance;
 mod member_validation_cache;
 mod messages;
 mod outbound;

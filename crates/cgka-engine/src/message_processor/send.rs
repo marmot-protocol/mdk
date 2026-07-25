@@ -68,6 +68,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_remove_members(group_id, members).await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
+            SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => {
                 self.do_send_update_app_components(group_id, updates).await
             }

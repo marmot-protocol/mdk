@@ -133,6 +133,12 @@ pub enum SendIntent {
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
+    /// Rotate only this sender's MLS LeafNode key material.
+    ///
+    /// The engine forces an update path and deliberately leaves the proposal
+    /// store untouched, so maintenance cannot accidentally commit unrelated
+    /// pending proposals.
+    SelfUpdate { group_id: GroupId },
     /// Update one or more MLS app-component dictionary entries.
     ///
     /// This is the generic path for group settings such as profile,

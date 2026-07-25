@@ -706,7 +706,7 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
 }
 
 #[tokio::test]
-async fn app_runtime_reuses_initial_key_package_when_republishing() {
+async fn app_runtime_routine_key_package_publish_replaces_under_stable_slot() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -741,9 +741,9 @@ async fn app_runtime_reuses_initial_key_package_when_republishing() {
         .unwrap();
 
     assert_eq!(republished_bytes, first.key_package.bytes().len());
-    assert_eq!(second.key_package.bytes(), first.key_package.bytes());
+    assert_ne!(second.key_package.bytes(), first.key_package.bytes());
     assert_eq!(second.key_package_id, first.key_package_id);
-    assert_eq!(second.key_package_ref_hex, first.key_package_ref_hex);
+    assert_ne!(second.key_package_ref_hex, first.key_package_ref_hex);
     assert!(!first.key_package_id.is_empty());
     assert!(!second.key_package_id.is_empty());
     assert!(!first.key_package_ref_hex.is_empty());
@@ -856,9 +856,9 @@ async fn app_runtime_can_rotate_key_package_on_request() {
     assert_eq!(rotated_bytes, rotated.key_package.bytes().len());
     assert_eq!(rotated.key_package_id, first.key_package_id);
     assert_ne!(rotated.key_package_ref_hex, first.key_package_ref_hex);
-    assert_eq!(republished.key_package.bytes(), rotated.key_package.bytes());
+    assert_ne!(republished.key_package.bytes(), rotated.key_package.bytes());
     assert_eq!(republished.key_package_id, rotated.key_package_id);
-    assert_eq!(republished.key_package_ref_hex, rotated.key_package_ref_hex);
+    assert_ne!(republished.key_package_ref_hex, rotated.key_package_ref_hex);
     assert!(!rotated.key_package_id.is_empty());
     assert!(!republished.key_package_id.is_empty());
     assert!(!rotated.key_package_ref_hex.is_empty());
@@ -901,7 +901,7 @@ async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
 }
 
 #[tokio::test]
-async fn app_runtime_replaces_invalid_cached_key_package_when_republishing() {
+async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -935,12 +935,21 @@ async fn app_runtime_replaces_invalid_cached_key_package_when_republishing() {
         .publish_key_package(&created.account.account_id_hex)
         .await
         .unwrap();
+    let published = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
     let cache: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
 
     assert!(republished_bytes > 3);
-    assert_ne!(cache["key_package_id"], "legacy-invalid");
-    assert_ne!(cache["key_package_hex"], "010203");
+    assert_eq!(published.key_package.bytes().len(), republished_bytes);
+    assert_ne!(published.key_package_id, "legacy-invalid");
+    assert_eq!(cache["key_package_id"], "legacy-invalid");
+    assert_eq!(cache["key_package_hex"], "010203");
 
     runtime.shutdown().await;
 }

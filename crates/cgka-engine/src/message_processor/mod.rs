@@ -1124,6 +1124,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }

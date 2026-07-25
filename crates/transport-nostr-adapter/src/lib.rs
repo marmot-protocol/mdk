@@ -114,6 +114,16 @@ pub enum NostrSubscription {
         endpoints: Vec<TransportEndpoint>,
         since: Option<Timestamp>,
     },
+    /// Temporary full-history subscription used only by post-join maintenance.
+    ///
+    /// Its distinct id keeps it independent from the normal incremental group
+    /// subscription even though both route the same authenticated MLS events.
+    GroupMaintenance {
+        account_id: MemberId,
+        group_id: GroupId,
+        transport_group_id: Vec<u8>,
+        endpoints: Vec<TransportEndpoint>,
+    },
 }
 
 impl NostrSubscription {
@@ -148,20 +158,41 @@ impl NostrSubscription {
                     ],
                 )
             }
+            Self::GroupMaintenance {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+            } => {
+                let h_tag = hex::encode(transport_group_id);
+                compact_subscription_id(
+                    "group-maintenance",
+                    &[
+                        account_id.as_slice(),
+                        group_id.as_slice(),
+                        h_tag.as_bytes(),
+                        endpoint_set_digest(endpoints).as_bytes(),
+                    ],
+                )
+            }
         }
     }
 
     /// Relay endpoints this subscription was issued to.
     pub fn endpoints(&self) -> &[TransportEndpoint] {
         match self {
-            Self::AccountInbox { endpoints, .. } | Self::Group { endpoints, .. } => endpoints,
+            Self::AccountInbox { endpoints, .. }
+            | Self::Group { endpoints, .. }
+            | Self::GroupMaintenance { endpoints, .. } => endpoints,
         }
     }
 
     /// Account this subscription belongs to.
     pub fn account_id(&self) -> &MemberId {
         match self {
-            Self::AccountInbox { account_id, .. } | Self::Group { account_id, .. } => account_id,
+            Self::AccountInbox { account_id, .. }
+            | Self::Group { account_id, .. }
+            | Self::GroupMaintenance { account_id, .. } => account_id,
         }
     }
 
@@ -187,6 +218,17 @@ impl NostrSubscription {
                 transport_group_id: transport_group_id.clone(),
                 endpoints: normalized_endpoints(endpoints),
             },
+            Self::GroupMaintenance {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+            } => NostrSubscriptionRouteKey::GroupMaintenance {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: normalized_endpoints(endpoints),
+            },
         }
     }
 }
@@ -198,6 +240,12 @@ enum NostrSubscriptionRouteKey {
         endpoints: Vec<TransportEndpoint>,
     },
     Group {
+        account_id: MemberId,
+        group_id: GroupId,
+        transport_group_id: Vec<u8>,
+        endpoints: Vec<TransportEndpoint>,
+    },
+    GroupMaintenance {
         account_id: MemberId,
         group_id: GroupId,
         transport_group_id: Vec<u8>,
@@ -398,6 +446,59 @@ impl NostrTransportAdapter {
             .await
             .sync
             .subscription_synced(subscription_id)
+    }
+
+    /// Whether at least one relay has returned EOSE for a live subscription.
+    pub async fn subscription_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        self.state
+            .read()
+            .await
+            .sync
+            .subscription_any_eose(subscription_id)
+    }
+
+    /// Install the temporary, full-history subscription used by the post-join
+    /// maintenance gate. The caller owns its eventual removal.
+    pub async fn install_group_maintenance_subscription(
+        &self,
+        account_id: &MemberId,
+        group: &TransportGroupSubscription,
+    ) -> Result<String, TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        let subscription = NostrSubscription::GroupMaintenance {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+        };
+        let subscription_id = subscription.subscription_id();
+        let now_ms = self.now_ms();
+        self.state
+            .write()
+            .await
+            .record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+        if let Err(error) = self.relay_client.subscribe(subscription.clone()).await {
+            self.state
+                .write()
+                .await
+                .forget_subscription_starts(std::slice::from_ref(&subscription));
+            return Err(error);
+        }
+        Ok(subscription_id)
+    }
+
+    /// Remove a temporary post-join maintenance subscription.
+    pub async fn remove_group_maintenance_subscription(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        self.relay_client.unsubscribe(subscription.clone()).await?;
+        self.state
+            .write()
+            .await
+            .forget_subscription_starts(std::slice::from_ref(&subscription));
+        Ok(())
     }
 
     /// Resolve opaque relay indices to relay endpoints for the opt-in export

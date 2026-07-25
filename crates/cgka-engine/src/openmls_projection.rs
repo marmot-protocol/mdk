@@ -446,6 +446,15 @@ pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
         | StoredMessagePayload::OwnCommitWire { message, .. } => {
             StoredMessagePayload::own_commit_wire(message, stamp)
         }
+        StoredMessagePayload::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            ..
+        } => StoredMessagePayload::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            stamp: Some(stamp),
+        },
         // Raw-transport rows never enter the OpenMLS candidate graph; a plain
         // state update preserves their shape.
         other @ (StoredMessagePayload::RawTransport(_)

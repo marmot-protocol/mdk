@@ -28,9 +28,9 @@ pub mod tui;
 pub use args::SecretStoreKind;
 pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
-    GroupCommand, GroupsCommand, KeyPackageCommand, MediaCommand, MessageCommand,
-    MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand, SettingsCommand,
-    StreamCommand, UsersCommand,
+    GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
+    MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
+    SettingsCommand, StreamCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
 

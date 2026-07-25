@@ -24,6 +24,10 @@ use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
+use cgka_traits::maintenance::{
+    GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
+    MaintenanceTrigger, PeriodicMaintenancePolicy,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
@@ -31,14 +35,72 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::prelude::{
-    BasicCredential, CreationFromExternalError, Extension, Extensions, MlsMessageBodyIn,
-    MlsMessageIn, WelcomeError,
+    BasicCredential, CreationFromExternalError, Extension, Extensions, KeyPackageBundle,
+    MlsMessageBodyIn, MlsMessageIn, WelcomeError,
 };
 use openmls::treesync::Node;
 use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
+
+const POST_JOIN_OPERATIONAL_TARGET_SECS: u64 = 24 * 60 * 60;
+
+fn persist_new_group_maintenance<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    enrolled_at: cgka_traits::Timestamp,
+    post_join: Option<(&MessageId, u64)>,
+    own_leaf_baseline_hash: Option<Vec<u8>>,
+) -> Result<(), EngineError> {
+    let Some(maintenance) = storage.maintenance_storage() else {
+        return Ok(());
+    };
+    let periodic_enrolled = matches!(
+        maintenance.periodic_maintenance_policy()?,
+        PeriodicMaintenancePolicy::EnabledForNewGroups
+    );
+    maintenance.put_group_maintenance(&GroupMaintenanceState {
+        group_id: group_id.clone(),
+        enrolled_at: Some(enrolled_at),
+        periodic_enrolled,
+        last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
+        next_periodic_rotation_at: None,
+    })?;
+    if let Some((welcome_id, sampled_jitter_ms)) = post_join {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-post-join-maintenance-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(welcome_id.as_slice());
+        let obligation_id = MessageId::new(hasher.finalize().to_vec());
+        maintenance.put_maintenance_obligation(&MaintenanceObligation {
+            id: obligation_id,
+            group_id: group_id.clone(),
+            trigger: MaintenanceTrigger::PostJoin,
+            phase: MaintenancePhase::CatchUp,
+            created_at: enrolled_at,
+            operational_target_at: Some(cgka_traits::Timestamp(
+                enrolled_at
+                    .0
+                    .saturating_add(POST_JOIN_OPERATIONAL_TARGET_SECS),
+            )),
+            overdue: false,
+            // Starts when the temporary full-history subscription is actually
+            // installed, not merely when the Welcome transaction commits.
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash,
+            sampled_jitter_ms,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })?;
+    }
+    Ok(())
+}
 
 pub(crate) fn welcome_content_dedup_id(
     peeled: &cgka_traits::ingest::PeeledMessage,
@@ -524,6 +586,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         if self.new_protocol_profile == ProtocolProfile::Current {
+            let enrolled_at = self.wall_clock.now();
             let unique_welcome_ids = welcomes
                 .iter()
                 .map(|welcome| welcome.id.as_slice().to_vec())
@@ -577,6 +640,7 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.epoch = canonical_epoch;
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
+                        persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
 
                         for welcome in &welcomes {
                             let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
@@ -871,6 +935,11 @@ impl<S: StorageProvider> Engine<S> {
         // only for the group being re-joined. We never clear a group we are
         // still an active member of.
         let join_config = join_config(self.max_past_epochs);
+        let joined_at = self.wall_clock.now();
+        let sampled_jitter_ms = self.maintenance_random.sample_inclusive(
+            0,
+            cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
+        );
         // Building a group from a staged Welcome performs the same multi-row
         // OpenMLS store as group creation. Keep KeyPackage consumption, stale
         // live-state clearing, that store, every Marmot post-check, the
@@ -879,6 +948,33 @@ impl<S: StorageProvider> Engine<S> {
         let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                // Match in the same order OpenMLS uses: the first Welcome
+                // KeyPackageRef for which this account-device has a private
+                // bundle. Transport tags are deliberately outside this
+                // selection.
+                let local_bundle_keys = storage
+                    .stored_key_package_bundles()?
+                    .into_iter()
+                    .map(|stored| {
+                        let bundle = serde_json::from_slice::<KeyPackageBundle>(&stored.value)
+                            .map_err(|error| EngineError::Serialize(error.to_string()))?;
+                        let reference =
+                            bundle
+                                .key_package()
+                                .hash_ref(provider.crypto())
+                                .map_err(|error| {
+                                    EngineError::Backend(format!("key_package ref: {error:?}"))
+                                })?;
+                        Ok::<_, EngineError>(reference.as_slice().to_vec())
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                let consumed_key_package_ref = welcome
+                    .secrets()
+                    .iter()
+                    .map(|secret| secret.new_member())
+                    .find(|reference| local_bundle_keys.contains(reference.as_slice()))
+                    .map(|reference| reference.as_slice().to_vec())
+                    .ok_or(EngineError::InvalidWelcome)?;
                 let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                     &provider,
                     &join_config,
@@ -1039,6 +1135,29 @@ impl<S: StorageProvider> Engine<S> {
                 storage.put_ingress_dedup_marker(&welcome_id)?;
                 storage.put_ingress_dedup_marker(&content_id)?;
 
+                let own_leaf_baseline_hash = mls_group
+                    .own_leaf_node()
+                    .ok_or(EngineError::InvalidWelcome)?
+                    .tls_serialize_detached()
+                    .map(|leaf| Sha256::digest(leaf).to_vec())
+                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+                persist_new_group_maintenance(
+                    storage,
+                    &group_id,
+                    joined_at,
+                    Some((&welcome_id, sampled_jitter_ms)),
+                    Some(own_leaf_baseline_hash),
+                )?;
+                if let Some(maintenance) = storage.maintenance_storage() {
+                    let mut lifecycle = maintenance
+                        .key_package_lifecycle()?
+                        .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
+                    lifecycle.last_consumed_key_package_ref =
+                        Some(consumed_key_package_ref.clone());
+                    lifecycle.last_consumed_at = Some(joined_at);
+                    maintenance.put_key_package_lifecycle(&lifecycle)?;
+                }
+
                 Ok::<_, EngineError>((
                     group_id,
                     mls_group,
@@ -1114,7 +1233,6 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         self.seen_message_ids.insert(welcome_id);
-
         // An authenticated welcome re-validated every leaf and wrote fresh
         // group state — strictly stronger evidence of health than
         // `retry_hydrate_quarantined_group` re-reading stored state. Clear a

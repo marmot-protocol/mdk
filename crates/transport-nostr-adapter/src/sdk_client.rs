@@ -298,6 +298,24 @@ impl NostrSdkRelayClient {
                     filter,
                 })
             }
+            NostrSubscription::GroupMaintenance {
+                account_id,
+                group_id: _,
+                transport_group_id,
+                endpoints,
+            } => {
+                let h_tag = hex::encode(transport_group_id);
+                let filter = Filter::new()
+                    .kind(Kind::MlsGroupMessage)
+                    .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [h_tag.clone()]);
+                let subscription_id = SubscriptionId::new(subscription.subscription_id());
+                Ok(NostrSdkSubscriptionPlan {
+                    account_id: account_id.clone(),
+                    subscription_id,
+                    endpoints: parse_endpoints(endpoints, "group maintenance subscription")?,
+                    filter,
+                })
+            }
         }
     }
 

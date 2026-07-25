@@ -11,7 +11,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, sleep, timeout};
 use zeroize::Zeroizing;
 
 use super::{
@@ -26,10 +26,10 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupRecord, AppInitialGroupImage, AppProjectionUpdate,
-    AppQuarantinedGroup, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    AppQuarantinedGroup, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
+    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
+    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
     SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -260,6 +260,33 @@ pub(crate) enum AccountWorkerCommand {
     },
     RotateKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
+    },
+    KeyPackageMaintenanceStatus {
+        respond: oneshot::Sender<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
+    },
+    MaintenanceStatus {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<cgka_traits::GroupMaintenanceStatus, AppError>>,
+    },
+    ScheduleManualSelfUpdate {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<String, AppError>>,
+    },
+    PeriodicMaintenancePolicy {
+        respond: oneshot::Sender<Result<cgka_traits::PeriodicMaintenancePolicy, AppError>>,
+    },
+    SetPeriodicMaintenancePolicy {
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    PauseMaintenance {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    ResumeMaintenance {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RunDueMaintenance {
+        respond: oneshot::Sender<Result<MaintenanceRunSummary, AppError>>,
     },
     SharePushRegistration {
         respond: oneshot::Sender<Result<PushRegistrationShareOutcome, AppError>>,
@@ -557,9 +584,12 @@ async fn run_app_runtime_account_worker(
     scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
+    let mut maintenance_tick = interval(Duration::from_secs(15));
+    maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                 return;
             }
@@ -709,6 +739,75 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            _ = maintenance_tick.tick() => {
+                if client.key_package_maintenance_requires_catch_up() {
+                    match timeout(Duration::from_secs(15), client.sync()).await {
+                        Ok(Ok(summary)) => {
+                            publish_app_runtime_summary(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &summary,
+                            );
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            scheduled_convergence
+                                .schedule_groups(client.take_pending_convergence_groups());
+                        }
+                        Ok(Err(err)) => {
+                            publish_app_runtime_account_error(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                account_error_message(
+                                    "key package maintenance catch-up failed",
+                                    &err,
+                                ),
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app::runtime",
+                                method = "key_package_maintenance_catch_up",
+                                "key package maintenance catch-up reached its time cap"
+                            );
+                        }
+                    }
+                }
+                if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message("post-join maintenance subscription failed", &err),
+                    );
+                }
+                match client.run_due_maintenance().await {
+                    Ok(summary) => {
+                        let _ = summary;
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        scheduled_convergence
+                            .schedule_groups(client.take_pending_convergence_groups());
+                    }
+                    Err(err) => {
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            account_error_message("scheduled maintenance failed", &err),
+                        );
                     }
                 }
             }
@@ -1324,6 +1423,41 @@ async fn handle_account_worker_command(
                 Ok(key_package.bytes().len())
             }
             .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => {
+            let _ = respond.send(client.key_package_maintenance_status());
+        }
+        AccountWorkerCommand::MaintenanceStatus { group_id, respond } => {
+            let _ = respond.send(client.maintenance_status(&group_id));
+        }
+        AccountWorkerCommand::ScheduleManualSelfUpdate { group_id, respond } => {
+            let _ = respond.send(client.schedule_manual_self_update(&group_id));
+        }
+        AccountWorkerCommand::PeriodicMaintenancePolicy { respond } => {
+            let _ = respond.send(client.periodic_maintenance_policy());
+        }
+        AccountWorkerCommand::SetPeriodicMaintenancePolicy { policy, respond } => {
+            let _ = respond.send(client.set_periodic_maintenance_policy(policy));
+        }
+        AccountWorkerCommand::PauseMaintenance { respond } => {
+            client.pause_maintenance();
+            let _ = respond.send(Ok(()));
+        }
+        AccountWorkerCommand::ResumeMaintenance { respond } => {
+            client.resume_maintenance();
+            let _ = respond.send(Ok(()));
+        }
+        AccountWorkerCommand::RunDueMaintenance { respond } => {
+            let result = client.run_due_maintenance().await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::SharePushRegistration { respond } => {

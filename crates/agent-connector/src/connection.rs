@@ -192,6 +192,43 @@ impl AgentConnector {
                 self.group_info_response(&account_id_hex, &group_id_hex)
                     .await
             }
+            AgentControlRequest::MaintenanceStatus {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.maintenance_status_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::KeyPackageMaintenanceStatus { account_id_hex } => {
+                self.key_package_maintenance_status_response(&account_id_hex)
+                    .await
+            }
+            AgentControlRequest::MaintenanceScheduleSelfUpdate {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.maintenance_schedule_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::MaintenanceGetPolicy { account_id_hex } => {
+                self.maintenance_policy_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceSetPolicy {
+                account_id_hex,
+                enabled_for_new_groups,
+            } => {
+                self.set_maintenance_policy_response(&account_id_hex, enabled_for_new_groups)
+                    .await
+            }
+            AgentControlRequest::MaintenancePause { account_id_hex } => {
+                self.pause_maintenance_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceResume { account_id_hex } => {
+                self.resume_maintenance_response(&account_id_hex).await
+            }
+            AgentControlRequest::MaintenanceRun { account_id_hex } => {
+                self.run_maintenance_response(&account_id_hex).await
+            }
             AgentControlRequest::DebugInjectInbound {
                 account_id_hex,
                 group_id_hex,

@@ -1941,6 +1941,7 @@ pub(crate) fn send_summary_from_effects(
             .iter()
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect(),
+        maintenance_disposition: effects.maintenance_disposition,
     }
 }
 

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
     MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest,
+    TransportDelivery, TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest,
 };
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
+    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
+    RelayRegistrationOutcome,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -791,6 +792,74 @@ impl MarmotRelayPlaneAccountAdapter {
     /// attributed to exactly the account whose subscribes produced it.
     pub(crate) fn account_id(&self) -> &MemberId {
         &self.account_id
+    }
+
+    pub(crate) async fn install_group_maintenance_subscription(
+        &self,
+        group: TransportGroupSubscription,
+    ) -> Result<String, TransportAdapterError> {
+        let sync = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_sync(TransportGroupSync {
+                account_id: self.account_id.clone(),
+                group_subscriptions: vec![group],
+                since: None,
+            })
+            .map_err(TransportAdapterError::Subscription)?;
+        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
+            TransportAdapterError::Subscription(
+                "maintenance group subscription was empty".to_owned(),
+            )
+        })?;
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .install_group_maintenance_subscription(&self.account_id, &group)
+            .await
+    }
+
+    pub(crate) async fn group_maintenance_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .subscription_any_eose(subscription_id)
+            .await
+    }
+
+    pub(crate) async fn remove_group_maintenance_subscription(
+        &self,
+        group: &TransportGroupSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        let sync = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_sync(TransportGroupSync {
+                account_id: self.account_id.clone(),
+                group_subscriptions: vec![group.clone()],
+                since: None,
+            })
+            .map_err(TransportAdapterError::Subscription)?;
+        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
+            TransportAdapterError::Subscription(
+                "maintenance group subscription was empty".to_owned(),
+            )
+        })?;
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .remove_group_maintenance_subscription(NostrSubscription::GroupMaintenance {
+                account_id: self.account_id.clone(),
+                group_id: group.group_id,
+                transport_group_id: group.transport_group_id,
+                endpoints: group.endpoints,
+            })
+            .await
     }
 }
 

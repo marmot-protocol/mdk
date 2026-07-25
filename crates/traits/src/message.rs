@@ -47,6 +47,9 @@ pub struct OwnCommitConvergenceStamp {
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
 ///   wire bytes. Only this variant and `OwnCommitWire` are eligible for
 ///   OpenMLS projection and convergence replay.
+/// - `SignedOpenMlsWire`: the exact signed outer transport message alongside
+///   the projection-friendly MLS wire message. This is the current outbound
+///   representation and supports byte-identical retry after restart.
 /// - `OwnCommitWire`: an `OpenMlsWire` commit this device published and
 ///   confirmed, enriched with its [`OwnCommitConvergenceStamp`] so stored
 ///   convergence can treat it as a pre-validated candidate branch after a
@@ -57,6 +60,12 @@ pub enum StoredMessagePayload {
     RawTransport(TransportMessage),
     OutboundWelcome(TransportMessage),
     OpenMlsWire(TransportMessage),
+    SignedOpenMlsWire {
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stamp: Option<OwnCommitConvergenceStamp>,
+    },
     OwnCommitWire {
         message: TransportMessage,
         stamp: OwnCommitConvergenceStamp,
@@ -74,6 +83,17 @@ impl StoredMessagePayload {
 
     pub fn openmls_wire(message: TransportMessage) -> Self {
         Self::OpenMlsWire(message)
+    }
+
+    pub fn signed_openmls_wire(
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+    ) -> Self {
+        Self::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            stamp: None,
+        }
     }
 
     pub fn own_commit_wire(message: TransportMessage, stamp: OwnCommitConvergenceStamp) -> Self {
@@ -97,14 +117,20 @@ impl StoredMessagePayload {
     pub fn as_raw_transport(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(message) => Some(message),
-            Self::OutboundWelcome(_) | Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+            Self::OutboundWelcome(_)
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
     pub fn as_outbound_welcome(&self) -> Option<&TransportMessage> {
         match self {
             Self::OutboundWelcome(message) => Some(message),
-            Self::RawTransport(_) | Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+            Self::RawTransport(_)
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
@@ -112,6 +138,18 @@ impl StoredMessagePayload {
         match self {
             Self::RawTransport(_) | Self::OutboundWelcome(_) => None,
             Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
+            Self::SignedOpenMlsWire {
+                openmls_message, ..
+            } => Some(openmls_message),
+        }
+    }
+
+    /// Exact signed outer event retained for restart-safe retransmission.
+    pub fn as_exact_transport(&self) -> Option<&TransportMessage> {
+        match self {
+            Self::RawTransport(message) | Self::OutboundWelcome(message) => Some(message),
+            Self::SignedOpenMlsWire { exact_message, .. } => Some(exact_message),
+            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
         }
     }
 
@@ -120,6 +158,7 @@ impl StoredMessagePayload {
     pub fn own_commit_stamp(&self) -> Option<&OwnCommitConvergenceStamp> {
         match self {
             Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::OpenMlsWire(_) => None,
+            Self::SignedOpenMlsWire { stamp, .. } => stamp.as_ref(),
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
         }
     }
@@ -130,6 +169,9 @@ impl StoredMessagePayload {
             | Self::OutboundWelcome(message)
             | Self::OpenMlsWire(message)
             | Self::OwnCommitWire { message, .. } => message,
+            Self::SignedOpenMlsWire {
+                openmls_message, ..
+            } => openmls_message,
         }
     }
 }

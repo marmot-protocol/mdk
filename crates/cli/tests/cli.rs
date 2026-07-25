@@ -706,7 +706,7 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&keys_help.stderr)
     );
     for expected in [
-        "Republish the currently cached KeyPackage",
+        "Publish or retry the durable stable-slot KeyPackage replacement",
         "Force mint and publish a fresh replacement KeyPackage",
         "Publish a Nostr deletion for one KeyPackage event",
         "Publish Nostr deletions for all relay-published KeyPackage events",
@@ -2601,7 +2601,7 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
 }
 
 #[test]
-fn keys_publish_reuses_create_identity_key_package() {
+fn keys_publish_replaces_create_identity_key_package_under_stable_slot() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
 
@@ -2621,7 +2621,7 @@ fn keys_publish_reuses_create_identity_key_package() {
     assert_eq!(republished["key_package_bytes"], first["key_package_bytes"]);
     assert_eq!(second["key_package_bytes"], first["key_package_bytes"]);
     assert_eq!(second["key_package_id"], first["key_package_id"]);
-    assert_eq!(second["key_package_ref"], first["key_package_ref"]);
+    assert_ne!(second["key_package_ref"], first["key_package_ref"]);
     assert!(
         first["key_package_id"]
             .as_str()
@@ -2635,7 +2635,7 @@ fn keys_publish_reuses_create_identity_key_package() {
 }
 
 #[test]
-fn keys_rotate_forces_a_new_key_package_then_publish_reuses_it() {
+fn keys_rotate_and_publish_each_replace_under_the_stable_slot() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
 
@@ -2663,7 +2663,7 @@ fn keys_rotate_forces_a_new_key_package_then_publish_reuses_it() {
     assert_eq!(second["key_package_bytes"], rotated["key_package_bytes"]);
     assert_eq!(third["key_package_bytes"], second["key_package_bytes"]);
     assert_eq!(third["key_package_id"], second["key_package_id"]);
-    assert_eq!(third["key_package_ref"], second["key_package_ref"]);
+    assert_ne!(third["key_package_ref"], second["key_package_ref"]);
     assert!(
         third["key_package_id"]
             .as_str()

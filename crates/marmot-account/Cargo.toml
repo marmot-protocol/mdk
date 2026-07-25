@@ -17,13 +17,14 @@ marmot-forensics.workspace = true
 nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 cgka-engine.workspace = true
-sha2.workspace = true
 storage-sqlite.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

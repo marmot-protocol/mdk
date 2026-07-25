@@ -109,8 +109,37 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     }
 }
 
-#[tokio::test]
-async fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
+/// Run app-runtime integration chains on a stack large enough for debug
+/// OpenMLS group creation. Libtest's default 2 MiB stack is too small once a
+/// test composes the account worker with maintenance and push lifecycle work.
+fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let test_thread = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(body());
+        })
+        .unwrap();
+    test_thread.join().unwrap();
+}
+
+#[test]
+fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
+    run_composed_app_runtime_test(
+        "disable-native-push-removal",
+        disable_native_push_removal_body,
+    );
+}
+
+async fn disable_native_push_removal_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -247,8 +276,15 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
+#[test]
+fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
+    run_composed_app_runtime_test(
+        "push-registration-idle-retry",
+        push_registration_idle_retry_body,
+    );
+}
+
+async fn push_registration_idle_retry_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -302,8 +338,15 @@ async fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_even
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_local_projection_advances_only_after_publish() {
+#[test]
+fn push_registration_local_projection_advances_only_after_publish() {
+    run_composed_app_runtime_test(
+        "push-registration-projection",
+        push_registration_local_projection_body,
+    );
+}
+
+async fn push_registration_local_projection_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -358,8 +401,15 @@ async fn push_registration_local_projection_advances_only_after_publish() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
+#[test]
+fn local_group_wipe_keeps_and_drains_durable_push_removal() {
+    run_composed_app_runtime_test(
+        "local-wipe-push-removal",
+        local_group_wipe_push_removal_body,
+    );
+}
+
+async fn local_group_wipe_push_removal_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -429,21 +479,10 @@ async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
 
 #[test]
 fn failed_leave_restores_push_registration_after_removal_publishes() {
-    // This integration path composes the app runtime, account worker, push
-    // outbox, and MLS leave/compensation futures. Debug builds need more than
-    // libtest's default 2 MiB stack while polling that full chain.
-    let test_thread = std::thread::Builder::new()
-        .name("failed-leave-push-compensation".to_owned())
-        .stack_size(4 * 1024 * 1024)
-        .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            test_runtime.block_on(failed_leave_push_compensation_body());
-        })
-        .unwrap();
-    test_thread.join().unwrap();
+    run_composed_app_runtime_test(
+        "failed-leave-push-compensation",
+        failed_leave_push_compensation_body,
+    );
 }
 
 async fn failed_leave_push_compensation_body() {
@@ -528,8 +567,15 @@ async fn failed_leave_push_compensation_body() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn push_registration_removal_retry_survives_clear_and_restart() {
+#[test]
+fn push_registration_removal_retry_survives_clear_and_restart() {
+    run_composed_app_runtime_test(
+        "push-registration-removal-retry",
+        push_registration_removal_retry_body,
+    );
+}
+
+async fn push_registration_removal_retry_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -685,6 +731,138 @@ async fn key_package_cutover_retains_current_cache_without_scheduling_replacemen
 }
 
 #[tokio::test]
+async fn key_package_cutover_imports_stable_slot_before_cache_retirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("legacy-slot-import").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let legacy = fresh_key_package_for_account(&app, &account, true).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&legacy).unwrap();
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: "stable-legacy-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "11".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(legacy.bytes()),
+        },
+    )
+    .unwrap();
+
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    let lifecycle = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.stable_slot_id, "stable-legacy-slot");
+    assert!(
+        app.key_package_cutover_replacement_pending(&account.label),
+        "the imported slot and upgrade obligation must both survive cache cleanup"
+    );
+}
+
+#[tokio::test]
+async fn key_package_cutover_repairs_empty_welcome_slot_without_losing_consumed_reference() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("welcome-before-slot-import").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let legacy = fresh_key_package_for_account(&app, &account, true).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&legacy).unwrap();
+    let consumed_ref = vec![7, 8, 9];
+    let mut lifecycle = cgka_traits::KeyPackageLifecycleState::slot_only(String::new());
+    lifecycle.last_consumed_key_package_ref = Some(consumed_ref.clone());
+    lifecycle.last_consumed_at = Some(Timestamp(42));
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "recovered-stable-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "22".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(legacy.bytes()),
+        },
+    )
+    .unwrap();
+
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    let repaired = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.stable_slot_id, "recovered-stable-slot");
+    assert_eq!(
+        repaired.last_consumed_key_package_ref,
+        Some(consumed_ref),
+        "slot repair must preserve the Welcome-consumed KeyPackage reference"
+    );
+    assert_eq!(repaired.last_consumed_at, Some(Timestamp(42)));
+}
+
+#[test]
+fn fresh_account_persists_its_slot_before_session_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("fresh-slot").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    let lifecycle = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.stable_slot_id.len(), 64);
+    assert!(hex::decode(&lifecycle.stable_slot_id).is_ok());
+    assert!(app.key_package_cutover_replacement_pending(&account.label));
+}
+
+#[test]
+fn existing_account_database_without_slot_evidence_fails_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("missing-slot-evidence").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    // Simulate an upgraded device whose encrypted account database predates
+    // lifecycle migration, while its JSON cache and private bundles are gone.
+    app.account_storage(&account.label).unwrap();
+
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    assert!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .is_none(),
+        "an existing database must not mint a second stable slot without migration evidence"
+    );
+    assert!(app.key_package_cutover_replacement_pending(&account.label));
+}
+
+#[tokio::test]
 async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -729,6 +907,11 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     app.open_account(&account.label, &relay_plane).unwrap();
     assert!(app.key_package_cutover_replacement_pending(&account.label));
+    assert!(
+        app.reusable_key_package_slot_id(&account.label, &account.account_id_hex)
+            .is_err(),
+        "an existing account without recoverable slot metadata must fail closed"
+    );
 
     drop(app);
     let reopened = MarmotApp::with_relay(directory.path(), "wss://relay.example");

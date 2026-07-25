@@ -196,6 +196,16 @@ async fn wait_for_first_catch_up(runtime: &MarmotAppRuntime) {
     }
 }
 
+/// Keep these cursor-characterization tests scoped to the ordinary incremental
+/// group subscription and the epoch-gap backfill they explicitly arm. New
+/// post-join groups also have an independent full-history maintenance
+/// subscription; allowing that here would recover the below-floor probe
+/// through a different feature and make the assertions meaningless.
+async fn start_with_maintenance_paused(runtime: &MarmotAppRuntime, account_ref: &str) {
+    runtime.start().await.unwrap();
+    runtime.pause_maintenance(account_ref).await.unwrap();
+}
+
 async fn inbound_events_delivered(app: &MarmotApp) -> usize {
     app.relay_telemetry().await.metrics.inbound_events_delivered
 }
@@ -295,7 +305,7 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     }
     let runtime_bob_boot1 = MarmotAppRuntime::new(app_bob_boot1.clone());
     let mut events_bob_boot1 = runtime_bob_boot1.subscribe();
-    runtime_bob_boot1.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot1, "bob").await;
 
     let mut alice_client = app_alice.client("alice").await.unwrap();
     let group_id = alice_client
@@ -367,7 +377,7 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     // landed ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
-    runtime_bob_boot2.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
     wait_for_first_catch_up(&runtime_bob_boot2).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let delivered_after_boot2 = inbound_events_delivered(&app_bob_boot2).await;
@@ -386,7 +396,7 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     // behave differently; it must not. ---
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
-    runtime_bob_boot3.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
     wait_for_first_catch_up(&runtime_bob_boot3).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;
     let delivered_after_boot3 = inbound_events_delivered(&app_bob_boot3).await;
@@ -443,7 +453,7 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     }
     let runtime_bob_boot1 = MarmotAppRuntime::new(app_bob_boot1.clone());
     let mut events_bob_boot1 = runtime_bob_boot1.subscribe();
-    runtime_bob_boot1.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot1, "bob").await;
 
     let mut alice_client = app_alice.client("alice").await.unwrap();
     let group_id = alice_client
@@ -538,7 +548,7 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     // --- boot 2: cold restart; catch-up arms the detector, backfill heals ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
-    runtime_bob_boot2.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
     wait_for_first_catch_up(&runtime_bob_boot2).await;
     wait_for_inbound_delivered(&app_bob_boot2, expected_healed).await;
     // Settle grace so any spurious extra delivery lands before the
@@ -565,7 +575,7 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     let expected_after_heal = legitimate_delivery_count + BACKFILL_THRESHOLD;
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
-    runtime_bob_boot3.start().await.unwrap();
+    start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
     wait_for_first_catch_up(&runtime_bob_boot3).await;
     wait_for_inbound_delivered(&app_bob_boot3, expected_after_heal).await;
     sleep(TELEMETRY_SETTLE_GRACE).await;

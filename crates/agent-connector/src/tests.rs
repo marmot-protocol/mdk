@@ -2,7 +2,8 @@
 
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
-    AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
+    read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -1197,7 +1198,10 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
         },
     )
     .await;
-    let AgentControlResponse::FinalSent { message_ids_hex } = sent.payload else {
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent.payload
+    else {
         panic!("expected debug final sent response");
     };
     assert_eq!(message_ids_hex, vec![format!("{:064x}", 1)]);
@@ -2199,7 +2203,10 @@ async fn connector_socket_sends_final_message() {
     let response: AgentControlEnvelope<AgentControlResponse> =
         read_envelope(&mut client_read).await.unwrap().unwrap();
     assert_eq!(response.id.as_deref(), Some("req-final"));
-    let AgentControlResponse::FinalSent { message_ids_hex } = response.payload else {
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = response.payload
+    else {
         panic!("expected final sent response");
     };
     assert_eq!(message_ids_hex.len(), 1);
@@ -3848,6 +3855,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
 
     let AgentControlResponse::FinalSent {
         message_ids_hex: first_ids,
+        ..
     } = first_result.unwrap()
     else {
         panic!("expected first send to return FinalSent");
@@ -3856,6 +3864,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
 
     let AgentControlResponse::FinalSent {
         message_ids_hex: second_ids,
+        ..
     } = second_result.unwrap()
     else {
         panic!("expected concurrent retry to return FinalSent");
@@ -3914,6 +3923,22 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
         None,
         "an unrelated key stays absent"
     );
+
+    let pending_ids = vec!["cc".repeat(32)];
+    store.record_with_disposition(
+        "k-pending".to_owned(),
+        "fp-pending".to_owned(),
+        pending_ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
+    assert_eq!(
+        store.get_with_disposition("k-pending", "fp-pending"),
+        Some((
+            pending_ids,
+            AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+        )),
+        "a retry must preserve the original machine-readable send disposition"
+    );
 }
 
 async fn wait_for_idempotency_follower(
@@ -3957,11 +3982,14 @@ async fn send_idempotency_store_same_request_waits_for_leader_result() {
         "same-fingerprint".to_owned(),
         ids.clone(),
     );
-    leader.complete(ids.clone());
+    leader.complete(ids.clone(), AgentControlSendMaintenanceDisposition::Ready);
     drop(leader);
 
     match follower.await.unwrap() {
-        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
         SendIdempotencyAcquisition::Leader(_) => {
             panic!("a follower must reuse the leader's committed result")
         }
@@ -4045,11 +4073,20 @@ async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
         None,
         "the original durable key binding remains first-write-wins"
     );
-    leader.complete(ids.clone());
+    leader.complete(
+        ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
     drop(leader);
 
     match follower.await.unwrap() {
-        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(
+                disposition,
+                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable
+            );
+        }
         SendIdempotencyAcquisition::Leader(_) => {
             panic!("a concurrent follower must reuse the transient leader result")
         }
