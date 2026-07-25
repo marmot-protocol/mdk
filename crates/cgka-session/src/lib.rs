@@ -155,6 +155,10 @@ impl SessionConfig {
         self
     }
 
+    /// Set the session convergence policy.
+    ///
+    /// Production hosts MUST leave the default (pinned v1). Non-baseline values
+    /// are accepted only by explicit `test-policy-overrides` harness builds.
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
         self
@@ -254,6 +258,14 @@ impl AccountDeviceSession {
             )
             .into());
         }
+        // Fail closed before opening storage or hydrating: a rejected release
+        // policy must not retire key packages or mutate durable group state
+        // (mdk#970 / PR review). Session construction always uses the default
+        // MLS past-epoch window, so validate against that same horizon here.
+        config
+            .convergence_policy
+            .ensure_acceptable(cgka_engine::DEFAULT_MAX_PAST_EPOCHS)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
@@ -308,7 +320,9 @@ impl AccountDeviceSession {
             );
         }
         engine.hydrate_stable_groups_from_storage()?;
-        engine.set_convergence_policy(config.convergence_policy);
+        engine
+            .set_convergence_policy(config.convergence_policy)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         engine.audit_recorder_health();
         tracing::debug!(
             target: TRACE_TARGET,
@@ -909,13 +923,18 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
-    pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+    pub fn set_convergence_policy(
+        &mut self,
+        policy: CanonicalizationPolicy,
+    ) -> Result<(), EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "set_convergence_policy",
             "updating convergence policy"
         );
-        self.engine.set_convergence_policy(policy);
+        self.engine
+            .set_convergence_policy(policy)
+            .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))
     }
 
     pub fn record_audit_event(

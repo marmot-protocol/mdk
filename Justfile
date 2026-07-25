@@ -1,6 +1,7 @@
 set shell := ["bash", "-cu"]
 
 otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,wn-cli/otlp-export"
+test-features := "wn-cli/test-policy-overrides"
 
 default:
     @just --list
@@ -38,11 +39,11 @@ clippy-otlp:
 test: test-default test-otlp
 
 test-default:
-    cargo nextest run --workspace
+    cargo nextest run --workspace --features {{test-features}}
     cargo test --workspace --doc
 
 test-otlp:
-    cargo nextest run --workspace --features {{otlp-features}}
+    cargo nextest run --workspace --features {{otlp-features}},{{test-features}}
 
 relay-up:
     docker compose up -d
@@ -233,9 +234,9 @@ e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -z "{{test}}" ]; then
-        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli --features test-policy-overrides -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
     else
-        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli "{{test}}"
+        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli --features test-policy-overrides "{{test}}"
     fi
 
 conformance:
@@ -290,8 +291,13 @@ dead-code-audit:
 naming-gate:
     ./scripts/check_legacy_naming.sh
 
-# Fast local pre-push gate: mechanical/static checks only. GitHub CI runs the
-# full `just ci` suite (including the workspace test matrix).
-fast-ci: fmt-check naming-gate check clippy
+# Prove the normal-build convergence policy pin (mdk#970). The broader test
+# matrix explicitly enables test-policy-overrides; this target must not.
+test-convergence-policy-pin:
+    cargo test -p cgka-engine --test convergence_policy_pin --locked
 
-ci: fmt-check naming-gate check clippy test
+# Fast local pre-push gate: mechanical/static checks plus the release pin proof.
+# GitHub CI runs the full `just ci` suite (including the workspace test matrix).
+fast-ci: fmt-check naming-gate check clippy test-convergence-policy-pin
+
+ci: fmt-check naming-gate check clippy test-convergence-policy-pin test

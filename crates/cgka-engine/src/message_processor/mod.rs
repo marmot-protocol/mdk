@@ -482,8 +482,12 @@ impl<S: StorageProvider> Engine<S> {
         // it gates again correctly once the tip advances into `[anchor, ceiling]`.
         let (anchor, ceiling) = match self.storage.get_group(group_id) {
             Ok(group) => {
+                // Ungated: hydration calls this while the group is still
+                // quarantined to decide whether to schedule post-repair
+                // convergence. Live send/convergence paths already gate via
+                // `ensure_group_live` before reaching here.
                 let policy = self
-                    .convergence_policy_for_group(group_id)
+                    .convergence_policy_for_group_ungated(group_id)
                     .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
                 let rewind = policy.convergence.max_rewind_commits;
                 (

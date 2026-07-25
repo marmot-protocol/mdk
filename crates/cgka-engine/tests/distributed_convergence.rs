@@ -1321,13 +1321,15 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     carol.drain_events();
 
     // Same-epoch fork by the two admins: one removes Carol, the other renames
@@ -2120,13 +2122,15 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
@@ -2226,13 +2230,15 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
@@ -2332,13 +2338,15 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     // Carol settles on Alice's commit (epoch 1 -> 2) and retains the epoch-1
     // anchor. This is the first settle for the group: not a reorg.
@@ -2575,13 +2583,15 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
@@ -2762,13 +2772,15 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
@@ -2963,13 +2975,15 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let invite_david = alice
@@ -3053,13 +3067,15 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
 
     let frank_kp = frank.fresh_key_package().await.unwrap();
     let bob_invite = bob
@@ -4559,13 +4575,15 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
         .unwrap();
     // Tight horizon so a small real epoch is already "far future": with the tip
     // at epoch 1 and `max_rewind_commits = 1`, the ceiling is epoch 2.
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        convergence: ConvergencePolicy {
-            max_rewind_commits: 1,
-            ..ConvergencePolicy::default()
-        },
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     carol.drain_events();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
 
@@ -4945,10 +4963,12 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         MessageState::PeelDeferred
     );
 
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     let sent = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
@@ -5059,10 +5079,12 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
         .ingest(commit_to_epoch2)
         .await
         .expect("commit buffered");
-    carol.set_convergence_policy(CanonicalizationPolicy {
-        settlement_quiescence_ms: 0,
-        ..CanonicalizationPolicy::default()
-    });
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await
@@ -5113,8 +5135,11 @@ async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epo
         .unwrap();
     bob.set_convergence_policy(CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
+        // Keep the app window aligned with bob's MLS `max_past_epochs = 1`.
+        app_message_past_epoch_limit: 1,
         ..CanonicalizationPolicy::default()
-    });
+    })
+    .expect("convergence policy accepted");
 
     let old_app = send_app(&mut alice, &group_id, b"outside past window".to_vec()).await;
 
@@ -5338,7 +5363,9 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
         settlement_quiescence_ms: 0,
         ..CanonicalizationPolicy::default()
     };
-    carol.set_convergence_policy(policy);
+    carol
+        .set_convergence_policy(policy)
+        .expect("convergence policy accepted");
 
     let mut engine: Box<dyn CgkaEngine> = Box::new(carol);
     let drained = engine.advance_convergence(&group_id).await.unwrap();
@@ -5848,6 +5875,48 @@ fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
     assert!(
         matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
         "expected InvalidPolicy, got {err:?}"
+    );
+}
+
+#[test]
+fn set_convergence_policy_rejects_app_window_mismatch() {
+    let (mut alice, _storage) = build_client(b"alice");
+    let err = alice
+        .set_convergence_policy(CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect_err("app window must match engine max_past_epochs");
+    assert!(
+        matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
+        "expected InvalidPolicy, got {err:?}"
+    );
+}
+
+#[test]
+fn set_convergence_policy_accepts_pinned_v1_baseline() {
+    let (mut alice, _storage) = build_client(b"alice");
+    alice
+        .set_convergence_policy(CanonicalizationPolicy::default())
+        .expect("pinned v1 baseline must be accepted");
+}
+
+#[test]
+fn non_pinned_policy_fails_ensure_pinned_v1_helper() {
+    // Pure helper coverage. The engine reject arm under
+    // `#[cfg(not(debug_assertions))]` is proven by
+    // `just test-convergence-policy-pin` (tests/convergence_policy_pin.rs).
+    let policy = CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    };
+    assert!(
+        !policy.is_pinned_v1(),
+        "fixture must differ from the pinned baseline"
+    );
+    assert_eq!(
+        policy.ensure_pinned_v1(),
+        Err(cgka_engine::canonicalization::CanonicalizationPolicyError::NotPinnedV1)
     );
 }
 

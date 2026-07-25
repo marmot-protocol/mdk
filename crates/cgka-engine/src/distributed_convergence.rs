@@ -79,20 +79,33 @@ fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventC
 type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
 
 impl<S: StorageProvider> Engine<S> {
-    pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+    /// Install the process-wide convergence policy.
+    ///
+    /// Normal builds accept only the pinned v1 baseline. Test harnesses built
+    /// with `test-policy-overrides` may override it for instant settlement and
+    /// rewind probes, but still require the witness-override bound and
+    /// `app_message_past_epoch_limit == max_past_epochs`.
+    pub fn set_convergence_policy(
+        &mut self,
+        policy: CanonicalizationPolicy,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.accept_convergence_policy(&policy)?;
         self.convergence_policy = policy;
         self.audit_engine_context();
+        Ok(())
     }
 
+    /// Persist a per-group convergence policy.
+    ///
+    /// Same acceptance rules as [`Self::set_convergence_policy`]. Under v1 the
+    /// policy is not group-negotiated; normal builds reject any non-baseline
+    /// value so a stored override cannot fork honest clients.
     pub fn set_group_convergence_policy(
         &mut self,
         group_id: &GroupId,
         policy: CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
-        // Fail fast: never persist a policy that violates the witness-override bound.
-        policy
-            .validate()
-            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+        self.accept_convergence_policy(&policy)?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
@@ -108,6 +121,16 @@ impl<S: StorageProvider> Engine<S> {
             },
         );
         Ok(())
+    }
+
+    /// Fail closed before a policy can drive branch selection or be persisted.
+    fn accept_convergence_policy(
+        &self,
+        policy: &CanonicalizationPolicy,
+    ) -> Result<(), OpenMlsProjectionError> {
+        policy
+            .ensure_acceptable(self.max_past_epochs)
+            .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))
     }
 
     /// Hex-encoded `seen_message_ids` snapshot for the convergence
@@ -132,7 +155,10 @@ impl<S: StorageProvider> Engine<S> {
         snapshot
     }
 
-    pub(crate) fn convergence_policy_for_group(
+    /// Load and accept the group's convergence policy without the live-group
+    /// gate. Used by hydration while a group is still quarantined (it must
+    /// inspect pending convergence work before clearing quarantine).
+    pub(crate) fn convergence_policy_for_group_ungated(
         &self,
         group_id: &GroupId,
     ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
@@ -145,21 +171,45 @@ impl<S: StorageProvider> Engine<S> {
             // `set_convergence_policy` fails closed at read rather than driving
             // branch selection.
             let policy = self.convergence_policy.clone();
-            policy
-                .validate()
-                .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
+            self.accept_convergence_policy(&policy)?;
             return Ok(policy);
         };
-        decode_convergence_policy(&policy_bytes)
+        let policy = decode_convergence_policy(&policy_bytes)?;
+        self.accept_convergence_policy(&policy)?;
+        Ok(policy)
+    }
+
+    pub(crate) fn convergence_policy_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
+        // Quarantined groups are hidden from every live surface (mdk#364): do
+        // not read or return a default/stored policy that could drive rewind
+        // retention or branch selection.
+        self.ensure_group_live(group_id).map_err(|e| match e {
+            cgka_traits::error::EngineError::UnknownGroup(_) => {
+                OpenMlsProjectionError::MissingGroup
+            }
+            other => OpenMlsProjectionError::Storage(format!("{other}")),
+        })?;
+        self.convergence_policy_for_group_ungated(group_id)
     }
 
     pub(crate) fn retain_current_epoch_snapshot_for_group(
         &self,
         group_id: &GroupId,
     ) -> Result<(), cgka_traits::error::EngineError> {
-        let policy = self.convergence_policy_for_group(group_id).map_err(|e| {
-            cgka_traits::error::EngineError::Backend(format!("load convergence policy: {e}"))
-        })?;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|e| match e {
+                // `convergence_policy_for_group` maps quarantine to MissingGroup.
+                OpenMlsProjectionError::MissingGroup => {
+                    cgka_traits::error::EngineError::UnknownGroup(group_id.clone())
+                }
+                other => cgka_traits::error::EngineError::Backend(format!(
+                    "load convergence policy: {other}"
+                )),
+            })?;
         retain_current_group_epoch_snapshot(
             &self.storage,
             group_id,
@@ -232,12 +282,38 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        // A hydration-quarantined group is frozen until explicit repair: no
+        // canonicalization pass may read or mutate its state, and no
+        // set_stable may re-activate it out of band (mdk#364). Check this
+        // before syncing a durable Unrecoverable halt into memory so the
+        // quarantine path cannot mutate `epoch_manager`. Report a blocked run
+        // and leave everything untouched; retained inputs replay once repair
+        // clears the quarantine (hydration then restores any durable halt).
+        if self.quarantined_reason(group_id).is_some() {
+            let epoch = self
+                .epoch_manager
+                .epoch(group_id)
+                .map(|e| e.0)
+                .unwrap_or_default();
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Blocked,
+                    current_tip_epoch: Some(epoch),
+                    retained_anchor_horizon: None,
+                    reason: Some("group_quarantined".to_string()),
+                    error_kind: None,
+                },
+            );
+            return Ok(quarantined_result(epoch));
+        }
+
         // A group that has already entered `Unrecoverable` MUST stop applying
         // group-state changes until a verified repair path
         // (spec/protocol-core/group-state.md:50-51,65). Report the halt and
-        // leave canonical state untouched. Sync from the durable marker first
-        // so a restart (or a path that skipped hydration) cannot skip the halt
-        // (mdk#971).
+        // leave canonical state untouched. Sync from the durable marker so a
+        // restart (or a path that skipped hydration) cannot skip the halt
+        // (mdk#971). Only reached for non-quarantined groups.
         if self
             .sync_unrecoverable_halt_from_storage(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -258,30 +334,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
             );
             return Ok(unrecoverable_result(epoch));
-        }
-
-        // A hydration-quarantined group is frozen until explicit repair: no
-        // canonicalization pass may read or mutate its state, and no
-        // set_stable may re-activate it out of band (mdk#364). Report a
-        // blocked run and leave everything untouched; retained inputs replay
-        // once repair clears the quarantine.
-        if self.quarantined_reason(group_id).is_some() {
-            let epoch = self
-                .epoch_manager
-                .epoch(group_id)
-                .map(|e| e.0)
-                .unwrap_or_default();
-            self.audit_group(
-                group_id,
-                marmot_forensics::AuditEventKind::ConvergenceRunState {
-                    phase: ConvergencePhase::Blocked,
-                    current_tip_epoch: Some(epoch),
-                    retained_anchor_horizon: None,
-                    reason: Some("group_quarantined".to_string()),
-                    error_kind: None,
-                },
-            );
-            return Ok(quarantined_result(epoch));
         }
 
         let previous_group = self

@@ -1677,7 +1677,6 @@ impl Drop for ScheduledPushRegistrationRetry {
     }
 }
 
-const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 /// Extra delay beyond the engine quiescence window before the first scheduled
 /// convergence tick fires. Avoids off-by-one-ms races where the timer fires
 /// while `ConvergenceStatus` is still `Syncing` (mdk#494).
@@ -1794,12 +1793,16 @@ impl ScheduledConvergence {
 }
 
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
-    Duration::from_millis(
+    // Normal builds always schedule against the pinned v1 quiescence window
+    // (mdk#970); the override exists only in explicit test-policy builds.
+    let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
         app.config
             .dev_settlement_quiescence_ms
-            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS)
-            .saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
-    )
+            .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS)
+    } else {
+        cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
+    };
+    Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }
 
 fn retry_delay_for_attempt(attempt: u32) -> Duration {

@@ -1057,10 +1057,8 @@ fn app_for(
     let mut config = MarmotAppConfig::default()
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays());
-    // Dev/test only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
-    // convergence settlement window (e.g. `0` for instant settlement in
-    // integration tests). Production installs leave it unset and use the pinned
-    // default.
+    // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
+    // pinned convergence settlement window (e.g. `0` for integration tests).
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
@@ -1103,7 +1101,7 @@ fn resolve_dev_settlement_quiescence_ms(
 
 fn wn_dev_settlement_quiescence_ms() -> Result<Option<u64>, WnError> {
     let value = std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS").ok();
-    resolve_dev_settlement_quiescence_ms(value.as_deref(), cfg!(debug_assertions))
+    resolve_dev_settlement_quiescence_ms(value.as_deref(), cfg!(feature = "test-policy-overrides"))
 }
 
 fn open_account_home(
@@ -1411,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_settlement_override_is_available_in_debug_builds() {
+    fn dev_settlement_override_is_available_in_explicit_test_builds() {
         assert_eq!(
             resolve_dev_settlement_quiescence_ms(Some("0"), true).unwrap(),
             Some(0)
@@ -1419,9 +1417,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_settlement_override_is_rejected_in_release_builds() {
+    fn dev_settlement_override_is_rejected_without_test_feature() {
         let error =
-            resolve_dev_settlement_quiescence_ms(Some("0"), false).expect_err("release rejection");
+            resolve_dev_settlement_quiescence_ms(Some("0"), false).expect_err("feature rejection");
         assert!(matches!(&error, WnError::DevSettlementOverrideInRelease));
         assert_eq!(
             super::wn_error_json(&error)["code"],

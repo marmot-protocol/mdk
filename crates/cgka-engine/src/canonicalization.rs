@@ -7,11 +7,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::convergence::{
-    AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, is_branch_eligible,
-    select_canonical_branch, select_canonical_branch_traced,
+    AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, ConvergencePolicyError,
+    is_branch_eligible, select_canonical_branch, select_canonical_branch_traced,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
+
+/// Adopted v1 app-message past-epoch delivery/decrypt window.
+///
+/// Must stay equal to [`crate::wire_format::DEFAULT_MAX_PAST_EPOCHS`] — the MLS
+/// past-epoch window — so witness and delivery horizons cannot diverge.
+pub const V1_APP_MESSAGE_PAST_EPOCH_LIMIT: u64 = 5;
+/// Adopted v1 settlement quiescence window, in milliseconds.
+pub const V1_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizationPolicy {
@@ -24,17 +32,84 @@ impl Default for CanonicalizationPolicy {
     fn default() -> Self {
         Self {
             convergence: ConvergencePolicy::default(),
-            app_message_past_epoch_limit: 5,
-            settlement_quiescence_ms: 1_000,
+            app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+            settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
         }
     }
+}
+
+/// Validation errors for a [`CanonicalizationPolicy`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalizationPolicyError {
+    #[error(transparent)]
+    Convergence(#[from] ConvergencePolicyError),
+    /// Policy differs from the adopted v1 baseline. Until a negotiation mechanism
+    /// exists behind a required capability, every client MUST use exactly those
+    /// pinned constants — not a local preference or per-group override.
+    #[error("convergence policy must equal the pinned v1 baseline")]
+    NotPinnedV1,
+    /// App-message window disagrees with the engine's MLS `max_past_epochs`.
+    #[error(
+        "app_message_past_epoch_limit ({app_message_past_epoch_limit}) must equal \
+         engine max_past_epochs ({max_past_epochs})"
+    )]
+    AppWindowMismatch {
+        app_message_past_epoch_limit: u64,
+        max_past_epochs: u64,
+    },
 }
 
 impl CanonicalizationPolicy {
     /// Validate the nested convergence policy bounds. See
     /// [`ConvergencePolicy::validate`](crate::convergence::ConvergencePolicy::validate).
-    pub fn validate(&self) -> Result<(), crate::convergence::ConvergencePolicyError> {
+    pub fn validate(&self) -> Result<(), ConvergencePolicyError> {
         self.convergence.validate()
+    }
+
+    /// Exact equality with the adopted convergence-policy v1 constants.
+    pub fn is_pinned_v1(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Fail closed unless this policy is exactly the adopted v1 baseline.
+    pub fn ensure_pinned_v1(&self) -> Result<(), CanonicalizationPolicyError> {
+        self.validate()?;
+        if !self.is_pinned_v1() {
+            return Err(CanonicalizationPolicyError::NotPinnedV1);
+        }
+        Ok(())
+    }
+
+    /// Keep the app-message delivery window aligned with MLS past-epoch decryptability.
+    pub fn ensure_app_window_matches(
+        &self,
+        max_past_epochs: usize,
+    ) -> Result<(), CanonicalizationPolicyError> {
+        if self.app_message_past_epoch_limit != max_past_epochs as u64 {
+            return Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: self.app_message_past_epoch_limit,
+                max_past_epochs: max_past_epochs as u64,
+            });
+        }
+        Ok(())
+    }
+
+    /// Same acceptance contract as engine setters and session open (mdk#970).
+    ///
+    /// Always enforces the witness-override bound and app-window alignment.
+    /// Normal builds also require the pinned v1 baseline. Only test harnesses
+    /// built with the explicit `test-policy-overrides` feature may override it.
+    pub fn ensure_acceptable(
+        &self,
+        max_past_epochs: usize,
+    ) -> Result<(), CanonicalizationPolicyError> {
+        self.validate()?;
+        self.ensure_app_window_matches(max_past_epochs)?;
+        #[cfg(not(feature = "test-policy-overrides"))]
+        if !self.is_pinned_v1() {
+            return Err(CanonicalizationPolicyError::NotPinnedV1);
+        }
+        Ok(())
     }
 }
 
@@ -961,18 +1036,68 @@ mod witness_window_tests {
 
     #[test]
     fn v1_default_policy_constants_are_pinned() {
+        use crate::convergence::{
+            V1_MAX_REWIND_COMMITS, V1_MAX_WITNESS_OVERRIDE_DEPTH, V1_WITNESS_QUORUM_EPOCHS,
+            V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+        };
         assert_eq!(
             CanonicalizationPolicy::default(),
             CanonicalizationPolicy {
                 convergence: ConvergencePolicy {
-                    max_rewind_commits: 5,
-                    witness_quorum_senders_per_epoch: 2,
-                    witness_quorum_epochs: 1,
-                    max_witness_override_depth: 1,
+                    max_rewind_commits: V1_MAX_REWIND_COMMITS,
+                    witness_quorum_senders_per_epoch: V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+                    witness_quorum_epochs: V1_WITNESS_QUORUM_EPOCHS,
+                    max_witness_override_depth: V1_MAX_WITNESS_OVERRIDE_DEPTH,
                 },
-                app_message_past_epoch_limit: 5,
-                settlement_quiescence_ms: 1_000,
+                app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+                settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
             }
+        );
+        assert!(CanonicalizationPolicy::default().ensure_pinned_v1().is_ok());
+        assert_eq!(
+            CanonicalizationPolicy {
+                settlement_quiescence_ms: 0,
+                ..CanonicalizationPolicy::default()
+            }
+            .ensure_pinned_v1(),
+            Err(CanonicalizationPolicyError::NotPinnedV1)
+        );
+    }
+
+    #[test]
+    fn app_message_window_must_match_engine_max_past_epochs() {
+        let policy = CanonicalizationPolicy::default();
+        assert!(
+            policy
+                .ensure_app_window_matches(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize)
+                .is_ok()
+        );
+        assert_eq!(
+            policy.ensure_app_window_matches(1),
+            Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+                max_past_epochs: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ensure_acceptable_requires_app_window_alignment() {
+        let policy = CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        };
+        assert_eq!(
+            policy.ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize),
+            Err(CanonicalizationPolicyError::AppWindowMismatch {
+                app_message_past_epoch_limit: 1,
+                max_past_epochs: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+            })
+        );
+        assert!(
+            CanonicalizationPolicy::default()
+                .ensure_acceptable(V1_APP_MESSAGE_PAST_EPOCH_LIMIT as usize)
+                .is_ok()
         );
     }
 
