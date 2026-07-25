@@ -9724,6 +9724,63 @@ fn flick_j_schedules_a_debounced_preview_and_fires_after_the_quiet_window() {
     assert_eq!(app.focus, Focus::Chats, "focus never left the chat list");
 }
 
+#[test]
+fn flick_preview_does_not_fire_after_leaving_the_main_view() {
+    let account_id = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat(&"aa".repeat(32), "a"), flick_chat(&group_b, "b")];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('j')).expect("j");
+    assert_eq!(app.flick_countdown, Some(FLICK_PREVIEW_DEBOUNCE_TICKS));
+
+    // The user immediately opens the user-search screen.
+    app.open_user_search(None);
+    assert_eq!(app.screen, Screen::UserSearch);
+    assert_eq!(app.status, "user search");
+
+    for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+        app.tick();
+    }
+    assert!(
+        app.loading_chat.is_none(),
+        "flick preview fired while on the user-search screen"
+    );
+}
+
+#[test]
+fn flick_preview_does_not_fire_behind_an_open_popup() {
+    let account_id = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat(&"aa".repeat(32), "a"), flick_chat(&group_b, "b")];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('j')).expect("j");
+    assert_eq!(app.flick_countdown, Some(FLICK_PREVIEW_DEBOUNCE_TICKS));
+
+    // `?` opens the help card over the still-focused chat list (Screen::Main,
+    // Focus::Chats). The countdown keeps running behind the modal.
+    app.handle_key(char_key('?')).expect("?");
+    assert!(app.popup.is_some());
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(app.focus, Focus::Chats);
+
+    for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+        app.tick();
+    }
+    assert!(
+        app.loading_chat.is_none(),
+        "flick preview fired behind the help popup, reloading the pane and \
+         marking a chat read behind the modal"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {

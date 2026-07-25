@@ -865,13 +865,18 @@ impl TuiApp {
 
     /// Fire the debounced flick-through preview: load the highlighted chat's
     /// timeline while focus stays on the chat list. A no-op unless the chat list
-    /// has focus and the highlight names a chat the pane is not already showing.
-    /// The load is tagged with its group id (via `begin_timeline_load`), so a
-    /// preview superseded by further movement is dropped at fold time, and it
-    /// marks the previewed chat read exactly as opening it does — the chat is on
-    /// screen, so viewing-is-reading applies.
+    /// is actually what the user is looking at — the main screen, no popup, and
+    /// the chat list focused — and the highlight names a chat the pane is not
+    /// already showing. Focus alone is not enough: none of the `open_*` screens
+    /// change `self.focus`, and the help popup is reachable from `Focus::Chats`,
+    /// so a preview fired there would reload the pane and mark a chat read behind
+    /// a modal or on another screen (the read marker is forward-only, so that is
+    /// not recoverable). The load is tagged with its group id (via
+    /// `begin_timeline_load`), so a preview superseded by further movement is
+    /// dropped at fold time, and it marks the previewed chat read exactly as
+    /// opening it does — the chat is on screen, so viewing-is-reading applies.
     fn fire_flick_preview(&mut self) {
-        if self.focus != Focus::Chats {
+        if self.screen != Screen::Main || self.popup.is_some() || self.focus != Focus::Chats {
             return;
         }
         let Some(account_id) = self
