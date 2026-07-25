@@ -11168,6 +11168,48 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
 }
 
 #[test]
+fn a_switched_away_accounts_timeline_fold_is_dropped() {
+    let account_a = "aa".repeat(32);
+    let group_a = "cc".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_a);
+    app.daemon.running = false;
+    app.chats = vec![flick_chat(&group_a, "a")];
+    app.selected_chat = 0;
+
+    app.begin_timeline_load(account_a.clone(), group_a.clone());
+
+    // Switch to a public-only account: refresh_chats takes its early return,
+    // clearing the pane without queueing a superseding load.
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: None,
+        local_signing: false,
+    });
+    app.selected_account = 1;
+    app.refresh_chats().expect("refresh_chats");
+    assert!(app.messages_group_id.is_none());
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: account_a.clone(),
+            group: group_a.clone(),
+        },
+        result: Ok(vec![serde_json::json!({"messages": []})]),
+    });
+    assert!(
+        app.messages_group_id.is_none(),
+        "a switched-away account's timeline fold repopulated the pane"
+    );
+    // The drop path clears the anchor so the pane's loading notice does not
+    // stick on a group the user has left (nothing supersedes this load).
+    assert!(
+        app.loading_chat.is_none(),
+        "the switched-away load left the loading anchor pointing at a left chat"
+    );
+}
+
+#[test]
 fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     let account_id = "aa".repeat(32);
     let group_id = "bb".repeat(32);

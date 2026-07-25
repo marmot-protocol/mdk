@@ -2046,6 +2046,24 @@ impl TuiApp {
         result: Result<Vec<Value>, String>,
     ) {
         if self.loading_chat.as_deref() != Some(group.as_str()) {
+            // A newer load (an explicit open or a fired preview) already claimed
+            // the pane; leave `loading_chat` pointing at that pending target so
+            // this stale fold cannot cancel it.
+            return;
+        }
+        // Anchor to the enqueuing account, the same guard `fold_relist`,
+        // `fold_invites`, and `fold_follow_update` apply: `refresh_chats` has
+        // early returns (no selection, public-only, no chats) that clear the pane
+        // without a superseding load, so a switched-away account's in-flight load
+        // would otherwise repopulate the pane under the new account. Nothing will
+        // supersede it, so clear the anchor too or `empty_messages_notice` keeps
+        // showing `loading messages...` for a group the user has left.
+        if self
+            .selected_account_row()
+            .map(|row| row.account_id.as_str())
+            != Some(account.as_str())
+        {
+            self.loading_chat = None;
             return;
         }
         let result = match single_effect_value(result) {
