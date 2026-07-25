@@ -1,0 +1,12 @@
+# pkg-config template for marmot-c; instantiated by c-bindings.sh with the
+# staged output/ layout. Relocatable: prefix resolves relative to this file.
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: marmot-c
+Description: C ABI bindings for the Marmot app runtime
+Version: @VERSION@
+Libs: -L${libdir} -lmarmot_c
+Libs.private: -lm -lpthread -ldl
+Cflags: -I${includedir}
