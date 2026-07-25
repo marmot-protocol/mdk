@@ -1192,11 +1192,12 @@ impl TuiApp {
     }
 
     /// Fold the pending-invites list into the invites picker (an empty result
-    /// shows an info card rather than an empty picker). The picker is not
-    /// screen-scoped (it is reachable from both the main view and group detail),
-    /// but it is anchored to the enqueuing account: a result whose account no
-    /// longer matches the selection is dropped rather than opening a picker of a
-    /// switched-away account's invites.
+    /// shows an info card rather than an empty picker). The fold is dropped
+    /// unless the selection still matches the enqueuing account and the current
+    /// screen is one the picker is reachable from (the main view or group
+    /// detail, via their `I` bindings) — a result that lands after an account
+    /// switch or after the user left for another screen never pops a picker of a
+    /// switched-away account's invites or over a screen it cannot be opened from.
     fn fold_invites(&mut self, account: String, result: Result<Vec<Value>, String>) {
         if !self.loading_invites {
             return;
@@ -1209,6 +1210,13 @@ impl TuiApp {
         {
             return;
         }
+        // The picker is reachable only from the main view and group detail (the
+        // `I` bindings). A result that lands after the user left for another
+        // screen (e.g. `I` then `p`) must drop rather than pop over a screen the
+        // picker cannot be opened from.
+        if !matches!(self.screen, Screen::Main | Screen::GroupDetail) {
+            return;
+        }
         let result = match single_effect_value(result) {
             Ok(value) => value,
             Err(err) => {
@@ -1218,6 +1226,11 @@ impl TuiApp {
         };
         let items = parse_invite_items(&result);
         let count = items.len();
+        // Route the replacement through the close funnel so a pixel image drawn
+        // by an image popup this picker supersedes cannot outlive it: `close_popup`
+        // drops the viewer's native protocol and schedules the full clear+repaint
+        // ratatui's cell diff cannot do for a terminal-side image.
+        self.close_popup();
         self.popup = Some(if items.is_empty() {
             Popup::info("Invites", "No pending invites.")
         } else {

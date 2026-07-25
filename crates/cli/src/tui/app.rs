@@ -1387,8 +1387,10 @@ impl TuiApp {
     /// Tear down the open popup: drop the viewer's on-demand native protocol
     /// (a no-op for non-image popups) and schedule the full clear+repaint that
     /// `run()` applies before the next draw. Every popup close funnels through
-    /// here so a terminal-side pixel image can never outlive its popup.
-    fn close_popup(&mut self) {
+    /// here so a terminal-side pixel image can never outlive its popup —
+    /// including a popup replaced by a fold (see `fold_invites`), not only one
+    /// dismissed by a key.
+    pub(crate) fn close_popup(&mut self) {
         self.popup = None;
         self.media.drop_viewer_protocol();
         self.pending_full_repaint = true;

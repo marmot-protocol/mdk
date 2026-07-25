@@ -10081,6 +10081,91 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
 }
 
 #[test]
+fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
+    // I from the chat list queues the invites load; the user Tabs to the pane
+    // and opens an image message. On a pixel terminal the viewer writes the
+    // image terminal-side, out of ratatui's cell-diff reach. When the invites
+    // result lands, replacing the popup by direct assignment would leave the
+    // pixel image on screen and the decoded viewer copy alive. The fold must
+    // funnel through close_popup: schedule the full clear+repaint and drop the
+    // native protocol before opening the picker.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = iterm2_media_with_ready_image("cafebabe");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+    assert!(matches!(app.popup, Some(Popup::Image { .. })));
+    assert!(app.media.viewer_protocol_mut("cafebabe").is_some());
+    assert!(!app.pending_full_repaint);
+
+    // The invites load (queued before the image was opened) now lands.
+    app.loading_invites = true;
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadInvites {
+            account: account_id,
+        },
+        result: Ok(vec![serde_json::json!({
+            "invites": [{"group_id": "cc", "profile": {"name": "Ops"}, "pending_confirmation": true}]
+        })]),
+    });
+
+    assert!(
+        matches!(
+            app.popup,
+            Some(Popup::Picker {
+                purpose: PickerPurpose::Invites,
+                ..
+            })
+        ),
+        "the invites picker replaced the image popup"
+    );
+    assert!(
+        app.pending_full_repaint,
+        "replacing the image popup must schedule the full clear+repaint"
+    );
+    assert!(
+        app.media.viewer_protocol_mut("cafebabe").is_none(),
+        "replacing the image popup must drop the terminal-side viewer protocol"
+    );
+}
+
+#[test]
+fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
+    // I queues the invites load from the chat list; p then opens Profile before
+    // the result lands. The picker is reachable only from Main and group detail,
+    // so a late fold must drop rather than pop over an unrelated screen.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Profile;
+    app.loading_invites = true;
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadInvites {
+            account: account_id,
+        },
+        result: Ok(vec![serde_json::json!({
+            "invites": [{"group_id": "cc", "profile": {"name": "Ops"}, "pending_confirmation": true}]
+        })]),
+    });
+
+    assert!(
+        app.popup.is_none(),
+        "the invites picker popped over the profile screen"
+    );
+    assert!(
+        !app.loading_invites,
+        "the dropped load clears the in-flight guard"
+    );
+}
+
+#[test]
 fn user_search_maps_to_the_users_search_argv_plus_a_follows_snapshot() {
     // The second call is the local `follows list` directory read — one cheap
     // call that lets every result row render an accurate follow badge, instead
