@@ -110,6 +110,11 @@ impl AgentConnector {
             );
         }
 
+        // Reject unknown accounts and malformed group ids before a request can
+        // wait on or reserve an in-flight send gate.
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+
         // Server-derived request fingerprint: a reused idempotency key only short-
         // circuits when the request it identifies is the same one. A reused key
         // carrying a different request body is a cache miss, so dedup can never
@@ -134,8 +139,6 @@ impl AgentConnector {
             None
         };
 
-        let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let summary = if let Some(target_message_id) = reply_to_message_id_hex {
             self.runtime
                 .reply_to_message(&account.label, &group_id, &target_message_id, &text)
@@ -148,9 +151,11 @@ impl AgentConnector {
         // Record only after a successful send so a failed send remains retryable.
         // A key already bound to a different fingerprint is left untouched (first
         // write wins), so this send simply proceeds without caching.
-        if let Some((key, _reservation)) = idempotency {
+        if let Some((key, reservation)) = idempotency {
+            let message_ids = summary.message_ids.clone();
             self.idempotency
-                .record(key, fingerprint, summary.message_ids.clone());
+                .record(key, fingerprint, message_ids.clone());
+            reservation.complete(message_ids);
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,

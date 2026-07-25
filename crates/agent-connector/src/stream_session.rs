@@ -53,8 +53,12 @@ pub(crate) const SEND_IDEMPOTENCY_FILE: &str = "dev/send-idempotency.json";
 const SEND_IDEMPOTENCY_FILE_VERSION: u8 = 1;
 
 type SendIdempotencyGateKey = (String, String);
-type SendIdempotencyGate = tokio::sync::Mutex<()>;
 type SendIdempotencyGates = Arc<Mutex<HashMap<SendIdempotencyGateKey, Weak<SendIdempotencyGate>>>>;
+
+struct SendIdempotencyGate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    completed: Mutex<Option<Vec<String>>>,
+}
 
 /// Bounded FIFO map from a client-supplied idempotency key to a server-derived
 /// request fingerprint plus the durable message ids produced by the first
@@ -86,6 +90,17 @@ pub(crate) enum SendIdempotencyAcquisition {
 
 pub(crate) struct SendIdempotencyLeader {
     _guard: OwnedMutexGuard<()>,
+    gate: Arc<SendIdempotencyGate>,
+}
+
+impl SendIdempotencyLeader {
+    /// Publish the leader's successful result to callers that were already
+    /// waiting on this in-process gate. This remains transient so a sequential
+    /// reuse of a key with a different fingerprint keeps its legacy cache-miss
+    /// behavior.
+    pub(crate) fn complete(&self, message_ids: Vec<String>) {
+        *crate::lock_recover(&self.gate.completed) = Some(message_ids);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,13 +147,25 @@ impl SendIdempotencyStore {
             .map(|(_, ids)| ids.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn in_flight_participant_count(&self, key: &str, fingerprint: &str) -> usize {
+        crate::lock_recover(&self.in_flight)
+            .get(&(key.to_owned(), fingerprint.to_owned()))
+            .map_or(0, Weak::strong_count)
+    }
+
     /// Serialize matching in-flight sends before their first external side
-    /// effect. A follower rechecks the committed cache after the leader exits;
-    /// if the leader failed, the follower becomes the next leader and may retry.
+    /// effect. A follower rechecks the committed cache and the transient gate
+    /// result after the leader exits; if the leader failed, the follower becomes
+    /// the next leader and may retry.
     ///
     /// The gate includes the fingerprint so the existing behavior for a reused
     /// key with a different request body remains a cache miss rather than
-    /// blocking behind or reusing an unrelated send.
+    /// blocking behind or reusing an unrelated send. A leader intentionally
+    /// holds its gate across the external send and result recording. Those
+    /// operations are not cancelled here because cancellation cannot prove that
+    /// an unrecallable send did not land; a follower instead receives
+    /// [`ConnectorError::SendInProgress`] after the bounded gate wait.
     pub(crate) async fn acquire(
         &self,
         key: &str,
@@ -155,20 +182,30 @@ impl SendIdempotencyStore {
             if let Some(gate) = in_flight.get(&gate_key).and_then(Weak::upgrade) {
                 gate
             } else {
-                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                let gate = Arc::new(SendIdempotencyGate {
+                    lock: Arc::new(tokio::sync::Mutex::new(())),
+                    completed: Mutex::new(None),
+                });
                 in_flight.insert(gate_key, Arc::downgrade(&gate));
                 gate
             }
         };
-        let guard =
-            crate::with_control_operation_timeout("send_idempotency_wait", gate.lock_owned())
-                .await?;
+        let guard = crate::with_control_operation_timeout(
+            "send_idempotency_wait",
+            Arc::clone(&gate.lock).lock_owned(),
+        )
+        .await
+        .map_err(|_| ConnectorError::SendInProgress)?;
 
         if let Some(message_ids) = self.get(key, fingerprint) {
             return Ok(SendIdempotencyAcquisition::Completed(message_ids));
         }
+        if let Some(message_ids) = crate::lock_recover(&gate.completed).clone() {
+            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        }
         Ok(SendIdempotencyAcquisition::Leader(SendIdempotencyLeader {
             _guard: guard,
+            gate,
         }))
     }
 

@@ -95,7 +95,7 @@ fn stream_finalize_idempotency_key(key: &str) -> String {
 struct StreamFinalizeIdempotency {
     key: String,
     fingerprint: String,
-    _reservation: SendIdempotencyLeader,
+    reservation: SendIdempotencyLeader,
 }
 
 impl AgentConnector {
@@ -365,6 +365,20 @@ impl AgentConnector {
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .map(stream_finalize_idempotency_key);
+        // Preserve the post-success retry path after its stream session has
+        // been removed, but reject a cache miss with an invalid capability
+        // before it can wait on or reserve an in-flight send gate.
+        if let Some(key) = idempotency_key.as_deref()
+            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
+        {
+            return Ok(AgentControlResponse::StreamFinalized {
+                stream_id_hex,
+                message_ids_hex,
+            });
+        }
+        let session = self
+            .streams
+            .get_authorized(&stream_id_hex, &stream_capability)?;
         let idempotency = if let Some(key) = idempotency_key {
             match self.idempotency.acquire(&key, &fingerprint).await? {
                 SendIdempotencyAcquisition::Completed(message_ids_hex) => {
@@ -377,7 +391,7 @@ impl AgentConnector {
                     Some(StreamFinalizeIdempotency {
                         key,
                         fingerprint,
-                        _reservation: reservation,
+                        reservation,
                     })
                 }
             }
@@ -388,10 +402,6 @@ impl AgentConnector {
         // expectation is validated inside the compose task, atomically with
         // its teardown. On mismatch the session stays registered and the
         // compose task keeps running, so finalize is retryable (#366).
-        let session = self
-            .streams
-            .get_authorized(&stream_id_hex, &stream_capability)?;
-
         // Retry fast-path: a prior finalize already validated the transcript and
         // the compose task exited, but the durable finish below failed. The
         // compose task is gone, so re-attempt the durable finish directly from
@@ -516,11 +526,13 @@ impl AgentConnector {
             )
             .await?;
         if let Some(idempotency) = idempotency {
+            let message_ids = summary.message_ids.clone();
             self.idempotency.record(
                 idempotency.key,
                 idempotency.fingerprint,
-                summary.message_ids.clone(),
+                message_ids.clone(),
             );
+            idempotency.reservation.complete(message_ids);
         }
         // Durable final published: it is now safe to drop the session.
         let _ = self.streams.remove_if_same(stream_id_hex, session);
