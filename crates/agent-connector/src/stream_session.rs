@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::AgentControlDebugFinalSend;
@@ -13,7 +13,7 @@ use cgka_traits::GroupId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::watch;
+use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
@@ -52,6 +52,14 @@ pub(crate) const SEND_IDEMPOTENCY_FILE: &str = "dev/send-idempotency.json";
 /// On-disk schema version for [`SEND_IDEMPOTENCY_FILE`].
 const SEND_IDEMPOTENCY_FILE_VERSION: u8 = 1;
 
+type SendIdempotencyGateKey = (String, String);
+type SendIdempotencyGates = Arc<Mutex<HashMap<SendIdempotencyGateKey, Weak<SendIdempotencyGate>>>>;
+
+struct SendIdempotencyGate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    completed: Mutex<Option<Vec<String>>>,
+}
+
 /// Bounded FIFO map from a client-supplied idempotency key to a server-derived
 /// request fingerprint plus the durable message ids produced by the first
 /// successful `send_final` for that key.
@@ -72,6 +80,27 @@ pub(crate) struct SendIdempotencyStore {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
     inner: Arc<Mutex<SendIdempotencyInner>>,
+    in_flight: SendIdempotencyGates,
+}
+
+pub(crate) enum SendIdempotencyAcquisition {
+    Completed(Vec<String>),
+    Leader(SendIdempotencyLeader),
+}
+
+pub(crate) struct SendIdempotencyLeader {
+    _guard: OwnedMutexGuard<()>,
+    gate: Arc<SendIdempotencyGate>,
+}
+
+impl SendIdempotencyLeader {
+    /// Publish the leader's successful result to callers that were already
+    /// waiting on this in-process gate. This remains transient so a sequential
+    /// reuse of a key with a different fingerprint keeps its legacy cache-miss
+    /// behavior.
+    pub(crate) fn complete(&self, message_ids: Vec<String>) {
+        *crate::lock_recover(&self.gate.completed) = Some(message_ids);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +130,7 @@ impl SendIdempotencyStore {
             path: home.join(SEND_IDEMPOTENCY_FILE),
             lock: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(SendIdempotencyInner::default())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         };
         store.load_from_disk();
         store
@@ -115,6 +145,68 @@ impl SendIdempotencyStore {
             .get(key)
             .filter(|(recorded, _)| constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()))
             .map(|(_, ids)| ids.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_participant_count(&self, key: &str, fingerprint: &str) -> usize {
+        crate::lock_recover(&self.in_flight)
+            .get(&(key.to_owned(), fingerprint.to_owned()))
+            .map_or(0, Weak::strong_count)
+    }
+
+    /// Serialize matching in-flight sends before their first external side
+    /// effect. A follower rechecks the committed cache and the transient gate
+    /// result after the leader exits; if the leader failed, the follower becomes
+    /// the next leader and may retry.
+    ///
+    /// The gate includes the fingerprint so the existing behavior for a reused
+    /// key with a different request body remains a cache miss rather than
+    /// blocking behind or reusing an unrelated send. A leader intentionally
+    /// holds its gate across the external send and result recording. Those
+    /// operations are not cancelled here because cancellation cannot prove that
+    /// an unrecallable send did not land; a follower instead receives
+    /// [`ConnectorError::SendInProgress`] after the bounded gate wait.
+    pub(crate) async fn acquire(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<SendIdempotencyAcquisition, ConnectorError> {
+        if let Some(message_ids) = self.get(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        }
+
+        let gate_key = (key.to_owned(), fingerprint.to_owned());
+        let gate = {
+            let mut in_flight = crate::lock_recover(&self.in_flight);
+            in_flight.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = in_flight.get(&gate_key).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(SendIdempotencyGate {
+                    lock: Arc::new(tokio::sync::Mutex::new(())),
+                    completed: Mutex::new(None),
+                });
+                in_flight.insert(gate_key, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let guard = crate::with_control_operation_timeout(
+            "send_idempotency_wait",
+            Arc::clone(&gate.lock).lock_owned(),
+        )
+        .await
+        .map_err(|_| ConnectorError::SendInProgress)?;
+
+        if let Some(message_ids) = self.get(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        }
+        if let Some(message_ids) = crate::lock_recover(&gate.completed).clone() {
+            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        }
+        Ok(SendIdempotencyAcquisition::Leader(SendIdempotencyLeader {
+            _guard: guard,
+            gate,
+        }))
     }
 
     /// Record the request `fingerprint` and durable message ids produced for

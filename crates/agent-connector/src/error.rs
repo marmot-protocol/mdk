@@ -30,6 +30,8 @@ pub enum ConnectorError {
     InvalidProfileName(&'static str),
     #[error("connector operation timed out: {0}")]
     OperationTimedOut(&'static str),
+    #[error("matching send is still in progress")]
+    SendInProgress,
     #[error("outbound media path denied: {0}")]
     MediaPathDenied(&'static str),
     #[error("stream id is already reserved")]
@@ -57,6 +59,7 @@ impl ConnectorError {
             Self::Stream(_) => "stream_error",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::OperationTimedOut(_) => "operation_timed_out",
+            Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
             Self::StreamIdInUse => "stream_id_in_use",
             Self::StreamCapabilityDenied => "stream_capability_denied",
@@ -75,6 +78,9 @@ impl ConnectorError {
             Self::Stream(_) => "agent stream request failed",
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
+            Self::SendInProgress => {
+                "matching send is still in progress; retry with the same idempotency key"
+            }
             Self::MediaPathDenied(_) => "media path is not allowed",
             Self::StreamIdInUse => "stream id is already in use",
             Self::StreamCapabilityDenied => "stream capability is not authorized",
