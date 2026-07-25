@@ -768,6 +768,54 @@ async fn key_package_cutover_imports_stable_slot_before_cache_retirement() {
     );
 }
 
+#[tokio::test]
+async fn key_package_cutover_repairs_empty_welcome_slot_without_losing_consumed_reference() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("welcome-before-slot-import").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let legacy = fresh_key_package_for_account(&app, &account, true).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&legacy).unwrap();
+    let consumed_ref = vec![7, 8, 9];
+    let mut lifecycle = cgka_traits::KeyPackageLifecycleState::slot_only(String::new());
+    lifecycle.last_consumed_key_package_ref = Some(consumed_ref.clone());
+    lifecycle.last_consumed_at = Some(Timestamp(42));
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "recovered-stable-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "22".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(legacy.bytes()),
+        },
+    )
+    .unwrap();
+
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    let repaired = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.stable_slot_id, "recovered-stable-slot");
+    assert_eq!(
+        repaired.last_consumed_key_package_ref,
+        Some(consumed_ref),
+        "slot repair must preserve the Welcome-consumed KeyPackage reference"
+    );
+    assert_eq!(repaired.last_consumed_at, Some(Timestamp(42)));
+}
+
 #[test]
 fn fresh_account_persists_its_slot_before_session_open() {
     let directory = tempfile::tempdir().unwrap();

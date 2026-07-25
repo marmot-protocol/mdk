@@ -19,9 +19,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  # Debug OpenMLS group construction plus the composed runtime layers can
-  # exceed the platform-default 2 MiB stack in test and Tokio worker threads.
-  RUST_MIN_STACK: "4194304"
 
 jobs:
   rust-format:

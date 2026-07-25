@@ -87,6 +87,13 @@ just clippy
 just test
 ```
 
+The repository's [`.cargo/config.toml`](.cargo/config.toml) supplies a 4 MiB
+`RUST_MIN_STACK` for Cargo-launched tests and debug binaries. Unoptimized
+OpenMLS group construction and tree deserialization can exceed Rust's
+platform-default 2 MiB spawned-thread stack through the composed app runtime.
+If you launch a built debug binary directly instead of through Cargo, export
+the same `RUST_MIN_STACK=4194304` value first.
+
 The CLI real-relay E2E tests use local Nostr relays. Start the repo-owned relay stack before running them:
 
 ```sh

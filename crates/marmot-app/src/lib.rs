@@ -3016,7 +3016,11 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account_storage_preexisted = self.account_storage_path(label).exists();
         let storage = self.account_storage(label)?;
-        if storage.key_package_lifecycle()?.is_some() {
+        let existing_lifecycle = storage.key_package_lifecycle()?;
+        if existing_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| !lifecycle.stable_slot_id.is_empty())
+        {
             return Ok(());
         }
         let current_cache = self.validated_current_local_key_package(label).is_some();
@@ -3025,7 +3029,11 @@ impl MarmotApp {
             &self.account_home().account(label)?.account_id_hex,
         ) {
             Ok(Some(stable_slot_id)) => {
-                storage.put_key_package_lifecycle(&empty_key_package_lifecycle(stable_slot_id))?;
+                let mut lifecycle = existing_lifecycle
+                    .clone()
+                    .unwrap_or_else(|| empty_key_package_lifecycle(String::new()));
+                lifecycle.stable_slot_id = stable_slot_id;
+                storage.put_key_package_lifecycle(&lifecycle)?;
                 if current_cache || self.mark_key_package_cutover_replacement_pending(label) {
                     return Ok(());
                 }
