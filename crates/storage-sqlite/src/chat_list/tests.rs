@@ -329,8 +329,77 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
 }
 
 #[test]
+fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
+    // Migration 0036 backfills `activity_sort_at` in pure SQL. This proves the
+    // compatibility seam between a migrated row and the Rust upsert
+    // (`rebuild_chat_list_row_for_group_tx`): a durable anchor whose preview has
+    // since been pruned must be preserved across a real `refresh_chat_list_rows`
+    // cycle — not overwritten with the conversation-creation fallback — while a
+    // phantom anchor left over from a now-invalidated tombstone is still lowered.
+    let store = setup_store();
+
+    // Emulate the migration-backfilled state directly: create the row the way
+    // migration 0036 leaves it (SQL-populated, defaults elsewhere) carrying a
+    // durable anchor (350) and a low creation time (5), but with no kind-9
+    // preview in the timeline — its message was securely pruned, so nothing
+    // remains to reproduce 350. A read cursor at 300 is the only surviving
+    // durable history below the anchor.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups SET conversation_created_at = 5 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_read_state (
+                group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                initialized_at, updated_at
+             ) VALUES (?1, 'pruned-message', 300, 0, 300)",
+            params![GROUP],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows (
+                group_id_hex, conversation_created_at, activity_sort_at, updated_at
+             ) VALUES (?1, 5, 350, 500)",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    // A full rebuild (app warm-up path) must retain the migrated anchor: the
+    // preview is gone but its durable position stays, and the recompute floor
+    // (max(read cursor 300, creation 5) = 300) does not lower it.
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(row.last_message, None);
+    assert_eq!(row.conversation_created_at, 5);
+    assert_eq!(row.activity_sort_at, 350);
+
+    // The completeness check must treat the migrated-then-rebuilt row as current
+    // (there is no invalidated tombstone accounting for 350), so ensure is a
+    // no-op rather than perpetually rebuilding.
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after_ensure = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(after_ensure.activity_sort_at, 350);
+
+    // Now introduce a visible message strictly above the migrated anchor; the
+    // rebuild must advance to it, proving preservation is a floor, not a freeze.
+    store
+        .record_app_event(&chat("newer", REMOTE, 400, "newer activity"))
+        .unwrap();
+    let advanced = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(advanced.activity_sort_at, 400);
+}
+
+#[test]
 fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
     let store = setup_store();
+
     store
         .record_app_event(&chat("latest", REMOTE, 10, "single row"))
         .unwrap();
@@ -745,6 +814,18 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     // unread-count queries in #443.
     let store = setup_store();
 
+    // Pin conversation creation below the message timestamps so the activity
+    // anchor is driven by the kind-9 rows (not the wall-clock creation default),
+    // making the phantom-vs-fallback distinction observable.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups SET conversation_created_at = 5 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
     // Visible delivered chat.
     store
         .record_app_event(&chat("visible", REMOTE, 10, "real message"))
@@ -761,6 +842,8 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
         .expect("chat row");
     let last_message = row.last_message.expect("last message");
     assert_eq!(last_message.message_id_hex, "phantom");
+    // The losing branch also pinned the activity anchor to its claimed time.
+    assert_eq!(row.activity_sort_at, 11);
 
     // Convergence invalidates the losing-branch row (kept as a tombstone).
     store
@@ -768,7 +851,9 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
         .unwrap();
 
     // Preview and sort anchor must fall back to the visible delivered message,
-    // not the invalidated tombstone.
+    // not the invalidated tombstone. The MAX-preserve upsert must not conflate
+    // a convergence tombstone with a pruned message: the phantom anchor is
+    // lowered rather than staying permanently pinned at 11.
     let row = store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
@@ -777,6 +862,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     assert_eq!(last_message.message_id_hex, "visible");
     assert_eq!(last_message.plaintext, "real message");
     assert_eq!(last_message.timeline_at, 10);
+    assert_eq!(row.activity_sort_at, 10);
 
     // The cached projection read path agrees with the refresh path.
     let cached = store
@@ -788,6 +874,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
         cached.last_message.as_ref().unwrap().message_id_hex,
         "visible"
     );
+    assert_eq!(cached.activity_sort_at, 10);
 
     // And the completeness check considers the projection up to date, so a
     // subsequent ensure pass is a no-op rather than perpetually rebuilding.
@@ -801,6 +888,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
         after_ensure.last_message.as_ref().unwrap().message_id_hex,
         "visible"
     );
+    assert_eq!(after_ensure.activity_sort_at, 10);
 }
 
 #[test]
