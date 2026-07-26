@@ -452,6 +452,23 @@ impl AgentTextStreamTranscriptV1 {
         }
     }
 
+    /// Resume a transcript whose hash/count were loaded from durable publisher
+    /// or receiver lifecycle state. The caller must bind that state to the same
+    /// stream/start context before using this constructor.
+    pub fn from_state(
+        stream_id: impl Into<Vec<u8>>,
+        start_event_id: MessageId,
+        hash: [u8; 32],
+        chunk_count: u64,
+    ) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            start_event_id,
+            hash,
+            chunk_count,
+        }
+    }
+
     pub fn append(&mut self, seq: u64, record_type: u8, plaintext_frame: &[u8]) {
         let mut hasher = Sha256::new();
         hasher.update(self.hash);

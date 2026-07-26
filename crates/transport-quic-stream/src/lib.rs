@@ -13,6 +13,7 @@ mod frame;
 mod hardening;
 mod limits;
 mod protocol;
+mod publisher_sequence;
 mod receive;
 mod send;
 mod tls;
@@ -38,6 +39,12 @@ pub use limits::{
 pub use protocol::{
     AGENT_TEXT_STREAM_FRAME_ALLOWANCE, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
     effective_plaintext_cap, frame_len_cap,
+};
+#[doc(hidden)]
+pub use publisher_sequence::reserve_publisher_records as reserve_publisher_records_for_transport;
+pub use publisher_sequence::{
+    EphemeralPublisherSequenceStore, PublisherSequenceReservation, PublisherSequenceSnapshot,
+    PublisherSequenceStore, ReservedPublisherRecords,
 };
 pub use receive::{
     QuicTextStreamReceiver, ReceivedTextChunk, ReceivedTextStream, ServerTrust, stream_record_text,

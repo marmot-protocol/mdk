@@ -16,14 +16,6 @@ pub(crate) struct ParsedQuicCandidate {
     pub(crate) server_name: String,
 }
 
-pub(crate) fn first_quic_candidate(candidates: &[String]) -> Result<String, ConnectorError> {
-    candidates
-        .iter()
-        .find(|candidate| QuicCandidate::parse(candidate).is_ok())
-        .cloned()
-        .ok_or_else(|| ConnectorError::Stream("stream begin requires a quic:// candidate".into()))
-}
-
 pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, ConnectorError> {
     let parsed = QuicCandidate::parse(candidate)
         .map_err(|_| ConnectorError::Stream("invalid QUIC candidate".to_owned()))?;

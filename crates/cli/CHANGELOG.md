@@ -7,6 +7,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent text-stream QUIC starts now accept zero broker candidates for durable
+  final-message fallback, validate complete candidate values against the
+  adopted 512-byte authority rules, preserve ordered candidate failover, and
+  durably reserve encrypted publisher sequences so repeated `stream send`,
+  reconnect, or daemon reuse cannot restart at sequence 1 for one start.
+
 ## [0.9.6] - 2026-07-26
 
 ### Added

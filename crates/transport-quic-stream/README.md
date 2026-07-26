@@ -12,6 +12,8 @@ orchestration stay in higher layers.
   early-data policy) also consumed by `transport-quic-broker`.
 - Seals and opens length-delimited preview records with HKDF-derived keys and AAD.
 - Sends and receives text-stream preview chunks over ordered QUIC streams.
+- Requires encrypted publishers to reserve sequences through an account-device
+  durable state boundary before record writes; ambiguous state fails closed.
 
 ## What it does not do
 

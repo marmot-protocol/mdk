@@ -2,6 +2,7 @@
 //! the [`MarmotAppRuntime`] entry points that drive them.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -14,7 +15,8 @@ use cgka_traits::app_event::{
 use cgka_traits::{GroupId, MemberId, MessageId};
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::{
-    BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_limits,
+    BrokerServerTrust, BrokerTextReceiverState, SubscribeTextFromBroker,
+    subscribe_text_from_broker_with_resume,
 };
 use transport_quic_stream::{AgentTextStreamCrypto, AgentTextStreamReceiveLimits, QuicCandidate};
 
@@ -87,21 +89,31 @@ impl MarmotAppRuntime {
         let (updates_tx, updates_rx) = mpsc::channel(1024);
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let mut runtime_events = self.subscribe();
+        let invalidation_group_id = group_id.clone();
+        let invalidation_start_id = start_message_id_hex.clone();
         let handle = tokio::spawn(async move {
+            let watch = watch_broker_candidates(
+                BrokerWatch {
+                    candidates,
+                    server_cert_der,
+                    insecure_local,
+                    stream_id: crypto_context.stream_id,
+                    start_event_id: crypto_context.start_event_id,
+                    crypto: Some(crypto_context.crypto),
+                    policy_max_plaintext_frame_len,
+                },
+                updates_tx.clone(),
+            );
+            tokio::pin!(watch);
             let final_update = tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                update = watch_broker_candidates(
-                    BrokerWatch {
-                        candidates,
-                        server_cert_der,
-                        insecure_local,
-                        stream_id: crypto_context.stream_id,
-                        start_event_id: crypto_context.start_event_id,
-                        crypto: Some(crypto_context.crypto),
-                        policy_max_plaintext_frame_len,
-                    },
-                    updates_tx.clone(),
-                ) => update,
+                update = &mut watch => update,
+                reason = wait_for_preview_invalidation(
+                    &mut runtime_events,
+                    &invalidation_group_id,
+                    &invalidation_start_id,
+                ) => RuntimeAgentStreamUpdate::Failed { message: reason },
             };
             let _ = terminal_tx.send(final_update);
         });
@@ -180,6 +192,11 @@ impl MarmotAppRuntime {
                     Ok(secret) => secret,
                     Err(_) => continue,
                 };
+                let publisher_store = Arc::new(
+                    crate::publisher_sequences::SqlitePublisherSequenceStore::new(
+                        self.accounts.app.account_storage(&account.label)?,
+                    ),
+                );
                 let crypto = AgentTextStreamCrypto::new(
                     stream_secret,
                     AgentTextStreamKeyContextV1::new(
@@ -189,7 +206,8 @@ impl MarmotAppRuntime {
                         MemberId::new(hex::decode(message.sender)?),
                         start_event_id.clone(),
                     ),
-                );
+                )
+                .with_publisher_sequence_store(publisher_store);
                 // Carry the group policy alongside the start-event-bound crypto
                 // so send/watch/compose paths enforce the durable MLS component
                 // instead of silently falling back to the app-profile ceiling.
@@ -215,6 +233,38 @@ impl MarmotAppRuntime {
         }
 
         Err(AppError::AgentStreamMissingStart)
+    }
+}
+
+async fn wait_for_preview_invalidation(
+    events: &mut tokio::sync::broadcast::Receiver<crate::MarmotAppEvent>,
+    group_id: &GroupId,
+    start_message_id_hex: &str,
+) -> String {
+    loop {
+        match events.recv().await {
+            Ok(crate::MarmotAppEvent::GroupEvent(runtime_event)) => match runtime_event.event {
+                cgka_traits::engine::GroupEvent::EpochChanged {
+                    group_id: changed, ..
+                } if &changed == group_id => {
+                    return "agent stream preview closed by epoch change".to_owned();
+                }
+                cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                    group_id: changed,
+                    message_id,
+                    ..
+                } if &changed == group_id
+                    && hex::encode(message_id.as_slice()) == start_message_id_hex =>
+                {
+                    return "agent stream preview start was invalidated".to_owned();
+                }
+                _ => {}
+            },
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return "agent stream preview event source closed".to_owned();
+            }
+        }
     }
 }
 
@@ -334,6 +384,11 @@ async fn watch_broker_candidates(
             max_plaintext_frame_len.min(limits.max_plaintext_frame_len);
     }
     let mut last_error = None;
+    let mut receiver_state = BrokerTextReceiverState::new(
+        watch.stream_id.clone(),
+        watch.start_event_id.clone(),
+        limits,
+    );
     for candidate in watch.candidates {
         match resolve_broker_addr(&candidate.authority, watch.insecure_local).await {
             Ok(broker_addr) => {
@@ -355,51 +410,58 @@ async fn watch_broker_candidates(
                     crypto: watch.crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
-                match subscribe_text_from_broker_with_limits(config, limits, |chunk| {
-                    let update = match chunk.record_type {
-                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
-                            seq: chunk.seq,
-                            text: chunk.text.clone(),
-                        },
-                        AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
-                            seq: chunk.seq,
-                            status: chunk.text.clone(),
-                        },
-                        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
-                            RuntimeAgentStreamUpdate::Progress {
-                                seq: chunk.seq,
-                                text: chunk.text.clone(),
+                match subscribe_text_from_broker_with_resume(
+                    config,
+                    limits,
+                    &mut receiver_state,
+                    |chunk| {
+                        let update = match chunk.record_type {
+                            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => {
+                                RuntimeAgentStreamUpdate::Chunk {
+                                    seq: chunk.seq,
+                                    text: chunk.text.clone(),
+                                }
                             }
+                            AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
+                                seq: chunk.seq,
+                                status: chunk.text.clone(),
+                            },
+                            AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+                                RuntimeAgentStreamUpdate::Progress {
+                                    seq: chunk.seq,
+                                    text: chunk.text.clone(),
+                                }
+                            }
+                            record_type => RuntimeAgentStreamUpdate::Record {
+                                seq: chunk.seq,
+                                record_type,
+                                text: chunk.text.clone(),
+                            },
+                        };
+                        match chunk_tx.try_send(update) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_))
+                                if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
+                            {
+                                tracing::warn!(
+                                    target: "marmot_app::agent_stream",
+                                    method = "watch_agent_text_stream",
+                                    "dropping live agent text stream delta; consumer is behind",
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    target: "marmot_app::agent_stream",
+                                    method = "watch_agent_text_stream",
+                                    record_type = chunk.record_type,
+                                    dropped_record_class = "non_text",
+                                    "dropping non-text agent stream record; consumer is behind",
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
                         }
-                        record_type => RuntimeAgentStreamUpdate::Record {
-                            seq: chunk.seq,
-                            record_type,
-                            text: chunk.text.clone(),
-                        },
-                    };
-                    match chunk_tx.try_send(update) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_))
-                            if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
-                        {
-                            tracing::warn!(
-                                target: "marmot_app::agent_stream",
-                                method = "watch_agent_text_stream",
-                                "dropping live agent text stream delta; consumer is behind",
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                target: "marmot_app::agent_stream",
-                                method = "watch_agent_text_stream",
-                                record_type = chunk.record_type,
-                                dropped_record_class = "non_text",
-                                "dropping non-text agent stream record; consumer is behind",
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    }
-                })
+                    },
+                )
                 .await
                 {
                     Ok(received) => {
@@ -463,4 +525,74 @@ pub(crate) fn broker_trust_for_candidate(
     server_cert_der
         .map(BrokerServerTrust::CertificateDer)
         .unwrap_or(BrokerServerTrust::Platform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MarmotAppEvent, RuntimeGroupEvent};
+    use cgka_traits::EpochId;
+    use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+
+    fn runtime_group_event(event: GroupEvent) -> MarmotAppEvent {
+        MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
+            account_id_hex: "account".to_owned(),
+            account_label: "label".to_owned(),
+            event,
+        })
+    }
+
+    #[tokio::test]
+    async fn epoch_change_closes_only_the_matching_group_preview() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        let group = GroupId::new(vec![1; 16]);
+        events
+            .send(runtime_group_event(GroupEvent::EpochChanged {
+                group_id: GroupId::new(vec![2; 16]),
+                from: EpochId(1),
+                to: EpochId(2),
+            }))
+            .unwrap();
+        events
+            .send(runtime_group_event(GroupEvent::EpochChanged {
+                group_id: group.clone(),
+                from: EpochId(1),
+                to: EpochId(2),
+            }))
+            .unwrap();
+
+        assert_eq!(
+            wait_for_preview_invalidation(&mut receiver, &group, &hex::encode([3; 32])).await,
+            "agent stream preview closed by epoch change"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_branch_invalidation_withdraws_only_the_matching_start() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        let group = GroupId::new(vec![1; 16]);
+        events
+            .send(runtime_group_event(GroupEvent::AppMessageInvalidated {
+                group_id: group.clone(),
+                message_id: MessageId::new(vec![2; 32]),
+                epoch: EpochId(1),
+                reason: AppMessageInvalidationReason::LosingBranch,
+                decrypted_payload_ref: None,
+            }))
+            .unwrap();
+        events
+            .send(runtime_group_event(GroupEvent::AppMessageInvalidated {
+                group_id: group.clone(),
+                message_id: MessageId::new(vec![3; 32]),
+                epoch: EpochId(1),
+                reason: AppMessageInvalidationReason::LosingBranch,
+                decrypted_payload_ref: None,
+            }))
+            .unwrap();
+
+        assert_eq!(
+            wait_for_preview_invalidation(&mut receiver, &group, &hex::encode([3; 32])).await,
+            "agent stream preview start was invalidated"
+        );
+    }
 }

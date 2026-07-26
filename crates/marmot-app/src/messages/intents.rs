@@ -353,7 +353,7 @@ pub(crate) fn build_inner_event(
                     "agent text stream id must be 32 bytes".into(),
                 ));
             }
-            for candidate in &quic_candidates {
+            for candidate in quic_candidates {
                 transport_quic_stream::QuicCandidate::parse(candidate)
                     .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.clone()))?;
             }
@@ -374,8 +374,8 @@ pub(crate) fn build_inner_event(
             }
             tags.extend(
                 quic_candidates
-                    .into_iter()
-                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate]),
+                    .iter()
+                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
             );
             Ok(event(
                 MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,

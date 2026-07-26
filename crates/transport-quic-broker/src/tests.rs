@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
-    stream_record_text,
+    EphemeralPublisherSequenceStore, stream_record_text,
 };
 
 use crate::client::{
@@ -2145,7 +2145,8 @@ async fn broker_publish_frame_byte_limit_counts_wire_bytes_for_encrypted_records
             MemberId::new(vec![0x02; 32]),
             start_event_id.clone(),
         ),
-    );
+    )
+    .with_publisher_sequence_store(Arc::new(EphemeralPublisherSequenceStore::default()));
 
     let server = QuicBrokerServer::bind(QuicBrokerConfig {
         bind_addr: LOCAL_SERVER_BIND,

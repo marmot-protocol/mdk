@@ -13,8 +13,8 @@ use marmot_app::{
 };
 use serde_json::{Value, json};
 use transport_quic_broker::{
-    BrokerServerTrust, PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
-    subscribe_text_from_broker_with_limits,
+    BrokerServerTrust, BrokerTextReceiverState, PublishTextToBroker, SubscribeTextFromBroker,
+    publish_text_to_broker, subscribe_text_from_broker_with_resume,
 };
 use transport_quic_stream::{
     AgentTextStreamReceiveLimits, QuicTextStreamReceiver, SendTextStream, ServerTrust,
@@ -525,16 +525,6 @@ where
             stream_route_label(&start_payload.route).to_owned(),
         ));
     }
-    let candidate = start_payload
-        .quic_candidates
-        .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
-        .ok_or(WnError::MissingQuicCandidate)?;
-    let candidate = parse_quic_candidate(candidate)?;
-    // Only an explicit local `--insecure-local` opt-in may resolve to a
-    // local/private endpoint; otherwise reject unsafe sender-provided candidates.
-    let candidate_addr = resolve_quic_candidate_addr(&candidate, insecure_local).await?;
-    let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
     let (stream_id, crypto, policy_max_plaintext_frame_len) = stream_crypto_for_start_event(
@@ -554,29 +544,74 @@ where
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
     let delta_stream_id = stream_id_hex.clone();
-    let received = subscribe_text_from_broker_with_limits(
-        SubscribeTextFromBroker {
-            broker_addr: candidate_addr,
-            server_name: candidate.server_name.clone(),
-            trust: trust.clone(),
-            stream_id,
-            start_event_id,
-            crypto,
-        },
-        limits,
-        |chunk| {
-            on_delta(AgentStreamDelta {
-                account: delta_account.clone(),
-                group_id: delta_group_id.clone(),
-                stream_id: delta_stream_id.clone(),
-                seq: chunk.seq,
-                record_type: chunk.record_type,
-                flags: chunk.flags,
-                text: chunk.text.clone(),
-            });
-        },
-    )
-    .await?;
+    let mut receiver_state =
+        BrokerTextReceiverState::new(stream_id.clone(), start_event_id.clone(), limits);
+    let mut last_error = None;
+    let mut selected = None;
+    let mut received = None;
+    for candidate_value in &start_payload.quic_candidates {
+        let candidate = match parse_quic_candidate(candidate_value) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let candidate_addr = match resolve_quic_candidate_addr(&candidate, insecure_local).await {
+            Ok(addr) => addr,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let trust = match broker_trust_for_candidate(
+            &candidate.server_name,
+            candidate_addr,
+            server_cert_der_hex.clone(),
+            insecure_local,
+        ) {
+            Ok(trust) => trust,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let result = subscribe_text_from_broker_with_resume(
+            SubscribeTextFromBroker {
+                broker_addr: candidate_addr,
+                server_name: candidate.server_name.clone(),
+                trust: trust.clone(),
+                stream_id: stream_id.clone(),
+                start_event_id: start_event_id.clone(),
+                crypto: crypto.clone(),
+            },
+            limits,
+            &mut receiver_state,
+            |chunk| {
+                on_delta(AgentStreamDelta {
+                    account: delta_account.clone(),
+                    group_id: delta_group_id.clone(),
+                    stream_id: delta_stream_id.clone(),
+                    seq: chunk.seq,
+                    record_type: chunk.record_type,
+                    flags: chunk.flags,
+                    text: chunk.text.clone(),
+                });
+            },
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                selected = Some((candidate, candidate_addr, trust));
+                received = Some(value);
+                break;
+            }
+            Err(err) => last_error = Some(err.into()),
+        }
+    }
+    let received = received.ok_or_else(|| last_error.unwrap_or(WnError::MissingQuicCandidate))?;
+    let (candidate, candidate_addr, trust) =
+        selected.expect("a received stream always has a selected candidate");
     Ok(CommandOutput {
         plain: format!(
             "received brokered stream {} chunks={}\n{}",
@@ -790,6 +825,18 @@ pub(crate) fn broker_trust(
         .transpose()
         .map(|trust| trust.unwrap_or(BrokerServerTrust::Platform))
         .map_err(Into::into)
+}
+
+pub(crate) fn broker_trust_for_candidate(
+    candidate_host: &str,
+    server_addr: SocketAddr,
+    server_cert_der_hex: Option<String>,
+    insecure_local: bool,
+) -> Result<BrokerServerTrust, WnError> {
+    if insecure_local && !quic_host_is_loopback(candidate_host) {
+        return broker_trust(server_addr, server_cert_der_hex, false);
+    }
+    broker_trust(server_addr, server_cert_der_hex, insecure_local)
 }
 
 fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {

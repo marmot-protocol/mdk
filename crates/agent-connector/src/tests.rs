@@ -2216,7 +2216,7 @@ async fn connector_socket_sends_final_message() {
 }
 
 #[tokio::test]
-async fn connector_socket_composes_and_finalizes_stream() {
+async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -2262,7 +2262,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
             &group_id_hex,
             Some(stream_id_hex.clone()),
             Some(parent_message_id_hex.clone()),
-            vec!["quic://127.0.0.1:9".to_owned()],
+            Vec::new(),
         )
         .await;
     assert!(matches!(
@@ -2275,7 +2275,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         group_id_hex: group_id_hex.clone(),
         stream_id_hex: Some(stream_id_hex.clone()),
         parent_message_id_hex: Some(parent_message_id_hex.clone()),
-        quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        quic_candidates: Vec::new(),
     };
     let begun = serve_control_request_once(
         &connector,
@@ -2310,7 +2310,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
             group_id_hex: group_id_hex.clone(),
             stream_id_hex: Some(stream_id_hex.clone()),
             parent_message_id_hex: None,
-            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+            quic_candidates: Vec::new(),
         },
     )
     .await;
@@ -2346,7 +2346,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
     assert_eq!(stream_capability.len(), 64);
     assert_eq!(hex::decode(&stream_capability).unwrap().len(), 32);
     assert_eq!(stream_capability, stream_capability.to_ascii_lowercase());
-    assert_eq!(quic_candidates, vec!["quic://127.0.0.1:9"]);
+    assert!(quic_candidates.is_empty());
     let stored = connector
         .runtime
         .messages_with_query(

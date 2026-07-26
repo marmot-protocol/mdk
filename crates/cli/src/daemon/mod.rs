@@ -11,7 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
+#[cfg(test)]
+use agent_stream_compose::run_stream_compose_session;
+use agent_stream_compose::{
+    StreamComposeCommand, StreamComposeReport, run_stream_compose_session_candidates,
+    run_stream_compose_session_without_live,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
