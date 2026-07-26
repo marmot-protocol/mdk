@@ -70,6 +70,8 @@ mod migration_0034_maintenance_publication;
 mod migration_0035_durable_convergence_passes;
 #[path = "migrations/0036_agent_stream_publisher_sequences.rs"]
 mod migration_0036_agent_stream_publisher_sequences;
+#[path = "migrations/0037_chat_list_semantic_timestamps.rs"]
+mod migration_0037_chat_list_semantic_timestamps;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -261,6 +263,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 36,
         name: "0036_agent_stream_publisher_sequences",
         apply: migration_0036_agent_stream_publisher_sequences::apply,
+    },
+    Migration {
+        version: 37,
+        name: "0037_chat_list_semantic_timestamps",
+        apply: migration_0037_chat_list_semantic_timestamps::apply,
     },
 ];
 
@@ -522,6 +529,113 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(managed, vec![(7, 1), (8, 0)]);
+    }
+
+    #[test]
+    fn chat_list_semantic_timestamps_backfill_from_durable_history() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..35]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('never-messaged', 'relay', 100),
+                    ('active', 'relay', 200),
+                    ('pruned-read', 'relay', 300)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, recorded_at, received_at
+             ) VALUES ('active', 'origin', 'received', 'sender', 'origin', 9, '[]', 140, 140)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json
+             ) VALUES ('active', 'latest', 'received', 'sender', 'latest', 9, '[]', 150, 150, '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, invalidation_status
+             ) VALUES (
+                'active', 'invalidated', 'received', 'sender', 'losing branch',
+                9, '[]', 160, 160, '[]', 'LosingBranch'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_read_state (
+                group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                initialized_at, updated_at
+             ) VALUES ('pruned-read', 'pruned-message', 350, 0, 400)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json
+             ) VALUES (
+                'pruned-read', 'older-survivor', 'received', 'sender', 'older',
+                9, '[]', 310, 310, '[]'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows (group_id_hex, updated_at)
+             VALUES ('never-messaged', 500), ('active', 500), ('pruned-read', 500)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let rows = conn
+            .prepare(
+                "SELECT group_id_hex, conversation_created_at, activity_sort_at
+                 FROM chat_list_rows ORDER BY group_id_hex",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("active".to_owned(), 140, 150),
+                ("never-messaged".to_owned(), 100, 100),
+                ("pruned-read".to_owned(), 300, 350),
+            ]
+        );
+
+        run(&mut conn, MIGRATIONS).unwrap();
+        let after_second_run: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT group_id_hex, conversation_created_at, activity_sort_at
+                 FROM chat_list_rows ORDER BY group_id_hex",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(after_second_run, rows);
     }
 
     #[test]
