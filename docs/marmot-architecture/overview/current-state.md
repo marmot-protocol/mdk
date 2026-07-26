@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-25
+updated: 2026-07-26
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -105,7 +105,9 @@ This repository now has the main engine candidate:
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` / `1059` events, kind `445` group envelope
   peeling, and NIP-59 welcome wrap/peel with injected local signer/decrypter.
 - `crates/transport-quic-stream` — raw QUIC transport binding for transient agent text stream previews over reliable
-  ordered QUIC streams, with transcript hashes tied to durable MLS start/final app-message payloads.
+  ordered QUIC streams, with transcript hashes tied to durable MLS start/final app-message payloads. Encrypted
+  publishers reserve the next sequence and transcript in the per-account SQLCipher database before writing records;
+  ambiguous crash state disables that start's live preview rather than risking nonce reuse.
 - `crates/transport-quic-broker` — memory-only QUIC pub/sub broker for forwarding live preview records by
   `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.

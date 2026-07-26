@@ -1,23 +1,22 @@
 //! QUIC text-stream preview session lifecycle and the idle-session sweeper.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 use agent_control::AgentControlResponse;
 use agent_stream_compose::{
-    StreamComposeCommand, StreamComposeReport, StreamFinishExpectation, run_stream_compose_session,
+    StreamComposeCommand, StreamComposeReport, StreamFinishExpectation,
+    run_stream_compose_session_candidates, run_stream_compose_session_without_live,
 };
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::AgentTextStreamFinishRequest;
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
-use transport_quic_broker::OpenBrokerTextPublisher;
+use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
 
 use crate::error::ConnectorError;
-use crate::quic::{
-    broker_trust_for_candidate, first_quic_candidate, parse_quic_candidate,
-    resolve_quic_candidate_addr,
-};
+use crate::quic::{broker_trust_for_candidate, parse_quic_candidate, resolve_quic_candidate_addr};
 use crate::stream_session::{
     ActiveStreamSession, FinalizedStream, SendIdempotencyAcquisition, SendIdempotencyLeader,
     StreamBeginReceipt, StreamBeginReservation, normalize_stream_capability,
@@ -177,15 +176,6 @@ impl AgentConnector {
         let mut stream_capability = [0u8; 32];
         OsRng.fill_bytes(&mut stream_capability);
         let stream_capability_hex = hex::encode(stream_capability);
-        let candidate = first_quic_candidate(&quic_candidates)?;
-        let parsed_candidate = parse_quic_candidate(&candidate)?;
-        let broker_addr =
-            resolve_quic_candidate_addr(&parsed_candidate, self.allow_insecure_local_broker)
-                .await?;
-        let trust = broker_trust_for_candidate(
-            &parsed_candidate.server_name,
-            self.allow_insecure_local_broker,
-        );
         let (_payload, summary) = self
             .runtime
             .start_agent_text_stream_with_parent(
@@ -212,6 +202,27 @@ impl AgentConnector {
             .await?;
 
         let policy_max_plaintext_frame_len = crypto.policy_max_plaintext_frame_len;
+        let mut live_candidates = Vec::new();
+        for candidate in &quic_candidates {
+            let Ok(parsed) = parse_quic_candidate(candidate) else {
+                continue;
+            };
+            let Ok(addr) =
+                resolve_quic_candidate_addr(&parsed, self.allow_insecure_local_broker).await
+            else {
+                continue;
+            };
+            live_candidates.push((
+                candidate.clone(),
+                addr,
+                parsed.server_name.clone(),
+                broker_trust_for_candidate(&parsed.server_name, self.allow_insecure_local_broker),
+            ));
+        }
+        let candidate = live_candidates
+            .first()
+            .map(|(candidate, ..)| candidate.clone())
+            .unwrap_or_default();
 
         let (tx, rx) = mpsc::channel(STREAM_COMPOSE_CHANNEL_DEPTH);
         // Dedicated cancel signal: a separate, bounded channel that cannot be
@@ -230,21 +241,57 @@ impl AgentConnector {
             chunk_count: 0,
             error: None,
         };
-        let handle = tokio::spawn(run_stream_compose_session(
-            OpenBrokerTextPublisher {
-                broker_addr,
-                server_name: parsed_candidate.server_name,
-                trust,
-                stream_id: stream_id.clone(),
-                start_event_id: MessageId::new(hex::decode(&start_message_id_hex)?),
-                crypto: Some(crypto.crypto),
-                max_plaintext_frame_len: policy_max_plaintext_frame_len,
-            },
-            STREAM_COMPOSE_CHUNK_BYTES,
-            rx,
-            cancel_rx,
-            report,
-        ));
+        let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+        let open = OpenBrokerTextPublisher {
+            broker_addr: live_candidates
+                .first()
+                .map(|(_, addr, ..)| *addr)
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
+            server_name: live_candidates
+                .first()
+                .map(|(_, _, server_name, _)| server_name.clone())
+                .unwrap_or_else(|| "localhost".to_owned()),
+            trust: live_candidates
+                .first()
+                .map(|(_, _, _, trust)| trust.clone())
+                .unwrap_or(BrokerServerTrust::InsecureLocal),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: Some(crypto.crypto.clone()),
+            max_plaintext_frame_len: policy_max_plaintext_frame_len,
+        };
+        let candidate_opens = live_candidates
+            .into_iter()
+            .map(
+                |(_, broker_addr, server_name, trust)| OpenBrokerTextPublisher {
+                    broker_addr,
+                    server_name,
+                    trust,
+                    stream_id: stream_id.clone(),
+                    start_event_id: start_event_id.clone(),
+                    crypto: Some(crypto.crypto.clone()),
+                    max_plaintext_frame_len: policy_max_plaintext_frame_len,
+                },
+            )
+            .collect::<Vec<_>>();
+        let handle = if candidate_opens.is_empty() {
+            tokio::spawn(run_stream_compose_session_without_live(
+                open,
+                STREAM_COMPOSE_CHUNK_BYTES,
+                rx,
+                cancel_rx,
+                report,
+            ))
+        } else {
+            tokio::spawn(run_stream_compose_session_candidates(
+                open,
+                candidate_opens,
+                STREAM_COMPOSE_CHUNK_BYTES,
+                rx,
+                cancel_rx,
+                report,
+            ))
+        };
         self.streams.insert_new(
             stream_id_hex.clone(),
             ActiveStreamSession {

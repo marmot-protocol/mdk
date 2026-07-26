@@ -389,37 +389,6 @@ pub(crate) async fn open_stream_compose(
         Ok(None) => hex::encode(transport_quic_stream::random_stream_id()),
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
-    let Some(candidate) = quic_candidates
-        .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
-        .cloned()
-    else {
-        return daemon_error(
-            cli.json,
-            "stream_compose_failed",
-            "stream compose requires a quic:// candidate".to_owned(),
-        );
-    };
-    let parsed_candidate = match crate::commands::stream::parse_quic_candidate(&candidate) {
-        Ok(candidate) => candidate,
-        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-    };
-    // Only an explicit local `--insecure-local` opt-in may resolve to a
-    // local/private endpoint; otherwise reject unsafe candidates.
-    let candidate_addr = match crate::commands::stream::resolve_quic_candidate_addr(
-        &parsed_candidate,
-        insecure_local,
-    )
-    .await
-    {
-        Ok(addr) => addr,
-        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-    };
-    let trust = match crate::commands::stream::broker_trust(candidate_addr, None, insecure_local) {
-        Ok(trust) => trust,
-        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-    };
-
     let mut start_cli = cli.clone();
     start_cli.json = true;
     start_cli.command = crate::Command::Stream {
@@ -492,6 +461,35 @@ pub(crate) async fn open_stream_compose(
         }
     };
 
+    let mut live_candidates = Vec::new();
+    for candidate in &quic_candidates {
+        let parsed = match crate::commands::stream::parse_quic_candidate(candidate) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let addr =
+            match crate::commands::stream::resolve_quic_candidate_addr(&parsed, insecure_local)
+                .await
+            {
+                Ok(addr) => addr,
+                Err(_) => continue,
+            };
+        let trust = match crate::commands::stream::broker_trust_for_candidate(
+            &parsed.server_name,
+            addr,
+            None,
+            insecure_local,
+        ) {
+            Ok(trust) => trust,
+            Err(_) => continue,
+        };
+        live_candidates.push((candidate.clone(), addr, parsed.server_name, trust));
+    }
+    let candidate = live_candidates
+        .first()
+        .map(|(candidate, ..)| candidate.clone())
+        .unwrap_or_default();
+
     let key = stream_compose_key(account.as_deref(), &stream_id);
     let (tx, rx) = mpsc::channel(32);
     // Dedicated cancel signal: a bounded channel that can't be starved behind
@@ -511,24 +509,56 @@ pub(crate) async fn open_stream_compose(
         error: None,
     };
     let task_report = report.clone();
-    let handle = tokio::spawn(async move {
-        run_stream_compose_session(
-            OpenBrokerTextPublisher {
-                broker_addr: candidate_addr,
-                server_name: parsed_candidate.server_name,
+    let fallback_open = OpenBrokerTextPublisher {
+        broker_addr: live_candidates
+            .first()
+            .map(|(_, addr, ..)| *addr)
+            .unwrap_or_else(|| "127.0.0.1:9".parse().expect("literal socket address")),
+        server_name: live_candidates
+            .first()
+            .map(|(_, _, server_name, _)| server_name.clone())
+            .unwrap_or_else(|| "localhost".to_owned()),
+        trust: live_candidates
+            .first()
+            .map(|(_, _, _, trust)| trust.clone())
+            .unwrap_or(transport_quic_broker::BrokerServerTrust::InsecureLocal),
+        stream_id: stream_id_bytes.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: crypto.clone(),
+        max_plaintext_frame_len: policy_max_plaintext_frame_len,
+    };
+    let candidate_opens = live_candidates
+        .into_iter()
+        .map(
+            |(_, broker_addr, server_name, trust)| OpenBrokerTextPublisher {
+                broker_addr,
+                server_name,
                 trust,
-                stream_id: stream_id_bytes,
-                start_event_id,
-                crypto,
+                stream_id: stream_id_bytes.clone(),
+                start_event_id: start_event_id.clone(),
+                crypto: crypto.clone(),
                 max_plaintext_frame_len: policy_max_plaintext_frame_len,
             },
+        )
+        .collect::<Vec<_>>();
+    let handle = if candidate_opens.is_empty() {
+        tokio::spawn(run_stream_compose_session_without_live(
+            fallback_open,
             chunk_bytes,
             rx,
             cancel_rx,
             task_report,
-        )
-        .await;
-    });
+        ))
+    } else {
+        tokio::spawn(run_stream_compose_session_candidates(
+            fallback_open,
+            candidate_opens,
+            chunk_bytes,
+            rx,
+            cancel_rx,
+            task_report,
+        ))
+    };
     workers.insert(
         key,
         StreamComposeSession {

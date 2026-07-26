@@ -87,6 +87,7 @@ mod media;
 mod messages;
 mod notifications;
 mod projection;
+mod publisher_sequences;
 mod relay_plane;
 mod relay_telemetry_export;
 mod runtime;

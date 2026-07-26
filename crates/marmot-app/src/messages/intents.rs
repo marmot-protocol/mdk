@@ -353,12 +353,9 @@ pub(crate) fn build_inner_event(
                     "agent text stream id must be 32 bytes".into(),
                 ));
             }
-            let brokers: Vec<&String> = quic_candidates
-                .iter()
-                .filter(|candidate| !candidate.trim().is_empty())
-                .collect();
-            if brokers.is_empty() {
-                return Err(AppError::AgentStreamMissingCandidate);
+            for candidate in quic_candidates {
+                transport_quic_stream::QuicCandidate::parse(candidate)
+                    .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.clone()))?;
             }
             let mut tags = vec![
                 vec![STREAM_TAG.to_owned(), stream_id_hex],
@@ -376,8 +373,8 @@ pub(crate) fn build_inner_event(
                 ]);
             }
             tags.extend(
-                brokers
-                    .into_iter()
+                quic_candidates
+                    .iter()
                     .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
             );
             Ok(event(

@@ -83,6 +83,82 @@ fn expected_stream_transcript_hash_for_records(
 }
 
 #[tokio::test]
+async fn compose_candidates_fail_over_in_advertised_order() {
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let stream_id = vec![0xa1; 32];
+    let start = MessageId::new(vec![0xa2; 32]);
+    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start.clone(),
+        crypto: None,
+    }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let first = test_stream_compose_open(stream_id.clone(), start.clone());
+    let second = OpenBrokerTextPublisher {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id: start,
+        crypto: None,
+        max_plaintext_frame_len: None,
+    };
+    let (tx, rx) = mpsc::channel(4);
+    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+    let session = tokio::spawn(run_stream_compose_session_candidates(
+        first.clone(),
+        vec![first, second],
+        16,
+        rx,
+        cancel_rx,
+        test_stream_compose_report(&stream_id),
+    ));
+    // The first candidate is deliberately unreachable and gets its bounded
+    // five-second attempt before the live second candidate is selected.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (append_tx, append_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: "fallback".to_owned(),
+        respond: append_tx,
+    })
+    .await
+    .unwrap();
+    append_rx.await.unwrap().unwrap();
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    finish_rx.await.unwrap().unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(12), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.text, "fallback");
+    session.await.unwrap();
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn compose_session_finalizes_local_transcript_when_broker_connect_is_pending() {
     let stream_id = vec![0xaa; 32];
     let start_event_id = MessageId::new(vec![0xbb; 32]);

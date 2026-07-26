@@ -1251,8 +1251,8 @@ mod tests {
     };
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
     use super::commands::stream::{
-        first_quic_candidate_is_loopback, parse_quic_candidate, quic_candidate_host,
-        resolve_quic_candidate_addr,
+        broker_trust_for_candidate, first_quic_candidate_is_loopback, parse_quic_candidate,
+        quic_candidate_host, resolve_quic_candidate_addr,
     };
     use super::{
         Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
@@ -1874,6 +1874,17 @@ mod tests {
             .await
             .expect("loopback resolves with opt-in");
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn candidate_trust_rejects_conflicting_insecure_and_certificate_flags() {
+        let result = broker_trust_for_candidate(
+            "broker.example",
+            "203.0.113.10:4450".parse().unwrap(),
+            Some(hex::encode([1_u8; 8])),
+            true,
+        );
+        assert!(matches!(result, Err(WnError::ConflictingStreamTrust)));
     }
 
     #[tokio::test]

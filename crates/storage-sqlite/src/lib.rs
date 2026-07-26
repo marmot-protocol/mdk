@@ -6,6 +6,7 @@
 //! layers.
 
 mod account_projection;
+mod agent_stream_sequences;
 mod chat_list;
 mod codec;
 mod connection;
@@ -51,6 +52,10 @@ pub use timeline::{
     TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 
+pub use agent_stream_sequences::{
+    AgentStreamPublisherReservation, AgentStreamPublisherReservationRequest,
+    AgentStreamPublisherState, MAX_AGENT_STREAM_PUBLISHER_CONTEXTS,
+};
 pub(crate) use codec::{
     SqliteResultExt, bool_i64, created_at_to_i64, deserialize, epoch_to_i64, i64_to_u64,
     message_state_to_i64, optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms,

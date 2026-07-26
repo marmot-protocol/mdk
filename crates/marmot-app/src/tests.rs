@@ -3192,17 +3192,37 @@ fn stream_start_intent_without_parent_omits_parent_tag() {
 }
 
 #[test]
-fn stream_start_intent_requires_a_broker() {
-    let result = build_inner_event(
-        &AppMessageIntent::StreamStart {
-            stream_id: vec![0xab; 32],
-            parent_message_id: None,
-            quic_candidates: vec!["   ".to_owned()],
-        },
-        SENDER_HEX,
-        1,
-    );
-    assert!(matches!(result, Err(AppError::AgentStreamMissingCandidate)));
+fn stream_start_intent_accepts_zero_brokers_for_durable_fallback() {
+    let event = build(AppMessageIntent::StreamStart {
+        stream_id: vec![0xab; 32],
+        parent_message_id: None,
+        quic_candidates: Vec::new(),
+    });
+    let start = StreamStartView::from_event(event.kind, &event.tags).unwrap();
+    assert!(start.quic_candidates.is_empty());
+}
+
+#[test]
+fn stream_start_intent_rejects_each_malformed_broker_value() {
+    for candidate in [
+        "   ",
+        "https://broker.example:4450",
+        "quic://broker.example",
+    ] {
+        let result = build_inner_event(
+            &AppMessageIntent::StreamStart {
+                stream_id: vec![0xab; 32],
+                parent_message_id: None,
+                quic_candidates: vec![candidate.to_owned()],
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::AgentStreamInvalidCandidate(_))
+        ));
+    }
 }
 
 #[test]
