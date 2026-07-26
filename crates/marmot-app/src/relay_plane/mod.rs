@@ -147,6 +147,14 @@ impl MarmotRelayPlane {
         subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,
     ) -> Self {
+        Self::new_with_loopback(subscription_rebuild_lookback, relay_client, false)
+    }
+
+    pub(crate) fn new_with_loopback(
+        subscription_rebuild_lookback: Option<Duration>,
+        relay_client: Arc<dyn NostrRelayClient>,
+        allow_loopback: bool,
+    ) -> Self {
         let adapter = NostrTransportAdapter::new(relay_client);
         Self::from_adapter(
             subscription_rebuild_lookback,
@@ -154,7 +162,7 @@ impl MarmotRelayPlane {
             None,
             None,
             Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
-            false,
+            allow_loopback,
         )
     }
 

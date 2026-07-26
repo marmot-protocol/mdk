@@ -13,7 +13,9 @@ use cgka_traits::app_event::{
 };
 use marmot_account::AccountHomeError;
 use storage_sqlite::StoredRelayTelemetrySettings;
-use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
+use transport_nostr_adapter::{
+    NostrEventPublishRequest, NostrPublishOutcome, NostrRelayClient, NostrSubscription,
+};
 use transport_nostr_peeler::NostrTransportEvent;
 use transport_quic_broker::BrokerServerTrust;
 
@@ -34,6 +36,8 @@ use crate::messages::{AppMessageIntent, build_inner_event};
 struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     block_next_publish: std::sync::atomic::AtomicBool,
+    zero_ack_next_publish: std::sync::atomic::AtomicBool,
+    batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
 }
@@ -45,6 +49,11 @@ impl ScriptedPushRelayClient {
 
     fn block_next_publish(&self) {
         self.block_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn zero_ack_next_publish(&self) {
+        self.zero_ack_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -94,6 +103,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             self.publish_release.notified().await;
         }
         if self
+            .zero_ack_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(NostrPublishOutcome::default());
+        }
+        if self
             .publish_results
             .lock()
             .unwrap()
@@ -106,6 +121,22 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 "injected publish failure".to_owned(),
             ))
         }
+    }
+
+    async fn publish_events(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, cgka_traits::TransportAdapterError>> {
+        self.batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                self.publish_event(&request.endpoints, &request.event, request.required_acks)
+                    .await,
+            );
+        }
+        outcomes
     }
 }
 
@@ -696,6 +727,180 @@ async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_re
     );
     reopened.clear_key_package_cutover_replacement_pending(label);
     assert!(!reopened.key_package_cutover_replacement_pending(label));
+}
+
+#[tokio::test]
+async fn key_package_deletion_batch_preserves_partial_results_and_cache_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("delete-batch")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.script([true, false]);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let first_event_id = "11".repeat(32);
+    let retained_event_id = "22".repeat(32);
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "current-slot".into(),
+            key_package_ref_hex: "33".repeat(32),
+            key_package_event_id: retained_event_id.clone(),
+            published_at: 1,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+
+    let results = app
+        .delete_key_package_events(
+            &account.label,
+            vec![
+                KeyPackageDeletionTarget {
+                    event_id_hex: first_event_id,
+                    source_relays: vec![
+                        TransportEndpoint("wss://relay.example".into()),
+                        TransportEndpoint("wss://relay.example".into()),
+                    ],
+                },
+                KeyPackageDeletionTarget {
+                    event_id_hex: retained_event_id,
+                    source_relays: vec![TransportEndpoint("wss://second.example".into())],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].result.is_ok());
+    assert!(results[1].result.is_err());
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "all deletion events must use one batch publisher"
+    );
+    assert!(
+        app.key_package_record_path(&account.label).exists(),
+        "one acknowledged event must not clear another event's retained cache"
+    );
+}
+
+#[tokio::test]
+async fn manual_key_package_deletion_uses_batch_and_requires_ack_before_cache_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("manual-delete")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let event_id = "44".repeat(32);
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "current-slot".into(),
+            key_package_ref_hex: "55".repeat(32),
+            key_package_event_id: event_id.clone(),
+            published_at: 1,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+
+    relay.zero_ack_next_publish();
+    let error = app
+        .delete_key_package_event(
+            &account.label,
+            &event_id,
+            vec![TransportEndpoint("wss://relay.example".into())],
+        )
+        .await
+        .expect_err("zero acknowledgements must not confirm deletion");
+    assert!(matches!(error, AppError::Publish(_)));
+    assert!(app.key_package_record_path(&account.label).exists());
+
+    app.delete_key_package_event(
+        &account.label,
+        &event_id,
+        vec![TransportEndpoint("wss://relay.example".into())],
+    )
+    .await
+    .unwrap();
+    assert!(!app.key_package_record_path(&account.label).exists());
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "manual deletion must route through the one-item batch"
+    );
+}
+
+#[tokio::test]
+async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("safe-delete")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        vec!["wss://relay.example".into()],
+        AccountHome::open(directory.path()),
+    )
+    .with_test_relay_client(relay.clone());
+
+    let result = app
+        .delete_key_package_events(
+            &account.label,
+            vec![KeyPackageDeletionTarget {
+                event_id_hex: "66".repeat(32),
+                source_relays: vec![TransportEndpoint("ws://127.0.0.1:7777".into())],
+            }],
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(result.result.is_err());
+    assert_eq!(
+        relay.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unsafe endpoint must be rejected before publisher invocation"
+    );
+
+    let dev_directory = tempfile::tempdir().unwrap();
+    let dev_account = AccountHome::open(dev_directory.path())
+        .create_account("dev-delete")
+        .unwrap();
+    let dev_relay = Arc::new(ScriptedPushRelayClient::default());
+    let dev_app = MarmotApp::with_relays_and_config(
+        dev_directory.path(),
+        vec!["ws://127.0.0.1:7777".into()],
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_test_relay_client(dev_relay.clone());
+    let result = dev_app
+        .delete_key_package_events(
+            &dev_account.label,
+            vec![KeyPackageDeletionTarget {
+                event_id_hex: "77".repeat(32),
+                source_relays: vec![TransportEndpoint("ws://127.0.0.1:7777".into())],
+            }],
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(result.result.is_ok());
+    assert_eq!(
+        dev_relay
+            .batch_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }
 
 #[tokio::test]
