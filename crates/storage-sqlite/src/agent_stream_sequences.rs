@@ -191,22 +191,24 @@ impl SqliteAccountStorage {
         context_id: &[u8; 32],
         token: &[u8; 16],
     ) -> StorageResult<()> {
-        let changed = self
-            .connection
-            .lock()?
-            .execute(
-                "UPDATE agent_stream_publisher_sequences
+        retry_on_busy(|| {
+            let changed = self
+                .connection
+                .lock()?
+                .execute(
+                    "UPDATE agent_stream_publisher_sequences
              SET reservation_token = NULL, updated_at_ms = ?3
              WHERE context_id = ?1 AND reservation_token = ?2 AND disabled = 0",
-                params![context_id.as_slice(), token.as_slice(), unix_now_ms()],
-            )
-            .storage()?;
-        if changed != 1 {
-            return Err(StorageError::Backend(
-                "agent stream publisher reservation is not current".to_owned(),
-            ));
-        }
-        Ok(())
+                    params![context_id.as_slice(), token.as_slice(), unix_now_ms()],
+                )
+                .storage()?;
+            if changed != 1 {
+                return Err(StorageError::Backend(
+                    "agent stream publisher reservation is not current".to_owned(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     pub fn agent_stream_publisher_state(

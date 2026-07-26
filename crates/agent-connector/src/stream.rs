@@ -241,6 +241,7 @@ impl AgentConnector {
             chunk_count: 0,
             error: None,
         };
+        let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
         let open = OpenBrokerTextPublisher {
             broker_addr: live_candidates
                 .first()
@@ -255,7 +256,7 @@ impl AgentConnector {
                 .map(|(_, _, _, trust)| trust.clone())
                 .unwrap_or(BrokerServerTrust::InsecureLocal),
             stream_id: stream_id.clone(),
-            start_event_id: MessageId::new(hex::decode(&start_message_id_hex)?),
+            start_event_id: start_event_id.clone(),
             crypto: Some(crypto.crypto.clone()),
             max_plaintext_frame_len: policy_max_plaintext_frame_len,
         };
@@ -267,10 +268,7 @@ impl AgentConnector {
                     server_name,
                     trust,
                     stream_id: stream_id.clone(),
-                    start_event_id: MessageId::new(
-                        hex::decode(&start_message_id_hex)
-                            .expect("validated start message id remains valid"),
-                    ),
+                    start_event_id: start_event_id.clone(),
                     crypto: Some(crypto.crypto.clone()),
                     max_plaintext_frame_len: policy_max_plaintext_frame_len,
                 },

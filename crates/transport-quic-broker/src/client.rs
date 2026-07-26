@@ -88,6 +88,7 @@ pub struct BrokerTextPublisher {
 pub struct BrokerTextReceiverState {
     high_water: u64,
     frames_read: u64,
+    limits: AgentTextStreamReceiveLimits,
     chunks: Vec<ReceivedTextChunk>,
     text: String,
     transcript: AgentTextStreamTranscriptV1,
@@ -103,6 +104,7 @@ impl BrokerTextReceiverState {
         Self {
             high_water: 0,
             frames_read: 0,
+            limits,
             chunks: Vec::new(),
             text: String::new(),
             transcript: AgentTextStreamTranscriptV1::new(stream_id, start_event_id),
@@ -114,17 +116,13 @@ impl BrokerTextReceiverState {
         self.high_water
     }
 
-    fn begin_record(
-        &mut self,
-        seq: u64,
-        limits: AgentTextStreamReceiveLimits,
-    ) -> Result<bool, QuicBrokerError> {
+    fn begin_record(&mut self, seq: u64) -> Result<bool, QuicBrokerError> {
         self.frames_read = self.frames_read.saturating_add(1);
-        if self.frames_read > limits.max_records {
+        if self.frames_read > self.limits.max_records {
             return Err(QuicBrokerError::ReceiveLimit(
                 AgentTextStreamReceiveLimitError::RecordLimitExceeded {
                     attempted: self.frames_read,
-                    limit: limits.max_records,
+                    limit: self.limits.max_records,
                 },
             ));
         }
@@ -312,17 +310,19 @@ impl BrokerTextPublisher {
                 )
             })
             .transpose()?;
-        let record = reservation
-            .as_ref()
-            .map(|reservation| reservation.records[0].clone())
-            .unwrap_or_else(|| {
-                AgentTextStreamRecordV1::new(
-                    self.transcript.stream_id().to_vec(),
-                    self.next_seq,
-                    AGENT_TEXT_STREAM_RECORD_ABORT,
-                    Vec::new(),
+        let record = match &reservation {
+            Some(reservation) => reservation.records.first().cloned().ok_or_else(|| {
+                transport_quic_stream::QuicTextStreamError::PublisherSequence(
+                    "publisher reservation returned no records".to_owned(),
                 )
-            });
+            })?,
+            None => AgentTextStreamRecordV1::new(
+                self.transcript.stream_id().to_vec(),
+                self.next_seq,
+                AGENT_TEXT_STREAM_RECORD_ABORT,
+                Vec::new(),
+            ),
+        };
         record.validate()?;
         if reservation.is_none() {
             self.next_seq += 1;
@@ -421,12 +421,11 @@ where
         config.start_event_id.clone(),
         limits,
     );
-    subscribe_text_from_broker_with_resume(config, limits, &mut state, on_chunk).await
+    subscribe_text_from_broker_with_resume(config, &mut state, on_chunk).await
 }
 
 pub async fn subscribe_text_from_broker_with_resume<F>(
     config: SubscribeTextFromBroker,
-    limits: AgentTextStreamReceiveLimits,
     state: &mut BrokerTextReceiverState,
     mut on_chunk: F,
 ) -> Result<ReceivedTextStream, QuicBrokerError>
@@ -453,7 +452,7 @@ where
     // records at or below it (duplicates, broker backlog replayed on
     // reconnect) are discarded silently and are never stream-fatal; the next
     // accepted record is high_water + 1; a record further ahead is a gap.
-    let max_frame_len = frame_len_cap(Some(limits.max_plaintext_frame_len));
+    let max_frame_len = frame_len_cap(Some(state.limits.max_plaintext_frame_len));
     // The broker is untrusted and can replay `seq <= high_water` frames
     // forever. Those discards never reach `limit_state.observe`, so count every
     // frame read off the wire here and trip `max_records` before the dedup
@@ -462,7 +461,7 @@ where
     while let Some(record) =
         read_record_frame(&mut recv, Some(RECORD_QUIET_GAP_DEADLINE), max_frame_len).await?
     {
-        if !state.begin_record(record.seq, limits)? {
+        if !state.begin_record(record.seq)? {
             continue;
         }
         let record = if let Some(crypto) = &config.crypto {
@@ -500,16 +499,16 @@ mod lifecycle_tests {
         let mut state = BrokerTextReceiverState::new(stream_id.clone(), start.clone(), limits);
 
         let first = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"one".to_vec());
-        assert!(state.begin_record(first.seq, limits).unwrap());
+        assert!(state.begin_record(first.seq).unwrap());
         state.accept_record(first, &stream_id).unwrap();
 
         let replay = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"one".to_vec());
         assert!(
-            !state.begin_record(replay.seq, limits).unwrap(),
+            !state.begin_record(replay.seq).unwrap(),
             "a reconnect replay at the high-water mark is harmless"
         );
         let second = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 2, b"two".to_vec());
-        assert!(state.begin_record(second.seq, limits).unwrap());
+        assert!(state.begin_record(second.seq).unwrap());
         state.accept_record(second, &stream_id).unwrap();
 
         let mut expected = AgentTextStreamTranscriptV1::new(stream_id, start);

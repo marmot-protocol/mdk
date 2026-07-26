@@ -260,7 +260,10 @@ async fn wait_for_preview_invalidation(
                 }
                 _ => {}
             },
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                return "agent stream preview event stream lagged; preview withdrawn".to_owned();
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 return "agent stream preview event source closed".to_owned();
             }
@@ -410,58 +413,51 @@ async fn watch_broker_candidates(
                     crypto: watch.crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
-                match subscribe_text_from_broker_with_resume(
-                    config,
-                    limits,
-                    &mut receiver_state,
-                    |chunk| {
-                        let update = match chunk.record_type {
-                            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => {
-                                RuntimeAgentStreamUpdate::Chunk {
-                                    seq: chunk.seq,
-                                    text: chunk.text.clone(),
-                                }
-                            }
-                            AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
+                match subscribe_text_from_broker_with_resume(config, &mut receiver_state, |chunk| {
+                    let update = match chunk.record_type {
+                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
+                            seq: chunk.seq,
+                            text: chunk.text.clone(),
+                        },
+                        AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
+                            seq: chunk.seq,
+                            status: chunk.text.clone(),
+                        },
+                        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+                            RuntimeAgentStreamUpdate::Progress {
                                 seq: chunk.seq,
-                                status: chunk.text.clone(),
-                            },
-                            AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
-                                RuntimeAgentStreamUpdate::Progress {
-                                    seq: chunk.seq,
-                                    text: chunk.text.clone(),
-                                }
-                            }
-                            record_type => RuntimeAgentStreamUpdate::Record {
-                                seq: chunk.seq,
-                                record_type,
                                 text: chunk.text.clone(),
-                            },
-                        };
-                        match chunk_tx.try_send(update) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_))
-                                if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
-                            {
-                                tracing::warn!(
-                                    target: "marmot_app::agent_stream",
-                                    method = "watch_agent_text_stream",
-                                    "dropping live agent text stream delta; consumer is behind",
-                                );
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!(
-                                    target: "marmot_app::agent_stream",
-                                    method = "watch_agent_text_stream",
-                                    record_type = chunk.record_type,
-                                    dropped_record_class = "non_text",
-                                    "dropping non-text agent stream record; consumer is behind",
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
                         }
-                    },
-                )
+                        record_type => RuntimeAgentStreamUpdate::Record {
+                            seq: chunk.seq,
+                            record_type,
+                            text: chunk.text.clone(),
+                        },
+                    };
+                    match chunk_tx.try_send(update) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_))
+                            if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
+                        {
+                            tracing::warn!(
+                                target: "marmot_app::agent_stream",
+                                method = "watch_agent_text_stream",
+                                "dropping live agent text stream delta; consumer is behind",
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                target: "marmot_app::agent_stream",
+                                method = "watch_agent_text_stream",
+                                record_type = chunk.record_type,
+                                dropped_record_class = "non_text",
+                                "dropping non-text agent stream record; consumer is behind",
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                })
                 .await
                 {
                     Ok(received) => {
@@ -593,6 +589,26 @@ mod tests {
         assert_eq!(
             wait_for_preview_invalidation(&mut receiver, &group, &hex::encode([3; 32])).await,
             "agent stream preview start was invalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_runtime_events_withdraw_the_preview_fail_closed() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(1);
+        let group = GroupId::new(vec![1; 16]);
+        for _ in 0..2 {
+            events
+                .send(runtime_group_event(GroupEvent::EpochChanged {
+                    group_id: GroupId::new(vec![2; 16]),
+                    from: EpochId(1),
+                    to: EpochId(2),
+                }))
+                .unwrap();
+        }
+
+        assert_eq!(
+            wait_for_preview_invalidation(&mut receiver, &group, &hex::encode([3; 32])).await,
+            "agent stream preview event stream lagged; preview withdrawn"
         );
     }
 }

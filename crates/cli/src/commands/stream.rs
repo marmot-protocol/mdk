@@ -585,7 +585,6 @@ where
                 start_event_id: start_event_id.clone(),
                 crypto: crypto.clone(),
             },
-            limits,
             &mut receiver_state,
             |chunk| {
                 on_delta(AgentStreamDelta {
@@ -833,6 +832,9 @@ pub(crate) fn broker_trust_for_candidate(
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
 ) -> Result<BrokerServerTrust, WnError> {
+    if insecure_local && server_cert_der_hex.is_some() {
+        return Err(WnError::ConflictingStreamTrust);
+    }
     if insecure_local && !quic_host_is_loopback(candidate_host) {
         return broker_trust(server_addr, server_cert_der_hex, false);
     }
