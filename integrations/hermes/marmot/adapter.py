@@ -3027,6 +3027,7 @@ def register(ctx):
         label="Marmot",
         adapter_factory=lambda cfg: MarmotPlatformAdapter(cfg),
         check_fn=check_requirements,
+        is_connected=validate_config,
         validate_config=validate_config,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="MARMOT_HOME_CHANNEL",

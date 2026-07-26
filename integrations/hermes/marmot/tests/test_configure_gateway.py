@@ -3,6 +3,7 @@ import os
 import socket
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -30,11 +31,43 @@ def load_adapter_module():
     return helper.load_adapter_module()
 
 
+class PlatformConfigHarness:
+    def __init__(self, *, enabled=False, extra=None):
+        self.enabled = enabled
+        self.extra = extra or {}
+
+
 class PlatformRegistryHarness:
-    """Minimal copy of Hermes' check, validate, then create registry flow."""
+    """Minimal copy of Hermes platform enablement and adapter creation."""
+
+    def __init__(self):
+        self.entry = {}
 
     def register_platform(self, **entry):
         self.entry = entry
+
+    def apply_env_overrides(self, platform_config=None):
+        """Mirror the relevant gateway.config._apply_env_overrides plugin gate."""
+        existing = platform_config
+        env_fn = self.entry.get("env_enablement_fn")
+        seed = env_fn() if env_fn else None
+        is_connected = self.entry.get("is_connected")
+        if (existing is None or not existing.enabled) and is_connected is not None:
+            probe_extra = dict(getattr(existing, "extra", {}) or {})
+            if isinstance(seed, dict):
+                probe_extra.update({key: value for key, value in seed.items() if key != "home_channel"})
+            probe = PlatformConfigHarness(enabled=True, extra=probe_extra)
+            if not is_connected(probe):
+                return existing
+
+        if not self.entry["check_fn"]():
+            return existing
+        if existing is None:
+            existing = PlatformConfigHarness()
+        existing.enabled = True
+        if isinstance(seed, dict):
+            existing.extra.update({key: value for key, value in seed.items() if key != "home_channel"})
+        return existing
 
     def create_adapter(self, config):
         if not self.entry["check_fn"]():
@@ -43,6 +76,18 @@ class PlatformRegistryHarness:
         if validate is not None and not validate(config):
             return None
         return self.entry["adapter_factory"](config)
+
+
+def clear_marmot_env():
+    saved = {key: os.environ.pop(key) for key in list(os.environ) if key.startswith("MARMOT_")}
+    return saved
+
+
+def restore_marmot_env(saved):
+    for key in list(os.environ):
+        if key.startswith("MARMOT_"):
+            os.environ.pop(key)
+    os.environ.update(saved)
 
 
 class ConfigureGatewayTests(unittest.TestCase):
@@ -184,7 +229,7 @@ class ConfigureGatewayTests(unittest.TestCase):
 
     def test_persisted_config_creates_adapter_without_marmot_env(self):
         adapter_module = load_adapter_module()
-        saved_env = {key: os.environ.pop(key) for key in list(os.environ) if key.startswith("MARMOT_")}
+        saved_env = clear_marmot_env()
         try:
             with tempfile.TemporaryDirectory() as tempdir:
                 home = Path(tempdir)
@@ -213,22 +258,58 @@ class ConfigureGatewayTests(unittest.TestCase):
                     )
                     config = self.module.load_config(home / "config.yaml")
                     extra = config["platforms"]["marmot"]["extra"]
-                    platform_config = type(
-                        "PlatformConfig",
-                        (),
-                        {"enabled": True, "extra": extra},
-                    )()
+                    platform_config = PlatformConfigHarness(enabled=True, extra=extra)
                     registry = PlatformRegistryHarness()
                     adapter_module.register(registry)
 
-                    adapter = registry.create_adapter(platform_config)
+                    enabled_config = registry.apply_env_overrides(platform_config)
+                    self.assertIs(enabled_config, platform_config)
+                    adapter = registry.create_adapter(enabled_config)
 
                     self.assertTrue(config["platforms"]["marmot"]["enabled"])
                     self.assertIsInstance(adapter, adapter_module.MarmotPlatformAdapter)
                     assert adapter is not None
                     self.assertEqual(adapter.socket_path, str(socket_path))
         finally:
-            os.environ.update(saved_env)
+            restore_marmot_env(saved_env)
+
+
+class MarmotPlatformEnablementTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+        self.registry = PlatformRegistryHarness()
+        self.adapter_module.register(self.registry)
+
+    def test_register_wires_is_connected_for_env_override_gate(self):
+        self.assertIs(self.registry.entry.get("is_connected"), self.adapter_module.validate_config)
+
+    def test_unconfigured_platform_stays_disabled_without_marmot_env(self):
+        saved_env = clear_marmot_env()
+        try:
+            with unittest.mock.patch.object(Path, "exists", return_value=False):
+                self.assertIsNone(self.registry.apply_env_overrides())
+        finally:
+            restore_marmot_env(saved_env)
+
+    def test_environment_only_config_enables_and_creates_adapter(self):
+        saved_env = clear_marmot_env()
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                socket_path = Path(tempdir) / "wn-agent.sock"
+                os.environ["MARMOT_AGENT_SOCKET"] = str(socket_path)
+
+                platform_config = self.registry.apply_env_overrides()
+                self.assertIsNotNone(platform_config)
+                assert platform_config is not None
+                self.assertTrue(platform_config.enabled)
+                self.assertEqual(platform_config.extra["socket_path"], str(socket_path))
+                adapter = self.registry.create_adapter(platform_config)
+
+                self.assertIsInstance(adapter, self.adapter_module.MarmotPlatformAdapter)
+                assert adapter is not None
+                self.assertEqual(adapter.socket_path, str(socket_path))
+        finally:
+            restore_marmot_env(saved_env)
 
 
 if __name__ == "__main__":
