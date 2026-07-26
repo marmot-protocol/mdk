@@ -130,6 +130,7 @@ def load_adapter_module():
         "gateway.platforms",
         "gateway.platforms.base",
         "gateway.config",
+        "gateway.stream_events",
     ]:
         sys.modules.pop(name, None)
     install_fake_hermes_modules()
@@ -2101,6 +2102,504 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             fake_client.final_sends,
             [("11" * 32, "22" * 32, "Based on my search", None)],
         )
+
+
+class _DeliveryRoutingFakeClient:
+    def __init__(self):
+        self.activities = []
+        self.tool_events = []
+        self.final_sends = []
+        self.stream_begins = []
+        self.stream_appends = []
+        self.stream_finalizes = []
+        self.stream_cancels = []
+        self.activity_attempts = 0
+        self.fail_next_activity = False
+        self.activity_response = {
+            "type": "app_event_sent",
+            "message_ids_hex": ["aa" * 32],
+        }
+
+    async def send_agent_activity(self, account_id_hex, group_id_hex, **kwargs):
+        self.activity_attempts += 1
+        if self.fail_next_activity:
+            self.fail_next_activity = False
+            raise OSError("temporary activity failure")
+        self.activities.append((account_id_hex, group_id_hex, kwargs))
+        return self.activity_response
+
+    async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
+        self.tool_events.append((account_id_hex, group_id_hex, kwargs))
+        return {"type": "app_event_sent", "message_ids_hex": ["bb" * 32]}
+
+    async def send_final(
+        self,
+        account_id_hex,
+        group_id_hex,
+        text,
+        reply_to_message_id_hex=None,
+        idempotency_key=None,
+    ):
+        self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+        return {"type": "final_sent", "message_ids_hex": ["cc" * 32]}
+
+    async def stream_begin(
+        self,
+        account_id_hex,
+        group_id_hex,
+        *,
+        stream_id_hex=None,
+        quic_candidates=(),
+        request_id=None,
+        parent_message_id_hex=None,
+    ):
+        self.stream_begins.append((account_id_hex, group_id_hex, parent_message_id_hex))
+        return {
+            "type": "stream_begun",
+            "stream_id_hex": "55" * 32,
+            "stream_capability": "33" * 32,
+            "start_message_id_hex": "66" * 32,
+            "quic_candidates": list(quic_candidates),
+        }
+
+    async def stream_append(self, stream_id_hex, stream_capability, append_text):
+        self.stream_appends.append((stream_id_hex, append_text))
+        return {"type": "ack"}
+
+    async def stream_finalize(
+        self,
+        stream_id_hex,
+        stream_capability,
+        final_text,
+        transcript_hash_hex,
+        chunk_count,
+        idempotency_key=None,
+    ):
+        self.stream_finalizes.append((stream_id_hex, final_text))
+        return {
+            "type": "stream_finalized",
+            "stream_id_hex": stream_id_hex,
+            "message_ids_hex": ["77" * 32],
+        }
+
+    async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
+        self.stream_cancels.append((stream_id_hex, reason))
+        return {"type": "ack"}
+
+
+class DeliveryMetadataRoutingTests(unittest.IsolatedAsyncioTestCase):
+    NON_FINAL_COMMENTARY = {"is_turn_final": False, "delivery_class": "commentary"}
+
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def _adapter(self, fake_client, *, quic_candidates=None):
+        extra = {"account_id_hex": "11" * 32}
+        if quic_candidates is not None:
+            extra["quic_candidates"] = quic_candidates
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=extra),
+            client=fake_client,
+        )
+
+    async def test_direct_commentary_metadata_variants_map_to_activity(self):
+        cases = [
+            ("is_turn_final canonical", {"is_turn_final": False}),
+            ("turn_final alias", {"turn_final": False}),
+            ("delivery_context container", {"delivery_context": {"is_turn_final": False}}),
+            ("delivery container", {"delivery": {"delivery_class": "commentary"}}),
+        ]
+        for label, metadata in cases:
+            with self.subTest(label=label):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self._adapter(fake_client)
+                result = await adapter.send(
+                    chat_id="22" * 32,
+                    content="I'll check that now.",
+                    reply_to="33" * 32,
+                    metadata=metadata,
+                )
+                self.assertTrue(result.success, label)
+                self.assertEqual(result.message_id, "aa" * 32, label)
+                self.assertEqual(len(fake_client.activities), 1, label)
+                self.assertEqual(fake_client.final_sends, [], label)
+                self.assertEqual(fake_client.activities[0][2]["status"], "commentary", label)
+                self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32, label)
+
+    async def test_explicit_non_final_overrides_every_delivery_class(self):
+        delivery_classes = ("final", "approval", "commentary", "operation", "notice", "mystery")
+        for finality_key in ("is_turn_final", "turn_final"):
+            for delivery_class in delivery_classes:
+                with self.subTest(finality_key=finality_key, delivery_class=delivery_class):
+                    fake_client = _DeliveryRoutingFakeClient()
+                    adapter = self._adapter(fake_client)
+                    result = await adapter.send(
+                        chat_id="22" * 32,
+                        content="Still working.",
+                        metadata={"delivery_class": delivery_class, finality_key: False},
+                    )
+                    self.assertTrue(result.success)
+                    self.assertEqual(len(fake_client.activities), 1)
+                    self.assertEqual(fake_client.final_sends, [])
+                    self.assertEqual(fake_client.activities[0][2]["status"], "commentary")
+
+    async def test_explicit_turn_final_overrides_every_delivery_class(self):
+        delivery_classes = ("final", "approval", "commentary", "operation", "notice", "mystery")
+        for finality_key in ("is_turn_final", "turn_final"):
+            for delivery_class in delivery_classes:
+                with self.subTest(finality_key=finality_key, delivery_class=delivery_class):
+                    fake_client = _DeliveryRoutingFakeClient()
+                    adapter = self._adapter(fake_client)
+                    result = await adapter.send(
+                        chat_id="22" * 32,
+                        content="Authoritative answer.",
+                        metadata={"delivery_class": delivery_class, finality_key: True},
+                    )
+                    self.assertTrue(result.success)
+                    self.assertEqual(fake_client.activities, [])
+                    self.assertEqual(len(fake_client.final_sends), 1)
+
+    async def test_delivery_class_applies_only_when_finality_is_missing(self):
+        cases = (
+            ("commentary", True),
+            ("final", False),
+            ("approval", False),
+            ("operation", False),
+            ("notice", False),
+            ("mystery", False),
+        )
+        for delivery_class, expect_activity in cases:
+            with self.subTest(delivery_class=delivery_class):
+                fake_client = _DeliveryRoutingFakeClient()
+                adapter = self._adapter(fake_client)
+                result = await adapter.send(
+                    chat_id="22" * 32,
+                    content="Classified by delivery class.",
+                    metadata={"delivery_class": delivery_class},
+                )
+                self.assertTrue(result.success)
+                self.assertEqual(len(fake_client.activities), int(expect_activity))
+                self.assertEqual(len(fake_client.final_sends), int(not expect_activity))
+
+    async def test_commentary_rejects_activity_response_without_message_ids(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        fake_client.activity_response = {"type": "ack"}
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content="I'll check that.",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_commentary_before_tool_sends_one_activity_zero_finals(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        commentary = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search for that.",
+            reply_to="33" * 32,
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        tool = await adapter.send(
+            chat_id="22" * 32,
+            content='* search: "titanium prices"',
+            reply_to="33" * 32,
+        )
+
+        self.assertTrue(commentary.success)
+        self.assertTrue(tool.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(len(fake_client.tool_events), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search for that.")
+
+    async def test_final_answer_after_commentary_sends_exactly_one_kind_9(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        commentary = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me look that up.",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        final = await adapter.send(
+            chat_id="22" * 32,
+            content="Here is the answer.",
+            metadata={"is_turn_final": True, "delivery_class": "final"},
+        )
+
+        self.assertTrue(commentary.success)
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], "Here is the answer.")
+
+    async def test_missing_metadata_preserves_final_behavior(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        result = await adapter.send(chat_id="22" * 32, content="pong", reply_to="33" * 32)
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], "pong")
+
+    async def test_same_text_across_two_turns_emits_two_activities(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        first = await adapter.send(
+            chat_id="22" * 32,
+            content="Checking...",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+        second = await adapter.send(
+            chat_id="22" * 32,
+            content="Checking...",
+            metadata=self.NON_FINAL_COMMENTARY,
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(len(fake_client.activities), 2)
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_reply_parent_metadata_survives_direct_activity_mapping(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client)
+
+        await adapter.send(
+            chat_id="22" * 32,
+            content="One moment.",
+            metadata={
+                **self.NON_FINAL_COMMENTARY,
+                "reply_to_message_id": "33" * 32,
+            },
+        )
+
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+
+    async def test_non_final_preview_stream_lifecycle_emits_one_activity(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+
+        preview = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search\u2589",
+            reply_to="33" * 32,
+            metadata=metadata,
+        )
+        self.assertTrue(preview.success)
+        self.assertEqual(len(fake_client.stream_begins), 1)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        edited = await adapter.edit_message(
+            "22" * 32,
+            preview.message_id,
+            "Let me search the docs\u2589",
+            metadata=metadata,
+        )
+        self.assertTrue(edited.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        result = await adapter.edit_message(
+            "22" * 32,
+            preview.message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "aa" * 32)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_non_final_draft_frames_then_sealed_send_emits_one_activity(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+
+        first = await adapter.send_draft(
+            "22" * 32,
+            1,
+            "Let me search",
+            metadata={
+                **metadata,
+                "parent_message_id_hex": "33" * 32,
+            },
+        )
+        second = await adapter.send_draft(
+            "22" * 32,
+            1,
+            "Let me search the docs",
+            metadata=metadata,
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(len(fake_client.stream_begins), 1)
+        self.assertEqual(len(fake_client.stream_appends), 2)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content="Let me search the docs",
+            metadata=metadata,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_commentary_finalize_retryable_failure_preserves_stream_for_same_message_id(
+        self,
+    ):
+        fake_client = _DeliveryRoutingFakeClient()
+        fake_client.fail_next_activity = True
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+        metadata = self.NON_FINAL_COMMENTARY
+        chat_id = "22" * 32
+
+        preview = await adapter.send(
+            chat_id=chat_id,
+            content="Let me search\u2589",
+            reply_to="33" * 32,
+            metadata=metadata,
+        )
+        self.assertTrue(preview.success)
+        message_id = preview.message_id
+        self.assertIn(message_id, adapter._active_streams)
+
+        first = await adapter.edit_message(
+            chat_id,
+            message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertFalse(first.success)
+        self.assertTrue(first.retryable)
+        self.assertEqual(fake_client.activity_attempts, 1)
+        self.assertEqual(len(fake_client.activities), 0)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.stream_cancels, [])
+        self.assertIn(message_id, adapter._active_streams)
+
+        second = await adapter.edit_message(
+            chat_id,
+            message_id,
+            "Let me search the docs",
+            finalize=True,
+            metadata=metadata,
+        )
+        self.assertTrue(second.success)
+        self.assertEqual(second.message_id, "aa" * 32)
+        self.assertEqual(fake_client.activity_attempts, 2)
+        self.assertEqual(len(fake_client.activities), 1)
+        self.assertEqual(fake_client.activities[0][2]["text"], "Let me search the docs")
+        self.assertEqual(fake_client.activities[0][2]["reply_to_message_id_hex"], "33" * 32)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "non-final commentary")])
+        self.assertNotIn(message_id, adapter._active_streams)
+
+    async def test_turn_final_true_streaming_path_still_finalizes_kind_9(self):
+        fake_client = _DeliveryRoutingFakeClient()
+        adapter = self._adapter(fake_client, quic_candidates=["quic://127.0.0.1:4433"])
+
+        preview = await adapter.send("22" * 32, "Based on my research\u2589")
+        final = await adapter.send(
+            "22" * 32,
+            "Based on my research, here's the answer",
+            metadata={"is_turn_final": True, "delivery_class": "final"},
+        )
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.activities, [])
+        self.assertEqual(len(fake_client.stream_finalizes), 1)
+        self.assertEqual(fake_client.final_sends, [])
+
+
+def _install_stream_events_module():
+    stream_events = types.ModuleType("gateway.stream_events")
+
+    @dataclass
+    class Commentary:
+        text: str = ""
+
+    @dataclass
+    class MessageChunk:
+        text: str = ""
+
+    @dataclass
+    class MessageStop:
+        final: bool = True
+
+    stream_events.Commentary = Commentary
+    stream_events.MessageChunk = MessageChunk
+    stream_events.MessageStop = MessageStop
+    sys.modules["gateway.stream_events"] = stream_events
+    return stream_events
+
+
+class CommentaryRendererTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def test_render_message_event_commentary_schedules_one_activity(self):
+        stream_events = _install_stream_events_module()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=_DeliveryRoutingFakeClient(),
+        )
+        scheduled = []
+
+        def track_schedule(chat_id, *, status, text, reply_to_message_id_hex=None):
+            scheduled.append(
+                {
+                    "chat_id": chat_id,
+                    "status": status,
+                    "text": text,
+                    "reply_to_message_id_hex": reply_to_message_id_hex,
+                }
+            )
+
+        adapter._schedule_agent_activity = track_schedule
+
+        class Sink:
+            chat_id = "22" * 32
+            _initial_reply_to_id = "33" * 32
+
+        adapter.render_message_event(
+            stream_events.Commentary(text="Checking sources."),
+            Sink(),
+        )
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0]["status"], "commentary")
+        self.assertEqual(scheduled[0]["text"], "Checking sources.")
+        self.assertEqual(scheduled[0]["reply_to_message_id_hex"], "33" * 32)
 
 
 class SendFinalIdempotencyRetryTests(unittest.IsolatedAsyncioTestCase):

@@ -345,12 +345,19 @@ directory with `--media-allowed-root`; without one, path sends fail closed.
   the Marmot group id and `user_id` set to the sender account id.
 - Hermes progressive edits open at most one live preview per chat at a time. A
   newer preview cancels the previous stream for that chat.
+- Explicit Hermes delivery context routes non-final commentary to durable agent
+  activity (`kind: 1201`, `status: commentary`). Preview and draft frames remain
+  transient; sealing the segment cancels its preview and emits one activity.
+- Final answers and approvals remain durable `kind: 9` messages. Missing delivery
+  context keeps this legacy final behavior for compatibility with older Hermes
+  versions.
 - Durable message text is exactly what Hermes hands the adapter. The adapter
   never merges, splices, or reconstructs text across sends; fragmented or
   duplicated finals must be fixed in Hermes message segmentation.
-- A plain send while a preview is open finalizes that stream as one tagged
-  stream-final `kind: 9` when the final text is an append-only extension of the
-  streamed text. There is no duplicate plain `send_final` for the same text.
+- A final or legacy plain send while a preview is open finalizes that stream as
+  one tagged stream-final `kind: 9` when the final text is an append-only
+  extension of the streamed text. There is no duplicate plain `send_final` for
+  the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
 - Status records are included in the stream transcript hash and chunk count.

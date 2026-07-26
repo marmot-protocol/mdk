@@ -1268,6 +1268,7 @@ class MarmotLiveStream:
         stream_id_hex: str,
         stream_capability: str,
         start_message_id_hex: str,
+        parent_message_id_hex: Optional[str],
         chunk_bytes: int,
     ):
         self.client = client
@@ -1276,6 +1277,10 @@ class MarmotLiveStream:
         self.stream_id_hex = stream_id_hex
         self.stream_capability = stream_capability
         self.start_message_id_hex = start_message_id_hex
+        self.parent_message_id_hex = _optional_hex(
+            parent_message_id_hex,
+            "parent_message_id_hex",
+        )
         self.text = AppendOnlyTextState()
         self.transcript = AgentTextStreamTranscript(
             stream_id_hex,
@@ -1332,6 +1337,7 @@ class MarmotLiveStream:
             stream_id_hex=response["stream_id_hex"],
             stream_capability=_normalize_stream_capability(response["stream_capability"]),
             start_message_id_hex=response["start_message_id_hex"],
+            parent_message_id_hex=parent_message_id_hex,
             chunk_bytes=effective_stream_chunk_bytes(
                 chunk_bytes,
                 response.get("policy_max_plaintext_frame_len"),
@@ -1545,7 +1551,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=_optional_hex(reply_to),
             )
 
-        if self._looks_like_stream_preview(content):
+        is_preview = self._looks_like_stream_preview(content)
+        if _delivery_routes_to_commentary_activity(metadata) and not is_preview:
+            return await self._send_commentary_activity(
+                chat_id,
+                visible_content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        if is_preview:
             if not self.quic_candidates:
                 return SendResult(success=False, error="Marmot live preview requires MARMOT_QUIC_CANDIDATES")
             try:
@@ -1609,6 +1624,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         self._capture_loop()
         if message_id.startswith(TOOL_PROGRESS_MESSAGE_PREFIX):
@@ -1629,6 +1645,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
         chat_id = _normalize_hex(chat_id, "chat_id")
         visible_content = self._strip_streaming_cursor(content)
+        if finalize and _delivery_routes_to_commentary_activity(metadata):
+            result = await self._send_commentary_activity(
+                chat_id,
+                visible_content,
+                reply_to=stream.parent_message_id_hex,
+                metadata=metadata,
+                preserve_stream=stream,
+            )
+            if result.success:
+                await self._cancel_stream(chat_id, message_id, stream, "non-final commentary")
+            return result
         try:
             await stream.append_replacement(visible_content)
             if not finalize:
@@ -2223,15 +2250,66 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         status: str,
         text: str,
         reply_to_message_id_hex: Optional[str] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         account_id = await self._ensure_account_id()
-        await self.client.send_agent_activity(
+        return await self.client.send_agent_activity(
             account_id,
             _normalize_hex(chat_id, "chat_id"),
             status=status,
             text=text,
             reply_to_message_id_hex=_optional_hex(reply_to_message_id_hex, "reply_to_message_id_hex"),
         )
+
+    async def _send_commentary_activity(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        preserve_stream: Optional[MarmotLiveStream] = None,
+    ) -> SendResult:
+        if not str(text or "").strip():
+            return SendResult(success=True)
+        reply_to_message_id_hex = _reply_to_from_send_context(metadata, reply_to)
+        stream = self._last_chat_stream.get(chat_id)
+        if reply_to_message_id_hex is None and stream is not None:
+            reply_to_message_id_hex = stream.parent_message_id_hex
+        await self._cancel_other_chat_streams(
+            chat_id,
+            reason="non-final commentary",
+            keep=preserve_stream,
+        )
+        try:
+            response = await self._send_agent_activity_event(
+                chat_id,
+                status="commentary",
+                text=text,
+                reply_to_message_id_hex=reply_to_message_id_hex,
+            )
+            message_ids = tuple(response.get("message_ids_hex") or ())
+            if response.get("type") != "app_event_sent" or not message_ids:
+                raise AgentControlError(
+                    "Marmot agent activity send returned no message ids",
+                    code="unexpected_activity_response",
+                    retryable=True,
+                )
+            message_id = message_ids[-1]
+            account_id = await self._ensure_account_id()
+            self._sent_targets.record_all(
+                message_ids,
+                account_id_hex=account_id,
+                group_id_hex=chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response=response,
+                continuation_message_ids=message_ids[:-1],
+            )
+        except Exception as exc:
+            logger.debug("Marmot send_agent_activity failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
     async def _cancel_other_draft_streams(
         self,
@@ -3203,6 +3281,63 @@ def _optional_hex(value: Any, field: str = "hex") -> Optional[str]:
     if value is None or str(value).strip() == "":
         return None
     return _normalize_hex(value, field)
+
+
+def _metadata_dict_value(metadata: Optional[Dict[str, Any]], key: str) -> Any:
+    if not metadata:
+        return None
+    if key in metadata:
+        return metadata[key]
+    for container_key in ("delivery", "delivery_context"):
+        container = metadata.get(container_key)
+        if isinstance(container, dict) and key in container:
+            return container[key]
+    return None
+
+
+def _delivery_class(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    value = _metadata_dict_value(metadata, "delivery_class")
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _delivery_explicit_turn_final(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
+    for key in ("is_turn_final", "turn_final"):
+        value = _metadata_dict_value(metadata, key)
+        if value is not None:
+            return _config_bool(value, default=True)
+    return None
+
+
+_DURABLE_DELIVERY_CLASSES = frozenset({"final", "approval"})
+_COMMENTARY_DELIVERY_CLASSES = frozenset({"commentary"})
+
+
+def _delivery_routes_to_commentary_activity(metadata: Optional[Dict[str, Any]]) -> bool:
+    explicit = _delivery_explicit_turn_final(metadata)
+    if explicit is not None:
+        return not explicit
+    delivery_class = _delivery_class(metadata)
+    if delivery_class in _COMMENTARY_DELIVERY_CLASSES:
+        return True
+    if delivery_class in _DURABLE_DELIVERY_CLASSES:
+        return False
+    return False
+
+
+def _reply_to_from_send_context(
+    metadata: Optional[Dict[str, Any]],
+    reply_to: Optional[str],
+) -> Optional[str]:
+    if reply_to is not None and str(reply_to).strip():
+        return _optional_hex(reply_to)
+    for key in ("reply_to_message_id_hex", "reply_to_message_id", "parent_message_id_hex"):
+        value = _metadata_dict_value(metadata, key)
+        if value is not None and str(value).strip():
+            return _optional_hex(value, key)
+    return _TURN_PARENT_MESSAGE_ID_HEX.get()
 
 
 def _encode_quic_varint(value: int) -> bytes:
