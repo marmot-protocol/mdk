@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
+use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, SecretBytes};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -263,6 +264,9 @@ pub(crate) enum AccountWorkerCommand {
     },
     KeyPackageMaintenanceStatus {
         respond: oneshot::Sender<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
+    },
+    DurablyOwnedKeyPackages {
+        respond: oneshot::Sender<Result<Vec<KeyPackage>, AppError>>,
     },
     MaintenanceStatus {
         group_id: GroupId,
@@ -1440,6 +1444,9 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => {
             let _ = respond.send(client.key_package_maintenance_status());
+        }
+        AccountWorkerCommand::DurablyOwnedKeyPackages { respond } => {
+            let _ = respond.send(client.durably_owned_key_packages());
         }
         AccountWorkerCommand::MaintenanceStatus { group_id, respond } => {
             let _ = respond.send(client.maintenance_status(&group_id));

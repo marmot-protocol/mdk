@@ -159,6 +159,49 @@ impl<S: StorageProvider> Engine<S> {
         self.build_fresh_key_package(&self.storage)
     }
 
+    /// Enumerate KeyPackages whose private OpenMLS bundles are durably usable
+    /// by this account-device.
+    ///
+    /// The storage row key is part of the ownership proof: OpenMLS looks a
+    /// bundle up by the serialized KeyPackageRef while processing a Welcome.
+    /// A decodable bundle stored under any other key is therefore not usable
+    /// and must not be reported as device-owned. Corrupt or otherwise invalid
+    /// rows are skipped rather than turning a read-only ownership query into a
+    /// destructive repair operation.
+    pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut owned = Vec::new();
+        for stored in self.storage.stored_key_package_bundles()? {
+            let Ok(bundle) = serde_json::from_slice::<KeyPackageBundle>(&stored.value) else {
+                continue;
+            };
+            let Ok(reference) = bundle.key_package().hash_ref(provider.crypto()) else {
+                continue;
+            };
+            use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+            let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<
+                _,
+                KeyPackageBundle,
+            >(provider.storage(), &reference) else {
+                continue;
+            };
+            if persisted_bundle.key_package() != bundle.key_package() {
+                continue;
+            }
+            let mls_message: MlsMessageOut = bundle.key_package().clone().into();
+            let Ok(bytes) = mls_message.tls_serialize_detached() else {
+                continue;
+            };
+            let key_package =
+                KeyPackage::new(bytes).with_protocol_profile(self.new_protocol_profile);
+            if key_package_metadata(&key_package).is_err() {
+                continue;
+            }
+            owned.push(key_package);
+        }
+        Ok(owned)
+    }
+
     /// Build + persist a fresh KeyPackage using the supplied storage view.
     ///
     /// Maintenance uses this inside `StorageProvider::with_transaction` so the

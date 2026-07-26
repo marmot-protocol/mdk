@@ -25,6 +25,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 cgka-engine.workspace = true
+rusqlite.workspace = true
 storage-sqlite.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

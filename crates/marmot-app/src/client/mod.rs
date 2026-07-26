@@ -255,6 +255,10 @@ impl AppClient {
         Ok(self.runtime.key_package_maintenance_status()?)
     }
 
+    pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, AppError> {
+        Ok(self.runtime.durably_owned_key_packages()?)
+    }
+
     pub fn schedule_manual_self_update(&mut self, group_id: &GroupId) -> Result<String, AppError> {
         self.ensure_group(group_id)?;
         Ok(hex::encode(

@@ -6,7 +6,7 @@
 //! decoded metadata, reconcile fresh vs cached results, merge KeyPackage
 //! records, and pick publish endpoints. They hold no `MarmotApp` state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
@@ -354,36 +354,43 @@ pub(crate) fn account_key_package_record_from_fetched(
 pub(crate) fn merge_key_package_records(
     records: Vec<AccountKeyPackageRecord>,
 ) -> Vec<AccountKeyPackageRecord> {
-    let mut merged: BTreeMap<String, AccountKeyPackageRecord> = BTreeMap::new();
+    let mut merged: Vec<AccountKeyPackageRecord> = Vec::new();
     for record in records {
-        let key = if !record.key_package_event_id.is_empty() {
-            record.key_package_event_id.clone()
-        } else if !record.key_package_ref_hex.is_empty() {
-            record.key_package_ref_hex.clone()
+        if let Some(existing) = merged.iter_mut().find(|existing| {
+            (!record.key_package_event_id.is_empty()
+                && record.key_package_event_id == existing.key_package_event_id)
+                || (!record.key_package_ref_hex.is_empty()
+                    && record.key_package_ref_hex == existing.key_package_ref_hex)
+                || (record.key_package_event_id.is_empty()
+                    && record.key_package_ref_hex.is_empty()
+                    && existing.key_package_event_id.is_empty()
+                    && existing.key_package_ref_hex.is_empty()
+                    && record.key_package_id == existing.key_package_id)
+        }) {
+            existing.local |= record.local;
+            existing.relay |= record.relay;
+            existing.published_at = existing.published_at.max(record.published_at);
+            if existing.account_label.is_none() {
+                existing.account_label = record.account_label.clone();
+            }
+            if existing.key_package_event_id.is_empty() {
+                existing.key_package_event_id = record.key_package_event_id.clone();
+            }
+            if existing.key_package_ref_hex.is_empty() {
+                existing.key_package_ref_hex = record.key_package_ref_hex.clone();
+            }
+            push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
         } else {
-            record.key_package_id.clone()
-        };
-        merged
-            .entry(key)
-            .and_modify(|existing| {
-                existing.local |= record.local;
-                existing.relay |= record.relay;
-                existing.published_at = existing.published_at.max(record.published_at);
-                if existing.account_label.is_none() {
-                    existing.account_label = record.account_label.clone();
-                }
-                push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
-            })
-            .or_insert(record);
+            merged.push(record);
+        }
     }
-    let mut records = merged.into_values().collect::<Vec<_>>();
-    records.sort_by(|left, right| {
+    merged.sort_by(|left, right| {
         right
             .published_at
             .cmp(&left.published_at)
             .then_with(|| left.key_package_event_id.cmp(&right.key_package_event_id))
     });
-    records
+    merged
 }
 
 pub(crate) fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {

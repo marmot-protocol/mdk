@@ -3185,8 +3185,9 @@ impl AccountManager {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.resolve(account_ref)?;
+        let owned = self.durably_owned_key_packages(account_ref).await?;
         self.app
-            .account_key_package_records(&account.label, bootstrap_relays)
+            .account_key_package_records(&account.label, bootstrap_relays, owned)
             .await
     }
 
