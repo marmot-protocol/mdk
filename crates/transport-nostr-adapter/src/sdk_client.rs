@@ -525,6 +525,7 @@ impl NostrSdkRelayClient {
         &self,
         request: PreparedPublish,
         unavailable: &HashMap<RelayUrl, TransportEndpointFailure>,
+        connect_before_send: bool,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         // A configured threshold of zero relaxes the quorum but never permits
         // confirming work that no relay accepted.
@@ -538,11 +539,14 @@ impl NostrSdkRelayClient {
                 failed.push(failure.clone());
                 continue;
             }
-            publishes.spawn(Self::send_event_to_relay(
-                self.client.clone(),
-                endpoint,
-                request.event.clone(),
-            ));
+            let sdk = self.clone();
+            let event = request.event.clone();
+            publishes.spawn(async move {
+                if connect_before_send {
+                    sdk.connect_publish_relay(endpoint.clone()).await?;
+                }
+                Self::send_event_to_relay(sdk.client.clone(), endpoint, event).await
+            });
         }
 
         let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
@@ -612,6 +616,37 @@ impl NostrSdkRelayClient {
         result
     }
 
+    async fn publish_prepared_single(
+        &self,
+        request: PreparedPublish,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let mut lease = ScopedPublishRelayLease::new(self.clone());
+        let mut unavailable = HashMap::new();
+        for endpoint in &request.endpoints {
+            match self.retain_publish_relay(endpoint).await {
+                Ok(retained) => {
+                    if retained {
+                        lease.retain(endpoint.clone());
+                    }
+                }
+                Err(failure) => {
+                    unavailable.insert(endpoint.clone(), failure);
+                }
+            }
+        }
+
+        // Preserve the original single-event latency behavior: each relay
+        // races connect + send as one task, and reaching the acknowledgement
+        // goal aborts relays that are still connecting. The multi-event path
+        // below may pre-connect because it amortizes those connections across
+        // the batch.
+        let outcome = self
+            .publish_prepared_event(request, &unavailable, true)
+            .await;
+        lease.release().await;
+        outcome
+    }
+
     async fn publish_prepared_batch(
         &self,
         requests: Vec<Result<PreparedPublish, TransportAdapterError>>,
@@ -677,7 +712,7 @@ impl NostrSdkRelayClient {
             }
             match timeout(
                 remaining,
-                self.publish_prepared_event(request, &unavailable),
+                self.publish_prepared_event(request, &unavailable, false),
             )
             .await
             {
@@ -1016,6 +1051,12 @@ impl NostrRelayClient for NostrSdkRelayClient {
             event_count = prepared.len(),
             "publishing SDK relay event batch"
         );
+        if prepared.len() == 1 {
+            return match prepared.pop().expect("one prepared publish") {
+                Ok(request) => vec![self.publish_prepared_single(request).await],
+                Err(error) => vec![Err(error)],
+            };
+        }
         self.publish_prepared_batch(prepared).await
     }
 }
@@ -1589,6 +1630,29 @@ mod tests {
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
+    #[tokio::test]
+    async fn publish_event_does_not_wait_for_hung_connect_once_required_ack_is_met() {
+        let relay = MockRelay::run().await.unwrap();
+        let reachable = TransportEndpoint(relay.url().await.to_string());
+        let hung_connect = TransportEndpoint(hanging_connect_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = signed_group_event_dto();
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            sdk.publish_event(&[hung_connect, reachable.clone()], &dto, 1),
+        )
+        .await
+        .expect("a hung relay connect must not delay a healthy acknowledgement")
+        .expect("one healthy relay should satisfy the publish");
+
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, reachable);
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn publish_event_cleans_one_shot_relay_after_overall_timeout() {
         let silent = TransportEndpoint(silent_relay_url().await);
@@ -1898,6 +1962,20 @@ mod tests {
                     if tokio_tungstenite::accept_async(stream).await.is_ok() {
                         std::future::pending::<()>().await;
                     }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn hanging_connect_relay_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
                 });
             }
         });
