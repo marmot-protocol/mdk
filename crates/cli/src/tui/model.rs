@@ -84,9 +84,9 @@ pub(crate) struct ChatProjection {
 }
 
 /// The last-message preview embedded in a chat projection (`last_message`). The
-/// chat list renders `sender`/`plaintext` and orders by `timeline_at`; `kind`
-/// lets a group-system row render its summary instead of raw JSON. Every field
-/// is parsed tolerantly.
+/// chat list renders `sender`/`plaintext`; rows are ordered by the projection's
+/// `activity_sort_at`. `kind` lets a group-system row render its summary instead
+/// of raw JSON. Every field is parsed tolerantly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChatLastMessage {
     pub(crate) sender: Option<String>,
