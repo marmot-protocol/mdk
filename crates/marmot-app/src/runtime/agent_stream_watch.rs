@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::{
     BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_limits,
 };
-use transport_quic_stream::{AgentTextStreamCrypto, AgentTextStreamReceiveLimits};
+use transport_quic_stream::{AgentTextStreamCrypto, AgentTextStreamReceiveLimits, QuicCandidate};
 
 use super::{
     AgentStreamWatchOptions, AgentTextStreamCryptoContext, MarmotAppRuntime,
@@ -289,21 +289,11 @@ fn normalize_hex_app(value: &str) -> Result<String, AppError> {
 }
 
 pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, AppError> {
-    let trimmed = candidate.trim();
-    let Some(rest) = trimmed.strip_prefix("quic://") else {
-        return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
-    };
-    // Per transports/quic.md a receiver MUST ignore any path, query, or
-    // fragment after the authority; the authority ends at the first of '/',
-    // '?', or '#'.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
-    }
-    let server_name = candidate_server_name(authority)?;
+    let parsed = QuicCandidate::parse(candidate)
+        .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.to_owned()))?;
     Ok(ParsedQuicCandidate {
-        authority: authority.to_owned(),
-        server_name,
+        authority: parsed.authority().to_owned(),
+        server_name: parsed.host().to_owned(),
     })
 }
 
@@ -312,27 +302,12 @@ pub(crate) fn parse_quic_candidates(
 ) -> Result<Vec<ParsedQuicCandidate>, AppError> {
     let parsed = candidates
         .iter()
-        .filter(|candidate| candidate.trim().starts_with("quic://"))
         .filter_map(|candidate| parse_quic_candidate(candidate).ok())
         .collect::<Vec<_>>();
     if parsed.is_empty() {
         return Err(AppError::AgentStreamMissingCandidate);
     }
     Ok(parsed)
-}
-
-fn candidate_server_name(authority: &str) -> Result<String, AppError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, _)) = rest.split_once(']') else {
-            return Err(AppError::AgentStreamInvalidCandidate(authority.to_owned()));
-        };
-        return Ok(host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
 }
 
 /// One broker-watch attempt: every reachable candidate for one preview

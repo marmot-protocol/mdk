@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_socket_addr};
 use transport_quic_broker::BrokerServerTrust;
+use transport_quic_stream::QuicCandidate;
 
 use crate::error::ConnectorError;
 use crate::with_control_operation_timeout;
@@ -18,33 +19,18 @@ pub(crate) struct ParsedQuicCandidate {
 pub(crate) fn first_quic_candidate(candidates: &[String]) -> Result<String, ConnectorError> {
     candidates
         .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
-        .map(|candidate| candidate.trim().to_owned())
+        .find(|candidate| QuicCandidate::parse(candidate).is_ok())
+        .cloned()
         .ok_or_else(|| ConnectorError::Stream("stream begin requires a quic:// candidate".into()))
 }
 
 pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, ConnectorError> {
-    let trimmed = candidate.trim();
-    let Some(rest) = trimmed.strip_prefix("quic://") else {
-        return Err(ConnectorError::Stream(format!(
-            "invalid QUIC candidate: {trimmed}"
-        )));
-    };
-    // Per transports/quic.md a receiver MUST ignore any path, query, or
-    // fragment after the authority; the authority ends at the first of '/',
-    // '?', or '#'. Mirror the app/CLI parsers so this connector accepts the
-    // same candidates the rest of the stack does.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(ConnectorError::Stream(format!(
-            "invalid QUIC candidate: {trimmed}"
-        )));
-    }
-    let server_name = candidate_server_name(authority)?;
+    let parsed = QuicCandidate::parse(candidate)
+        .map_err(|_| ConnectorError::Stream("invalid QUIC candidate".to_owned()))?;
     Ok(ParsedQuicCandidate {
-        original: trimmed.to_owned(),
-        authority: authority.to_owned(),
-        server_name,
+        original: parsed.original().to_owned(),
+        authority: parsed.authority().to_owned(),
+        server_name: parsed.host().to_owned(),
     })
 }
 
@@ -82,24 +68,6 @@ pub(crate) async fn resolve_quic_candidate_addr(
         ))
     })?;
     Ok(addr)
-}
-
-pub(crate) fn candidate_server_name(authority: &str) -> Result<String, ConnectorError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, _)) = rest.split_once(']') else {
-            return Err(ConnectorError::Stream(format!(
-                "invalid QUIC candidate authority: {authority}"
-            )));
-        };
-        return Ok(host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| {
-            ConnectorError::Stream(format!("invalid QUIC candidate authority: {authority}"))
-        })
 }
 
 /// Select TLS trust for a broker candidate from configuration and the LITERAL

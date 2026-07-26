@@ -6,6 +6,7 @@
 //! constants live in `cgka-traits`; live chunks are provisional preview data
 //! and the final MLS app payload remains authoritative.
 
+mod candidate;
 mod crypto;
 mod error;
 mod frame;
@@ -19,6 +20,7 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
+pub use candidate::{QUIC_CANDIDATE_MAX_LEN, QuicCandidate, QuicCandidateError};
 pub use crypto::{
     AgentTextStreamCrypto, decrypt_record, derive_record_key, derive_record_nonce, encrypt_record,
     record_aad,

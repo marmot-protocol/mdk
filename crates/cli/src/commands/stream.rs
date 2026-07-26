@@ -689,29 +689,13 @@ pub(crate) struct ParsedQuicCandidate {
     pub(crate) server_name: String,
 }
 
-/// Extract the `host:port` (or `[ipv6]:port`) authority from a `quic://` URL
-/// remainder, ignoring any path, query, or fragment after it. Per
-/// `transports/quic.md` the authority ends at the first `/`, `?`, or `#`. Shared
-/// by both quic-candidate parsers below (and mirrors `marmot_app`'s
-/// `parse_quic_candidate`) so the rule cannot drift.
-fn quic_authority(rest: &str) -> &str {
-    rest.split(['/', '?', '#']).next().unwrap_or(rest)
-}
-
 pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, WnError> {
-    let trimmed = candidate.trim();
-    let Some(rest) = trimmed.strip_prefix("quic://") else {
-        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
-    };
-    let authority = quic_authority(rest);
-    if authority.is_empty() {
-        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
-    }
-    let server_name = candidate_server_name(authority)?;
+    let parsed = transport_quic_stream::QuicCandidate::parse(candidate)
+        .map_err(|_| WnError::InvalidQuicCandidate(candidate.to_owned()))?;
     Ok(ParsedQuicCandidate {
-        original: trimmed.to_owned(),
-        authority: authority.to_owned(),
-        server_name,
+        original: parsed.original().to_owned(),
+        authority: parsed.authority().to_owned(),
+        server_name: parsed.host().to_owned(),
     })
 }
 
@@ -754,38 +738,18 @@ fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
     !is_public_ip(addr.ip())
 }
 
-fn candidate_server_name(authority: &str) -> Result<String, WnError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, _)) = rest.split_once(']') else {
-            return Err(WnError::InvalidQuicCandidate(authority.to_owned()));
-        };
-        return Ok(host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| WnError::InvalidQuicCandidate(authority.to_owned()))
-}
-
 pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
     candidates
         .iter()
-        .find(|candidate| candidate.trim().starts_with("quic://"))
+        .find(|candidate| transport_quic_stream::QuicCandidate::parse(candidate).is_ok())
         .and_then(|candidate| quic_candidate_host(candidate))
         .is_some_and(|host| quic_host_is_loopback(&host))
 }
 
 pub(crate) fn quic_candidate_host(candidate: &str) -> Option<String> {
-    let rest = candidate.trim().strip_prefix("quic://")?;
-    let authority = quic_authority(rest);
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host.to_owned());
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host.to_owned())
-        .filter(|host| !host.is_empty())
+    transport_quic_stream::QuicCandidate::parse(candidate)
+        .ok()
+        .map(|candidate| candidate.host().to_owned())
 }
 
 fn quic_host_is_loopback(host: &str) -> bool {
