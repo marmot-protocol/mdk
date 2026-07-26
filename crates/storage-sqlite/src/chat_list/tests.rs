@@ -330,7 +330,7 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
 
 #[test]
 fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
-    // Migration 0036 backfills `activity_sort_at` in pure SQL. This proves the
+    // Migration 0037 backfills `activity_sort_at` in pure SQL. This proves the
     // compatibility seam between a migrated row and the Rust upsert
     // (`rebuild_chat_list_row_for_group_tx`): a durable anchor whose preview has
     // since been pruned must be preserved across a real `refresh_chat_list_rows`
@@ -339,7 +339,7 @@ fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
     let store = setup_store();
 
     // Emulate the migration-backfilled state directly: create the row the way
-    // migration 0036 leaves it (SQL-populated, defaults elsewhere) carrying a
+    // migration 0037 leaves it (SQL-populated, defaults elsewhere) carrying a
     // durable anchor (350) and a low creation time (5), but with no kind-9
     // preview in the timeline — its message was securely pruned, so nothing
     // remains to reproduce 350. A read cursor at 300 is the only surviving
