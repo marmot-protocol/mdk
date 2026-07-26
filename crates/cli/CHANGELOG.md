@@ -7,11 +7,23 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
-### Changed
+## [0.9.6] - 2026-07-26
+
+### Added
+
+- MarmotKit now exposes account-signed public profile-image uploads to Blossom,
+  with validated raster content and returned HTTPS URLs.
+- MarmotKit profile metadata now includes an optional `banner` field while
+  preserving the existing banner when partial updates omit it.
+
+### Fixed
 
 - `keys list` now reports every durably device-owned KeyPackage, including
   retained private material, and merges relay visibility without losing
   distinct relay event ids.
+- MarmotKit key-package ownership now reflects durable, Welcome-usable private
+  material across manual publication, automatic maintenance, and runtime
+  restarts; matching relay events merge with their local record.
 
 ## [0.9.5] - 2026-07-25
 
