@@ -2904,7 +2904,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    return validate_config(_MinimalConfig(extra={}))
+    # Install-time only: runtime readiness is validated with the effective
+    # PlatformConfig by validate_config() before the adapter factory runs.
+    return True
 
 
 def validate_config(config) -> bool:
@@ -3508,8 +3510,3 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except Exception as exc:
         logger.debug("error while closing Marmot socket writer: %s", exc)
-
-
-class _MinimalConfig:
-    def __init__(self, extra: Optional[Dict[str, Any]] = None):
-        self.extra = extra or {}

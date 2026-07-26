@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +19,30 @@ def load_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def load_adapter_module():
+    helper_path = REPO_ROOT / "integrations" / "hermes" / "marmot" / "tests" / "test_adapter.py"
+    spec = importlib.util.spec_from_file_location("hermes_marmot_test_adapter_helpers", helper_path)
+    helper = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(helper)
+    return helper.load_adapter_module()
+
+
+class PlatformRegistryHarness:
+    """Minimal copy of Hermes' check, validate, then create registry flow."""
+
+    def register_platform(self, **entry):
+        self.entry = entry
+
+    def create_adapter(self, config):
+        if not self.entry["check_fn"]():
+            return None
+        validate = self.entry.get("validate_config")
+        if validate is not None and not validate(config):
+            return None
+        return self.entry["adapter_factory"](config)
 
 
 class ConfigureGatewayTests(unittest.TestCase):
@@ -155,6 +181,54 @@ class ConfigureGatewayTests(unittest.TestCase):
         self.assertTrue(config["streaming"]["enabled"])
         self.assertEqual(config["streaming"]["transport"], "auto")
         self.assertTrue(config["display"]["platforms"]["marmot"]["streaming"])
+
+    def test_persisted_config_creates_adapter_without_marmot_env(self):
+        adapter_module = load_adapter_module()
+        saved_env = {key: os.environ.pop(key) for key in list(os.environ) if key.startswith("MARMOT_")}
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                home = Path(tempdir)
+                agent_home = home / "marmot-agent"
+                socket_dir = agent_home / "dev"
+                socket_dir.mkdir(parents=True)
+                socket_path = socket_dir / "wn-agent.sock"
+
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                    server.bind(str(socket_path))
+                    server.listen(1)
+                    self.assertTrue(socket_path.is_socket())
+
+                    self.module.configure_gateway_config(
+                        hermes_home=home,
+                        platform="marmot",
+                        streaming_enabled=False,
+                        streaming_transport="off",
+                        tool_progress="off",
+                        interim_assistant_messages=False,
+                        long_running_notifications=False,
+                        busy_ack_detail=False,
+                        agent_home=agent_home,
+                        socket_path=socket_path,
+                        account_id_hex="11" * 32,
+                    )
+                    config = self.module.load_config(home / "config.yaml")
+                    extra = config["platforms"]["marmot"]["extra"]
+                    platform_config = type(
+                        "PlatformConfig",
+                        (),
+                        {"enabled": True, "extra": extra},
+                    )()
+                    registry = PlatformRegistryHarness()
+                    adapter_module.register(registry)
+
+                    adapter = registry.create_adapter(platform_config)
+
+                    self.assertTrue(config["platforms"]["marmot"]["enabled"])
+                    self.assertIsInstance(adapter, adapter_module.MarmotPlatformAdapter)
+                    assert adapter is not None
+                    self.assertEqual(adapter.socket_path, str(socket_path))
+        finally:
+            os.environ.update(saved_env)
 
 
 if __name__ == "__main__":

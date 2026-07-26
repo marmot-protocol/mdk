@@ -710,7 +710,7 @@ Hermes:
   plugin: $MARMOT_PLUGIN_DIR
 
 Restart your existing Hermes gateway when you are ready for it to load the Marmot plugin/config:
-  hermes gateway run
+  hermes gateway restart
 
 Existing Hermes connectors were not removed or disabled. The installer only updated the Marmot plugin and Marmot-specific config entries.
 

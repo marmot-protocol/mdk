@@ -2,6 +2,7 @@ import asyncio
 from contextlib import suppress
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -3867,6 +3868,33 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await queue.join()
+
+
+class MarmotGatewayReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def test_environment_only_config_still_validates(self):
+        saved_home = os.environ.pop("MARMOT_HOME", None)
+        saved_socket = os.environ.pop("MARMOT_AGENT_SOCKET", None)
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                socket_path = Path(tempdir) / "wn-agent.sock"
+                os.environ["MARMOT_AGENT_SOCKET"] = str(socket_path)
+
+                platform_config = self.config_cls(enabled=True, extra={})
+
+                self.assertTrue(self.adapter_module.check_requirements())
+                self.assertTrue(self.adapter_module.validate_config(platform_config))
+                adapter = self.adapter_module.MarmotPlatformAdapter(platform_config, client=object())
+                self.assertEqual(adapter.socket_path, str(socket_path))
+        finally:
+            os.environ.pop("MARMOT_AGENT_SOCKET", None)
+            if saved_socket is not None:
+                os.environ["MARMOT_AGENT_SOCKET"] = saved_socket
+            if saved_home is not None:
+                os.environ["MARMOT_HOME"] = saved_home
 
 
 if __name__ == "__main__":
