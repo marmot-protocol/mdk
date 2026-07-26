@@ -1308,7 +1308,14 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        if has_queued_intents || has_convergence_inputs {
+        let restored_self_remove_work = self
+            .restore_self_remove_auto_commit_schedules_for_group(
+                group_id,
+                group.epoch,
+                self.convergence_now_ms(),
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if has_queued_intents || has_convergence_inputs || restored_self_remove_work {
             self.schedule_pending_convergence_group(group_id);
         }
         Ok(group.epoch)
