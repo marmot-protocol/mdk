@@ -787,6 +787,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.env_dry_run and not args.configure_env:
+        parser.error("--env-dry-run requires --configure-env")
 
     try:
         hermes_home = Path(args.home).expanduser()

@@ -648,6 +648,28 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
 
+    def test_env_dry_run_requires_configure_env_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes"
+            env_path = hermes_home / ".env"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--env-dry-run",
+                    "--allow-user",
+                    USER_A,
+                ],
+                capture_output=True,
+                text=True,
+                env={**scrub_marmot_env(), "HERMES_HOME": str(hermes_home)},
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn(
+                "--env-dry-run requires --configure-env", completed.stderr
+            )
+            self.assertFalse(env_path.exists())
+
     def test_invalid_bool_leaves_env_and_config_byte_identical(self):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
