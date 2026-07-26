@@ -50,7 +50,9 @@ WN_AGENT_TEMP_PID=""
 
 RELAYS=()
 ALLOW_WELCOMERS=()
+ALLOW_USERS=()
 QUIC_CANDIDATES=()
+EXPLICIT_ALLOW_ALL=0
 
 usage() {
     cat <<'USAGE'
@@ -65,6 +67,8 @@ Options:
   --home PATH              Marmot agent home (default: ~/.marmot-agents/hermes)
   --hermes-home PATH       Hermes home (default: $HERMES_HOME or ~/.hermes)
   --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat
+  --allow-user VALUE       Allow Marmot messages from this npub or hex account id; may repeat
+  --allow-all-users        Allow Marmot messages from any sender (explicit opt-in)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --enable-streaming       Configure Marmot live preview streaming
   --quic-candidate URI     QUIC preview candidate used with --enable-streaming
@@ -92,10 +96,19 @@ Environment:
   MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
 
+Welcomer allowlist entries control which accounts may invite the Marmot agent
+through wn-agent. Message-sender allowlist entries control which Marmot senders
+Hermes accepts after gateway restart via $HERMES_HOME/.env.
+
 Example:
   curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
 
-  curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
+  curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes \
+    --allow-welcomer npub1... \
+    --allow-user npub1...
+
+  curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes \
+    --allow-all-users
 USAGE
 }
 
@@ -202,6 +215,10 @@ is_welcomer_ref_syntax() {
     esac
 }
 
+is_user_ref_syntax() {
+    is_welcomer_ref_syntax "$1"
+}
+
 validate_welcomer_inputs() {
     local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
@@ -209,11 +226,192 @@ validate_welcomer_inputs() {
     fi
     for welcomer in "${ALLOW_WELCOMERS[@]}"; do
         if ! is_welcomer_ref_syntax "$welcomer"; then
-            echo "error: invalid welcomer allowlist value: $welcomer" >&2
+            echo "error: invalid welcomer allowlist entry" >&2
             echo "expected a Nostr npub or 64-character hex account id" >&2
             exit 1
         fi
     done
+}
+
+validate_user_inputs() {
+    local user
+    if [ "${#ALLOW_USERS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    for user in "${ALLOW_USERS[@]}"; do
+        if ! is_user_ref_syntax "$user"; then
+            echo "error: invalid message sender allowlist entry" >&2
+            echo "expected a Nostr npub or 64-character hex account id" >&2
+            exit 1
+        fi
+    done
+}
+
+configure_gateway_helper_path() {
+    if installed_configure_gateway_helper_path; then
+        return 0
+    fi
+    same_version_configure_gateway_helper_path
+}
+
+same_version_configure_gateway_helper_path() {
+    if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/hermes_marmot_configure_gateway.py" ]; then
+        printf '%s\n' "$SCRIPT_DIR/hermes_marmot_configure_gateway.py"
+        return 0
+    fi
+    return 1
+}
+
+installed_configure_gateway_helper_path() {
+    if [ -f "$MARMOT_PLUGIN_DIR/configure_gateway.py" ]; then
+        printf '%s\n' "$MARMOT_PLUGIN_DIR/configure_gateway.py"
+        return 0
+    fi
+    return 1
+}
+
+hermes_env_has_managed_sender_auth_keys() {
+    local env_file="$HERMES_HOME/.env"
+    [ -f "$env_file" ] || return 1
+    grep -Eq '^[[:space:]]*(export[[:space:]]+)?MARMOT_ALLOWED_USERS[[:space:]]*=' "$env_file" && return 0
+    grep -Eq '^[[:space:]]*(export[[:space:]]+)?MARMOT_ALLOW_ALL_USERS[[:space:]]*=' "$env_file" && return 0
+    return 1
+}
+
+is_strict_hex_account_id() {
+    local value normalized
+    value="${1#"${1%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    normalized="${normalized#0x}"
+    [[ "$normalized" =~ ^[0-9a-f]{64}$ ]]
+}
+
+allow_users_need_helper_validation() {
+    local user normalized
+    for user in "${ALLOW_USERS[@]}"; do
+        normalized="$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')"
+        case "$normalized" in
+            npub1*) return 0 ;;
+        esac
+        if ! is_strict_hex_account_id "$user"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_gateway_helper_env_dry_run() {
+    local helper="${1:-}"
+    if [ -z "$helper" ]; then
+        if ! helper="$(configure_gateway_helper_path)"; then
+            return 1
+        fi
+    fi
+    local -a args=(
+        "$helper"
+        --home "$HERMES_HOME"
+        --configure-env
+        --env-dry-run
+        --quiet
+    )
+    local user
+    for user in "${ALLOW_USERS[@]}"; do
+        args+=(--allow-user "$user")
+    done
+    if [ "$EXPLICIT_ALLOW_ALL" -eq 1 ]; then
+        args+=(--allow-all-users)
+    fi
+    python3 "${args[@]}"
+}
+
+sender_auth_not_configured_message() {
+    echo "error: Hermes Marmot sender authorization is not configured." >&2
+    echo "Pass one or more --allow-user npub-or-hex values, opt into --allow-all-users," >&2
+    echo "or keep an existing valid allowlist in $HERMES_HOME/.env." >&2
+    echo "Use --no-configure-hermes to install assets without patching Hermes." >&2
+}
+
+log_sender_auth_dry_run_intent() {
+    if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
+        log "would configure Marmot message-sender authorization for ${#ALLOW_USERS[@]} allowed sender(s)"
+    elif [ -f "$HERMES_HOME/.env" ]; then
+        log "would preserve or update existing Marmot message-sender authorization in Hermes env"
+    else
+        log "would configure Marmot message-sender authorization in Hermes env"
+    fi
+    if [ "$EXPLICIT_ALLOW_ALL" -eq 1 ]; then
+        log "would set MARMOT_ALLOW_ALL_USERS=true"
+    else
+        log "would keep MARMOT_ALLOW_ALL_USERS=false unless already true in Hermes env"
+    fi
+}
+
+validate_hermes_sender_auth_pre_install() {
+    if [ "$CONFIGURE_HERMES" -ne 1 ]; then
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 1 ]; then
+        if [ "$EXPLICIT_ALLOW_ALL" -eq 0 ] && [ "${#ALLOW_USERS[@]}" -eq 0 ]; then
+            if ! hermes_env_has_managed_sender_auth_keys; then
+                sender_auth_not_configured_message
+                exit 1
+            fi
+            return 0
+        fi
+    fi
+
+    local helper=""
+    if same_version_configure_gateway_helper_path >/dev/null 2>&1; then
+        helper="$(same_version_configure_gateway_helper_path)"
+        if ! run_gateway_helper_env_dry_run "$helper"; then
+            echo "error: invalid Hermes Marmot sender authorization inputs" >&2
+            exit 1
+        fi
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$EXPLICIT_ALLOW_ALL" -eq 1 ]; then
+            return 0
+        fi
+        if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
+            if allow_users_need_helper_validation; then
+                echo "error: cannot strictly validate sender authorization without the configure helper" >&2
+                exit 1
+            fi
+            return 0
+        fi
+        if hermes_env_has_managed_sender_auth_keys; then
+            echo "error: cannot strictly validate existing sender authorization without the configure helper" >&2
+            exit 1
+        fi
+        sender_auth_not_configured_message
+        exit 1
+    fi
+
+    if [ "$EXPLICIT_ALLOW_ALL" -eq 1 ] || [ "${#ALLOW_USERS[@]}" -gt 0 ] || hermes_env_has_managed_sender_auth_keys; then
+        return 0
+    fi
+
+    sender_auth_not_configured_message
+    exit 1
+}
+
+validate_hermes_sender_auth_post_install() {
+    if [ "$CONFIGURE_HERMES" -ne 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    local helper
+    if ! helper="$(installed_configure_gateway_helper_path)"; then
+        echo "error: Hermes config helper not found after plugin install" >&2
+        exit 1
+    fi
+    if ! run_gateway_helper_env_dry_run "$helper"; then
+        echo "error: Hermes Marmot sender authorization validation failed after plugin install" >&2
+        exit 1
+    fi
 }
 
 detect_platform() {
@@ -649,15 +847,22 @@ configure_hermes_gateway() {
     if [ "$CONFIGURE_HERMES" -ne 1 ]; then
         return 0
     fi
-    local helper="$MARMOT_PLUGIN_DIR/configure_gateway.py"
+    local helper
+    if ! helper="$(configure_gateway_helper_path)"; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "would patch Hermes config: $HERMES_HOME/config.yaml"
+            log "would preserve other Hermes connectors and only update platforms.marmot/display.platforms.marmot"
+            log_sender_auth_dry_run_intent
+            return 0
+        fi
+        echo "error: Hermes config helper not found" >&2
+        exit 1
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would patch Hermes config: $HERMES_HOME/config.yaml"
         log "would preserve other Hermes connectors and only update platforms.marmot/display.platforms.marmot"
+        log_sender_auth_dry_run_intent
         return 0
-    fi
-    if [ ! -f "$helper" ]; then
-        echo "error: Hermes config helper not found in plugin: $helper" >&2
-        exit 1
     fi
 
     local -a args=(
@@ -670,17 +875,25 @@ configure_hermes_gateway() {
         --interim-messages 0
         --long-running-notifications 0
         --busy-ack-detail 0
+        --configure-env
     )
     if [ "$ENABLE_STREAMING" -eq 1 ]; then
         args+=(--streaming 1 --transport auto --configure-global-streaming)
     else
         args+=(--streaming 0 --transport off)
     fi
+    local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
-        local welcomer
         for welcomer in "${ALLOW_WELCOMERS[@]}"; do
             args+=(--welcomer-allowlist "$welcomer")
         done
+    fi
+    local user
+    for user in "${ALLOW_USERS[@]}"; do
+        args+=(--allow-user "$user")
+    done
+    if [ "$EXPLICIT_ALLOW_ALL" -eq 1 ]; then
+        args+=(--allow-all-users)
     fi
     run python3 "${args[@]}"
 }
@@ -695,7 +908,6 @@ Marmot agent:
   home: $MARMOT_HOME
   socket: $MARMOT_AGENT_SOCKET
   service: $MARMOT_AGENT_SERVICE_NAME.service (Linux) / $MARMOT_AGENT_LAUNCHD_LABEL (macOS)
-  account: $BOOTSTRAP_ACCOUNT_ID_HEX
   bootstrap JSON: $BOOTSTRAP_JSON_PATH
 EOF
     if [ -n "${WN_AGENT_TEMP_PID:-}" ]; then
@@ -711,6 +923,10 @@ Hermes:
 
 Restart your existing Hermes gateway when you are ready for it to load the Marmot plugin/config:
   hermes gateway restart
+
+Hermes loads sender authorization from $HERMES_HOME/.env at gateway startup.
+After changing MARMOT_ALLOWED_USERS or MARMOT_ALLOW_ALL_USERS, restart Hermes
+so allowed Marmot senders are accepted.
 
 Existing Hermes connectors were not removed or disabled. The installer only updated the Marmot plugin and Marmot-specific config entries.
 
@@ -739,6 +955,14 @@ while [ "$#" -gt 0 ]; do
         --allow-welcomer)
             ALLOW_WELCOMERS+=("${2:?missing value for --allow-welcomer}")
             shift 2
+            ;;
+        --allow-user)
+            ALLOW_USERS+=("${2:?missing value for --allow-user}")
+            shift 2
+            ;;
+        --allow-all-users)
+            EXPLICIT_ALLOW_ALL=1
+            shift
             ;;
         --relay)
             CLI_RELAYS=1
@@ -837,11 +1061,47 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             fi
         done
     fi
+    if [ "${#ALLOW_USERS[@]}" -eq 0 ] && [ "$EXPLICIT_ALLOW_ALL" -ne 1 ]; then
+        prompt_sender_auth=1
+        if hermes_env_has_managed_sender_auth_keys; then
+            log "existing Marmot message-sender authorization found in Hermes env; preserving unless you add entries"
+            if ! prompt_yes_no "Add more allowed Marmot message senders?" "no"; then
+                prompt_sender_auth=0
+            fi
+        fi
+        if [ "$prompt_sender_auth" -eq 1 ]; then
+            while true; do
+                user_reply="$(prompt_value "Allowed Marmot message sender npub or hex (blank to finish)" "")"
+                if [ -n "$user_reply" ]; then
+                    ALLOW_USERS+=("$user_reply")
+                    continue
+                fi
+                if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
+                    break
+                fi
+                if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
+                    if prompt_yes_no "Also allow configured welcomer identity/identities to message Hermes?" "no"; then
+                        ALLOW_USERS+=("${ALLOW_WELCOMERS[@]}")
+                    fi
+                fi
+                if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
+                    break
+                fi
+                if prompt_yes_no "Allow Marmot messages from any sender? This sets MARMOT_ALLOW_ALL_USERS=true." "no"; then
+                    EXPLICIT_ALLOW_ALL=1
+                    break
+                fi
+                printf 'Add at least one allowed sender or opt into allow-all before continuing.\n' >/dev/tty
+            done
+        fi
+    fi
 fi
 
 MARMOT_OUTBOUND_MEDIA_DIR="${MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE:-$MARMOT_HOME/dev/outbound-media}"
 
 validate_welcomer_inputs
+validate_user_inputs
+validate_hermes_sender_auth_pre_install
 
 need_cmd curl
 need_cmd tar
@@ -872,6 +1132,7 @@ log "Marmot socket: $MARMOT_AGENT_SOCKET"
 log "Marmot agent label: $MARMOT_AGENT_LABEL"
 install_wn_agent "$platform" "$tmpdir"
 install_plugin "$tmpdir"
+validate_hermes_sender_auth_post_install
 enable_hermes_plugin
 bootstrap_agent
 configure_hermes_gateway

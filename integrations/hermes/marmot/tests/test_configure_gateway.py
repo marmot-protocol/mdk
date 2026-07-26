@@ -1,14 +1,25 @@
 import importlib.util
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "hermes_marmot_configure_gateway.py"
+INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install-hermes-marmot.sh"
+
+NPUB_SAMPLE = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+INVALID_NPUB = "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+NPUB_HEX = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4"
+USER_A = "11" * 32
+USER_B = "22" * 32
+USER_C = "33" * 32
 
 
 def load_module():
@@ -18,6 +29,7 @@ def load_module():
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -88,6 +100,16 @@ def restore_marmot_env(saved):
         if key.startswith("MARMOT_"):
             os.environ.pop(key)
     os.environ.update(saved)
+
+
+def scrub_marmot_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    base = dict(os.environ)
+    for key in list(base):
+        if key.startswith("MARMOT_"):
+            base.pop(key, None)
+    if env:
+        base.update(env)
+    return base
 
 
 class ConfigureGatewayTests(unittest.TestCase):
@@ -310,6 +332,473 @@ class MarmotPlatformEnablementTests(unittest.TestCase):
                 self.assertEqual(adapter.socket_path, str(socket_path))
         finally:
             restore_marmot_env(saved_env)
+
+
+class ConfigureHermesEnvTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+
+    def test_fresh_env_writes_allowlist_and_disallow_all(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_A],
+            )
+            env_path = home / ".env"
+            text = env_path.read_text(encoding="utf-8")
+            state = self.module.read_hermes_env_auth(env_path)
+
+            self.assertIn(f"MARMOT_ALLOWED_USERS={USER_A}", text)
+            self.assertIn("MARMOT_ALLOW_ALL_USERS=false", text)
+            self.assertEqual(state.allowed_users_hex, [USER_A])
+            self.assertFalse(state.allow_all_users)
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+
+    def test_normalizes_mixed_npub_and_hex_users(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[NPUB_SAMPLE, USER_B.upper(), f"0x{USER_C}"],
+            )
+            state = self.module.read_hermes_env_auth(home / ".env")
+
+        self.assertEqual(
+            state.allowed_users_hex,
+            sorted([NPUB_HEX, USER_B, USER_C]),
+        )
+
+    def test_reinstall_unions_users_and_preserves_unrelated_env_lines(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "# gateway secrets",
+                        "",
+                        "OPENAI_API_KEY=secret",
+                        f'MARMOT_ALLOWED_USERS = "{USER_A}"',
+                        "MARMOT_ALLOW_ALL_USERS=false",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_B],
+            )
+            text = env_path.read_text(encoding="utf-8")
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertIn("OPENAI_API_KEY=secret", text)
+        self.assertIn("# gateway secrets", text)
+        self.assertEqual(state.allowed_users_hex, sorted([USER_A, USER_B]))
+        self.assertFalse(state.allow_all_users)
+        self.assertEqual(text.count("MARMOT_ALLOWED_USERS="), 1)
+        self.assertEqual(text.count("MARMOT_ALLOW_ALL_USERS="), 1)
+
+    def test_reinstall_without_new_users_preserves_existing_allowlist(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n",
+                encoding="utf-8",
+            )
+            before = env_path.read_text(encoding="utf-8")
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[],
+            )
+            after = env_path.read_text(encoding="utf-8")
+
+        self.assertEqual(before, after)
+
+    def test_explicit_allow_all_opt_in(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_A],
+                allow_all_opt_in=True,
+            )
+            state = self.module.read_hermes_env_auth(home / ".env")
+
+        self.assertTrue(state.allow_all_users)
+
+    def test_preserves_existing_allow_all_on_reinstall(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=true\n",
+                encoding="utf-8",
+            )
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_B],
+            )
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertTrue(state.allow_all_users)
+        self.assertEqual(state.allowed_users_hex, sorted([USER_A, USER_B]))
+
+    def test_malformed_existing_env_fails_closed_without_modifying(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            original = "MARMOT_ALLOWED_USERS=not-a-valid-user\n"
+            env_path.write_text(original, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.module.configure_hermes_env(
+                    hermes_home=home,
+                    add_allowed_users=[USER_A],
+                )
+            self.assertEqual(env_path.read_text(encoding="utf-8"), original)
+
+    def test_malformed_explicit_user_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with self.assertRaises(ValueError):
+                self.module.configure_hermes_env(
+                    hermes_home=home,
+                    add_allowed_users=["npub1invalid"],
+                )
+            self.assertFalse((home / ".env").exists())
+
+    def test_requires_explicit_auth_for_fresh_target(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with self.assertRaises(ValueError):
+                self.module.configure_hermes_env(hermes_home=home)
+
+    def test_existing_valid_auth_satisfies_requirement_without_new_users(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n",
+                encoding="utf-8",
+            )
+            self.module.configure_hermes_env(hermes_home=home)
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertEqual(state.allowed_users_hex, [USER_A])
+
+    def test_reads_exported_allowlist_and_allow_all(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        f"  export MARMOT_ALLOWED_USERS={USER_A}",
+                        "export MARMOT_ALLOW_ALL_USERS=true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertEqual(state.allowed_users_hex, [USER_A])
+        self.assertTrue(state.allow_all_users)
+
+    def test_reads_unquoted_inline_comments(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}  # phone user\n"
+                "MARMOT_ALLOW_ALL_USERS=false  # keep restricted\n",
+                encoding="utf-8",
+            )
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertEqual(state.allowed_users_hex, [USER_A])
+        self.assertFalse(state.allow_all_users)
+
+    def test_reads_tab_before_inline_comments(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}\t# tabbed comment\n"
+                "MARMOT_ALLOW_ALL_USERS=false\n",
+                encoding="utf-8",
+            )
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertEqual(state.allowed_users_hex, [USER_A])
+        self.assertFalse(state.allow_all_users)
+
+    def test_atomic_write_closes_fd_when_chmod_fails(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with mock.patch("os.chmod", side_effect=OSError("chmod failed")):
+                with self.assertRaises(OSError):
+                    self.module.configure_hermes_env(
+                        hermes_home=home,
+                        add_allowed_users=[USER_A],
+                    )
+            self.assertEqual(list(home.glob(".env.*")), [])
+            self.assertFalse((home / ".env").exists())
+
+    def test_last_assignment_wins_for_duplicate_managed_keys(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        f"MARMOT_ALLOWED_USERS={USER_A}",
+                        "OPENAI_API_KEY=secret",
+                        f"MARMOT_ALLOWED_USERS={USER_B}",
+                        "MARMOT_ALLOW_ALL_USERS=false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_C],
+            )
+            text = env_path.read_text(encoding="utf-8")
+            state = self.module.read_hermes_env_auth(env_path)
+
+        self.assertEqual(state.allowed_users_hex, sorted([USER_B, USER_C]))
+        self.assertEqual(text.count("MARMOT_ALLOWED_USERS="), 1)
+        self.assertIn("OPENAI_API_KEY=secret", text)
+
+    def test_ambient_marmot_auth_env_does_not_broaden_target(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MARMOT_ALLOWED_USERS": USER_B,
+                    "MARMOT_ALLOW_ALL_USERS": "true",
+                },
+                clear=False,
+            ):
+                with self.assertRaises(ValueError):
+                    self.module.configure_hermes_env(hermes_home=home)
+
+    def test_atomic_replace_uses_private_mode(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_A],
+            )
+            env_path = home / ".env"
+            mode = env_path.stat().st_mode
+            self.assertEqual(mode & 0o777, 0o600)
+            self.assertFalse(env_path.with_suffix(".env.bak").exists())
+
+    def test_atomic_write_cleans_up_temp_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with mock.patch("os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(OSError):
+                    self.module.configure_hermes_env(
+                        hermes_home=home,
+                        add_allowed_users=[USER_A],
+                    )
+            leftovers = list(home.glob(".env.*"))
+            self.assertEqual(leftovers, [])
+            self.assertFalse((home / ".env").exists())
+
+
+class ConfigureGatewayEnvDryRunTests(unittest.TestCase):
+    def test_env_dry_run_with_ambient_marmot_home_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            ambient_home = home / "ambient-marmot"
+            ambient_home.mkdir()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--home",
+                    str(home / "hermes"),
+                    "--configure-env",
+                    "--env-dry-run",
+                    "--quiet",
+                    "--allow-user",
+                    USER_A,
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "MARMOT_HOME": str(ambient_home),
+                        "MARMOT_AGENT_SOCKET": str(ambient_home / "dev" / "wn-agent.sock"),
+                        "MARMOT_ACCOUNT_ID_HEX": USER_B,
+                    }
+                ),
+            )
+            hermes_home = home / "hermes"
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse((hermes_home / ".env").exists())
+            self.assertFalse((hermes_home / "config.yaml").exists())
+
+
+class ConfigureGatewayCliTests(unittest.TestCase):
+    def test_skip_auth_requirement_flag_removed(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--configure-env",
+                "--skip-auth-requirement",
+            ],
+            capture_output=True,
+            text=True,
+            env=scrub_marmot_env(),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("unrecognized arguments", completed.stderr)
+
+    def test_installer_dry_run_accepts_allow_user(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            completed = subprocess.run(
+                [
+                    str(INSTALL_SCRIPT),
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    tempdir,
+                    "--allow-user",
+                    USER_A,
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                    }
+                ),
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout + completed.stderr
+        self.assertIn("would configure Marmot message-sender authorization", output)
+        self.assertNotIn(USER_A, output)
+
+    def test_installer_dry_run_rejects_bad_npub_without_helper(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    tempdir,
+                    "--allow-user",
+                    INVALID_NPUB,
+                ],
+                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                    }
+                ),
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        combined = completed.stdout + completed.stderr
+        self.assertNotIn("npub1qq", combined)
+
+    def test_installer_dry_run_rejects_missing_sender_without_helper(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    tempdir,
+                ],
+                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                    }
+                ),
+            )
+        self.assertNotEqual(completed.returncode, 0)
+
+    def test_streamed_dry_run_rejects_existing_env_without_helper(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            hermes_home.mkdir()
+            (hermes_home / ".env").write_text(
+                f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                ],
+                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                    }
+                ),
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        combined = completed.stdout + completed.stderr
+        self.assertIn("cannot strictly validate existing sender authorization", combined)
+        self.assertNotIn(USER_A, combined)
+
+    def test_streamed_install_fails_before_download_without_sender_auth(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--no-service",
+                ],
+                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                    }
+                ),
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse((hermes_home / ".env").exists())
+        self.assertFalse((hermes_home / "plugins" / "marmot").exists())
 
 
 if __name__ == "__main__":
