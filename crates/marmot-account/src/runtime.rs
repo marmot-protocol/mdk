@@ -492,6 +492,10 @@ where
         Ok(self.session.key_package_lifecycle()?)
     }
 
+    pub fn durably_owned_key_packages(&self) -> AccountResult<Vec<KeyPackage>> {
+        Ok(self.session.durably_owned_key_packages()?)
+    }
+
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
         let now = self.wall_clock.now();
         Ok(match self.session.key_package_lifecycle()? {

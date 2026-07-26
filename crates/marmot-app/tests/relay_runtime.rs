@@ -640,14 +640,11 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
             UserProfileMetadata {
                 name: Some("first".to_owned()),
                 display_name: Some("First".to_owned()),
+                banner: Some("https://example.test/banner.png".to_owned()),
                 extra: std::collections::BTreeMap::from([
                     (
                         "website".to_owned(),
                         serde_json::json!("https://example.test"),
-                    ),
-                    (
-                        "banner".to_owned(),
-                        serde_json::json!("https://example.test/banner.png"),
                     ),
                     ("bot".to_owned(), serde_json::json!(false)),
                 ]),
@@ -664,6 +661,7 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
             UserProfileMetadata {
                 name: Some("second".to_owned()),
                 about: Some("known-field edit".to_owned()),
+                banner: Some("https://example.test/banner.png".to_owned()),
                 ..UserProfileMetadata::default()
             },
             bootstrap,
@@ -678,8 +676,8 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
         Some(&serde_json::json!("https://example.test"))
     );
     assert_eq!(
-        updated.extra.get("banner"),
-        Some(&serde_json::json!("https://example.test/banner.png"))
+        updated.banner.as_deref(),
+        Some("https://example.test/banner.png")
     );
     assert_eq!(updated.extra.get("bot"), Some(&serde_json::json!(false)));
 
@@ -697,8 +695,8 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
         Some(&serde_json::json!("https://example.test"))
     );
     assert_eq!(
-        fetched.extra.get("banner"),
-        Some(&serde_json::json!("https://example.test/banner.png"))
+        fetched.banner.as_deref(),
+        Some("https://example.test/banner.png")
     );
     assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
 
@@ -865,6 +863,131 @@ async fn app_runtime_can_rotate_key_package_on_request() {
     assert!(!republished.key_package_ref_hex.is_empty());
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_survives_restart() {
+    use nostr::prelude::ToBech32;
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let (relay, url) = mock_relay().await;
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let first_app = MarmotApp::with_relay_and_config(first_dir.path(), url.clone(), config.clone());
+    let second_app = MarmotApp::with_relay_and_config(second_dir.path(), url.clone(), config);
+    let first_runtime = MarmotAppRuntime::new(first_app.clone());
+    let second_runtime = MarmotAppRuntime::new(second_app);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let setup = AccountSetupRequest {
+        identity: Some(secret),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first = first_runtime
+        .create_or_import_account(setup.clone())
+        .await
+        .unwrap();
+    second_runtime
+        .create_or_import_account(setup)
+        .await
+        .unwrap();
+
+    let before_rotation = first_runtime
+        .account_key_packages(&first.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert_eq!(
+        before_rotation
+            .iter()
+            .filter(|package| package.local && package.relay)
+            .count(),
+        1,
+        "this device's relay echo must merge with its durable local bundle"
+    );
+    assert_eq!(
+        before_rotation
+            .iter()
+            .filter(|package| !package.local && package.relay)
+            .count(),
+        1,
+        "the other device's package has no private material in this database"
+    );
+
+    first_runtime
+        .publish_new_key_package(&first.account.account_id_hex)
+        .await
+        .unwrap();
+    let fetched_ref = first_runtime
+        .key_package_maintenance_status(&first.account.account_id_hex)
+        .await
+        .unwrap()
+        .and_then(|lifecycle| lifecycle.current_key_package_ref)
+        .map(hex::encode)
+        .expect("rotation must promote a current locally owned package");
+    let after_rotation = first_runtime
+        .account_key_packages(&first.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let rotated = after_rotation
+        .iter()
+        .filter(|package| package.key_package_ref_hex == fetched_ref)
+        .collect::<Vec<_>>();
+    assert_eq!(rotated.len(), 1, "local and fetched copies must not split");
+    assert!(rotated[0].local);
+    assert!(rotated[0].relay);
+
+    first_runtime
+        .sign_out(
+            &first.account.account_id_hex,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    let while_signed_out = first_runtime
+        .account_key_packages(&first.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let signed_out_rotated = while_signed_out
+        .iter()
+        .filter(|package| package.key_package_ref_hex == fetched_ref)
+        .collect::<Vec<_>>();
+    assert_eq!(signed_out_rotated.len(), 1);
+    assert!(
+        signed_out_rotated[0].local && signed_out_rotated[0].relay,
+        "signed-out ownership must be read from durable storage without a worker"
+    );
+
+    first_runtime.shutdown().await;
+    drop(first_runtime);
+    drop(first_app);
+    let reopened_app = MarmotApp::with_relay_and_config(
+        first_dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let restarted = MarmotAppRuntime::new(reopened_app);
+    restarted.reconcile_accounts().await.unwrap();
+    let after_restart = restarted
+        .account_key_packages(&first.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let restarted_rotated = after_restart
+        .iter()
+        .filter(|package| package.key_package_ref_hex == fetched_ref)
+        .collect::<Vec<_>>();
+    assert_eq!(restarted_rotated.len(), 1);
+    assert!(restarted_rotated[0].local);
+    assert!(restarted_rotated[0].relay);
+
+    restarted.shutdown().await;
+    second_runtime.shutdown().await;
+    drop(relay);
 }
 
 #[tokio::test]
@@ -4934,6 +5057,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             display_name: Some("Bob Builder".into()),
             about: Some("Can we fix it".into()),
             picture: None,
+            banner: None,
             nip05: Some("bob@example.test".into()),
             lud16: None,
             created_at: 0,
@@ -4951,6 +5075,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             display_name: Some("Carol Singer".into()),
             about: None,
             picture: None,
+            banner: None,
             nip05: None,
             lud16: None,
             created_at: 0,

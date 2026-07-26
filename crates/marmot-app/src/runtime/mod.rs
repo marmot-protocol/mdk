@@ -2353,6 +2353,32 @@ impl MarmotAppRuntime {
         Ok(profile)
     }
 
+    pub async fn upload_profile_image(
+        &self,
+        account_ref: &str,
+        data: Vec<u8>,
+        media_type: &str,
+        blossom_server: Option<&str>,
+    ) -> Result<String, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let signer = self.accounts.app.account_signer_for_summary(&account)?;
+        let signer = signer.as_nostr_signer();
+        let configured_server = self
+            .accounts
+            .app
+            .service_endpoints()
+            .profile_image_blob_endpoint
+            .as_deref();
+        crate::media::upload_profile_image_with_policy(
+            &data,
+            media_type,
+            blossom_server.or(configured_server),
+            signer.as_ref(),
+            self.accounts.app.allow_loopback_blob_endpoints(),
+        )
+        .await
+    }
+
     async fn latest_known_user_profile_for_publish(
         &self,
         account_id_hex: &str,
@@ -3171,8 +3197,13 @@ impl AccountManager {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.resolve(account_ref)?;
+        let owned = cgka_engine::key_package::durably_owned_key_packages(
+            &self.app.account_storage(&account.label)?,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(cgka_session::SessionError::from)?;
         self.app
-            .account_key_package_records(&account.label, bootstrap_relays)
+            .account_key_package_records(&account.label, bootstrap_relays, owned)
             .await
     }
 
@@ -3847,6 +3878,9 @@ fn merge_user_profile_update(
     current.display_name = update.display_name;
     current.about = update.about;
     current.picture = update.picture;
+    if update.banner.is_some() {
+        current.banner = update.banner;
+    }
     current.nip05 = update.nip05;
     current.lud16 = update.lud16;
     current.created_at = update.created_at;

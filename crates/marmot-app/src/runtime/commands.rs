@@ -1130,6 +1130,19 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn durably_owned_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<cgka_traits::engine::KeyPackage>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DurablyOwnedKeyPackages { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn maintenance_status(
         &self,
         account_ref: &str,

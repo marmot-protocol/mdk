@@ -397,6 +397,28 @@ async fn group_image_binding_methods_are_public_and_validate_inputs() {
 }
 
 #[tokio::test]
+async fn profile_image_upload_binding_is_public_and_requires_a_known_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .upload_profile_image(
+            "missing-account".into(),
+            vec![0x89, b'P', b'N', b'G'],
+            "image/png".into(),
+            None,
+        )
+        .await
+        .expect_err("profile image upload must resolve the signing account");
+    assert!(format!("{error}").contains("account"));
+}
+
+#[tokio::test]
 async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

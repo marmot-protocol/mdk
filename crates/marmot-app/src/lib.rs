@@ -789,13 +789,19 @@ pub struct FetchedKeyPackage {
 pub struct AccountKeyPackageRecord {
     pub account_label: Option<String>,
     pub account_id_hex: String,
+    /// Relay `d` tag / durable lifecycle slot when known. For a local bundle
+    /// with no lifecycle or legacy metadata, this falls back to the
+    /// KeyPackageRef hex so it remains stable and non-secret.
     pub key_package_id: String,
     pub key_package_ref_hex: String,
     pub key_package_event_id: String,
     pub published_at: u64,
     pub key_package_bytes: usize,
     pub source_relays: Vec<String>,
+    /// True only when the corresponding private OpenMLS bundle is durably
+    /// stored and can be looked up for Welcome processing.
     pub local: bool,
+    /// True when this exact event id was discovered from a relay.
     pub relay: bool,
 }
 
@@ -2805,23 +2811,100 @@ impl MarmotApp {
     pub fn local_key_package_records(
         &self,
         label: &str,
+        owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
-        let path = self.key_package_record_path(label);
-        if !path.exists() {
-            return Ok(Vec::new());
+        let account = self.account_home().account(label)?;
+        let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
+        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
+        let source_relays = self.account_nip65_relays(label).unwrap_or_default();
+        let mut records = Vec::with_capacity(owned_key_packages.len());
+
+        for key_package in owned_key_packages {
+            let metadata = key_package_metadata(&key_package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+            let mut key_package_id = metadata.key_package_ref_hex.clone();
+            let mut key_package_event_id = String::new();
+            let mut published_at = 0;
+
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                if lifecycle.current_key_package_ref.as_deref() == Some(&key_package_ref) {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    key_package_event_id = lifecycle
+                        .authored_event_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice()))
+                        .unwrap_or_default();
+                    published_at = lifecycle
+                        .authored_event_created_at
+                        .map(|created_at| created_at.0)
+                        .unwrap_or_default();
+                } else if let Some(pending) = lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .filter(|pending| pending.key_package_ref == key_package_ref)
+                {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    key_package_event_id = pending
+                        .signed_event
+                        .as_ref()
+                        .map(|event| hex::encode(event.id.as_slice()))
+                        .unwrap_or_default();
+                    published_at = pending
+                        .signed_event
+                        .as_ref()
+                        .map(|event| event.created_at.0)
+                        .unwrap_or(pending.authored_created_at.0);
+                } else if let Some(retained) = lifecycle
+                    .retained_private_material
+                    .iter()
+                    .find(|retained| retained.key_package_ref == key_package_ref)
+                {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    published_at = retained.replaced_at.0;
+                }
+            }
+
+            if let Some(legacy) = legacy_record
+                .as_ref()
+                .filter(|legacy| legacy.key_package_ref_hex == metadata.key_package_ref_hex)
+            {
+                if key_package_id == metadata.key_package_ref_hex {
+                    key_package_id = legacy.key_package_id.clone();
+                }
+                if key_package_event_id.is_empty() {
+                    key_package_event_id = legacy.key_package_event_id.clone();
+                }
+                if published_at == 0 {
+                    published_at = legacy.published_at;
+                }
+            }
+
+            records.push(AccountKeyPackageRecord {
+                account_label: Some(account.label.clone()),
+                account_id_hex: account.account_id_hex.clone(),
+                key_package_id,
+                key_package_ref_hex: metadata.key_package_ref_hex,
+                key_package_event_id,
+                published_at,
+                key_package_bytes: key_package.bytes().len(),
+                source_relays: source_relays.clone(),
+                local: true,
+                relay: false,
+            });
         }
-        let record: KeyPackageRecord = read_json(path)?;
-        Ok(vec![self.account_key_package_record_from_local(record)?])
+        Ok(records)
     }
 
     pub async fn account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
+        owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
-        let mut packages = self.local_key_package_records(label)?;
+        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
 
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
         let mut relay_lists = if has_explicit_bootstrap_relays {
@@ -2931,27 +3014,6 @@ impl MarmotApp {
         }
 
         Ok(outcome.accepted.len())
-    }
-
-    fn account_key_package_record_from_local(
-        &self,
-        record: KeyPackageRecord,
-    ) -> Result<AccountKeyPackageRecord, AppError> {
-        let source_relays = self
-            .account_nip65_relays(&record.account_label)
-            .unwrap_or_default();
-        Ok(AccountKeyPackageRecord {
-            account_label: Some(record.account_label),
-            account_id_hex: record.account_id_hex,
-            key_package_id: record.key_package_id,
-            key_package_ref_hex: record.key_package_ref_hex,
-            key_package_event_id: record.key_package_event_id,
-            published_at: record.published_at,
-            key_package_bytes: hex::decode(record.key_package_hex)?.len(),
-            source_relays,
-            local: true,
-            relay: false,
-        })
     }
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {

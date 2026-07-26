@@ -2749,17 +2749,27 @@ fn keys_list_reports_published_key_package() {
     let keys = listed["keys"].as_array().expect("keys array");
     assert_eq!(
         keys.len(),
+        2,
+        "expected the current relay-visible package and retained local package, got {keys:?}"
+    );
+    let relay_keys = keys
+        .iter()
+        .filter(|key| key["relay"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_keys.len(),
         1,
         "expected the published key package, got {keys:?}"
     );
-    assert_eq!(keys[0]["account_id"], account_id);
+    let published = relay_keys[0];
+    assert_eq!(published["account_id"], account_id);
     assert!(
-        keys[0]["key_package_event_id"]
+        published["key_package_event_id"]
             .as_str()
             .is_some_and(|event_id| !event_id.is_empty())
     );
-    assert_eq!(keys[0]["local"], true);
-    assert_eq!(keys[0]["relay"], true);
+    assert_eq!(published["local"], true);
+    assert_eq!(published["relay"], true);
 }
 
 #[test]
@@ -2771,7 +2781,12 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     let account_id = create_account_with_real_relay(home.path(), relay_url);
     run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
     let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
-    let event_id = listed["keys"][0]["key_package_event_id"]
+    let event_id = listed["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|key| key["relay"] == true)
+        .expect("relay-visible key package")["key_package_event_id"]
         .as_str()
         .expect("key package event id")
         .to_owned();

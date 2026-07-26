@@ -19,6 +19,7 @@ use openmls::prelude::{
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::crypto::OpenMlsCrypto;
+use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +40,66 @@ pub struct KeyPackageRetirementReport {
     pub legacy_retired: usize,
     pub invalid_retired: usize,
     pub current_retained: usize,
+}
+
+/// Enumerate KeyPackages whose private OpenMLS bundles are durably usable.
+///
+/// This is deliberately a storage-only query so callers can establish device
+/// ownership while an account is signed out and no signing runtime is active.
+pub fn durably_owned_key_packages<S: StorageProvider>(
+    storage: &S,
+    protocol_profile: ProtocolProfile,
+) -> Result<Vec<KeyPackage>, EngineError> {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let mut owned = Vec::new();
+    let mut seen_references = std::collections::BTreeSet::new();
+    let mut skipped = 0_usize;
+    for stored in storage.stored_key_package_bundles()? {
+        let Ok(bundle) = serde_json::from_slice::<KeyPackageBundle>(&stored.value) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(reference) = bundle.key_package().hash_ref(provider.crypto()) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
+            provider.storage(),
+            &reference,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        if persisted_bundle.key_package() != bundle.key_package() {
+            skipped += 1;
+            continue;
+        }
+        if !seen_references.insert(reference.as_slice().to_vec()) {
+            skipped += 1;
+            continue;
+        }
+        let mls_message: MlsMessageOut = bundle.key_package().clone().into();
+        let Ok(bytes) = mls_message.tls_serialize_detached() else {
+            skipped += 1;
+            continue;
+        };
+        let key_package = KeyPackage::new(bytes).with_protocol_profile(protocol_profile);
+        if key_package_metadata(&key_package).is_err() {
+            skipped += 1;
+            continue;
+        }
+        owned.push(key_package);
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            target: "cgka_engine::key_package",
+            method = "durably_owned_key_packages",
+            skipped,
+            "stored key package bundles were not usable"
+        );
+    }
+    Ok(owned)
 }
 
 /// Parse and validate a transported KeyPackage enough for transport-directory
@@ -157,6 +218,19 @@ impl<S: StorageProvider> Engine<S> {
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         self.build_fresh_key_package(&self.storage)
+    }
+
+    /// Enumerate KeyPackages whose private OpenMLS bundles are durably usable
+    /// by this account-device.
+    ///
+    /// The storage row key is part of the ownership proof: OpenMLS looks a
+    /// bundle up by the serialized KeyPackageRef while processing a Welcome.
+    /// A decodable bundle stored under any other key is therefore not usable
+    /// and must not be reported as device-owned. Corrupt or otherwise invalid
+    /// rows are skipped rather than turning a read-only ownership query into a
+    /// destructive repair operation.
+    pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
+        durably_owned_key_packages(&self.storage, self.new_protocol_profile)
     }
 
     /// Build + persist a fresh KeyPackage using the supplied storage view.

@@ -385,6 +385,21 @@ impl Marmot {
             .await?;
         Ok(pushed.into())
     }
+
+    /// Upload a public raster profile image to Blossom with the account's
+    /// signer. The returned HTTPS URL can be published as kind:0 `picture`.
+    pub async fn upload_profile_image(
+        &self,
+        account_ref: String,
+        data: Vec<u8>,
+        media_type: String,
+        blossom_server: Option<String>,
+    ) -> Result<String, MarmotKitError> {
+        Ok(self
+            .runtime
+            .upload_profile_image(&account_ref, data, &media_type, blossom_server.as_deref())
+            .await?)
+    }
 }
 
 fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {

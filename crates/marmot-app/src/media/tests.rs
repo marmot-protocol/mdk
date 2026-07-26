@@ -455,6 +455,112 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
 }
 
 #[tokio::test]
+async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
+    let signer = signing_keys();
+    let svg = upload_profile_image(
+        b"<svg/>",
+        "image/svg+xml",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        svg.to_string(),
+        "blob store request failed: profile image must be JPEG, PNG, WebP, or GIF"
+    );
+
+    let oversized = vec![0_u8; MAX_PROFILE_IMAGE_BYTES + 1];
+    let error = upload_profile_image(
+        &oversized,
+        "image/png",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image exceeds 10 MiB limit"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_empty_inputs_before_network() {
+    let error = upload_profile_image(
+        &[],
+        "image/jpeg",
+        Some("https://blossom.example"),
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image cannot be empty"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
+    let error = upload_profile_image(
+        b"<svg/>",
+        "image/png",
+        Some("https://blossom.example"),
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image bytes do not match the declared media type"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_policy() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let server = spawn_http_response(http_json_response("{}"));
+    let url = upload_profile_image_with_policy(
+        png_header,
+        " IMAGE/PNG ; charset=binary",
+        Some(&server),
+        &signing_keys(),
+        true,
+    )
+    .await
+    .expect("profile upload should accept the explicit test loopback policy");
+
+    assert!(url.ends_with(".png"), "unexpected profile image URL: {url}");
+    assert!(!url.ends_with(".bin"));
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_cross_site_descriptor_url() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let hash = hex::encode(Sha256::digest(png_header));
+    let descriptor = serde_json::json!({
+        "url": format!("https://attacker.example/{hash}.png"),
+        "sha256": hash,
+    });
+    let server = spawn_http_response(http_json_response(&descriptor.to_string()));
+    let error = upload_profile_image_with_policy(
+        png_header,
+        "image/png",
+        Some(&server),
+        &signing_keys(),
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("unsafe upload descriptor host"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
     let first = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let second = spawn_http_response(http_status_response(502, "Bad Gateway"));

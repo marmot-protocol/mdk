@@ -836,6 +836,34 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
         publications[0].endpoints,
         vec![TransportEndpoint("wss://keys.example".into())]
     );
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        vec![key_package],
+        "a generated package is local only when its OpenMLS private bundle is present"
+    );
+}
+
+#[tokio::test]
+async fn automatic_maintenance_publication_preserves_private_material_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot automatic kp ownership key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+
+    let published = publisher.publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        vec![published[0].key_package.clone()]
+    );
 }
 
 #[tokio::test]
@@ -904,6 +932,11 @@ async fn publish_fresh_key_package_retries_the_same_durable_replacement() {
     assert_eq!(publications.len(), 2);
     assert_eq!(publications[0], publications[1]);
     assert_eq!(publications[1].key_package, key_package);
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        vec![key_package],
+        "publish failure and retry must retain the staged private bundle"
+    );
 }
 
 #[tokio::test]
@@ -937,6 +970,11 @@ async fn unsigned_key_package_replacement_recovers_after_restart_without_changin
         .unwrap()
         .pending_replacement
         .unwrap();
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        vec![pending_before_crash.key_package.clone()],
+        "a failed publication remains locally owned"
+    );
     assert!(pending_before_crash.signed_event.is_none());
     assert_eq!(
         pending_before_crash.authored_created_at,
@@ -967,6 +1005,97 @@ async fn unsigned_key_package_replacement_recovers_after_restart_without_changin
             .unwrap()
             .pending_replacement
             .is_none()
+    );
+    assert_eq!(
+        restarted.durably_owned_key_packages().unwrap(),
+        vec![published[0].key_package.clone()],
+        "restart must preserve the private bundle used by the published event"
+    );
+}
+
+#[tokio::test]
+async fn missing_or_corrupt_private_bundle_is_not_reported_as_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot missing private bundle key").unwrap();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    );
+    runtime.publish_fresh_key_package().await.unwrap();
+    assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 1);
+    drop(runtime);
+
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let bundles = storage.stored_key_package_bundles().unwrap();
+    assert_eq!(bundles.len(), 1);
+    storage
+        .delete_stored_key_package_bundle(&bundles[0].storage_key)
+        .unwrap();
+    drop(storage);
+
+    let reopened = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    );
+    assert!(
+        reopened.durably_owned_key_packages().unwrap().is_empty(),
+        "lifecycle metadata alone must not imply local ownership"
+    );
+
+    let corrupt_database = dir.path().join("corrupt.sqlite");
+    let corrupt_key_text = "marmot corrupt private bundle key";
+    let corrupt_key = SqlCipherKey::new(corrupt_key_text).unwrap();
+    let mut corrupt_runtime = AccountDeviceRuntime::new(
+        session(corrupt_database.clone(), &corrupt_key, b"corrupt-alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    );
+    corrupt_runtime.publish_fresh_key_package().await.unwrap();
+    assert_eq!(
+        corrupt_runtime.durably_owned_key_packages().unwrap().len(),
+        1
+    );
+    drop(corrupt_runtime);
+
+    let connection = rusqlite::Connection::open(&corrupt_database).unwrap();
+    connection
+        .pragma_update(None, "key", corrupt_key_text)
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE openmls_values
+                 SET value = x'00'
+                 WHERE label = x'4b65795061636b616765'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let reopened_corrupt = AccountDeviceRuntime::new(
+        session(corrupt_database, &corrupt_key, b"corrupt-alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    );
+    assert!(
+        reopened_corrupt
+            .durably_owned_key_packages()
+            .unwrap()
+            .is_empty(),
+        "corrupt private material must fail closed instead of inheriting lifecycle ownership"
     );
 }
 

@@ -22,6 +22,11 @@ object, subscription objects, records, enums, and error variants.
 These are route URLs only. Host apps still supply audit and telemetry bearer tokens at runtime. Set either environment
 variable before invoking a build script to override the default for staging or local testing.
 
+Public profile-image uploads default to `https://blossom.primal.net`. Rust
+hosts can override or disable that third-party service with
+`MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
+to pass an explicit Blossom server to `uploadProfileImage`.
+
 ## Kotlin / Android
 
 Prerequisites:

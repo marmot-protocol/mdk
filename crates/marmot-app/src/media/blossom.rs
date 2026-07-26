@@ -28,21 +28,41 @@ struct BlossomBlobDescriptor {
 
 pub(crate) async fn upload_blossom_blob(
     server: &str,
-    encrypted: &[u8],
-    encrypted_hash_hex: &str,
+    blob: &[u8],
+    blob_hash_hex: &str,
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
+    upload_blossom_blob_with_content_type(
+        server,
+        blob,
+        blob_hash_hex,
+        signer,
+        allow_loopback_http,
+        BLOSSOM_UPLOAD_CONTENT_TYPE,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn upload_blossom_blob_with_content_type(
+    server: &str,
+    blob: &[u8],
+    blob_hash_hex: &str,
+    signer: &dyn NostrSigner,
+    allow_loopback_http: bool,
+    content_type: &str,
+    fallback_extension: Option<&str>,
+) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
-    let authorization =
-        blossom_authorization_header(signer, &server_host, encrypted_hash_hex).await?;
+    let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
     let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
-        .put(upload_url)
+        .put(upload_url.clone())
         .header(reqwest::header::AUTHORIZATION, authorization)
-        .header(reqwest::header::CONTENT_TYPE, BLOSSOM_UPLOAD_CONTENT_TYPE)
-        .header("X-SHA-256", encrypted_hash_hex)
-        .body(encrypted.to_vec())
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .header("X-SHA-256", blob_hash_hex)
+        .body(blob.to_vec())
         .send()
         .await
         .map_err(reqwest_blob_error)?;
@@ -55,22 +75,28 @@ pub(crate) async fn upload_blossom_blob(
     let descriptor = serde_json::from_slice::<BlossomBlobDescriptor>(&descriptor_body)
         .map_err(|_| AppError::BlobStore("upload returned an invalid descriptor".into()))?;
     if let Some(sha256) = descriptor.sha256.as_deref()
-        && sha256.to_ascii_lowercase() != encrypted_hash_hex
+        && sha256.to_ascii_lowercase() != blob_hash_hex
     {
         return Err(AppError::BlobStore(
-            "upload descriptor hash did not match encrypted blob".into(),
+            "upload descriptor hash did not match blob".into(),
         ));
     }
     let url = descriptor
         .url
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| blossom_blob_url(server, encrypted_hash_hex));
+        .unwrap_or_else(|| {
+            blossom_blob_url_with_extension(server, blob_hash_hex, fallback_extension)
+        });
+    let parsed_url = Url::parse(&url)
+        .map_err(|_| AppError::BlobStore("upload descriptor URL is invalid".into()))?;
+    validate_blossom_redirect_host(&upload_url, &parsed_url)
+        .map_err(|err| AppError::BlobStore(format!("unsafe upload descriptor host: {err}")))?;
     let content_hash = blossom_content_hash_from_url(&url).ok_or_else(|| {
-        AppError::BlobStore("upload descriptor URL did not include encrypted blob hash".into())
+        AppError::BlobStore("upload descriptor URL did not include blob hash".into())
     })?;
-    if content_hash != encrypted_hash_hex {
+    if content_hash != blob_hash_hex {
         return Err(AppError::BlobStore(
-            "upload descriptor URL hash did not match encrypted blob".into(),
+            "upload descriptor URL hash did not match blob".into(),
         ));
     }
     Ok(url)
@@ -355,18 +381,23 @@ fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
 }
 
 pub(crate) fn blossom_blob_url(server: &str, encrypted_hash_hex: &str) -> String {
+    blossom_blob_url_with_extension(server, encrypted_hash_hex, Some(".bin"))
+}
+
+fn blossom_blob_url_with_extension(
+    server: &str,
+    hash_hex: &str,
+    extension: Option<&str>,
+) -> String {
+    let suffix = extension.unwrap_or_default();
     match Url::parse(server.trim()) {
         Ok(mut url) => {
-            url.set_path(&format!("{encrypted_hash_hex}.bin"));
+            url.set_path(&format!("{hash_hex}{suffix}"));
             url.set_query(None);
             url.set_fragment(None);
             url.to_string()
         }
-        Err(_) => format!(
-            "{}/{}.bin",
-            server.trim_end_matches('/'),
-            encrypted_hash_hex
-        ),
+        Err(_) => format!("{}/{}{}", server.trim_end_matches('/'), hash_hex, suffix),
     }
 }
 

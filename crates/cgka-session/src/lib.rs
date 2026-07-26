@@ -347,6 +347,10 @@ impl AccountDeviceSession {
         Ok(key_package)
     }
 
+    pub fn durably_owned_key_packages(&self) -> SessionResult<Vec<KeyPackage>> {
+        Ok(self.engine.durably_owned_key_packages()?)
+    }
+
     pub fn key_package_metadata(
         &self,
         key_package: &KeyPackage,

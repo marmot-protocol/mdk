@@ -92,6 +92,10 @@ pub struct MarmotServiceEndpoints {
     pub relay_telemetry_otlp_endpoint: Option<String>,
     pub audit_log_tracker_endpoint: Option<String>,
     pub encrypted_media_blob_endpoints: Vec<String>,
+    /// Public, unencrypted profile-image upload endpoint. The resulting URL is
+    /// published in kind:0 metadata, so hosts with different privacy or
+    /// availability requirements should override the built-in service.
+    pub profile_image_blob_endpoint: Option<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -162,6 +166,9 @@ impl MarmotServiceEndpoints {
             encrypted_media_blob_endpoints: COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
                 .map(split_endpoint_list)
                 .unwrap_or_default(),
+            profile_image_blob_endpoint: Some(
+                crate::media::DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL.to_owned(),
+            ),
         }
         .normalize()
     }
@@ -171,6 +178,7 @@ impl MarmotServiceEndpoints {
         self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self.encrypted_media_blob_endpoints =
             normalize_endpoint_list(self.encrypted_media_blob_endpoints);
+        self.profile_image_blob_endpoint = trim_optional(self.profile_image_blob_endpoint);
         self
     }
 }

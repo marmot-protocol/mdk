@@ -54,6 +54,8 @@ pub struct UserProfileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nip05: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lud16: Option<String>,
@@ -252,6 +254,7 @@ pub(crate) fn profile_from_record(
                 .or_else(|| string_field(&content, "displayName")),
             about: string_field(&content, "about"),
             picture: string_field(&content, "picture"),
+            banner: string_field(&content, "banner"),
             nip05: string_field(&content, "nip05"),
             lud16: string_field(&content, "lud16"),
             created_at: record.event.created_at,
@@ -280,6 +283,7 @@ fn is_known_profile_field(field: &str) -> bool {
             | "displayName"
             | "about"
             | "picture"
+            | "banner"
             | "nip05"
             | "lud16"
             | "created_at"
@@ -423,6 +427,12 @@ pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json:
             serde_json::Value::String(picture.clone()),
         );
     }
+    if let Some(banner) = profile.banner.as_ref().filter(|value| !value.is_empty()) {
+        value.insert(
+            "banner".to_owned(),
+            serde_json::Value::String(banner.clone()),
+        );
+    }
     if let Some(nip05) = profile.nip05.as_ref().filter(|value| !value.is_empty()) {
         value.insert("nip05".to_owned(), serde_json::Value::String(nip05.clone()));
     }
@@ -539,5 +549,28 @@ mod tests {
             Some("alice[2Jadmin")
         );
         assert_eq!(string_field(&content, "about"), None);
+    }
+
+    #[test]
+    fn legacy_flattened_extra_banner_promotes_to_typed_field() {
+        // Before `banner` was typed, serde's flattened `extra` map wrote it at
+        // the profile's top level. New readers must promote that cached shape
+        // instead of losing it on the next profile update.
+        let cached: UserProfileMetadata = serde_json::from_value(serde_json::json!({
+            "name": "alice",
+            "banner": "https://example.test/banner.png",
+            "website": "https://example.test"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cached.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
+        assert_eq!(
+            cached.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert!(!cached.extra.contains_key("banner"));
     }
 }

@@ -1630,6 +1630,18 @@ fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam(
     assert!(legacy_error.to_string().contains("strict cutover"));
 }
 
+#[tokio::test]
+async fn freshly_generated_key_package_is_durably_owned_before_publication() {
+    let mut engine = build_current_client(b"fresh-owned-package");
+    let generated = engine.fresh_key_package().await.unwrap();
+
+    assert_eq!(
+        engine.durably_owned_key_packages().unwrap(),
+        vec![generated],
+        "generation must durably persist the private OpenMLS bundle before returning"
+    );
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn strict_cutover_compatibility_gate_enables_legacy_fixture_builds() {

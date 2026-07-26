@@ -211,6 +211,7 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
         relay_telemetry_otlp_endpoint: None,
         audit_log_tracker_endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
         encrypted_media_blob_endpoints: Vec::new(),
+        profile_image_blob_endpoint: None,
     });
     let app = MarmotApp::with_relay_and_config(tmp.path(), "wss://relay.example", config);
     app.set_audit_log_settings(AuditLogSettings {
