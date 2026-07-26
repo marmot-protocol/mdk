@@ -38,13 +38,15 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-la
 ```
 
 For repeatable noninteractive setup, pass the allowed inviter/welcomer and allowed
-message sender as either an `npub` or raw hex public key:
+message sender as either an `npub` or raw hex public key. `--allow-user` may be
+repeated to authorize multiple senders:
 
 ```sh
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
   bash -s -- --yes \
     --allow-welcomer npub1... \
-    --allow-user npub1...
+    --allow-user npub1... \
+    --allow-user 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 To accept Marmot messages from any sender (explicit opt-in):

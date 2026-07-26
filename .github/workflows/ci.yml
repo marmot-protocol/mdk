@@ -358,3 +358,53 @@ jobs:
 
       - name: Run Tamarin proofs
         run: make -C formal/tamarin prove
+
+  hermes-installer-auth:
+    name: Hermes installer auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3 python3-venv git
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - name: Hermes configure_gateway Python unit tests
+        run: |
+          set -euo pipefail
+          env -i HOME="$HOME" PATH="$PATH" USER="${USER:-runner}" \
+            python3 -m unittest discover -s integrations/hermes/marmot/tests -v
+
+      - name: Prepare isolated Hermes checkout for authorization E2E
+        run: |
+          set -euo pipefail
+          ./scripts/hermes_marmot_dev_setup.sh \
+            --root "$RUNNER_TEMP/hermes-installer-auth" \
+            --hermes-ref af8d698b418ede7dc8b078a8116510699ec94eb7
+
+      - name: Hermes installer unit and mock regressions
+        run: |
+          set -euo pipefail
+          bash -n scripts/install-hermes-marmot.sh
+          bash -n integrations/hermes/marmot/tests/test_installer_env.sh
+          bash -n scripts/hermes_marmot_deterministic_e2e.sh
+          python3 -m py_compile scripts/hermes_marmot_configure_gateway.py integrations/hermes/marmot/tests/e2e_gateway_auth.py
+          integrations/hermes/marmot/tests/test_dev_scripts.sh
+
+      - name: Real Hermes authorization and deterministic Marmot E2E
+        run: |
+          set -euo pipefail
+          # The deterministic runner sources the pinned dev root, runs
+          # test_installer_env.sh against its real GatewayRunner, then runs the
+          # adapter E2E. A missing Hermes venv is a hard failure, not a skip.
+          ./scripts/hermes_marmot_deterministic_e2e.sh --root "$RUNNER_TEMP/hermes-installer-auth"

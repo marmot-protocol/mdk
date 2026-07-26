@@ -23,6 +23,9 @@ USER_C = "33" * 32
 
 
 def load_module():
+    scripts_dir = str(SCRIPT_PATH.parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
     spec = importlib.util.spec_from_file_location(
         "hermes_marmot_configure_gateway",
         SCRIPT_PATH,
@@ -469,6 +472,13 @@ class ConfigureHermesEnvTests(unittest.TestCase):
                 )
             self.assertFalse((home / ".env").exists())
 
+    def test_rejects_blank_explicit_user(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            with self.assertRaises(ValueError):
+                self.module.validate_sender_auth_entries(["   "])
+            self.assertFalse((home / ".env").exists())
+
     def test_requires_explicit_auth_for_fresh_target(self):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
@@ -505,6 +515,28 @@ class ConfigureHermesEnvTests(unittest.TestCase):
 
         self.assertEqual(state.allowed_users_hex, [USER_A])
         self.assertTrue(state.allow_all_users)
+
+    def test_preserves_export_prefix_when_rewriting_managed_env_lines(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        f"export MARMOT_ALLOWED_USERS={USER_A}",
+                        "export MARMOT_ALLOW_ALL_USERS=false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.module.configure_hermes_env(
+                hermes_home=home,
+                add_allowed_users=[USER_B],
+            )
+            text = env_path.read_text(encoding="utf-8")
+
+        self.assertIn(f"export MARMOT_ALLOWED_USERS={USER_A},{USER_B}", text)
+        self.assertIn("export MARMOT_ALLOW_ALL_USERS=false", text)
 
     def test_reads_unquoted_inline_comments(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -612,6 +644,138 @@ class ConfigureHermesEnvTests(unittest.TestCase):
             self.assertFalse((home / ".env").exists())
 
 
+class ConfigureGatewayTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+
+    def test_invalid_bool_leaves_env_and_config_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            config_path = home / "config.yaml"
+            env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
+            config_original = "model: gpt-4o\n"
+            env_path.write_text(env_original, encoding="utf-8")
+            config_path.write_text(config_original, encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--home",
+                    str(home),
+                    "--configure-env",
+                    "--quiet",
+                    "--allow-user",
+                    USER_B,
+                    "--agent-home",
+                    str(home / "marmot-agent"),
+                    "--streaming",
+                    "maybe",
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(),
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertEqual(env_path.read_text(encoding="utf-8"), env_original)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), config_original)
+
+    def test_config_write_failure_restores_env_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            config_path = home / "config.yaml"
+            env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
+            config_original = "model: gpt-4o\n"
+            env_path.write_text(env_original, encoding="utf-8")
+            config_path.write_text(config_original, encoding="utf-8")
+            real_replace = os.replace
+            replace_calls = {"count": 0}
+
+            def replace_side_effect(src, dst, *args, **kwargs):
+                replace_calls["count"] += 1
+                if replace_calls["count"] == 2:
+                    raise OSError("replace failed")
+                return real_replace(src, dst, *args, **kwargs)
+
+            with mock.patch("os.replace", side_effect=replace_side_effect):
+                with self.assertRaises(OSError):
+                    self.module.commit_env_and_config_transaction(
+                        env_path=env_path,
+                        env_lines=[
+                            f"MARMOT_ALLOWED_USERS={USER_A},{USER_B}",
+                            "MARMOT_ALLOW_ALL_USERS=false",
+                        ],
+                        config_path=config_path,
+                        config_text="platforms: {}\n",
+                        config_backup=False,
+                    )
+            self.assertEqual(replace_calls["count"], 3)
+            self.assertEqual(env_path.read_text(encoding="utf-8"), env_original)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), config_original)
+            self.assertFalse(
+                config_path.with_suffix(config_path.suffix + ".tmp").exists()
+            )
+
+    def test_env_only_invalid_bool_leaves_env_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
+            env_path.write_text(env_original, encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--home",
+                    str(home),
+                    "--configure-env",
+                    "--quiet",
+                    "--allow-user",
+                    USER_B,
+                    "--streaming",
+                    "maybe",
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(),
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertEqual(env_path.read_text(encoding="utf-8"), env_original)
+
+    def test_malformed_existing_config_leaves_targets_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            env_path = home / ".env"
+            config_path = home / "config.yaml"
+            env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
+            config_original = "model: gpt-4o\nplatforms: <<\n"
+            env_path.write_text(env_original, encoding="utf-8")
+            config_path.write_text(config_original, encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--home",
+                    str(home),
+                    "--configure-env",
+                    "--quiet",
+                    "--allow-user",
+                    USER_B,
+                    "--agent-home",
+                    str(home / "marmot-agent"),
+                    "--streaming",
+                    "0",
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(),
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertEqual(env_path.read_text(encoding="utf-8"), env_original)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), config_original)
+
+
 class ConfigureGatewayEnvDryRunTests(unittest.TestCase):
     def test_env_dry_run_with_ambient_marmot_home_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -647,6 +811,47 @@ class ConfigureGatewayEnvDryRunTests(unittest.TestCase):
 
 
 class ConfigureGatewayCliTests(unittest.TestCase):
+    def _write_mock_curl(self, tempdir: Path) -> tuple[Path, Path]:
+        mock_bin = tempdir / "mock-bin"
+        mock_bin.mkdir()
+        curl_log = tempdir / "curl.log"
+        curl_log.write_text("", encoding="utf-8")
+        (mock_bin / "curl").write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env bash",
+                    "set -euo pipefail",
+                    'printf "%s\\n" "$2" >>"${CURL_LOG:?}"',
+                    "exit 0",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (mock_bin / "curl").chmod(0o755)
+        return mock_bin, curl_log
+
+    def _run_streamed_installer(
+        self,
+        tempdir: Path,
+        extra_args: list[str],
+        *,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = scrub_marmot_env(
+            {
+                "WN_AGENT_SHA": "9.9.9",
+                "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                **(env_extra or {}),
+            }
+        )
+        return subprocess.run(
+            ["bash", "-s", "--", *extra_args],
+            input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
     def test_skip_auth_requirement_flag_removed(self):
         completed = subprocess.run(
             [
@@ -662,10 +867,48 @@ class ConfigureGatewayCliTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("unrecognized arguments", completed.stderr)
 
+    def test_empty_allow_users_loops_are_guarded_for_bash_3_2(self):
+        source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        loop = 'for user in "${ALLOW_USERS[@]}"; do'
+        offsets = []
+        start = 0
+        while True:
+            offset = source.find(loop, start)
+            if offset == -1:
+                break
+            offsets.append(offset)
+            start = offset + len(loop)
+
+        self.assertGreater(len(offsets), 0)
+        for offset in offsets:
+            function_start = source.rfind("\n}", 0, offset) + 2
+            prefix = source[function_start:offset]
+            guarded = (
+                'if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then' in prefix
+                or (
+                    'if [ "${#ALLOW_USERS[@]}" -eq 0 ]; then' in prefix
+                    and "return" in prefix
+                )
+            )
+            self.assertTrue(
+                guarded,
+                f"unguarded Bash 3.2 empty-array expansion near byte {offset}",
+            )
+
+        strict_start = source.index("strict_validate_sender_auth_preflight()")
+        strict_end = source.index("\n}\n", strict_start)
+        strict_body = source[strict_start:strict_end]
+        self.assertIn(
+            '"${args[@]+"${args[@]}"}"',
+            strict_body,
+            "empty preflight args must use the Bash 3.2-compatible expansion",
+        )
+
     def test_installer_dry_run_accepts_allow_user(self):
         with tempfile.TemporaryDirectory() as tempdir:
             completed = subprocess.run(
                 [
+                    "bash",
                     str(INSTALL_SCRIPT),
                     "--dry-run",
                     "--yes",
@@ -687,6 +930,102 @@ class ConfigureGatewayCliTests(unittest.TestCase):
         output = completed.stdout + completed.stderr
         self.assertIn("would configure Marmot message-sender authorization", output)
         self.assertNotIn(USER_A, output)
+
+    def test_streamed_install_rejects_checksum_invalid_npub_before_download(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            mock_bin, curl_log = self._write_mock_curl(Path(tempdir))
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--no-service",
+                    "--allow-user",
+                    INVALID_NPUB,
+                ],
+                env_extra={
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "CURL_LOG": str(curl_log),
+                },
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            combined = completed.stdout + completed.stderr
+            self.assertNotIn("npub1qq", combined)
+            self.assertEqual(curl_log.read_text(encoding="utf-8"), "")
+            self.assertFalse((hermes_home / ".env").exists())
+            self.assertFalse((hermes_home / "plugins" / "marmot").exists())
+
+    def test_streamed_dry_run_accepts_valid_npub_without_helper(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--allow-user",
+                    NPUB_SAMPLE,
+                ],
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout + completed.stderr
+        self.assertIn("would configure Marmot message-sender authorization", output)
+        self.assertNotIn(NPUB_HEX, output)
+
+    def test_streamed_non_dry_rejects_blank_allow_user_before_download(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            mock_bin, curl_log = self._write_mock_curl(Path(tempdir))
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--no-service",
+                    "--allow-user",
+                    "   ",
+                ],
+                env_extra={
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "CURL_LOG": str(curl_log),
+                },
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(curl_log.read_text(encoding="utf-8"), "")
+            self.assertFalse((hermes_home / ".env").exists())
+            self.assertFalse((hermes_home / "plugins" / "marmot").exists())
+
+
+    def test_guided_tty_read_failure_aborts_without_looping(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "--hermes-home",
+                    str(hermes_home),
+                ],
+                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(
+                    {
+                        "WN_AGENT_SHA": "9.9.9",
+                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+                        "HERMES_INSTALLER_TEST_PROMPT_TTY": "/dev/null",
+                    }
+                ),
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        combined = completed.stdout + completed.stderr
+        self.assertIn("guided setup input is unavailable", combined)
 
     def test_installer_dry_run_rejects_bad_npub_without_helper(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -740,7 +1079,7 @@ class ConfigureGatewayCliTests(unittest.TestCase):
             )
         self.assertNotEqual(completed.returncode, 0)
 
-    def test_streamed_dry_run_rejects_existing_env_without_helper(self):
+    def test_streamed_dry_run_accepts_valid_existing_env_without_helper(self):
         with tempfile.TemporaryDirectory() as tempdir:
             hermes_home = Path(tempdir) / "hermes-home"
             hermes_home.mkdir()
@@ -748,30 +1087,62 @@ class ConfigureGatewayCliTests(unittest.TestCase):
                 f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n",
                 encoding="utf-8",
             )
-            completed = subprocess.run(
+            completed = self._run_streamed_installer(
+                Path(tempdir),
                 [
-                    "bash",
-                    "-s",
-                    "--",
                     "--dry-run",
                     "--yes",
                     "--hermes-home",
                     str(hermes_home),
                 ],
-                input=INSTALL_SCRIPT.read_text(encoding="utf-8"),
-                capture_output=True,
-                text=True,
-                env=scrub_marmot_env(
-                    {
-                        "WN_AGENT_SHA": "9.9.9",
-                        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
-                    }
-                ),
             )
-        self.assertNotEqual(completed.returncode, 0)
-        combined = completed.stdout + completed.stderr
-        self.assertIn("cannot strictly validate existing sender authorization", combined)
-        self.assertNotIn(USER_A, combined)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout + completed.stderr
+        self.assertIn("would preserve or update existing Marmot message-sender authorization", output)
+        self.assertNotIn(USER_A, output)
+
+    def test_streamed_non_dry_malformed_existing_env_fails_before_download(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            hermes_home.mkdir()
+            env_original = "MARMOT_ALLOWED_USERS=not-a-valid-user\n"
+            (hermes_home / ".env").write_text(env_original, encoding="utf-8")
+            mock_bin, curl_log = self._write_mock_curl(Path(tempdir))
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--no-service",
+                ],
+                env_extra={
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "CURL_LOG": str(curl_log),
+                },
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(curl_log.read_text(encoding="utf-8"), "")
+            self.assertEqual((hermes_home / ".env").read_text(encoding="utf-8"), env_original)
+            self.assertFalse((hermes_home / "plugins" / "marmot").exists())
+
+    def test_streamed_dry_run_valid_existing_env_preserves_bytes(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            hermes_home.mkdir()
+            env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
+            (hermes_home / ".env").write_text(env_original, encoding="utf-8")
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                ],
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((hermes_home / ".env").read_text(encoding="utf-8"), env_original)
 
     def test_streamed_install_fails_before_download_without_sender_auth(self):
         with tempfile.TemporaryDirectory() as tempdir:

@@ -108,6 +108,13 @@ def _validate_account_id(entry: str, *, label: str) -> str:
     return normalized
 
 
+def validate_sender_auth_entries(entries: list[str]) -> None:
+    for entry in entries:
+        if not str(entry).strip():
+            raise ValueError("invalid allowed user: empty value is not allowed")
+        _validate_account_id(entry, label="allowed user")
+
+
 def _parse_dotenv_scalar(raw_value: str) -> str:
     value = raw_value.strip()
     if not value:
@@ -157,13 +164,17 @@ def _managed_env_key(line: str) -> Optional[str]:
     return None
 
 
-def read_hermes_env_auth(env_path: Path) -> HermesEnvAuthState:
-    if not env_path.exists():
-        return HermesEnvAuthState(allowed_users_hex=[], allow_all_users=False)
+def _managed_env_export_prefix(line: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith("export "):
+        return "export "
+    return ""
 
+
+def read_hermes_env_auth_from_lines(lines: list[str]) -> HermesEnvAuthState:
     allowed_users: list[str] | None = None
     allow_all_users: bool | None = None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         key = _managed_env_key(line)
         if key is None:
             continue
@@ -183,6 +194,14 @@ def read_hermes_env_auth(env_path: Path) -> HermesEnvAuthState:
     )
 
 
+def read_hermes_env_auth(env_path: Path) -> HermesEnvAuthState:
+    if not env_path.exists():
+        return HermesEnvAuthState(allowed_users_hex=[], allow_all_users=False)
+    return read_hermes_env_auth_from_lines(
+        env_path.read_text(encoding="utf-8").splitlines()
+    )
+
+
 def _render_env_lines(
     *,
     existing_lines: list[str],
@@ -196,10 +215,12 @@ def _render_env_lines(
         "MARMOT_ALLOW_ALL_USERS": rendered_allow_all,
     }
     last_indices: dict[str, int] = {}
+    managed_prefixes: dict[str, str] = {}
     for index, line in enumerate(existing_lines):
         key = _managed_env_key(line)
         if key is not None:
             last_indices[key] = index
+            managed_prefixes[key] = _managed_env_export_prefix(line)
 
     output: list[str] = []
     seen: set[str] = set()
@@ -210,7 +231,7 @@ def _render_env_lines(
             continue
         if last_indices.get(key) != index:
             continue
-        output.append(managed_values[key])
+        output.append(f"{managed_prefixes.get(key, '')}{managed_values[key]}")
         seen.add(key)
 
     for key in MANAGED_ENV_KEYS:
@@ -247,7 +268,6 @@ def _write_env_atomically(env_path: Path, lines: list[str]) -> None:
                 owns_fd = False
             raise
         os.replace(tmp_path, env_path)
-        os.chmod(env_path, stat.S_IRUSR | stat.S_IWUSR)
     except Exception:
         if owns_fd:
             os.close(fd)
@@ -255,21 +275,19 @@ def _write_env_atomically(env_path: Path, lines: list[str]) -> None:
         raise
 
 
-def configure_hermes_env(
+def prepare_hermes_env(
     *,
     hermes_home: Path,
     add_allowed_users: list[str] | None = None,
     allow_all_opt_in: bool = False,
-    dry_run: bool = False,
-) -> HermesEnvAuthState:
+) -> tuple[HermesEnvAuthState, Path, list[str]]:
     env_path = hermes_home / ".env"
     existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    current = read_hermes_env_auth(env_path)
+    current = read_hermes_env_auth_from_lines(existing_lines)
 
     normalized_new = [
         _validate_account_id(entry, label="allowed user")
         for entry in (add_allowed_users or [])
-        if str(entry).strip()
     ]
     merged_users = sorted(dict.fromkeys([*current.allowed_users_hex, *normalized_new]))
     merged_allow_all = current.allow_all_users or allow_all_opt_in
@@ -286,11 +304,118 @@ def configure_hermes_env(
         allowed_users_hex=merged_users,
         allow_all_users=merged_allow_all,
     )
+    return (
+        HermesEnvAuthState(
+            allowed_users_hex=merged_users,
+            allow_all_users=merged_allow_all,
+        ),
+        env_path,
+        rendered_lines,
+    )
+
+
+def configure_hermes_env(
+    *,
+    hermes_home: Path,
+    add_allowed_users: list[str] | None = None,
+    allow_all_opt_in: bool = False,
+    dry_run: bool = False,
+) -> HermesEnvAuthState:
+    env_state, env_path, rendered_lines = prepare_hermes_env(
+        hermes_home=hermes_home,
+        add_allowed_users=add_allowed_users,
+        allow_all_opt_in=allow_all_opt_in,
+    )
     if not dry_run:
         _write_env_atomically(env_path, rendered_lines)
-    return HermesEnvAuthState(
-        allowed_users_hex=merged_users,
-        allow_all_users=merged_allow_all,
+    return env_state
+
+
+def _restore_path_bytes(path: Path, backup: bytes | None) -> None:
+    if backup is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.rollback.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp_path = Path(tmp_name)
+    owns_fd = True
+    try:
+        os.chmod(tmp_path, current_mode)
+        with os.fdopen(fd, "wb") as handle:
+            owns_fd = False
+            handle.write(backup)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if owns_fd:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def commit_env_and_config_transaction(
+    *,
+    env_path: Path | None,
+    env_lines: list[str] | None,
+    config_path: Path | None,
+    config_text: str | None,
+    config_backup: bool = True,
+) -> None:
+    env_backup = env_path.read_bytes() if env_path is not None and env_path.exists() else None
+    config_backup_bytes = (
+        config_path.read_bytes() if config_path is not None and config_path.exists() else None
+    )
+
+    wrote_env = False
+    wrote_config = False
+    config_tmp_path: Path | None = None
+    config_backup_path: Path | None = None
+    try:
+        if env_path is not None and env_lines is not None:
+            _write_env_atomically(env_path, env_lines)
+            wrote_env = True
+        if config_path is not None and config_text is not None:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_backup:
+                config_backup_path = _create_backup(config_path)
+            config_tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+            config_tmp_path.write_text(config_text, encoding="utf-8")
+            os.replace(config_tmp_path, config_path)
+            wrote_config = True
+    except Exception:
+        if wrote_env and env_path is not None:
+            _restore_path_bytes(env_path, env_backup)
+        if wrote_config and config_path is not None:
+            _restore_path_bytes(config_path, config_backup_bytes)
+        for cleanup_path in (config_tmp_path, config_backup_path):
+            if cleanup_path is None:
+                continue
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def print_env_summary(
+    *,
+    hermes_home: Path,
+    env_state: HermesEnvAuthState,
+    env_dry_run: bool,
+) -> None:
+    print(
+        "Hermes Marmot gateway env:"
+        f" path={hermes_home / '.env'}"
+        f" allowed_users={len(env_state.allowed_users_hex)}"
+        f" allow_all_users={str(env_state.allow_all_users).lower()}"
+        f" dry_run={str(env_dry_run).lower()}"
     )
 
 
@@ -480,7 +605,7 @@ def _create_backup(config_path: Path) -> Path | None:
     return backup_path
 
 
-def configure_gateway_config(
+def prepare_gateway_config(
     *,
     hermes_home: Path,
     platform: str,
@@ -496,8 +621,7 @@ def configure_gateway_config(
     welcomer_allowlist: list[str] | None = None,
     profile_name_onboarding: bool | None = None,
     configure_global_streaming: bool = False,
-    backup: bool = True,
-) -> Path:
+) -> tuple[Path, str]:
     if streaming_transport not in VALID_STREAMING_TRANSPORT:
         valid = ", ".join(sorted(VALID_STREAMING_TRANSPORT))
         raise ValueError(f"streaming transport must be one of: {valid}")
@@ -506,7 +630,6 @@ def configure_gateway_config(
         raise ValueError(f"tool progress must be one of: {valid}")
 
     config_path = hermes_home / "config.yaml"
-    hermes_home.mkdir(parents=True, exist_ok=True)
     config = load_config(config_path)
     effective_streaming = streaming_enabled and streaming_transport != "off"
 
@@ -543,11 +666,50 @@ def configure_gateway_config(
     platform_config["long_running_notifications"] = long_running_notifications
     platform_config["busy_ack_detail"] = busy_ack_detail
 
-    if backup:
-        _create_backup(config_path)
-    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    tmp_path.write_text(dump_config(config), encoding="utf-8")
-    os.replace(tmp_path, config_path)
+    return config_path, dump_config(config)
+
+
+def configure_gateway_config(
+    *,
+    hermes_home: Path,
+    platform: str,
+    streaming_enabled: bool,
+    streaming_transport: str,
+    tool_progress: str,
+    interim_assistant_messages: bool,
+    long_running_notifications: bool,
+    busy_ack_detail: bool,
+    agent_home: Path | None = None,
+    socket_path: Path | None = None,
+    account_id_hex: str | None = None,
+    welcomer_allowlist: list[str] | None = None,
+    profile_name_onboarding: bool | None = None,
+    configure_global_streaming: bool = False,
+    backup: bool = True,
+) -> Path:
+    config_path, config_text = prepare_gateway_config(
+        hermes_home=hermes_home,
+        platform=platform,
+        streaming_enabled=streaming_enabled,
+        streaming_transport=streaming_transport,
+        tool_progress=tool_progress,
+        interim_assistant_messages=interim_assistant_messages,
+        long_running_notifications=long_running_notifications,
+        busy_ack_detail=busy_ack_detail,
+        agent_home=agent_home,
+        socket_path=socket_path,
+        account_id_hex=account_id_hex,
+        welcomer_allowlist=welcomer_allowlist,
+        profile_name_onboarding=profile_name_onboarding,
+        configure_global_streaming=configure_global_streaming,
+    )
+    commit_env_and_config_transaction(
+        env_path=None,
+        env_lines=None,
+        config_path=config_path,
+        config_text=config_text,
+        config_backup=backup,
+    )
     return config_path
 
 
@@ -631,43 +793,9 @@ def main(argv: list[str] | None = None) -> int:
         allowed_users: list[str] = []
         for value in args.allow_user:
             allowed_users.extend(value.split(","))
-        env_state: HermesEnvAuthState | None = None
-        if args.configure_env or allowed_users or args.allow_all_users:
-            env_state = configure_hermes_env(
-                hermes_home=hermes_home,
-                add_allowed_users=allowed_users,
-                allow_all_opt_in=args.allow_all_users,
-                dry_run=args.env_dry_run,
-            )
 
-        if args.configure_env and args.env_dry_run:
-            if not args.quiet and env_state is not None:
-                print(
-                    "Hermes Marmot gateway env:"
-                    f" path={hermes_home / '.env'}"
-                    f" allowed_users={len(env_state.allowed_users_hex)}"
-                    f" allow_all_users={str(env_state.allow_all_users).lower()}"
-                    f" dry_run={str(args.env_dry_run).lower()}"
-                )
-            return 0
-
-        if args.configure_env and not (
-            args.agent_home
-            or args.socket_path
-            or args.account_id_hex
-            or args.welcomer_allowlist
-            or args.profile_name_onboarding is not None
-            or args.configure_global_streaming
-        ):
-            if not args.quiet and env_state is not None:
-                print(
-                    "Hermes Marmot gateway env:"
-                    f" path={hermes_home / '.env'}"
-                    f" allowed_users={len(env_state.allowed_users_hex)}"
-                    f" allow_all_users={str(env_state.allow_all_users).lower()}"
-                    f" dry_run={str(args.env_dry_run).lower()}"
-                )
-            return 0
+        if allowed_users:
+            validate_sender_auth_entries(allowed_users)
 
         streaming_enabled = parse_bool(args.streaming, name="streaming")
         interim_assistant_messages = parse_bool(
@@ -687,6 +815,47 @@ def main(argv: list[str] | None = None) -> int:
                 name="profile name onboarding",
             )
         )
+
+        env_state: HermesEnvAuthState | None = None
+        env_prepared: tuple[Path, list[str]] | None = None
+        needs_env = args.configure_env or allowed_users or args.allow_all_users
+        if needs_env:
+            env_state, env_path, env_lines = prepare_hermes_env(
+                hermes_home=hermes_home,
+                add_allowed_users=allowed_users,
+                allow_all_opt_in=args.allow_all_users,
+            )
+            if not (args.configure_env and args.env_dry_run):
+                env_prepared = (env_path, env_lines)
+
+        if args.configure_env and args.env_dry_run:
+            if not args.quiet and env_state is not None:
+                print_env_summary(
+                    hermes_home=hermes_home,
+                    env_state=env_state,
+                    env_dry_run=args.env_dry_run,
+                )
+            return 0
+
+        env_only = args.configure_env and not (
+            args.agent_home
+            or args.socket_path
+            or args.account_id_hex
+            or args.welcomer_allowlist
+            or args.profile_name_onboarding is not None
+            or args.configure_global_streaming
+        )
+        if env_only:
+            if env_prepared is not None:
+                _write_env_atomically(env_prepared[0], env_prepared[1])
+            if not args.quiet and env_state is not None:
+                print_env_summary(
+                    hermes_home=hermes_home,
+                    env_state=env_state,
+                    env_dry_run=args.env_dry_run,
+                )
+            return 0
+
         welcomer_allowlist = []
         env_allowlist = os.environ.get("MARMOT_WELCOMER_ALLOWLIST") or os.environ.get(
             "MARMOT_DM_ALLOW_FROM"
@@ -695,7 +864,7 @@ def main(argv: list[str] | None = None) -> int:
             welcomer_allowlist.extend(env_allowlist.split(","))
         for value in args.welcomer_allowlist:
             welcomer_allowlist.extend(value.split(","))
-        config_path = configure_gateway_config(
+        config_path, config_text = prepare_gateway_config(
             hermes_home=hermes_home,
             platform=args.platform,
             streaming_enabled=streaming_enabled,
@@ -710,8 +879,23 @@ def main(argv: list[str] | None = None) -> int:
             welcomer_allowlist=welcomer_allowlist,
             profile_name_onboarding=profile_name_onboarding,
             configure_global_streaming=args.configure_global_streaming,
-            backup=not args.no_backup,
         )
+        if env_prepared is not None:
+            commit_env_and_config_transaction(
+                env_path=env_prepared[0],
+                env_lines=env_prepared[1],
+                config_path=config_path,
+                config_text=config_text,
+                config_backup=not args.no_backup,
+            )
+        else:
+            commit_env_and_config_transaction(
+                env_path=None,
+                env_lines=None,
+                config_path=config_path,
+                config_text=config_text,
+                config_backup=not args.no_backup,
+            )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -729,12 +913,10 @@ def main(argv: list[str] | None = None) -> int:
             f" global_streaming={str(args.configure_global_streaming).lower()}"
         )
         if env_state is not None:
-            print(
-                "Hermes Marmot gateway env:"
-                f" path={hermes_home / '.env'}"
-                f" allowed_users={len(env_state.allowed_users_hex)}"
-                f" allow_all_users={str(env_state.allow_all_users).lower()}"
-                f" dry_run={str(args.env_dry_run).lower()}"
+            print_env_summary(
+                hermes_home=hermes_home,
+                env_state=env_state,
+                env_dry_run=args.env_dry_run,
             )
     return 0
 

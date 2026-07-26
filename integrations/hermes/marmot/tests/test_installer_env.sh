@@ -277,6 +277,56 @@ run_installer "$case_root" --allow-user "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
 [ "$malformed_explicit_status" -ne 0 ]
 [ ! -f "$case_root/hermes-home/.env" ]
 
+case_root="$fixture_root/streamed-malformed-npub"
+streamed_bad_status=0
+run_streamed_installer "$case_root" --allow-user "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" >/dev/null 2>&1 || streamed_bad_status=$?
+[ "$streamed_bad_status" -ne 0 ]
+assert_curl_not_called
+[ ! -f "$case_root/hermes-home/.env" ]
+[ ! -d "$case_root/hermes-home/plugins/marmot" ]
+
+case_root="$fixture_root/streamed-blank-allow-user"
+streamed_blank_status=0
+run_streamed_installer "$case_root" --allow-user "   " >/dev/null 2>&1 || streamed_blank_status=$?
+[ "$streamed_blank_status" -ne 0 ]
+assert_curl_not_called
+[ ! -f "$case_root/hermes-home/.env" ]
+
+case_root="$fixture_root/guided-no-continues"
+mkdir -p "$case_root"
+guided_log="$case_root/guided.log"
+if command -v script >/dev/null 2>&1 \
+    && command -v timeout >/dev/null 2>&1 \
+    && script --version 2>&1 | grep -qi 'util-linux'; then
+    printf '\n\n\nn\n' | timeout 10s script -qefc \
+        "env -i HOME='$case_root/home' HERMES_HOME='$case_root/hermes-home' PATH=/usr/bin:/bin WN_AGENT_SHA=9.9.9 MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test bash '$installer' --dry-run --hermes-home '$case_root/hermes-home' --allow-welcomer '$user_a'" \
+        /dev/null >"$guided_log" 2>&1 || true
+    grep -Fq "Allow Marmot messages from any sender?" "$guided_log"
+else
+    echo "skip: guided prompt integration (util-linux script(1) and timeout required)"
+fi
+
+case_root="$fixture_root/allow-all-users"
+run_installer "$case_root" --allow-all-users
+env_file="$case_root/hermes-home/.env"
+[ -f "$env_file" ]
+assert_env_contains "$env_file" "MARMOT_ALLOW_ALL_USERS=true"
+
+case_root="$fixture_root/streamed-reinstall-preserves-existing-auth"
+mkdir -p "$case_root/hermes-home"
+env_file="$case_root/hermes-home/.env"
+printf '%s\n' \
+    "MARMOT_ALLOWED_USERS=$user_a" \
+    "MARMOT_ALLOW_ALL_USERS=false" \
+    >"$env_file"
+before="$(cat "$env_file")"
+run_streamed_installer "$case_root" --force
+after_first="$(cat "$env_file")"
+run_streamed_installer "$case_root" --force
+after_second="$(cat "$env_file")"
+[ "$before" = "$after_first" ]
+[ "$before" = "$after_second" ]
+
 case_root="$fixture_root/fresh-streamed-fail-early"
 fresh_status=0
 run_streamed_installer "$case_root" >/dev/null 2>&1 || fresh_status=$?
@@ -329,6 +379,8 @@ if [ -n "$hermes_repo" ] && [ -x "$hermes_repo/.venv/bin/hermes" ] && [ -x "$her
             exit 1
             ;;
     esac
+else
+    echo "skip: real Hermes gateway authorization E2E (set HERMES_AGENT_REPO to an isolated checkout with .venv/bin/hermes)"
 fi
 
 echo "installer env test passed"

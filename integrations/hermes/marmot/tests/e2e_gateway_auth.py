@@ -34,9 +34,16 @@ def main() -> int:
     from gateway.session import SessionSource
 
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {}
-    runner.pairing_store = None
-    runner.pairing_stores = {}
+    try:
+        runner.adapters = {}
+        runner.pairing_store = None
+        runner.pairing_stores = {}
+    except AttributeError:
+        print(
+            "error: Hermes GatewayRunner internals changed; update e2e_gateway_auth.py",
+            file=sys.stderr,
+        )
+        return 3
 
     allowed_source = SessionSource(
         platform=Platform("marmot"),
@@ -51,8 +58,15 @@ def main() -> int:
         user_id=unknown_hex,
     )
 
-    allowed_ok = runner._is_user_authorized(allowed_source)
-    unknown_ok = runner._is_user_authorized(unknown_source)
+    try:
+        allowed_ok = runner._is_user_authorized(allowed_source)
+        unknown_ok = runner._is_user_authorized(unknown_source)
+    except AttributeError:
+        print(
+            "error: Hermes GatewayRunner authorization hook changed; update e2e_gateway_auth.py",
+            file=sys.stderr,
+        )
+        return 3
 
     print(f"allowed={str(allowed_ok).lower()} unknown={str(unknown_ok).lower()}")
     return 0 if allowed_ok and not unknown_ok else 1
