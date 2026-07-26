@@ -1646,13 +1646,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         chat_id = _normalize_hex(chat_id, "chat_id")
         visible_content = self._strip_streaming_cursor(content)
         if finalize and _delivery_routes_to_commentary_activity(metadata):
-            await self._cancel_stream(chat_id, message_id, stream, "non-final commentary")
-            return await self._send_commentary_activity(
+            result = await self._send_commentary_activity(
                 chat_id,
                 visible_content,
                 reply_to=stream.parent_message_id_hex,
                 metadata=metadata,
+                preserve_stream=stream,
             )
+            if result.success:
+                await self._cancel_stream(chat_id, message_id, stream, "non-final commentary")
+            return result
         try:
             await stream.append_replacement(visible_content)
             if not finalize:
@@ -2264,6 +2267,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        preserve_stream: Optional[MarmotLiveStream] = None,
     ) -> SendResult:
         if not str(text or "").strip():
             return SendResult(success=True)
@@ -2271,7 +2275,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         stream = self._last_chat_stream.get(chat_id)
         if reply_to_message_id_hex is None and stream is not None:
             reply_to_message_id_hex = stream.parent_message_id_hex
-        await self._cancel_other_chat_streams(chat_id, reason="non-final commentary")
+        await self._cancel_other_chat_streams(
+            chat_id,
+            reason="non-final commentary",
+            keep=preserve_stream,
+        )
         try:
             response = await self._send_agent_activity_event(
                 chat_id,
@@ -3295,12 +3303,12 @@ def _delivery_class(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     return text or None
 
 
-def _delivery_is_turn_final(metadata: Optional[Dict[str, Any]]) -> bool:
+def _delivery_explicit_turn_final(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
     for key in ("is_turn_final", "turn_final"):
         value = _metadata_dict_value(metadata, key)
         if value is not None:
             return _config_bool(value, default=True)
-    return True
+    return None
 
 
 _DURABLE_DELIVERY_CLASSES = frozenset({"final", "approval"})
@@ -3308,14 +3316,15 @@ _COMMENTARY_DELIVERY_CLASSES = frozenset({"commentary"})
 
 
 def _delivery_routes_to_commentary_activity(metadata: Optional[Dict[str, Any]]) -> bool:
+    explicit = _delivery_explicit_turn_final(metadata)
+    if explicit is not None:
+        return not explicit
     delivery_class = _delivery_class(metadata)
-    if delivery_class in _DURABLE_DELIVERY_CLASSES:
-        return False
     if delivery_class in _COMMENTARY_DELIVERY_CLASSES:
         return True
-    if delivery_class is not None:
+    if delivery_class in _DURABLE_DELIVERY_CLASSES:
         return False
-    return not _delivery_is_turn_final(metadata)
+    return False
 
 
 def _reply_to_from_send_context(
