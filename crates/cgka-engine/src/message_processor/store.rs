@@ -30,6 +30,20 @@ impl<S: StorageProvider> Engine<S> {
             MessageState::Sent => IngestOutcome::Ignored {
                 category: InputRejectionCategory::OwnEcho,
             },
+            MessageState::Created | MessageState::Retryable
+                if crate::openmls_projection::decode_openmls_wire_projection(&record.payload)
+                    .is_some_and(|(_, projection)| {
+                        projection.kind == crate::openmls_projection::OpenMlsContentKind::Proposal
+                    }) =>
+            {
+                // Retained standalone proposals stay Created/Retryable until
+                // convergence consumes or invalidates them, but byte-identical
+                // transport repeats are still duplicates. Internal replay
+                // bypasses this outer durable-dedup seam.
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
+                }
+            }
             MessageState::Created | MessageState::Retryable => IngestOutcome::Buffered {
                 group_id: record.group_id,
                 epoch: record.epoch,

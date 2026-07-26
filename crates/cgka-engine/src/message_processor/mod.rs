@@ -479,6 +479,41 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, scheduled| &scheduled.group_id != group_id);
     }
 
+    /// Rebuild the in-memory jitter edges for durable current-epoch proposal
+    /// rows. Replay performs the authenticated SelfRemove/type/authorization
+    /// checks before staging; this scan only restores wakeups lost at restart
+    /// or after publish rollback.
+    pub(crate) fn restore_self_remove_auto_commit_schedules_for_group(
+        &mut self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        now_ms: u64,
+    ) -> Result<bool, EngineError> {
+        let mut restored = false;
+        for record in self.storage.list_messages(group_id, source_epoch)? {
+            if record.epoch != source_epoch
+                || !matches!(
+                    record.state,
+                    MessageState::Created | MessageState::Retryable | MessageState::Processed
+                )
+            {
+                continue;
+            }
+            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
+            else {
+                continue;
+            };
+            if projection.kind != crate::openmls_projection::OpenMlsContentKind::Proposal
+                || projection.source_epoch != Some(source_epoch.0)
+            {
+                continue;
+            }
+            self.schedule_self_remove_auto_commit(group_id, &record.id, source_epoch, now_ms)?;
+            restored = true;
+        }
+        Ok(restored)
+    }
+
     fn self_remove_auto_commit_jitter_ms(
         &self,
         group_id: &GroupId,

@@ -346,6 +346,13 @@ impl<S: StorageProvider> Engine<S> {
             .transpose()?;
 
         let has_pending_commit = mls_group.pending_commit().is_some();
+        let pending_was_self_remove_only = mls_group.pending_commit().is_some_and(|staged| {
+            let mut count = 0usize;
+            staged.queued_proposals().all(|queued| {
+                count += 1;
+                matches!(queued.proposal(), openmls::prelude::Proposal::SelfRemove)
+            }) && count > 0
+        });
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 if has_pending_commit {
@@ -354,6 +361,18 @@ impl<S: StorageProvider> Engine<S> {
                     mls_group
                         .clear_pending_commit(tx_provider.storage())
                         .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    if pending_was_self_remove_only {
+                        // Auto-commit preparation started from an empty
+                        // OpenMLS proposal store and queued only its selected
+                        // SelfRemove references. Drop that staging residue so
+                        // the durable retained-message scan can deterministically
+                        // rebuild the same selection after publish failure.
+                        mls_group
+                            .clear_pending_proposals(tx_provider.storage())
+                            .map_err(|e| {
+                                EngineError::Backend(format!("clear_pending_proposals: {e:?}"))
+                            })?;
+                    }
                 }
 
                 // Re-derive the Marmot projection in the same durable unit as the
@@ -417,6 +436,11 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(&queued_group_id);
         }
         self.forget_pending_commit_for_recovery(pending)?;
+        self.restore_self_remove_auto_commit_schedules_for_group(
+            &group_id,
+            prior_epoch,
+            self.convergence_now_ms(),
+        )?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
     }

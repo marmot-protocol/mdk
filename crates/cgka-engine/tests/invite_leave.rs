@@ -27,10 +27,14 @@ use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
-use openmls::prelude::{BasicCredential, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
+use openmls::prelude::{
+    BasicCredential, LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use sha2::Digest as _;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
 
@@ -236,6 +240,110 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = build_client_on_storage(id, storage.clone());
     (engine, storage)
+}
+
+fn load_group_and_signer(
+    storage: &SqliteAccountStorage,
+    member: &MemberId,
+    group_id: &GroupId,
+) -> (MlsGroup, SignatureKeyPair) {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load group")
+        .expect("group present");
+    let binding = storage
+        .account_device_signer(member)
+        .expect("signer binding")
+        .expect("signer binding present");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer present");
+    (mls_group, signer)
+}
+
+fn proposal_transport(message: MlsMessageOut, group_id: &GroupId) -> TransportMessage {
+    let payload = message
+        .tls_serialize_detached()
+        .expect("serialize proposal MLSMessage");
+    TransportMessage {
+        id: MessageId::new(sha2::Sha256::digest(&payload).to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-proposal".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn raw_self_remove_proposal(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    aad: &[u8],
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let (mut group, signer) = load_group_and_signer(storage, sender, group_id);
+    group.set_aad(aad.to_vec());
+    let message = group
+        .leave_group_via_self_remove(&provider, &signer)
+        .expect("build SelfRemove proposal");
+    proposal_transport(message, group_id)
+}
+
+fn raw_self_update_proposal(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let (mut group, signer) = load_group_and_signer(storage, sender, group_id);
+    let (message, _) = group
+        .propose_self_update(&provider, &signer, LeafNodeParameters::default())
+        .expect("build self-update proposal");
+    proposal_transport(message, group_id)
+}
+
+fn proposal_reference_for(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    proposal: &TransportMessage,
+) -> Vec<u8> {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load observer group")
+        .expect("observer group present");
+    let message = MlsMessageIn::tls_deserialize_exact(proposal.payload.as_slice())
+        .expect("deserialize proposal");
+    let protocol: ProtocolMessage = match message.extract() {
+        MlsMessageBodyIn::PrivateMessage(private) => private.into(),
+        MlsMessageBodyIn::PublicMessage(public) => public.into(),
+        other => panic!("expected handshake message, got {other:?}"),
+    };
+    let processed = group
+        .process_message(&provider, protocol)
+        .expect("process proposal");
+    let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content() else {
+        panic!("expected queued proposal");
+    };
+    queued
+        .proposal_reference_ref()
+        .tls_serialize_detached()
+        .expect("serialize proposal ref")
 }
 
 fn clone_key_package_for_invite(kp: &KeyPackage) -> openmls::prelude::KeyPackage {
@@ -1995,6 +2103,232 @@ async fn engine_rejects_malformed_local_credential_identity_at_build() {
 // ── Leave (MIP-03 SelfRemove) ───────────────────────────────────────────────
 
 #[tokio::test]
+async fn selfremove_local_selection_uses_lowest_complete_message_digest_after_restart() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let (mut carol, carol_storage) = build_with_storage(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove digest selection".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let mut welcomes = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // Distinct authenticated-data bytes produce distinct complete serialized
+    // handshake MLSMessages carrying the same leaf-scoped SelfRemove.
+    let first = raw_self_remove_proposal(&bob_storage, &bob.self_id(), &group_id, b"variant-a");
+    let second = raw_self_remove_proposal(&bob_storage, &bob.self_id(), &group_id, b"variant-b");
+    assert_ne!(first.payload, second.payload);
+    let (lowest, highest) =
+        if sha2::Sha256::digest(&first.payload) < sha2::Sha256::digest(&second.payload) {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+    let expected_ref = proposal_reference_for(&carol_storage, &group_id, lowest);
+
+    // Deliberately ingest the higher digest first. Startup must reconstruct the
+    // scheduling edge from durable rows and make the same local choice.
+    for proposal in [highest, lowest] {
+        assert!(matches!(
+            alice.ingest(proposal.clone()).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+    }
+    assert!(matches!(
+        alice.ingest(highest.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        }
+    ));
+    drop(alice);
+    let mut alice = build_client_on_storage(b"alice", alice_storage.clone());
+    alice.hydrate_stable_groups_from_storage().unwrap();
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let group = MlsGroup::load(provider.storage(), &mls_gid)
+        .unwrap()
+        .unwrap();
+    let staged = group.pending_commit().expect("SelfRemove commit staged");
+    let refs: Vec<_> = staged
+        .queued_proposals()
+        .map(|queued| {
+            queued
+                .proposal_reference_ref()
+                .tls_serialize_detached()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(refs, vec![expected_ref]);
+    assert_eq!(alice.drain_auto_publish().len(), 1);
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "pending local selection must not produce a duplicate commit"
+    );
+}
+
+#[tokio::test]
+async fn non_selected_selfremove_alternative_remains_processable_by_peer_commit() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove alternative retention".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let mut welcomes = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    let first = raw_self_remove_proposal(&bob_storage, &bob.self_id(), &group_id, b"variant-a");
+    let second = raw_self_remove_proposal(&bob_storage, &bob.self_id(), &group_id, b"variant-b");
+    let (lowest, alternative) =
+        if sha2::Sha256::digest(&first.payload) < sha2::Sha256::digest(&second.payload) {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+    assert!(matches!(
+        alice.ingest(lowest.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(matches!(
+        alice.ingest(alternative.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+
+    // Carol sees only the higher-digest alternative and validly references it.
+    assert!(matches!(
+        carol.ingest(alternative.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    advance_selfremove_auto_commit(&mut carol, &group_id).await;
+    let mut peer_publish = carol.drain_auto_publish();
+    assert_eq!(peer_publish.len(), 1);
+    let peer_publish = peer_publish.remove(0);
+    let peer_commit = peer_publish.msg.clone();
+    carol.confirm_published(peer_publish.pending).await.unwrap();
+
+    // Alice's own local rule would choose `lowest`, but the peer's valid
+    // alternative remains retained for proposal-reference replay.
+    assert!(matches!(
+        alice.ingest(peer_commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    converge_buffered_commit(&mut alice, &group_id);
+    assert!(
+        alice
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .all(|member| member.id != bob.self_id()),
+        "peer commit referencing the non-selected alternative must remove bob"
+    );
+}
+
+#[tokio::test]
+async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_proposals() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let (mut carol, carol_storage) = build_with_storage(b"carol");
+    let (mut dave, dave_storage) = build_with_storage(b"dave");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove multiple leaves".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp, dave_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let mut welcomes = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    dave.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    let unrelated = raw_self_update_proposal(&dave_storage, &dave.self_id(), &group_id);
+    let bob_leave = raw_self_remove_proposal(&bob_storage, &bob.self_id(), &group_id, b"bob-leave");
+    let carol_leave =
+        raw_self_remove_proposal(&carol_storage, &carol.self_id(), &group_id, b"carol-leave");
+    for proposal in [unrelated, bob_leave, carol_leave] {
+        assert!(matches!(
+            alice.ingest(proposal).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+    }
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let group = MlsGroup::load(provider.storage(), &mls_gid)
+        .unwrap()
+        .unwrap();
+    let staged = group.pending_commit().expect("SelfRemove commit staged");
+    let proposals: Vec<_> = staged.queued_proposals().collect();
+    assert_eq!(proposals.len(), 2);
+    assert!(
+        proposals
+            .iter()
+            .all(|queued| matches!(queued.proposal(), Proposal::SelfRemove))
+    );
+}
+
+#[tokio::test]
 async fn selfremove_full_flow_with_auto_commit() {
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome
@@ -2542,6 +2876,13 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
     assert!(
         !emits_departure_of(&events, &bob.self_id()),
         "failed auto-publish must not emit a departure; got {events:?}"
+    );
+
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    assert_eq!(
+        alice.drain_auto_publish().len(),
+        1,
+        "publish failure must leave the retained SelfRemove eligible for retry"
     );
 }
 

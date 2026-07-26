@@ -54,10 +54,10 @@ pub(crate) struct PendingCommitCleanupGuard<S: StorageProvider> {
     // caller created one. `None` for paths that stage a commit without a
     // snapshot (e.g. group creation).
     snapshot_name: Option<String>,
-    // Proposal this staging attempt stored via `store_pending_proposal`, to
-    // remove from the OpenMLS proposal store on Drop. `None` for the send
-    // paths, which commit proposals they did not store themselves.
-    stored_proposal_ref: Option<ProposalRef>,
+    // Proposals this staging attempt stored via `store_pending_proposal`, to
+    // remove from the OpenMLS proposal store on Drop. Empty for send paths,
+    // which commit proposals they did not store themselves.
+    stored_proposal_refs: Vec<ProposalRef>,
     armed: bool,
 }
 
@@ -77,7 +77,7 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
             mls_storage: provider.storage() as *const S::Mls,
             group_id,
             snapshot_name: None,
-            stored_proposal_ref: None,
+            stored_proposal_refs: Vec::new(),
             armed: true,
         }
     }
@@ -95,7 +95,7 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
     /// OpenMLS 0.8.1 panics when a later `remove_members` commit filters a
     /// leftover SelfRemove proposal against a Remove for the same leaf.
     pub(crate) fn set_stored_proposal_ref(&mut self, proposal_ref: ProposalRef) {
-        self.stored_proposal_ref = Some(proposal_ref);
+        self.stored_proposal_refs.push(proposal_ref);
     }
 
     /// The staged commit (and its snapshot) is now tracked by `EpochManager`
@@ -180,17 +180,17 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
         // snapshot decision below: a proposal that is already gone is benign
         // (`clear_pending_commit` does not remove stored proposals, but a
         // concurrent merge would have consumed it).
-        if let (Some(mls_group), Some(proposal_ref)) =
-            (loaded_group.as_mut(), self.stored_proposal_ref.as_ref())
-        {
-            match mls_group.remove_pending_proposal(mls_storage, proposal_ref) {
-                Ok(()) | Err(RemoveProposalError::ProposalNotFound) => {}
-                Err(_e) => {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "drop",
-                        "pending commit guard could not remove stored proposal"
-                    );
+        if let Some(mls_group) = loaded_group.as_mut() {
+            for proposal_ref in &self.stored_proposal_refs {
+                match mls_group.remove_pending_proposal(mls_storage, proposal_ref) {
+                    Ok(()) | Err(RemoveProposalError::ProposalNotFound) => {}
+                    Err(_e) => {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            method = "drop",
+                            "pending commit guard could not remove stored proposal"
+                        );
+                    }
                 }
             }
         }
