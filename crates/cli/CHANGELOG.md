@@ -7,6 +7,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-07-26
+
 ### Fixed
 
 - Agent text-stream QUIC starts now accept zero broker candidates for durable
@@ -16,6 +18,22 @@ versioning through the workspace version in the root `Cargo.toml`.
   reconnect, or daemon reuse cannot restart at sequence 1 for one start.
   Zero-candidate daemon compose returns a `streaming` payload with
   `candidate: ""` for TUI and script consumers instead of failing the start.
+- KeyPackage deletion during sign-out, wipe, and explicit deletion now uses one
+  scoped, account-bound relay connection set for the complete batch instead of
+  cold-connecting a throwaway client for every deletion event. Relay
+  acknowledgement and local-cache removal remain tracked per event.
+- The Hermes plugin now maps explicitly non-final assistant commentary to
+  durable kind-1201 agent activity while retaining kind-9 delivery for final
+  answers and compatibility with Hermes versions that do not yet provide
+  delivery metadata.
+
+### Security
+
+- Updated `quinn-proto` and `crossbeam-epoch` to patched releases, clearing the
+  active RustSec vulnerabilities in the QUIC and OpenMLS dependency paths.
+  Also removed the remaining unsoundness and yanked-package findings without
+  adding audit ignores; unmaintained-only dependencies remain tracked in
+  issue #1116.
 
 ## [0.9.6] - 2026-07-26
 
@@ -721,7 +739,9 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/marmot-protocol/mdk/compare/v0.9.6...v0.9.7
+[0.9.6]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/marmot-protocol/mdk/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/marmot-protocol/mdk/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/marmot-protocol/mdk/releases/tag/v0.9.3
