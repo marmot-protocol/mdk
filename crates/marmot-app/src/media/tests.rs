@@ -455,6 +455,53 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
 }
 
 #[tokio::test]
+async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
+    let signer = signing_keys();
+    let svg = upload_profile_image(
+        b"<svg/>",
+        "image/svg+xml",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        svg.to_string(),
+        "blob store request failed: profile image must be JPEG, PNG, WebP, or GIF"
+    );
+
+    let oversized = vec![0_u8; MAX_PROFILE_IMAGE_BYTES + 1];
+    let error = upload_profile_image(
+        &oversized,
+        "image/png",
+        Some("https://blossom.example"),
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image exceeds 10 MiB limit"
+    );
+}
+
+#[tokio::test]
+async fn profile_image_upload_rejects_empty_inputs_before_network() {
+    let error = upload_profile_image(
+        &[],
+        "image/jpeg",
+        Some("https://blossom.example"),
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image cannot be empty"
+    );
+}
+
+#[tokio::test]
 async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
     let first = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let second = spawn_http_response(http_status_response(502, "Bad Gateway"));

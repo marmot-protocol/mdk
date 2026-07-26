@@ -640,14 +640,11 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
             UserProfileMetadata {
                 name: Some("first".to_owned()),
                 display_name: Some("First".to_owned()),
+                banner: Some("https://example.test/banner.png".to_owned()),
                 extra: std::collections::BTreeMap::from([
                     (
                         "website".to_owned(),
                         serde_json::json!("https://example.test"),
-                    ),
-                    (
-                        "banner".to_owned(),
-                        serde_json::json!("https://example.test/banner.png"),
                     ),
                     ("bot".to_owned(), serde_json::json!(false)),
                 ]),
@@ -664,6 +661,7 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
             UserProfileMetadata {
                 name: Some("second".to_owned()),
                 about: Some("known-field edit".to_owned()),
+                banner: Some("https://example.test/banner.png".to_owned()),
                 ..UserProfileMetadata::default()
             },
             bootstrap,
@@ -678,8 +676,8 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
         Some(&serde_json::json!("https://example.test"))
     );
     assert_eq!(
-        updated.extra.get("banner"),
-        Some(&serde_json::json!("https://example.test/banner.png"))
+        updated.banner.as_deref(),
+        Some("https://example.test/banner.png")
     );
     assert_eq!(updated.extra.get("bot"), Some(&serde_json::json!(false)));
 
@@ -697,8 +695,8 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
         Some(&serde_json::json!("https://example.test"))
     );
     assert_eq!(
-        fetched.extra.get("banner"),
-        Some(&serde_json::json!("https://example.test/banner.png"))
+        fetched.banner.as_deref(),
+        Some("https://example.test/banner.png")
     );
     assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
 
@@ -4934,6 +4932,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             display_name: Some("Bob Builder".into()),
             about: Some("Can we fix it".into()),
             picture: None,
+            banner: None,
             nip05: Some("bob@example.test".into()),
             lud16: None,
             created_at: 0,
@@ -4951,6 +4950,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             display_name: Some("Carol Singer".into()),
             about: None,
             picture: None,
+            banner: None,
             nip05: None,
             lud16: None,
             created_at: 0,

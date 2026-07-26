@@ -23,6 +23,7 @@ use crate::app_telemetry::{
 };
 use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
 use crate::ids::normalize_group_id_hex_app;
+use crate::media::upload_profile_image;
 use crate::messages::AppMessageIntent;
 use crate::notifications;
 use crate::{
@@ -2353,6 +2354,19 @@ impl MarmotAppRuntime {
         Ok(profile)
     }
 
+    pub async fn upload_profile_image(
+        &self,
+        account_ref: &str,
+        data: Vec<u8>,
+        media_type: &str,
+        blossom_server: Option<&str>,
+    ) -> Result<String, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let signer = self.accounts.app.account_signer_for_summary(&account)?;
+        let signer = signer.as_nostr_signer();
+        upload_profile_image(&data, media_type, blossom_server, signer.as_ref()).await
+    }
+
     async fn latest_known_user_profile_for_publish(
         &self,
         account_id_hex: &str,
@@ -3847,6 +3861,7 @@ fn merge_user_profile_update(
     current.display_name = update.display_name;
     current.about = update.about;
     current.picture = update.picture;
+    current.banner = update.banner;
     current.nip05 = update.nip05;
     current.lud16 = update.lud16;
     current.created_at = update.created_at;

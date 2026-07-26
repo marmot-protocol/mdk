@@ -28,21 +28,39 @@ struct BlossomBlobDescriptor {
 
 pub(crate) async fn upload_blossom_blob(
     server: &str,
-    encrypted: &[u8],
-    encrypted_hash_hex: &str,
+    blob: &[u8],
+    blob_hash_hex: &str,
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
+    upload_blossom_blob_with_content_type(
+        server,
+        blob,
+        blob_hash_hex,
+        signer,
+        allow_loopback_http,
+        BLOSSOM_UPLOAD_CONTENT_TYPE,
+    )
+    .await
+}
+
+pub(crate) async fn upload_blossom_blob_with_content_type(
+    server: &str,
+    blob: &[u8],
+    blob_hash_hex: &str,
+    signer: &dyn NostrSigner,
+    allow_loopback_http: bool,
+    content_type: &str,
+) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
-    let authorization =
-        blossom_authorization_header(signer, &server_host, encrypted_hash_hex).await?;
+    let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
     let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
         .put(upload_url)
         .header(reqwest::header::AUTHORIZATION, authorization)
-        .header(reqwest::header::CONTENT_TYPE, BLOSSOM_UPLOAD_CONTENT_TYPE)
-        .header("X-SHA-256", encrypted_hash_hex)
-        .body(encrypted.to_vec())
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .header("X-SHA-256", blob_hash_hex)
+        .body(blob.to_vec())
         .send()
         .await
         .map_err(reqwest_blob_error)?;
@@ -55,22 +73,22 @@ pub(crate) async fn upload_blossom_blob(
     let descriptor = serde_json::from_slice::<BlossomBlobDescriptor>(&descriptor_body)
         .map_err(|_| AppError::BlobStore("upload returned an invalid descriptor".into()))?;
     if let Some(sha256) = descriptor.sha256.as_deref()
-        && sha256.to_ascii_lowercase() != encrypted_hash_hex
+        && sha256.to_ascii_lowercase() != blob_hash_hex
     {
         return Err(AppError::BlobStore(
-            "upload descriptor hash did not match encrypted blob".into(),
+            "upload descriptor hash did not match blob".into(),
         ));
     }
     let url = descriptor
         .url
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| blossom_blob_url(server, encrypted_hash_hex));
+        .unwrap_or_else(|| blossom_blob_url(server, blob_hash_hex));
     let content_hash = blossom_content_hash_from_url(&url).ok_or_else(|| {
-        AppError::BlobStore("upload descriptor URL did not include encrypted blob hash".into())
+        AppError::BlobStore("upload descriptor URL did not include blob hash".into())
     })?;
-    if content_hash != encrypted_hash_hex {
+    if content_hash != blob_hash_hex {
         return Err(AppError::BlobStore(
-            "upload descriptor URL hash did not match encrypted blob".into(),
+            "upload descriptor URL hash did not match blob".into(),
         ));
     }
     Ok(url)

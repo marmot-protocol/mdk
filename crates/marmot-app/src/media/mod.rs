@@ -16,7 +16,9 @@ mod crypto;
 mod group_image;
 mod host_safety;
 
-use blossom::{blossom_content_hash_from_url, upload_blossom_blob};
+use blossom::{
+    blossom_content_hash_from_url, upload_blossom_blob, upload_blossom_blob_with_content_type,
+};
 use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
     media_hash_from_reference, media_nonce_from_reference, validate_sha256_hex,
@@ -42,6 +44,10 @@ pub const DEFAULT_BLOSSOM_SERVER_URLS: &[&str] = &[
 /// Primary built-in Blossom endpoint used by single-endpoint APIs such as
 /// encrypted group-image upload.
 pub const DEFAULT_BLOSSOM_SERVER_URL: &str = DEFAULT_BLOSSOM_SERVER_URLS[0];
+/// Public-profile images are intentionally not encrypted: their Blossom URL is
+/// published in Nostr kind:0 metadata and must be fetchable by other clients.
+pub const DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL: &str = "https://blossom.primal.net";
+const MAX_PROFILE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Frozen legacy format label. New code chooses a version from group state.
 pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
 
@@ -75,6 +81,43 @@ impl EncryptedMediaVersion {
             )),
         }
     }
+}
+
+pub(crate) async fn upload_profile_image(
+    image: &[u8],
+    media_type: &str,
+    server: Option<&str>,
+    signer: &dyn NostrSigner,
+) -> Result<String, AppError> {
+    if image.is_empty() {
+        return Err(AppError::BlobStore("profile image cannot be empty".into()));
+    }
+    if image.len() > MAX_PROFILE_IMAGE_BYTES {
+        return Err(AppError::BlobStore(
+            "profile image exceeds 10 MiB limit".into(),
+        ));
+    }
+    let media_type = match media_type.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/webp" => "image/webp",
+        "image/gif" => "image/gif",
+        _ => {
+            return Err(AppError::BlobStore(
+                "profile image must be JPEG, PNG, WebP, or GIF".into(),
+            ));
+        }
+    };
+    let server = server.unwrap_or(DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL);
+    let hash_hex = hex::encode(Sha256::digest(image));
+    let url =
+        upload_blossom_blob_with_content_type(server, image, &hash_hex, signer, false, media_type)
+            .await?;
+    let parsed = url::Url::parse(&url)
+        .map_err(|_| AppError::BlobStore("upload returned an invalid image URL".into()))?;
+    host_safety::validate_blossom_fetch_url(&parsed, false)
+        .map_err(|_| AppError::BlobStore("upload returned an unsafe image URL".into()))?;
+    Ok(url)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

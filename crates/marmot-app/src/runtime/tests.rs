@@ -135,6 +135,7 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
         name: Some("old-name".to_owned()),
         display_name: Some("Old Name".to_owned()),
         picture: Some("https://example.test/old.png".to_owned()),
+        banner: Some("https://example.test/old-banner.png".to_owned()),
         created_at: 123,
         source_relays: vec!["wss://relay.example".to_owned()],
         extra: std::collections::BTreeMap::from([
@@ -155,6 +156,7 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
         display_name: Some("New Name".to_owned()),
         about: Some("updated about".to_owned()),
         picture: None,
+        banner: Some("https://example.test/new-banner.png".to_owned()),
         created_at: 0,
         source_relays: Vec::new(),
         ..UserProfileMetadata::default()
@@ -166,6 +168,10 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
     assert_eq!(merged.display_name.as_deref(), Some("New Name"));
     assert_eq!(merged.about.as_deref(), Some("updated about"));
     assert_eq!(merged.picture, None);
+    assert_eq!(
+        merged.banner.as_deref(),
+        Some("https://example.test/new-banner.png")
+    );
     assert_eq!(
         merged.extra.get("website"),
         Some(&serde_json::json!("https://example.test"))

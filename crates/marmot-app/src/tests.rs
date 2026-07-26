@@ -1455,6 +1455,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
                     display_name: None,
                     about: None,
                     picture: None,
+                    banner: None,
                     nip05: None,
                     lud16: None,
                     created_at: 0,
@@ -1513,6 +1514,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
                     display_name: None,
                     about: None,
                     picture: None,
+                    banner: None,
                     nip05: None,
                     lud16: None,
                     created_at: 1_700_000_001,
@@ -1556,6 +1558,7 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
             display_name: None,
             about: None,
             picture: None,
+            banner: None,
             nip05: None,
             lud16: None,
             created_at,
@@ -1573,14 +1576,11 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
 fn profile_content_json_preserves_unknown_kind0_fields() {
     let profile = UserProfileMetadata {
         name: Some("alice".to_owned()),
+        banner: Some("https://example.test/banner.png".to_owned()),
         extra: std::collections::BTreeMap::from([
             (
                 "website".to_owned(),
                 serde_json::json!("https://example.test"),
-            ),
-            (
-                "banner".to_owned(),
-                serde_json::json!("https://example.test/banner.png"),
             ),
             ("bot".to_owned(), serde_json::json!(false)),
             ("name".to_owned(), serde_json::json!("spoofed-extra-name")),

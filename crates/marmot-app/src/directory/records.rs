@@ -54,6 +54,8 @@ pub struct UserProfileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nip05: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lud16: Option<String>,
@@ -252,6 +254,7 @@ pub(crate) fn profile_from_record(
                 .or_else(|| string_field(&content, "displayName")),
             about: string_field(&content, "about"),
             picture: string_field(&content, "picture"),
+            banner: string_field(&content, "banner"),
             nip05: string_field(&content, "nip05"),
             lud16: string_field(&content, "lud16"),
             created_at: record.event.created_at,
@@ -280,6 +283,7 @@ fn is_known_profile_field(field: &str) -> bool {
             | "displayName"
             | "about"
             | "picture"
+            | "banner"
             | "nip05"
             | "lud16"
             | "created_at"
@@ -421,6 +425,12 @@ pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json:
         value.insert(
             "picture".to_owned(),
             serde_json::Value::String(picture.clone()),
+        );
+    }
+    if let Some(banner) = profile.banner.as_ref().filter(|value| !value.is_empty()) {
+        value.insert(
+            "banner".to_owned(),
+            serde_json::Value::String(banner.clone()),
         );
     }
     if let Some(nip05) = profile.nip05.as_ref().filter(|value| !value.is_empty()) {

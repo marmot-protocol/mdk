@@ -108,6 +108,7 @@ pub struct UserProfileMetadataFfi {
     pub display_name: Option<String>,
     pub about: Option<String>,
     pub picture: Option<String>,
+    pub banner: Option<String>,
     pub nip05: Option<String>,
     pub lud16: Option<String>,
 }
@@ -119,6 +120,7 @@ impl From<UserProfileMetadata> for UserProfileMetadataFfi {
             display_name: value.display_name,
             about: value.about,
             picture: value.picture,
+            banner: value.banner,
             nip05: value.nip05,
             lud16: value.lud16,
         }
@@ -132,6 +134,7 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
             display_name: value.display_name,
             about: value.about,
             picture: value.picture,
+            banner: value.banner,
             nip05: value.nip05,
             lud16: value.lud16,
             created_at: 0,
