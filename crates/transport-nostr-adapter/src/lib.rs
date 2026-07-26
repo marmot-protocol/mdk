@@ -299,6 +299,19 @@ impl NostrPublishOutcome {
     }
 }
 
+/// One event in an ordered relay publish batch.
+///
+/// Batch-capable relay clients may retain and connect the union of these
+/// endpoints for the duration of [`NostrRelayClient::publish_events`]. Results
+/// remain ordered one-for-one with requests so callers can preserve per-event
+/// partial-success reporting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrEventPublishRequest {
+    pub endpoints: Vec<TransportEndpoint>,
+    pub event: NostrTransportEvent,
+    pub required_acks: usize,
+}
+
 /// Relay event as observed by the Nostr relay client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrRelayEvent {
@@ -327,6 +340,25 @@ pub trait NostrRelayClient: Send + Sync {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError>;
+
+    /// Publish an ordered batch through one client lifecycle.
+    ///
+    /// The default preserves compatibility for injected relay clients. Socket
+    /// implementations should override this when they can safely retain scoped
+    /// write-only connections across the batch.
+    async fn publish_events(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                self.publish_event(&request.endpoints, &request.event, request.required_acks)
+                    .await,
+            );
+        }
+        outcomes
+    }
 }
 
 /// Nostr implementation of the shared transport adapter boundary.
