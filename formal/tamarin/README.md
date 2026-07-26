@@ -137,6 +137,8 @@ The v0 model now uses bounded symbolic score classes instead of an opaque `Score
 dN       commit-depth or effective-depth class
 wN       app-witness score class
 qyes/qno witness quorum class
+p0/p1    commit-priority rank class, where lower wins
+cHEX     authenticated-committer rank class, where lower wins
 g00/gff  digest rank class, where lower wins final ties
 ```
 
@@ -146,7 +148,9 @@ The derivation rules mirror the selector order:
 2. quorum tie,
 3. higher raw commit depth,
 4. higher app-witness score,
-5. lower digest rank.
+5. lower/preferred commit-priority rank,
+6. lexicographically lower authenticated-committer rank,
+7. lower digest rank.
 
 ## How Proofs Map To Tests
 
@@ -202,6 +206,13 @@ For bounded policy seeds, update `policy_cases.json` first. Then check both cons
 cargo test -p cgka-conformance-simulator --test generated_policy_cases
 cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
 ```
+
+The seven-rule adjacency cases stay grep-aligned across both consumers:
+
+- `generated_priority_tie` / `generated_priority_tie_executable` /
+  `generated_priority_tie_matches_selector_before_digest`
+- `generated_committer_tie` / `generated_committer_tie_executable` /
+  `generated_committer_tie_matches_selector_before_digest`
 
 Use the executable lemmas as a fixture catalog. Each one says "this situation exists and the system must handle it." Use
 the universal lemmas as property-test targets. For example, `same_input_set_converges` maps to generated branch sets fed

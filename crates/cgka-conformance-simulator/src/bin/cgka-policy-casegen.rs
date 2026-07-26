@@ -3,7 +3,7 @@ use std::fs;
 
 use cgka_conformance_simulator::convergence::ConvergencePolicy;
 use cgka_conformance_simulator::policy_cases::{
-    PolicyCase, digest_rank, parse_policy_cases, reason_against,
+    PolicyCase, committer_rank, digest_rank, parse_policy_cases, priority_rank, reason_against,
 };
 
 fn main() {
@@ -90,16 +90,28 @@ fn print_tamarin(cases: &[PolicyCase]) {
         for candidate in &candidates {
             let score = candidate.score(&policy);
             println!(
-                "    Score(~run, '{}', '{}', '{}', '{}', '{}', '{}'),",
+                "    Score(~run, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'),",
                 candidate.id,
                 depth(score.valid_commit_depth),
                 depth(score.effective_commit_depth),
                 quorum(score.witness_quorum_met),
                 witness(score.app_witness_score),
+                priority_rank(score.tip_priority),
+                committer_rank(&score.tip_committer),
                 digest_rank(&score.tip_digest)
             );
         }
         match reason {
+            "priority_tie" => println!(
+                "    PriorityLower(~run, '{}', '{}')",
+                priority_rank(winner_score.tip_priority),
+                priority_rank(loser_score.tip_priority)
+            ),
+            "committer_tie" => println!(
+                "    CommitterLower(~run, '{}', '{}')",
+                committer_rank(&winner_score.tip_committer),
+                committer_rank(&loser_score.tip_committer)
+            ),
             "digest_tie" => println!(
                 "    DigestLower(~run, '{}', '{}')",
                 digest_rank(&winner_score.tip_digest),
@@ -133,16 +145,28 @@ fn print_tamarin(cases: &[PolicyCase]) {
         for candidate in &candidates {
             let score = candidate.score(&policy);
             println!(
-                "    !ScoreState(~run, '{}', '{}', '{}', '{}', '{}', '{}'),",
+                "    !ScoreState(~run, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'),",
                 candidate.id,
                 depth(score.valid_commit_depth),
                 depth(score.effective_commit_depth),
                 quorum(score.witness_quorum_met),
                 witness(score.app_witness_score),
+                priority_rank(score.tip_priority),
+                committer_rank(&score.tip_committer),
                 digest_rank(&score.tip_digest)
             );
         }
         match reason {
+            "priority_tie" => println!(
+                "    !PriorityLtState(~run, '{}', '{}')",
+                priority_rank(winner_score.tip_priority),
+                priority_rank(loser_score.tip_priority)
+            ),
+            "committer_tie" => println!(
+                "    !CommitterLtState(~run, '{}', '{}')",
+                committer_rank(&winner_score.tip_committer),
+                committer_rank(&loser_score.tip_committer)
+            ),
             "digest_tie" => println!(
                 "    !DigestLtState(~run, '{}', '{}')",
                 digest_rank(&winner_score.tip_digest),
