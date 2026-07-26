@@ -64,9 +64,9 @@ use storage_sqlite::{
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
-    NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrKeyPackagePublication,
-    NostrKeyPackagePublisher, NostrNip65RelayListPublication, NostrNip65RelaySet, NostrRelayClient,
-    NostrSdkRelayClient, parse_nip65_relay_set,
+    NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrEventPublishRequest,
+    NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
+    NostrNip65RelaySet, NostrRelayClient, NostrSdkRelayClient, parse_nip65_relay_set,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -804,6 +804,18 @@ pub struct AccountKeyPackageRecord {
     pub local: bool,
     /// True when this exact event id was discovered from a relay.
     pub relay: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KeyPackageDeletionTarget {
+    pub event_id_hex: String,
+    pub source_relays: Vec<TransportEndpoint>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyPackageDeletionResult {
+    pub event_id_hex: String,
+    pub result: Result<usize, AppError>,
 }
 
 /// Per-account unread aggregate, suitable for an account-switcher badge
@@ -2974,47 +2986,126 @@ impl MarmotApp {
         event_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
     ) -> Result<usize, AppError> {
-        let event_id_hex = parse_key_package_event_id_hex(event_id_hex)?;
+        let mut outcomes = self
+            .delete_key_package_events(
+                label,
+                vec![KeyPackageDeletionTarget {
+                    event_id_hex: event_id_hex.to_owned(),
+                    source_relays,
+                }],
+            )
+            .await?;
+        outcomes
+            .pop()
+            .expect("single-event deletion batch returns one outcome")
+            .result
+    }
+
+    pub(crate) async fn delete_key_package_events(
+        &self,
+        label: &str,
+        targets: Vec<KeyPackageDeletionTarget>,
+    ) -> Result<Vec<KeyPackageDeletionResult>, AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id_hex = account.account_id_hex;
-        let mut endpoints = source_relays;
-        if endpoints.is_empty() {
-            let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-            endpoints = self.key_package_endpoints(&relay_lists);
-        }
-        if endpoints.is_empty() {
-            return Err(AppError::MissingRelayLists(vec![
-                MissingRelayListKind::Nip65,
-            ]));
+        let mut results = targets
+            .iter()
+            .map(|target| KeyPackageDeletionResult {
+                event_id_hex: target.event_id_hex.clone(),
+                result: Err(AppError::Publish("deletion was not attempted".to_owned())),
+            })
+            .collect::<Vec<_>>();
+        let mut requests = Vec::new();
+        let mut request_indices = Vec::new();
+        let mut all_endpoints = Vec::new();
+
+        for (index, target) in targets.into_iter().enumerate() {
+            let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
+                Ok(event_id_hex) => event_id_hex,
+                Err(error) => {
+                    results[index].result = Err(error);
+                    continue;
+                }
+            };
+            let endpoints = if target.source_relays.is_empty() {
+                match self.account_relay_list_status_for_account_id(&account_id_hex) {
+                    Ok(relay_lists) => self.key_package_endpoints(&relay_lists),
+                    Err(error) => {
+                        results[index].result = Err(error);
+                        continue;
+                    }
+                }
+            } else {
+                target.source_relays
+            };
+            if endpoints.is_empty() {
+                results[index].result = Err(AppError::MissingRelayLists(vec![
+                    MissingRelayListKind::Nip65,
+                ]));
+                continue;
+            }
+            let endpoints = match self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "key package deletion publish")
+            {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    results[index].result = Err(AppError::Transport(
+                        cgka_traits::TransportAdapterError::Publish(error),
+                    ));
+                    continue;
+                }
+            };
+            all_endpoints.extend(endpoints.iter().cloned());
+            requests.push(NostrEventPublishRequest {
+                endpoints,
+                event: NostrTransportEvent::new_unsigned(
+                    account_id_hex.clone(),
+                    5,
+                    vec![
+                        vec!["e".into(), event_id_hex],
+                        vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                    ],
+                    String::new(),
+                ),
+                required_acks: 1,
+            });
+            request_indices.push(index);
         }
 
-        let event = NostrTransportEvent::new_unsigned(
-            account_id_hex,
-            5,
-            vec![
-                vec!["e".into(), event_id_hex.clone()],
-                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
-            ],
-            String::new(),
-        );
-        let outcome = self
-            .relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
-            .publish_event(&endpoints, &event, 1)
-            .await?;
-
-        let path = self.key_package_record_path(label);
-        if let Ok(record) = read_json::<KeyPackageRecord>(&path)
-            && record.key_package_event_id == event_id_hex
-        {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+        if !requests.is_empty() {
+            let relay_client =
+                self.relay_client_for_endpoints(signer.as_nostr_signer(), &all_endpoints);
+            let outcomes = relay_client.publish_events(&requests).await;
+            for (index, outcome) in request_indices.into_iter().zip(outcomes) {
+                results[index].result = match outcome {
+                    Ok(outcome) if !outcome.accepted.is_empty() => Ok(outcome.accepted.len()),
+                    Ok(_) => Err(AppError::Publish(
+                        "relay acknowledged zero key package deletions".to_owned(),
+                    )),
+                    Err(error) => Err(error.into()),
+                };
             }
         }
 
-        Ok(outcome.accepted.len())
+        let path = self.key_package_record_path(label);
+        for result in &mut results {
+            if result.result.is_err() {
+                continue;
+            }
+            if let Ok(record) = read_json::<KeyPackageRecord>(&path)
+                && record.key_package_event_id == result.event_id_hex
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => result.result = Err(err.into()),
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {
@@ -3953,7 +4044,11 @@ impl MarmotApp {
 
     #[cfg(test)]
     fn with_test_relay_client(mut self, client: Arc<dyn NostrRelayClient>) -> Self {
-        self.relay_plane = MarmotRelayPlane::new(None, client.clone());
+        self.relay_plane = MarmotRelayPlane::new_with_loopback(
+            None,
+            client.clone(),
+            self.config.allow_loopback_relay_endpoints,
+        );
         self.test_relay_client = Some(client);
         self
     }

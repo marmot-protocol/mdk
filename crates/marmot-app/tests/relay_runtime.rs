@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +23,8 @@ use marmot_app::{
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
+use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
     Timestamp as NostrTimestamp,
@@ -57,6 +59,37 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
         MarmotAppConfig::default()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
+    );
+    (relay, app, url)
+}
+
+#[derive(Debug)]
+struct RejectDeletionEvents;
+
+impl WritePolicy for RejectDeletionEvents {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::EventDeletion {
+                PolicyResult::Reject("injected deletion rejection".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotApp, String) {
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(RejectDeletionEvents));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -5464,6 +5497,37 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
 }
 
 #[tokio::test]
+async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = deletion_rejecting_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let account_id = created.account.account_id_hex;
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    assert_eq!(outcome.key_packages_deleted, 0);
+    assert!(!outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    assert!(
+        home.accounts()
+            .unwrap()
+            .into_iter()
+            .all(|account| account.account_id_hex != account_id),
+        "best-effort remote failure must not block destructive local cleanup"
+    );
+}
+
+#[tokio::test]
 async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
     // Regression for mdk#478: an incoming Welcome auto-joins MLS state
     // while the app keeps the invite `pending_confirmation` until accepted. A
@@ -5659,6 +5723,39 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
         "signed-out account ref must stay valid for a later sign-in"
     );
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = deletion_rejecting_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let account_id = created.account.account_id_hex;
+
+    let outcome = runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.key_packages_deleted, 0);
+    assert!(!outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    assert!(home.account(&account_id).unwrap().signed_out);
+    assert!(
+        runtime.accounts().resolve(&account_id).is_ok(),
+        "best-effort remote failure must keep the local account"
+    );
     runtime.shutdown().await;
 }
 

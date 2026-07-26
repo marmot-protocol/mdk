@@ -83,8 +83,9 @@ impl Marmot {
     /// same identity can be signed back in from the account picker with its
     /// groups, message history, and drafts intact. The account ref stays valid
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
-    /// KeyPackage cleanup failures so the app can show a "will retry on next
-    /// sign-in" hint (mdk#477).
+    /// KeyPackage cleanup failures. These are the final best-effort results for
+    /// this call; the runtime does not persist a remote-deletion retry queue
+    /// (mdk#477).
     pub async fn sign_out(
         &self,
         account_ref: String,

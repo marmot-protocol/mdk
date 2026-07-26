@@ -34,15 +34,16 @@ use crate::{
     AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
     BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS,
+    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
+    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 mod account_worker;
@@ -654,8 +655,8 @@ pub struct SignOutOutcome {
     /// `0` when `delete_key_packages` was `false`.
     pub key_packages_deleted: u32,
     /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort: a
-    /// failure here never blocks local cleanup, and the app can show a
-    /// "will retry on next sign-in" hint.
+    /// failure here never blocks local cleanup. No durable remote-deletion
+    /// retry is implied by this outcome.
     pub key_package_failures: Vec<RelayFailure>,
     /// Result of the always-run local teardown (worker shutdown, subscription
     /// deactivation, in-memory cache eviction). Unlike a wipe this never
@@ -2042,6 +2043,70 @@ impl MarmotAppRuntime {
             .await
     }
 
+    async fn delete_relay_key_packages(
+        &self,
+        account_label: &str,
+        packages: Vec<AccountKeyPackageRecord>,
+    ) -> (u32, Vec<RelayFailure>) {
+        let targets = packages
+            .into_iter()
+            .filter(|package| package.relay)
+            .map(|package| KeyPackageDeletionTarget {
+                event_id_hex: package.key_package_event_id,
+                source_relays: package
+                    .source_relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return (0, Vec::new());
+        }
+        let event_ids = targets
+            .iter()
+            .map(|target| target.event_id_hex.clone())
+            .collect::<Vec<_>>();
+        let results = match self
+            .accounts
+            .app
+            .delete_key_package_events(account_label, targets)
+            .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                let reason = wipe_failure_reason(&error);
+                return (
+                    0,
+                    event_ids
+                        .into_iter()
+                        .map(|event_id_hex| RelayFailure {
+                            event_id_hex,
+                            reason: reason.clone(),
+                        })
+                        .collect(),
+                );
+            }
+        };
+
+        let mut deleted = 0;
+        let mut failures = Vec::new();
+        for result in results {
+            match result.result {
+                Ok(accepted) if accepted > 0 => deleted += 1,
+                Ok(_) => failures.push(RelayFailure {
+                    event_id_hex: result.event_id_hex,
+                    reason: "relay publish failed".to_owned(),
+                }),
+                Err(error) => failures.push(RelayFailure {
+                    event_id_hex: result.event_id_hex,
+                    reason: wipe_failure_reason(&error),
+                }),
+            }
+        }
+        (deleted, failures)
+    }
+
     /// Non-destructive sign-out: deactivate the account on this device and
     /// (optionally) clean up its relay-published KeyPackages, while keeping all
     /// local state so the same identity can be signed back in later.
@@ -2071,8 +2136,8 @@ impl MarmotAppRuntime {
     /// - The MLS state DB is never touched — that is the "sign back in and
     ///   resume" contract.
     /// - KeyPackage cleanup is best-effort and per-relay: a failure is recorded
-    ///   in [`SignOutOutcome::key_package_failures`] (so the app can show a
-    ///   "will retry on next sign-in" hint) and never blocks the local teardown.
+    ///   in [`SignOutOutcome::key_package_failures`] and never blocks the local
+    ///   teardown. The runtime does not persist a remote-deletion retry queue.
     /// - A discovery failure (could not enumerate KeyPackages) is recorded as a
     ///   single failure with an empty `event_id_hex`, not silently treated as
     ///   "no KeyPackages".
@@ -2108,28 +2173,11 @@ impl MarmotAppRuntime {
         if options.delete_key_packages {
             match self.account_key_packages(account_ref, Vec::new()).await {
                 Ok(packages) => {
-                    for package in packages {
-                        if !package.relay {
-                            continue;
-                        }
-                        let event_id_hex = package.key_package_event_id.clone();
-                        let relays = package
-                            .source_relays
-                            .iter()
-                            .cloned()
-                            .map(TransportEndpoint)
-                            .collect::<Vec<_>>();
-                        match self
-                            .delete_key_package(account_ref, &event_id_hex, relays)
-                            .await
-                        {
-                            Ok(_) => outcome.key_packages_deleted += 1,
-                            Err(err) => outcome.key_package_failures.push(RelayFailure {
-                                event_id_hex,
-                                reason: wipe_failure_reason(&err),
-                            }),
-                        }
-                    }
+                    let (deleted, failures) = self
+                        .delete_relay_key_packages(&account.label, packages)
+                        .await;
+                    outcome.key_packages_deleted += deleted;
+                    outcome.key_package_failures.extend(failures);
                 }
                 Err(err) => outcome.key_package_failures.push(RelayFailure {
                     event_id_hex: String::new(),
@@ -2265,28 +2313,11 @@ impl MarmotAppRuntime {
         // (no event id) and must not abort the wipe.
         match self.account_key_packages(account_ref, Vec::new()).await {
             Ok(packages) => {
-                for package in packages {
-                    if !package.relay {
-                        continue;
-                    }
-                    let event_id_hex = package.key_package_event_id.clone();
-                    let relays = package
-                        .source_relays
-                        .iter()
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect::<Vec<_>>();
-                    match self
-                        .delete_key_package(account_ref, &event_id_hex, relays)
-                        .await
-                    {
-                        Ok(_) => outcome.key_packages_deleted += 1,
-                        Err(err) => outcome.key_package_failures.push(RelayFailure {
-                            event_id_hex,
-                            reason: wipe_failure_reason(&err),
-                        }),
-                    }
-                }
+                let (deleted, failures) = self
+                    .delete_relay_key_packages(&account.label, packages)
+                    .await;
+                outcome.key_packages_deleted += deleted;
+                outcome.key_package_failures.extend(failures);
             }
             Err(err) => outcome.key_package_failures.push(RelayFailure {
                 event_id_hex: String::new(),

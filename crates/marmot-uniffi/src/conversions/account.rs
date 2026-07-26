@@ -183,7 +183,7 @@ pub struct LocalCleanupReportFfi {
 /// Structured result of the non-destructive `signOut`. The account's local
 /// state is kept on device; only the relay-published KeyPackages are cleaned
 /// up (when requested), so the app can render the same per-relay
-/// partial-failure sheet as a wipe and show a "will retry on next sign-in" hint.
+/// partial-failure sheet as a wipe. Failures are not durably queued for retry.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct SignOutOutcomeFfi {
     /// Relay-published KeyPackage events successfully deleted. `0` when
