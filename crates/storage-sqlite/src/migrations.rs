@@ -540,7 +540,8 @@ mod tests {
             "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
              VALUES ('never-messaged', 'relay', 100),
                     ('active', 'relay', 200),
-                    ('pruned-read', 'relay', 300)",
+                    ('pruned-read', 'relay', 300),
+                    ('zero-updated', 'relay', 0)",
             [],
         )
         .unwrap();
@@ -549,6 +550,20 @@ mod tests {
                 group_id_hex, message_id_hex, direction, sender, plaintext, kind,
                 tags_json, recorded_at, received_at
              ) VALUES ('active', 'origin', 'received', 'sender', 'origin', 9, '[]', 140, 140)",
+            [],
+        )
+        .unwrap();
+        // `zero-updated` exercises the `ag.updated_at = 0` sentinel branch: the
+        // group has app events but no persisted group timestamp, so
+        // `conversation_created_at` must fall back to the earliest event time
+        // (250) rather than collapsing to `MIN(0, 250) = 0`.
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, recorded_at, received_at
+             ) VALUES
+                ('zero-updated', 'first', 'received', 'sender', 'first', 9, '[]', 250, 250),
+                ('zero-updated', 'later', 'received', 'sender', 'later', 9, '[]', 275, 275)",
             [],
         )
         .unwrap();
@@ -592,7 +607,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO chat_list_rows (group_id_hex, updated_at)
-             VALUES ('never-messaged', 500), ('active', 500), ('pruned-read', 500)",
+             VALUES ('never-messaged', 500), ('active', 500), ('pruned-read', 500),
+                    ('zero-updated', 500)",
             [],
         )
         .unwrap();
@@ -621,6 +637,7 @@ mod tests {
                 ("active".to_owned(), 140, 150),
                 ("never-messaged".to_owned(), 100, 100),
                 ("pruned-read".to_owned(), 300, 350),
+                ("zero-updated".to_owned(), 250, 250),
             ]
         );
 
