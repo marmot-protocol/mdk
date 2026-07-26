@@ -12,6 +12,8 @@
     dN: commit-depth or effective-depth class
     wN: app-witness score class
     qyes/qno: witness quorum class
+    p0/p1: commit-priority rank class, where lower rank wins
+    cHEX: authenticated-committer rank class, where lower rank wins
     g00/gff: digest rank class, where lower rank wins final ties
 
   The ordering facts are scenario-local so this model stays small and focused.
@@ -41,8 +43,8 @@ rule Init_Quorum_Override:
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
     BoostAllowed(~run, 'online'),
-    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    Score(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00')
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c00', 'gff'),
+    Score(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'p1', 'c00', 'g00')
   ]->
   [
     Compare(~run, 'online', 'withheld'),
@@ -54,8 +56,8 @@ rule Init_Quorum_Override:
     !EligibleState(~run, 'withheld'),
     !QuorumState(~run, 'online'),
     !BoostAllowedState(~run, 'online'),
-    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    !ScoreState(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00')
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'p1', 'c00', 'g00')
   ]
 
 /*
@@ -75,8 +77,8 @@ rule Init_Raw_Depth_Lead:
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
     BoostAllowed(~run, 'online'),
-    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    Score(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c00', 'gff'),
+    Score(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd6', 'd5')
   ]->
   [
@@ -89,8 +91,8 @@ rule Init_Raw_Depth_Lead:
     !EligibleState(~run, 'withheld'),
     !QuorumState(~run, 'online'),
     !BoostAllowedState(~run, 'online'),
-    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    !ScoreState(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd6', 'd5')
   ]
 
@@ -109,8 +111,8 @@ rule Init_Witness_Score_Tie:
     PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'used'),
     Eligible(~run, 'quiet'),
-    Score(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'gff'),
-    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    Score(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'p1', 'c00', 'gff'),
+    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'w3', 'w1')
   ]->
   [
@@ -121,8 +123,8 @@ rule Init_Witness_Score_Tie:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'used'),
     !EligibleState(~run, 'quiet'),
-    !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'gff'),
-    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !GtState(~run, 'w3', 'w1')
   ]
 
@@ -141,8 +143,8 @@ rule Init_Digest_Tie:
     PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'lower_digest'),
     Eligible(~run, 'higher_digest'),
-    Score(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
-    Score(~run, 'higher_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
+    Score(~run, 'higher_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
     DigestLower(~run, 'g00', 'gff')
   ]->
   [
@@ -153,8 +155,8 @@ rule Init_Digest_Tie:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'lower_digest'),
     !EligibleState(~run, 'higher_digest'),
-    !ScoreState(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
-    !ScoreState(~run, 'higher_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
+    !ScoreState(~run, 'higher_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
     !DigestLtState(~run, 'g00', 'gff')
   ]
 
@@ -179,8 +181,8 @@ rule Init_Stale_Rewind:
     RewindDistance(~run, 'late', 'd7'),
     RewindLimit(~run, 'd5'),
     RewindTooDeep(~run, 'd7', 'd5'),
-    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
-    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd7', 'd3')
   ]->
   [
@@ -195,8 +197,8 @@ rule Init_Stale_Rewind:
     !RewindDistanceState(~run, 'late', 'd7'),
     !RewindLimitState(~run, 'd5'),
     !RewindTooDeepState(~run, 'd7', 'd5'),
-    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
-    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd7', 'd3')
   ]
 
@@ -224,8 +226,8 @@ rule Init_Duplicate_Witness_Dedupe:
     DuplicateWitnessIgnored(~run, 'used', 'e2', 'alice'),
     WitnessScore(~run, 'used', 'w2'),
     WitnessScore(~run, 'quiet', 'w1'),
-    Score(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'gff'),
-    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    Score(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'w2', 'w1')
   ]->
   [
@@ -238,8 +240,8 @@ rule Init_Duplicate_Witness_Dedupe:
     !EligibleState(~run, 'quiet'),
     !WitnessScoreState(~run, 'used', 'w2'),
     !WitnessScoreState(~run, 'quiet', 'w1'),
-    !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'gff'),
-    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !GtState(~run, 'w2', 'w1')
   ]
 
@@ -296,9 +298,9 @@ rule Init_Three_Branch_Permutation:
     Eligible(~run, 'best'),
     Eligible(~run, 'mid'),
     Eligible(~run, 'low'),
-    Score(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'gff'),
-    Score(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'g00'),
-    Score(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'g00'),
+    Score(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    Score(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'p1', 'c00', 'g00'),
+    Score(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd4', 'd3'),
     ScoreGreater(~run, 'd4', 'd2')
   ]->
@@ -312,9 +314,9 @@ rule Init_Three_Branch_Permutation:
     !EligibleState(~run, 'best'),
     !EligibleState(~run, 'mid'),
     !EligibleState(~run, 'low'),
-    !ScoreState(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'gff'),
-    !ScoreState(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'g00'),
-    !ScoreState(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'g00'),
+    !ScoreState(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'p1', 'c00', 'g00'),
+    !ScoreState(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd4', 'd3'),
     !GtState(~run, 'd4', 'd2')
   ]
@@ -345,8 +347,8 @@ rule Init_Withheld_Published_After_Anchor:
     RewindDistance(~run, 'late', 'd7'),
     RewindLimit(~run, 'd5'),
     RewindTooDeep(~run, 'd7', 'd5'),
-    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
-    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd7', 'd3')
   ]->
   [
@@ -362,17 +364,16 @@ rule Init_Withheld_Published_After_Anchor:
     !RewindDistanceState(~run, 'late', 'd7'),
     !RewindLimitState(~run, 'd5'),
     !RewindTooDeepState(~run, 'd7', 'd5'),
-    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
-    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd7', 'd3')
   ]
 
 /*
   Scenario family 11:
 
-  These are hand-written seeds for the bounded cases we eventually want to
-  generate from the Rust policy model. Each case names the expected winner and
-  reason.
+  These bounded cases are generated from policy_cases.json by the Rust policy
+  model. Each case names the expected winner and reason.
 */
 rule Init_Generated_Family_QuorumOverride:
   [ Fr(~run) ]
@@ -387,8 +388,8 @@ rule Init_Generated_Family_QuorumOverride:
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
     BoostAllowed(~run, 'online'),
-    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    Score(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00'),
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c6f6e6c696e65', 'gff'),
+    Score(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'p1', 'c7769746868656c64', 'g00'),
     QuorumTieCase(~run, 'online', 'withheld')
   ]->
   [
@@ -400,8 +401,8 @@ rule Init_Generated_Family_QuorumOverride:
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
     !BoostAllowedState(~run, 'online'),
-    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    !ScoreState(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'g00'),
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c6f6e6c696e65', 'gff'),
+    !ScoreState(~run, 'withheld', 'd5', 'd5', 'qno', 'w0', 'p1', 'c7769746868656c64', 'g00'),
     !QuorumTieCaseState(~run, 'online', 'withheld')
   ]
 
@@ -416,8 +417,8 @@ rule Init_Generated_Family_QuorumCappedByDepth:
     PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'online'),
     Eligible(~run, 'withheld'),
-    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    Score(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c6f6e6c696e65', 'gff'),
+    Score(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'p1', 'c7769746868656c64', 'g00'),
     ScoreGreater(~run, 'd6', 'd5')
   ]->
   [
@@ -428,8 +429,8 @@ rule Init_Generated_Family_QuorumCappedByDepth:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
-    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
-    !ScoreState(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'g00'),
+    !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'p1', 'c6f6e6c696e65', 'gff'),
+    !ScoreState(~run, 'withheld', 'd6', 'd6', 'qno', 'w0', 'p1', 'c7769746868656c64', 'g00'),
     !GtState(~run, 'd6', 'd5')
   ]
 
@@ -444,8 +445,8 @@ rule Init_Generated_Family_DepthPriority:
     PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'deep'),
     Eligible(~run, 'chatty'),
-    Score(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
-    Score(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'g00'),
+    Score(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'p1', 'c64656570', 'gff'),
+    Score(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'p1', 'c636861747479', 'g00'),
     ScoreGreater(~run, 'd4', 'd3')
   ]->
   [
@@ -456,8 +457,8 @@ rule Init_Generated_Family_DepthPriority:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'deep'),
     !EligibleState(~run, 'chatty'),
-    !ScoreState(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
-    !ScoreState(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'g00'),
+    !ScoreState(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'p1', 'c64656570', 'gff'),
+    !ScoreState(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'p1', 'c636861747479', 'g00'),
     !GtState(~run, 'd4', 'd3')
   ]
 
@@ -472,8 +473,8 @@ rule Init_Generated_Family_WitnessPriority:
     PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'chatty'),
     Eligible(~run, 'quiet'),
-    Score(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
-    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    Score(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'p1', 'c636861747479', 'gff'),
+    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c7175696574', 'g00'),
     ScoreGreater(~run, 'w3', 'w1')
   ]->
   [
@@ -484,9 +485,65 @@ rule Init_Generated_Family_WitnessPriority:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'chatty'),
     !EligibleState(~run, 'quiet'),
-    !ScoreState(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
-    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'p1', 'c636861747479', 'gff'),
+    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'p1', 'c7175696574', 'g00'),
     !GtState(~run, 'w3', 'w1')
+  ]
+
+rule Init_Generated_Family_PriorityTie:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_priority_tie'),
+    GeneratedBoundedCase(~run, 'priority_tie'),
+    GeneratedExpectedSelection(~run, 'privileged', 'priority_tie'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
+    Eligible(~run, 'privileged'),
+    Eligible(~run, 'ordinary'),
+    Score(~run, 'privileged', 'd2', 'd2', 'qno', 'w1', 'p0', 'c7a', 'gff'),
+    Score(~run, 'ordinary', 'd2', 'd2', 'qno', 'w1', 'p1', 'c61', 'g00'),
+    PriorityLower(~run, 'p0', 'p1')
+  ]->
+  [
+    Compare(~run, 'privileged', 'ordinary'),
+    Compare(~run, 'ordinary', 'privileged'),
+    View(~run, 'alice', 'privileged', 'ordinary'),
+    View(~run, 'bob', 'ordinary', 'privileged'),
+    !PolicyLoadedState(~run),
+    !EligibleState(~run, 'privileged'),
+    !EligibleState(~run, 'ordinary'),
+    !ScoreState(~run, 'privileged', 'd2', 'd2', 'qno', 'w1', 'p0', 'c7a', 'gff'),
+    !ScoreState(~run, 'ordinary', 'd2', 'd2', 'qno', 'w1', 'p1', 'c61', 'g00'),
+    !PriorityLtState(~run, 'p0', 'p1')
+  ]
+
+rule Init_Generated_Family_CommitterTie:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_committer_tie'),
+    GeneratedBoundedCase(~run, 'committer_tie'),
+    GeneratedExpectedSelection(~run, 'lower_committer', 'committer_tie'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
+    Eligible(~run, 'lower_committer'),
+    Eligible(~run, 'higher_committer'),
+    Score(~run, 'lower_committer', 'd2', 'd2', 'qno', 'w1', 'p1', 'c61', 'gff'),
+    Score(~run, 'higher_committer', 'd2', 'd2', 'qno', 'w1', 'p1', 'c7a', 'g00'),
+    CommitterLower(~run, 'c61', 'c7a')
+  ]->
+  [
+    Compare(~run, 'lower_committer', 'higher_committer'),
+    Compare(~run, 'higher_committer', 'lower_committer'),
+    View(~run, 'alice', 'lower_committer', 'higher_committer'),
+    View(~run, 'bob', 'higher_committer', 'lower_committer'),
+    !PolicyLoadedState(~run),
+    !EligibleState(~run, 'lower_committer'),
+    !EligibleState(~run, 'higher_committer'),
+    !ScoreState(~run, 'lower_committer', 'd2', 'd2', 'qno', 'w1', 'p1', 'c61', 'gff'),
+    !ScoreState(~run, 'higher_committer', 'd2', 'd2', 'qno', 'w1', 'p1', 'c7a', 'g00'),
+    !CommitterLtState(~run, 'c61', 'c7a')
   ]
 
 rule Init_Generated_Family_DigestPriority:
@@ -500,8 +557,8 @@ rule Init_Generated_Family_DigestPriority:
     PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'low_digest'),
     Eligible(~run, 'high_digest'),
-    Score(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
-    Score(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c73616d65', 'g00'),
+    Score(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c73616d65', 'gff'),
     DigestLower(~run, 'g00', 'gff')
   ]->
   [
@@ -512,8 +569,8 @@ rule Init_Generated_Family_DigestPriority:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'low_digest'),
     !EligibleState(~run, 'high_digest'),
-    !ScoreState(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
-    !ScoreState(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c73616d65', 'g00'),
+    !ScoreState(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'p1', 'c73616d65', 'gff'),
     !DigestLtState(~run, 'g00', 'gff')
   ]
 
@@ -542,8 +599,8 @@ rule Init_Retained_Anchor_Within_Horizon:
     SameInputSet(~run, 'bob'),
     Eligible(~run, 'online'),
     Eligible(~run, 'late'),
-    Score(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    Score(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    Score(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    Score(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     DigestLower(~run, 'g00', 'gff')
   ]->
   [
@@ -560,8 +617,8 @@ rule Init_Retained_Anchor_Within_Horizon:
     !BranchAtOrAfterAnchorState(~run, 'late', 'e1'),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'late'),
-    !ScoreState(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    !ScoreState(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !DigestLtState(~run, 'g00', 'gff')
   ]
 
@@ -644,8 +701,8 @@ rule Init_Commit_Application_App_Output:
     PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'selected'),
     Eligible(~run, 'losing'),
-    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd2', 'd1'),
     AppDecryptsOnBranch(~run, 'app_selected', 'selected'),
     AppDecryptsOnBranch(~run, 'app_losing', 'losing'),
@@ -659,8 +716,8 @@ rule Init_Commit_Application_App_Output:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'selected'),
     !EligibleState(~run, 'losing'),
-    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd2', 'd1'),
     !AppDecryptsOnBranchState(~run, 'app_selected', 'selected'),
     !AppDecryptsOnBranchState(~run, 'app_losing', 'losing'),
@@ -739,8 +796,8 @@ rule Init_Proposal_Canonical_Consumption:
     PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'selected'),
     Eligible(~run, 'losing'),
-    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd2', 'd1'),
     ProposalMessage(~run, 'remove_bob', 'proposal_pending'),
     ProposalMessage(~run, 'losing_remove', 'losing'),
@@ -755,8 +812,8 @@ rule Init_Proposal_Canonical_Consumption:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'selected'),
     !EligibleState(~run, 'losing'),
-    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd2', 'd1'),
     !ProposalMessageState(~run, 'remove_bob', 'proposal_pending'),
     !ProposalMessageState(~run, 'losing_remove', 'losing'),
@@ -795,8 +852,8 @@ rule Init_Delivery_Order_Robustness:
     PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'selected'),
     Eligible(~run, 'losing'),
-    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     ScoreGreater(~run, 'd2', 'd1'),
     AppDecryptsOnBranch(~run, 'app_selected', 'selected'),
     AppDecryptsOnBranch(~run, 'app_losing', 'losing'),
@@ -815,8 +872,8 @@ rule Init_Delivery_Order_Robustness:
     !PolicyLoadedState(~run),
     !EligibleState(~run, 'selected'),
     !EligibleState(~run, 'losing'),
-    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
-    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'p1', 'c00', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'p1', 'c00', 'g00'),
     !GtState(~run, 'd2', 'd1'),
     !AppDecryptsOnBranchState(~run, 'app_selected', 'selected'),
     !AppDecryptsOnBranchState(~run, 'app_losing', 'losing'),
@@ -855,8 +912,8 @@ rule Derive_Late_Withheld_Rejection:
 rule Derive_Better_By_Effective_Depth:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw_w, effective_w, quorum_w, witness_w, digest_w),
-    !ScoreState(run, loser, raw_l, effective_l, quorum_l, witness_l, digest_l),
+    !ScoreState(run, winner, raw_w, effective_w, quorum_w, witness_w, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw_l, effective_l, quorum_l, witness_l, priority_l, committer_l, digest_l),
     !GtState(run, effective_w, effective_l)
   ]
 --[
@@ -869,8 +926,8 @@ rule Derive_Better_By_Effective_Depth:
 rule Derive_Better_By_Quorum_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw_w, effective, 'qyes', witness_w, digest_w),
-    !ScoreState(run, loser, raw_l, effective, 'qno', witness_l, digest_l),
+    !ScoreState(run, winner, raw_w, effective, 'qyes', witness_w, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw_l, effective, 'qno', witness_l, priority_l, committer_l, digest_l),
     !BoostAllowedState(run, winner)
   ]
 --[
@@ -883,8 +940,8 @@ rule Derive_Better_By_Quorum_Tie:
 rule Derive_Better_By_Raw_Depth_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw_w, effective, quorum, witness_w, digest_w),
-    !ScoreState(run, loser, raw_l, effective, quorum, witness_l, digest_l),
+    !ScoreState(run, winner, raw_w, effective, quorum, witness_w, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw_l, effective, quorum, witness_l, priority_l, committer_l, digest_l),
     !GtState(run, raw_w, raw_l)
   ]
 --[
@@ -897,8 +954,8 @@ rule Derive_Better_By_Raw_Depth_Tie:
 rule Derive_Better_By_Witness_Score_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness_w, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness_l, digest_l),
+    !ScoreState(run, winner, raw, effective, quorum, witness_w, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw, effective, quorum, witness_l, priority_l, committer_l, digest_l),
     !GtState(run, witness_w, witness_l)
   ]
 --[
@@ -908,11 +965,39 @@ rule Derive_Better_By_Witness_Score_Tie:
     !BetterState(run, winner, loser, 'witness_score_tie')
   ]
 
+rule Derive_Better_By_Priority_Tie:
+  [
+    Compare(run, winner, loser),
+    !ScoreState(run, winner, raw, effective, quorum, witness, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw, effective, quorum, witness, priority_l, committer_l, digest_l),
+    !PriorityLtState(run, priority_w, priority_l)
+  ]
+--[
+    DerivedBetter(run, winner, loser, 'priority_tie')
+  ]->
+  [
+    !BetterState(run, winner, loser, 'priority_tie')
+  ]
+
+rule Derive_Better_By_Committer_Tie:
+  [
+    Compare(run, winner, loser),
+    !ScoreState(run, winner, raw, effective, quorum, witness, priority, committer_w, digest_w),
+    !ScoreState(run, loser, raw, effective, quorum, witness, priority, committer_l, digest_l),
+    !CommitterLtState(run, committer_w, committer_l)
+  ]
+--[
+    DerivedBetter(run, winner, loser, 'committer_tie')
+  ]->
+  [
+    !BetterState(run, winner, loser, 'committer_tie')
+  ]
+
 rule Derive_Better_By_Digest_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness, digest_l),
+    !ScoreState(run, winner, raw, effective, quorum, witness, priority, committer, digest_w),
+    !ScoreState(run, loser, raw, effective, quorum, witness, priority, committer, digest_l),
     !DigestLtState(run, digest_w, digest_l)
   ]
 --[
@@ -1465,9 +1550,9 @@ lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
       Selected(run, client, branch, 'effective_depth') @ #i
     ==> (
-      Ex loser raw_b effective_b quorum_b witness_b digest_b raw_l effective_l quorum_l witness_l digest_l #j #k #m.
-          Score(run, branch, raw_b, effective_b, quorum_b, witness_b, digest_b) @ #j
-        & Score(run, loser, raw_l, effective_l, quorum_l, witness_l, digest_l) @ #k
+      Ex loser raw_b effective_b quorum_b witness_b priority_b committer_b digest_b raw_l effective_l quorum_l witness_l priority_l committer_l digest_l #j #k #m.
+          Score(run, branch, raw_b, effective_b, quorum_b, witness_b, priority_b, committer_b, digest_b) @ #j
+        & Score(run, loser, raw_l, effective_l, quorum_l, witness_l, priority_l, committer_l, digest_l) @ #k
         & ScoreGreater(run, effective_b, effective_l) @ #m
     )"
 
@@ -1475,9 +1560,9 @@ lemma quorum_tie_selection_requires_quorum_and_bound:
   "All run client branch #i.
       Selected(run, client, branch, 'quorum_tie') @ #i
     ==> (
-      Ex loser raw_b effective witness_b digest_b raw_l witness_l digest_l #j #k #m #n.
-          Score(run, branch, raw_b, effective, 'qyes', witness_b, digest_b) @ #j
-        & Score(run, loser, raw_l, effective, 'qno', witness_l, digest_l) @ #k
+      Ex loser raw_b effective witness_b priority_b committer_b digest_b raw_l witness_l priority_l committer_l digest_l #j #k #m #n.
+          Score(run, branch, raw_b, effective, 'qyes', witness_b, priority_b, committer_b, digest_b) @ #j
+        & Score(run, loser, raw_l, effective, 'qno', witness_l, priority_l, committer_l, digest_l) @ #k
         & QuorumMet(run, branch) @ #m
         & BoostAllowed(run, branch) @ #n
     )"
@@ -1486,19 +1571,39 @@ lemma witness_score_selection_requires_score_order:
   "All run client branch #i.
       Selected(run, client, branch, 'witness_score_tie') @ #i
     ==> (
-      Ex loser raw effective quorum witness_b digest_b witness_l digest_l #j #k #m.
-          Score(run, branch, raw, effective, quorum, witness_b, digest_b) @ #j
-        & Score(run, loser, raw, effective, quorum, witness_l, digest_l) @ #k
+      Ex loser raw effective quorum witness_b priority_b committer_b digest_b witness_l priority_l committer_l digest_l #j #k #m.
+          Score(run, branch, raw, effective, quorum, witness_b, priority_b, committer_b, digest_b) @ #j
+        & Score(run, loser, raw, effective, quorum, witness_l, priority_l, committer_l, digest_l) @ #k
         & ScoreGreater(run, witness_b, witness_l) @ #m
+    )"
+
+lemma priority_tie_selection_requires_preceding_equality_and_lower_priority:
+  "All run client branch #i.
+      Selected(run, client, branch, 'priority_tie') @ #i
+    ==> (
+      Ex loser raw effective quorum witness priority_b committer_b digest_b priority_l committer_l digest_l #j #k #m.
+          Score(run, branch, raw, effective, quorum, witness, priority_b, committer_b, digest_b) @ #j
+        & Score(run, loser, raw, effective, quorum, witness, priority_l, committer_l, digest_l) @ #k
+        & PriorityLower(run, priority_b, priority_l) @ #m
+    )"
+
+lemma committer_tie_selection_requires_preceding_equality_and_lower_committer:
+  "All run client branch #i.
+      Selected(run, client, branch, 'committer_tie') @ #i
+    ==> (
+      Ex loser raw effective quorum witness priority committer_b digest_b committer_l digest_l #j #k #m.
+          Score(run, branch, raw, effective, quorum, witness, priority, committer_b, digest_b) @ #j
+        & Score(run, loser, raw, effective, quorum, witness, priority, committer_l, digest_l) @ #k
+        & CommitterLower(run, committer_b, committer_l) @ #m
     )"
 
 lemma digest_tie_selection_requires_lower_digest:
   "All run client branch #i.
       Selected(run, client, branch, 'digest_tie') @ #i
     ==> (
-      Ex loser raw effective quorum witness digest_b digest_l #j #k #m.
-          Score(run, branch, raw, effective, quorum, witness, digest_b) @ #j
-        & Score(run, loser, raw, effective, quorum, witness, digest_l) @ #k
+      Ex loser raw effective quorum witness priority committer digest_b digest_l #j #k #m.
+          Score(run, branch, raw, effective, quorum, witness, priority, committer, digest_b) @ #j
+        & Score(run, loser, raw, effective, quorum, witness, priority, committer, digest_l) @ #k
         & DigestLower(run, digest_b, digest_l) @ #m
 	    )"
 
@@ -1815,6 +1920,18 @@ lemma generated_witness_priority_executable:
   "Ex run #i #j.
       GeneratedBoundedCase(run, 'witness_priority') @ #i
     & Selected(run, 'alice', 'chatty', 'witness_score_tie') @ #j"
+
+lemma generated_priority_tie_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'priority_tie') @ #i
+    & Selected(run, 'alice', 'privileged', 'priority_tie') @ #j"
+
+lemma generated_committer_tie_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'committer_tie') @ #i
+    & Selected(run, 'alice', 'lower_committer', 'committer_tie') @ #j"
 
 lemma generated_digest_priority_executable:
   exists-trace

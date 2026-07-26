@@ -693,6 +693,268 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
 }
 
 #[tokio::test]
+async fn multi_device_account_witness_deduplication_uses_real_openmls_leaves() {
+    let bus = TransportBus::ordered();
+    let shared_account_seed = pad32(b"shared-account");
+    let mut device_a = ClientBuilder::new(shared_account_seed.clone())
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut device_b = ClientBuilder::new(shared_account_seed)
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut other_account = ClientBuilder::new(pad32(b"other-account"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut competitor = ClientBuilder::new(pad32(b"competitor"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut observer = ClientBuilder::new(pad32(b"observer"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut app_invitee = ClientBuilder::new(pad32(b"app-invitee"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut quiet_invitee = ClientBuilder::new(pad32(b"quiet-invitee"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+
+    assert_eq!(
+        device_a.member_id(),
+        device_b.member_id(),
+        "the two devices intentionally share one Marmot account credential"
+    );
+    let device_b_kp = device_b.fresh_key_package().await;
+    let other_account_kp = other_account.fresh_key_package().await;
+    let competitor_kp = competitor.fresh_key_package().await;
+    let observer_kp = observer.fresh_key_package().await;
+    let (group_id, pending) = device_a
+        .create_group_with_admins_maybe_pending(
+            "multi-device-account-witness-dedupe",
+            vec![device_b_kp, other_account_kp, competitor_kp, observer_kp],
+            vec![],
+            vec![competitor.member_id()],
+        )
+        .await;
+    assert!(
+        pending.is_none(),
+        "current-profile founding creation is immediately stable"
+    );
+    bus.deliver_all();
+    for client in [
+        &mut device_b,
+        &mut other_account,
+        &mut competitor,
+        &mut observer,
+    ] {
+        let outcomes = client.tick().await;
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "client joins the shared base group: {outcomes:?}"
+        );
+    }
+
+    let base_epoch = observer.epoch().0;
+    let observer_members = observer.members();
+    let shared_account_leaves: Vec<_> = observer_members
+        .iter()
+        .filter(|member| member.id == device_a.member_id())
+        .collect();
+    assert_eq!(
+        shared_account_leaves.len(),
+        2,
+        "the base group must contain two MLS leaves for the shared account"
+    );
+    assert_ne!(
+        shared_account_leaves[0].credential, shared_account_leaves[1].credential,
+        "the shared-account leaves retain distinct MLS signature keys"
+    );
+
+    let shared_history = device_b
+        .send_app_capture(b"shared history before the fork".to_vec())
+        .await;
+    let shared_history = openmls_projection_message(&device_b, &shared_history).await;
+    assert_eq!(
+        project_mls_message(&shared_history.payload)
+            .expect("shared-history app projects")
+            .source_epoch,
+        Some(base_epoch),
+        "the control message is at the fork epoch and must not witness either branch"
+    );
+
+    let app_invitee_kp = app_invitee.fresh_key_package().await;
+    let quiet_invitee_kp = quiet_invitee.fresh_key_package().await;
+    let app_pending = device_a.invite(vec![app_invitee_kp]).await;
+    let _quiet_pending = competitor.invite(vec![quiet_invitee_kp]).await;
+    let commit_messages = queued_commit_messages(&observer, &bus).await;
+    assert_eq!(
+        commit_messages.len(),
+        2,
+        "the setup creates two branch tips"
+    );
+
+    let wrapped_app_commit = bus
+        .queued_messages()
+        .into_iter()
+        .find(|message| message.id == commit_messages[0].id)
+        .expect("wrapped app-branch commit remains queued");
+    device_a.confirm(app_pending).await;
+    for client in [&mut device_b, &mut other_account] {
+        bus.inject(client.bus_id, wrapped_app_commit.clone());
+        let outcomes = client.tick().await;
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "peer advances onto the app branch: {outcomes:?}"
+        );
+        assert_eq!(client.epoch().0, base_epoch + 1);
+    }
+
+    let device_b_app = device_b
+        .send_app_capture(b"shared account device B".to_vec())
+        .await;
+    let device_b_app = openmls_projection_message(&device_b, &device_b_app).await;
+    let device_a_app = device_a
+        .send_app_capture(b"shared account device A".to_vec())
+        .await;
+    let device_a_app = openmls_projection_message(&device_a, &device_a_app).await;
+    let other_account_app = other_account
+        .send_app_capture(b"different account witness".to_vec())
+        .await;
+    let other_account_app = openmls_projection_message(&other_account, &other_account_app).await;
+
+    let canonicalize = |pending_messages: Vec<TransportMessage>| {
+        canonicalize_openmls_batch(
+            observer.storage(),
+            &group_id,
+            OpenMlsCanonicalizationBatch {
+                state: CanonicalizationState {
+                    current_tip_epoch: base_epoch,
+                    retained_anchor_epoch: base_epoch,
+                    last_convergence_relevant_input_ms: 0,
+                    seen_message_ids: BTreeSet::new(),
+                },
+                candidate_paths: vec![
+                    OpenMlsCandidatePath {
+                        branch_id: "same-account-branch".into(),
+                        messages: vec![commit_messages[0].clone()],
+                    },
+                    OpenMlsCandidatePath {
+                        branch_id: "quiet-branch".into(),
+                        messages: vec![commit_messages[1].clone()],
+                    },
+                ],
+                pending_messages,
+                already_delivered_app_ids: BTreeSet::new(),
+                outbound_intents: vec![],
+                policy: base_test_policy(),
+                now_ms: 2_000,
+            },
+        )
+        .expect("real OpenMLS canonicalization succeeds")
+    };
+
+    let device_b_first = canonicalize(vec![
+        shared_history.clone(),
+        device_b_app.clone(),
+        device_a_app.clone(),
+    ]);
+    let device_a_first = canonicalize(vec![
+        device_a_app.clone(),
+        shared_history.clone(),
+        device_b_app.clone(),
+    ]);
+    for result in [&device_b_first, &device_a_first] {
+        let trace = result
+            .selection_trace
+            .as_ref()
+            .expect("selection trace is recorded");
+        let candidate = trace
+            .candidates
+            .iter()
+            .find(|candidate| candidate.branch_id == "same-account-branch")
+            .expect("app branch is traced");
+        assert_eq!(candidate.app_witnesses.len(), 2);
+        assert_eq!(
+            candidate.score.app_witness_score, 1,
+            "two real leaves of one account count once"
+        );
+        assert!(
+            !candidate.score.witness_quorum_met,
+            "one distinct account cannot satisfy a two-account quorum"
+        );
+        assert_eq!(
+            result.selected_branch_id.as_deref(),
+            Some("same-account-branch")
+        );
+        assert_eq!(
+            trace
+                .rule_trace
+                .iter()
+                .find(|rule| rule.decisive)
+                .map(|rule| rule.rule_name),
+            Some("app_witness_score")
+        );
+    }
+    assert_eq!(
+        device_b_first.selection_trace, device_a_first.selection_trace,
+        "delivery order and which same-account device arrives first do not change selection"
+    );
+
+    let with_other_account = canonicalize(vec![
+        shared_history,
+        device_b_app,
+        other_account_app,
+        device_a_app,
+    ]);
+    let trace = with_other_account
+        .selection_trace
+        .as_ref()
+        .expect("selection trace is recorded");
+    let candidate = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.branch_id == "same-account-branch")
+        .expect("app branch is traced");
+    assert_eq!(
+        candidate.app_witnesses.len(),
+        3,
+        "the fork-epoch shared-history message is excluded from branch witnesses"
+    );
+    assert_eq!(
+        candidate.score.app_witness_score, 2,
+        "a genuinely different account increases the witness score"
+    );
+    assert!(
+        candidate.score.witness_quorum_met,
+        "two distinct accounts satisfy the configured quorum"
+    );
+    assert_eq!(
+        with_other_account.selected_branch_id.as_deref(),
+        Some("same-account-branch")
+    );
+    assert_eq!(
+        trace
+            .rule_trace
+            .iter()
+            .find(|rule| rule.decisive)
+            .map(|rule| rule.rule_name),
+        Some("effective_commit_depth"),
+        "quorum boost is the first decisive selector field"
+    );
+    assert_eq!(
+        observer.epoch().0,
+        base_epoch,
+        "projection probes leave the retained observer state untouched"
+    );
+}
+
+#[tokio::test]
 async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))

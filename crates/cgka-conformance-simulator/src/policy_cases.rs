@@ -155,6 +155,17 @@ pub fn digest_rank(digest: &[u8; 32]) -> &'static str {
     }
 }
 
+pub fn priority_rank(priority: CommitOrderingPriority) -> &'static str {
+    match priority {
+        CommitOrderingPriority::Privileged => "p0",
+        CommitOrderingPriority::Ordinary => "p1",
+    }
+}
+
+pub fn committer_rank(committer: &[u8]) -> String {
+    format!("c{}", hex::encode(committer))
+}
+
 fn digest_from_rank(rank: &str) -> [u8; 32] {
     match rank {
         "00" | "g00" => [0x00; 32],
