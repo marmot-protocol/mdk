@@ -108,6 +108,7 @@ pub struct UserProfileMetadataFfi {
     pub display_name: Option<String>,
     pub about: Option<String>,
     pub picture: Option<String>,
+    #[uniffi(default = None)]
     pub banner: Option<String>,
     pub nip05: Option<String>,
     pub lud16: Option<String>,

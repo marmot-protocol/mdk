@@ -352,36 +352,62 @@ pub(crate) fn account_key_package_record_from_fetched(
 }
 
 pub(crate) fn merge_key_package_records(
-    records: Vec<AccountKeyPackageRecord>,
+    mut records: Vec<AccountKeyPackageRecord>,
 ) -> Vec<AccountKeyPackageRecord> {
-    let mut merged: Vec<AccountKeyPackageRecord> = Vec::new();
-    for record in records {
+    // Normalize input order first. Matching by KeyPackageRef is deliberately
+    // not a general equivalence relation: multiple relay events may advertise
+    // the same usable package and each event id must remain addressable.
+    for record in &mut records {
+        record.source_relays.sort();
+        record.source_relays.dedup();
+    }
+    records.sort_by(record_identity_cmp);
+    let mut merged = Vec::<AccountKeyPackageRecord>::new();
+
+    for record in records.iter().filter(|record| record.relay) {
         if let Some(existing) = merged.iter_mut().find(|existing| {
-            (!record.key_package_event_id.is_empty()
-                && record.key_package_event_id == existing.key_package_event_id)
-                || (!record.key_package_ref_hex.is_empty()
-                    && record.key_package_ref_hex == existing.key_package_ref_hex)
-                || (record.key_package_event_id.is_empty()
-                    && record.key_package_ref_hex.is_empty()
-                    && existing.key_package_event_id.is_empty()
-                    && existing.key_package_ref_hex.is_empty()
-                    && record.key_package_id == existing.key_package_id)
+            !record.key_package_event_id.is_empty()
+                && record.key_package_event_id == existing.key_package_event_id
         }) {
-            existing.local |= record.local;
-            existing.relay |= record.relay;
-            existing.published_at = existing.published_at.max(record.published_at);
-            if existing.account_label.is_none() {
-                existing.account_label = record.account_label.clone();
-            }
-            if existing.key_package_event_id.is_empty() {
-                existing.key_package_event_id = record.key_package_event_id.clone();
-            }
-            if existing.key_package_ref_hex.is_empty() {
-                existing.key_package_ref_hex = record.key_package_ref_hex.clone();
-            }
-            push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
+            merge_record_fields(existing, record);
         } else {
-            merged.push(record);
+            merged.push(record.clone());
+        }
+    }
+
+    for record in records.iter().filter(|record| record.local) {
+        let matching_relay_indexes = merged
+            .iter()
+            .enumerate()
+            .filter_map(|(index, existing)| {
+                ((!record.key_package_event_id.is_empty()
+                    && record.key_package_event_id == existing.key_package_event_id)
+                    || (record.key_package_event_id.is_empty()
+                        && !record.key_package_ref_hex.is_empty()
+                        && record.key_package_ref_hex == existing.key_package_ref_hex))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching_relay_indexes.is_empty() {
+            if let Some(existing) = merged.iter_mut().find(|existing| {
+                existing.local
+                    && !existing.relay
+                    && ((!record.key_package_ref_hex.is_empty()
+                        && record.key_package_ref_hex == existing.key_package_ref_hex)
+                        || (record.key_package_ref_hex.is_empty()
+                            && existing.key_package_ref_hex.is_empty()
+                            && record.key_package_event_id.is_empty()
+                            && existing.key_package_event_id.is_empty()
+                            && record.key_package_id == existing.key_package_id))
+            }) {
+                merge_record_fields(existing, record);
+            } else {
+                merged.push(record.clone());
+            }
+        } else {
+            for index in matching_relay_indexes {
+                merge_record_fields(&mut merged[index], record);
+            }
         }
     }
     merged.sort_by(|left, right| {
@@ -389,8 +415,46 @@ pub(crate) fn merge_key_package_records(
             .published_at
             .cmp(&left.published_at)
             .then_with(|| left.key_package_event_id.cmp(&right.key_package_event_id))
+            .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
+            .then_with(|| left.key_package_id.cmp(&right.key_package_id))
     });
     merged
+}
+
+fn record_identity_cmp(
+    left: &AccountKeyPackageRecord,
+    right: &AccountKeyPackageRecord,
+) -> std::cmp::Ordering {
+    left.key_package_event_id
+        .cmp(&right.key_package_event_id)
+        .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
+        .then_with(|| left.key_package_id.cmp(&right.key_package_id))
+        .then_with(|| left.local.cmp(&right.local))
+        .then_with(|| left.relay.cmp(&right.relay))
+        .then_with(|| left.published_at.cmp(&right.published_at))
+        .then_with(|| left.source_relays.cmp(&right.source_relays))
+}
+
+fn merge_record_fields(existing: &mut AccountKeyPackageRecord, record: &AccountKeyPackageRecord) {
+    existing.local |= record.local;
+    existing.relay |= record.relay;
+    existing.published_at = existing.published_at.max(record.published_at);
+    existing.key_package_bytes = existing.key_package_bytes.max(record.key_package_bytes);
+    if existing.account_label.is_none() {
+        existing.account_label.clone_from(&record.account_label);
+    }
+    if existing.key_package_event_id.is_empty() {
+        existing
+            .key_package_event_id
+            .clone_from(&record.key_package_event_id);
+    }
+    if existing.key_package_ref_hex.is_empty() {
+        existing
+            .key_package_ref_hex
+            .clone_from(&record.key_package_ref_hex);
+    }
+    push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
+    existing.source_relays.sort();
 }
 
 pub(crate) fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
@@ -481,5 +545,67 @@ pub(crate) fn publish_endpoints_from_bootstrap(
         bootstrap.default_relays.clone()
     } else {
         bootstrap.bootstrap_relays.clone()
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn record(event: &str, reference: &str, local: bool, relay: bool) -> AccountKeyPackageRecord {
+        AccountKeyPackageRecord {
+            account_label: local.then(|| "device".to_owned()),
+            account_id_hex: "account".to_owned(),
+            key_package_id: format!("slot-{event}-{reference}"),
+            key_package_ref_hex: reference.to_owned(),
+            key_package_event_id: event.to_owned(),
+            published_at: event.len() as u64,
+            key_package_bytes: 123,
+            source_relays: relay
+                .then(|| "wss://relay.example".to_owned())
+                .into_iter()
+                .collect(),
+            local,
+            relay,
+        }
+    }
+
+    #[test]
+    fn local_and_relay_copy_merge_without_losing_distinct_relay_events() {
+        let records = merge_key_package_records(vec![
+            record("", "ref", true, false),
+            record("event-b", "ref", false, true),
+            record("event-a", "ref", false, true),
+        ]);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.local && record.relay));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.key_package_event_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["event-a", "event-b"])
+        );
+    }
+
+    #[test]
+    fn empty_identity_records_only_merge_by_stable_slot() {
+        let records = merge_key_package_records(vec![
+            record("", "", true, false),
+            record("", "", false, true),
+        ]);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn merge_is_independent_of_input_order() {
+        let input = vec![
+            record("", "ref", true, false),
+            record("event-b", "ref", false, true),
+            record("event-a", "ref", false, true),
+        ];
+        let expected = merge_key_package_records(input.clone());
+        let actual = merge_key_package_records(input.into_iter().rev().collect());
+        assert_eq!(actual, expected);
     }
 }

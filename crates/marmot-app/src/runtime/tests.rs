@@ -156,7 +156,7 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
         display_name: Some("New Name".to_owned()),
         about: Some("updated about".to_owned()),
         picture: None,
-        banner: Some("https://example.test/new-banner.png".to_owned()),
+        banner: None,
         created_at: 0,
         source_relays: Vec::new(),
         ..UserProfileMetadata::default()
@@ -170,7 +170,7 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
     assert_eq!(merged.picture, None);
     assert_eq!(
         merged.banner.as_deref(),
-        Some("https://example.test/new-banner.png")
+        Some("https://example.test/old-banner.png")
     );
     assert_eq!(
         merged.extra.get("website"),
@@ -180,6 +180,23 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
     assert_eq!(
         merged.extra.get("custom"),
         Some(&serde_json::json!({"source": "other-client"}))
+    );
+}
+
+#[test]
+fn merge_user_profile_update_replaces_banner_when_present() {
+    let current = UserProfileMetadata {
+        banner: Some("https://example.test/old-banner.png".to_owned()),
+        ..UserProfileMetadata::default()
+    };
+    let update = UserProfileMetadata {
+        banner: Some("https://example.test/new-banner.png".to_owned()),
+        ..UserProfileMetadata::default()
+    };
+
+    assert_eq!(
+        merge_user_profile_update(current, update).banner.as_deref(),
+        Some("https://example.test/new-banner.png")
     );
 }
 

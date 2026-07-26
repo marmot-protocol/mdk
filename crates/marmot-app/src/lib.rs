@@ -789,13 +789,19 @@ pub struct FetchedKeyPackage {
 pub struct AccountKeyPackageRecord {
     pub account_label: Option<String>,
     pub account_id_hex: String,
+    /// Relay `d` tag / durable lifecycle slot when known. For a local bundle
+    /// with no lifecycle or legacy metadata, this falls back to the
+    /// KeyPackageRef hex so it remains stable and non-secret.
     pub key_package_id: String,
     pub key_package_ref_hex: String,
     pub key_package_event_id: String,
     pub published_at: u64,
     pub key_package_bytes: usize,
     pub source_relays: Vec<String>,
+    /// True only when the corresponding private OpenMLS bundle is durably
+    /// stored and can be looked up for Welcome processing.
     pub local: bool,
+    /// True when this exact event id was discovered from a relay.
     pub relay: bool,
 }
 
@@ -2863,9 +2869,15 @@ impl MarmotApp {
                 .as_ref()
                 .filter(|legacy| legacy.key_package_ref_hex == metadata.key_package_ref_hex)
             {
-                key_package_id = legacy.key_package_id.clone();
-                key_package_event_id = legacy.key_package_event_id.clone();
-                published_at = legacy.published_at;
+                if key_package_id == metadata.key_package_ref_hex {
+                    key_package_id = legacy.key_package_id.clone();
+                }
+                if key_package_event_id.is_empty() {
+                    key_package_event_id = legacy.key_package_event_id.clone();
+                }
+                if published_at == 0 {
+                    published_at = legacy.published_at;
+                }
             }
 
             records.push(AccountKeyPackageRecord {

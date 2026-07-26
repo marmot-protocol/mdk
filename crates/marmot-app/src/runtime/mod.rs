@@ -23,7 +23,6 @@ use crate::app_telemetry::{
 };
 use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
 use crate::ids::normalize_group_id_hex_app;
-use crate::media::upload_profile_image;
 use crate::messages::AppMessageIntent;
 use crate::notifications;
 use crate::{
@@ -2364,7 +2363,20 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let signer = self.accounts.app.account_signer_for_summary(&account)?;
         let signer = signer.as_nostr_signer();
-        upload_profile_image(&data, media_type, blossom_server, signer.as_ref()).await
+        let configured_server = self
+            .accounts
+            .app
+            .service_endpoints()
+            .profile_image_blob_endpoint
+            .as_deref();
+        crate::media::upload_profile_image_with_policy(
+            &data,
+            media_type,
+            blossom_server.or(configured_server),
+            signer.as_ref(),
+            self.accounts.app.allow_loopback_blob_endpoints(),
+        )
+        .await
     }
 
     async fn latest_known_user_profile_for_publish(
@@ -3185,11 +3197,11 @@ impl AccountManager {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.resolve(account_ref)?;
-        let owned = if account.is_active_signing() {
-            self.durably_owned_key_packages(account_ref).await?
-        } else {
-            Vec::new()
-        };
+        let owned = cgka_engine::key_package::durably_owned_key_packages(
+            &self.app.account_storage(&account.label)?,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(cgka_session::SessionError::from)?;
         self.app
             .account_key_package_records(&account.label, bootstrap_relays, owned)
             .await
@@ -3866,7 +3878,9 @@ fn merge_user_profile_update(
     current.display_name = update.display_name;
     current.about = update.about;
     current.picture = update.picture;
-    current.banner = update.banner;
+    if update.banner.is_some() {
+        current.banner = update.banner;
+    }
     current.nip05 = update.nip05;
     current.lud16 = update.lud16;
     current.created_at = update.created_at;

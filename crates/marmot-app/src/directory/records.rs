@@ -550,4 +550,27 @@ mod tests {
         );
         assert_eq!(string_field(&content, "about"), None);
     }
+
+    #[test]
+    fn legacy_flattened_extra_banner_promotes_to_typed_field() {
+        // Before `banner` was typed, serde's flattened `extra` map wrote it at
+        // the profile's top level. New readers must promote that cached shape
+        // instead of losing it on the next profile update.
+        let cached: UserProfileMetadata = serde_json::from_value(serde_json::json!({
+            "name": "alice",
+            "banner": "https://example.test/banner.png",
+            "website": "https://example.test"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cached.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
+        assert_eq!(
+            cached.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert!(!cached.extra.contains_key("banner"));
+    }
 }

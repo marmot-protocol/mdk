@@ -2747,6 +2747,11 @@ fn keys_list_reports_published_key_package() {
     let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
     assert_eq!(listed["account_id"], account_id);
     let keys = listed["keys"].as_array().expect("keys array");
+    assert_eq!(
+        keys.len(),
+        2,
+        "expected the current relay-visible package and retained local package, got {keys:?}"
+    );
     let relay_keys = keys
         .iter()
         .filter(|key| key["relay"] == true)

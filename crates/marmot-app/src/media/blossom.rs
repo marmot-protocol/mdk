@@ -40,6 +40,7 @@ pub(crate) async fn upload_blossom_blob(
         signer,
         allow_loopback_http,
         BLOSSOM_UPLOAD_CONTENT_TYPE,
+        None,
     )
     .await
 }
@@ -51,12 +52,13 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     signer: &dyn NostrSigner,
     allow_loopback_http: bool,
     content_type: &str,
+    fallback_extension: Option<&str>,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
     let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
-        .put(upload_url)
+        .put(upload_url.clone())
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .header("X-SHA-256", blob_hash_hex)
@@ -82,7 +84,13 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     let url = descriptor
         .url
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| blossom_blob_url(server, blob_hash_hex));
+        .unwrap_or_else(|| {
+            blossom_blob_url_with_extension(server, blob_hash_hex, fallback_extension)
+        });
+    let parsed_url = Url::parse(&url)
+        .map_err(|_| AppError::BlobStore("upload descriptor URL is invalid".into()))?;
+    validate_blossom_redirect_host(&upload_url, &parsed_url)
+        .map_err(|err| AppError::BlobStore(format!("unsafe upload descriptor host: {err}")))?;
     let content_hash = blossom_content_hash_from_url(&url).ok_or_else(|| {
         AppError::BlobStore("upload descriptor URL did not include blob hash".into())
     })?;
@@ -373,18 +381,23 @@ fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
 }
 
 pub(crate) fn blossom_blob_url(server: &str, encrypted_hash_hex: &str) -> String {
+    blossom_blob_url_with_extension(server, encrypted_hash_hex, Some(".bin"))
+}
+
+fn blossom_blob_url_with_extension(
+    server: &str,
+    hash_hex: &str,
+    extension: Option<&str>,
+) -> String {
+    let suffix = extension.unwrap_or_default();
     match Url::parse(server.trim()) {
         Ok(mut url) => {
-            url.set_path(&format!("{encrypted_hash_hex}.bin"));
+            url.set_path(&format!("{hash_hex}{suffix}"));
             url.set_query(None);
             url.set_fragment(None);
             url.to_string()
         }
-        Err(_) => format!(
-            "{}/{}.bin",
-            server.trim_end_matches('/'),
-            encrypted_hash_hex
-        ),
+        Err(_) => format!("{}/{}{}", server.trim_end_matches('/'), hash_hex, suffix),
     }
 }
 

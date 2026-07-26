@@ -940,6 +940,29 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     assert!(rotated[0].local);
     assert!(rotated[0].relay);
 
+    first_runtime
+        .sign_out(
+            &first.account.account_id_hex,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    let while_signed_out = first_runtime
+        .account_key_packages(&first.account.account_id_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let signed_out_rotated = while_signed_out
+        .iter()
+        .filter(|package| package.key_package_ref_hex == fetched_ref)
+        .collect::<Vec<_>>();
+    assert_eq!(signed_out_rotated.len(), 1);
+    assert!(
+        signed_out_rotated[0].local && signed_out_rotated[0].relay,
+        "signed-out ownership must be read from durable storage without a worker"
+    );
+
     first_runtime.shutdown().await;
     drop(first_runtime);
     drop(first_app);

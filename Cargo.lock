@@ -3189,6 +3189,7 @@ dependencies = [
  "fs-private",
  "hex",
  "hkdf 0.12.4",
+ "image",
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",

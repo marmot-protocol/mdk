@@ -7,6 +7,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `keys list` now reports every durably device-owned KeyPackage, including
+  retained private material, and merges relay visibility without losing
+  distinct relay event ids.
+
 ## [0.9.5] - 2026-07-25
 
 ### Changed
