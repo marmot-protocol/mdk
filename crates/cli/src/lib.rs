@@ -877,8 +877,8 @@ pub(crate) fn chat_json(group: AppGroupRecord, chat_list_row: Option<ChatListRow
 /// `chat_list_row` object embedded on every `timeline_projection_updated`
 /// event, so the snapshot feed (`chats list`/`subscribe`) and the live timeline
 /// feed agree key-for-key. The surface is deliberately the minimal reviewed set
-/// — unread state, a last-message preview, and the last-read marker — rather
-/// than the full `ChatListRow` (whose title/avatar/membership fields either
+/// — unread state, durable `activity_sort_at`, a last-message preview, and the
+/// last-read marker — rather than the full `ChatListRow` (whose title/avatar/membership fields either
 /// duplicate `group_json` or are group-state concerns).
 ///
 /// The keys are always present: a group with no projection row yet (or no
@@ -888,25 +888,34 @@ pub(crate) fn insert_chat_projection(value: &mut Value, chat_list_row: Option<Ch
     let Some(object) = value.as_object_mut() else {
         return;
     };
-    let (unread_count, has_unread, last_message, last_read_message_id_hex, last_read_timeline_at) =
-        match chat_list_row {
-            Some(row) => (
-                json!(row.unread_count),
-                json!(row.has_unread),
-                json!(row.last_message),
-                json!(row.last_read_message_id_hex),
-                json!(row.last_read_timeline_at),
-            ),
-            None => (
-                json!(0),
-                json!(false),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ),
-        };
+    let (
+        unread_count,
+        has_unread,
+        activity_sort_at,
+        last_message,
+        last_read_message_id_hex,
+        last_read_timeline_at,
+    ) = match chat_list_row {
+        Some(row) => (
+            json!(row.unread_count),
+            json!(row.has_unread),
+            json!(row.activity_sort_at),
+            json!(row.last_message),
+            json!(row.last_read_message_id_hex),
+            json!(row.last_read_timeline_at),
+        ),
+        None => (
+            json!(0),
+            json!(false),
+            json!(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+    };
     object.insert("unread_count".to_owned(), unread_count);
     object.insert("has_unread".to_owned(), has_unread);
+    object.insert("activity_sort_at".to_owned(), activity_sort_at);
     object.insert("last_message".to_owned(), last_message);
     object.insert(
         "last_read_message_id_hex".to_owned(),
@@ -1272,6 +1281,7 @@ mod tests {
         assert_eq!(value["archived"], false);
         assert_eq!(value["unread_count"], 0);
         assert_eq!(value["has_unread"], false);
+        assert_eq!(value["activity_sort_at"], 0);
         assert!(value["last_message"].is_null());
         assert!(value["last_read_message_id_hex"].is_null());
         assert!(value["last_read_timeline_at"].is_null());
@@ -1318,6 +1328,7 @@ mod tests {
 
         assert_eq!(value["unread_count"], 3);
         assert_eq!(value["has_unread"], true);
+        assert_eq!(value["activity_sort_at"], 1_700_000_050_u64);
         assert_eq!(value["last_read_message_id_hex"], "r1");
         assert_eq!(value["last_read_timeline_at"], 1_700_000_000_u64);
         // `last_message` is byte-identical to the timeline feed's preview.

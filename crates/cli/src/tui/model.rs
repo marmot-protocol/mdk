@@ -75,6 +75,9 @@ pub(crate) struct ChatRow {
 pub(crate) struct ChatProjection {
     pub(crate) unread_count: usize,
     pub(crate) has_unread: bool,
+    /// Durable user-visible activity anchor from the chat-list projection.
+    /// Matches storage `ORDER BY activity_sort_at DESC, group_id_hex`.
+    pub(crate) activity_sort_at: u64,
     pub(crate) last_message: Option<ChatLastMessage>,
     pub(crate) last_read_message_id_hex: Option<String>,
     pub(crate) last_read_timeline_at: Option<u64>,
@@ -2046,7 +2049,7 @@ pub(crate) fn parse_chat(value: &Value) -> Option<ChatRow> {
     })
 }
 
-/// Parse the five chat-projection keys off any object that carries them: a
+/// Parse the chat-projection keys off any object that carries them: a
 /// `chats list`/`subscribe` row, the timeline feed's `chat_list_row`, or the
 /// `chats mark-read` response. Every field is optional — a group with no
 /// projection yet (or a row missing a key) takes the empty default — so the
@@ -2062,6 +2065,10 @@ pub(crate) fn parse_chat_projection(value: &Value) -> ChatProjection {
             .get("has_unread")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        activity_sort_at: value
+            .get("activity_sort_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         last_message: value
             .get("last_message")
             .filter(|message| !message.is_null())
@@ -3428,20 +3435,19 @@ pub(crate) fn selected_chat_index(chats: &[ChatRow], group_id: Option<&str>) -> 
     group_id.and_then(|group_id| chats.iter().position(|chat| chat.group_id == group_id))
 }
 
-/// The activity timestamp a chat orders by: its last message's `timeline_at`, or
-/// `0` when it has no messages yet (message-less chats sort to the bottom).
+/// The durable activity anchor a chat orders by (`activity_sort_at`).
 pub(crate) fn chat_activity(chat: &ChatRow) -> u64 {
-    chat.projection
-        .last_message
-        .as_ref()
-        .map_or(0, |message| message.timeline_at)
+    chat.projection.activity_sort_at
 }
 
-/// Order chats by last activity, newest first. A stable sort keyed only on
-/// activity, so equal-activity rows (all message-less chats, or same-second
-/// activity) keep the order `chats list` returned — the documented fallback.
+/// Order chats by durable activity, newest first, then ascending `group_id` —
+/// matching storage `ORDER BY activity_sort_at DESC, group_id_hex`.
 pub(crate) fn sort_chats_by_activity(chats: &mut [ChatRow]) {
-    chats.sort_by_key(|chat| std::cmp::Reverse(chat_activity(chat)));
+    chats.sort_by(|left, right| {
+        chat_activity(right)
+            .cmp(&chat_activity(left))
+            .then_with(|| left.group_id.cmp(&right.group_id))
+    });
 }
 
 /// Re-order chats by activity while keeping the highlight on the same chat by

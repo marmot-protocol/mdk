@@ -7,6 +7,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on
+  `chats list`/`subscribe`/`mark-read` rows (and timeline `chat_list_row`
+  updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
+  chats keep their storage position. Equal-activity rows tie-break on ascending
+  `group_id`, matching storage.
+
 ## [0.9.7] - 2026-07-26
 
 ### Fixed

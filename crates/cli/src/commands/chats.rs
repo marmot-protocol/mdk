@@ -155,9 +155,10 @@ pub(crate) async fn chats_command_with_runtime(
 }
 
 /// Render the `chats mark-read` response: the account/group identity plus the
-/// refreshed chat-list projection (unread state, last-message preview, last-read
-/// marker) via [`insert_chat_projection`], so the five projection keys are
-/// byte-identical to the `chats list` rows and the `chats subscribe` feed.
+/// refreshed chat-list projection (unread state, durable activity anchor,
+/// last-message preview, last-read marker) via [`insert_chat_projection`], so the
+/// projection keys are byte-identical to the `chats list` rows and the
+/// `chats subscribe` feed.
 fn chat_mark_read_json(
     account_id_hex: &str,
     group_id_hex: &str,
