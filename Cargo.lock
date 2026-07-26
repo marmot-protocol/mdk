@@ -68,6 +68,7 @@ dependencies = [
  "tracing",
  "transport-quic-broker",
  "transport-quic-stream",
+ "zeroize",
 ]
 
 [[package]]

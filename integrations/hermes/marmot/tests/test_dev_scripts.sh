@@ -106,6 +106,25 @@ installer_stdin_dry_run="$(
         MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     bash -s -- --dry-run --yes < "$repo_root/scripts/install-hermes-marmot.sh"
 )"
+identity_secret="nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99"
+identity_file="$tmp_parent/hermes-agent.nsec"
+printf '%s\n' "$identity_secret" > "$identity_file"
+chmod 0600 "$identity_file"
+expected_identity="$(printf '11%.0s' {1..32})"
+installer_existing_identity_dry_run="$(
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+        --existing-identity-file "$identity_file" \
+        --expected-npub "$expected_identity"
+)"
+installer_generated_identity_dry_run="$(
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --generate-identity
+)"
 installer_bad_welcomer_status=0
 env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     WN_AGENT_SHA="9.9.9" \
@@ -113,6 +132,14 @@ env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
 [ "$installer_bad_welcomer_status" -ne 0 ]
+installer_identity_conflict_status=0
+"$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --generate-identity \
+    --existing-identity-file "$identity_file" >/dev/null 2>&1 || installer_identity_conflict_status=$?
+[ "$installer_identity_conflict_status" -ne 0 ]
+installer_expected_without_source_status=0
+"$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --expected-npub "$expected_identity" \
+    >/dev/null 2>&1 || installer_expected_without_source_status=$?
+[ "$installer_expected_without_source_status" -ne 0 ]
 case "$installer_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -166,6 +193,22 @@ esac
 case "$installer_stdin_dry_run" in
     *"--label hermes-agent"* ) ;;
     *) echo "Hermes installer stdin dry-run did not pass the Hermes bootstrap label" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"import-identity"*"--identity-file"*"$identity_file"*"--expected-identity"*"$expected_identity"* ) ;;
+    *) echo "Hermes installer did not use the shared secure identity-import command" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"bootstrap"*"--no-create"*"--account-id-hex"* ) ;;
+    *) echo "Hermes installer did not bootstrap the imported account with creation disabled" >&2; exit 1;;
+esac
+case "$installer_existing_identity_dry_run" in
+    *"$identity_secret"* ) echo "Hermes installer output exposed identity secret material" >&2; exit 1;;
+    *) ;;
+esac
+case "$installer_generated_identity_dry_run" in
+    *"import-identity"* | *"--no-create"* ) echo "Hermes generated-identity path used existing-identity flags" >&2; exit 1;;
+    *) ;;
 esac
 
 echo "dev script test passed"

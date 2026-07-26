@@ -7,6 +7,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- The Hermes and OpenClaw release installers can now securely import an existing
+  Nostr identity from an owner-only file, optionally pin it to an expected npub,
+  and bootstrap that exact account without creating a replacement identity.
+  Interactive installs also provide a masked `/dev/tty` identity prompt.
+
+### Security
+
+- `wn-agent import-identity` keeps secret material out of argv, environment,
+  output, and bootstrap/config artifacts; rejects symlinked, shared, or
+  non-regular credential files; verifies the expected public identity before
+  persistence; and makes duplicate or interrupted imports recoverable.
+
 ## [0.9.7] - 2026-07-26
 
 ### Fixed

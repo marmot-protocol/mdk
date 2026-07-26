@@ -726,7 +726,10 @@ mod tests {
             )
             .await;
 
-        let result = run_bootstrap(test_options(socket_path)).await.unwrap();
+        let mut options = test_options(socket_path);
+        options.account_id_hex = Some(ACCOUNT_ID.to_owned());
+        options.create_if_missing = false;
+        let result = run_bootstrap(options).await.unwrap();
         server.abort();
 
         assert!(!result.created);

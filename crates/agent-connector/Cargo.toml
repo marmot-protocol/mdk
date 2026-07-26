@@ -29,6 +29,7 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "proce
 tracing.workspace = true
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true
