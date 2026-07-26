@@ -1,5 +1,5 @@
 use super::*;
-use nostr::secp256k1::{Secp256k1, ecdh::SharedSecret};
+use nostr::secp256k1::{Keypair, Secp256k1, ecdh::SharedSecret};
 
 fn server_secret() -> SecretKey {
     let secp = Secp256k1::new();
@@ -1387,9 +1387,10 @@ fn sign_removal_record_with_event_kind(
 
 fn sign_token_record_raw_legacy(record: &mut GroupPushTokenRecord, keys: &Keys) {
     let message = Message::from_digest(record.signing_digest().unwrap());
+    let keypair = Keypair::from_secret_key(SECP256K1, keys.secret_key());
     record.owner_sig = hex::encode(
         SECP256K1
-            .sign_schnorr_no_aux_rand(&message, keys.key_pair(SECP256K1))
+            .sign_schnorr_no_aux_rand(&message, &keypair)
             .serialize(),
     );
 }
@@ -1400,9 +1401,10 @@ fn sign_removal_record_raw_legacy(
     keys: &Keys,
 ) {
     let message = Message::from_digest(record.signing_digest(group_id_hex).unwrap());
+    let keypair = Keypair::from_secret_key(SECP256K1, keys.secret_key());
     record.owner_sig = hex::encode(
         SECP256K1
-            .sign_schnorr_no_aux_rand(&message, keys.key_pair(SECP256K1))
+            .sign_schnorr_no_aux_rand(&message, &keypair)
             .serialize(),
     );
 }
