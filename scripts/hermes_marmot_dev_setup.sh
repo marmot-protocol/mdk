@@ -392,6 +392,14 @@ source "$dev_root/env.sh"
 exec "$MDK_REPO/scripts/hermes_marmot_connector_e2e.sh" --root "$dev_root"
 SCRIPT
 
+    cat >"$dev_root/verify-persisted-config.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+exec "$MDK_REPO/scripts/hermes_marmot_verify_persisted_config.sh" --root "$dev_root" "$@"
+SCRIPT
+
     cat >"$dev_root/bootstrap-agent.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -461,6 +469,7 @@ SCRIPT
         "$dev_root/smoke-plugin.sh" \
         "$dev_root/e2e-deterministic.sh" \
         "$dev_root/e2e-connector.sh" \
+        "$dev_root/verify-persisted-config.sh" \
         "$dev_root/bootstrap-agent.sh" \
         "$dev_root/start-wn-agent.sh" \
         "$dev_root/start-hermes-gateway.sh" \
@@ -509,6 +518,7 @@ if [ "$print_env" -eq 1 ]; then
     echo "  $(printf '%q' "$dev_root/smoke-plugin.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-deterministic.sh")"
     echo "  $(printf '%q' "$dev_root/e2e-connector.sh")"
+    echo "  $(printf '%q' "$dev_root/verify-persisted-config.sh")"
     echo "  $(printf '%q' "$dev_root/bootstrap-agent.sh") --qr"
     echo "  $(printf '%q' "$dev_root/run-wn-agent.sh")"
     echo "  $(printf '%q' "$dev_root/run-hermes-gateway.sh")"

@@ -55,7 +55,10 @@ class PlatformRegistryHarness:
         if (existing is None or not existing.enabled) and is_connected is not None:
             probe_extra = dict(getattr(existing, "extra", {}) or {})
             if isinstance(seed, dict):
-                probe_extra.update({key: value for key, value in seed.items() if key != "home_channel"})
+                for key, value in seed.items():
+                    if key == "home_channel":
+                        continue
+                    probe_extra.setdefault(key, value)
             probe = PlatformConfigHarness(enabled=True, extra=probe_extra)
             if not is_connected(probe):
                 return existing
@@ -289,6 +292,40 @@ class MarmotPlatformEnablementTests(unittest.TestCase):
             with unittest.mock.patch.object(Path, "exists", return_value=False):
                 self.assertIsNone(self.registry.apply_env_overrides())
         finally:
+            restore_marmot_env(saved_env)
+
+    def test_persisted_extra_wins_over_overlapping_env_seed_during_probe(self):
+        saved_env = clear_marmot_env()
+        probe_socket_paths: list[str] = []
+
+        def capture_probe(config):
+            probe_socket_paths.append(config.extra.get("socket_path", ""))
+            return self.adapter_module.validate_config(config)
+
+        original_is_connected = self.registry.entry["is_connected"]
+        self.registry.entry["is_connected"] = capture_probe
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                persisted_socket = Path(tempdir) / "persisted.sock"
+                conflicting_socket = Path(tempdir) / "conflicting.sock"
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                    server.bind(str(persisted_socket))
+                    server.listen(1)
+
+                os.environ["MARMOT_AGENT_SOCKET"] = str(conflicting_socket)
+                platform_config = PlatformConfigHarness(
+                    enabled=False,
+                    extra={"socket_path": str(persisted_socket)},
+                )
+
+                enabled_config = self.registry.apply_env_overrides(platform_config)
+
+                self.assertEqual(probe_socket_paths, [str(persisted_socket)])
+                self.assertIsNotNone(enabled_config)
+                assert enabled_config is not None
+                self.assertTrue(enabled_config.enabled)
+        finally:
+            self.registry.entry["is_connected"] = original_is_connected
             restore_marmot_env(saved_env)
 
     def test_environment_only_config_enables_and_creates_adapter(self):
