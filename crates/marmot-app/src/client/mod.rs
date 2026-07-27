@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_session::PublishWork;
@@ -67,6 +68,7 @@ pub struct AppClient {
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
+    pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
     pub(crate) state: AccountState,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
@@ -759,8 +761,7 @@ impl AppClient {
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
     /// `account: None` / `local: false` during the catch-up window). The worker
-    /// then falls back to serving those reads from the live session after
-    /// catch-up, matching the live path's error semantics.
+    /// treats that error as a failed local-readiness attempt.
     pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single

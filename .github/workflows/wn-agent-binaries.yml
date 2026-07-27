@@ -5,6 +5,9 @@ on:
     paths:
       - .github/workflows/wn-agent-binaries.yml
       - scripts/install-hermes-marmot.sh
+      - scripts/hermes_marmot_configure_gateway.py
+      - scripts/hermes_marmot_dev_setup.sh
+      - scripts/hermes_marmot_verify_persisted_config.sh
       - integrations/hermes/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
@@ -309,6 +312,44 @@ jobs:
           path: dist/hermes-marmot-plugin/*
           if-no-files-found: error
 
+  hermes-marmot-integration:
+    name: Hermes Marmot persisted config
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run Hermes Marmot unit tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests
+
+      - name: Run Hermes dev-script smoke test
+        run: integrations/hermes/marmot/tests/test_dev_scripts.sh
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Prepare isolated Hermes dev root
+        env:
+          HERMES_MARMOT_INTEGRATION_REF: c7b75a7849cb260e6f17a045473bfdd0ea21ca81
+        run: |
+          set -euo pipefail
+          dev_root="$RUNNER_TEMP/hermes-marmot-integration"
+          ./scripts/hermes_marmot_dev_setup.sh \
+            --root "$dev_root" \
+            --hermes-ref "$HERMES_MARMOT_INTEGRATION_REF" \
+            --no-enable-plugin
+          echo "HERMES_MARMOT_DEV_ROOT=$dev_root" >> "$GITHUB_ENV"
+
+      - name: Run real Hermes persisted-config probe
+        run: ./scripts/hermes_marmot_verify_persisted_config.sh --root "$HERMES_MARMOT_DEV_ROOT"
+
   openclaw-plugin:
     name: Package OpenClaw plugin
     runs-on: ubuntu-latest
@@ -390,6 +431,7 @@ jobs:
     needs:
       - build
       - plugin
+      - hermes-marmot-integration
       - openclaw-plugin
     timeout-minutes: 15
     permissions:

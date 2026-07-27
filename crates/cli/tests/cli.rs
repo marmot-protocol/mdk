@@ -2732,7 +2732,10 @@ fn keys_list_reports_startup_published_key_package() {
             .is_some_and(|event_id| !event_id.is_empty())
     );
     assert_eq!(keys[0]["local"], true);
-    assert_eq!(keys[0]["relay"], true);
+    assert_eq!(
+        keys[0]["relay"], true,
+        "expected startup-published key package to remain relay-visible: {keys:?}"
+    );
 }
 
 #[test]

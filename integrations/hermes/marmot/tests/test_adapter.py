@@ -464,6 +464,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["text"], "ping")
 
     async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
+        ack_sent = asyncio.Event()
         release_event = asyncio.Event()
 
         async def handler(reader, writer):
@@ -476,6 +477,8 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
                     "type": "ack",
                 },
             )
+            await writer.drain()
+            ack_sent.set()
             await release_event.wait()
             await write_json_line(
                 writer,
@@ -494,12 +497,17 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
 
         await self.start_server(handler)
-        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+        request_timeout = 0.1
+        client = self.adapter.MarmotAgentControlClient(
+            self.socket_path,
+            request_timeout=request_timeout,
+        )
         events = client.inbound_events(account_id_hex="11" * 32)
 
         pending_event = asyncio.create_task(anext(events))
         try:
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(ack_sent.wait(), timeout=1.0)
+            await asyncio.sleep(request_timeout * 2)
             self.assertFalse(pending_event.done())
 
             release_event.set()

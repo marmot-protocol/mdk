@@ -354,6 +354,7 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
             count,
         }],
         overflow_count: 0,
+        sum_ms: count.saturating_mul(50),
     };
 
     let spread = RelayDeliverySpread {

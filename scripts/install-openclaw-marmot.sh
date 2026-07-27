@@ -48,6 +48,11 @@ CLI_RELAYS=0
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_JSON_PATH=""
 BOOTSTRAP_WELCOMER_ALLOWLIST_CSV=""
+EXISTING_IDENTITY_FILE=""
+EXISTING_IDENTITY_PROMPT=0
+GENERATE_IDENTITY_EXPLICIT=0
+EXPECTED_IDENTITY=""
+IMPORTED_ACCOUNT_ID_HEX=""
 WN_AGENT_TEMP_PID=""
 
 RELAYS=()
@@ -67,6 +72,13 @@ Options:
   --home PATH              Marmot agent home (default: ~/.marmot-agents/openclaw)
   --openclaw-home PATH     OpenClaw home (default: $OPENCLAW_HOME or $HOME)
   --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat
+  --existing-identity-file PATH
+                           Import an existing nsec/raw-hex identity from an
+                           owner-only regular file before bootstrap
+  --expected-npub VALUE    Fail unless the imported identity matches this npub
+                           or 64-character hex public key; this must be a public
+                           key, never an nsec or raw secret key
+  --generate-identity      Explicitly use generated-identity onboarding (default)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --enable-streaming       Configure OpenClaw/Marmot live preview streaming
   --quic-candidate URI     QUIC preview candidate used with --enable-streaming
@@ -97,6 +109,10 @@ Example:
   curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
 
   curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
+
+  curl -fsSL .../install-openclaw-marmot.sh | bash -s -- --yes \
+    --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+    --expected-npub npub1... --allow-welcomer npub1...
 USAGE
 }
 
@@ -488,6 +504,52 @@ start_temp_agent() {
     log "temporary wn-agent pid: $WN_AGENT_TEMP_PID"
 }
 
+import_existing_identity() {
+    if [ -z "$EXISTING_IDENTITY_FILE" ] && [ "$EXISTING_IDENTITY_PROMPT" -ne 1 ]; then
+        return 0
+    fi
+    ensure_path
+    if [ "$DRY_RUN" -eq 0 ]; then
+        need_cmd wn-agent
+        need_cmd python3
+    fi
+
+    local -a args=(
+        import-identity
+        --json
+        --home "$MARMOT_HOME"
+        --label "$MARMOT_AGENT_LABEL"
+    )
+    if [ -n "$EXISTING_IDENTITY_FILE" ]; then
+        args+=(--identity-file "$EXISTING_IDENTITY_FILE")
+    else
+        args+=(--prompt)
+    fi
+    if [ -n "$EXPECTED_IDENTITY" ]; then
+        args+=(--expected-identity "$EXPECTED_IDENTITY")
+    fi
+
+    log "importing and verifying existing Nostr identity"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] wn-agent'
+        printf ' %q' "${args[@]}"
+        printf '\n'
+        IMPORTED_ACCOUNT_ID_HEX="<account-id-from-identity-import>"
+        return 0
+    fi
+
+    local imported_json
+    imported_json="$(wn-agent "${args[@]}")"
+    IMPORTED_ACCOUNT_ID_HEX="$(
+        printf '%s\n' "$imported_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
+    )"
+    if [ -z "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        echo "error: identity import did not return an account id" >&2
+        exit 1
+    fi
+}
+
 bootstrap_agent() {
     ensure_path
     if [ "$DRY_RUN" -eq 0 ]; then need_cmd wn-agent; fi
@@ -509,6 +571,9 @@ bootstrap_agent() {
         --socket "$MARMOT_AGENT_SOCKET"
         --label "$MARMOT_AGENT_LABEL"
     )
+    if [ -n "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        args+=(--no-create --account-id-hex "$IMPORTED_ACCOUNT_ID_HEX")
+    fi
     local relay
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
     if [ "$ENABLE_STREAMING" -eq 1 ]; then
@@ -655,6 +720,9 @@ while [ $# -gt 0 ]; do
         --yes | --non-interactive) ASSUME_YES=1; shift ;;
         --home) MARMOT_HOME="${2:?missing value for --home}"; MARMOT_AGENT_SOCKET_OVERRIDE=""; shift 2 ;;
         --openclaw-home) OPENCLAW_HOME="${2:?missing value for --openclaw-home}"; shift 2 ;;
+        --existing-identity-file) EXISTING_IDENTITY_FILE="${2:?missing value for --existing-identity-file}"; shift 2 ;;
+        --expected-npub) EXPECTED_IDENTITY="${2:?missing value for --expected-npub}"; shift 2 ;;
+        --generate-identity) GENERATE_IDENTITY_EXPLICIT=1; shift ;;
         --allow-welcomer) ALLOW_WELCOMERS+=("${2:?missing value for --allow-welcomer}"); shift 2 ;;
         --relay) CLI_RELAYS=1; RELAYS+=("${2:?missing value for --relay}"); shift 2 ;;
         --enable-streaming) ENABLE_STREAMING=1; shift ;;
@@ -692,6 +760,20 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     if [ -e "$MARMOT_HOME" ]; then
         log "existing Marmot agent home detected; bootstrap will reuse or repair it: $MARMOT_HOME"
     fi
+    if [ "$GENERATE_IDENTITY_EXPLICIT" -ne 1 ] && [ -z "$EXISTING_IDENTITY_FILE" ]; then
+        if prompt_yes_no "Import an existing Nostr identity?" "no"; then
+            if prompt_yes_no "Read the identity from an owner-only file?" "yes"; then
+                EXISTING_IDENTITY_FILE="$(prompt_value "Existing identity file" "")"
+                if [ -z "$EXISTING_IDENTITY_FILE" ]; then
+                    echo "error: existing identity file path cannot be empty" >&2
+                    exit 1
+                fi
+            else
+                EXISTING_IDENTITY_PROMPT=1
+            fi
+            EXPECTED_IDENTITY="$(prompt_value "Expected npub or hex (blank to skip)" "$EXPECTED_IDENTITY")"
+        fi
+    fi
     if [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
         while true; do
             welcomer_reply="$(prompt_value "Allowed inviter/welcomer npub or hex (blank to skip)" "")"
@@ -707,6 +789,15 @@ if [ "$INTERACTIVE" -eq 1 ]; then
 fi
 
 MARMOT_OUTBOUND_MEDIA_DIR="${MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE:-$MARMOT_HOME/dev/outbound-media}"
+
+if [ "$GENERATE_IDENTITY_EXPLICIT" -eq 1 ] && { [ -n "$EXISTING_IDENTITY_FILE" ] || [ "$EXISTING_IDENTITY_PROMPT" -eq 1 ]; }; then
+    echo "error: --generate-identity conflicts with existing-identity onboarding" >&2
+    exit 1
+fi
+if [ -n "$EXPECTED_IDENTITY" ] && [ -z "$EXISTING_IDENTITY_FILE" ] && [ "$EXISTING_IDENTITY_PROMPT" -ne 1 ]; then
+    echo "error: --expected-npub requires --existing-identity-file" >&2
+    exit 1
+fi
 
 validate_welcomer_inputs
 
@@ -737,6 +828,7 @@ log "Marmot home: $MARMOT_HOME"
 log "Marmot socket: $MARMOT_AGENT_SOCKET"
 log "Marmot agent label: $MARMOT_AGENT_LABEL"
 install_wn_agent "$platform" "$tmpdir"
+import_existing_identity
 install_plugin "$tmpdir"
 enable_openclaw_plugin
 bootstrap_agent

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
@@ -7,13 +8,14 @@ use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
+use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{EventGroupProjection, event_group_id, fail_if_publish_failed, observe_event};
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AppError, AppGroupAdminPolicyComponent, AppMessageProjection, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW,
-    remember_seen_event, unix_now_seconds,
+    AppError, AppGroupAdminPolicyComponent, AppMessageProjection, AppPerformanceTelemetry,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, remember_seen_event, unix_now_seconds,
 };
 
 use super::AppClient;
@@ -64,22 +66,71 @@ impl AppClient {
         Ok(())
     }
 
+    pub(crate) async fn prepare_transport(&self) -> Result<(), AppError> {
+        self.prepare_transport_with_telemetry(None).await
+    }
+
+    async fn prepare_transport_with_telemetry(
+        &self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<(), AppError> {
+        // Before any subscription goes out: auth-gated relays (NIP-42)
+        // withhold gift-wrapped welcomes from unauthenticated subscribers.
+        let activation_started = Instant::now();
+        self.relay_plane
+            .set_transport_signer(self.transport_signer.clone())
+            .await;
+        let rebuild_since = self
+            .relay_plane
+            .subscription_rebuild_since(self.state.last_transport_timestamp);
+        let activation = self.runtime.activate_transport(rebuild_since).await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                AppPerformanceOperation::AccountTransportActivation,
+                activation_started.elapsed(),
+                activation.is_ok(),
+            );
+        }
+        activation?;
+
+        let registration_started = Instant::now();
+        let registration = self.sync_runtime_groups().await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                AppPerformanceOperation::AccountSubscriptionRegistration,
+                registration_started.elapsed(),
+                registration.is_ok(),
+            );
+        }
+        registration
+    }
+
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        self.sync_inner(None).await
+    }
+
+    pub(crate) async fn sync_with_startup_stage_telemetry(
+        &mut self,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<SyncSummary, AppError> {
+        self.sync_inner(Some(telemetry)).await
+    }
+
+    async fn sync_inner(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<SyncSummary, AppError> {
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
         if self.refresh_group_routes()? {
             self.app.save_state(&self.state)?;
         }
-        let rebuild_since = self
+        let rebuild_since_secs = self
             .relay_plane
-            .subscription_rebuild_since(self.state.last_transport_timestamp);
-        // Capture the derived `since` floor before it is moved into activation;
-        // the forensic `subscription_rebuild` row records it alongside the
-        // per-relay registration outcome the activation produces.
-        let rebuild_since_secs = rebuild_since.map(|timestamp| timestamp.0);
-        self.runtime.activate_transport(rebuild_since).await?;
-        self.sync_runtime_groups().await?;
+            .subscription_rebuild_since(self.state.last_transport_timestamp)
+            .map(|timestamp| timestamp.0);
+        self.prepare_transport_with_telemetry(telemetry).await?;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.

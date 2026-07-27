@@ -119,6 +119,7 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+    HostPerformanceOperation, HostPerformanceOutcome,
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
@@ -1134,13 +1135,13 @@ impl MarmotApp {
             .await
     }
 
-    async fn runtime_client(
+    async fn runtime_local_client(
         &self,
         label: &str,
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
     ) -> Result<AppClient, AppError> {
-        self.client_with_relay_plane(label, relay_plane, Some(lifecycle))
+        self.local_client_with_relay_plane(label, relay_plane, Some(lifecycle))
             .await
     }
 
@@ -1150,10 +1151,27 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
+        let mut client = self
+            .local_client_with_relay_plane(label, relay_plane, lifecycle.clone())
+            .await?;
+        client.prepare_transport().await?;
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.ensure_running()?;
+        }
+        self.finish_client_open_network_maintenance(&mut client)
+            .await;
+        Ok(client)
+    }
+
+    async fn local_client_with_relay_plane(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+    ) -> Result<AppClient, AppError> {
         let app = self.clone();
         let label = label.to_owned();
         let relay_plane_for_open = relay_plane.clone();
-        let relay_plane_for_rebuild = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
@@ -1167,24 +1185,13 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        // Before any subscription goes out: auth-gated relays (NIP-42)
-        // withhold gift-wrapped welcomes from unauthenticated subscribers,
-        // and the catch-up REQ gets no error back — the events are simply
-        // absent.
-        relay_plane.set_transport_signer(open.signer.clone()).await;
-        let rebuild_since =
-            relay_plane_for_rebuild.subscription_rebuild_since(open.state.last_transport_timestamp);
-        open.runtime.activate_transport(rebuild_since).await?;
-        if let Some(lifecycle) = &lifecycle {
-            lifecycle.ensure_running()?;
-        }
-        open.runtime.sync_transport_groups(rebuild_since).await?;
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
             adapter: open.adapter,
             routing: open.routing,
             relay_plane: relay_plane.clone(),
+            transport_signer: open.signer,
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
@@ -1193,6 +1200,19 @@ impl MarmotApp {
             epoch_backfill_pending: false,
             post_join_maintenance_subscriptions: HashMap::new(),
         };
+        if client.reconcile_live_engine_groups()? {
+            // Persist repaired local state before returning command-readiness.
+            // The first asynchronous transport preparation observes the
+            // reconciled group set when it registers subscriptions.
+            client.app.save_state(&client.state)?;
+        }
+        // This once-only projection migration is local SQL work and must land
+        // before the host renders its first chat-list snapshot.
+        client.backfill_self_membership_once()?;
+        Ok(client)
+    }
+
+    async fn finish_client_open_network_maintenance(&self, client: &mut AppClient) {
         client
             .app
             .retire_cached_non_current_key_package(&client.state.label)
@@ -1225,12 +1245,12 @@ impl MarmotApp {
                 match client.runtime.publish_fresh_key_package().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
-                        method = "client_with_relay_plane",
+                        method = "finish_client_open_network_maintenance",
                         "published current key package replacement after strict cutover"
                     ),
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
-                        method = "client_with_relay_plane",
+                        method = "finish_client_open_network_maintenance",
                         error_kind = AppError::from(error).privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
@@ -1254,26 +1274,6 @@ impl MarmotApp {
                 }
             }
         }
-        if client.reconcile_live_engine_groups()? {
-            // Persist the repaired roster before any fallible network refresh,
-            // so another restart cannot lose the group again.
-            client.app.save_state(&client.state)?;
-            if let Err(error) = client.sync_runtime_groups().await {
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "runtime_client",
-                    error_kind = error.privacy_safe_kind(),
-                    "reconciled engine groups but deferred their subscription refresh"
-                );
-            }
-        }
-        // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
-        // from current engine state so groups the local account already left /
-        // was removed from stop inflating `account_unread_total()`. Gated by a
-        // once-only marker, so this is a single marker read on every later open
-        // and the hot path stays projection-only.
-        client.backfill_self_membership_once()?;
-        Ok(client)
     }
 
     pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {

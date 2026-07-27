@@ -14,6 +14,7 @@ fn hist(count: u64) -> DurationHistogramSnapshot {
             count,
         }],
         overflow_count: 0,
+        sum_ms: count.saturating_mul(50),
     }
 }
 
@@ -128,6 +129,7 @@ fn build_export_batch_forwards_histogram_bucket_edges() {
                 },
             ],
             overflow_count: 4,
+            sum_ms: 123_456,
         },
         ..Default::default()
     };
@@ -142,6 +144,7 @@ fn build_export_batch_forwards_histogram_bucket_edges() {
             assert_eq!(histogram.bounds_ms, vec![10, 50]);
             assert_eq!(histogram.bucket_counts, vec![1, 2]);
             assert_eq!(histogram.overflow_count, 4);
+            assert_eq!(histogram.sum_ms, 123_456);
             assert_eq!(histogram.total(), 7);
         }
         other => panic!("expected histogram, got {other:?}"),
@@ -227,6 +230,24 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failures: 0,
             duration_ms: hist(1),
         },
+        host_splash_ready: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            duration_ms: hist(5),
+        },
+        account_transport_activation: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            duration_ms: hist(2),
+        },
+        account_subscription_registration: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 0,
+            failures: 1,
+            duration_ms: hist(3),
+        },
         ..Default::default()
     };
     let batch = build_export_batch_with_app_performance(
@@ -243,6 +264,28 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_START_SUCCESSES
             && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_HOST_SPLASH_READY_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_HOST_SPLASH_READY_DURATION
+            && point.value
+                == ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![50],
+                    bucket_counts: vec![5],
+                    overflow_count: 0,
+                    sum_ms: 250,
+                })
     }));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_START_FAILURES

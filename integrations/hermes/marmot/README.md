@@ -49,6 +49,36 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-la
     --allow-user 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
+Generated-identity onboarding is the default (and can be selected explicitly
+with `--generate-identity`). To preserve an existing Nostr identity, place its
+`nsec` or raw secret hex in a regular file owned by the current user with mode
+`0600`, then use a pinned release URL:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.8/install-hermes-marmot.sh" | \
+  bash -s -- \
+    --yes \
+    --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
+    --expected-npub npub1... \
+    --allow-welcomer npub1... \
+    --allow-user npub1...
+```
+
+The installer passes only the file path, never the secret, in process arguments.
+`wn-agent` rejects symlinks, non-regular files, files owned by another user, and
+files accessible by group/other users. It verifies `--expected-npub` before
+starting the connector or changing Hermes configuration, imports idempotently,
+then bootstraps the exact account with creation disabled. During interactive
+setup, the same identity can instead be entered through a masked `/dev/tty`
+prompt, which remains usable when the installer itself arrives through a pipe.
+The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
+
+Hermes keeps its isolated default connector home. Reusing the same identity in
+another connector home, such as OpenClaw's, requires a separate explicit import;
+the installers never opt into shared home/socket state silently.
+
 To accept Marmot messages from any sender (explicit opt-in):
 
 ```sh
@@ -88,12 +118,19 @@ Manual equivalent:
 export MARMOT_HOME="$HOME/.marmot-agents/hermes"
 export PATH="$HOME/.local/bin:$PATH"
 
+wn-agent import-identity --json \
+  --home "$MARMOT_HOME" \
+  --label hermes-agent \
+  --identity-file "$HOME/.config/example/hermes-agent.nsec" \
+  --expected-identity npub1...
+
 wn-agent --home "$MARMOT_HOME" \
   --socket "$MARMOT_HOME/dev/wn-agent.sock" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
-wn-agent bootstrap --home "$MARMOT_HOME" --label hermes-agent --qr
+wn-agent bootstrap --home "$MARMOT_HOME" --label hermes-agent \
+  --no-create --account-id-hex <imported-account-hex> --qr
 hermes gateway run
 ```
 
@@ -117,7 +154,7 @@ The setup script creates these paths under that root:
 - `marmot-agent-home` for isolated `wn-agent` state.
 - `hermes-home/plugins/marmot` as a symlink back to this plugin directory.
 - helper scripts: `smoke-plugin.sh`, `e2e-deterministic.sh`,
-  `e2e-connector.sh`, `bootstrap-agent.sh`,
+  `e2e-connector.sh`, `verify-persisted-config.sh`, `bootstrap-agent.sh`,
   `run-wn-agent.sh`, `run-hermes-gateway.sh`, `start-wn-agent.sh`,
   `start-hermes-gateway.sh`, and `stop-dev-processes.sh`.
 
@@ -151,6 +188,22 @@ Smoke-test the plugin import against the isolated Hermes venv:
 ```sh
 just hermes-dev-smoke
 ```
+
+Verify Marmot loads from persisted Hermes config in a fresh Hermes subprocess
+with no inherited `MARMOT_*` environment (installer/configure + fresh subprocess
+probe):
+
+```sh
+just hermes-dev-setup --hermes-ref c7b75a7849cb260e6f17a045473bfdd0ea21ca81 --install-uv --print-env
+source /tmp/hermes-marmot-test/env.sh
+just hermes-verify-persisted-config
+```
+
+This uses the real Hermes checkout pinned above, runs `configure_gateway.py` and
+`hermes plugins enable marmot`, then launches a fresh Python process with all
+`MARMOT_*` variables removed. The probe exercises Hermes plugin discovery,
+`load_gateway_config()`, and `platform_registry.create_adapter()` only. It does
+not start `hermes gateway run` or require a model provider.
 
 Run the deterministic adapter E2E:
 

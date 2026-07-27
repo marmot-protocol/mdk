@@ -20,6 +20,7 @@ mod notification;
 mod push;
 mod relay;
 mod subscription;
+mod telemetry;
 mod timeline;
 
 pub use group::InitialGroupImageFfi;

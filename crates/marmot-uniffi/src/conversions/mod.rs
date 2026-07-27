@@ -24,6 +24,7 @@ mod message;
 mod notification;
 mod push;
 mod relay;
+mod telemetry;
 mod timeline;
 
 pub(super) fn saturating_u32(value: usize) -> u32 {
@@ -44,6 +45,7 @@ pub use message::*;
 pub use notification::*;
 pub use push::*;
 pub use relay::*;
+pub use telemetry::*;
 pub use timeline::*;
 
 #[cfg(test)]

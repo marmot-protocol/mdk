@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- The Hermes and OpenClaw release installers can now securely import an existing
+  Nostr identity from an owner-only file, optionally pin it to an expected npub,
+  and bootstrap that exact account without creating a replacement identity.
+  Interactive installs also provide a masked `/dev/tty` identity prompt.
 - MarmotKit now exposes the durable pending leave intent, so a cold launch can
   rediscover a leave that has not reached terminal `Left` membership yet.
   `ChatListRowFfi`, `AppGroupRecordFfi`, and `GroupManagementStateFfi` carry
@@ -23,6 +27,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   a group-state update, so subscribers see the pending flag without waiting for an
   unrelated refresh. `chats list --json` / `chat_list_row` rows gain a matching
   `leave_requested_at_ms` field; no other JSON response shapes changed.
+
+### Security
+
+- `wn-agent import-identity` keeps secret material out of argv, environment,
+  output, and bootstrap/config artifacts; rejects symlinked, shared, or
+  non-regular credential files; verifies the expected public identity before
+  persistence; and makes duplicate or interrupted imports recoverable.
 
 ### Fixed
 

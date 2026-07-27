@@ -57,6 +57,12 @@ the shared agent stream watch manager. The relay plane now also owns shared dire
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. Explicit catch-up remains
 available for repair and tests, but the daemon path is runtime-owned subscriptions plus typed events.
 
+`MarmotAppRuntime::start()` returns at local readiness: persisted account sessions are hydrated and worker-routed local
+reads are available. Relay activation, group-subscription registration, shared-directory synchronization, and initial
+catch-up continue asynchronously. Hosts should render local chat projections at that point, show network progress
+separately, and allow subsequent relay events to refresh or reorder the rendered rows. Mutating worker commands received
+during initial catch-up are deferred and replayed in order once the live client is ready.
+
 The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media

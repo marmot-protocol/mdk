@@ -35,11 +35,14 @@ use crate::messages::{AppMessageIntent, build_inner_event};
 #[derive(Default)]
 struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    block_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
+    subscribe_started: tokio::sync::Notify,
+    subscribe_release: tokio::sync::Notify,
 }
 
 impl ScriptedPushRelayClient {
@@ -50,6 +53,19 @@ impl ScriptedPushRelayClient {
     fn block_next_publish(&self) {
         self.block_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn block_next_subscribe(&self) {
+        self.block_next_subscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_subscribe(&self) {
+        self.subscribe_started.notified().await;
+    }
+
+    fn release_subscribe(&self) {
+        self.subscribe_release.notify_one();
     }
 
     fn zero_ack_next_publish(&self) {
@@ -72,6 +88,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         _subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self
+            .block_next_subscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.subscribe_started.notify_one();
+            self.subscribe_release.notified().await;
+        }
         Ok(())
     }
 
@@ -168,6 +191,85 @@ fn disabling_native_push_persists_removal_before_returning_without_waiting_for_r
         "disable-native-push-removal",
         disable_native_push_removal_body,
     );
+}
+
+#[test]
+fn account_reconcile_returns_local_readiness_before_relay_subscription_registration() {
+    run_composed_app_runtime_test(
+        "account-local-ready-before-subscribe",
+        account_local_ready_before_subscribe_body,
+    );
+}
+
+async fn account_local_ready_before_subscribe_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.block_next_subscribe();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.reconcile_accounts(),
+    )
+    .await
+    .expect("local account readiness must not wait for relay registration")
+    .unwrap();
+    assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.quarantined_groups("alice"),
+        )
+        .await
+        .expect("worker-routed local reads must be served during registration")
+        .unwrap()
+        .is_empty()
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("subscription registration should continue after local readiness");
+
+    let telemetry = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(telemetry.account_open.successes, 1);
+    assert_eq!(telemetry.account_subscription_registration.attempts, 0);
+
+    relay.release_subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .account_subscription_registration
+                .successes
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("subscription registration telemetry should complete asynchronously");
+    let telemetry = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(telemetry.account_transport_activation.successes, 1);
+    assert_eq!(telemetry.account_subscription_registration.successes, 1);
+    runtime.shutdown().await;
 }
 
 async fn disable_native_push_removal_body() {
@@ -304,6 +406,41 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     })
     .await
     .expect("startup retry should drain the persisted update intent");
+    runtime.shutdown().await;
+}
+
+#[test]
+fn runtime_start_returns_before_initial_directory_subscription_registration() {
+    run_composed_app_runtime_test(
+        "runtime-local-ready-before-directory-subscribe",
+        runtime_local_ready_before_directory_subscribe_body,
+    );
+}
+
+async fn runtime_local_ready_before_directory_subscribe_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    relay.block_next_subscribe();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), runtime.start())
+        .await
+        .expect("runtime start must not wait for network subscription registration")
+        .unwrap();
+    assert!(runtime.shared_services().lifecycle().is_running());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("a subscription should continue asynchronously after runtime start");
+    relay.release_subscribe();
     runtime.shutdown().await;
 }
 
