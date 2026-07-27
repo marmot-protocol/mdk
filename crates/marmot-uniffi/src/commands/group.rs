@@ -378,6 +378,20 @@ impl Marmot {
         let group_id_hex = hex::encode(group_id.as_slice());
         let state =
             group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        // A fast-path reject only, not the source of correctness: this read and
+        // the worker command that acts on it are not atomic, so two concurrent
+        // leaves can both pass here. The engine settles it under its own lock and
+        // returns `EngineError::LeaveAlreadyRequested`, which maps to this same
+        // variant — see `MarmotKitError::from_engine_error`.
+        //
+        // Checked before the two below because a pending leave also clears
+        // `can_leave`, so letting them run would report a wrong reason
+        // (`MemberNotInGroup`) for a group the account is very much still in.
+        if state.leave_request_pending {
+            return Err(MarmotKitError::LeaveAlreadyRequested {
+                group_id_hex: group_id_hex.clone(),
+            });
+        }
         if state.requires_self_demote_before_leave {
             return Err(MarmotKitError::AdminCannotSelfRemove {
                 group_id_hex: group_id_hex.clone(),
@@ -873,6 +887,8 @@ mod tests {
             can_invite: self_admin,
             can_leave: !self_admin,
             requires_self_demote_before_leave: self_admin,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
             member_actions: vec![
                 GroupMemberActionStateFfi {
                     member_id_hex: self_id.into(),

@@ -2328,7 +2328,31 @@ impl MarmotApp {
 
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self.load_state(label)?.groups)
+        let mut groups = self.load_state(label)?.groups;
+        // `leave_requested_at_ms` is not part of the stored projection, so stamp
+        // it from the engine-owned leave-request table here. This is the single
+        // population point for the group record: `visible_groups`, `group`, and
+        // `subscribe_chats` all read through this method.
+        let pending = self.pending_leave_requests(label)?;
+        if !pending.is_empty() {
+            for group in &mut groups {
+                group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Outstanding durable leave requests for this account, keyed by group id hex
+    /// and mapped to when the user asked to leave.
+    ///
+    /// Reads the engine's own `cgka_leave_requests` rows rather than a
+    /// denormalized projection column: the engine clears them from paths that
+    /// never notify the app layer (an accepted commit that removed us, hydration
+    /// finding the local member gone, a convergence reorg), so a cached copy
+    /// would silently go stale.
+    pub fn pending_leave_requests(&self, label: &str) -> Result<HashMap<String, u64>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.pending_leave_requests()?)
     }
 
     pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {

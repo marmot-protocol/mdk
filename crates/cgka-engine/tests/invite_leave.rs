@@ -2654,9 +2654,100 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
             group_id: group_id.clone(),
         })
         .await;
+    // Typed, not `InvalidTransition`: a repeat leave is routine user input (a
+    // double tap), not the engine bug that `InvalidTransition` denotes, and
+    // callers above the engine need the reason by name. Note the contrast with
+    // the app send just above, which stays `InvalidTransition` because a blocked
+    // ordinary send really is an illegal transition out of the leaving state.
     assert!(
-        matches!(leave_again, Err(EngineError::InvalidTransition(_))),
+        matches!(
+            leave_again,
+            Err(EngineError::LeaveAlreadyRequested { group_id: ref g }) if *g == group_id
+        ),
         "bob should not duplicate a SelfRemove proposal for the same new epoch; got {leave_again:?}"
+    );
+}
+
+/// The already-requested verdict is decided inside the engine, under the same
+/// lock as the durable read and write, so it cannot be raced past.
+///
+/// Callers above the engine (`Marmot::leave_group`) precheck a pending flag for
+/// fast UX, but that read and the send that follows it are not atomic: two
+/// concurrent leaves can both observe "not pending". Whichever one the engine
+/// serializes second must still learn the real reason from here, by name, rather
+/// than getting an opaque failure. Guards the error contract this exposes to the
+/// bindings.
+#[tokio::test]
+async fn repeat_leave_in_the_same_epoch_is_classified_by_the_engine() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "leave-classification".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    // First leave records the durable request and mints the proposal.
+    let first = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await;
+    assert!(
+        matches!(first, Ok(SendResult::Proposal { .. })),
+        "the first leave should mint a SelfRemove proposal; got {first:?}"
+    );
+    let recorded = bob_storage
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("the first leave records a durable request");
+    assert!(
+        recorded.last_proposed_epoch.is_some(),
+        "the durable request must record the epoch it proposed for"
+    );
+
+    // Every subsequent leave in the same epoch is refused by name, repeatably —
+    // a host retrying must keep getting the same answer, never an opaque one.
+    for attempt in 0..3 {
+        let repeat = bob
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await;
+        match repeat {
+            Err(EngineError::LeaveAlreadyRequested { group_id: ref got }) => {
+                assert_eq!(*got, group_id, "the error must name the group it refused")
+            }
+            other => {
+                panic!("repeat leave {attempt} must be typed as already-requested; got {other:?}")
+            }
+        }
+    }
+
+    // Refusing a duplicate must not disturb the durable request it protects.
+    assert_eq!(
+        bob_storage.leave_request(&group_id).unwrap(),
+        Some(recorded),
+        "refused duplicates must leave the durable request byte-identical"
     );
 }
 

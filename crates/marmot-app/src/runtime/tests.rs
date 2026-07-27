@@ -1052,6 +1052,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         activity_sort_at: 0,
         updated_at: 0,
         self_membership: crate::SelfMembership::Member,
+        leave_requested_at_ms: None,
     }
 }
 

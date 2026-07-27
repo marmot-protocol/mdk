@@ -596,6 +596,7 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::UnknownMember { .. } => "unknown_member",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
+        EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::AdminDepletion { .. } => "admin_depletion",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",

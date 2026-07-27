@@ -779,6 +779,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::AdminCannotSelfRemove { .. } | EngineError::AdminDepletion { .. } => {
             "admin_policy"
         }
+        EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::Serialize(_) => "invalid_admin_policy",
         EngineError::InvalidWelcome => "invalid_welcome",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",

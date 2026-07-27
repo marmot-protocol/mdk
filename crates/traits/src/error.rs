@@ -37,6 +37,23 @@ pub enum EngineError {
     #[error("admin cannot self-remove: leave the admin set first")]
     AdminCannotSelfRemove { group_id: GroupId },
 
+    /// A durable leave request already covers this group's current epoch, so a
+    /// fresh SelfRemove proposal would be redundant.
+    ///
+    /// Not an engine bug and not a transient failure: the durable intent is
+    /// already recorded and the engine re-proposes on each new epoch until a
+    /// commit removes the local member. Callers should surface progress rather
+    /// than retry.
+    ///
+    /// This is deliberately its own variant rather than an
+    /// [`InvalidTransition`](crate::engine_state::InvalidTransition), which is
+    /// documented below as indicating an engine bug: a user double-tapping Leave
+    /// is routine input, and the classification has to be decided here — under
+    /// the same lock as the durable read and write — because any check made
+    /// above this layer is a check-then-act race.
+    #[error("leave already requested for the current epoch")]
+    LeaveAlreadyRequested { group_id: GroupId },
+
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
     /// before construction. Used when an inbound SelfRemove from the only
     /// admin would deplete admins on commit.

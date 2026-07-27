@@ -13,6 +13,36 @@ versioning through the workspace version in the root `Cargo.toml`.
   Nostr identity from an owner-only file, optionally pin it to an expected npub,
   and bootstrap that exact account without creating a replacement identity.
   Interactive installs also provide a masked `/dev/tty` identity prompt.
+- MarmotKit now exposes the durable pending leave intent, so a cold launch can
+  rediscover a leave whose request has not resolved yet — including one whose
+  publish failed. `ChatListRowFfi`, `AppGroupRecordFfi`, and
+  `GroupManagementStateFfi` carry `leave_request_pending` plus
+  `leave_requested_at_ms` (always equal to `leave_requested_at_ms != null`),
+  derived at read time from the engine-owned `cgka_leave_requests` rows rather
+  than a denormalized projection column, so the value cannot go stale when the
+  engine clears a request without notifying the app layer. The flag is
+  orthogonal to `self_membership`, which records the locally classified
+  departure: `Left` is written as soon as the SelfRemove proposal publishes, so
+  a pending request and `Left` routinely coexist while the group waits for a
+  member to commit the removal. `GroupManagementStateFfi.can_leave` is now
+  `false` while a leave is pending, and a repeat leave returns the new
+  `MarmotKitError::LeaveAlreadyRequested` instead of an opaque runtime error.
+  A failed leave now also publishes a group-state update, so subscribers see the
+  pending flag without waiting for an unrelated refresh. `chats list --json` /
+  `chat_list_row` rows gain a matching `leave_requested_at_ms` field; no other
+  JSON response shapes changed.
+
+### Changed
+
+- A leave request that already covers the current epoch is now reported as
+  `EngineError::LeaveAlreadyRequested` instead of
+  `EngineError::InvalidTransition`, which is documented as indicating an engine
+  bug and was flattened to an opaque error at the UniFFI boundary. A user
+  double-tapping Leave is routine input, and the classification is made inside
+  the engine — under the same lock as the durable read and write — so concurrent
+  leaves cannot race past a caller-side precheck and lose the reason. Forensic
+  audit records and conformance observations for this case change from
+  `invalid_transition` to `leave_already_requested`.
 
 ### Security
 

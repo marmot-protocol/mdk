@@ -47,6 +47,16 @@ pub struct AppGroupRecordFfi {
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
     pub self_membership: SelfMembershipFfi,
+    /// The local account asked to leave this group and the request has not
+    /// resolved yet. Orthogonal to `self_membership`, which records the locally
+    /// classified departure rather than whether the request resolved — see
+    /// `ChatListRowFfi::leave_request_pending` for the full state table.
+    ///
+    /// Always equal to `leave_requested_at_ms != null`.
+    pub leave_request_pending: bool,
+    /// When the local account asked to leave, in milliseconds since the Unix
+    /// epoch; `null` when no leave is pending.
+    pub leave_requested_at_ms: Option<u64>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
 }
@@ -87,6 +97,8 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             pending_confirmation: value.pending_confirmation,
             unrecoverable: value.unrecoverable,
             self_membership: value.self_membership.into(),
+            leave_request_pending: value.leave_requested_at_ms.is_some(),
+            leave_requested_at_ms: value.leave_requested_at_ms,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
         }
@@ -231,8 +243,22 @@ pub struct GroupManagementStateFfi {
     pub is_self_admin: bool,
     pub is_last_admin: bool,
     pub can_invite: bool,
+    /// Whether a Leave action would do anything: the local account is a member,
+    /// is not an admin, and has no leave already in flight.
+    ///
+    /// When this is `false`, the reason is one of
+    /// `requires_self_demote_before_leave` (demote first) or
+    /// `leave_request_pending` (already leaving) — or the account is not a member
+    /// at all. Check those before reporting an error to the user.
     pub can_leave: bool,
     pub requires_self_demote_before_leave: bool,
+    /// A leave is already in flight for this group; `Marmot::leave_group` would
+    /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather
+    /// than a Leave affordance.
+    pub leave_request_pending: bool,
+    /// When the local account asked to leave, in milliseconds since the Unix
+    /// epoch; `null` when no leave is pending.
+    pub leave_requested_at_ms: Option<u64>,
     pub member_actions: Vec<GroupMemberActionStateFfi>,
 }
 
@@ -335,7 +361,15 @@ pub(crate) fn group_management_state_ffi(
     let is_self_admin = self_member.is_some_and(|member| member.is_admin);
     let is_last_admin = is_self_admin && admin_count == 1;
     let can_invite = is_self_admin;
-    let can_leave = self_member.is_some() && !is_self_admin;
+    // A leave already in flight suppresses `can_leave` so hosts do not offer a
+    // second Leave that the engine would reject: the durable request is not
+    // epoch-bound, but the SelfRemove proposal backing it is, and re-requesting
+    // inside the same epoch returns `EngineError::LeaveAlreadyRequested`, which
+    // reaches the host as `MarmotKitError::LeaveAlreadyRequested`. Suppressing
+    // the affordance keeps that error off the happy path; it does not prevent it,
+    // since this state is not read atomically with the leave it guards.
+    let leave_request_pending = details.group.leave_request_pending;
+    let can_leave = self_member.is_some() && !is_self_admin && !leave_request_pending;
     let requires_self_demote_before_leave = self_member.is_some() && is_self_admin;
     let member_actions = details
         .members
@@ -362,6 +396,8 @@ pub(crate) fn group_management_state_ffi(
         can_invite,
         can_leave,
         requires_self_demote_before_leave,
+        leave_request_pending,
+        leave_requested_at_ms: details.group.leave_requested_at_ms,
         member_actions,
     }
 }

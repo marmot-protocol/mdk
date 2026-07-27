@@ -98,6 +98,34 @@ pub struct ChatListRowFfi {
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
     pub self_membership: SelfMembershipFfi,
+    /// The local account asked to leave this group and the request has not
+    /// resolved yet. Render the conversation as leaving, and do not offer Leave
+    /// again — see `GroupManagementStateFfi::can_leave`.
+    ///
+    /// Durable unresolved *intent*, which survives a failed publish and app
+    /// termination — so a cold launch can rediscover it. Read this rather than
+    /// `self_membership` to decide whether to show a leave in progress.
+    ///
+    /// This is orthogonal to `self_membership`, not a precursor to it. The two
+    /// answer different questions and combine freely:
+    ///
+    /// | `self_membership` | this flag | meaning |
+    /// |---|---|---|
+    /// | `Member` | `true`  | leave requested, publish failed or was interrupted |
+    /// | `Left`   | `true`  | leave published, still waiting for a member to commit it |
+    /// | `Left`   | `false` | leave resolved |
+    /// | `Removed`| `false` | removed by someone else |
+    ///
+    /// `self_membership` is the locally *classified departure* — `Left` is
+    /// recorded as soon as the SelfRemove proposal publishes, so it does **not**
+    /// imply a commit removed the member, and `Removed` marks an involuntary
+    /// removal. This flag is about whether the request is still outstanding.
+    ///
+    /// Always equal to `leave_requested_at_ms != null`.
+    pub leave_request_pending: bool,
+    /// When the local account asked to leave, in milliseconds since the Unix
+    /// epoch; `null` when no leave is pending.
+    pub leave_requested_at_ms: Option<u64>,
 }
 
 impl From<ChatListRow> for ChatListRowFfi {
@@ -122,6 +150,8 @@ impl From<ChatListRow> for ChatListRowFfi {
             activity_sort_at: value.activity_sort_at,
             updated_at: value.updated_at,
             self_membership: value.self_membership.into(),
+            leave_request_pending: value.leave_requested_at_ms.is_some(),
+            leave_requested_at_ms: value.leave_requested_at_ms,
         }
     }
 }
@@ -192,9 +222,8 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chat_list_row_exports_semantic_timestamps() {
-        let ffi = ChatListRowFfi::from(ChatListRow {
+    fn sample_row() -> ChatListRow {
+        ChatListRow {
             group_id_hex: "11".to_owned(),
             archived: false,
             pending_confirmation: false,
@@ -214,11 +243,37 @@ mod tests {
             activity_sort_at: 200,
             updated_at: 300,
             self_membership: marmot_app::SelfMembership::Member,
-        });
+            leave_requested_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn chat_list_row_exports_semantic_timestamps() {
+        let ffi = ChatListRowFfi::from(sample_row());
 
         assert_eq!(ffi.conversation_created_at, 100);
         assert_eq!(ffi.activity_sort_at, 200);
         assert_eq!(ffi.updated_at, 300);
+    }
+
+    #[test]
+    fn chat_list_row_exports_pending_leave_alongside_active_membership() {
+        // The pair must stay consistent: hosts branch on the bool and render the
+        // timestamp, so a `true` with no timestamp (or vice versa) would be a
+        // contradiction. Also note membership is still `Member` here — that is the
+        // whole window this field exists to cover.
+        let ffi = ChatListRowFfi::from(ChatListRow {
+            leave_requested_at_ms: Some(1_700_000_000_123),
+            ..sample_row()
+        });
+
+        assert!(ffi.leave_request_pending);
+        assert_eq!(ffi.leave_requested_at_ms, Some(1_700_000_000_123));
+        assert!(matches!(ffi.self_membership, SelfMembershipFfi::Member));
+
+        let ffi = ChatListRowFfi::from(sample_row());
+        assert!(!ffi.leave_request_pending);
+        assert_eq!(ffi.leave_requested_at_ms, None);
     }
 
     #[test]

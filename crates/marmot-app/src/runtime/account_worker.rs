@@ -1130,6 +1130,19 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::LeaveGroup { group_id, respond } => {
             let result = client.leave_group(&group_id).await;
+            // Published regardless of outcome. The engine records the durable
+            // leave request before it publishes, so a leave that failed at the
+            // relay still changed what subscribers should render: the group is
+            // now pending-leave even though `self_membership` is still `Member`.
+            // Without this, a failed leave leaves the flag invisible until some
+            // unrelated refresh. A no-op re-read is cheap — `subscribe_chat_list`
+            // fingerprint-dedupes it away when nothing actually changed.
+            publish_app_runtime_group_state_updated(
+                events,
+                account_id_hex,
+                account_label,
+                &group_id,
+            );
             let _ = respond.send(result);
         }
         AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => {
