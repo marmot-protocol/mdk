@@ -959,6 +959,7 @@ fn secure_prune_selected_app_events_tx(
         )?);
     }
 
+    retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
     scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it
     // under `secure_delete` before DELETE also rewrites the old index key.
@@ -986,6 +987,49 @@ fn secure_prune_selected_app_events_tx(
         pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
     })
+}
+
+fn retain_pruned_chat_activity_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    pruned_message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    let mut statement = tx
+        .prepare(
+            "SELECT timeline_at
+             FROM message_timeline
+             WHERE group_id_hex = ?1
+               AND message_id_hex = ?2
+               AND kind = ?3
+               AND invalidation_status IS NULL",
+        )
+        .storage()?;
+    let mut latest_pruned_activity = None;
+    for message_id_hex in pruned_message_ids {
+        let timeline_at = statement
+            .query_row(
+                params![
+                    group_id_hex,
+                    message_id_hex,
+                    u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?;
+        latest_pruned_activity = latest_pruned_activity.max(timeline_at);
+    }
+    if let Some(timeline_at) = latest_pruned_activity {
+        tx.execute(
+            "UPDATE chat_list_rows
+             SET retained_activity_sort_at = MAX(retained_activity_sort_at, ?2),
+                 activity_sort_at = MAX(activity_sort_at, ?2)
+             WHERE group_id_hex = ?1",
+            params![group_id_hex, timeline_at],
+        )
+        .storage()?;
+    }
+    Ok(())
 }
 
 fn refresh_chat_list_last_message_after_secure_prune_tx(
@@ -1025,6 +1069,16 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_kind = ?4,
                  last_message_timeline_at = ?5,
                  last_message_deleted = ?6,
+                 activity_sort_at = MAX(
+                     retained_activity_sort_at,
+                     ?5,
+                     COALESCE((
+                         SELECT last_read_timeline_at
+                         FROM conversation_read_state
+                         WHERE group_id_hex = ?8
+                     ), 0),
+                     conversation_created_at
+                 ),
                  updated_at = ?7
              WHERE group_id_hex = ?8",
             params![
@@ -1048,6 +1102,15 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_kind = NULL,
                  last_message_timeline_at = NULL,
                  last_message_deleted = 0,
+                 activity_sort_at = MAX(
+                     retained_activity_sort_at,
+                     COALESCE((
+                         SELECT last_read_timeline_at
+                         FROM conversation_read_state
+                         WHERE group_id_hex = ?2
+                     ), 0),
+                     conversation_created_at
+                 ),
                  updated_at = ?1
              WHERE group_id_hex = ?2",
             params![updated_at, group_id_hex],

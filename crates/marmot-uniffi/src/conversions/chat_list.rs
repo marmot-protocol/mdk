@@ -92,6 +92,8 @@ pub struct ChatListRowFfi {
     pub first_unread_message_id_hex: Option<String>,
     pub last_read_message_id_hex: Option<String>,
     pub last_read_timeline_at: Option<u64>,
+    pub conversation_created_at: u64,
+    pub activity_sort_at: u64,
     pub updated_at: u64,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily or was removed.
@@ -116,6 +118,8 @@ impl From<ChatListRow> for ChatListRowFfi {
             first_unread_message_id_hex: value.first_unread_message_id_hex,
             last_read_message_id_hex: value.last_read_message_id_hex,
             last_read_timeline_at: value.last_read_timeline_at,
+            conversation_created_at: value.conversation_created_at,
+            activity_sort_at: value.activity_sort_at,
             updated_at: value.updated_at,
             self_membership: value.self_membership.into(),
         }
@@ -187,6 +191,35 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_list_row_exports_semantic_timestamps() {
+        let ffi = ChatListRowFfi::from(ChatListRow {
+            group_id_hex: "11".to_owned(),
+            archived: false,
+            pending_confirmation: false,
+            title: "Marmot Lab".to_owned(),
+            group_name: "Marmot Lab".to_owned(),
+            avatar_url: None,
+            avatar: None,
+            last_message: None,
+            unread_count: 0,
+            has_unread: false,
+            unread_mention_count: 0,
+            has_unread_mention: false,
+            first_unread_message_id_hex: None,
+            last_read_message_id_hex: None,
+            last_read_timeline_at: None,
+            conversation_created_at: 100,
+            activity_sort_at: 200,
+            updated_at: 300,
+            self_membership: marmot_app::SelfMembership::Member,
+        });
+
+        assert_eq!(ffi.conversation_created_at, 100);
+        assert_eq!(ffi.activity_sort_at, 200);
+        assert_eq!(ffi.updated_at, 300);
+    }
 
     #[test]
     fn chat_list_avatar_debug_redacts_key_material() {
