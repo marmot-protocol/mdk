@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_session::PublishWork;
@@ -67,6 +68,7 @@ pub struct AppClient {
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
+    pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
     pub(crate) state: AccountState,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and

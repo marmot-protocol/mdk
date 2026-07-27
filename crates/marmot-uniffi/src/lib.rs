@@ -185,8 +185,16 @@ impl Marmot {
         )
     }
 
-    /// Bring the runtime online: reconcile known accounts, start workers,
-    /// subscribe to transport events.
+    /// Bring the runtime to local readiness.
+    ///
+    /// On success, persisted account state is hydrated and worker-routed local
+    /// reads are available. Relay activation, group-subscription registration,
+    /// shared-directory synchronization, and initial catch-up continue
+    /// asynchronously. Hosts should render local projections immediately and
+    /// represent network progress separately.
+    ///
+    /// The binding signature and result type are unchanged; this local-ready
+    /// completion point is the behavioral contract for this implementation.
     pub async fn start(&self) -> Result<(), MarmotKitError> {
         self.runtime.start().await?;
         Ok(())

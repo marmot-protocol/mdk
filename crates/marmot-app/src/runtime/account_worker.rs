@@ -402,7 +402,7 @@ async fn run_app_runtime_account_worker(
             }
             return;
         }
-        result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+        result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
     } {
         Ok(client) => client,
         Err(err) => {
@@ -431,8 +431,9 @@ async fn run_app_runtime_account_worker(
     // catch-up still runs (below) and its results flow to subscribers via the
     // normal event mechanism; it is only removed from the readiness/blocking
     // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
-    // the ready-wait) now measures time-to-command-ready (hydrate + connect +
-    // subscribe), while `AccountSync` (below) measures the catch-up.
+    // the ready-wait) now measures local hydration and snapshot readiness;
+    // transport activation, subscription registration, and catch-up have
+    // separate asynchronous measurements below.
     //
     // Snapshot capture is best-effort: its only failure is the shared profile
     // load. On failure, surface the error and serve read commands by deferring
@@ -455,19 +456,26 @@ async fn run_app_runtime_account_worker(
         let _ = ready.send(Ok(()));
     }
 
-    // Run the initial catch-up in the background. The `client.sync()` future
-    // holds `&mut client` for its whole lifetime, so while it is in flight the
-    // command loop must not touch the live session: read commands are answered
-    // from `read_snapshot`, and every other command is deferred and replayed on
-    // live state once the catch-up lands, in arrival order. `CatchUp` requests
-    // that arrive during the initial sync are coalesced onto it (kept in the same
-    // deferred sequence so they cannot jump ahead of an earlier mutation), so a
-    // second concurrent sync on the same client is never started. Shutdown drops
-    // the pinned future, cancelling the sync.
+    // Start signer installation, transport activation, group-subscription
+    // registration, and initial catch-up only after local readiness has been
+    // signalled. The sync future holds `&mut client` for its whole lifetime, so
+    // while it is in flight the command loop must not touch the live session:
+    // read commands are answered from `read_snapshot`, and every other command
+    // is deferred and replayed on live state once catch-up lands, in arrival
+    // order. `CatchUp` requests that arrive during the initial sync are
+    // coalesced onto it.
     let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
     let sync_started_at = Instant::now();
+    let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
-        let mut initial_sync = std::pin::pin!(client.sync());
+        let mut initial_sync = std::pin::pin!(async {
+            let summary = client
+                .sync_with_startup_stage_telemetry(&startup_stage_telemetry)
+                .await?;
+            app.finish_client_open_network_maintenance(&mut client)
+                .await;
+            Ok::<_, AppError>(summary)
+        });
         loop {
             tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
@@ -723,15 +731,28 @@ async fn run_app_runtime_account_worker(
                         match tokio::select! {
                             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                             _ = &mut shutdown => return,
-                            result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+                            result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                         } {
                             Ok(mut reopened) => {
-                                // The reopen re-hydrates + reconnects + resubscribes
-                                // (via `runtime_client`) but does NOT run the
-                                // catch-up `sync()` on the readiness path — it
-                                // resumes the live `next_event` tail below — so it
-                                // does not reintroduce the catch-up blocking this
-                                // worker removed from startup.
+                                // `runtime_local_client` is local-only. Reconnect must
+                                // establish subscriptions and catch up before
+                                // replacing the prior live client.
+                                let reopen_sync = tokio::select! {
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                    _ = &mut shutdown => return,
+                                    result = reopened.sync() => result,
+                                };
+                                if let Err(sync_err) = reopen_sync {
+                                    publish_app_runtime_account_error(
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        account_error_message("runtime restart sync failed", &sync_err),
+                                    );
+                                    continue;
+                                }
+                                app.finish_client_open_network_maintenance(&mut reopened)
+                                    .await;
                                 let pending = reopened
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;

@@ -123,6 +123,22 @@ pub mod metric_names {
     pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
     /// Failed account opens.
     pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION: &str =
+        "app_account_transport_activation_duration_ms";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS: &str =
+        "app_account_transport_activation_attempts";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES: &str =
+        "app_account_transport_activation_successes";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES: &str =
+        "app_account_transport_activation_failures";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION: &str =
+        "app_account_subscription_registration_duration_ms";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS: &str =
+        "app_account_subscription_registration_attempts";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES: &str =
+        "app_account_subscription_registration_successes";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES: &str =
+        "app_account_subscription_registration_failures";
     /// Multi-account catch-up duration histogram.
     pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
     /// Multi-account catch-up attempts.
@@ -593,6 +609,22 @@ fn append_app_performance_points(
         metric_names::APP_ACCOUNT_OPEN_ATTEMPTS,
         metric_names::APP_ACCOUNT_OPEN_SUCCESSES,
         metric_names::APP_ACCOUNT_OPEN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_transport_activation,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_subscription_registration,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES,
     );
     append_app_operation_points(
         points,

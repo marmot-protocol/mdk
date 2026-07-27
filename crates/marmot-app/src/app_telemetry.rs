@@ -22,6 +22,8 @@ pub(crate) enum AppPerformanceOperation {
     DirectorySubscriptionSync,
     AccountReconcile,
     AccountOpen,
+    AccountTransportActivation,
+    AccountSubscriptionRegistration,
     AccountCatchUp,
     AccountSync,
     AccountSetupAdvisoryStep,
@@ -78,6 +80,10 @@ pub struct AppPerformanceSnapshot {
     pub directory_subscription_sync: AppPerformanceOperationSnapshot,
     pub account_reconcile: AppPerformanceOperationSnapshot,
     pub account_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_transport_activation: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_subscription_registration: AppPerformanceOperationSnapshot,
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
@@ -123,6 +129,8 @@ struct AppPerformanceTelemetryInner {
     directory_subscription_sync: AppPerformanceOperationTelemetry,
     account_reconcile: AppPerformanceOperationTelemetry,
     account_open: AppPerformanceOperationTelemetry,
+    account_transport_activation: AppPerformanceOperationTelemetry,
+    account_subscription_registration: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
     account_setup_advisory_step: AppPerformanceOperationTelemetry,
@@ -239,6 +247,14 @@ impl AppPerformanceTelemetry {
                 inner.account_reconcile.record(duration, success);
             }
             AppPerformanceOperation::AccountOpen => inner.account_open.record(duration, success),
+            AppPerformanceOperation::AccountTransportActivation => {
+                inner.account_transport_activation.record(duration, success);
+            }
+            AppPerformanceOperation::AccountSubscriptionRegistration => {
+                inner
+                    .account_subscription_registration
+                    .record(duration, success);
+            }
             AppPerformanceOperation::AccountCatchUp => {
                 inner.account_catch_up.record(duration, success);
             }
@@ -332,6 +348,8 @@ impl AppPerformanceTelemetry {
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),
             account_open: inner.account_open.snapshot(),
+            account_transport_activation: inner.account_transport_activation.snapshot(),
+            account_subscription_registration: inner.account_subscription_registration.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
@@ -420,6 +438,16 @@ mod tests {
             Duration::from_millis(750),
             true,
         );
+        telemetry.record(
+            AppPerformanceOperation::AccountTransportActivation,
+            Duration::from_millis(5_000),
+            false,
+        );
+        telemetry.record(
+            AppPerformanceOperation::AccountSubscriptionRegistration,
+            Duration::from_millis(250),
+            true,
+        );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.app_start.attempts, 2);
@@ -432,6 +460,19 @@ mod tests {
         assert_eq!(snapshot.group_invite_members.failures, 0);
         assert_eq!(snapshot.group_invite_members.duration_ms.sample_count(), 1);
         assert_eq!(snapshot.group_invite_members.duration_ms.sum_ms, 750);
+        assert_eq!(snapshot.account_transport_activation.failures, 1);
+        assert_eq!(
+            snapshot.account_transport_activation.duration_ms.sum_ms,
+            5_000
+        );
+        assert_eq!(snapshot.account_subscription_registration.successes, 1);
+        assert_eq!(
+            snapshot
+                .account_subscription_registration
+                .duration_ms
+                .sum_ms,
+            250
+        );
         assert!(
             snapshot
                 .app_start
