@@ -140,5 +140,5 @@ Used by selector, canonicalization, capability, quiescence, and restart properti
   properties cover those today.
 - Partition behavior is covered by fixed scenarios and generated families. The property-test delivery profiles cover
   FIFO, reverse, and seeded random delivery.
-- Storage-loss recovery is still future work. Restart equivalence covers rebuilding over the same storage, not missing
-  or corrupted local records.
+- File-backed restart and subprocess-kill coverage exercises close/reopen and crash recovery with an intact encrypted
+  database and WAL. Recovery from genuinely missing or corrupted local records is still future work.

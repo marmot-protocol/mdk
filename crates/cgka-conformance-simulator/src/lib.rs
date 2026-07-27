@@ -35,7 +35,7 @@ pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
 pub use family::{
     GeneratedScenarioCase, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report,
+    run_generated_case_report, run_generated_case_report_with_storage_mode,
 };
 pub use oracle::{
     BehaviorEvidenceSummary, CoverageMatrixEntry, OracleBehavior, OracleCoverageWarning,
@@ -51,8 +51,9 @@ pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
     InvariantFailure, ScenarioReport, ScenarioReportMetadata, ScenarioRunError, ScenarioSpec,
     ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, VectorFixtureMetadata,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
-    run_vector_fixture_report,
+    run_scenario_report, run_scenario_report_with_outcomes,
+    run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_storage_mode,
+    run_scenario_spec, run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

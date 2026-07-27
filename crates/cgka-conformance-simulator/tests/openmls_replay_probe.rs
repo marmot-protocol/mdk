@@ -250,7 +250,7 @@ async fn proposal_authorization_vector_rejects_direct_and_nostr_wrapped_input() 
     // auto-commit scheduling.
     let snapshot = {
         let context = alice
-            .engine
+            .engine_mut()
             .group_context(&group_id)
             .expect("load group context");
         GroupContextSnapshot::from_context(
@@ -289,7 +289,7 @@ async fn proposal_authorization_vector_rejects_direct_and_nostr_wrapped_input() 
         "wrapped rejection leaves a terminal failed content record"
     );
     assert!(
-        alice.engine.drain_auto_publish().is_empty(),
+        alice.engine_mut().drain_auto_publish().is_empty(),
         "rejected proposal cannot schedule an auto-commit"
     );
     assert_eq!(

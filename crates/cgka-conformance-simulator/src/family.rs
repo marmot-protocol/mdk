@@ -4,8 +4,9 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    GeneratedScenarioMetadata, ScenarioReport, ScenarioRunError, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, TraceExpectation, VectorFixture, run_scenario_report_with_outcomes,
+    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioReport, ScenarioRunError, ScenarioSpec,
+    ScenarioStep, ScenarioTrace, TraceExpectation, VectorFixture,
+    run_scenario_report_with_outcomes_and_storage_mode,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -98,16 +99,30 @@ pub async fn run_generated_case_report(
     case: &GeneratedScenarioCase,
     expected_trace: Option<ScenarioTrace>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut report = run_scenario_report_with_outcomes(
+    run_generated_case_report_with_storage_mode(
+        case,
+        expected_trace,
+        HarnessStorageMode::from_env(),
+    )
+    .await
+}
+
+pub async fn run_generated_case_report_with_storage_mode(
+    case: &GeneratedScenarioCase,
+    expected_trace: Option<ScenarioTrace>,
+    storage_mode: HarnessStorageMode,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    let mut report = run_scenario_report_with_outcomes_and_storage_mode(
         &case.scenario,
         expected_trace.clone(),
         case.expected_outcomes.clone(),
+        storage_mode,
     )
     .await?;
     let minimized_case = if report.expectation_failures.is_empty() {
         None
     } else {
-        minimize_failing_case(case, expected_trace.as_ref(), &report).await
+        minimize_failing_case(case, expected_trace.as_ref(), &report, storage_mode).await
     };
     report.metadata.generated = Some(GeneratedScenarioMetadata {
         family_name: case.family_name.clone(),
@@ -123,6 +138,7 @@ async fn minimize_failing_case(
     case: &GeneratedScenarioCase,
     expected_trace: Option<&ScenarioTrace>,
     failing_report: &ScenarioReport,
+    storage_mode: HarnessStorageMode,
 ) -> Option<ScenarioSpec> {
     let target_failures = failure_kinds(failing_report);
     if target_failures.is_empty() {
@@ -145,6 +161,7 @@ async fn minimize_failing_case(
             expected_trace.cloned(),
             case.expected_outcomes.clone(),
             &target_failures,
+            storage_mode,
         )
         .await
         {
@@ -163,8 +180,16 @@ async fn reproduces_failure(
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
     target_failures: &BTreeSet<String>,
+    storage_mode: HarnessStorageMode,
 ) -> bool {
-    match run_scenario_report_with_outcomes(scenario, expected_trace, expected_outcomes).await {
+    match run_scenario_report_with_outcomes_and_storage_mode(
+        scenario,
+        expected_trace,
+        expected_outcomes,
+        storage_mode,
+    )
+    .await
+    {
         Ok(report) => target_failures.is_subset(&failure_kinds(&report)),
         Err(_) => false,
     }

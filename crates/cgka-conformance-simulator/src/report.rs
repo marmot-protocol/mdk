@@ -2,10 +2,10 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    CoverageMatrixEntry, GeneratedScenarioCase, ScenarioReport, VectorFixture,
+    CoverageMatrixEntry, GeneratedScenarioCase, HarnessStorageMode, ScenarioReport, VectorFixture,
     coverage_matrix_entry, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report, run_vector_fixture_report,
+    run_generated_case_report_with_storage_mode, run_vector_fixture_report_with_storage_mode,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub struct ReportArgs {
     pub input: ReportInput,
     pub out: PathBuf,
     pub strict_oracle: bool,
+    pub storage_mode: HarnessStorageMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,11 +158,19 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
             seed,
             cases,
         } => {
-            run_generated_family_reports(family, *seed, *cases, &args.out, args.strict_oracle)
-                .await?
+            run_generated_family_reports(
+                family,
+                *seed,
+                *cases,
+                &args.out,
+                args.strict_oracle,
+                args.storage_mode,
+            )
+            .await?
         }
         ReportInput::VectorFixtures { paths } => {
-            run_vector_fixture_reports(paths, &args.out, args.strict_oracle).await?
+            run_vector_fixture_reports(paths, &args.out, args.strict_oracle, args.storage_mode)
+                .await?
         }
     };
 
@@ -183,6 +192,7 @@ async fn run_generated_family_reports(
     cases: usize,
     out: &Path,
     strict_oracle: bool,
+    storage_mode: HarnessStorageMode,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     let cases = match family {
         "send-leave/v1" => generate_send_leave_family(seed, cases),
@@ -193,7 +203,7 @@ async fn run_generated_family_reports(
 
     let mut summaries = Vec::with_capacity(cases.len());
     for case in cases {
-        let report = run_generated_case_report(&case, None).await?;
+        let report = run_generated_case_report_with_storage_mode(&case, None, storage_mode).await?;
         let output = out.join(format!(
             "{}-seed-{}-case-{}.json",
             case.family_name.replace('/', "-"),
@@ -254,12 +264,13 @@ async fn run_vector_fixture_reports(
     paths: &[PathBuf],
     out: &Path,
     strict_oracle: bool,
+    storage_mode: HarnessStorageMode,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     let fixture_paths = collect_vector_fixture_paths(paths)?;
     let mut summaries = Vec::with_capacity(fixture_paths.len());
     for path in fixture_paths {
         let fixture: VectorFixture = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        let report = run_vector_fixture_report(&fixture).await?;
+        let report = run_vector_fixture_report_with_storage_mode(&fixture, storage_mode).await?;
         let output = out.join(format!(
             "{}-report.json",
             fixture.scenario_name.replace('/', "-")
@@ -350,6 +361,7 @@ pub fn parse_report_command(
     let mut vectors = Vec::new();
     let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
     let mut strict_oracle = false;
+    let mut storage_mode = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -359,6 +371,12 @@ pub fn parse_report_command(
             "--cases" => cases = next_value(&mut args, "--cases")?.parse()?,
             "--vectors" => vectors.push(PathBuf::from(next_value(&mut args, "--vectors")?)),
             "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
+            "--storage" => {
+                storage_mode = Some(HarnessStorageMode::parse(&next_value(
+                    &mut args,
+                    "--storage",
+                )?)?)
+            }
             "--strict-oracle" => strict_oracle = true,
             "--help" | "-h" => return Ok(ReportCommand::Help),
             other => return Err(format!("unknown argument {other}").into()),
@@ -379,6 +397,7 @@ pub fn parse_report_command(
         input,
         out,
         strict_oracle,
+        storage_mode: storage_mode.unwrap_or_else(HarnessStorageMode::from_env),
     }))
 }
 
@@ -391,7 +410,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--strict-oracle]"
+    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle]"
 }
 
 #[cfg(test)]
@@ -408,6 +427,7 @@ mod tests {
                 scenario_name: "oracle-summary-test".into(),
                 spec_version: "1".into(),
                 step_count: 0,
+                storage_backend: "in-memory-sqlite".into(),
                 generated: None,
                 fixture: None,
             },

@@ -941,7 +941,10 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
     let result = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
-        Ok(()) => canonicalize_stored_openmls_messages_from_current(storage, group_id, work),
+        Ok(()) => {
+            crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
+            canonicalize_stored_openmls_messages_from_current(storage, group_id, work)
+        }
         Err(StorageError::SnapshotMissing(_)) => Ok(missing_retained_anchor_result(
             work.state,
             work.outbound_intents,
@@ -1437,6 +1440,9 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             &replay_messages,
             profile_policy,
         )?;
+        if apply_start_epoch < current_epoch {
+            crate::test_crash_hooks::pause_if_requested("historical-apply-before-commit");
+        }
         storage
             .release_group_snapshot(group_id, &snapshot)
             .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;

@@ -5,10 +5,10 @@
 //! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    ClientBuilder, ExpectationFailure, HarnessClient, PendingResolutionObservation,
-    ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
-    TraceExpectation, TransportBus, VectorFixture, build_scenario_oracle_report,
-    compare_trace_expectations, observe_client,
+    ClientBuilder, ExpectationFailure, HarnessClient, HarnessStorageMode,
+    PendingResolutionObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
+    ScenarioOracleReport, ScenarioTrace, TraceExpectation, TransportBus, VectorFixture,
+    build_scenario_oracle_report, compare_trace_expectations, observe_client,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
@@ -184,6 +184,7 @@ pub struct ScenarioReportMetadata {
     pub scenario_name: String,
     pub spec_version: String,
     pub step_count: usize,
+    pub storage_backend: String,
     pub generated: Option<GeneratedScenarioMetadata>,
     pub fixture: Option<VectorFixtureMetadata>,
 }
@@ -259,7 +260,24 @@ pub async fn run_scenario_report(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    run_scenario_report_inner(spec, expected_trace, vec![], None, ProtocolProfile::Legacy).await
+    run_scenario_report_with_storage_mode(spec, expected_trace, HarnessStorageMode::from_env())
+        .await
+}
+
+pub async fn run_scenario_report_with_storage_mode(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    storage_mode: HarnessStorageMode,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_inner(
+        spec,
+        expected_trace,
+        vec![],
+        None,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .await
 }
 
 pub async fn run_scenario_report_with_outcomes(
@@ -267,18 +285,41 @@ pub async fn run_scenario_report_with_outcomes(
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_with_outcomes_and_storage_mode(
+        spec,
+        expected_trace,
+        expected_outcomes,
+        HarnessStorageMode::from_env(),
+    )
+    .await
+}
+
+pub async fn run_scenario_report_with_outcomes_and_storage_mode(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    storage_mode: HarnessStorageMode,
+) -> Result<ScenarioReport, ScenarioRunError> {
     run_scenario_report_inner(
         spec,
         expected_trace,
         expected_outcomes,
         None,
         ProtocolProfile::Legacy,
+        storage_mode,
     )
     .await
 }
 
 pub async fn run_vector_fixture_report(
     fixture: &VectorFixture,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    run_vector_fixture_report_with_storage_mode(fixture, HarnessStorageMode::from_env()).await
+}
+
+pub async fn run_vector_fixture_report_with_storage_mode(
+    fixture: &VectorFixture,
+    storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let protocol_profile = match fixture
         .application_profile
@@ -305,6 +346,7 @@ pub async fn run_vector_fixture_report(
             seed: fixture.seed,
         }),
         protocol_profile,
+        storage_mode,
     )
     .await
 }
@@ -315,6 +357,7 @@ async fn run_scenario_report_inner(
     expected_outcomes: Vec<TraceExpectation>,
     fixture: Option<VectorFixtureMetadata>,
     protocol_profile: ProtocolProfile,
+    storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     if spec.spec_version != "1" {
         return Err(ScenarioRunError {
@@ -334,6 +377,7 @@ async fn run_scenario_report_inner(
         let client = ClientBuilder::new(pad32(label.as_bytes()))
             .registry(scenario_registry())
             .protocol_profile(protocol_profile)
+            .storage_mode(storage_mode)
             .attach(&bus);
         clients.insert(label.clone(), client);
     }
@@ -620,6 +664,7 @@ async fn run_scenario_report_inner(
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
             step_count: spec.steps.len(),
+            storage_backend: storage_mode.report_label().into(),
             generated: None,
             fixture,
         },
