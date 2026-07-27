@@ -96,7 +96,7 @@ describe("resolveMarmotChannelAccount", () => {
       connected: true,
       enabled: true,
       configured: true,
-      mode: "block",
+      mode: "off",
       dmPolicy: "allowlist",
       probe,
     });
@@ -112,7 +112,7 @@ describe("resolveMarmotChannelAccount", () => {
       configured: true,
       running: true,
       connected: true,
-      mode: "block",
+      mode: "off",
       probe,
     });
   });

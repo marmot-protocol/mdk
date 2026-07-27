@@ -2,9 +2,8 @@
 //
 // Composed with `createChatChannelPlugin`: meta + capabilities + a config
 // adapter that resolves a Marmot account from the `channels.marmot` config (or
-// MARMOT_* env), the durable/live message adapter, DM allowlist security, and
-// reply threading. Outbound (durable send + live preview) flows through the
-// message adapter; inbound is driven by src/inbound-runtime.ts.
+// MARMOT_* env), the durable message adapter, gateway-owned inbound lifecycle,
+// DM allowlist security, and reply threading.
 
 import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
 import type {
@@ -29,6 +28,7 @@ import {
   type MarmotChannelAccountConfig,
   type ResolvedMarmotAccount,
 } from "./config.js";
+import { startMarmotGatewayAccount } from "./gateway.js";
 import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import {
@@ -98,7 +98,7 @@ function accountSnapshot(
     lastInboundAt: inbound.lastInboundAt ?? runtime?.lastInboundAt ?? null,
     lastOutboundAt: inbound.lastOutboundAt ?? runtime?.lastOutboundAt ?? null,
     reconnectAttempts: inbound.reconnectAttempts ?? runtime?.reconnectAttempts,
-    mode: account.streamMode,
+    mode: "off",
     dmPolicy: account.dmPolicy ?? "allowlist",
     allowFrom: account.allowFrom.map(String),
     probe,
@@ -207,7 +207,7 @@ export function createMarmotChannelPlugin() {
         chatTypes: ["direct", "group"],
         reply: true,
         media: true,
-        blockStreaming: true,
+        blockStreaming: false,
         // Marmot supports deleting (unsending) a previously-sent message; gates
         // the agent-facing `delete` message action's visibility.
         unsend: true,
@@ -248,6 +248,9 @@ export function createMarmotChannelPlugin() {
         ],
       },
       actions,
+      gateway: {
+        startAccount: startMarmotGatewayAccount,
+      },
     },
     security: {
       dm: {

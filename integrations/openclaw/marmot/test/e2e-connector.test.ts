@@ -5,8 +5,17 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MarmotAgentControlClient } from "../src/client.js";
-import { startMarmotInbound, type InboundPluginApi } from "../src/inbound-runtime.js";
-import type { MarmotInboundMessage } from "../src/inbound.js";
+import {
+  createMarmotInboundDispatcher,
+  type MarmotDispatchClient,
+  type OpenClawChannelRuntime,
+} from "../src/dispatch.js";
+import {
+  resetMarmotInboundAccountsForTests,
+  startMarmotInbound,
+  type InboundPluginApi,
+} from "../src/inbound-runtime.js";
+import { createMarmotMessageAdapter } from "../src/outbound.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
 
 const RUN_CONNECTOR_E2E = process.env.MARMOT_OPENCLAW_CONNECTOR_E2E === "1";
@@ -14,10 +23,7 @@ const maybeDescribe = RUN_CONNECTOR_E2E ? describe : describe.skip;
 
 const ACCOUNT_ID_HEX = "11".repeat(32);
 const GROUP_ID_HEX = "22".repeat(32);
-const MESSAGE_ID_HEX = "33".repeat(32);
 const SENDER_ACCOUNT_ID_HEX = "44".repeat(32);
-const INBOUND_TEXT = "ping from connector";
-const DETERMINISTIC_RESPONSE = `marmot-e2e-ok: ${INBOUND_TEXT}`;
 
 interface DebugRecordedFinalSend {
   account_id_hex: string;
@@ -40,9 +46,7 @@ async function waitFor<T>(
   probe: () => Promise<T | null | undefined> | T | null | undefined,
   options: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
 ): Promise<T> {
-  const timeoutMs = options.timeoutMs ?? 30_000;
-  const intervalMs = options.intervalMs ?? 50;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
@@ -53,7 +57,7 @@ async function waitFor<T>(
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 50));
   }
   const suffix = lastError instanceof Error ? `: ${lastError.message}` : "";
   throw new Error(`${options.label ?? "waitFor"} timed out${suffix}`);
@@ -82,14 +86,14 @@ async function recordedFinals(
 }
 
 afterEach(() => {
+  resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
 });
 
 maybeDescribe("OpenClaw Marmot connector E2E", () => {
   it(
-    "dispatches debug-injected inbound through the OpenClaw inbound runtime into real wn-agent send_final",
+    "keeps sequential and restarted inbound replies on the source Marmot group",
     async () => {
-      // Keep the Unix socket path short for macOS sockaddr_un limits.
       const tempRoot = await mkdtemp("/tmp/omce-");
       const marmotHome = join(tempRoot, "marmot-home");
       const socketPath = join(tempRoot, "a.sock");
@@ -133,14 +137,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           { timeoutMs: 60_000, label: "wn-agent debug control socket" },
         );
 
-        let resolveReady: () => void = () => {};
-        const ready = new Promise<void>((resolve) => {
-          resolveReady = resolve;
-        });
-        let resolveDispatched: (message: MarmotInboundMessage) => void = () => {};
-        const dispatched = new Promise<MarmotInboundMessage>((resolve) => {
-          resolveDispatched = resolve;
-        });
+        let readyCount = 0;
         const api: InboundPluginApi = {
           config: {
             channels: {
@@ -155,59 +152,126 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           logger: {
             info: (message) => {
               if (message.includes("inbound subscription established")) {
-                resolveReady();
+                readyCount += 1;
               }
             },
             warn: () => {},
           },
         };
 
-        const stopInbound = startMarmotInbound(
-          api,
-          async (message) => {
-            await client.sendFinal(
-              message.accountIdHex,
-              message.groupIdHex,
-              DETERMINISTIC_RESPONSE,
-              message.messageIdHex,
-            );
-            resolveDispatched(message);
+        const adapter = createMarmotMessageAdapter({
+          resolveTarget: async () => ({
+            client,
+            marmotAccountIdHex: ACCOUNT_ID_HEX,
+          }),
+        });
+        const runtimeChannel: OpenClawChannelRuntime = {
+          routing: {
+            resolveAgentRoute: () => ({
+              agentId: "main",
+              accountId: "default",
+              sessionKey: `agent:main:marmot:group:${GROUP_ID_HEX}`,
+            }),
           },
-          { clientFactory: () => client },
-        );
+          session: {
+            resolveStorePath: () => join(tempRoot, "sessions.json"),
+            recordInboundSession: () => {},
+          },
+          reply: {
+            dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+              const typed = params as {
+                ctx: { MessageSid: string };
+                dispatcherOptions: {
+                  deliver: (
+                    payload: { text: string },
+                    info: { kind: "final" },
+                  ) => Promise<void>;
+                };
+              };
+              await typed.dispatcherOptions.deliver(
+                { text: `marmot-e2e-ok:${typed.ctx.MessageSid.slice(0, 2)}` },
+                { kind: "final" },
+              );
+            },
+          },
+        };
+        const dispatch = createMarmotInboundDispatcher({
+          cfg: api.config,
+          runtimeChannel,
+          client: client as unknown as MarmotDispatchClient,
+          channelAccountId: "default",
+          groupActivation: "always",
+          mentionPatterns: [],
+          deliverInboundReply: async (params) => {
+            const context = params.ctxPayload as {
+              OriginatingTo?: string;
+              To?: string;
+            };
+            const to = context.OriginatingTo ?? context.To;
+            if (!to) {
+              return { status: "unsupported", reason: "missing_target" };
+            }
+            await adapter.send.text({
+              cfg: params.cfg,
+              to,
+              text: params.payload.text ?? "",
+              accountId: params.accountId,
+              replyToId: params.replyToId,
+            } as never);
+            return { status: "handled_visible", delivery: {} as never };
+          },
+        });
+        const runInbound = () =>
+          startMarmotInbound(api, dispatch, {
+            channelAccountId: "default",
+            clientFactory: () => client,
+          });
 
+        let stopInbound = runInbound();
         try {
-          await ready;
+          await waitFor(() => readyCount === 1, { label: "initial inbound subscription" });
+          const messageIds = ["a1", "a2", "a3"].map((byte) => byte.repeat(32));
+          for (const messageIdHex of messageIds.slice(0, 2)) {
+            await client.request({
+              type: "debug_inject_inbound",
+              account_id_hex: ACCOUNT_ID_HEX,
+              group_id_hex: GROUP_ID_HEX,
+              message_id_hex: messageIdHex,
+              sender_account_id_hex: SENDER_ACCOUNT_ID_HEX,
+              text: "ping from connector",
+            });
+          }
+          await waitFor(async () => (await recordedFinals(client)).sends.length === 2, {
+            label: "two sequential final sends",
+          });
+
+          stopInbound();
+          stopInbound = runInbound();
+          await waitFor(() => readyCount === 2, { label: "restarted inbound subscription" });
           await client.request({
             type: "debug_inject_inbound",
             account_id_hex: ACCOUNT_ID_HEX,
             group_id_hex: GROUP_ID_HEX,
-            message_id_hex: MESSAGE_ID_HEX,
+            message_id_hex: messageIds[2]!,
             sender_account_id_hex: SENDER_ACCOUNT_ID_HEX,
-            text: INBOUND_TEXT,
+            text: "ping after restart",
           });
+          const finals = await waitFor(async () => {
+            const recorded = await recordedFinals(client);
+            return recorded.sends.length === 3 ? recorded.sends : null;
+          }, { label: "post-restart final send" });
 
-          await expect(dispatched).resolves.toMatchObject({
-            accountIdHex: ACCOUNT_ID_HEX,
-            groupIdHex: GROUP_ID_HEX,
-            messageIdHex: MESSAGE_ID_HEX,
-            senderAccountIdHex: SENDER_ACCOUNT_ID_HEX,
-            text: INBOUND_TEXT,
-          });
-          const final = await waitFor(
-            async () => {
-              const recorded = await recordedFinals(client);
-              return recorded.sends[0] ?? null;
-            },
-            { timeoutMs: 10_000, label: "recorded final send" },
+          expect(
+            finals.map((send) => ({
+              groupIdHex: send.group_id_hex,
+              replyToId: send.reply_to_message_id_hex,
+            })),
+          ).toEqual(
+            messageIds.map((messageIdHex) => ({
+              groupIdHex: GROUP_ID_HEX,
+              replyToId: messageIdHex,
+            })),
           );
-          expect(final).toMatchObject({
-            account_id_hex: ACCOUNT_ID_HEX,
-            group_id_hex: GROUP_ID_HEX,
-            text: DETERMINISTIC_RESPONSE,
-            reply_to_message_id_hex: MESSAGE_ID_HEX,
-            message_ids_hex: ["1".padStart(64, "0")],
-          });
         } finally {
           stopInbound();
         }

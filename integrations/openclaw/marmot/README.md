@@ -206,6 +206,9 @@ advanced shared deployment can point both gateways at one `wn-agent`:
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
+The QUIC/streaming settings are still accepted for configuration compatibility,
+but inbound agent replies are currently delivered final-only.
+
 `accountIdHex` is the Marmot/wn-agent account id. It is intentionally distinct
 from OpenClaw's channel account id (`default`, or a key under
 `channels.marmot.accounts`) used for routing, session metadata, and message-tool
@@ -220,11 +223,14 @@ The token grants the full connector API for every hosted account, not only the
 configured OpenClaw channel account. Use a separate connector home/socket/token
 for any plugin or tenant that is not in the same trust boundary.
 
-- **Inbound → agent turn** (`src/dispatch.ts`): the inbound bridge feeds each
-  received Marmot message (`chatId` = Marmot group id, `userId` = sender) into
-  OpenClaw's turn kernel via `runChannelInboundEvent` + `dispatchReplyWithBufferedBlockDispatcher`,
-  **modeled on the bundled Telegram channel**. The agent's reply is delivered
-  back through the message adapter and threads to the triggering message.
+- **Inbound → agent turn** (`src/dispatch.ts`): the gateway-owned inbound bridge
+  feeds each received Marmot message (`chatId` = Marmot group id, `userId` =
+  sender) into OpenClaw's turn kernel via `runChannelInboundEvent` +
+  `dispatchReplyWithBufferedBlockDispatcher`. The trusted inbound context owns
+  the destination. A normal assistant final is passed to
+  `deliverInboundReplyWithMessageSendContext`, which invokes the registered
+  Marmot message adapter and threads the reply to the triggering message. The
+  model never has to reconstruct or select the source group.
   Dispatch is serialized per group (distinct groups run concurrently, each group
   stays FIFO), so a slow turn in one group never blocks inbound for others; set
   `debounceMs` to coalesce rapid same-sender bursts into one turn.
@@ -245,16 +251,11 @@ for any plugin or tenant that is not in the same trust boundary.
   unrecallable barge-in there is worse than dropping a single reply in a true
   two-party DM (where the user can re-send or address the agent explicitly). The
   error is not cached, so the next message retries the lookup.
-- **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
-  the adapter never merges or rewrites text across sends. Each durable reply is
-  **idempotent + retried**: the sink generates one `idempotency_key` per reply
-  and retries the send a few times (with a short backoff) on retryable errors,
-  reusing the same key so `wn-agent` dedups instead of double-posting. A repeated
-  key returns the original message ids without a second send, so a retry after a
-  post-write timeout cannot double-post an unrecallable encrypted message.
-  Live-preview `stream_finalize` uses the same posture: one idempotency key per
-  preview stream, bounded retry on retryable failures, and connector-side cached
-  final message ids for post-success retries.
+- **Durable replies** are sent verbatim as `kind: 9` messages via the registered
+  message adapter's `send.text` → `wn-agent send_final` mapping. The adapter
+  never merges or rewrites text across sends. A bounded retry reuses one
+  per-send idempotency key so a transient control-socket failure does not create
+  a second Marmot message.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call
@@ -296,18 +297,11 @@ for any plugin or tenant that is not in the same trust boundary.
   non-regular files. `wn-agent` encrypts + uploads to Blossom; the content key
   never leaves it. The vision model actually
   receiving the image is confirmed on the docker harness.
-- **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
-  append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
-  update cancels the preview and sends the final verbatim. The transcript hash +
-  chunk count match `wn-agent` byte-for-byte (Rust-anchored parity test in
-  `test/transcript.test.ts`). Previews run whenever `streaming.mode` is not
-  `off` and `quicCandidates` are set, and OpenClaw is emitting progressive
-  blocks. Marmot enables OpenClaw block delivery automatically when
-  `quicCandidates` are configured and `streaming.mode` is not `off`; operators
-  can override it with `blockStreaming`, `streaming.block.enabled`, or
-  `MARMOT_BLOCK_STREAMING`. Like a Telegram preview,
-  this is driven by the channel's reply `deliver` callback, not a core-driven
-  live adapter (that SDK seam does not exist yet).
+- **Live QUIC previews** (`src/live.ts`) are temporarily not wired into inbound
+  agent turns. Those turns are final-only so durable delivery has one owner: the
+  registered OpenClaw message adapter. The transcript and preview primitives
+  remain tested for a later reintroduction through OpenClaw's standard live
+  message-adapter lifecycle.
   The plugin keeps one stable request id across retries of the initial
   `stream_begin`, retains the returned v2 stream capability in memory, and
   presents it on every later operation. It never logs or persists that bearer.
