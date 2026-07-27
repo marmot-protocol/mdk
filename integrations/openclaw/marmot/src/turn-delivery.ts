@@ -2,7 +2,10 @@
 //
 // Coordinates the bound MarmotReplySink and outbound message-tool sends so an
 // inbound turn commits at most one durable reply to its source route. Scoped to
-// the active inbound dispatch — never a global or last-seen route cache.
+// the active inbound dispatch — never a global or last-seen route cache. A
+// second same-route text send is rejected even when its content differs; without
+// a deterministic per-send ordinal, it cannot receive a distinct replay-stable
+// identity without weakening the exactly-one reply contract.
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -48,6 +51,7 @@ export interface MarmotTurnDeliveryState {
 
 const turnDeliveryStorage = new AsyncLocalStorage<MarmotTurnDeliveryState>();
 
+/** Freeze the immutable route portion before exposing it through async context. */
 function freezeTurnRoute(route: MarmotTurnRoute): MarmotTurnRoute {
   return Object.freeze({
     channelAccountId: route.channelAccountId,
@@ -58,6 +62,7 @@ function freezeTurnRoute(route: MarmotTurnRoute): MarmotTurnRoute {
   });
 }
 
+/** Construct the unclaimed delivery state for a newly-dispatched turn. */
 function initialTurnState(route: MarmotTurnRoute): MarmotTurnDeliveryState {
   return {
     route: freezeTurnRoute(route),

@@ -6,6 +6,12 @@
 // previews are layered on separately via the finalizable-live-preview adapter
 // (see src/live.ts) and are only declared as capabilities once backed by
 // contract tests.
+//
+// During an inbound Marmot turn, exactly one same-route durable reply may own
+// delivery. Text can participate because send_final carries the deterministic
+// turn idempotency key. send_media has no equivalent key, so same-route media
+// fails before file access instead of bypassing ownership with an ambiguous
+// restart contract. Explicit cross-route media remains supported.
 
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -29,6 +35,7 @@ import { isRetryable, type AgentControlMediaUpload, type MarmotAgentControlClien
 import { canonicalizeMarmotGroupTarget, MarmotTargetError } from "./target.js";
 import {
   getMarmotTurnDelivery,
+  MarmotTurnDurableOwnershipError,
   matchesMarmotTurnRoute,
   resolveTurnIdempotencyKey,
   runTurnOutboundSendOnce,
@@ -258,6 +265,7 @@ function defaultOutboundMediaDir(): string {
 
 const MESSAGE_SEND_RETRY_BACKOFF_MS = [100, 300] as const;
 
+/** Sleep between bounded durable-send retries. */
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -309,6 +317,7 @@ async function defaultWriteTempMedia(
   return path;
 }
 
+/** Resolve an explicit or turn-inherited outbound group target. */
 function resolveOutboundGroupTarget(
   rawTo: string | undefined | null,
   turn: MarmotTurnDeliveryState | undefined,
@@ -323,6 +332,7 @@ function resolveOutboundGroupTarget(
   throw new MarmotTargetError("empty");
 }
 
+/** Resolve an explicit or turn-inherited OpenClaw channel account id. */
 function resolveOutboundChannelAccountId(
   rawAccountId: string | undefined | null,
   turn: MarmotTurnDeliveryState | undefined,
@@ -427,6 +437,17 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
         const turn = getMarmotTurnDelivery();
         const groupIdHex = resolveOutboundGroupTarget(ctx.to, turn);
         const channelAccountId = resolveOutboundChannelAccountId(ctx.accountId, turn);
+        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, channelAccountId);
+        if (
+          turn &&
+          matchesMarmotTurnRoute(turn, {
+            channelAccountId,
+            marmotAccountIdHex,
+            groupIdHex,
+          })
+        ) {
+          throw new MarmotTurnDurableOwnershipError();
+        }
         const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);
         if (!resolved) {
           throw new Error(
@@ -434,7 +455,6 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
           );
         }
         try {
-          const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, channelAccountId);
           const caption = ctx.text.trim().length > 0 ? ctx.text : null;
           const response = await client.sendMedia(
             marmotAccountIdHex,

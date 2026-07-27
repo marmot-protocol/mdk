@@ -16,6 +16,7 @@ export interface DeriveTurnIdempotencyKeyParams {
   sourceMessageIdsHex: readonly string[];
 }
 
+/** Encode one UTF-8 field without concatenation ambiguity. */
 function encodeLengthPrefixedUtf8(value: string): Buffer {
   const bytes = Buffer.from(value, "utf8");
   const len = Buffer.alloc(2);
@@ -23,6 +24,7 @@ function encodeLengthPrefixedUtf8(value: string): Buffer {
   return Buffer.concat([len, bytes]);
 }
 
+/** Validate and encode one hex field without concatenation ambiguity. */
 function encodeLengthPrefixedHex(value: string): Buffer {
   const normalized = value.trim().toLowerCase();
   const bytes = Buffer.from(normalized, "hex");
@@ -75,6 +77,7 @@ export function deriveTurnIdempotencyKey(params: DeriveTurnIdempotencyKeyParams)
   return createHash("sha256").update(Buffer.concat(parts)).digest("hex");
 }
 
+/** Derive the turn key directly from the inbound message identity fields. */
 export function deriveTurnIdempotencyKeyFromInbound(
   message: Pick<
     MarmotInboundMessage,

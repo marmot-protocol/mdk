@@ -68,10 +68,10 @@ struct SendIdempotencyGate {
 /// A retry that reuses the same key AND matches the recorded fingerprint returns
 /// the cached ids without re-sending, so a retry after a post-write timeout cannot
 /// double-post an unrecallable encrypted message. A reused key whose fingerprint
-/// differs (a different request body under the same key) is treated as a cache
-/// miss, so it can never return ids belonging to an unrelated send. Keys are
-/// evicted oldest-first once the capacity is reached and the eviction is mirrored
-/// to disk.
+/// differs (a different request body under the same logical identity) fails
+/// closed, so regenerated content cannot publish a second durable message. Keys
+/// are evicted oldest-first once the capacity is reached and the eviction is
+/// mirrored to disk.
 ///
 /// Records are persisted under [`SEND_IDEMPOTENCY_FILE`] with crash-safe atomic
 /// renames so a connector restart can still dedup a bounded retry window. The
@@ -96,9 +96,7 @@ pub(crate) struct SendIdempotencyLeader {
 
 impl SendIdempotencyLeader {
     /// Publish the leader's successful result to callers that were already
-    /// waiting on this in-process gate. This remains transient so a sequential
-    /// reuse of a key with a different fingerprint keeps its legacy cache-miss
-    /// behavior.
+    /// waiting on this in-process gate.
     pub(crate) fn complete(
         &self,
         message_ids: Vec<String>,
@@ -165,6 +163,24 @@ impl SendIdempotencyStore {
             .map(|(_, ids, disposition)| (ids.clone(), *disposition))
     }
 
+    /// Return a committed matching result, reject an existing key bound to
+    /// different inputs, or report that the key has not committed yet.
+    fn committed_for_acquire(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<SendIdempotencyResult>, ConnectorError> {
+        let inner = crate::lock_recover(&self.inner);
+        let Some((recorded, ids, disposition)) = inner.seen.get(key) else {
+            return Ok(None);
+        };
+        if constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
+            Ok(Some((ids.clone(), *disposition)))
+        } else {
+            Err(ConnectorError::SendIdempotencyConflict)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn in_flight_participant_count(&self, key: &str, fingerprint: &str) -> usize {
         crate::lock_recover(&self.in_flight)
@@ -177,19 +193,19 @@ impl SendIdempotencyStore {
     /// result after the leader exits; if the leader failed, the follower becomes
     /// the next leader and may retry.
     ///
-    /// The gate includes the fingerprint so the existing behavior for a reused
-    /// key with a different request body remains a cache miss rather than
-    /// blocking behind or reusing an unrelated send. A leader intentionally
-    /// holds its gate across the external send and result recording. Those
-    /// operations are not cancelled here because cancellation cannot prove that
-    /// an unrecallable send did not land; a follower instead receives
-    /// [`ConnectorError::SendInProgress`] after the bounded gate wait.
+    /// A live or committed key bound to a different fingerprint is rejected:
+    /// allowing a second leader would let a replay with regenerated text publish
+    /// another unrecallable message. A leader intentionally holds its gate across
+    /// the external send and result recording. Those operations are not cancelled
+    /// here because cancellation cannot prove that an unrecallable send did not
+    /// land; a follower instead receives [`ConnectorError::SendInProgress`] after
+    /// the bounded gate wait.
     pub(crate) async fn acquire(
         &self,
         key: &str,
         fingerprint: &str,
     ) -> Result<SendIdempotencyAcquisition, ConnectorError> {
-        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+        if let Some(result) = self.committed_for_acquire(key, fingerprint)? {
             return Ok(SendIdempotencyAcquisition::Completed(result));
         }
 
@@ -197,6 +213,19 @@ impl SendIdempotencyStore {
         let gate = {
             let mut in_flight = crate::lock_recover(&self.in_flight);
             in_flight.retain(|_, gate| gate.strong_count() > 0);
+            if in_flight
+                .iter()
+                .any(|((existing_key, existing_fingerprint), gate)| {
+                    existing_key == key
+                        && gate.strong_count() > 0
+                        && !constant_time_eq(
+                            existing_fingerprint.as_bytes(),
+                            fingerprint.as_bytes(),
+                        )
+                })
+            {
+                return Err(ConnectorError::SendIdempotencyConflict);
+            }
             if let Some(gate) = in_flight.get(&gate_key).and_then(Weak::upgrade) {
                 gate
             } else {
@@ -215,7 +244,7 @@ impl SendIdempotencyStore {
         .await
         .map_err(|_| ConnectorError::SendInProgress)?;
 
-        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+        if let Some(result) = self.committed_for_acquire(key, fingerprint)? {
             return Ok(SendIdempotencyAcquisition::Completed(result));
         }
         if let Some(result) = crate::lock_recover(&gate.completed).clone() {

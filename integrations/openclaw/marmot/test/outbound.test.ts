@@ -14,7 +14,11 @@ import {
   receiptFromMessageIds,
   SentMessageTargetCache,
 } from "../src/outbound.js";
-import { runInMarmotTurn, type MarmotTurnRoute } from "../src/turn-delivery.js";
+import {
+  MarmotTurnDurableOwnershipError,
+  runInMarmotTurn,
+  type MarmotTurnRoute,
+} from "../src/turn-delivery.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 
@@ -641,6 +645,81 @@ describe("createMarmotMessageAdapter", () => {
         idempotencyKey: "turn-key-inherit",
       },
     ]);
+  });
+
+  it("rejects same-route turn media before reading or staging the file", async () => {
+    const calls = emptyClientCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "acct-a",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key-media",
+    };
+    let mediaReads = 0;
+    let mediaWrites = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(calls),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+      writeTempMedia: async () => {
+        mediaWrites += 1;
+        return "/tmp/unused";
+      },
+    });
+
+    await runInMarmotTurn(route, async () => {
+      await expect(
+        adapter.send!.media!({
+          cfg: {},
+          accountId: "acct-a",
+          to: HEX32("cc"),
+          text: "same-route media",
+          mediaUrl: "https://example.test/photo.jpg",
+          mediaReadFile: async () => {
+            mediaReads += 1;
+            return Buffer.from("bytes");
+          },
+        } as ChannelMessageSendMediaContext),
+      ).rejects.toBeInstanceOf(MarmotTurnDurableOwnershipError);
+    });
+
+    expect(mediaReads).toBe(0);
+    expect(mediaWrites).toBe(0);
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("keeps explicit cross-route media available during a Marmot turn", async () => {
+    const calls = emptyClientCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "acct-a",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key-cross-route-media",
+    };
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(calls),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+      writeTempMedia: async () => "/tmp/staged-photo.jpg",
+    });
+
+    await runInMarmotTurn(route, async () => {
+      await adapter.send!.media!({
+        cfg: {},
+        accountId: "acct-a",
+        to: HEX32("ff"),
+        text: "cross-route media",
+        mediaUrl: "https://example.test/photo.jpg",
+        mediaReadFile: async () => Buffer.from("bytes"),
+      } as ChannelMessageSendMediaContext);
+    });
+
+    expect(calls.sendMedia).toHaveLength(1);
+    expect(calls.sendMedia[0]?.groupIdHex).toBe(HEX32("ff"));
   });
 
   it("prefers explicit to and accountId over the bound turn route", async () => {

@@ -121,8 +121,8 @@ impl AgentConnector {
 
         // Server-derived request fingerprint: a reused idempotency key only short-
         // circuits when the request it identifies is the same one. A reused key
-        // carrying a different request body is a cache miss, so dedup can never
-        // return ids belonging to an unrelated send.
+        // carrying a different request body fails closed so a replay with
+        // regenerated text cannot publish a second durable message.
         let fingerprint = send_final_fingerprint(
             account_id_hex,
             &group_id_hex,
@@ -159,8 +159,8 @@ impl AgentConnector {
                 .await?
         };
         // Record only after a successful send so a failed send remains retryable.
-        // A key already bound to a different fingerprint is left untouched (first
-        // write wins), so this send simply proceeds without caching.
+        // The acquisition above guarantees this key is either new or bound to
+        // the same fingerprint.
         if let Some((key, reservation)) = idempotency {
             let message_ids = summary.message_ids.clone();
             let maintenance_disposition =

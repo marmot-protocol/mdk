@@ -19,7 +19,11 @@ import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
-import { MarmotDispatchNotReadyError } from "./dispatch-errors.js";
+import {
+  MarmotDispatchAmbiguousDeliveryError,
+  MarmotDispatchDeliveryFailedError,
+  MarmotDispatchNotReadyError,
+} from "./dispatch-errors.js";
 import {
   inboundDedupeForAccount,
   MarmotInboundBridge,
@@ -194,10 +198,12 @@ const inboundActiveByAccount = new Map<string, boolean>();
 const DISPATCH_NOT_READY_MAX_ATTEMPTS = 3;
 const DISPATCH_NOT_READY_BACKOFF_MS = [50, 100, 200] as const;
 
+/** Sleep between bounded readiness retries. */
 async function sleepMs(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Resolve the stable per-channel-account key used for guards and dedupe. */
 function resolveInboundAccountKey(
   api: InboundPluginApi,
   channelAccountId?: string | null,
@@ -212,6 +218,7 @@ function resolveInboundAccountKey(
   }
 }
 
+/** Clear per-account subscription guards and dedupe between isolated tests. */
 export function resetMarmotInboundAccountsForTests(): void {
   inboundActiveByAccount.clear();
   resetInboundDedupeForTests();
@@ -338,6 +345,17 @@ export function startMarmotInbound(
           await dispatch(message);
           return;
         } catch (error) {
+          if (
+            error instanceof MarmotDispatchAmbiguousDeliveryError ||
+            error instanceof MarmotDispatchDeliveryFailedError
+          ) {
+            // These failures are explicitly replay-safe: the turn identity is
+            // deterministic and wn-agent either reuses the committed receipt or
+            // rejects a regenerated payload under the same key. Clear every
+            // coalesced source id so reconnect redelivery can run that replay.
+            rollbackInboundDedupe(message);
+            throw error;
+          }
           if (!(error instanceof MarmotDispatchNotReadyError)) {
             throw error;
           }

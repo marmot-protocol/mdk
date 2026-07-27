@@ -5,7 +5,11 @@ import type {
   AgentControlMediaRef,
   MarmotAgentControlClient,
 } from "../src/client.js";
-import { MarmotDispatchNotReadyError } from "../src/dispatch-errors.js";
+import {
+  MarmotDispatchAmbiguousDeliveryError,
+  MarmotDispatchDeliveryFailedError,
+  MarmotDispatchNotReadyError,
+} from "../src/dispatch-errors.js";
 import {
   startMarmotInbound,
   syncMarmotAllowlist,
@@ -673,6 +677,49 @@ describe("startMarmotInbound readiness redelivery", () => {
     await waitFor(() => dispatched.length === 1);
     stopSecond();
     expect(dispatched).toEqual([secondId]);
+  });
+
+  it.each([
+    ["ambiguous delivery", () => new MarmotDispatchAmbiguousDeliveryError()],
+    ["terminal delivery failure", () => new MarmotDispatchDeliveryFailedError()],
+  ])("rolls back every coalesced id after %s so reconnect can replay", async (_label, failure) => {
+    const firstId = HEX32("c1");
+    const secondId = HEX32("c2");
+    const firstEvent = inboundEvent("cc", "c1");
+    firstEvent.message_id_hex = firstId;
+    firstEvent.text = "part one";
+    const secondEvent = inboundEvent("cc", "c2");
+    secondEvent.message_id_hex = secondId;
+    secondEvent.text = "part two";
+    const warnings: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
+      logger: { info: () => {}, warn: (message) => warnings.push(message) },
+    };
+
+    const stopFirst = startMarmotInbound(
+      api,
+      async () => {
+        throw failure();
+      },
+      { clientFactory: () => inboundStubClient([firstEvent, secondEvent]) },
+    );
+    await waitFor(() => warnings.some((message) => message.includes("dispatch task failed")));
+    stopFirst();
+
+    const replayed: MarmotInboundMessage[] = [];
+    const stopSecond = startMarmotInbound(
+      api,
+      (message) => {
+        replayed.push(message);
+      },
+      { clientFactory: () => inboundStubClient([firstEvent, secondEvent]) },
+    );
+    await waitFor(() => replayed.length === 1);
+    stopSecond();
+
+    expect(replayed[0]?.messageIdHex).toBe(secondId);
+    expect(replayed[0]?.coalescedMessageIdsHex).toEqual([firstId, secondId]);
   });
 
   it("stops readiness retries on abort and rolls back dedupe without dispatching again", async () => {

@@ -43,7 +43,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
   versioned SHA-256 request fingerprints, `stream_finalize_v2:` keys for durable finalized sends,
   crash-safe atomic writes, plus bounded same-key/same-fingerprint in-flight gates whose followers
-  reuse a leader's successful result or receive `send_in_progress` when the gate wait expires), and
+  reuse a leader's successful result or receive `send_in_progress` when the gate wait expires;
+  same-key/different-fingerprint reuse fails closed with `idempotency_conflict`), and
   the `DebugFinalSendStore` recorder.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.

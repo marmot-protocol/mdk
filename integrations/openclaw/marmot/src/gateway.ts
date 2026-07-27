@@ -19,6 +19,7 @@ import {
 } from "./inbound-runtime.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
 
+/** Resolve the configured default agent's display name for onboarding prompts. */
 function resolveConfiguredAgentName(cfg: unknown): string | null {
   const agents = (cfg as { agents?: { list?: Array<{ name?: string; default?: boolean }> } })
     .agents;

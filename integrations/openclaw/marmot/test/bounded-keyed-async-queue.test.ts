@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { BoundedKeyedAsyncQueue } from "../src/bounded-keyed-async-queue.js";
+import {
+  MarmotDispatchAmbiguousDeliveryError,
+  MarmotDispatchDeliveryFailedError,
+  MarmotDispatchNotReadyError,
+} from "../src/dispatch-errors.js";
 
 describe("BoundedKeyedAsyncQueue", () => {
   it("reports whether enqueue accepted the task", () => {
@@ -49,5 +54,31 @@ describe("BoundedKeyedAsyncQueue", () => {
     });
 
     await vi.waitFor(() => expect(ran).toEqual(["after-reject"]));
+  });
+
+  it.each([
+    [
+      new MarmotDispatchAmbiguousDeliveryError(),
+      "marmot: inbound dispatch task failed (ambiguous_delivery)",
+    ],
+    [
+      new MarmotDispatchDeliveryFailedError(),
+      "marmot: inbound dispatch task failed (delivery_failed)",
+    ],
+    [
+      new MarmotDispatchNotReadyError("non_retryable"),
+      "marmot: inbound dispatch task failed (not_ready)",
+    ],
+    [new Error("secret route and payload"), "marmot: inbound dispatch task failed (unexpected)"],
+  ])("logs a fixed privacy-safe category for %s", async (error, expected) => {
+    const warnings: string[] = [];
+    const queue = new BoundedKeyedAsyncQueue(1, (message) => warnings.push(message));
+
+    queue.enqueue("group-a", async () => {
+      throw error;
+    });
+
+    await vi.waitFor(() => expect(warnings).toEqual([expected]));
+    expect(warnings.join(" ")).not.toContain("secret route and payload");
   });
 });

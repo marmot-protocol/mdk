@@ -32,6 +32,8 @@ pub enum ConnectorError {
     OperationTimedOut(&'static str),
     #[error("matching send is still in progress")]
     SendInProgress,
+    #[error("idempotency key was reused with different send inputs")]
+    SendIdempotencyConflict,
     #[error("outbound media path denied: {0}")]
     MediaPathDenied(&'static str),
     #[error("stream id is already reserved")]
@@ -60,6 +62,7 @@ impl ConnectorError {
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
+            Self::SendIdempotencyConflict => "idempotency_conflict",
             Self::MediaPathDenied(_) => "media_path_denied",
             Self::StreamIdInUse => "stream_id_in_use",
             Self::StreamCapabilityDenied => "stream_capability_denied",
@@ -80,6 +83,9 @@ impl ConnectorError {
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
                 "matching send is still in progress; retry with the same idempotency key"
+            }
+            Self::SendIdempotencyConflict => {
+                "idempotency key was reused with different send inputs"
             }
             Self::MediaPathDenied(_) => "media path is not allowed",
             Self::StreamIdInUse => "stream id is already in use",

@@ -21,6 +21,7 @@ export type GroupReadinessResult =
   | { status: "ready"; groupInfo: GroupInfoResponse }
   | { status: "not_ready"; reason: "timeout" | "non_retryable" };
 
+/** Sleep between bounded group-readiness probes. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

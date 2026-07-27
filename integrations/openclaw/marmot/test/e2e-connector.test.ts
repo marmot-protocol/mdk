@@ -450,14 +450,38 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
             sender_account_id_hex: SENDER_ACCOUNT_ID_HEX,
             text: "replay",
           });
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          const observationMessageId = "dd".repeat(32);
+          await client.request({
+            type: "debug_inject_inbound",
+            account_id_hex: ACCOUNT_ID_HEX,
+            group_id_hex: GROUP_ID_HEX,
+            message_id_hex: observationMessageId,
+            sender_account_id_hex: SENDER_ACCOUNT_ID_HEX,
+            text: "post-replay observation",
+          });
+          // The subscription and same-group queue preserve order. Seeing this
+          // later event complete proves the replay was observed before the
+          // unchanged duplicate-count assertions below.
+          await waitFor(
+            () => delivered.some((message) => message.messageIdHex === observationMessageId),
+            { label: "post-replay positive observation" },
+          );
+          await waitFor(
+            async () =>
+              (await recordedFinals(client)).sends.filter(
+                (send) =>
+                  send.text === "adapter-owned-turn-reply" &&
+                  send.group_id_hex === GROUP_ID_HEX,
+              ).length === 4,
+            { label: "post-replay observation final" },
+          );
 
           const finalsAfterReplay = await recordedFinals(client);
           expect(
             finalsAfterReplay.sends.filter(
               (send) => send.text === "adapter-owned-turn-reply" && send.group_id_hex === GROUP_ID_HEX,
             ),
-          ).toHaveLength(3);
+          ).toHaveLength(4);
           expect(
             finalsAfterReplay.sends.filter(
               (send) => send.text === "bound-final" && send.group_id_hex === GROUP_ID_HEX,
@@ -476,7 +500,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
   );
 
   it(
-    "reuses a derived idempotency key across independent plugin processes without duplicating durable sends",
+    "rejects regenerated text under a restart-stable key without duplicating durable sends",
     async () => {
       const tempRoot = await mkdtemp("/tmp/omce-restart-");
       const { client, proc, socketPath } = await startWnAgent(tempRoot);
@@ -496,6 +520,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           MARMOT_E2E_GROUP: GROUP_ID_HEX,
           MARMOT_E2E_MESSAGE: MESSAGE_ID_HEX,
           MARMOT_E2E_REPLY: replyText,
+          MARMOT_E2E_REPLAY_REPLY: "restart-idempotency-regenerated-reply",
         };
         const pluginRoot = join(import.meta.dirname, "..");
         const clientModule = join(pluginRoot, "dist/src/client.js");
@@ -553,14 +578,18 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
             socketPath: process.env.MARMOT_E2E_SOCKET,
             requestTimeoutMs: 5_000,
           });
-          const response = await client.sendFinal(
-            inbound.accountIdHex,
-            inbound.groupIdHex,
-            process.env.MARMOT_E2E_REPLY,
-            inbound.messageIdHex,
-            key,
-          );
-          console.log(JSON.stringify({ key, messageIdsHex: response.message_ids_hex }));
+          try {
+            await client.sendFinal(
+              inbound.accountIdHex,
+              inbound.groupIdHex,
+              process.env.MARMOT_E2E_REPLAY_REPLY,
+              inbound.messageIdHex,
+              key,
+            );
+            console.log(JSON.stringify({ key, errorCode: null }));
+          } catch (error) {
+            console.log(JSON.stringify({ key, errorCode: error?.code ?? null }));
+          }
         `;
 
         const runChild = <T>(script: string) =>
@@ -612,13 +641,16 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
         );
         const committedMessageIdsHex = committed.message_ids_hex;
 
-        const replay = await runChild<{ key: string; messageIdsHex: string[] }>(replayChildScript);
+        const replay = await runChild<{ key: string; errorCode: string | null }>(replayChildScript);
         expect(replay.key).toBe(committedKey);
-        expect(replay.messageIdsHex).toEqual(committedMessageIdsHex);
+        expect(replay.errorCode).toBe("idempotency_conflict");
 
         const finals = await recordedFinals(client);
         expect(finals.sends.filter(matchesReply)).toHaveLength(1);
         expect(finals.sends.filter(matchesReply)[0]?.message_ids_hex).toEqual(committedMessageIdsHex);
+        expect(
+          finals.sends.filter((send) => send.text === childEnv.MARMOT_E2E_REPLAY_REPLY),
+        ).toHaveLength(0);
       } finally {
         await stopProcess(proc);
         await rm(tempRoot, { recursive: true, force: true });

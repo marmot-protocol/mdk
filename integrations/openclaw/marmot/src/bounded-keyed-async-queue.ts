@@ -1,6 +1,30 @@
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 
+import {
+  MarmotDispatchAmbiguousDeliveryError,
+  MarmotDispatchDeliveryFailedError,
+  MarmotDispatchNotReadyError,
+} from "./dispatch-errors.js";
+
 export const DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32;
+
+/**
+ * Map queue task failures onto fixed privacy-safe operator categories. Never
+ * forward an arbitrary error message because it may contain route or payload
+ * material from an upstream SDK failure.
+ */
+export function inboundDispatchFailureCategory(error: unknown): string {
+  if (error instanceof MarmotDispatchAmbiguousDeliveryError) {
+    return "ambiguous_delivery";
+  }
+  if (error instanceof MarmotDispatchDeliveryFailedError) {
+    return "delivery_failed";
+  }
+  if (error instanceof MarmotDispatchNotReadyError) {
+    return "not_ready";
+  }
+  return "unexpected";
+}
 
 /**
  * Per-key FIFO dispatch with a bounded queue depth. When a key is at capacity,
@@ -40,7 +64,11 @@ export class BoundedKeyedAsyncQueue {
           }
         }
       })
-      .catch(() => this.onShed?.("marmot: inbound dispatch task failed"));
+      .catch((error) =>
+        this.onShed?.(
+          `marmot: inbound dispatch task failed (${inboundDispatchFailureCategory(error)})`,
+        ),
+      );
     return true;
   }
 }

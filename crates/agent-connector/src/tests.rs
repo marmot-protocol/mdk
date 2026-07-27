@@ -73,6 +73,16 @@ fn send_in_progress_has_a_distinct_retry_contract() {
     );
 }
 
+#[test]
+fn idempotency_conflict_has_a_distinct_fail_closed_contract() {
+    let error = crate::ConnectorError::SendIdempotencyConflict;
+    assert_eq!(error.code(), "idempotency_conflict");
+    assert_eq!(
+        error.client_message(),
+        "idempotency key was reused with different send inputs"
+    );
+}
+
 #[tokio::test]
 async fn control_frame_write_timeout_includes_flush() {
     struct FlushStallingWriter;
@@ -4187,69 +4197,33 @@ async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
 }
 
 #[tokio::test]
-async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
+async fn send_idempotency_store_rejects_a_conflicting_in_flight_fingerprint() {
     use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
-    store.record(
-        "shared-key".to_owned(),
-        "first-fingerprint".to_owned(),
-        vec!["aa".repeat(32)],
-    );
     let leader = match store
-        .acquire("shared-key", "second-fingerprint")
+        .acquire("shared-key", "first-fingerprint")
         .await
         .unwrap()
     {
         SendIdempotencyAcquisition::Leader(leader) => leader,
         SendIdempotencyAcquisition::Completed(_) => {
-            panic!("a new request body must remain a cache miss")
+            panic!("the first request must lead")
         }
     };
 
-    let follower_store = store.clone();
-    let follower = tokio::spawn(async move {
-        follower_store
-            .acquire("shared-key", "second-fingerprint")
-            .await
-            .unwrap()
-    });
-    wait_for_idempotency_follower(&store, "shared-key", "second-fingerprint").await;
-    assert!(!follower.is_finished());
-
-    let ids = vec!["bb".repeat(32)];
-    store.record(
-        "shared-key".to_owned(),
-        "second-fingerprint".to_owned(),
-        ids.clone(),
-    );
-    assert_eq!(
-        store.get("shared-key", "second-fingerprint"),
-        None,
-        "the original durable key binding remains first-write-wins"
-    );
-    leader.complete(
-        ids.clone(),
-        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
-    );
+    assert!(matches!(
+        store.acquire("shared-key", "different-fingerprint").await,
+        Err(crate::ConnectorError::SendIdempotencyConflict)
+    ));
     drop(leader);
 
-    match follower.await.unwrap() {
-        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
-            assert_eq!(recorded, ids);
-            assert_eq!(
-                disposition,
-                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable
-            );
-        }
-        SendIdempotencyAcquisition::Leader(_) => {
-            panic!("a concurrent follower must reuse the transient leader result")
-        }
-    }
+    // If the first leader failed before committing, the logical key remains
+    // available for a later replay rather than being poisoned indefinitely.
     assert!(matches!(
         store
-            .acquire("shared-key", "second-fingerprint")
+            .acquire("shared-key", "different-fingerprint")
             .await
             .unwrap(),
         SendIdempotencyAcquisition::Leader(_)
@@ -4257,8 +4231,8 @@ async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
 }
 
 #[tokio::test]
-async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
-    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+async fn send_idempotency_store_rejects_a_conflicting_committed_fingerprint() {
+    use crate::stream_session::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
@@ -4268,16 +4242,10 @@ async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
         vec!["aa".repeat(32)],
     );
 
-    match store
-        .acquire("shared-key", "different-fingerprint")
-        .await
-        .unwrap()
-    {
-        SendIdempotencyAcquisition::Leader(_) => {}
-        SendIdempotencyAcquisition::Completed(_) => {
-            panic!("different request bodies must not reuse unrelated message ids")
-        }
-    }
+    assert!(matches!(
+        store.acquire("shared-key", "different-fingerprint").await,
+        Err(crate::ConnectorError::SendIdempotencyConflict)
+    ));
 }
 
 #[test]

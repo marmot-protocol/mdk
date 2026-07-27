@@ -149,6 +149,7 @@ export function inboundDedupeForAccount(accountKey: string): InboundMessageDedup
   return dedupe;
 }
 
+/** Clear all process-local inbound dedupe windows between isolated tests. */
 export function resetInboundDedupeForTests(): void {
   dedupeByAccount.clear();
 }

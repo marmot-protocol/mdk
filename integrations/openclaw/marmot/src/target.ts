@@ -47,6 +47,7 @@ export type MarmotTargetRejectCategory =
   | "decorated_route"
   | "invalid_hex";
 
+/** True when a target is an OpenClaw session key involving Marmot routing. */
 export function looksLikeMarmotSessionKey(value: string): boolean {
   const lower = value.toLowerCase();
   if (lower.startsWith("agent:")) {
@@ -56,10 +57,12 @@ export function looksLikeMarmotSessionKey(value: string): boolean {
   return lower.includes(`:${MARMOT_TARGET_PREFIX}:`);
 }
 
+/** Internal alias kept local to the canonicalization decision tree. */
 function looksLikeSessionKey(value: string): boolean {
   return looksLikeMarmotSessionKey(value);
 }
 
+/** True when a target explicitly names a non-Marmot channel prefix. */
 export function looksLikeMarmotCrossChannelTarget(value: string): boolean {
   const match = /^([a-z][a-z0-9-]*):/.exec(value.toLowerCase());
   if (!match) {
@@ -69,15 +72,18 @@ export function looksLikeMarmotCrossChannelTarget(value: string): boolean {
   return prefix !== MARMOT_TARGET_PREFIX && prefix !== "group";
 }
 
+/** Internal alias kept local to the canonicalization decision tree. */
 function looksLikeCrossChannelTarget(value: string): boolean {
   return looksLikeMarmotCrossChannelTarget(value);
 }
 
+/** True when the input starts with a known non-group Marmot object kind. */
 export function hasMarmotRejectedKindPrefix(value: string): boolean {
   const lower = value.toLowerCase();
   return REJECTED_KIND_PREFIXES.some((prefix) => lower.startsWith(prefix));
 }
 
+/** Return the fixed privacy-safe message for a target rejection category. */
 export function marmotTargetRejectMessage(category: MarmotTargetRejectCategory): string {
   switch (category) {
     case "empty":
@@ -105,6 +111,7 @@ export function marmotTargetRejectMessage(category: MarmotTargetRejectCategory):
   }
 }
 
+/** Typed target rejection whose message never echoes the raw target. */
 export class MarmotTargetError extends Error {
   readonly category: MarmotTargetRejectCategory;
 

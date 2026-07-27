@@ -82,6 +82,7 @@ interface BufferedDispatchResult {
   failedCounts?: Partial<Record<ReplyDelivery["kind"], number>>;
 }
 
+/** Fail the inbound turn when OpenClaw reports any failed final delivery. */
 function assertBufferedDispatchDeliverySucceeded(result: unknown): void {
   const failedCounts = (result as BufferedDispatchResult | undefined)?.failedCounts;
   if ((failedCounts?.final ?? 0) > 0) {
@@ -89,6 +90,7 @@ function assertBufferedDispatchDeliverySucceeded(result: unknown): void {
   }
 }
 
+/** Fail closed if the active turn ended without a definite durable outcome. */
 function assertTurnDispatchDeliverySettled(): void {
   const turn = getMarmotTurnDelivery();
   if (!turn) {
@@ -531,6 +533,7 @@ export class MarmotReplySink {
 const MARMOT_TURN_DENIED_TOOLS = ["sessions_send"] as const;
 const MARMOT_TURN_ALSO_ALLOW_TOOLS = ["message"] as const;
 
+/** Append tool names without mutating the caller's list or adding duplicates. */
 function mergeUniqueToolNames(existing: readonly string[] | undefined, additions: readonly string[]): string[] {
   const merged = new Set(existing ?? []);
   for (const entry of additions) {
