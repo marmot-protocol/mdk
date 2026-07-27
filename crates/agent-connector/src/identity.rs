@@ -251,6 +251,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_identity_files_with_multiple_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.nsec");
+        let alias = dir.path().join("identity-alias.nsec");
+        write_identity(&identity, NSEC);
+        std::fs::hard_link(&identity, &alias).unwrap();
+
+        assert!(matches!(
+            import_existing_identity_file(&dir.path().join("home"), "agent", &identity, None),
+            Err(ExistingIdentityError::MultipleHardLinks)
+        ));
+        assert_eq!(std::fs::read_to_string(&identity).unwrap(), NSEC);
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), NSEC);
+    }
+
+    #[test]
     fn rejects_malformed_identity_without_echoing_it() {
         let dir = tempfile::tempdir().unwrap();
         let identity = dir.path().join("identity.nsec");
