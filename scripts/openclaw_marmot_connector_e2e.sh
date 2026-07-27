@@ -44,4 +44,5 @@ fi
 source "$dev_root/env.sh"
 
 cd "$OPENCLAW_PLUGIN_SRC"
+pnpm build
 exec env MARMOT_OPENCLAW_CONNECTOR_E2E=1 pnpm exec vitest run test/e2e-connector.test.ts

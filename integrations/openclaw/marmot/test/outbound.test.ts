@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import type {
-  ChannelMessageSendMediaContext,
-  ChannelMessageSendTextContext,
+import {
+  deriveDurableFinalDeliveryRequirements,
+  type ChannelMessageSendMediaContext,
+  type ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
 
 import type {
@@ -111,11 +112,26 @@ describe("createMarmotMessageAdapter", () => {
     expect(result.receipt.sentAt).toBe(1234);
   });
 
-  it("declares durable text + media + replyTo capabilities (no unproven live caps)", () => {
+  it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(emptyClientCalls()), marmotAccountIdHex: HEX32("aa") }),
     });
-    expect(adapter.durableFinal?.capabilities).toEqual({ text: true, media: true, replyTo: true });
+    expect(adapter.durableFinal?.capabilities).toEqual({
+      text: true,
+      media: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
+    const required = deriveDurableFinalDeliveryRequirements({
+      payload: { text: "done" },
+      replyToId: HEX32("dd"),
+    });
+    expect(required).toEqual({
+      text: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
+    expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
   });
 

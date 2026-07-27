@@ -21,7 +21,8 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/append-only.ts` — append-only suffix tracker for progressive updates.
 - `src/live.ts` — live-preview state machine → `stream_begin`/`append`/`finalize`/`cancel`.
 - `src/inbound.ts` — inbound subscription bridge (reconnect, dedupe, resync).
-- `src/inbound-runtime.ts` — `registerFull` wiring + the inbound→agent dispatch seam.
+- `src/gateway.ts` — OpenClaw-owned account lifecycle and inbound subscription.
+- `src/inbound-runtime.ts` — the inbound→agent dispatch seam.
 - `src/bounded-keyed-async-queue.ts` — per-group inbound dispatch with a depth cap.
 - `src/outbound.ts` — `defineChannelMessageAdapter` durable send → `send_final`.
 - `src/messaging.ts` — `messaging` target-resolution adapter so the shared `message` tool can resolve a Marmot conversation (group id hex).
@@ -37,7 +38,9 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - Regenerate `test/vectors/transcript-vectors.json` from the Rust
   `AgentTextStreamTranscriptV1` if the Rust transcript hashing ever changes.
 - Keep the `openclaw` dependency pinned; before bumping, verify the
-  `openclaw/plugin-sdk/*` subpath exports against the new version's types.
+  `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
+  re-verify the deliberate test-only `dist/plugins/loader.js` import used by the
+  connector E2E (the pinned SDK exposes no supported plugin-loader subpath).
 - The inbound→agent and live-preview-pipeline seams use OpenClaw gateway runtime
   internals and are validated by the deterministic connector E2E plus the docker
   phone test, not the unit tests alone.

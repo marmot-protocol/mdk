@@ -307,7 +307,12 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     durableFinal: {
       // Marmot durable sends are plain encrypted kind-9 text or media with an
       // optional reply.
-      capabilities: { text: true, media: true, replyTo: true },
+      capabilities: {
+        text: true,
+        media: true,
+        replyTo: true,
+        messageSendingHooks: true,
+      },
     },
     send: {
       text: async (ctx: ChannelMessageSendTextContext) => {

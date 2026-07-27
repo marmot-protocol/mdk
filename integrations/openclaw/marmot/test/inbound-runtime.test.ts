@@ -6,6 +6,7 @@ import type {
   MarmotAgentControlClient,
 } from "../src/client.js";
 import {
+  resetMarmotInboundAccountsForTests,
   startMarmotInbound,
   syncMarmotAllowlist,
   type InboundPluginApi,
@@ -77,6 +78,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
 }
 
 afterEach(() => {
+  resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
 });
 
