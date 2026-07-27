@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use agent_connector::{
     AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
-    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, default_socket_path,
+    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES, default_socket_path,
     import_existing_identity_file, import_existing_identity_secret, read_bootstrap_auth_token,
     resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
     resolve_bootstrap_socket, run_bootstrap, serve_socket,
@@ -304,8 +304,6 @@ fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
-    const MAX_IDENTITY_BYTES: usize = 4096;
-
     static PROMPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     extern "C" fn record_prompt_signal(signal: libc::c_int) {
         PROMPT_SIGNAL.store(signal, std::sync::atomic::Ordering::Relaxed);
@@ -426,7 +424,7 @@ fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
     tty.flush()
         .map_err(|_| "could not flush /dev/tty prompt".to_owned())?;
 
-    let mut bytes = Zeroizing::new(Vec::with_capacity(128));
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_IDENTITY_BYTES as usize + 1));
     let mut byte = [0u8; 1];
     let read_result = loop {
         if PROMPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
@@ -436,8 +434,8 @@ fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
             Ok(0) => break Ok(()),
             Ok(_) if byte[0] == b'\n' => break Ok(()),
             Ok(_) if byte[0] == b'\r' => {}
-            Ok(_) if bytes.len() == MAX_IDENTITY_BYTES => {
-                break Err("identity input exceeds 4096 bytes".to_owned());
+            Ok(_) if bytes.len() as u64 == MAX_IDENTITY_BYTES => {
+                break Err(format!("identity input exceeds {MAX_IDENTITY_BYTES} bytes"));
             }
             Ok(_) => bytes.push(byte[0]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,

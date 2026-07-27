@@ -9,7 +9,7 @@ use serde::Serialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const MAX_IDENTITY_BYTES: u64 = 4096;
+pub const MAX_IDENTITY_BYTES: u64 = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExistingIdentityImport {
@@ -129,7 +129,7 @@ fn validate_unix_identity_metadata(
 }
 
 fn read_identity(reader: impl Read) -> Result<Zeroizing<String>, ExistingIdentityError> {
-    let mut bytes = Zeroizing::new(Vec::with_capacity(128));
+    let mut bytes = new_identity_buffer();
     reader
         .take(MAX_IDENTITY_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -147,6 +147,10 @@ fn read_identity(reader: impl Read) -> Result<Zeroizing<String>, ExistingIdentit
         return Err(ExistingIdentityError::Empty);
     }
     Ok(secret)
+}
+
+fn new_identity_buffer() -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Vec::with_capacity(MAX_IDENTITY_BYTES as usize + 1))
 }
 
 #[cfg(all(test, unix))]
@@ -264,6 +268,20 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(&identity).unwrap(), NSEC);
         assert_eq!(std::fs::read_to_string(&alias).unwrap(), NSEC);
+    }
+
+    #[test]
+    fn identity_buffer_does_not_reallocate_during_full_bounded_read() {
+        let mut bytes = new_identity_buffer();
+        let initial_capacity = bytes.capacity();
+
+        std::io::repeat(b'a')
+            .take(MAX_IDENTITY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        assert_eq!(bytes.len(), MAX_IDENTITY_BYTES as usize + 1);
+        assert_eq!(bytes.capacity(), initial_capacity);
     }
 
     #[test]
