@@ -33,6 +33,7 @@ fn group() -> StoredAccountGroup {
         admin_keys_hex: String::new(),
         archived: false,
         pending_confirmation: false,
+        member_count: None,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
         nostr_routing_last_epoch: 0,
@@ -137,6 +138,262 @@ fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
         component_name: GROUP_AVATAR_URL_COMPONENT.to_owned(),
         component_data_hex: hex::encode(bytes),
     }
+}
+
+#[test]
+fn manual_unread_is_independent_durable_and_cleared_by_mark_read() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("history", REMOTE, 10, "old history"))
+        .unwrap();
+
+    // Creating manual state preserves the implicit-read baseline instead of
+    // turning retained history into unread incoming messages.
+    let mut row = store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert!(row.manually_marked_unread);
+    assert!(row.has_unread);
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(store.account_unread_total().unwrap().unread_count, 0);
+    assert_eq!(
+        store.account_unread_total().unwrap().unread_conversations,
+        1
+    );
+
+    store
+        .record_app_event(&chat("incoming", REMOTE, 20, "new message"))
+        .unwrap();
+    row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert!(row.manually_marked_unread);
+    assert_eq!(row.unread_count, 1);
+
+    row = store
+        .mark_timeline_message_read(LOCAL, GROUP, "incoming", &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert!(!row.manually_marked_unread);
+    assert!(!row.has_unread);
+    assert_eq!(row.unread_count, 0);
+
+    // Re-read from the durable projection, not the mutation return value.
+    let reopened = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(!reopened.manually_marked_unread);
+}
+
+#[test]
+fn manual_unread_without_history_keeps_the_first_later_delivery_unread() {
+    let store = setup_store();
+    let row = store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert!(row.manually_marked_unread);
+    assert_eq!(row.unread_count, 0);
+
+    // Sender timestamps can predate the local wall clock. With no prior
+    // message there is no durable read anchor, so this first later-recorded
+    // delivery must not be hidden behind the time of the local mark-unread.
+    store
+        .record_app_event(&chat("first-delivery", REMOTE, 20, "first"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+    assert!(row.manually_marked_unread);
+    assert!(row.has_unread);
+}
+
+#[test]
+fn clearing_manual_unread_does_not_move_the_message_marker() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("incoming", REMOTE, 20, "new message"))
+        .unwrap();
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap();
+
+    let row = store
+        .set_chat_manually_unread(LOCAL, GROUP, false, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert!(!row.manually_marked_unread);
+    assert!(row.has_unread);
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("incoming"));
+}
+
+#[test]
+fn chat_list_rows_join_effective_mute_without_per_row_queries() {
+    let store = setup_store();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let until = unix_now_ms() + 60_000;
+    store.set_chat_muted(GROUP, Some(until)).unwrap();
+    let timed = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(timed.muted);
+    assert_eq!(timed.muted_until_ms, Some(until));
+
+    store.set_chat_muted(GROUP, None).unwrap();
+    let indefinite = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(indefinite.muted);
+    assert_eq!(indefinite.muted_until_ms, None);
+
+    store
+        .set_chat_muted(GROUP, Some(unix_now_ms() - 1))
+        .unwrap();
+    let expired = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(!expired.muted);
+    assert_eq!(expired.muted_until_ms, None);
+
+    store.clear_chat_muted(GROUP).unwrap();
+    let cleared = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(!cleared.muted);
+    assert_eq!(cleared.muted_until_ms, None);
+}
+
+#[test]
+fn conversation_kind_uses_durable_current_roster_projection() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    let store = setup_store_with_group(direct);
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("chat row")
+            .conversation_kind,
+        ChatConversationKind::Direct
+    );
+
+    let mut expanded = group();
+    expanded.profile_name.clear();
+    expanded.member_count = Some(3);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![expanded],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("chat row")
+            .conversation_kind,
+        ChatConversationKind::Group
+    );
+
+    let mut legacy = group();
+    legacy.profile_name.clear();
+    legacy.member_count = None;
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![legacy],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("chat row")
+            .conversation_kind,
+        ChatConversationKind::Unknown
+    );
+}
+
+#[test]
+fn latest_preview_carries_exact_media_and_delivery_projection() {
+    let store = setup_store();
+    let mut pending = chat_with_tags(
+        "pending",
+        LOCAL,
+        10,
+        "",
+        vec![vec!["imeta".to_owned(), "m image/png".to_owned()]],
+    );
+    pending.source_message_id_hex = None;
+    store.record_app_event(&pending).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    let preview = row.last_message.expect("latest preview");
+    assert_eq!(preview.message_id_hex, "pending");
+    assert_eq!(
+        preview.delivery_state,
+        ChatListMessageDeliveryState::Pending
+    );
+    assert!(preview.media_json.is_some());
+
+    store
+        .invalidate_app_event_by_message_id(GROUP, "pending", "local_publish_failed")
+        .unwrap();
+    let failed = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row")
+        .last_message
+        .expect("failed preview");
+    assert_eq!(failed.message_id_hex, "pending");
+    assert_eq!(failed.delivery_state, ChatListMessageDeliveryState::Failed);
+
+    // A successful retry re-records the same durable app event with its MLS
+    // source id, clearing the local publish invalidation. The chat row must
+    // transition that exact preview back to delivered rather than waiting for
+    // a different message to replace it.
+    pending.source_message_id_hex = Some("source-after-retry".to_owned());
+    store.record_app_event(&pending).unwrap();
+    let retried = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row")
+        .last_message
+        .expect("retried preview");
+    assert_eq!(retried.message_id_hex, "pending");
+    assert_eq!(
+        retried.delivery_state,
+        ChatListMessageDeliveryState::Delivered
+    );
+
+    store
+        .record_app_event(&chat("delivered", LOCAL, 20, "replacement"))
+        .unwrap();
+    let delivered = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row")
+        .last_message
+        .expect("delivered preview");
+    assert_eq!(delivered.message_id_hex, "delivered");
+    assert_eq!(
+        delivered.delivery_state,
+        ChatListMessageDeliveryState::Delivered
+    );
 }
 
 #[test]

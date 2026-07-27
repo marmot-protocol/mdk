@@ -105,6 +105,10 @@ pub struct AppGroupRecord {
     pub archived: bool,
     #[serde(default)]
     pub pending_confirmation: bool,
+    /// Current locally observed MLS roster size. `None` only for legacy
+    /// projections that have not yet been hydrated by an upgraded runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
@@ -463,6 +467,7 @@ impl AppGroupRecord {
             unknown_components: Vec::new(),
             archived: false,
             pending_confirmation: false,
+            member_count: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
             unrecoverable: false,
@@ -501,6 +506,7 @@ impl AppGroupRecord {
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
             record.nostr_routing_last_epoch = group.epoch.0;
+            record.member_count = u64::try_from(group.members.len()).ok();
             record.unrecoverable = group.unrecoverable;
         }
         record
@@ -539,6 +545,7 @@ impl AppGroupRecord {
         self.profile = projection.profile.clone();
         if let Some(group) = projection.group_metadata {
             self.protocol_profile = group.protocol_profile.into();
+            self.member_count = u64::try_from(group.members.len()).ok();
             self.unrecoverable = group.unrecoverable;
         }
     }

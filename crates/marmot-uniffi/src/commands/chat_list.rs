@@ -1,6 +1,6 @@
 //! Durable chat-list and chat read-state commands.
 
-use crate::conversions::{ChatListRowFfi, group_id_from_hex};
+use crate::conversions::{ChatListRowFfi, ChatNotificationSettingsFfi, group_id_from_hex};
 use crate::errors::MarmotKitError;
 use crate::{Marmot, optional_message_id_hex};
 
@@ -56,5 +56,61 @@ impl Marmot {
             .runtime
             .mark_timeline_message_read(&account_ref, &group_id_hex, &message_id_hex)?
             .map(Into::into))
+    }
+
+    /// Set or clear a manual unread reminder without moving the durable
+    /// timeline read marker backwards.
+    pub fn set_chat_manually_unread(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        manually_unread: bool,
+    ) -> Result<Option<ChatListRowFfi>, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        Ok(self
+            .runtime
+            .set_chat_manually_unread(&account_ref, &group_id_hex, manually_unread)?
+            .map(Into::into))
+    }
+
+    /// Read the current MDK timed/indefinite mute state for one chat.
+    pub fn chat_notification_settings(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<ChatNotificationSettingsFfi, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        Ok(self
+            .runtime
+            .chat_notification_settings(&account_ref, &group_id_hex)?
+            .into())
+    }
+
+    /// Mute one chat until an absolute Unix epoch millisecond timestamp, or
+    /// indefinitely when `muted_until_ms` is `None`.
+    pub fn set_chat_muted(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        muted_until_ms: Option<i64>,
+    ) -> Result<ChatNotificationSettingsFfi, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        Ok(self
+            .runtime
+            .set_chat_muted(&account_ref, &group_id_hex, muted_until_ms)?
+            .into())
+    }
+
+    /// Clear either a finite or indefinite MDK chat mute.
+    pub fn clear_chat_muted(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<ChatNotificationSettingsFfi, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        Ok(self
+            .runtime
+            .clear_chat_muted(&account_ref, &group_id_hex)?
+            .into())
     }
 }

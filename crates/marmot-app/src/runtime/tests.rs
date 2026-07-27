@@ -1,3 +1,4 @@
+use super::subscriptions::chat_list_mute_expiries;
 use super::*;
 
 #[test]
@@ -1002,6 +1003,28 @@ async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_miss
 }
 
 #[test]
+fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
+    let base = chat_list_test_row("group", "title");
+    let mut manual = base.clone();
+    manual.manually_marked_unread = true;
+    manual.has_unread = true;
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&manual)
+    );
+
+    let mut timed = base.clone();
+    timed.muted = true;
+    timed.muted_until_ms = Some(1_700_000_000_000);
+    let expiries = chat_list_mute_expiries(&[timed]);
+    assert_eq!(expiries.get("group"), Some(&1_700_000_000_000));
+
+    let mut indefinite = base;
+    indefinite.muted = true;
+    assert!(chat_list_mute_expiries(&[indefinite]).is_empty());
+}
+
+#[test]
 fn latest_agent_stream_start_accepts_mixed_case_filter() {
     let stream_id_hex = hex::encode([0xab; 32]);
     let (message_id_hex, start, sender) = latest_agent_stream_start(
@@ -1043,6 +1066,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         last_message: None,
         unread_count: 0,
         has_unread: false,
+        manually_marked_unread: false,
         unread_mention_count: 0,
         has_unread_mention: false,
         first_unread_message_id_hex: None,
@@ -1052,6 +1076,9 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         activity_sort_at: 0,
         updated_at: 0,
         self_membership: crate::SelfMembership::Member,
+        conversation_kind: crate::ChatConversationKind::Unknown,
+        muted: false,
+        muted_until_ms: None,
         leave_requested_at_ms: None,
     }
 }

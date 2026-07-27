@@ -1001,7 +1001,10 @@ fn retain_pruned_chat_activity_tx(
              WHERE group_id_hex = ?1
                AND message_id_hex = ?2
                AND kind = ?3
-               AND invalidation_status IS NULL",
+               AND (
+                   invalidation_status IS NULL
+                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               )",
         )
         .storage()?;
     let mut latest_pruned_activity = None;
@@ -1038,11 +1041,21 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let latest = tx
         .query_row(
-            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
+                    media_json,
+                    CASE
+                        WHEN direction != 'sent' THEN 'not_applicable'
+                        WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
+                        WHEN source_message_id_hex IS NULL THEN 'pending'
+                        ELSE 'delivered'
+                    END
              FROM message_timeline
              WHERE group_id_hex = ?1
                AND kind = ?2
-               AND invalidation_status IS NULL
+               AND (
+                   invalidation_status IS NULL
+                   OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               )
              ORDER BY timeline_at DESC, message_id_hex DESC
              LIMIT 1",
             params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
@@ -1054,13 +1067,25 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
         .optional()
         .storage()?;
     let updated_at = u64_to_i64(unix_now_seconds())?;
-    if let Some((message_id, sender, plaintext, kind, timeline_at, deleted)) = latest {
+    if let Some((
+        message_id,
+        sender,
+        plaintext,
+        kind,
+        timeline_at,
+        deleted,
+        media_json,
+        delivery_state,
+    )) = latest
+    {
         tx.execute(
             "UPDATE chat_list_rows
              SET last_message_id_hex = ?1,
@@ -1069,18 +1094,20 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_kind = ?4,
                  last_message_timeline_at = ?5,
                  last_message_deleted = ?6,
+                 last_message_media_json = ?7,
+                 last_message_delivery_state = ?8,
                  activity_sort_at = MAX(
                      retained_activity_sort_at,
                      ?5,
                      COALESCE((
                          SELECT last_read_timeline_at
                          FROM conversation_read_state
-                         WHERE group_id_hex = ?8
+                         WHERE group_id_hex = ?10
                      ), 0),
                      conversation_created_at
                  ),
-                 updated_at = ?7
-             WHERE group_id_hex = ?8",
+                 updated_at = ?9
+             WHERE group_id_hex = ?10",
             params![
                 message_id,
                 sender,
@@ -1088,6 +1115,8 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                 kind,
                 timeline_at,
                 deleted,
+                media_json,
+                delivery_state,
                 updated_at,
                 group_id_hex
             ],
@@ -1102,6 +1131,8 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_kind = NULL,
                  last_message_timeline_at = NULL,
                  last_message_deleted = 0,
+                 last_message_media_json = NULL,
+                 last_message_delivery_state = 'not_applicable',
                  activity_sort_at = MAX(
                      retained_activity_sort_at,
                      COALESCE((

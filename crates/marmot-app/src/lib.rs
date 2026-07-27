@@ -182,8 +182,9 @@ pub use relay_telemetry_export::{
     build_export_batch_with_app_performance, metric_names,
 };
 pub use storage_sqlite::{
-    ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT,
-    SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, MAX_TIMELINE_LIMIT, SelfMembership,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
     TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
 };
 pub use transport_nostr_adapter::{
@@ -1782,6 +1783,29 @@ impl MarmotApp {
                 &account.account_id_hex,
                 group_id_hex,
                 message_id_hex,
+                &classifier,
+            )?;
+        self.hydrate_chat_list_row(row.as_mut())?;
+        Ok(row)
+    }
+
+    /// Set or clear a manual-unread reminder without rewinding the cumulative
+    /// timeline read marker.
+    pub fn set_chat_manually_unread(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        manually_unread: bool,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let mut row = self
+            .account_storage(&account.label)?
+            .set_chat_manually_unread(
+                &account.account_id_hex,
+                group_id_hex,
+                manually_unread,
                 &classifier,
             )?;
         self.hydrate_chat_list_row(row.as_mut())?;
@@ -3467,6 +3491,8 @@ impl MarmotApp {
             let Some(message) = row.last_message.as_mut() else {
                 continue;
             };
+            (message.attachment_kind, message.attachment_count) =
+                media::classify_chat_list_attachments(message.media_json.as_deref());
             if let Some(name) = names.get(&message.sender) {
                 message.sender_display_name = Some(name.clone());
             }
@@ -3481,6 +3507,8 @@ impl MarmotApp {
         let Some(message) = row.last_message.as_mut() else {
             return Ok(());
         };
+        (message.attachment_kind, message.attachment_count) =
+            media::classify_chat_list_attachments(message.media_json.as_deref());
         if let Some(name) = self.display_name_for_account_id(&message.sender)? {
             message.sender_display_name = Some(name);
         }

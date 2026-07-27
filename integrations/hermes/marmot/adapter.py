@@ -1628,7 +1628,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         self._capture_loop()
         chat_id = _normalize_hex(chat_id, "chat_id")
-        visible_content = self._strip_streaming_cursor(content)
+        visible_content, is_preview = self._split_stream_preview(content)
 
         tool_events = _tool_events_from_progress_text(visible_content)
         if tool_events:
@@ -1638,7 +1638,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=_optional_hex(reply_to),
             )
 
-        is_preview = self._looks_like_stream_preview(content)
         if _delivery_routes_to_commentary_activity(metadata) and not is_preview:
             return await self._send_commentary_activity(
                 chat_id,
@@ -2979,19 +2978,39 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             )
         return True
 
-    def _looks_like_stream_preview(self, content: str) -> bool:
-        return bool(self.streaming_cursor and str(content or "").rstrip().endswith(self.streaming_cursor))
-
-    def _strip_streaming_cursor(self, content: str) -> str:
+    def _split_stream_preview(self, content: str) -> tuple[str, bool]:
         text = str(content or "")
         cursor = self.streaming_cursor
-        if cursor and text.rstrip().endswith(cursor):
-            trailing_len = len(text) - len(text.rstrip())
-            stripped = text.rstrip()
-            text = stripped[: -len(cursor)]
-            if trailing_len:
-                text += " " * trailing_len
-        return text
+        if not cursor:
+            return text, False
+
+        trimmed = text.rstrip()
+        # Hermes balances Markdown after appending its streaming cursor. An
+        # unclosed inline span therefore ends with the cursor followed by one
+        # backtick, while an unclosed fenced block adds a newline plus three
+        # backticks. If both need balancing, the two closers form four trailing
+        # backticks. These display-only closers are not part of the append-only
+        # stream transcript.
+        cursor_suffixes = (
+            cursor,
+            cursor + "`",
+            cursor + "\n```",
+            cursor + "\n````",
+        )
+        for suffix in cursor_suffixes:
+            if not trimmed.endswith(suffix):
+                continue
+            visible = trimmed[: -len(suffix)]
+            return visible + text[len(trimmed) :], True
+        return text, False
+
+    def _looks_like_stream_preview(self, content: str) -> bool:
+        _, is_preview = self._split_stream_preview(content)
+        return is_preview
+
+    def _strip_streaming_cursor(self, content: str) -> str:
+        visible, _ = self._split_stream_preview(content)
+        return visible
 
 
 def check_requirements() -> bool:

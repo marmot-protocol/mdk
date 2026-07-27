@@ -961,6 +961,26 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
         .expect_err("invalid message hex should fail before account lookup");
     assert!(format!("{invalid_message}").contains("invalid hex"));
 
+    let invalid_manual_unread = kit
+        .set_chat_manually_unread("missing".into(), "not-hex".into(), true)
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_manual_unread}").contains("invalid hex"));
+
+    let invalid_mute_read = kit
+        .chat_notification_settings("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_read}").contains("invalid hex"));
+
+    let invalid_mute_set = kit
+        .set_chat_muted("missing".into(), "not-hex".into(), None)
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_set}").contains("invalid hex"));
+
+    let invalid_mute_clear = kit
+        .clear_chat_muted("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_mute_clear}").contains("invalid hex"));
+
     let subscribe_error = match kit.subscribe_chat_list("missing".into(), false).await {
         Ok(_) => panic!("missing account subscription should fail"),
         Err(err) => err,
