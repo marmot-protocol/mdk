@@ -6,6 +6,7 @@ mod bootstrap;
 mod connection;
 mod error;
 mod event_projection;
+mod identity;
 mod inbound;
 mod invite_policy;
 mod maintenance;
@@ -28,6 +29,10 @@ pub use bootstrap::{
     resolve_bootstrap_socket, run_bootstrap,
 };
 pub use error::ConnectorError;
+pub use identity::{
+    ExistingIdentityError, ExistingIdentityImport, MAX_IDENTITY_BYTES,
+    import_existing_identity_file, import_existing_identity_secret,
+};
 pub use socket::{bind_connector_socket, bind_connector_socket_with_mode, default_socket_path};
 
 use std::future::Future;

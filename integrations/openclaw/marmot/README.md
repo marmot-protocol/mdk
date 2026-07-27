@@ -46,16 +46,49 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-la
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
-Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
+Generated-identity onboarding is the default (and can be selected explicitly
+with `--generate-identity`). To preserve an existing Nostr identity, place its
+`nsec` or raw secret hex in a regular file owned by the current user with mode
+`0600`, then use a pinned release URL:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.8/install-openclaw-marmot.sh" | \
+  bash -s -- \
+    --yes \
+    --existing-identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+    --expected-npub npub1... \
+    --allow-welcomer npub1...
+```
+
+The installer passes only the file path, never the secret, in process arguments.
+`wn-agent` rejects symlinks, non-regular files, files owned by another user, and
+files accessible by group/other users. It verifies `--expected-npub` before
+starting the connector or changing OpenClaw configuration, imports idempotently,
+then bootstraps the exact account with creation disabled. During interactive
+setup, the same identity can instead be entered through a masked `/dev/tty`
+prompt, which remains usable when the installer itself arrives through a pipe.
+The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
+
+OpenClaw keeps its isolated default connector home. Reusing the same identity in
+another connector home, such as Hermes's, requires a separate explicit import;
+the installers never opt into shared home/socket state silently.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically. Manual equivalent:
 
 ```sh
+wn-agent import-identity --json \
+  --home ~/.marmot-agents/openclaw \
+  --label openclaw-agent \
+  --identity-file "$HOME/.config/example/openclaw-agent.nsec" \
+  --expected-identity npub1...
 wn-agent --home ~/.marmot-agents/openclaw \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
-wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent --qr
+wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent \
+  --no-create --account-id-hex <imported-account-hex> --qr
 openclaw gateway run
 ```
 

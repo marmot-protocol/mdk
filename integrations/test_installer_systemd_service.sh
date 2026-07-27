@@ -81,9 +81,17 @@ case "$archive_name" in
         mkdir -p "$output_dir"
         cat >"$output_dir/wn-agent" <<'SCRIPT'
 #!/usr/bin/env bash
-if [ "${1:-}" = bootstrap ]; then
-    printf '%s\n' '{"account_id_hex":"aa","welcomer_account_ids_hex":["bb"]}'
-fi
+set -euo pipefail
+printf '%q ' "$@" >>"$WN_AGENT_LOG"
+printf '\n' >>"$WN_AGENT_LOG"
+case "${1:-}" in
+    import-identity)
+        printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":"imported-agent","local_signing":true}'
+        ;;
+    bootstrap)
+        printf '%s\n' '{"account_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created":false,"welcomer_account_ids_hex":["bb"]}'
+        ;;
+esac
 SCRIPT
         chmod +x "$output_dir/wn-agent"
         ;;
@@ -126,8 +134,10 @@ run_case() {
 
     mkdir -p "$case_root"
     : >"$log_file"
+    : >"$case_root/wn-agent.log"
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
+    WN_AGENT_LOG="$case_root/wn-agent.log" \
     HOME="$case_root/home" \
     HERMES_HOME="$case_root/hermes-home" \
     OPENCLAW_HOME="$case_root/openclaw-home" \
@@ -171,3 +181,35 @@ assert_log_equals "$no_start_log" ""
 no_service_log="$fixture_root/systemctl-no-service.log"
 run_case no-service 1 "$no_service_log" --no-service
 assert_log_equals "$no_service_log" ""
+
+identity_secret="nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99"
+identity_file="$fixture_root/existing-identity.nsec"
+printf '%s\n' "$identity_secret" >"$identity_file"
+chmod 0600 "$identity_file"
+expected_identity="$(printf 'aa%.0s' {1..32})"
+existing_log="$fixture_root/systemctl-existing.log"
+run_case existing 0 "$existing_log" \
+    --existing-identity-file "$identity_file" \
+    --expected-npub "$expected_identity"
+assert_log_equals "$existing_log" "--user daemon-reload
+--user is-active --quiet $service
+--user enable --now $service"
+
+wn_agent_log="$fixture_root/existing/wn-agent.log"
+case "$(cat "$wn_agent_log")" in
+    *"import-identity"*"--identity-file"*"--expected-identity"*"bootstrap"*"--no-create"*"--account-id-hex"* ) ;;
+    *) echo "$flavor installer did not import then bootstrap the exact existing identity" >&2; exit 1 ;;
+esac
+bootstrap_json="$fixture_root/existing/marmot-home/bootstrap.json"
+python3 - "$bootstrap_json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["created"] is False
+PY
+if grep -Fq "$identity_secret" "$wn_agent_log" "$bootstrap_json"; then
+    echo "$flavor installer exposed identity secret material" >&2
+    exit 1
+fi
+[ "$(cat "$identity_file")" = "$identity_secret" ]

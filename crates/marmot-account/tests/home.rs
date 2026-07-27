@@ -108,6 +108,64 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
 }
 
 #[test]
+fn account_home_idempotent_import_reuses_existing_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let first = home.import_account_idempotent("agent", nsec).unwrap();
+    let second = home.import_account_idempotent("agent", nsec).unwrap();
+
+    assert_eq!(second, first);
+    assert_eq!(home.accounts().unwrap(), vec![first]);
+}
+
+#[test]
+fn account_home_idempotent_import_reactivates_signed_out_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    home.import_account_idempotent("agent", nsec).unwrap();
+    home.set_account_signed_out("agent", true).unwrap();
+
+    let imported = home.import_account_idempotent("agent", nsec).unwrap();
+
+    assert!(!imported.signed_out);
+    assert!(!home.account("agent").unwrap().signed_out);
+}
+
+#[test]
+fn account_home_idempotent_import_repairs_interrupted_record_first_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let account = AccountSummary {
+        label: "agent".to_owned(),
+        account_id_hex: keys.public_key().to_hex(),
+        local_signing: true,
+        external_signing: false,
+        signed_out: false,
+    };
+    let account_dir = dir.path().join("accounts").join(&account.label);
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("account.json"),
+        serde_json::to_vec(&account).unwrap(),
+    )
+    .unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let repaired = home
+        .import_account_idempotent("agent", &keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(repaired, account);
+    assert_eq!(
+        home.load_signing_keys("agent").unwrap().public_key(),
+        keys.public_key()
+    );
+}
+
+#[test]
 fn account_home_accounts_skips_unreadable_records() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -361,6 +419,30 @@ fn account_home_keychain_rejects_second_label_for_same_account_id() {
         home.import_account("label-two", &secret_hex),
         Err(AccountHomeError::AccountIdInUse(_))
     ));
+}
+
+#[test]
+fn account_home_idempotent_import_recovers_orphaned_keychain_credential() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home =
+        AccountHome::open_with_keychain(dir.path(), "com.marmot.test.orphan-recovery").unwrap();
+    let keys = nostr::Keys::generate();
+    let secret_hex = keys.secret_key().to_secret_hex();
+    let original = home.import_account("old-label", &secret_hex).unwrap();
+    std::fs::remove_dir_all(home.account_dir(&original.label)).unwrap();
+    assert!(home.accounts().unwrap().is_empty());
+
+    let recovered = home
+        .import_account_idempotent("agent", &secret_hex)
+        .unwrap();
+
+    assert_eq!(recovered.label, "agent");
+    assert_eq!(recovered.account_id_hex, original.account_id_hex);
+    assert_eq!(
+        home.load_signing_keys("agent").unwrap().public_key(),
+        keys.public_key()
+    );
 }
 
 #[test]

@@ -167,6 +167,70 @@ impl AccountHome {
         self.write_signing_account_for_label(label, &keys)
     }
 
+    /// Import a local signing identity, reusing or repairing an exact match.
+    ///
+    /// This is intended for repeatable bootstrap flows. It never creates a
+    /// second local-signing record for the same public key, and a retry can
+    /// finish an import interrupted after the account record was persisted but
+    /// before its secret was written.
+    pub fn import_account_idempotent(
+        &self,
+        label: &str,
+        secret_key: &str,
+    ) -> AccountHomeResult<AccountSummary> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_account_label(label)?;
+
+        let account_id_hex = keys.public_key().to_hex();
+        if self.account_record_path(label).exists() {
+            let account = self.account(label)?;
+            if account.account_id_hex != account_id_hex || !account.local_signing {
+                return Err(AccountHomeError::AccountExists(label.to_owned()));
+            }
+            return self.reuse_or_repair_signing_account(account, &keys);
+        }
+
+        if let Some(account) = self
+            .accounts()?
+            .into_iter()
+            .find(|account| account.local_signing && account.account_id_hex == account_id_hex)
+        {
+            return self.reuse_or_repair_signing_account(account, &keys);
+        }
+
+        let account = AccountSummary {
+            label: label.to_owned(),
+            account_id_hex,
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+        };
+
+        // Recover a credential left behind by the old secret-first import
+        // ordering (#822), or a same-label local-file secret whose record was
+        // interrupted. Verify that it is the requested identity before making
+        // the account visible again.
+        if self.secret_store.has_secret_for_label(label)?
+            || self
+                .secret_store
+                .has_secret_for_account_id(&account.account_id_hex)?
+        {
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            self.write_account_record(&account)?;
+            return Ok(account);
+        }
+
+        self.write_new_signing_account(&account, &keys)
+    }
+
     pub fn import_nostr_account(&self, secret_key: &str) -> AccountHomeResult<AccountSummary> {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
@@ -591,12 +655,50 @@ impl AccountHome {
             external_signing: false,
             signed_out: false,
         };
-        self.secret_store.write_secret(&account, keys)?;
-        if let Err(err) = self.write_account_record(&account) {
-            let _ = self.secret_store.remove_secret(&account);
-            return Err(err);
+        self.write_new_signing_account(&account, keys)
+    }
+
+    fn reuse_or_repair_signing_account(
+        &self,
+        mut account: AccountSummary,
+        keys: &nostr::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
+        match self.secret_store.load_secret(&account) {
+            Ok(stored_keys) => {
+                if stored_keys.public_key() != keys.public_key() {
+                    return Err(AccountHomeError::AccountIdMismatch);
+                }
+            }
+            Err(AccountHomeError::SecretNotFound(_)) => {
+                self.secret_store.write_secret(&account, keys)?;
+            }
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.secret_store.write_secret(&account, keys)?;
+            }
+            Err(err) => return Err(err),
+        }
+        if account.signed_out {
+            account.signed_out = false;
+            self.write_account_record(&account)?;
         }
         Ok(account)
+    }
+
+    fn write_new_signing_account(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
+        // Record first so a crash cannot leave an invisible keychain credential
+        // that permanently blocks re-import. A record without a secret is
+        // visible/removable and `import_account_idempotent` repairs it on retry.
+        self.write_account_record(account)?;
+        if let Err(err) = self.secret_store.write_secret(account, keys) {
+            let _ = fs::remove_file(self.account_record_path(&account.label));
+            let _ = fs::remove_dir(self.account_dir(&account.label));
+            return Err(err);
+        }
+        Ok(account.clone())
     }
 
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
