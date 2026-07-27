@@ -44,6 +44,11 @@ fi
 
 source "$dev_root/env.sh"
 
+if [ -n "${HERMES_AGENT_REPO:-}" ]; then
+    export HERMES_AGENT_REPO
+    "$MDK_REPO/integrations/hermes/marmot/tests/test_installer_env.sh"
+fi
+
 if [ ! -x "$HERMES_AGENT_REPO/.venv/bin/python" ]; then
     echo "error: Hermes venv python not found at $HERMES_AGENT_REPO/.venv/bin/python" >&2
     echo "       Rerun setup without --skip-hermes-install." >&2

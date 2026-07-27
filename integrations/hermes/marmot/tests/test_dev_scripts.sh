@@ -93,26 +93,104 @@ source "$default_root/env.sh"
 [ ! -e "$default_root" ]
 
 [ -x "$repo_root/scripts/install-hermes-marmot.sh" ]
+allowed_sender_hex="$(printf 'aa%.0s' {1..32})"
+installer_hermes_home="$tmp_parent/hermes-install-home"
+mkdir -p "$installer_hermes_home"
+
+run_installer_scrubbed() {
+    python3 - "$@" <<'PY'
+import os
+import subprocess
+import sys
+
+extra = {}
+args = sys.argv[1:]
+while args and args[0] == "--env":
+    args.pop(0)
+    key, value = args.pop(0).split("=", 1)
+    extra[key] = value
+
+env = {key: value for key, value in os.environ.items() if not key.startswith("MARMOT_")}
+env.update(extra)
+completed = subprocess.run(args, env=env, capture_output=True, text=True)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+PY
+}
+
 "$repo_root/integrations/test_installer_systemd_service.sh" hermes
 installer_dry_run="$(
-    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes
+    run_installer_scrubbed \
+        --env "WN_AGENT_SHA=9.9.9" \
+        --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+        --env "HERMES_HOME=$installer_hermes_home" \
+        "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-user "$allowed_sender_hex"
 )"
 installer_stdin_dry_run="$(
-    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    bash -s -- --dry-run --yes < "$repo_root/scripts/install-hermes-marmot.sh"
+    python3 - "$repo_root/scripts/install-hermes-marmot.sh" "$allowed_sender_hex" "$installer_hermes_home" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+installer = Path(sys.argv[1])
+allowed_sender_hex = sys.argv[2]
+installer_hermes_home = sys.argv[3]
+env = {key: value for key, value in os.environ.items() if not key.startswith("MARMOT_")}
+env.update(
+    {
+        "WN_AGENT_SHA": "9.9.9",
+        "MARMOT_RELEASE_TAG": "wn-agent-v9.9.9-test",
+        "HERMES_HOME": installer_hermes_home,
+    }
+)
+completed = subprocess.run(
+    [
+        "bash",
+        "-s",
+        "--",
+        "--dry-run",
+        "--yes",
+        "--allow-user",
+        allowed_sender_hex,
+    ],
+    input=installer.read_text(encoding="utf-8"),
+    capture_output=True,
+    text=True,
+    env=env,
+)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+PY
 )"
 installer_bad_welcomer_status=0
-env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
     "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
+installer_missing_sender_status=0
+run_installer_scrubbed \
+    --env "WN_AGENT_SHA=9.9.9" \
+    --env "MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test" \
+    --env "HERMES_HOME=$installer_hermes_home" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes \
+    >/dev/null 2>&1 || installer_missing_sender_status=$?
 [ "$installer_bad_welcomer_status" -ne 0 ]
+[ "$installer_missing_sender_status" -ne 0 ]
+case "$installer_dry_run" in
+    *"would configure Marmot message-sender authorization"* ) ;;
+    *) echo "Hermes installer dry-run did not describe sender authorization" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"$allowed_sender_hex"* )
+        echo "Hermes installer dry-run leaked sender identity" >&2
+        exit 1
+        ;;
+esac
 case "$installer_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -171,5 +249,7 @@ case "$installer_stdin_dry_run" in
     *"--label hermes-agent"* ) ;;
     *) echo "Hermes installer stdin dry-run did not pass the Hermes bootstrap label" >&2; exit 1;;
 esac
+
+bash "$repo_root/integrations/hermes/marmot/tests/test_installer_env.sh"
 
 echo "dev script test passed"
