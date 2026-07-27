@@ -364,7 +364,10 @@ pub(crate) fn group_management_state_ffi(
     // A leave already in flight suppresses `can_leave` so hosts do not offer a
     // second Leave that the engine would reject: the durable request is not
     // epoch-bound, but the SelfRemove proposal backing it is, and re-requesting
-    // inside the same epoch is an invalid transition.
+    // inside the same epoch returns `EngineError::LeaveAlreadyRequested`, which
+    // reaches the host as `MarmotKitError::LeaveAlreadyRequested`. Suppressing
+    // the affordance keeps that error off the happy path; it does not prevent it,
+    // since this state is not read atomically with the leave it guards.
     let leave_request_pending = details.group.leave_request_pending;
     let can_leave = self_member.is_some() && !is_self_admin && !leave_request_pending;
     let requires_self_demote_before_leave = self_member.is_some() && is_self_admin;
