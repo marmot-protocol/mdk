@@ -769,6 +769,33 @@ impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionSweepStatus {
+    NoExpiredMessages,
+    Pruned,
+    DeferredClockSkew,
+    DeferredUnread,
+    DeferredScanExhausted,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionSweepGroupOutcome {
+    pub group_id_hex: String,
+    pub status: RetentionSweepStatus,
+    pub pruned_messages: u64,
+    pub secrets_deleted: u64,
+    pub media_ciphertext_sha256: Vec<String>,
+    /// Stable privacy-safe category such as `storage_busy`. Raw error text is
+    /// intentionally never returned across the app boundary.
+    pub failure_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionSweepReport {
+    pub groups: Vec<RetentionSweepGroupOutcome>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupInviteDeclineResult {
     pub group: AppGroupRecord,

@@ -41,9 +41,9 @@ use crate::{
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
     PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1886,6 +1886,19 @@ impl MarmotAppRuntime {
     ) -> Result<SecureDeleteExpiredResult, AppError> {
         self.accounts
             .secure_delete_expired_plaintext(account_ref, group_id)
+            .await
+    }
+
+    /// Apply the engine-owned disappearing-message sweep policy to every
+    /// retention-enabled group in one account. `now_ms` is supplied by the host
+    /// scheduler so skew handling and tests use one deterministic clock value.
+    pub async fn sweep_expired_retention(
+        &self,
+        account_ref: &str,
+        now_ms: u64,
+    ) -> Result<RetentionSweepReport, AppError> {
+        self.accounts
+            .sweep_expired_retention(account_ref, now_ms)
             .await
     }
 

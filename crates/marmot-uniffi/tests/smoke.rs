@@ -1075,3 +1075,20 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
         .expect_err("missing account should fail after hex validation");
     assert!(format!("{missing_account}").contains("missing"));
 }
+
+#[tokio::test]
+async fn retention_sweep_binding_is_public_and_requires_a_known_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let missing_account = kit
+        .sweep_expired_retention("missing".into(), 1_750_000_000_000)
+        .await
+        .expect_err("missing account should fail at the runtime boundary");
+    assert!(format!("{missing_account}").contains("missing"));
+}
