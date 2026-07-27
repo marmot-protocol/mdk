@@ -59,6 +59,27 @@ pub(crate) struct TuiApp {
     /// zero count leaves it clear. Cleared before the call and re-armed on error
     /// like `pending_chat_relist`, so a failure retries next tick, not forever.
     pub(crate) pending_mark_read: bool,
+    /// The group id of the most recently requested open-chat / flick-through
+    /// timeline load. A `LoadTimeline` result is folded only while its group
+    /// still matches this (the subscription-style stale guard); a later open
+    /// supersedes an earlier one that has not landed yet. `None` when the pane
+    /// is settled.
+    pub(crate) loading_chat: Option<String>,
+    /// The query of the most recently requested user search, or `None` when no
+    /// search is outstanding. A `UserSearch` result is folded only while its
+    /// query still matches (the same stale guard as `loading_chat`).
+    pub(crate) searching_users: Option<String>,
+    /// The group id of the group-detail load in flight, or `None`. A
+    /// `LoadGroupDetail` result is folded only while it still matches.
+    pub(crate) loading_group_detail: Option<String>,
+    /// Whether an invites-list load is in flight, gating a duplicate enqueue and
+    /// signalling the fold to open the picker.
+    pub(crate) loading_invites: bool,
+    /// Ticks remaining before the highlighted chat is previewed (flick-through),
+    /// or `None` when no preview is pending. Set to `FLICK_PREVIEW_DEBOUNCE_TICKS`
+    /// on each chat-list selection move and counted down each tick, so rapid j/k
+    /// coalesces to one load of the chat the user settles on.
+    pub(crate) flick_countdown: Option<u32>,
     /// Notification `notification_key`s already handled, so the runtime feed's
     /// duplicated emissions do not re-trigger a re-list or a repeated invite
     /// notice. FIFO-bounded to the recent event window, not unbounded.
@@ -71,6 +92,14 @@ pub(crate) struct TuiApp {
     /// The one open modal, or none. While set it captures every key (routed at
     /// the top of `handle_key`) and overlays whatever screen is showing.
     pub(crate) popup: Option<Popup>,
+    /// Set when a popup is torn down; `run()` consumes it and clears the whole
+    /// terminal before the next draw. Ratatui otherwise erases a closed popup
+    /// by diffing cells, which cannot reach a pixel-protocol image stored
+    /// terminal-side (iTerm2 does not self-erase when its cells are
+    /// overwritten), so the viewer popup needs the full clear — and it is
+    /// applied uniformly to every popup close, which is rare and cheap, so no
+    /// close path has to know what the popup drew.
+    pub(crate) pending_full_repaint: bool,
     /// Group-detail screen state, loaded on entry and dropped on exit. Present
     /// only while `screen == Screen::GroupDetail`.
     pub(crate) group_detail: Option<GroupDetailView>,
@@ -86,13 +115,42 @@ pub(crate) struct TuiApp {
     /// Inbound-media state (Phase 6): terminal image capability, per-hash
     /// download/decode status, and the decoded protocols the renderer draws.
     pub(crate) media: MediaState,
+    /// Runs user-initiated `wn` mutations and loads off the event loop, in FIFO
+    /// order, delivering results back for folding on `tick`. This is what keeps
+    /// send/react/open-chat/search/etc. from freezing the render loop for a
+    /// subprocess round-trip.
+    pub(crate) effects: EffectRunner,
+    /// Receiver for the launch daemon auto-start's outcome, delivered from its
+    /// own one-shot thread and drained on `tick`. Auto-start deliberately does
+    /// not ride the shared FIFO `effects` worker: its `wn daemon start` blocks up
+    /// to five seconds on a readiness poll and has no ordering dependency with
+    /// user effects, so queueing it there would stall the first user action
+    /// behind it. `None` until auto-start spawns, and again once its result folds.
+    pub(crate) daemon_autostart: Option<Receiver<Result<Value, String>>>,
+}
+
+/// True when a keypress carries no Ctrl/Alt modifier, so a bare accelerator (a
+/// letter that fires an action on its own) may fire. Shift is deliberately
+/// tolerated: the uppercase accelerators (`G`/`R`/`A`/`I`/`P`/`L`) arrive with
+/// SHIFT under the kitty keyboard protocol, so an `is_empty()` modifier check
+/// would silently break them if enhancement flags are ever negotiated. Excluding
+/// only Ctrl/Alt lets chords like Ctrl-U (composer kill-line), Ctrl-Q, and
+/// Ctrl-C reach their own handlers — or fall through harmlessly — instead of
+/// being swallowed by the modifier-insensitive accelerator that shares the
+/// letter. Centralizing the policy in one predicate keeps every accelerator arm
+/// consistent and states the intent ("plain keypress") at each call site.
+fn plain(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 impl TuiApp {
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
         let client = WnClient::from_cli(&cli)?;
+        let effects = EffectRunner::spawn(client.clone());
         Ok(Self {
             client,
+            effects,
             initial_account: cli.account.clone(),
             running: true,
             screen: Screen::Login(LoginMode::Menu),
@@ -117,6 +175,11 @@ impl TuiApp {
             notification_subscription: None,
             pending_chat_relist: false,
             pending_mark_read: false,
+            loading_chat: None,
+            searching_users: None,
+            loading_group_detail: None,
+            loading_invites: false,
+            flick_countdown: None,
             seen_notification_keys: SeenNotificationKeys::new(),
             daemon: DaemonView::default(),
             group_diagnostics: None,
@@ -124,11 +187,13 @@ impl TuiApp {
             streaming: None,
             status: "loading accounts".to_owned(),
             popup: None,
+            pending_full_repaint: false,
             group_detail: None,
             user_search: None,
             profile_view: None,
             relay_health: None,
             media: MediaState::new(),
+            daemon_autostart: None,
         })
     }
 
@@ -154,10 +219,21 @@ impl TuiApp {
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
             self.start()?;
+            // After the startup routing so the auto-start status is what the
+            // first frame shows, and so its enqueued effect runs behind any
+            // initial loads instead of delaying them on the FIFO worker.
+            self.autostart_daemon_if_needed(std::env::var("WN_RELAY").ok());
             let mut dirty = true;
             while self.running {
                 dirty |= self.tick();
                 if dirty {
+                    // A closed popup may have drawn a pixel-protocol image that
+                    // lives terminal-side, beyond the cell diff's reach; the
+                    // scheduled full clear wipes it and the draw below repaints
+                    // every cell.
+                    if std::mem::take(&mut self.pending_full_repaint) {
+                        terminal.clear()?;
+                    }
                     terminal.draw(|frame| self.render(frame))?;
                     dirty = false;
                 }
@@ -247,6 +323,18 @@ impl TuiApp {
         // subprocess and decode run on worker threads; this only folds results.
         changed |= self.media.drain();
         changed |= self.ensure_media_downloads();
+        // Fold the launch daemon auto-start's outcome if its one-shot thread has
+        // reported (it runs off the shared effect worker, so it drains here).
+        changed |= self.drain_daemon_autostart();
+        // Fold every effect that finished off-loop since the last tick, exactly
+        // as the synchronous handler folded its `run_json` return.
+        let completed = self.effects.drain();
+        if !completed.is_empty() {
+            for done in completed {
+                self.apply_effect_done(done);
+            }
+            changed = true;
+        }
         // Debounce: notification drains coalesce every NewMessage for a
         // non-loaded chat since the last tick into this one pending flag, so at
         // most one background `chats list` re-read runs per tick. Cleared before
@@ -256,9 +344,22 @@ impl TuiApp {
         // tick cadence is the hot-loop ceiling by construction).
         if self.pending_chat_relist {
             self.pending_chat_relist = false;
-            if let Err(err) = self.relist_chats() {
-                self.pending_chat_relist = true;
-                self.set_drain_status(format!("chat re-list failed: {err}"));
+            // Route the re-read through the effect worker rather than shelling out
+            // on the key-handling thread: a `chats list` subprocess inside `tick`
+            // would freeze typing. FIFO behind any queued mutations is fine (and
+            // even desirable — the mutation lands before the re-read reflects it).
+            // Only a local signing account has chats to list; a non-signing or
+            // absent selection simply queues nothing. The fold re-arms this flag on
+            // failure, so a transient error retries next tick instead of dropping
+            // the batch.
+            if let Some(account) = self
+                .selected_account_row()
+                .filter(|account| account.local_signing)
+            {
+                self.effects.enqueue(Effect::Relist {
+                    account: account.account_id.clone(),
+                    include_archived: self.show_archived_chats,
+                });
             }
             changed = true;
         }
@@ -271,10 +372,25 @@ impl TuiApp {
             if let (Some(account_id), Some(group_id)) = (
                 self.messages_account_id.clone(),
                 self.messages_group_id.clone(),
-            ) && let Err(err) = self.mark_selected_chat_read(&account_id, &group_id)
-            {
-                self.pending_mark_read = true;
-                self.set_drain_status(format!("mark-read failed: {err}"));
+            ) {
+                self.effects.enqueue(Effect::MarkRead {
+                    account: account_id,
+                    group: group_id,
+                });
+            }
+            changed = true;
+        }
+        // Flick-through debounce: count down the ticks since the last chat-list
+        // move and fire one preview load when the movement quiets, so racing
+        // through the list with j/k coalesces to a single load of the settled-on
+        // chat. `fire_flick_preview` and `begin_timeline_load` clear the counter.
+        if let Some(remaining) = self.flick_countdown {
+            let next = remaining.saturating_sub(1);
+            if next == 0 {
+                self.flick_countdown = None;
+                self.fire_flick_preview();
+            } else {
+                self.flick_countdown = Some(next);
             }
             changed = true;
         }
@@ -286,6 +402,71 @@ impl TuiApp {
             }
         }
         changed
+    }
+
+    /// Launch daemon auto-start: when the daemon is down and the TUI holds a
+    /// relay source to give it, start it exactly as `/daemon start` would — but
+    /// on its own one-shot thread, because `wn daemon start` blocks up to five
+    /// seconds on its readiness poll. It runs off the shared FIFO effect worker
+    /// deliberately: it has no ordering dependency with user effects, so queueing
+    /// it there would stall the first user action behind that five-second poll.
+    /// The thread mirrors the media worker — spawn, run the subprocess, deliver
+    /// the outcome over a channel drained on `tick`. Without a relay source the
+    /// start would only fail with `missing_relay_url`, so one honest status is
+    /// surfaced instead (no attempt, no retry loop) and the login/main flow
+    /// continues degraded. With a daemon already running this is a no-op (today's
+    /// behavior). Deliberate divergence from the retired reference client, which
+    /// killed its auto-started daemon on exit: ours outlives the TUI, because
+    /// other `wn` commands share it. `env_relay` is the caller's `WN_RELAY` read,
+    /// injected so the relay-source decision stays pure and testable.
+    pub(crate) fn autostart_daemon_if_needed(&mut self, env_relay: Option<String>) {
+        if self.daemon.running {
+            return;
+        }
+        if daemon_start_has_relay_source(
+            self.client.relay.as_deref(),
+            &self.client.discovery_relays,
+            &self.client.default_account_relays,
+            env_relay.as_deref(),
+        ) {
+            let client = self.client.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let args =
+                    daemon_start_args(&client.discovery_relays, &client.default_account_relays);
+                let result = client.run_json(None, &args).map_err(|err| err.to_string());
+                // The receiver is dropped only at shutdown; a failed send there
+                // simply means the app is gone and the result is moot.
+                let _ = tx.send(result);
+            });
+            self.daemon_autostart = Some(rx);
+            self.status = STARTING_DAEMON_STATUS.to_owned();
+        } else {
+            self.status = DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned();
+        }
+    }
+
+    /// Fold the launch daemon auto-start's outcome once its thread reports, then
+    /// clear the one-shot channel. Returns whether anything changed, so `tick`
+    /// can mark the frame dirty. `Disconnected` (the thread panicked before
+    /// sending, which the panic-free subprocess path makes unreachable) just
+    /// clears the channel and leaves the degraded status in place.
+    fn drain_daemon_autostart(&mut self) -> bool {
+        let Some(rx) = self.daemon_autostart.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.daemon_autostart = None;
+                self.fold_daemon_start(result);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.daemon_autostart = None;
+                true
+            }
+        }
     }
 
     /// Route the opening screen from the loaded account list: no accounts opens
@@ -391,7 +572,9 @@ impl TuiApp {
             KeyCode::Char('?') if self.focus != Focus::Composer => {
                 self.popup = Some(Popup::help());
             }
-            KeyCode::Char('q') if self.focus != Focus::Composer && self.input.is_empty() => {
+            KeyCode::Char('q')
+                if self.focus != Focus::Composer && self.input.is_empty() && plain(key) =>
+            {
                 self.running = false;
             }
             KeyCode::Tab => self.focus = self.focus.next(),
@@ -405,89 +588,99 @@ impl TuiApp {
             KeyCode::Esc if is_armed_interaction(self.input.value()) => {
                 self.input.clear();
             }
+            // Otherwise Esc is spatial back: Composer -> Messages -> Chats, and a
+            // no-op from Chats. It never clears a hand-typed draft (only an armed
+            // interaction clears, handled above), so leaving the composer keeps the
+            // draft intact for when focus returns.
+            KeyCode::Esc => {
+                self.focus = match self.focus {
+                    Focus::Composer => Focus::Messages,
+                    Focus::Messages | Focus::Chats => Focus::Chats,
+                };
+            }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
                 self.focus = Focus::Composer;
                 self.input.insert('/');
             }
             // Reopen the account picker from the chat list (the accounts pane is
             // gone; `A` is its replacement entry point).
-            KeyCode::Char('A') if self.focus == Focus::Chats => {
+            KeyCode::Char('A') if self.focus == Focus::Chats && plain(key) => {
                 self.open_account_picker();
             }
             // Group detail and invites are entered from the chat list.
-            KeyCode::Char('g') if self.focus == Focus::Chats => {
+            KeyCode::Char('g') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_group_detail() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('I') if self.focus == Focus::Chats => {
+            KeyCode::Char('I') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_invites() {
                     self.status = format!("error: {err}");
                 }
             }
             // Full-view screens entered from the chat list (Phase 5b).
-            KeyCode::Char('s') if self.focus == Focus::Chats => {
+            KeyCode::Char('s') if self.focus == Focus::Chats && plain(key) => {
                 self.open_user_search(None);
             }
-            KeyCode::Char('p') if self.focus == Focus::Chats => {
+            KeyCode::Char('p') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_profile() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('h') if self.focus == Focus::Chats => {
+            KeyCode::Char('h') if self.focus == Focus::Chats && plain(key) => {
                 if let Err(err) = self.open_relay_health() {
                     self.status = format!("error: {err}");
                 }
             }
             // Messages pane: the message-offset scroll model. `k`/Up and PageUp
             // may reach the oldest loaded row and page in older history.
-            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Messages => {
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Messages && plain(key) => {
                 self.messages_select_up();
             }
-            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Messages => {
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Messages && plain(key) => {
                 self.timeline_scroll.select_down(self.timeline.len());
             }
             KeyCode::PageUp if self.focus == Focus::Messages => self.messages_page_up(),
             KeyCode::PageDown if self.focus == Focus::Messages => {
                 self.timeline_scroll.page_down(self.timeline.len());
             }
-            KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Messages => {
+            KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Messages && plain(key) => {
                 self.timeline_scroll.jump_newest(self.timeline.len());
             }
-            KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Messages => {
+            KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Messages && plain(key) => {
                 self.messages_jump_oldest();
             }
-            KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages => {
+            KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages && plain(key) => {
                 self.focus = Focus::Composer;
             }
             // Message-interaction accelerators (Messages focus, popups are Phase 5).
             // `r` and `d` prefill a slash command in the composer so Enter is the
             // visible action; `u` removes your own reaction immediately (no input).
-            KeyCode::Char('r') if self.focus == Focus::Messages => {
+            KeyCode::Char('r') if self.focus == Focus::Messages && plain(key) => {
                 self.prefill_composer("/react ");
             }
-            KeyCode::Char('u') if self.focus == Focus::Messages => {
+            KeyCode::Char('u') if self.focus == Focus::Messages && plain(key) => {
                 if let Err(err) = self.unreact_selected_message() {
                     self.status = format!("error: {err}");
                 }
             }
-            KeyCode::Char('d') if self.focus == Focus::Messages => {
+            KeyCode::Char('d') if self.focus == Focus::Messages && plain(key) => {
                 self.prefill_composer("/delete");
             }
             // `R` prefills `/reply ` (draft-protected, like `r`/`d`) and names the
             // reply target on the status line; the target resolves at submit.
-            KeyCode::Char('R') if self.focus == Focus::Messages => {
+            KeyCode::Char('R') if self.focus == Focus::Messages && plain(key) => {
                 self.begin_reply();
             }
             // Open the selected message's downloaded image full-size.
-            KeyCode::Char('o') if self.focus == Focus::Messages => {
+            KeyCode::Char('o') if self.focus == Focus::Messages && plain(key) => {
                 self.open_selected_image_viewer();
             }
             // Chat list navigation.
-            KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
+            KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer && plain(key) => {
                 self.move_selection(-1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.focus != Focus::Composer => {
+            KeyCode::Down | KeyCode::Char('j') if self.focus != Focus::Composer && plain(key) => {
                 self.move_selection(1);
             }
             KeyCode::Enter => {
@@ -600,6 +793,14 @@ impl TuiApp {
     /// on disk is decrypted plaintext with no reader; clearing it keeps decrypted
     /// media from lingering at rest. Best-effort and non-recursive; see
     /// `sweep_media_cache_dir`.
+    ///
+    /// A concurrent session that shares this `--home` sweeps the same directory,
+    /// so this startup sweep can unlink another live session's in-flight download.
+    /// That is harmless and self-healing: the affected image renders as
+    /// `[<name> failed: ...]` and re-downloads next session, and the
+    /// decrypted-plaintext-at-rest guarantee still holds (an artifact is only ever
+    /// removed, never exposed). Cross-process locking would be over-engineering for
+    /// a rare race that already recovers on its own.
     pub(crate) fn sweep_media_cache(&self) {
         sweep_media_cache_dir(&self.media_cache_dir());
     }
@@ -624,6 +825,11 @@ impl TuiApp {
         });
         match ready {
             Some((name, hash)) => {
+                // Build the native pixel-protocol viewer where the terminal has
+                // one and the pixels are still retained; on `false` the popup
+                // falls back to drawing the shared cell-exact halfblock
+                // protocol, so the viewer opens either way.
+                self.media.build_viewer_protocol(&hash);
                 self.popup = Some(Popup::Image {
                     title: format!("Image: {name}"),
                     hash,
@@ -642,12 +848,51 @@ impl TuiApp {
     pub(crate) fn move_selection(&mut self, delta: isize) {
         match self.focus {
             Focus::Chats => {
+                let before = self.selected_chat;
                 self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
+                if self.selected_chat != before {
+                    // Flick-through: schedule a debounced preview of the newly
+                    // highlighted chat. Focus stays on the chat list; the load
+                    // fires only after the movement quiets (see `tick`).
+                    self.flick_countdown = Some(FLICK_PREVIEW_DEBOUNCE_TICKS);
+                }
             }
             // The messages pane owns its own selection through `timeline_scroll`;
             // it is driven directly in `handle_key`, not through `move_selection`.
             Focus::Messages | Focus::Composer => {}
         }
+    }
+
+    /// Fire the debounced flick-through preview: load the highlighted chat's
+    /// timeline while focus stays on the chat list. A no-op unless the chat list
+    /// is actually what the user is looking at — the main screen, no popup, and
+    /// the chat list focused — and the highlight names a chat the pane is not
+    /// already showing. Focus alone is not enough: none of the `open_*` screens
+    /// change `self.focus`, and the help popup is reachable from `Focus::Chats`,
+    /// so a preview fired there would reload the pane and mark a chat read behind
+    /// a modal or on another screen (the read marker is forward-only, so that is
+    /// not recoverable). The load is tagged with its group id (via
+    /// `begin_timeline_load`), so a preview superseded by further movement is
+    /// dropped at fold time, and it marks the previewed chat read exactly as
+    /// opening it does — the chat is on screen, so viewing-is-reading applies.
+    fn fire_flick_preview(&mut self) {
+        if self.screen != Screen::Main || self.popup.is_some() || self.focus != Focus::Chats {
+            return;
+        }
+        let Some(account_id) = self
+            .selected_account_row()
+            .filter(|account| account.local_signing)
+            .map(|account| account.account_id.clone())
+        else {
+            return;
+        };
+        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+            return;
+        };
+        if self.messages_group_id.as_deref() == Some(group_id.as_str()) {
+            return;
+        }
+        self.begin_timeline_load(account_id, group_id);
     }
 
     /// Move the account-picker highlight (login/account-select screen only).
@@ -697,7 +942,19 @@ impl TuiApp {
             // Opening a chat also moves focus to the messages pane so the reader
             // can immediately scroll the conversation.
             Focus::Chats => {
-                self.refresh_messages()?;
+                // Opening the chat already loaded and settled in the pane — Enter
+                // after a settled flick preview of the same chat — is a focus move
+                // only. Reloading would re-enqueue a redundant timeline load and a
+                // second mark-read for a pane that already shows this chat (its
+                // live subscription keeps it current). A load still in flight, a
+                // different highlighted chat, or an empty pane still (re)loads.
+                let already_settled = self.loading_chat.is_none()
+                    && self.messages_group_id.is_some()
+                    && self.selected_chat_row().map(|chat| chat.group_id.as_str())
+                        == self.messages_group_id.as_deref();
+                if !already_settled {
+                    self.refresh_messages()?;
+                }
                 self.focus = Focus::Messages;
                 Ok(())
             }
@@ -1092,10 +1349,13 @@ impl TuiApp {
         };
         match popup_key(popup, key.code) {
             PopupAction::None => {}
-            PopupAction::Dismiss => self.popup = None,
+            PopupAction::Dismiss => self.close_popup(),
             // A multi-step flow: the reducer resolved the next popup (the group
             // picker's Enter opens the add-user confirm). No CLI call yet.
-            PopupAction::Open(next) => self.popup = Some(next),
+            PopupAction::Open(next) => {
+                self.close_popup();
+                self.popup = Some(next);
+            }
             PopupAction::Submit(submit) => {
                 // The invites picker stays open across actions so one
                 // accept/decline does not lose the user's place: capture the
@@ -1110,7 +1370,7 @@ impl TuiApp {
                     }) => Some(*selected),
                     _ => None,
                 };
-                self.popup = None;
+                self.close_popup();
                 if let Err(err) = self.run_popup_submit(submit) {
                     self.status = format!("error: {err}");
                 }
@@ -1122,6 +1382,18 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Tear down the open popup: drop the viewer's on-demand native protocol
+    /// (a no-op for non-image popups) and schedule the full clear+repaint that
+    /// `run()` applies before the next draw. Every popup close funnels through
+    /// here so a terminal-side pixel image can never outlive its popup —
+    /// including a popup replaced by a fold (see `fold_invites`), not only one
+    /// dismissed by a key.
+    pub(crate) fn close_popup(&mut self) {
+        self.popup = None;
+        self.media.drop_viewer_protocol();
+        self.pending_full_repaint = true;
     }
 
     fn run_popup_submit(&mut self, submit: PopupSubmit) -> TuiResult<()> {
@@ -1164,6 +1436,10 @@ impl TuiApp {
     /// same submit reached from elsewhere (e.g. group detail) is unaffected.
     fn reveal_chat_from_search(&mut self) {
         if self.screen == Screen::UserSearch {
+            // Drop any in-flight search so a late fold cannot repopulate the search
+            // view after we have moved on to the revealed chat (the same stale-fold
+            // guard `leave_screen` applies on `Esc`).
+            self.searching_users = None;
             self.user_search = None;
             self.screen = Screen::Main;
             self.focus = Focus::Chats;
@@ -1204,6 +1480,16 @@ impl TuiApp {
 
     pub(crate) fn leave_group_detail(&mut self) {
         self.group_detail = None;
+        // Clearing the load anchor drops any group-detail result still in flight,
+        // so a late load cannot repopulate the view after the screen is left.
+        self.loading_group_detail = None;
+        // Leaving mid-load would otherwise strand the "loading group detail..."
+        // status (the fold that clears it is now dropped). Reset it, guarded so a
+        // meaningful status a caller sets afterward (accept-invite, leave-group) is
+        // never clobbered.
+        if self.status == LOADING_GROUP_DETAIL_STATUS {
+            self.status = String::new();
+        }
         self.screen = Screen::Main;
         self.focus = Focus::Chats;
     }
@@ -1375,6 +1661,14 @@ impl TuiApp {
     /// the search/profile/relay-health `Esc` handlers (their data is a one-shot
     /// load with no per-view subscription to tear down).
     pub(crate) fn leave_screen(&mut self) {
+        // A user search may still be in flight. Clearing its anchor drops the
+        // stale result at fold time (mirroring `leave_group_detail`'s
+        // `loading_group_detail` clear), so reopening the search screen never
+        // inherits the abandoned query's results, and resets the "searching..."
+        // status the abandoned load would otherwise strand on the status line.
+        if self.searching_users.take().is_some() {
+            self.status = String::new();
+        }
         self.user_search = None;
         self.profile_view = None;
         self.relay_health = None;
@@ -1435,8 +1729,12 @@ impl TuiApp {
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
-    /// query), `Enter` opens the profile card, `c` starts a chat, `a` picks a chat
-    /// to add the user to, and `i`/`/` return to the query.
+    /// query), `Enter` opens the profile card, `f`/`x` follow/unfollow the
+    /// highlighted result (the same key letters as the Profile screen's, but
+    /// acting directly on the highlighted result — Profile's `f`/`x` go through
+    /// popups; `Tab` would collide with the muscle memory of pane cycling on
+    /// Main), `c` starts a chat, `a` picks a chat to add the user to, and `i`/`/`
+    /// return to the query.
     fn handle_user_search_results_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1458,6 +1756,8 @@ impl TuiApp {
                     self.status = format!("error: {err}");
                 }
             }
+            KeyCode::Char('f') => self.follow_search_result(),
+            KeyCode::Char('x') => self.unfollow_search_result(),
             KeyCode::Char('c') => self.open_new_chat_with_user_popup(),
             KeyCode::Char('a') => self.open_add_user_to_chat_popup(),
             KeyCode::Char('i') | KeyCode::Char('/') => {

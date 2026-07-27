@@ -25,6 +25,10 @@ report() {
     fail=1
 }
 
+# `.claude` is local agent tooling, not repo content: worktrees created under it
+# carry full repo checkouts that would re-trip this gate on their own copy of the
+# source. It is globbed out (alongside `.git`) rather than scanned.
+
 # One-word and two-word project-name forms, any case.
 if hits="$(rg --hidden --glob '!.git' --glob '!.claude' -n -i 'dark[- ]?matter' "${HISTORY_EXCLUDES[@]}" . 2>/dev/null)" && [ -n "$hits" ]; then
     report 'darkmatter / dark matter' "$hits"

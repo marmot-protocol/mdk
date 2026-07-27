@@ -539,6 +539,25 @@ When a daemon is running for the same home, TUI child commands use the daemon so
 state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
 group-state changes, and refreshes snapshots when the composer is idle.
 
+When the daemon is not running at launch, the TUI auto-starts it — exactly as `/daemon start` would — provided it
+holds a relay source to give it: the passthrough flags above, a global `--relay`, or `WN_RELAY`. The start runs off
+the event loop (`wn daemon start` waits on a readiness poll), so the status line shows `starting daemon...` and then
+the outcome, and the status-bar dot flips green when it lands. Without any relay source no start is attempted — it
+would only fail requiring a relay URL — and one status says so; the login/main flow continues degraded. To fix it,
+restart `wn tui` with `--discovery-relays`/`--default-account-relays` (or `WN_RELAY`); `/daemon start` in-session reads
+the same relay sources and would fail identically. Unlike the retired reference client, which killed its auto-started
+daemon on exit, the TUI never stops the daemon when it quits:
+other `wn` commands share it. Stop it explicitly with `/daemon stop` or `wn daemon stop`.
+
+User-initiated commands — sending a message, replying, reacting/unreacting, deleting, opening a chat, searching users,
+opening group detail, and listing invites — run on a background worker so a `wn` round-trip never freezes typing,
+scrolling, or input. The ambient chat-list re-read that a notification for a non-selected chat triggers runs on that
+same worker, so a burst of notifications never blocks key handling either. Each shows in-flight feedback (`sending...`,
+`loading chat...`, `searching...`) and folds its result in on the next frame; user-initiated mutations keep their
+submission order, and a load whose target you have already moved past is dropped rather than overwriting the current
+view. Modal or rare flows (login, logout, daemon start/stop, and popup submits such as rename or follow) stay
+synchronous.
+
 Login screen controls:
 
 - Menu (no accounts): `c` create a new identity, `l` log in with an nsec, `q` quit.
@@ -549,7 +568,13 @@ Login screen controls:
 Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
-- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `g` opens the
+- Chats: `j`/`k` or arrows move the selection; moving it also live-previews the highlighted chat in the message pane
+  after a brief pause (~150ms of quiet), with focus staying on the list, so flicking through with `j`/`k` loads only
+  the chat you settle on. The messages-pane title names the loaded chat (falling back to "Messages"), and the composer
+  sends to that same chat, so the pane always shows which conversation you are reading and sending to — whether it was
+  opened or previewed. `Enter` opens the highlighted chat and moves focus to the messages pane (cancelling any pending
+  preview; opening the chat already shown is just a focus move); a previewed chat is marked read the same way opening
+  it is. `g` opens the
   group-detail screen for the selected chat; `s` opens user search; `p` opens your profile; `h` opens the relay-health
   screen; `I` opens the pending-invites picker; `A` reopens the
   account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
@@ -589,17 +614,23 @@ Main view controls:
   `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
   text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
   viewer (see "Inbound media" below).
-- Inbound media: an image attachment renders inline in the message pane as cell-exact half-block glyphs (`▀` colored
-  cells) on any image-capable terminal. The rendering is deliberately cell-exact rather than a native pixel image
+- Inbound media: an image attachment renders inline in the message pane as a filtered half-block preview — cell-exact
+  `▀` colored cells, downscaled with a proper resampling filter (Lanczos3) so the small preview stays legible — on any
+  image-capable terminal. The inline rendering is deliberately cell-exact rather than a native pixel image
   (iTerm2/Kitty/Sixel): half-blocks are ordinary colored cells bounded strictly to the reserved block, so an image can
   never overdraw a neighboring message or leave a terminal-side artifact behind when you scroll. Each image is
   downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
   `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
   with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
-  The `o` full-size viewer uses the same cell-exact rendering. Each image is decrypted to a private
-  `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file is then removed right
-  away — the viewer draws the in-memory image, so nothing reads the file again and no decrypted media is left at rest.
-  Any files a prior crashed session left behind are swept from that directory at startup.
+  The `o` full-size viewer shows the actual image with the terminal's native pixel protocol when the startup
+  capability query found one (in an iTerm2 session it uses iTerm2's own inline-image protocol), and closing the
+  viewer — like closing any popup — forces a full terminal repaint so nothing lingers on screen. Viewer pixels are
+  kept in a small in-memory pool (the most recent images, oldest evicted first); on terminals without a pixel
+  protocol, or for an evicted image, the viewer falls back to the same cell-exact half-block rendering. Each image is
+  decrypted to a private `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file
+  is then removed right away — inline preview and full-size viewer both draw from memory, so nothing reads the file
+  again and no decrypted media is left at rest. Any files a prior crashed session left behind are swept from that
+  directory at startup.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
   character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
   or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard
@@ -639,7 +670,12 @@ query (so `j`/`k` are literal text) and `Enter` runs the search; once there are 
 starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to an existing chat: a
 group picker lists your chats (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), preselecting the open
 chat when one is loaded, and `Enter` opens the confirm popup that guards the add (`groups add-members`), naming both
-the user and the chosen chat. With no chats a status notice explains and points at `c`. `i` returns to the query, and
+the user and the chosen chat. With no chats a status notice explains and points at `c`. `f` follows the highlighted
+result (`follows add`) and `x` unfollows them (`follows remove`) — the same key letters as the Profile screen's
+`f`/`x`, but acting directly on the highlighted result (Profile's go through popups). Both run on the background
+worker with in-flight feedback and fold into a per-row
+`[following]` badge; rows you already follow are badged up front from a `follows list` snapshot taken with each
+search. `i` returns to the query, and
 `Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
 attribution the search returns.
 

@@ -17,6 +17,297 @@ pub(crate) struct WnInvocation {
     pub(crate) stdin: Option<String>,
 }
 
+/// One `wn` call an [`Effect`] expands to: the account it runs under (`None`
+/// for the account-less daemon control call, which must work before any
+/// account exists) plus the argv. Distinct from [`WnInvocation`] (the argv+stdin
+/// of the synchronous account-setup path) because no effect feeds stdin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WnCall {
+    pub(crate) account: Option<String>,
+    pub(crate) args: Vec<String>,
+}
+
+/// A user-initiated `wn` operation resolved to a pure value and queued to run
+/// off the event loop. Separating *what to run* (this value, resolved from the
+/// key and current state) from *running it* (the worker) is the testing
+/// backbone: the resolve step and the argv mapping are asserted without ever
+/// spawning a subprocess, and the worker folds the result back on `tick`.
+///
+/// Each field the fold needs that is not carried by the `wn` result travels on
+/// the variant (the group id a load targets, the text an optimistic send row
+/// shows), so a completed effect can be folded exactly as the synchronous
+/// handler folded its `run_json` return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Effect {
+    /// Send a text message. The optimistic row the fold inserts uses `text` and
+    /// `account` (data the `wn` result does not echo back).
+    SendMessage {
+        account: String,
+        group: String,
+        text: String,
+    },
+    /// Send a reply to `reply_to`. Mirrors `SendMessage` plus the parent id the
+    /// optimistic reply row carries.
+    SendReply {
+        account: String,
+        group: String,
+        reply_to: String,
+        text: String,
+    },
+    React {
+        account: String,
+        group: String,
+        message_id: String,
+        emoji: String,
+    },
+    Unreact {
+        account: String,
+        group: String,
+        message_id: String,
+    },
+    Delete {
+        account: String,
+        group: String,
+        message_id: String,
+    },
+    /// Load (or reload) the materialized timeline page for a chat — the
+    /// open-chat / flick-through load. Stale results (a newer open superseded
+    /// this one) are dropped at fold time by comparing `group` to the pane's
+    /// pending target.
+    LoadTimeline { account: String, group: String },
+    /// Mark the loaded chat read up to its newest message and fold the returned
+    /// projection into its row, clearing the badge without waiting for a push.
+    MarkRead { account: String, group: String },
+    /// Load MLS group diagnostics for the loaded chat (the no-daemon fallback;
+    /// with a daemon the group-state subscription supplies these live).
+    GroupDiagnostics { account: String, group: String },
+    /// Run a one-shot user directory search. Stale results (a newer query, or a
+    /// left screen) are dropped at fold time by comparing `query` to the pending
+    /// search.
+    UserSearch { account: String, query: String },
+    /// Load the group-detail view: members, admins, relays, and profile (four
+    /// `wn` calls run in that order on the worker thread).
+    LoadGroupDetail { account: String, group: String },
+    /// Load the pending-invites list (`groups invites`) to open the invites
+    /// picker off the event loop.
+    LoadInvites { account: String },
+    /// Re-read the chat list for ambient state (the debounced response to a
+    /// notification for a non-selected chat). Runs off the event loop so a
+    /// notification burst never freezes key handling; the fold resorts and
+    /// preserves the highlighted chat by group id. Stale results (the selected
+    /// account changed while it was in flight) are dropped at fold time.
+    Relist {
+        account: String,
+        include_archived: bool,
+    },
+    /// Follow the highlighted search result (`f`). `label` names the user on
+    /// the status line; `relay` is the setup relay `follows add` requires,
+    /// resolved at enqueue by the same only-when-no-global-`--relay` rule the
+    /// Profile screen's synchronous path uses. The fold badges the acted-on
+    /// row by pubkey, anchored to the surviving view and acting account.
+    FollowUser {
+        account: String,
+        pubkey: String,
+        label: String,
+        relay: Option<String>,
+    },
+    /// Unfollow the highlighted search result (`x`). Mirrors [`Self::FollowUser`].
+    UnfollowUser {
+        account: String,
+        pubkey: String,
+        label: String,
+        relay: Option<String>,
+    },
+}
+
+impl Effect {
+    /// The `wn` call(s) this effect runs, in order. Almost every effect is a
+    /// single call; the group-detail load expands to several. Pure — the worker
+    /// executes the returned calls and tests assert them.
+    pub(crate) fn calls(&self) -> Vec<WnCall> {
+        match self {
+            Effect::SendMessage {
+                account,
+                group,
+                text,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "send".to_owned(),
+                    group.clone(),
+                    text.clone(),
+                ],
+            }],
+            Effect::SendReply {
+                account,
+                group,
+                reply_to,
+                text,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: reply_send_args(group, reply_to, text),
+            }],
+            Effect::React {
+                account,
+                group,
+                message_id,
+                emoji,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "react".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                    emoji.clone(),
+                ],
+            }],
+            Effect::Unreact {
+                account,
+                group,
+                message_id,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "unreact".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                ],
+            }],
+            Effect::Delete {
+                account,
+                group,
+                message_id,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "delete".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                ],
+            }],
+            Effect::LoadTimeline { account, group } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "timeline".to_owned(),
+                    "list".to_owned(),
+                    "--group".to_owned(),
+                    group.clone(),
+                    "--limit".to_owned(),
+                    TUI_TIMELINE_PAGE_SIZE.to_string(),
+                ],
+            }],
+            Effect::MarkRead { account, group } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec!["chats".to_owned(), "mark-read".to_owned(), group.clone()],
+            }],
+            Effect::GroupDiagnostics { account, group } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
+            }],
+            Effect::UserSearch { account, query } => vec![
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["users".to_owned(), "search".to_owned(), query.clone()],
+                },
+                // The local `follows list` directory read: one cheap call that
+                // badges every result row's follow state up front, instead of
+                // a `follows check` round-trip per row.
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["follows".to_owned(), "list".to_owned()],
+                },
+            ],
+            Effect::LoadGroupDetail { account, group } => vec![
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["groups".to_owned(), "members".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["groups".to_owned(), "admins".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["groups".to_owned(), "relays".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
+                },
+            ],
+            Effect::LoadInvites { account } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec!["groups".to_owned(), "invites".to_owned()],
+            }],
+            Effect::Relist {
+                account,
+                include_archived,
+            } => {
+                let mut args = vec!["chats".to_owned(), "list".to_owned()];
+                if *include_archived {
+                    args.push("--include-archived".to_owned());
+                }
+                vec![WnCall {
+                    account: Some(account.clone()),
+                    args,
+                }]
+            }
+            Effect::FollowUser {
+                account,
+                pubkey,
+                relay,
+                ..
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: follows_update_args("add", pubkey, relay.as_deref()),
+            }],
+            Effect::UnfollowUser {
+                account,
+                pubkey,
+                relay,
+                ..
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: follows_update_args("remove", pubkey, relay.as_deref()),
+            }],
+        }
+    }
+
+    /// How many of this effect's trailing [`calls`](Self::calls) are best-effort
+    /// enrichment rather than required work. A required call's failure aborts the
+    /// effect with the error; a trailing best-effort call's failure instead yields
+    /// the required results already gathered, so the fold degrades gracefully
+    /// (it reads trailing enrichment values tolerantly). Zero unless an effect
+    /// opts a trailing call out here.
+    pub(crate) fn best_effort_trailing_calls(&self) -> usize {
+        match self {
+            // `[users search, follows list]`: the search is required, but the
+            // `follows list` only badges results with follow state. A badge-read
+            // failure must yield the search results with no badges, never discard
+            // a successful search as an error.
+            Effect::UserSearch { .. } => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Args for `follows add|remove <pubkey>`, with the command-local `--relay`
+/// those handlers require appended when the enqueue resolved one (absent when a
+/// global `--relay` already covers every child).
+fn follows_update_args(action: &str, pubkey: &str, relay: Option<&str>) -> Vec<String> {
+    let mut args = vec!["follows".to_owned(), action.to_owned(), pubkey.to_owned()];
+    if let Some(relay) = relay {
+        args.push("--relay".to_owned());
+        args.push(relay.to_owned());
+    }
+    args
+}
+
 /// Build the `wn` invocation for account setup. `setup_relay` supplies the
 /// first-run relay to `create-identity` / `login` through the one relay flag
 /// those commands actually accept — the (global, for `create-identity`;
@@ -791,7 +1082,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
-        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat.",
+        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat; f follow; x unfollow.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",
@@ -1013,6 +1304,10 @@ pub(crate) struct UserSearchResultRow {
     pub(crate) matched_field: String,
     pub(crate) match_quality: String,
     pub(crate) radius: u8,
+    /// Whether the selected account follows this user. Not in the `users
+    /// search` JSON: seeded from the search effect's `follows list` snapshot
+    /// at fold time, then kept current by the `f`/`x` follow-effect folds.
+    pub(crate) following: bool,
 }
 
 impl UserSearchResultRow {
@@ -1088,7 +1383,24 @@ fn parse_user_search_result(value: &Value) -> Option<UserSearchResultRow> {
             .get("radius")
             .and_then(Value::as_u64)
             .unwrap_or_default() as u8,
+        following: false,
     })
+}
+
+/// The set of followed pubkeys (hex account ids) a `follows list` result
+/// carries, for badging search rows. Tolerant like every parse here: a missing
+/// or malformed value is an empty set.
+pub(crate) fn follows_pubkey_set(value: &Value) -> HashSet<String> {
+    value
+        .get("follows")
+        .and_then(Value::as_array)
+        .map(|follows| {
+            follows
+                .iter()
+                .filter_map(|follow| value_string(follow, "account_id"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The dismiss-on-any-key profile card body for a `users show` result. Picture
@@ -1447,7 +1759,9 @@ fn build_relay_health_rows(spread: &Value, sync: &Value) -> Vec<RelayHealthRow> 
 pub(crate) fn user_search_hint(focus: UserSearchFocus) -> &'static str {
     match focus {
         UserSearchFocus::Query => "type query  Enter search  Down results  Esc back",
-        UserSearchFocus::Results => "j/k move  Enter profile  c chat  a add  i query  Esc back",
+        UserSearchFocus::Results => {
+            "j/k move  Enter profile  f follow  x unfollow  c chat  a add  i query  Esc back"
+        }
     }
 }
 
@@ -1610,23 +1924,95 @@ impl Input {
     }
 }
 
-/// The one-line status bar for the main view:
-/// `{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`.
-/// Untrusted fields (the account label and the status message) pass through
-/// `terminal_safe_text`, and the assembled line is shortened to `width`.
+/// The one-line bottom status bar as styled spans: a daemon-connection dot
+/// (green ● up / red ○ down), the account display name styled distinctly from
+/// its shortened npub (gray), gray `│` separators, the chat count, a
+/// hide-when-zero yellow unread badge, and our own last-action/error status
+/// segment truncated to fit the remaining width. The full-width DarkGray bar
+/// background is filled by the rendering `Paragraph`; the spans set only a
+/// foreground so the fill shows through. Untrusted fields (the account label
+/// and the status message) pass through `terminal_safe_text`.
+///
+/// Kept as our content over wn-tui's: the trailing status segment has no
+/// wn-tui equivalent and stays, and the pending-invites badge wn-tui showed is
+/// omitted because this TUI keeps no persistent pending-invites count (invites
+/// load on demand into a picker).
 pub(crate) fn status_bar_line(
-    account_label: &str,
+    display_name: Option<&str>,
+    npub: Option<&str>,
     daemon_running: bool,
     chats: usize,
     unread: usize,
     status: &str,
     width: usize,
-) -> String {
-    let account = shorten(&terminal_safe_text(account_label), 24);
-    let daemon = if daemon_running { "on" } else { "off" };
+) -> Line<'static> {
+    let sep = || Span::styled(" │ ", Style::default().fg(Color::Gray));
+    let (dot, dot_color) = if daemon_running {
+        ("●", Color::Green)
+    } else {
+        ("○", Color::Red)
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(dot, Style::default().fg(dot_color)),
+    ];
+
+    match (display_name.filter(|name| !name.trim().is_empty()), npub) {
+        (Some(name), Some(npub)) => {
+            spans.push(Span::styled(
+                format!(" {}", shorten(&terminal_safe_text(name), 24)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", shorten(&terminal_safe_text(npub), 20)),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        (None, Some(npub)) => spans.push(Span::raw(format!(
+            " {}",
+            shorten(&terminal_safe_text(npub), 24)
+        ))),
+        _ => spans.push(Span::styled(
+            " not logged in".to_owned(),
+            Style::default().fg(Color::Gray),
+        )),
+    }
+
+    spans.push(sep());
+    spans.push(Span::raw(format!("{chats} chats")));
+    if unread > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{unread} unread"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
     let status = terminal_safe_text(status);
-    let line = format!("{account} · daemon {daemon} · {chats} chats · {unread} unread · {status}");
-    shorten(&line, width)
+    if !status.is_empty() {
+        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        // 3 covers the leading " │ " separator the status segment adds.
+        let remaining = width.saturating_sub(used + 3);
+        if remaining >= 4 {
+            spans.push(sep());
+            spans.push(Span::raw(truncate_status(&status, remaining)));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Trailing-truncate a status segment to `max` chars, appending an ellipsis
+/// when clipped. Trailing (not middle) truncation reads better for prose than
+/// `shorten`'s id-shaped middle ellipsis.
+fn truncate_status(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    if max <= 3 {
+        return text.chars().take(max).collect();
+    }
+    let kept = text.chars().take(max - 3).collect::<String>();
+    format!("{kept}...")
 }
 
 /// The per-screen, per-focus hints line. Terse and kept in lockstep with the
@@ -1695,9 +2081,14 @@ const ARMED_INTERACTIONS: &[ArmedInteraction] = &[
 /// The armed interaction the composer text begins with, if any: `input` is the
 /// command exactly (`/delete`) or the command followed by whitespace (`/react `,
 /// `/reply hello`). Matching on the whole command word (not a bare prefix) keeps
-/// `/refresh` and `/reactor` from counting. Shared by the persistent armed hint
-/// and the `Esc` escape hatch so they agree on what "armed" means.
+/// `/refresh` and `/reactor` from counting. Surrounding whitespace is trimmed
+/// first so this agrees with `parse_slash_command` (which also trims): a
+/// hand-typed leading space (" /react x") still submits as a reaction, so it
+/// must still read as armed here — otherwise the hint and the `Esc` escape hatch
+/// would silently disagree with what Enter sends. Shared by the persistent armed
+/// hint and the `Esc` escape hatch so they agree on what "armed" means.
 fn armed_interaction(input: &str) -> Option<&'static ArmedInteraction> {
+    let input = input.trim();
     ARMED_INTERACTIONS.iter().find(|armed| {
         input
             .strip_prefix(armed.command)
@@ -1726,6 +2117,138 @@ pub(crate) fn armed_interaction_hint(input: &str, row: Option<&TimelineRow>) -> 
         "{} {target} — {}, Esc clears",
         armed.verb, armed.action
     ))
+}
+
+/// The chat-list sidebar width in cells: a fixed 36, but never more than a third
+/// of the available width, so a narrow terminal gives the conversation more room
+/// instead of a sidebar that crowds it out.
+pub(crate) fn sidebar_width(total_width: u16) -> u16 {
+    36.min(total_width / 3)
+}
+
+/// The centered notice shown in the messages pane when the timeline is empty,
+/// as `(text, color)`. Three distinct cases, keyed off the async load flag and
+/// whether a chat is loaded into the pane: an in-flight load is yellow
+/// ("loading messages..."); a settled pane with no chat loaded shows the
+/// dark-gray pick-a-chat prompt; a settled pane holding a chat with no messages
+/// is a genuinely empty (dark-gray) "no messages yet".
+pub(crate) fn empty_messages_notice(loading: bool, chat_loaded: bool) -> (&'static str, Color) {
+    if loading {
+        ("loading messages...", Color::Yellow)
+    } else if !chat_loaded {
+        ("select a chat to start messaging", Color::DarkGray)
+    } else {
+        ("no messages yet", Color::DarkGray)
+    }
+}
+
+/// A single keycap: the key text in a dark-gray-background block (bold white fg),
+/// space-padded so it reads as a raised cap. White-on-dark-gray stays legible on
+/// dark themes, where the previous black-on-dark-gray washed out. The bg is what
+/// distinguishes a key reference from its dim label.
+fn keycap_span(key: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {key} "),
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// A dim (dark-gray) hint label span with a leading space, so it sits a cell off
+/// the keycap that precedes it.
+fn hint_label_span(label: &str) -> Span<'static> {
+    Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray))
+}
+
+/// Whether a hint segment's leading token is a key press to box as a keycap
+/// (rather than prose to dim). A key is a single character, a slash-combo
+/// (`j/k`, `G/g`), or a capitalized key name (`Enter`, `Esc`, `Down`,
+/// `Ctrl-U`); a lowercase multi-char word (`type`) is prose. This keeps the one
+/// prose-leading hint (`type query`) from boxing the word "type" while every
+/// real key stays boxed.
+fn looks_like_key(token: &str) -> bool {
+    token.chars().count() == 1
+        || token.contains('/')
+        || token.starts_with(|ch: char| ch.is_uppercase())
+}
+
+/// Render a per-focus keymap hint string (`"j/k move  Enter open  ..."`) as
+/// keycap+label spans: each `"  "`-separated segment becomes a boxed keycap for
+/// its leading key token followed by a dim label. A segment whose leading token
+/// is prose (not a key) renders entirely dim. The hint strings are trusted
+/// static keymaps, so no terminal-safe filtering is needed.
+pub(crate) fn keymap_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, segment) in text.split("  ").filter(|s| !s.is_empty()).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        match segment.split_once(' ') {
+            Some((key, label)) if looks_like_key(key) => {
+                spans.push(keycap_span(key));
+                spans.push(hint_label_span(label));
+            }
+            None if looks_like_key(segment) => spans.push(keycap_span(segment)),
+            _ => spans.push(Span::styled(
+                segment.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
+    }
+    spans
+}
+
+/// Render the persistent armed-interaction hint as spans: the prose stays dim,
+/// but the `Enter`/`Esc` key references are boxed as keycaps so the armed state
+/// styles its keys consistently with the keymap it replaces. The text is
+/// already terminal-safe (see `timeline_target_label`).
+pub(crate) fn armed_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, word) in text.split(' ').enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if word == "Enter" || word == "Esc" {
+            spans.push(keycap_span(word));
+        } else {
+            spans.push(Span::styled(
+                word.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    spans
+}
+
+/// Render a popup hint row (`"[Enter] submit  [Esc] cancel"`) as spans: the
+/// bracketed `[key]` token cyan, its description gray — the popup convention,
+/// distinct from the main-screen keycap blocks. Trusted static text.
+pub(crate) fn popup_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, segment) in text.split("  ").filter(|s| !s.is_empty()).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        match segment.split_once(' ') {
+            Some((key, desc)) => {
+                spans.push(Span::styled(
+                    key.to_owned(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::styled(
+                    format!(" {desc}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            None => spans.push(Span::styled(
+                segment.to_owned(),
+                Style::default().fg(Color::Cyan),
+            )),
+        }
+    }
+    spans
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4219,6 +4742,28 @@ pub(crate) fn daemon_start_args(
         args.push(default_account_relays.join(","));
     }
     args
+}
+
+/// Whether a `daemon start` spawned by this TUI would have a relay to run with.
+/// Mirrors the exact sources `wn daemon start` accepts — the two passthrough
+/// flag lists, the global `--relay`, and the `WN_RELAY` environment fallback —
+/// so the launch auto-start never declines to start a daemon that would in
+/// fact have started, and never attempts one guaranteed to fail with
+/// `missing_relay_url`. An empty or whitespace-only `--relay` or `WN_RELAY` is
+/// not a relay source — it would fail the start with `missing_relay_url`, the
+/// exact outcome this predicate exists to avoid. The environment value arrives
+/// as a parameter so this stays pure; the caller reads `WN_RELAY` at the
+/// composition root.
+pub(crate) fn daemon_start_has_relay_source(
+    relay: Option<&str>,
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+    env_relay: Option<&str>,
+) -> bool {
+    relay.is_some_and(|relay| !relay.trim().is_empty())
+        || !discovery_relays.is_empty()
+        || !default_account_relays.is_empty()
+        || env_relay.is_some_and(|relay| !relay.trim().is_empty())
 }
 
 pub(crate) fn message_subscription_args() -> Vec<String> {

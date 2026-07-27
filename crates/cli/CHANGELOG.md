@@ -46,6 +46,34 @@ versioning through the workspace version in the root `Cargo.toml`.
   pending flag without waiting for an unrelated refresh. `chats list --json` /
   `chat_list_row` rows gain a matching `leave_requested_at_ms` field; no other
   JSON response shapes changed.
+- TUI: the daemon auto-starts at launch when it is down and the TUI holds a relay source to give it (the
+  `--discovery-relays`/`--default-account-relays` passthrough flags, a global `--relay`, or `WN_RELAY`) — exactly as
+  `/daemon start` would, but off the event loop, since `wn daemon start` blocks up to five seconds on its readiness
+  poll. The status line shows `starting daemon...` and then the outcome, the status-bar dot flips green when the start
+  lands, and the daemon-backed live subscriptions attach without any manual action. Without a relay source no start is
+  attempted (it would fail requiring a relay URL): one honest status says so and the login/main flow continues degraded
+  exactly as before. Deliberate divergence from the retired reference client, which killed its auto-started daemon on
+  exit: the TUI never stops the daemon, because other `wn` commands share it — stop it explicitly with `/daemon stop`.
+- TUI: `f`/`x` on a highlighted user-search result follow/unfollow that user directly — the same key letters as the
+  Profile screen's `f`/`x`, but acting directly on the highlighted result (Profile's go through popups) instead of a
+  round-trip through the Profile screen with a pasted pubkey. Both run
+  `follows add`/`follows remove` on the background worker with in-flight feedback, and the outcome folds into a
+  per-row `[following]` badge. Rows an account already follows are badged up front from a `follows list` snapshot (one
+  local directory read per search, not a `follows check` per row). A fold whose search screen was left, whose acting
+  account was switched, or whose user is no longer among the results is dropped rather than badging the wrong row; the
+  results-focus hints line and the help card name the new keys.
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact
+  half-block glyphs (`▀` colored cells) on any image-capable terminal. The fidelity choice is deliberate: half-blocks
+  are ordinary colored cells rather than a native pixel image (iTerm2/Kitty/Sixel), so an image is bounded strictly to
+  its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
+  Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
+  `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
+  image full-size in a dismiss-on-any-key viewer, drawn with the terminal's native pixel protocol when it has one and
+  the same cell-exact rendering otherwise. Decrypted media is held in memory only; the downloaded artifact is removed
+  right after decode rather than cached on disk. No JSON response shapes changed (the existing `media download --json`
+  `output_path` is passed via `--output`).
 
 ### Changed
 
@@ -58,6 +86,90 @@ versioning through the workspace version in the root `Cargo.toml`.
   leaves cannot race past a caller-side precheck and lose the reason. Forensic
   audit records and conformance observations for this case change from
   `invalid_transition` to `leave_already_requested`.
+- TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
+  after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders
+  when that pane holds focus or while an interaction is armed — arming `/react`/`/reply`/`/delete` moves focus to the
+  composer, but the target row stays lit so you can see what the action is aimed at; a flick-through preview (focus on
+  the chat list with nothing armed) still shows no stray highlight. The chat sidebar shrinks to at
+  most a third of the width on narrow terminals (was a fixed 36 columns). Color roles are split: cyan for
+  chrome/labels/focused borders/selected markers, green reserved strictly for your own messages and the
+  daemon-connection dot; the unread badge stays yellow. The login screen centers its brand/menu block as a focused
+  card.
+- TUI: loading and empty states are now centered and color-coded — yellow while a load is in flight
+  (`loading messages...`, `searching...`, and the group-detail/profile/relay-health screen loads), dark gray when
+  genuinely empty (`no chats yet`, `no messages yet`). The messages pane distinguishes its three cases: no chat loaded
+  ("select a chat to start messaging"), a load in flight, and a loaded-but-empty chat.
+- TUI: popups are now sized to their content in cells and centered exactly, instead of always covering 70% of the
+  screen — a short confirmation is a small box, not a full panel. Confirmation bodies render yellow, the irreversible
+  typed-token logout body renders red, the title shows as a cyan-bold ` Title ` on the cyan border, and the hint row is
+  centered at the bottom. Every popup's key/paste modality and purpose is unchanged (styling and geometry only); the
+  image viewer keeps its aspect-fit 80%×80% card.
+- TUI: the hints bar now renders each key as a keycap (bold white text on a dark-gray block) followed by a dim label,
+  instead of one uniform gray string. The armed-interaction hint keeps its priority over the keymap while a
+  `/react`/`/reply`/`/delete` prefill is held, and boxes its `Enter`/`Esc` key references the same way. Popup hint rows
+  color the bracketed `[key]` cyan with a gray description.
+- TUI: the bottom status bar is now a full-width bar with a green ● / red ○ daemon-connection dot, the account display
+  name styled distinctly from its shortened npub, gray `│` separators, and hide-when-zero badges — the unread count
+  (yellow) only shows when nonzero instead of a permanent `0 unread`. Our last-action/error status segment is kept as a
+  trailing bar segment, truncated to fit. Existing redactions (terminal-safe account label and status, no relay URLs)
+  are unchanged.
+- TUI: user-initiated actions no longer freeze the interface for a `wn` subprocess round-trip. Sending a message,
+  replying, reacting/unreacting, deleting, opening a chat, searching users, opening group detail, and listing invites
+  now run on a dedicated background worker and fold their result back into the view on the next frame, so typing,
+  scrolling, and input stay responsive while the command runs. The ambient chat-list re-read that a notification for a
+  non-selected chat triggers runs on that same worker (behind any queued mutations, so a re-read reflects a send that
+  preceded it), so a notification burst never blocks key handling either. Each shows honest in-flight feedback
+  (`sending...`, `loading chat...`, `searching...`, `loading invites...`, `loading group detail...`, and a
+  `loading chat...` placeholder in the message pane) and reports the outcome when it lands. User-initiated mutations
+  keep their submission order (a single worker drains a FIFO queue), optimistic send rows keep their by-id upsert
+  semantics, and a result whose target the user has already moved past — an open-chat load for a chat they left, a
+  search whose query changed, an invites list or a chat re-list whose account changed — is dropped instead of
+  clobbering the current view. A same-chat reload merges its page by id rather than replacing, so a live subscription
+  insert during the load window survives. Failures are still caught to the status line and never tear down the session.
+  Genuinely modal or rare flows (login/create-identity, logout, daemon start/stop, popup submits such as
+  rename/add-member/follow, profile, relay health, and stream compose) stay synchronous. No JSON response shapes
+  changed.
+- TUI: `j`/`k` in the chat list now live-previews the highlighted conversation while focus stays on the list
+  (flick-through browsing). The preview is debounced to ~150ms of quiet after the last movement, so racing through the
+  list loads only the chat you settle on rather than one load per row; a preview superseded by further movement is
+  dropped, and it marks the previewed chat read the same way opening it does (it is on screen — matching the reference
+  client's select-clears-unread precedent). The composer's send target follows the previewed chat (WYSIWYG), and the
+  messages-pane title now names the loaded chat (terminal-safe, shortened, falling back to "Messages"), keeping the
+  `[N older | M newer]` overflow annotation alongside — so the pane always shows which conversation you are reading and
+  sending to, whether it was opened or previewed. `Enter` is unchanged — it opens the highlighted chat and moves focus
+  to the message pane, cancelling any pending preview; opening the chat already settled in the pane is a focus move
+  only (no redundant reload). No JSON response shapes changed.
+- TUI: inline images are no longer pixelated, and `o` now shows the actual image on pixel-capable terminals. Inline
+  previews stay cell-exact half-blocks but downscale through a proper resampling filter (Lanczos3) instead of
+  `ratatui-image`'s nearest-neighbor default, so the 8-row preview reads as a legible thumbnail. On a terminal whose
+  startup capability query reported a real pixel protocol, the `o` full-size viewer draws the image with that native
+  protocol (inside an iTerm2 session the misdetected kitty answer is overridden to iTerm2's own inline-image
+  protocol); every popup close now forces a full terminal clear and repaint so a terminal-side image can never linger
+  after dismissal. Decoded images are capped to a 2100x1400 fit box at decode time — a general memory bound on every
+  decode, so neither the inline preview nor any retained copy ever holds an unbounded camera-photo pixel buffer.
+  Separately, viewer pixels are retained in memory only: at most four viewer copies are kept (oldest evicted first,
+  worst case ~47 MB), so the decrypted download artifact is still removed right after decode and nothing is written
+  back to disk. That ~47 MB bounds the viewer pool only. The inline image maps are decode-capped per image but not
+  bounded in aggregate: every image scrolled past keeps one decode-capped protocol (at most ~11.8 MB) alive for the
+  life of the session, so the session ceiling is ~47 MB plus that per-image cost times the images ever rendered, not
+  ~47 MB flat. LRU-bounding that inline retention needs re-download support (status un-tracking plus re-entrant
+  downloads) and is a deliberate follow-up, not this change. The Lanczos3 downscale runs synchronously on the render
+  thread and is cached per target size, so
+  scrolling never re-resizes; changing the terminal width does re-resize every visible image on that one frame, an
+  accepted cost of the sharper preview. Halfblock-only terminals, and evicted images, keep the cell-exact viewer popup.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`), run on the background worker rather than the event
+  loop. Group-invite notifications surface as a status-line notice. Background re-lists and reorders keep the
+  highlighted chat selected by group id. No JSON response shapes changed.
 
 ### Security
 
@@ -73,6 +185,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
   chats keep their storage position. Equal-activity rows tie-break on ascending
   `group_id`, matching storage.
+- TUI: main-view keyboard accelerators now fire only on a plain keypress and ignore `Ctrl`/`Alt` chords. Previously
+  `Ctrl-U` in the message pane matched the bare `u` (unreact) accelerator and published an unconfirmed reaction
+  removal, and `Ctrl-Q` quit through the bare `q` accelerator. The whole accelerator family (`r`/`u`/`d`/`R`/`o`/`i`
+  and `g`/`G` in the message pane, `q`/`A`/`s`/`p`/`h`/`I` and `j`/`k` list navigation elsewhere) is now guarded, while
+  `Ctrl-U` stays the composer kill-line and `Ctrl-C` still quits. `Shift` is still tolerated, so the uppercase
+  accelerators keep working under the kitty keyboard protocol. No JSON response shapes changed.
+- TUI: logging out now reports the outcome faithfully when the follow-up account-list reload fails. Previously a reload
+  failure after a successful, irreversible wipe was reported with an `error:` prefix while the removed account and its
+  stale subscriptions lingered on screen. The logout is now reported as done and the status names `/refresh` to retry
+  the reload; a failure of the wipe itself is still reported as an error. No JSON response shapes changed.
+- TUI: a message-interaction command typed with a leading space now shows the armed-interaction hint and can be
+  cleared with `Esc`, matching how it submits. `parse_slash_command` already trims the composer text, so `/react`,
+  `/reply`, and `/delete` submit even with surrounding whitespace; the armed hint and the `Esc` escape hatch now trim
+  the same way instead of treating a space-prefixed command as an invisible, un-clearable armed state. Plain text with
+  a leading space is still a hand-typed draft and is preserved by `Esc`. No JSON response shapes changed.
 
 ## [0.9.7] - 2026-07-26
 
