@@ -168,6 +168,15 @@ pub struct TimelineMessageRecordFfi {
     /// re-sending the text. For received messages this is the originating event
     /// id and is always `Some(..)`.
     pub source_message_id_hex: Option<String>,
+    /// Authenticated MLS source epoch used to resolve this message's pinned
+    /// retention and encrypted-media decisions.
+    pub source_epoch: Option<u64>,
+    /// `None` means no recoverable source-epoch decision (legacy/safe retain).
+    /// `Some(0)` means retention was explicitly disabled for this message.
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration timestamp. A positive retention duration can
+    /// still have no finite expiry when timestamp addition overflowed.
+    pub retention_expires_at: Option<u64>,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
@@ -212,6 +221,9 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention_seconds,
+            retention_expires_at: value.retention_expires_at,
             direction: value.direction,
             group_id_hex: value.group_id_hex,
             sender: value.sender,
@@ -474,6 +486,8 @@ mod tests {
             message_id_hex: "msg".to_owned(),
             source_message_id_hex: None,
             source_epoch,
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "received".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "alice".to_owned(),
@@ -519,6 +533,28 @@ mod tests {
     fn timeline_message_record_ffi_with_no_media_yields_empty() {
         let record: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
         assert!(record.media.is_empty());
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_preserves_retention_states_without_recomputation() {
+        let legacy: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
+        assert_eq!(legacy.source_epoch, Some(7));
+        assert_eq!(legacy.retention_seconds, None);
+        assert_eq!(legacy.retention_expires_at, None);
+
+        let mut disabled = record_with_media(Some(8), None, None);
+        disabled.retention_seconds = Some(0);
+        let disabled = TimelineMessageRecordFfi::from(disabled);
+        assert_eq!(disabled.source_epoch, Some(8));
+        assert_eq!(disabled.retention_seconds, Some(0));
+        assert_eq!(disabled.retention_expires_at, None);
+
+        let mut unbounded = record_with_media(Some(9), None, None);
+        unbounded.retention_seconds = Some(300);
+        let unbounded = TimelineMessageRecordFfi::from(unbounded);
+        assert_eq!(unbounded.source_epoch, Some(9));
+        assert_eq!(unbounded.retention_seconds, Some(300));
+        assert_eq!(unbounded.retention_expires_at, None);
     }
 
     #[test]

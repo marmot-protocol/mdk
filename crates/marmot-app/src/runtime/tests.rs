@@ -263,6 +263,8 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         source_epoch: None,
+        retention_seconds: None,
+        retention_expires_at: None,
         group_id_hex: "group-1".to_owned(),
         direction: "inbound".to_owned(),
         sender: "sender-1".to_owned(),

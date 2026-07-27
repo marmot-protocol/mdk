@@ -289,6 +289,8 @@ mod tests {
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
             source_epoch: Some(7),
+            retention_seconds: Some(300),
+            retention_expires_at: Some(310),
             direction: "received".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),
@@ -341,6 +343,9 @@ mod tests {
         let message = &page.messages[0];
         assert_eq!(message.message_id_hex, "message-1");
         assert_eq!(message.source_message_id_hex.as_deref(), Some("source-1"));
+        assert_eq!(message.source_epoch, Some(7));
+        assert_eq!(message.retention_seconds, Some(300));
+        assert_eq!(message.retention_expires_at, Some(310));
         assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
         assert!(matches!(
             &message.content_tokens.blocks[0],
@@ -407,6 +412,8 @@ mod tests {
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "system".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),
@@ -451,6 +458,8 @@ mod tests {
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "system".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: "aa".repeat(32),

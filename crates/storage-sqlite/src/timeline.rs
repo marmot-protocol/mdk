@@ -28,12 +28,13 @@ use serde_json::{Value, json};
 /// (`AppEventReplayCursor`, which additionally tie-breaks on the LOCAL
 /// `insert_order` and is used only for lag-recovery watermark/suppression). Keep
 /// the two distinct: the replay cursor MUST NOT be applied to timeline
-/// pagination. Non-aliased `ORDER BY` sites reference these; a few aliased
-/// subquery lookups and the keyset-pagination predicates express the SAME order
-/// inline (they carry a table alias / bind placeholders that don't fit a plain
-/// fragment).
-pub(crate) const TIMELINE_ORDER_BY_ASC: &str = "ORDER BY timeline_at ASC, message_id_hex ASC";
-pub(crate) const TIMELINE_ORDER_BY_DESC: &str = "ORDER BY timeline_at DESC, message_id_hex DESC";
+/// pagination. Timeline record queries alias the materialized table as
+/// `timeline` and reference these constants; a few other lookups and the
+/// keyset-pagination predicates express the SAME order inline.
+pub(crate) const TIMELINE_ORDER_BY_ASC: &str =
+    "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC";
+pub(crate) const TIMELINE_ORDER_BY_DESC: &str =
+    "ORDER BY timeline.timeline_at DESC, timeline.message_id_hex DESC";
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// Largest number of rows a single timeline cursor query returns. A
@@ -99,6 +100,13 @@ pub struct TimelineMessageRecord {
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
     pub source_epoch: Option<u64>,
+    /// Retention decision pinned from the message's authenticated source epoch.
+    /// `None` means no recoverable decision; `Some(0)` means retention was
+    /// explicitly disabled for this message.
+    pub retention_seconds: Option<u64>,
+    /// Exact pinned expiration timestamp. A positive retention duration can
+    /// still have no finite expiry when timestamp addition overflowed.
+    pub retention_expires_at: Option<u64>,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
@@ -2243,12 +2251,19 @@ fn timeline_records_by_ids_tx(
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
-                plaintext, kind, tags_json, timeline_at, received_at,
-                reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                deleted, deleted_by_message_id_hex, invalidation_status
-             FROM message_timeline
-             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
+            "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+             FROM message_timeline AS timeline
+             LEFT JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
+             WHERE timeline.group_id_hex = ?
+               AND timeline.message_id_hex IN ({placeholders})"
         );
         let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
         params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
@@ -2316,7 +2331,7 @@ fn timeline_query_sql(
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     if let Some(group_id_hex) = &query.group_id_hex {
-        clauses.push("group_id_hex = ?".to_owned());
+        clauses.push("timeline.group_id_hex = ?".to_owned());
         params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
     }
     if let Some(search) = query
@@ -2325,7 +2340,7 @@ fn timeline_query_sql(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        clauses.push("plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
+        clauses.push("timeline.plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
         params.push(rusqlite::types::Value::Text(format!(
             "%{}%",
             escape_like_literal(search)
@@ -2337,7 +2352,7 @@ fn timeline_query_sql(
             // tie-break comparison flips from `<` to `<=`.
             let id_comparison = if pagination.inclusive { "<=" } else { "<" };
             clauses.push(format!(
-                "(timeline_at < ? OR (timeline_at = ? AND message_id_hex {id_comparison} ?))"
+                "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
             ));
             let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
             params.push(rusqlite::types::Value::Integer(cursor_at));
@@ -2347,8 +2362,10 @@ fn timeline_query_sql(
             ));
         }
         CursorDirection::After => {
-            clauses
-                .push("(timeline_at > ? OR (timeline_at = ? AND message_id_hex > ?))".to_owned());
+            clauses.push(
+                "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
+                    .to_owned(),
+            );
             let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
             params.push(rusqlite::types::Value::Integer(cursor_at));
             params.push(rusqlite::types::Value::Integer(cursor_at));
@@ -2372,11 +2389,17 @@ fn timeline_query_sql(
     };
     Ok((
         format!(
-            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
-                    plaintext, kind, tags_json, timeline_at, received_at,
-                    reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                    deleted, deleted_by_message_id_hex, invalidation_status
-             FROM message_timeline
+            "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+             FROM message_timeline AS timeline
+             LEFT JOIN app_events AS source
+               ON source.group_id_hex = timeline.group_id_hex
+              AND source.message_id_hex = timeline.message_id_hex
              {where_sql}
              {order_sql}
              LIMIT ?"
@@ -2696,44 +2719,54 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         source_epoch: row
             .get::<_, Option<i64>>(2)?
             .and_then(|value| value.try_into().ok()),
-        direction: row.get(3)?,
-        group_id_hex: row.get(4)?,
-        sender: row.get(5)?,
-        plaintext: row.get(6)?,
-        kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        timeline_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
-        reply_to_message_id_hex: row.get(11)?,
-        reply_preview: None,
-        media: optional_value_from_json(row.get::<_, Option<String>>(12)?).map_err(|err| {
+        retention_seconds: row
+            .get::<_, Option<i64>>(3)?
+            .and_then(|value| value.try_into().ok()),
+        retention_expires_at: row
+            .get::<_, Option<i64>>(4)?
+            .and_then(|value| value.try_into().ok()),
+        direction: row.get(5)?,
+        group_id_hex: row.get(6)?,
+        sender: row.get(7)?,
+        plaintext: row.get(8)?,
+        kind: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        tags: tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                12,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(13)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    13,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
-        reactions: reaction_summary_from_json(row.get::<_, String>(14)?).map_err(|err| {
+        timeline_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+        reply_to_message_id_hex: row.get(13)?,
+        reply_preview: None,
+        media: optional_value_from_json(row.get::<_, Option<String>>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        deleted: row.get::<_, i64>(15)? != 0,
-        deleted_by_message_id_hex: row.get(16)?,
-        invalidation_status: row.get(17)?,
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        reactions: reaction_summary_from_json(row.get::<_, String>(16)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        deleted: row.get::<_, i64>(17)? != 0,
+        deleted_by_message_id_hex: row.get(18)?,
+        invalidation_status: row.get(19)?,
     })
 }
 
