@@ -37,12 +37,16 @@ One-line install:
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
 ```
 
-For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
-an `npub` or raw hex public key:
+For repeatable noninteractive setup, pass the allowed inviter/welcomer and allowed
+message sender as either an `npub` or raw hex public key. `--allow-user` may be
+repeated to authorize multiple senders:
 
 ```sh
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
-  bash -s -- --yes --allow-welcomer npub1...
+  bash -s -- --yes \
+    --allow-welcomer npub1... \
+    --allow-user npub1... \
+    --allow-user 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 Generated-identity onboarding is the default (and can be selected explicitly
@@ -56,7 +60,8 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0
     --yes \
     --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
     --expected-npub npub1... \
-    --allow-welcomer npub1...
+    --allow-welcomer npub1... \
+    --allow-user npub1...
 ```
 
 The installer passes only the file path, never the secret, in process arguments.
@@ -67,10 +72,26 @@ then bootstraps the exact account with creation disabled. During interactive
 setup, the same identity can instead be entered through a masked `/dev/tty`
 prompt, which remains usable when the installer itself arrives through a pipe.
 The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
 
 Hermes keeps its isolated default connector home. Reusing the same identity in
 another connector home, such as OpenClaw's, requires a separate explicit import;
 the installers never opt into shared home/socket state silently.
+
+To accept Marmot messages from any sender (explicit opt-in):
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
+  bash -s -- --yes --allow-all-users
+```
+
+Welcomer allowlist entries control which accounts may invite the Marmot agent
+through `wn-agent`. Message-sender allowlist entries control which Marmot senders
+Hermes accepts after gateway restart via `$HERMES_HOME/.env`
+(`MARMOT_ALLOWED_USERS` and `MARMOT_ALLOW_ALL_USERS`).
+
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
 Use the exact release version when reporting bugs:
 
@@ -88,7 +109,8 @@ Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel
 Both install scripts verify SHA256 checksums for downloaded release assets.
 
 The installer prints restart guidance for your existing Hermes gateway. It does
-not restart Hermes automatically.
+not restart Hermes automatically. Restart a managed gateway with
+`hermes gateway restart`.
 
 Manual equivalent:
 
@@ -359,6 +381,19 @@ On connect, `MARMOT_WELCOMER_ALLOWLIST` (or `MARMOT_DM_ALLOW_FROM`) mirrors
 configured hex account ids into `wn-agent`'s welcomer allowlist so approved
 inviters are accepted. Non-hex entries are ignored. When unset, the adapter
 does not touch an allowlist managed directly on `wn-agent`.
+
+### Hermes message-sender authorization
+
+Hermes applies a separate sender gate before Marmot messages reach the agent.
+The installer persists this in `$HERMES_HOME/.env`, which Hermes loads at gateway
+startup:
+
+- `MARMOT_ALLOWED_USERS` — comma-separated lowercase hex Marmot account ids
+- `MARMOT_ALLOW_ALL_USERS` — explicit opt-in to accept any Marmot sender
+
+These variables are independent from the welcomer allowlist above. A phone user
+may be allowed to invite the agent without being allowed to message Hermes, and
+vice versa. Restart Hermes after changing either variable.
 
 ### Media trust model
 

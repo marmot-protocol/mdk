@@ -466,6 +466,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::AccountCreated { .. } => "account_created",
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",
+        AgentControlResponse::ProfileLookup { .. } => "profile_lookup",
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
@@ -691,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_reuses_existing_account_and_repairs_key_package() {
+    async fn bootstrap_reuses_existing_account_by_id_and_repairs_key_package() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("wn-agent.sock");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -741,6 +742,66 @@ mod tests {
         );
         let recorded = requests.lock().await;
         assert_eq!(recorded.len(), 3);
+        assert!(matches!(recorded[0], AgentControlRequest::AccountList));
+        assert!(matches!(
+            recorded[1],
+            AgentControlRequest::AccountPublishKeyPackage { .. }
+        ));
+        assert!(matches!(
+            recorded[2],
+            AgentControlRequest::AllowlistList { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reuses_existing_account_by_label_and_repairs_key_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("wn-agent.sock");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server =
+            spawn_mock_server(
+                socket_path.clone(),
+                requests.clone(),
+                |request| match request {
+                    AgentControlRequest::AccountList => AgentControlResponse::AccountList {
+                        accounts: vec![AgentControlAccount {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
+                            local_signing: true,
+                        }],
+                    },
+                    AgentControlRequest::AccountPublishKeyPackage { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::KeyPackagePublished {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            key_package_bytes: 1234,
+                        }
+                    }
+                    AgentControlRequest::AllowlistList { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::Allowlist {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            welcomer_account_ids_hex: vec![WELCOMER_ID.to_owned()],
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                },
+            )
+            .await;
+
+        let result = run_bootstrap(test_options(socket_path)).await.unwrap();
+        server.abort();
+
+        assert!(!result.created);
+        assert!(result.key_package_published);
+        assert_eq!(result.key_package_bytes, Some(1234));
+        assert_eq!(
+            result.welcomer_account_ids_hex,
+            vec![WELCOMER_ID.to_owned()]
+        );
+        let recorded = requests.lock().await;
+        assert_eq!(recorded.len(), 3);
+        assert!(matches!(recorded[0], AgentControlRequest::AccountList));
         assert!(matches!(
             recorded[1],
             AgentControlRequest::AccountPublishKeyPackage { .. }

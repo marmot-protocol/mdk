@@ -68,6 +68,8 @@ then bootstraps the exact account with creation disabled. During interactive
 setup, the same identity can instead be entered through a masked `/dev/tty`
 prompt, which remains usable when the installer itself arrives through a pipe.
 The source credential file is read-only and is not rewritten or removed.
+The `--expected-npub` value must be a public `npub` or public-key hex, never an
+`nsec` or raw secret key.
 
 OpenClaw keeps its isolated default connector home. Reusing the same identity in
 another connector home, such as Hermes's, requires a separate explicit import;

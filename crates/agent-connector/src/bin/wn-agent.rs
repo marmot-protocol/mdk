@@ -355,7 +355,7 @@ fn read_identity_from_tty() -> Result<Zeroizing<String>, String> {
                 libc::SIGTSTP,
             ] {
                 let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-                action.sa_sigaction = record_prompt_signal as libc::sighandler_t;
+                action.sa_sigaction = record_prompt_signal as *const () as libc::sighandler_t;
                 unsafe { libc::sigemptyset(&mut action.sa_mask) };
                 let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
                 if unsafe { libc::sigaction(signal, &action, previous.as_mut_ptr()) } != 0 {

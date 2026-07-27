@@ -287,6 +287,29 @@ export class MarmotAgentControlClient {
     return (await this.request({ type: "account_list" })) as unknown as AccountListResponse;
   }
 
+  async accountLookupProfile(accountIdHex: string): Promise<{
+    type: "profile_lookup";
+    status: "profile_found" | "profile_not_found" | "indeterminate";
+    retryable: boolean;
+  }> {
+    const response = await this.request({
+      type: "account_profile_lookup",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+    });
+    if (
+      response.type !== "profile_lookup" ||
+      !["profile_found", "profile_not_found", "indeterminate"].includes(String(response.status)) ||
+      typeof response.retryable !== "boolean"
+    ) {
+      throw new Error("wn-agent returned invalid profile_lookup response");
+    }
+    return response as {
+      type: "profile_lookup";
+      status: "profile_found" | "profile_not_found" | "indeterminate";
+      retryable: boolean;
+    };
+  }
+
   async accountPublishProfile(
     accountIdHex: string,
     name: string,

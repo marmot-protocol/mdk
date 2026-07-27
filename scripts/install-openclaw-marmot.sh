@@ -76,7 +76,8 @@ Options:
                            Import an existing nsec/raw-hex identity from an
                            owner-only regular file before bootstrap
   --expected-npub VALUE    Fail unless the imported identity matches this npub
-                           or 64-character hex public key
+                           or 64-character hex public key; this must be a public
+                           key, never an nsec or raw secret key
   --generate-identity      Explicitly use generated-identity onboarding (default)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --enable-streaming       Configure OpenClaw/Marmot live preview streaming

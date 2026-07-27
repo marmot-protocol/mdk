@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
-use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
+use nostr_sdk::prelude::{Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
@@ -324,6 +324,22 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 }
 
+fn validated_directory_event(
+    event: &Event,
+    query: &DirectoryEventQuery,
+) -> Option<NostrTransportEvent> {
+    if event.verify().is_err()
+        || u64::from(event.kind.as_u16()) != query.kind
+        || !query
+            .authors
+            .iter()
+            .any(|author| author == &event.pubkey.to_hex())
+    {
+        return None;
+    }
+    NostrTransportEvent::from_nostr_event(event).ok()
+}
+
 #[async_trait]
 impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
     async fn fetch_directory_events(
@@ -371,8 +387,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .await
                 .map_err(|_| "fetch directory events failed".to_owned())?;
             for event in events {
-                let event = NostrTransportEvent::from_nostr_event(&event)
-                    .map_err(|_| "map directory event failed".to_owned())?;
+                let Some(event) = validated_directory_event(&event, &query) else {
+                    continue;
+                };
                 records.push(DirectoryRelayEventRecord {
                     endpoints: request.endpoints.clone(),
                     event,
@@ -386,6 +403,30 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {
+        use nostr_sdk::prelude::{Event, EventBuilder, JsonUtil, Keys};
+
+        let expected = Keys::generate();
+        let wrong = Keys::generate();
+        let query = DirectoryEventQuery::new(0, vec![expected.public_key().to_hex()], 1);
+        let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"agent"}"#)
+            .sign_with_keys(&expected)
+            .unwrap();
+        assert!(validated_directory_event(&valid, &query).is_some());
+
+        let wrong_author = EventBuilder::new(Kind::Metadata, r#"{"name":"other"}"#)
+            .sign_with_keys(&wrong)
+            .unwrap();
+        assert!(validated_directory_event(&wrong_author, &query).is_none());
+
+        let mut tampered = serde_json::to_value(&valid).unwrap();
+        tampered["content"] = serde_json::Value::String(r#"{"name":"tampered"}"#.to_owned());
+        let tampered = Event::from_json(tampered.to_string()).unwrap();
+        assert!(tampered.verify().is_err());
+        assert!(validated_directory_event(&tampered, &query).is_none());
+    }
 
     #[tokio::test]
     async fn sdk_fetcher_errors_do_not_echo_invalid_relay_urls() {

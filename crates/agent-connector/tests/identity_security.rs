@@ -123,6 +123,17 @@ fn wait_for_exit(child: &mut Child) -> ExitStatus {
     panic!("prompt process did not exit after signal");
 }
 
+fn wait_for_echo_restore(pty: &Pty) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline {
+        if pty.echo_enabled() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("prompt did not restore terminal echo after signal");
+}
+
 #[test]
 fn masked_prompt_restores_tty_and_handler_before_reraising_sigint() {
     let home = tempfile::tempdir().unwrap();
@@ -165,12 +176,13 @@ fn masked_prompt_restores_tty_and_handler_before_reraising_sigint() {
         unsafe { libc::kill(process.id() as libc::pid_t, libc::SIGINT) },
         0
     );
+    wait_for_echo_restore(&pty);
+    // Darwin can keep a session leader in its final exit state while the test
+    // process retains the synthetic controlling terminal. Echo restoration is
+    // already verified above, so release the PTY before reaping the child.
+    drop(pty);
     let status = wait_for_exit(process);
     child.0.take();
 
     assert_eq!(status.signal(), Some(libc::SIGINT));
-    assert!(
-        pty.echo_enabled(),
-        "prompt must restore terminal echo before re-raising SIGINT"
-    );
 }

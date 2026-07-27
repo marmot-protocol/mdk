@@ -45,6 +45,12 @@ optional_env:
   - name: MARMOT_WELCOMER_ALLOWLIST
     description: "Comma-separated hex account ids mirrored into wn-agent's welcomer allowlist on connect (also MARMOT_DM_ALLOW_FROM)"
     password: false
+  - name: MARMOT_ALLOWED_USERS
+    description: "Comma-separated hex Marmot account ids allowed to message Hermes; loaded from $HERMES_HOME/.env at gateway startup"
+    password: false
+  - name: MARMOT_ALLOW_ALL_USERS
+    description: "When true, accept Marmot messages from any sender; loaded from $HERMES_HOME/.env at gateway startup"
+    password: false
   - name: MARMOT_MEDIA_LOCAL_ROOTS
     description: "Comma-separated local directories allowed for outbound media sends; defaults to $MARMOT_HOME/dev/inbound-media"
     password: false

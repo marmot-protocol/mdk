@@ -114,6 +114,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::AccountCreate { .. } => "account_create",
         AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
         AgentControlRequest::AccountPublishProfile { .. } => "account_publish_profile",
+        AgentControlRequest::AccountProfileLookup { .. } => "account_profile_lookup",
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",

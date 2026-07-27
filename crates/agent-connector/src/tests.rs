@@ -2,8 +2,8 @@
 
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
-    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
-    read_envelope, write_frame,
+    AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
+    AgentControlSendMaintenanceDisposition, read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -2113,6 +2113,87 @@ async fn connector_socket_publishes_profile_metadata() {
     assert_eq!(profile.display_name.as_deref(), Some("Hermes Agent"));
 
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let absent = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        absent,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::ProfileNotFound,
+            retryable: false,
+            ..
+        }
+    ));
+
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Existing Agent".to_owned(),
+            Some("Existing Agent".to_owned()),
+        )
+        .await
+        .unwrap();
+
+    let found = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        found,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::ProfileFound,
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn connector_profile_lookup_without_relays_is_indeterminate() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("agent")
+        .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let response = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::Indeterminate,
+            retryable: true,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
