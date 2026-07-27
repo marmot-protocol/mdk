@@ -23,43 +23,21 @@ import type {
   ChatType,
 } from "openclaw/plugin-sdk/channel-runtime";
 
-/** Explicit cross-channel target prefix, e.g. `marmot:<groupIdHex>`. */
-export const MARMOT_TARGET_PREFIX = "marmot";
+import {
+  isMarmotGroupIdHex,
+  MARMOT_TARGET_PREFIX,
+  tryCanonicalizeMarmotGroupTarget,
+} from "./target.js";
 
-// Marmot conversation ids are MLS group ids: opaque byte strings rendered as
-// lowercase hex. OpenMLS mints a 16-byte (32 hex char) id at group creation; a
-// wider even-length band is accepted so a non-default-length group id still
-// resolves, while staying narrow enough not to swallow unrelated short tokens.
-const MIN_GROUP_ID_HEX_CHARS = 32;
-const MAX_GROUP_ID_HEX_CHARS = 128;
-
-/** True for an even-length lowercase hex string in the Marmot group-id size band. */
-export function isMarmotGroupIdHex(value: string): boolean {
-  if (value.length < MIN_GROUP_ID_HEX_CHARS || value.length > MAX_GROUP_ID_HEX_CHARS) {
-    return false;
-  }
-  if (value.length % 2 !== 0) {
-    return false;
-  }
-  return /^[0-9a-f]+$/.test(value);
-}
+export { isMarmotGroupIdHex, MARMOT_TARGET_PREFIX } from "./target.js";
 
 /**
  * Normalize a raw target into a bare Marmot group id hex, or `undefined` when it
- * is not a Marmot group id. Strips an optional `marmot:` channel prefix and an
- * optional `0x`, lowercases, and validates an even-length hex string within the
- * group-id size band. The returned value is exactly what wn-agent's `send_final`
- * expects as the group id (no prefix), matching `normalizeHex` in src/client.ts.
+ * is not a Marmot group id. Accepts bare hex, `marmot:<hex>`, and internal
+ * `group:<hex>` announce/fallback routes.
  */
 export function normalizeMarmotTarget(raw: string): string | undefined {
-  let text = raw.trim().toLowerCase();
-  if (text.startsWith(`${MARMOT_TARGET_PREFIX}:`)) {
-    text = text.slice(MARMOT_TARGET_PREFIX.length + 1).trim();
-  }
-  if (text.startsWith("0x")) {
-    text = text.slice(2);
-  }
-  return isMarmotGroupIdHex(text) ? text : undefined;
+  return tryCanonicalizeMarmotGroupTarget(raw);
 }
 
 /**

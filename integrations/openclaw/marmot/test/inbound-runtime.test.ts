@@ -5,9 +5,11 @@ import type {
   AgentControlMediaRef,
   MarmotAgentControlClient,
 } from "../src/client.js";
+import { MarmotDispatchNotReadyError } from "../src/dispatch-errors.js";
 import {
   startMarmotInbound,
   syncMarmotAllowlist,
+  resetMarmotInboundAccountsForTests,
   type InboundPluginApi,
 } from "../src/inbound-runtime.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
@@ -78,9 +80,33 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
 
 afterEach(() => {
   resetMarmotInboundRuntimeForTests();
+  resetMarmotInboundAccountsForTests();
 });
 
 describe("startMarmotInbound", () => {
+  it("does not poison the account guard when control-client construction fails", async () => {
+    const logs: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: { info: (message) => logs.push(message), warn: (message) => logs.push(message) },
+    };
+
+    expect(() =>
+      startMarmotInbound(api, () => {}, {
+        clientFactory: () => {
+          throw new Error("client construction failed");
+        },
+      }),
+    ).toThrow("client construction failed");
+
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () => inboundStubClient([]),
+    });
+    await waitFor(() => logs.some((message) => message.includes("subscription established")));
+    stop();
+    expect(logs).not.toContain("marmot: inbound subscription already active; ignoring duplicate start");
+  });
+
   it("resolves the agent account and dispatches mapped inbound messages", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     let resolveFirst: () => void = () => {};
@@ -459,5 +485,281 @@ describe("syncMarmotAllowlist", () => {
       },
     });
     expect(used).toBe(false);
+  });
+
+  it("syncs the requested multi-account slice, not only default", async () => {
+    const synced: string[] = [];
+    const client = {
+      async accountList() {
+        return {
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        };
+      },
+      async allowlistList() {
+        return { type: "allowlist", account_id_hex: HEX32("aa"), welcomer_account_ids_hex: [] };
+      },
+      async allowlistAdd(_account: string, id: string) {
+        synced.push(id);
+        return { type: "ack" };
+      },
+      async allowlistRemove() {
+        return { type: "ack" };
+      },
+    } as unknown as MarmotAgentControlClient;
+    const api: InboundPluginApi = {
+      config: {
+        channels: {
+          marmot: {
+            accounts: {
+              alice: { socketPath: "/a.sock", dm: { allowFrom: [HEX32("11")] } },
+              bob: { socketPath: "/b.sock", dm: { allowFrom: [HEX32("22")] } },
+            },
+          },
+        },
+      },
+      logger: noopLogger,
+    };
+    await syncMarmotAllowlist(api, { clientFactory: () => client, channelAccountId: "bob" });
+    expect(synced).toEqual([HEX32("22")]);
+  });
+});
+
+describe("startMarmotInbound readiness redelivery", () => {
+  it("retries readiness timeout inside the per-group queue and dispatches one turn", async () => {
+    const messageId = HEX32("f2");
+    const event = inboundEvent("cc", "f2");
+    event.message_id_hex = messageId;
+    let attempts = 0;
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stop = startMarmotInbound(
+      api,
+      async (message) => {
+        attempts += 1;
+        if (attempts < 3) {
+          throw new MarmotDispatchNotReadyError("timeout");
+        }
+        dispatched.push(message.messageIdHex);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await waitFor(() => dispatched.length === 1);
+    stop();
+    expect(dispatched).toEqual([messageId]);
+    expect(attempts).toBe(3);
+  });
+
+  it("fails fast on non-retryable readiness without consuming retry slots", async () => {
+    const messageId = HEX32("f4");
+    const event = inboundEvent("cc", "f4");
+    event.message_id_hex = messageId;
+    let attempts = 0;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stop = startMarmotInbound(
+      api,
+      async () => {
+        attempts += 1;
+        throw new MarmotDispatchNotReadyError("non_retryable");
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    stop();
+    expect(attempts).toBe(1);
+  });
+
+  it("clears dedupe on exhausted readiness so stop/start replay can dispatch once", async () => {
+    const messageId = HEX32("f3");
+    const event = inboundEvent("cc", "f3");
+    event.message_id_hex = messageId;
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stopFirst = startMarmotInbound(
+      api,
+      async () => {
+        throw new MarmotDispatchNotReadyError("non_retryable");
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    stopFirst();
+
+    const stopSecond = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message.messageIdHex);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await waitFor(() => dispatched.length === 1);
+    stopSecond();
+    expect(dispatched).toEqual([messageId]);
+  });
+
+  it("keeps successful inbound messages deduped after readiness exhaustion on another id", async () => {
+    const successId = HEX32("a1");
+    const failedId = HEX32("a2");
+    const successEvent = inboundEvent("cc", "a1");
+    successEvent.message_id_hex = successId;
+    const failedEvent = inboundEvent("cc", "a2");
+    failedEvent.message_id_hex = failedId;
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stop = startMarmotInbound(
+      api,
+      async (message) => {
+        dispatched.push(message.messageIdHex);
+        if (message.messageIdHex === failedId) {
+          throw new MarmotDispatchNotReadyError("non_retryable");
+        }
+      },
+      { clientFactory: () => inboundStubClient([successEvent, failedEvent, successEvent]) },
+    );
+    await waitFor(() => dispatched.includes(successId) && dispatched.includes(failedId));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    stop();
+    expect(dispatched.filter((id) => id === successId)).toEqual([successId]);
+  });
+
+  it("rolls back dedupe for every coalesced debounced id after readiness exhaustion", async () => {
+    const firstId = HEX32("b1");
+    const secondId = HEX32("b2");
+    const firstEvent = inboundEvent("cc", "b1");
+    firstEvent.message_id_hex = firstId;
+    firstEvent.text = "part one";
+    const secondEvent = inboundEvent("cc", "b2");
+    secondEvent.message_id_hex = secondId;
+    secondEvent.text = "part two";
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stopFirst = startMarmotInbound(
+      api,
+      async () => {
+        throw new MarmotDispatchNotReadyError("non_retryable");
+      },
+      { clientFactory: () => inboundStubClient([firstEvent, secondEvent]) },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    stopFirst();
+
+    const stopSecond = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message.messageIdHex);
+      },
+      { clientFactory: () => inboundStubClient([firstEvent, secondEvent]) },
+    );
+    await waitFor(() => dispatched.length === 1);
+    stopSecond();
+    expect(dispatched).toEqual([secondId]);
+  });
+});
+
+describe("startMarmotInbound queue shedding", () => {
+  it("rolls back dedupe when enqueue rejects due to per-group depth", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const groupId = HEX32("cc");
+    const msg1 = inboundEvent("cc", "01");
+    const msg2 = inboundEvent("cc", "02");
+    const msg3 = inboundEvent("cc", "03");
+    msg1.group_id_hex = groupId;
+    msg2.group_id_hex = groupId;
+    msg3.group_id_hex = groupId;
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stopFirst = startMarmotInbound(
+      api,
+      async (message) => {
+        dispatched.push(message.messageIdHex);
+        if (message.messageIdHex === msg1.message_id_hex) {
+          await firstGate;
+        }
+      },
+      {
+        clientFactory: () => inboundStubClient([msg1, msg2, msg3]),
+        inboundQueueMaxDepth: 2,
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseFirst?.();
+    await waitFor(() => dispatched.length === 2);
+    stopFirst();
+
+    const stopSecond = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message.messageIdHex);
+      },
+      { clientFactory: () => inboundStubClient([msg3]) },
+    );
+    await waitFor(() => dispatched.filter((id) => id === msg3.message_id_hex).length === 1);
+    stopSecond();
+
+    expect(dispatched.filter((id) => id === msg3.message_id_hex)).toEqual([msg3.message_id_hex]);
+  });
+});
+
+describe("startMarmotInbound subscription restart dedupe", () => {
+  it("does not dispatch the same inbound message id twice after stop/start in one process", async () => {
+    const messageId = HEX32("f1");
+    const event = inboundEvent("cc", "f1");
+    event.message_id_hex = messageId;
+    let generation = 0;
+    const dispatched: string[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stopFirst = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message.messageIdHex);
+      },
+      {
+        clientFactory: () => {
+          generation += 1;
+          return inboundStubClient(generation === 1 ? [event] : [event]);
+        },
+      },
+    );
+    await waitFor(() => dispatched.length === 1);
+    stopFirst();
+    const stopSecond = startMarmotInbound(api, (message) => {
+      dispatched.push(message.messageIdHex);
+    }, {
+      clientFactory: () => inboundStubClient([event]),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    stopSecond();
+    expect(dispatched).toEqual([messageId]);
   });
 });

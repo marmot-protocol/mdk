@@ -8,15 +8,13 @@ import type {
   ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
 
-import type {
-  AgentControlMediaUpload,
-  MarmotAgentControlClient,
-} from "../src/client.js";
+import { AgentControlError, type AgentControlMediaUpload, type MarmotAgentControlClient } from "../src/client.js";
 import {
   createMarmotMessageAdapter,
   receiptFromMessageIds,
   SentMessageTargetCache,
 } from "../src/outbound.js";
+import { runInMarmotTurn, type MarmotTurnRoute } from "../src/turn-delivery.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 
@@ -25,6 +23,11 @@ interface SendFinalCall {
   groupIdHex: string;
   text: string;
   replyToMessageIdHex?: string | null;
+  idempotencyKey?: string;
+}
+
+interface SendFinalKeyCall extends SendFinalCall {
+  idempotencyKey?: string;
 }
 
 interface SendMediaCall {
@@ -51,15 +54,43 @@ function emptyClientCalls(): ClientCalls {
 }
 
 /** Minimal stub of the control client capturing send_final / send_media / delete. */
-function stubClient(calls: ClientCalls, messageIdsHex: string[] = [HEX32("ab")]): MarmotAgentControlClient {
+function stubClient(
+  calls: ClientCalls,
+  messageIdsHex: string[] = [HEX32("ab")],
+  opts: {
+    sendFinalImpl?: (
+      accountIdHex: string,
+      groupIdHex: string,
+      text: string,
+      replyToMessageIdHex?: string | null,
+      idempotencyKey?: string,
+    ) => Promise<{ type: string; message_ids_hex: string[] }>;
+  } = {},
+): MarmotAgentControlClient {
   return {
     async sendFinal(
       accountIdHex: string,
       groupIdHex: string,
       text: string,
       replyToMessageIdHex?: string | null,
+      idempotencyKey?: string,
     ) {
-      calls.sendFinal.push({ accountIdHex, groupIdHex, text, replyToMessageIdHex });
+      calls.sendFinal.push({
+        accountIdHex,
+        groupIdHex,
+        text,
+        replyToMessageIdHex,
+        idempotencyKey,
+      });
+      if (opts.sendFinalImpl) {
+        return opts.sendFinalImpl(
+          accountIdHex,
+          groupIdHex,
+          text,
+          replyToMessageIdHex,
+          idempotencyKey,
+        );
+      }
       return { type: "final_sent", message_ids_hex: messageIdsHex };
     },
     async sendMedia(
@@ -418,6 +449,208 @@ describe("createMarmotMessageAdapter", () => {
     });
     expect(await adapter.deleteByMessageId(HEX32("77"), { cfg: {}, accountId: null })).toBe(false);
     expect(calls.delete).toHaveLength(0);
+  });
+
+  it("rejects invalid outbound targets before calling wn-agent", async () => {
+    const calls = emptyClientCalls();
+    let resolvedTargets = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => {
+        resolvedTargets += 1;
+        return {
+          client: stubClient(calls),
+          marmotAccountIdHex: HEX32("aa"),
+        };
+      },
+    });
+    await expect(
+      adapter.send!.text!({
+        cfg: {},
+        to: `agent:main:marmot:group:${HEX32("cc")}`,
+        text: "nope",
+      } as ChannelMessageSendTextContext),
+    ).rejects.toThrow(/session key/);
+    expect(resolvedTargets).toBe(0);
+    expect(calls.sendFinal).toHaveLength(0);
+  });
+
+  it("rejects an invalid media target before reading or staging media", async () => {
+    const calls = emptyClientCalls();
+    let resolvedTargets = 0;
+    let mediaReads = 0;
+    let mediaWrites = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => {
+        resolvedTargets += 1;
+        return { client: stubClient(calls), marmotAccountIdHex: HEX32("aa") };
+      },
+      writeTempMedia: async () => {
+        mediaWrites += 1;
+        return "/tmp/unused";
+      },
+    });
+
+    await expect(
+      adapter.send!.media!({
+        cfg: {},
+        to: `agent:main:marmot:group:${HEX32("cc")}`,
+        text: "nope",
+        mediaUrl: "https://example.test/photo.jpg",
+        mediaReadFile: async () => {
+          mediaReads += 1;
+          return Buffer.from("bytes");
+        },
+      } as ChannelMessageSendMediaContext),
+    ).rejects.toThrow(/session key/);
+    expect(resolvedTargets).toBe(0);
+    expect(mediaReads).toBe(0);
+    expect(mediaWrites).toBe(0);
+    expect(calls.sendMedia).toHaveLength(0);
+  });
+
+  it("canonicalizes internal group:<hex> before send_final", async () => {
+    const calls = emptyClientCalls();
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(calls),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    await adapter.send!.text!({
+      cfg: {},
+      to: `group:${HEX32("cc")}`,
+      text: "hello",
+    } as ChannelMessageSendTextContext);
+    expect(calls.sendFinal[0]?.groupIdHex).toBe(HEX32("cc"));
+  });
+
+  it("retries a retryable message-tool send_final with one idempotency key", async () => {
+    const calls = emptyClientCalls();
+    let attempts = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(calls, [HEX32("ab")], {
+          sendFinalImpl: async () => {
+            attempts += 1;
+            if (attempts === 1) {
+              throw new AgentControlError("temporary", { retryable: true });
+            }
+            return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+          },
+        }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    await adapter.send!.text!({
+      cfg: {},
+      to: HEX32("cc"),
+      text: "retry-me",
+    } as ChannelMessageSendTextContext);
+    expect(attempts).toBe(2);
+    expect(calls.sendFinal).toHaveLength(2);
+    const keys = (calls.sendFinal as SendFinalKeyCall[]).map((call) => call.idempotencyKey);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("does not retry a non-retryable message-tool send_final", async () => {
+    const calls = emptyClientCalls();
+    let attempts = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(calls, [HEX32("ab")], {
+          sendFinalImpl: async () => {
+            attempts += 1;
+            throw new AgentControlError("bad", { retryable: false });
+          },
+        }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    await expect(
+      adapter.send!.text!({
+        cfg: {},
+        to: HEX32("cc"),
+        text: "nope",
+      } as ChannelMessageSendTextContext),
+    ).rejects.toThrow("bad");
+    expect(attempts).toBe(1);
+    expect(calls.sendFinal).toHaveLength(1);
+  });
+
+  it("rejects omitted to outside a turn before resolveTarget", async () => {
+    let resolvedTargets = 0;
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => {
+        resolvedTargets += 1;
+        return { client: stubClient(emptyClientCalls()), marmotAccountIdHex: HEX32("aa") };
+      },
+    });
+    await expect(
+      adapter.send!.text!({ cfg: {}, text: "nope" } as ChannelMessageSendTextContext),
+    ).rejects.toThrow(/outbound target is required/);
+    expect(resolvedTargets).toBe(0);
+  });
+
+  it("inherits group, account, reply-to, and idempotency during a Marmot turn", async () => {
+    const calls = emptyClientCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "acct-a",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key-inherit",
+    };
+    const resolveCalls: { accountId?: string | null }[] = [];
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: (_cfg, accountId) => {
+        resolveCalls.push({ accountId });
+        return { client: stubClient(calls), marmotAccountIdHex: HEX32("aa") };
+      },
+    });
+    await runInMarmotTurn(route, async () => {
+      await adapter.send!.text!({
+        cfg: {},
+        text: "inherited route",
+      } as ChannelMessageSendTextContext);
+    });
+    expect(resolveCalls).toEqual([{ accountId: "acct-a" }]);
+    expect(calls.sendFinal).toEqual([
+      {
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        text: "inherited route",
+        replyToMessageIdHex: HEX32("dd"),
+        idempotencyKey: "turn-key-inherit",
+      },
+    ]);
+  });
+
+  it("prefers explicit to and accountId over the bound turn route", async () => {
+    const calls = emptyClientCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "acct-a",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key",
+    };
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+    });
+    await runInMarmotTurn(route, async () => {
+      await adapter.send!.text!({
+        cfg: {},
+        accountId: "acct-b",
+        to: HEX32("ff"),
+        text: "explicit target",
+        replyToId: HEX32("ee"),
+      } as ChannelMessageSendTextContext);
+    });
+    expect(calls.sendFinal[0]).toMatchObject({
+      groupIdHex: HEX32("ff"),
+      replyToMessageIdHex: HEX32("ee"),
+    });
   });
 });
 

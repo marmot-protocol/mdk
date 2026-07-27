@@ -25,7 +25,16 @@ import {
   getDefaultLocalRoots,
 } from "openclaw/plugin-sdk/media-runtime";
 
-import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
+import { isRetryable, type AgentControlMediaUpload, type MarmotAgentControlClient } from "./client.js";
+import { canonicalizeMarmotGroupTarget, MarmotTargetError } from "./target.js";
+import {
+  getMarmotTurnDelivery,
+  matchesMarmotTurnRoute,
+  MarmotTurnDurableOwnershipError,
+  resolveTurnIdempotencyKey,
+  runTurnOutboundSendOnce,
+  type MarmotTurnDeliveryState,
+} from "./turn-delivery.js";
 
 /** Marmot send target resolved from OpenClaw config + the inbound chat id. */
 export interface ResolvedMarmotTarget {
@@ -248,6 +257,45 @@ function defaultOutboundMediaDir(): string {
   return join(process.env.MARMOT_HOME ?? join(homedir(), ".marmot"), "dev", "outbound-media");
 }
 
+const MESSAGE_SEND_RETRY_BACKOFF_MS = [100, 300] as const;
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Durable text send with one idempotency key reused across bounded retryable
+ * attempts. SDK queue replay after process death cannot preserve the key because
+ * `ChannelMessageSendTextContext` exposes no queue id.
+ */
+async function sendFinalWithIdempotentRetry(
+  client: MarmotAgentControlClient,
+  accountIdHex: string,
+  groupIdHex: string,
+  text: string,
+  replyToMessageIdHex?: string | null,
+  idempotencyKey: string = randomUUID(),
+): Promise<Awaited<ReturnType<MarmotAgentControlClient["sendFinal"]>>> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await client.sendFinal(
+        accountIdHex,
+        groupIdHex,
+        text,
+        replyToMessageIdHex ?? null,
+        idempotencyKey,
+      );
+    } catch (err) {
+      if (attempt >= MESSAGE_SEND_RETRY_BACKOFF_MS.length || !isRetryable(err)) {
+        throw err;
+      }
+      await sleep(MESSAGE_SEND_RETRY_BACKOFF_MS[attempt] ?? 100);
+      attempt += 1;
+    }
+  }
+}
+
 /** Stage bytes under the connector-approved root; each copy is group-readable for split-user deployments. */
 async function defaultWriteTempMedia(
   fileName: string,
@@ -260,6 +308,34 @@ async function defaultWriteTempMedia(
   await writeFile(path, bytes, { flag: "wx", mode: 0o640 });
   await chmod(path, 0o640);
   return path;
+}
+
+function resolveOutboundGroupTarget(
+  rawTo: string | undefined | null,
+  turn: MarmotTurnDeliveryState | undefined,
+): string {
+  const trimmed = rawTo?.trim();
+  if (trimmed) {
+    return canonicalizeMarmotGroupTarget(trimmed);
+  }
+  if (turn) {
+    return turn.route.groupIdHex;
+  }
+  throw new MarmotTargetError("empty");
+}
+
+function resolveOutboundChannelAccountId(
+  rawAccountId: string | undefined | null,
+  turn: MarmotTurnDeliveryState | undefined,
+): string | undefined | null {
+  const trimmed = rawAccountId?.trim();
+  if (trimmed) {
+    return trimmed;
+  }
+  if (turn) {
+    return turn.route.channelAccountId;
+  }
+  return rawAccountId ?? null;
 }
 
 /**
@@ -311,20 +387,55 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     },
     send: {
       text: async (ctx: ChannelMessageSendTextContext) => {
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
-        const response = await client.sendFinal(
+        const turn = getMarmotTurnDelivery();
+        const groupIdHex = resolveOutboundGroupTarget(ctx.to, turn);
+        const channelAccountId = resolveOutboundChannelAccountId(ctx.accountId, turn);
+        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, channelAccountId);
+        const sameTurnRoute =
+          turn &&
+          matchesMarmotTurnRoute(turn, {
+            channelAccountId,
+            marmotAccountIdHex,
+            groupIdHex,
+          });
+        if (sameTurnRoute && turn.outboundDelivered && turn.outboundReceipt) {
+          return {
+            receipt: receiptFromMessageIds(turn.outboundReceipt.messageIdsHex, now()),
+          };
+        }
+        if (sameTurnRoute && turn.durableOwner === "sink") {
+          throw new MarmotTurnDurableOwnershipError();
+        }
+        const idempotencyKey =
+          sameTurnRoute && resolveTurnIdempotencyKey(turn)
+            ? resolveTurnIdempotencyKey(turn)!
+            : randomUUID();
+        const replyToMessageIdHex =
+          ctx.replyToId?.trim() || (sameTurnRoute ? turn.route.replyToMessageIdHex : null);
+        const executeSend = async () => {
+          const response = await sendFinalWithIdempotentRetry(
+            client,
+            marmotAccountIdHex,
+            groupIdHex,
+            ctx.text,
+            replyToMessageIdHex,
+            idempotencyKey,
+          );
+          return { messageIdsHex: response.message_ids_hex };
+        };
+        const receipt = sameTurnRoute
+          ? await runTurnOutboundSendOnce(turn, executeSend, isRetryable)
+          : await executeSend();
+        sentTargets.recordAll(receipt.messageIdsHex, {
           marmotAccountIdHex,
-          ctx.to,
-          ctx.text,
-          ctx.replyToId ?? null,
-        );
-        sentTargets.recordAll(response.message_ids_hex, {
-          marmotAccountIdHex,
-          groupIdHex: ctx.to,
+          groupIdHex,
         });
-        return { receipt: receiptFromMessageIds(response.message_ids_hex, now()) };
+        return { receipt: receiptFromMessageIds(receipt.messageIdsHex, now()) };
       },
       media: async (ctx: ChannelMessageSendMediaContext) => {
+        const turn = getMarmotTurnDelivery();
+        const groupIdHex = resolveOutboundGroupTarget(ctx.to, turn);
+        const channelAccountId = resolveOutboundChannelAccountId(ctx.accountId, turn);
         const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);
         if (!resolved) {
           throw new Error(
@@ -332,17 +443,17 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
           );
         }
         try {
-          const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
+          const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, channelAccountId);
           const caption = ctx.text.trim().length > 0 ? ctx.text : null;
           const response = await client.sendMedia(
             marmotAccountIdHex,
-            ctx.to,
+            groupIdHex,
             [resolved.upload],
             caption,
           );
           sentTargets.recordAll(response.message_ids_hex, {
             marmotAccountIdHex,
-            groupIdHex: ctx.to,
+            groupIdHex,
           });
           return { receipt: receiptFromMessageIds(response.message_ids_hex, now(), "media") };
         } finally {

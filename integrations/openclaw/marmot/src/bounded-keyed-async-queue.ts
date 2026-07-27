@@ -19,11 +19,12 @@ export class BoundedKeyedAsyncQueue {
     this.maxDepthPerKey = Math.max(1, maxDepthPerKey);
   }
 
-  enqueue(key: string, task: () => Promise<void>): void {
+  /** Returns false when the per-key depth cap rejects the task. */
+  enqueue(key: string, task: () => Promise<void>): boolean {
     const depth = this.depths.get(key) ?? 0;
     if (depth >= this.maxDepthPerKey) {
       this.onShed?.("marmot: inbound queue depth exceeded; shedding turn");
-      return;
+      return false;
     }
     this.depths.set(key, depth + 1);
     void this.queue
@@ -40,5 +41,6 @@ export class BoundedKeyedAsyncQueue {
         }
       })
       .catch(() => this.onShed?.("marmot: inbound dispatch task failed"));
+    return true;
   }
 }

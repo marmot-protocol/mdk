@@ -3,6 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 import { BoundedKeyedAsyncQueue } from "../src/bounded-keyed-async-queue.js";
 
 describe("BoundedKeyedAsyncQueue", () => {
+  it("reports whether enqueue accepted the task", () => {
+    const queue = new BoundedKeyedAsyncQueue(1);
+    expect(queue.enqueue("group-a", async () => {})).toBe(true);
+    expect(queue.enqueue("group-a", async () => {})).toBe(false);
+  });
+
   it("sheds incoming turns once per-key depth is reached", async () => {
     let releaseFirst: (() => void) | undefined;
     const firstStarted = new Promise<void>((resolve) => {

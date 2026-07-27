@@ -31,6 +31,8 @@ import {
 } from "./config.js";
 import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
+import { startMarmotGatewayAccount } from "./gateway.js";
+import { canonicalizeMarmotGroupTarget } from "./target.js";
 import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   marmotInboundRuntimeSnapshot,
@@ -82,22 +84,23 @@ function accountSnapshot(
   probe?: unknown,
 ): ChannelAccountSnapshot {
   const accountId = account.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
-  const inbound = marmotInboundRuntimeSnapshot(accountId);
+  // Gateway-owned `setStatus` snapshots win; the legacy runtime-state shim is only
+  // for direct legacy callers/tests that start inbound without a gateway account.
+  const status = runtime ?? marmotInboundRuntimeSnapshot(accountId);
   return {
-    ...runtime,
-    ...inbound,
+    ...status,
     accountId,
     name: accountId,
     enabled: true,
     configured: true,
-    running: inbound.running === true,
-    connected: inbound.connected === true,
-    lastStartAt: inbound.lastStartAt ?? runtime?.lastStartAt ?? null,
-    lastStopAt: inbound.lastStopAt ?? runtime?.lastStopAt ?? null,
-    lastError: inbound.lastError ?? runtime?.lastError ?? null,
-    lastInboundAt: inbound.lastInboundAt ?? runtime?.lastInboundAt ?? null,
-    lastOutboundAt: inbound.lastOutboundAt ?? runtime?.lastOutboundAt ?? null,
-    reconnectAttempts: inbound.reconnectAttempts ?? runtime?.reconnectAttempts,
+    running: status.running === true,
+    connected: status.connected === true,
+    lastStartAt: status.lastStartAt ?? null,
+    lastStopAt: status.lastStopAt ?? null,
+    lastError: status.lastError ?? null,
+    lastInboundAt: status.lastInboundAt ?? null,
+    lastOutboundAt: status.lastOutboundAt ?? null,
+    reconnectAttempts: status.reconnectAttempts,
     mode: account.streamMode,
     dmPolicy: account.dmPolicy ?? "allowlist",
     allowFrom: account.allowFrom.map(String),
@@ -162,7 +165,8 @@ export function createMarmotDeleteActionAdapter(
       const to = typeof ctx.params.to === "string" ? ctx.params.to : undefined;
       if (to) {
         const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId ?? null);
-        await client.deleteMessage(marmotAccountIdHex, to, messageId);
+        const groupIdHex = canonicalizeMarmotGroupTarget(to);
+        await client.deleteMessage(marmotAccountIdHex, groupIdHex, messageId);
         return jsonResult({ ok: true, deleted: true });
       }
       return jsonResult({ ok: false, error: "could not resolve group for this message id" });
@@ -248,6 +252,9 @@ export function createMarmotChannelPlugin() {
         ],
       },
       actions,
+      gateway: {
+        startAccount: (ctx) => startMarmotGatewayAccount(ctx),
+      },
     },
     security: {
       dm: {

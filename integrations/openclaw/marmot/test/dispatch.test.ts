@@ -1,15 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { NonAppendOnlyUpdateError } from "../src/append-only.js";
 import type { StreamMode } from "../src/config.js";
 import { AgentControlError, type AgentControlMediaRef } from "../src/client.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
+  buildMarmotTurnConfigOverlay,
   createMarmotInboundDispatcher,
   MarmotReplySink,
   type MarmotDispatchClient,
   type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
+import { MarmotDispatchNotReadyError } from "../src/dispatch-errors.js";
+import {
+  getMarmotTurnDelivery,
+  recordTurnOutboundDelivery,
+  runInMarmotTurn,
+  type MarmotTurnRoute,
+} from "../src/turn-delivery.js";
 
 import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
 
@@ -160,6 +169,12 @@ describe("MarmotReplySink", () => {
     expect(calls.begin).toBe(0);
     expect(calls.append).toEqual([]);
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+  });
+
+  it("preserves final reply whitespace while checking for non-empty text", async () => {
+    const calls = emptyCalls();
+    await makeSink(calls).deliver({ text: "  hello world  \n" }, { kind: "final" });
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["  hello world  \n"]);
   });
 
   it("streams progressive blocks as append-only deltas and finalizes", async () => {
@@ -352,11 +367,11 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
   });
 
-  it("falls back to a durable final when preview finalize fails", async () => {
+  it("falls back to a durable final when preview finalize fails with NonAppendOnlyUpdateError", async () => {
     const calls = emptyCalls();
     const client = stubClient(calls);
     client.streamFinalize = (async () => {
-      throw new Error("finalize failed");
+      throw new NonAppendOnlyUpdateError();
     }) as typeof client.streamFinalize;
     const sink = new MarmotReplySink({
       client,
@@ -370,10 +385,72 @@ describe("MarmotReplySink", () => {
     await sink.deliver({ text: "hello" }, { kind: "block" });
     await sink.deliver({ text: "hello world" }, { kind: "final" });
 
-    // The final suffix is appended before stream_finalize is attempted; the
-    // finalize then throws, so we abandon and re-send the whole text durably.
     expect(calls.append).toEqual(["hel", "lo", " world"]);
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+  });
+
+  it("does not fall back to send_final when preview finalize exhausts retryable errors", async () => {
+    const calls = emptyCalls();
+    const client = stubClient(calls);
+    client.streamFinalize = (async (
+      _id: string,
+      _capability: string,
+      _final: string,
+      hash: string,
+      count: number,
+    ) => {
+      calls.finalize.push({ hash, count });
+      throw new AgentControlError("timed out waiting for stream finalize", { retryable: true });
+    }) as typeof client.streamFinalize;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "block",
+      quicCandidates: ["quic://broker:4450"],
+    });
+
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await expect(sink.deliver({ text: "hello world" }, { kind: "final" })).rejects.toThrow(
+      "timed out waiting for stream finalize",
+    );
+
+    expect(calls.finalize.length).toBeGreaterThan(1);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("logs ambiguous finalize failure without send_final fallback for non-retryable errors", async () => {
+    const calls = emptyCalls();
+    const logs: string[] = [];
+    const client = stubClient(calls);
+    client.streamFinalize = (async (
+      _id: string,
+      _capability: string,
+      _final: string,
+      hash: string,
+      count: number,
+    ) => {
+      calls.finalize.push({ hash, count });
+      throw new AgentControlError("bad request", { retryable: false });
+    }) as typeof client.streamFinalize;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "block",
+      quicCandidates: ["quic://broker:4450"],
+      log: (message) => logs.push(message),
+    });
+
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await expect(sink.deliver({ text: "hello world" }, { kind: "final" })).rejects.toThrow(
+      "bad request",
+    );
+
+    expect(calls.finalize).toHaveLength(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(logs.some((line) => line.includes("ambiguous"))).toBe(true);
+    expect(logs.some((line) => line.includes("retryable"))).toBe(false);
   });
 
   it("commits the streamed reply at flush when the turn sends blocks but no final", async () => {
@@ -494,9 +571,106 @@ describe("MarmotReplySink", () => {
     await expect(sink.deliver({ text: "hello" }, { kind: "final" })).rejects.toThrow("bad request");
     expect(attempts).toBe(1);
   });
+
+  it("cancels a prewarmed preview when tool-owned delivery suppresses sink commit", async () => {
+    const calls = emptyCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "default",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key",
+    };
+    await runInMarmotTurn(route, async () => {
+      recordTurnOutboundDelivery(getMarmotTurnDelivery()!, { messageIdsHex: [HEX32("11")] });
+      const sink = new MarmotReplySink({
+        client: stubClient(calls),
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        streamMode: "block",
+        quicCandidates: ["quic://broker:4450"],
+      });
+      await sink.prewarm();
+      await sink.deliver({ text: "suppressed final" }, { kind: "final" });
+    });
+    expect(calls.begin).toBe(1);
+    expect(calls.cancel).toHaveLength(1);
+    expect(calls.finalize).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+  });
+});
+
+describe("buildMarmotTurnConfigOverlay", () => {
+  it("denies sessions_send, alsoAllows message, and leaves the base cfg untouched", () => {
+    const baseCfg = {
+      tools: { deny: ["exec"], alsoAllow: ["browser"], profile: "coding" },
+      channels: { marmot: { socketPath: "/tmp/m.sock" } },
+    };
+    const overlay = buildMarmotTurnConfigOverlay(baseCfg);
+    expect(overlay.tools).toMatchObject({
+      deny: ["exec", "sessions_send"],
+      alsoAllow: ["browser", "message"],
+      profile: "coding",
+    });
+    expect(baseCfg.tools).toEqual({ deny: ["exec"], alsoAllow: ["browser"], profile: "coding" });
+    expect(baseCfg).not.toBe(overlay);
+  });
 });
 
 describe("createMarmotInboundDispatcher", () => {
+  it("passes the turn-local cfg overlay into dispatchReplyWithBufferedBlockDispatcher", async () => {
+    const calls = emptyCalls();
+    const captured: unknown[] = [];
+    const baseCfg = { tools: { deny: ["exec"] } };
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-overlay-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          captured.push(params);
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "done" }, { kind: "final" });
+        },
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: baseCfg,
+      runtimeChannel,
+      client: stubClient(calls) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "hello",
+    });
+    const params = captured[0] as { cfg: { tools?: { deny?: string[]; alsoAllow?: string[] } } };
+    expect(params.cfg).not.toBe(baseCfg);
+    expect(params.cfg.tools?.deny).toContain("sessions_send");
+    expect(params.cfg.tools?.alsoAllow).toContain("message");
+    expect(baseCfg.tools?.deny).toEqual(["exec"]);
+  });
+
   it("enables OpenClaw block streaming when Marmot live block streaming is resolved on", async () => {
     const calls = emptyCalls();
     const captured: unknown[] = [];
@@ -562,6 +736,10 @@ describe("createMarmotInboundDispatcher", () => {
       (captured[0] as { replyOptions: { disableBlockStreaming?: boolean } }).replyOptions
         .disableBlockStreaming,
     ).toBe(false);
+    expect(
+      (captured[0] as { replyOptions: { sourceReplyDeliveryMode?: string } }).replyOptions
+        .sourceReplyDeliveryMode,
+    ).toBe("automatic");
     expect(calls.sendFinal[0]?.accountIdHex).toBe(HEX32("aa"));
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
     // GAP-01: the durable reply threads to the triggering message id.
@@ -738,6 +916,22 @@ describe("createMarmotInboundDispatcher activation cache", () => {
     });
   }
 
+  it("throws MarmotDispatchNotReadyError when initial groupInfo fails non-retryably", async () => {
+    const turns = { count: 0 };
+    const client = {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo() {
+        throw new AgentControlError("permanent membership failure", { retryable: false });
+      },
+    } as unknown as MarmotDispatchClient;
+    const dispatch = makeDispatch(client, turns);
+
+    await expect(dispatch(baseMessage)).rejects.toBeInstanceOf(MarmotDispatchNotReadyError);
+    expect(turns.count).toBe(0);
+  });
+
   it("queries group membership once and reuses the cached is_direct fact", async () => {
     const turns = { count: 0 };
     const { client, groupInfoCalls } = countingClient({ isDirect: false });
@@ -759,7 +953,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
 
     await dispatch({ ...baseMessage, mentionsSelf: true });
 
-    expect(groupInfoCalls()).toBe(0);
+    expect(groupInfoCalls()).toBe(1);
     expect(turns.count).toBe(1);
   });
 
@@ -796,33 +990,97 @@ describe("createMarmotInboundDispatcher activation cache", () => {
     expect(groupInfoCalls()).toBe(2);
   });
 
-  it("fails closed (skips the turn) when the membership lookup errors", async () => {
+  it("throws MarmotDispatchNotReadyError when the membership lookup fails non-retryably", async () => {
     const turns = { count: 0 };
     const { client, groupInfoCalls } = countingClient({ isDirect: true, throwError: () => true });
     const dispatch = makeDispatch(client, turns);
 
-    await dispatch({ ...baseMessage });
+    await expect(dispatch(baseMessage)).rejects.toBeInstanceOf(MarmotDispatchNotReadyError);
 
-    // An unaddressed message with an unresolvable membership must NOT barge in.
     expect(turns.count).toBe(0);
     expect(groupInfoCalls()).toBe(1);
   });
 
-  it("does not cache a membership-lookup error (retries on the next message)", async () => {
+  it("does not cache a non-retryable membership lookup (next message retries groupInfo)", async () => {
     const turns = { count: 0 };
     let fail = true;
     const { client, groupInfoCalls } = countingClient({ isDirect: true, throwError: () => fail });
     const dispatch = makeDispatch(client, turns);
 
-    expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("01") })).toBe(
-      false,
-    );
+    await expect(
+      dispatch({ ...baseMessage, messageIdHex: HEX32("01") }),
+    ).rejects.toBeInstanceOf(MarmotDispatchNotReadyError);
     expect(groupInfoCalls()).toBe(1);
 
-    // The error was not cached: the next message re-reads, succeeds, and (DM) replies.
     fail = false;
     expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("02") })).toBe(true);
     expect(groupInfoCalls()).toBe(2);
+  });
+
+  it("retries a transient membership lookup and starts one effective-DM turn", async () => {
+    const turns = { count: 0 };
+    let calls = 0;
+    const client = {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo(accountIdHex: string, groupIdHex: string) {
+        calls += 1;
+        if (calls === 1) {
+          throw new AgentControlError("temporary", { retryable: true });
+        }
+        return {
+          type: "group_info" as const,
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          member_count: 2,
+          is_direct: true,
+          subject: null,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+    const dispatch = makeDispatch(client, turns);
+
+    expect(await runTurn(dispatch, turns, baseMessage)).toBe(true);
+    expect(calls).toBe(2);
+    expect(turns.count).toBe(1);
+  });
+
+  it("throws a typed not-ready failure after readiness exhaustion", async () => {
+    const turns = { count: 0 };
+    const client = {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo() {
+        throw new AgentControlError("temporary", { retryable: true });
+      },
+    } as unknown as MarmotDispatchClient;
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: cachingRuntime(turns),
+      client,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await expect(dispatch({ ...baseMessage, mentionsSelf: true })).rejects.toBeInstanceOf(
+      MarmotDispatchNotReadyError,
+    );
+    expect(turns.count).toBe(0);
+  });
+
+  it("skips without throwing when the message is not addressed", async () => {
+    const turns = { count: 0 };
+    const { client } = countingClient({ isDirect: false });
+    const dispatch = makeDispatch(client, turns);
+
+    await expect(dispatch(baseMessage)).resolves.toBeUndefined();
+    expect(turns.count).toBe(0);
   });
 
   /** Dispatch a message and report whether an agent turn ran (the gate let it through). */

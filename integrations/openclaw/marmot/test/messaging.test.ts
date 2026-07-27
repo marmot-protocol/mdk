@@ -13,17 +13,18 @@ const GID16 = "a".repeat(32);
 const GID32 = "b".repeat(64);
 
 describe("isMarmotGroupIdHex", () => {
-  it("accepts 16-byte and 32-byte lowercase hex", () => {
+  it("accepts any non-empty even-length lowercase hex", () => {
     expect(isMarmotGroupIdHex(GID16)).toBe(true);
     expect(isMarmotGroupIdHex(GID32)).toBe(true);
+    expect(isMarmotGroupIdHex("ab")).toBe(true);
+    expect(isMarmotGroupIdHex("abcd")).toBe(true);
   });
 
-  it("rejects too-short, odd-length, non-hex, and uppercase input", () => {
-    expect(isMarmotGroupIdHex("ab")).toBe(false); // too short
+  it("rejects empty, odd-length, non-hex, and uppercase input", () => {
+    expect(isMarmotGroupIdHex("")).toBe(false);
     expect(isMarmotGroupIdHex("a".repeat(31))).toBe(false); // odd length
     expect(isMarmotGroupIdHex(`zz${"a".repeat(30)}`)).toBe(false); // non-hex
     expect(isMarmotGroupIdHex("A".repeat(32))).toBe(false); // not normalized
-    expect(isMarmotGroupIdHex("a".repeat(130))).toBe(false); // beyond the band
   });
 });
 
@@ -36,6 +37,7 @@ describe("normalizeMarmotTarget", () => {
     expect(normalizeMarmotTarget(`  ${MARMOT_TARGET_PREFIX}:${GID16}  `)).toBe(GID16);
     expect(normalizeMarmotTarget(`0x${GID16}`)).toBe(GID16);
     expect(normalizeMarmotTarget(`MARMOT:0X${"A".repeat(32)}`)).toBe(GID16);
+    expect(normalizeMarmotTarget(`group:${GID16}`)).toBe(GID16);
   });
 
   it("returns undefined for non-group-id input", () => {

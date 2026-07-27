@@ -116,6 +116,39 @@ describe("resolveMarmotChannelAccount", () => {
       probe,
     });
   });
+
+  it("prefers gateway runtime status over the legacy shim when runtime is present", async () => {
+    const cfg = { channels: { marmot: { profileNameOnboarding: false } } } as unknown as Cfg;
+    const plugin = createMarmotChannelPlugin();
+    const status = plugin.status;
+    if (!status?.buildAccountSnapshot) {
+      throw new Error("Marmot plugin should expose channel status hooks");
+    }
+    const account = resolveMarmotChannelAccount(cfg, "default");
+    const gatewayRuntime = {
+      accountId: "default",
+      running: true,
+      connected: true,
+      lastStartAt: 42,
+      lastInboundAt: 99,
+      lastStopAt: null,
+      lastError: null,
+    };
+
+    const snapshot = await status.buildAccountSnapshot({
+      account,
+      cfg,
+      runtime: gatewayRuntime,
+      probe: undefined,
+      audit: undefined,
+    });
+    expect(snapshot).toMatchObject({
+      running: true,
+      connected: true,
+      lastStartAt: 42,
+      lastInboundAt: 99,
+    });
+  });
 });
 
 describe("createMarmotDeleteActionAdapter", () => {

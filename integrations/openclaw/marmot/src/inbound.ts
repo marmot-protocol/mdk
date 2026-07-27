@@ -29,6 +29,11 @@ export interface MarmotInboundMessage {
   senderDisplayName?: string | null;
   /** Encrypted media references (`imeta` tags) attached to this message, if any. */
   media?: AgentControlMediaRef[];
+  /**
+   * When debounce coalescing merged multiple inbound events, every source message
+   * id so a failed pre-turn dispatch can roll back dedupe for the whole burst.
+   */
+  coalescedMessageIdsHex?: string[];
 }
 
 export interface MarmotGroupInvite {
@@ -75,6 +80,8 @@ export interface MarmotInboundBridgeOptions {
   /** Cap on the reconnect delay after exponential growth. */
   maxReconnectDelayMs?: number;
   dedupeWindow?: number;
+  /** Optional shared dedupe owner (survives bridge restarts within one process). */
+  dedupe?: InboundMessageDedupe;
 }
 
 const DEFAULT_RECONNECT_DELAY_MS = 1000;
@@ -105,7 +112,7 @@ export function reconnectBackoffMs(
 }
 
 /** Bounded insertion-ordered set for recent message-id dedupe. */
-class RecentIds {
+export class InboundMessageDedupe {
   private readonly ids = new Set<string>();
   constructor(private readonly max: number) {}
 
@@ -122,6 +129,28 @@ class RecentIds {
       }
     }
   }
+
+  /** Drop one id so a failed pre-turn dispatch can be replayed safely. */
+  remove(id: string): void {
+    this.ids.delete(id);
+  }
+}
+
+const dedupeByAccount = new Map<string, InboundMessageDedupe>();
+
+/** Per OpenClaw channel account dedupe that survives subscription restarts. */
+export function inboundDedupeForAccount(accountKey: string): InboundMessageDedupe {
+  const key = accountKey.trim() || "default";
+  let dedupe = dedupeByAccount.get(key);
+  if (!dedupe) {
+    dedupe = new InboundMessageDedupe(DEFAULT_DEDUPE_WINDOW);
+    dedupeByAccount.set(key, dedupe);
+  }
+  return dedupe;
+}
+
+export function resetInboundDedupeForTests(): void {
+  dedupeByAccount.clear();
 }
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -142,13 +171,14 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 export class MarmotInboundBridge {
-  private readonly recent: RecentIds;
+  private readonly recent: InboundMessageDedupe;
 
   constructor(
     private readonly client: InboundSubscribeClient,
     private readonly options: MarmotInboundBridgeOptions,
   ) {
-    this.recent = new RecentIds(options.dedupeWindow ?? DEFAULT_DEDUPE_WINDOW);
+    this.recent =
+      options.dedupe ?? new InboundMessageDedupe(options.dedupeWindow ?? DEFAULT_DEDUPE_WINDOW);
   }
 
   /** Run until `signal` aborts, reconnecting between subscription drops. */

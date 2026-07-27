@@ -21,12 +21,23 @@ import {
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
-import { isRetryable, type MarmotAgentControlClient } from "./client.js";
+import { isRetryable, type GroupInfoResponse, type MarmotAgentControlClient } from "./client.js";
 import type { GroupActivation, StreamMode } from "./config.js";
+import { MarmotDispatchNotReadyError } from "./dispatch-errors.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
+import { waitForGroupReadiness } from "./readiness.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
 import { resolveLatestAssistantTextFromSessionStore } from "./session-transcript.js";
+import {
+  acquireSinkDeliveryOrSuppress,
+  awaitTurnOutboundResolution,
+  getMarmotTurnDelivery,
+  resolveTurnIdempotencyKey,
+  runInMarmotTurn,
+  shouldSuppressSinkDurableDelivery,
+  type MarmotTurnRoute,
+} from "./turn-delivery.js";
 
 // --- reply sink (unit-tested) -----------------------------------------------
 
@@ -307,14 +318,27 @@ export class MarmotReplySink {
     );
   }
 
+  private async resolveSinkDeliveryGate(): Promise<"suppress" | "proceed"> {
+    const turn = getMarmotTurnDelivery();
+    if (!turn) {
+      return "proceed";
+    }
+    return acquireSinkDeliveryOrSuppress(turn);
+  }
+
   private async sendFinal(text: string): Promise<void> {
+    const gate = await this.resolveSinkDeliveryGate();
+    if (gate === "suppress") {
+      this.log("marmot: durable reply already owned for this turn; skipping sink send_final");
+      return;
+    }
     this.log(`marmot: sending durable final (${text.length} chars)`);
     // One idempotency key for all attempts of THIS durable reply: a retry after a
     // post-write timeout reuses the key so the connector dedups instead of
     // double-posting an unrecallable encrypted message. Bounded retries with a
     // tiny backoff cover the transient/timeout window; non-retryable errors fail
     // fast and the last error is rethrown.
-    const idempotencyKey = randomUUID();
+    const idempotencyKey = resolveTurnIdempotencyKey(getMarmotTurnDelivery()) ?? randomUUID();
     const backoffMs = [100, 300];
     let attempt = 0;
     for (;;) {
@@ -388,9 +412,30 @@ export class MarmotReplySink {
     if (this.finalized) {
       return true;
     }
+    const turn = getMarmotTurnDelivery();
+    if (turn) {
+      await awaitTurnOutboundResolution(turn);
+      if (shouldSuppressSinkDurableDelivery(turn)) {
+        if (this.preview?.isActive && !this.previewAbandoned) {
+          await this.abandonPreview("sink_delivery_suppressed");
+        }
+        this.finalized = true;
+        this.log("marmot: durable reply already owned for this turn; skipping sink commit");
+        return true;
+      }
+    }
     const finalText = await this.bestFinalText(text);
-    if (!finalText) {
+    if (!finalText.trim()) {
       return false;
+    }
+    const gate = await this.resolveSinkDeliveryGate();
+    if (gate === "suppress") {
+      if (this.preview?.isActive && !this.previewAbandoned) {
+        await this.abandonPreview("sink_delivery_suppressed");
+      }
+      this.finalized = true;
+      this.log("marmot: durable reply already owned for this turn; skipping sink commit");
+      return true;
     }
     this.finalized = true;
     this.logPartialSummary();
@@ -400,10 +445,19 @@ export class MarmotReplySink {
         this.log(`marmot: live preview finalized (${finalText.length} chars)`);
         return true;
       } catch (error) {
-        const reason =
-          error instanceof NonAppendOnlyUpdateError ? "final_not_append_only" : "finalize_error";
-        this.log(`marmot: preview finalize failed (${reason}); falling back to a durable send`);
-        await this.abandonPreview(reason);
+        if (error instanceof NonAppendOnlyUpdateError) {
+          const reason = "final_not_append_only";
+          this.log(`marmot: preview finalize failed (${reason}); falling back to a durable send`);
+          await this.abandonPreview(reason);
+        } else {
+          const retryable = isRetryable(error);
+          this.log(
+            retryable
+              ? "marmot: preview finalize failed (retryable); not falling back to send_final"
+              : "marmot: preview finalize failed (ambiguous); not falling back to send_final",
+          );
+          throw error;
+        }
       }
     }
     await this.sendFinal(finalText);
@@ -443,6 +497,38 @@ export class MarmotReplySink {
 }
 
 // --- inbound turn dispatch (SDK-coupled; harness-validated) ------------------
+
+const MARMOT_TURN_DENIED_TOOLS = ["sessions_send"] as const;
+const MARMOT_TURN_ALSO_ALLOW_TOOLS = ["message"] as const;
+
+function mergeUniqueToolNames(existing: readonly string[] | undefined, additions: readonly string[]): string[] {
+  const merged = new Set(existing ?? []);
+  for (const entry of additions) {
+    merged.add(entry);
+  }
+  return [...merged];
+}
+
+/**
+ * Immutable per-turn config overlay: deny cross-session `sessions_send` for the
+ * source-bound Marmot reply turn while keeping the shared `message` tool available
+ * for out-of-band sends. Never mutates `baseCfg`.
+ */
+export function buildMarmotTurnConfigOverlay(baseCfg: unknown): Record<string, unknown> {
+  const cfg = baseCfg as {
+    tools?: { deny?: string[]; alsoAllow?: string[]; allow?: string[]; profile?: string };
+    agents?: { list?: Array<{ tools?: { deny?: string[]; alsoAllow?: string[] } }> };
+  };
+  const tools = cfg.tools ?? {};
+  return {
+    ...cfg,
+    tools: {
+      ...tools,
+      deny: mergeUniqueToolNames(tools.deny, MARMOT_TURN_DENIED_TOOLS),
+      alsoAllow: mergeUniqueToolNames(tools.alsoAllow, MARMOT_TURN_ALSO_ALLOW_TOOLS),
+    },
+  };
+}
 
 /** Narrow view of `api.runtime.channel` (only the members we drive). */
 export interface OpenClawChannelRuntime {
@@ -538,6 +624,11 @@ export class GroupActivationCache {
   }
 }
 
+type InboundTurnGateResult =
+  | { proceed: false; kind: "not_addressed" }
+  | { proceed: false; kind: "not_ready"; reason: "non_retryable" }
+  | { proceed: true; groupInfo?: GroupInfoResponse; needsMembershipCheck: boolean };
+
 /**
  * Decide whether an inbound group message should run an agent turn. Always reply
  * when addressed (`mentionsSelf`, a trigger matches) or in an effective DM
@@ -545,38 +636,43 @@ export class GroupActivationCache {
  * otherwise unaddressed — to avoid a round-trip on the common addressed case, and
  * the `is_direct` result is cached per (account, group) so repeated ambient
  * messages don't each re-read MLS state (the cache is invalidated on a
- * `group_state_changed` event). On a membership-lookup error we fail **closed**
- * (skip the turn): under the `mention` policy an unaddressed message in a group
- * whose membership we can't resolve is more likely a multi-party conversation the
- * agent wasn't addressed in, and barging in there is worse (and unrecallable)
- * than dropping a single reply in a true two-party DM, where the user can simply
- * re-send or address the agent explicitly. The error is not cached.
+ * `group_state_changed` event). A transient membership-lookup error defers to
+ * {@link waitForGroupReadiness} instead of skipping before retries can run. A
+ * non-retryable membership error is surfaced as a readiness failure; it is not
+ * evidence that the message was merely unaddressed and is not cached.
  */
-async function shouldRunTurn(
+async function resolveInboundTurnGate(
   deps: MarmotDispatchDeps,
   cache: GroupActivationCache,
   message: MarmotInboundMessage,
-): Promise<boolean> {
+): Promise<InboundTurnGateResult> {
   if (deps.groupActivation === "always") {
-    return true;
+    return { proceed: true, needsMembershipCheck: false };
   }
   if (message.mentionsSelf) {
-    return true;
+    return { proceed: true, needsMembershipCheck: false };
   }
   if (matchesMentionPattern(message.text, deps.mentionPatterns)) {
-    return true;
+    return { proceed: true, needsMembershipCheck: false };
   }
   const cached = cache.get(message.accountIdHex, message.groupIdHex);
   if (cached !== undefined) {
-    return cached;
+    return cached
+      ? { proceed: true, needsMembershipCheck: false }
+      : { proceed: false, kind: "not_addressed" };
   }
   try {
     const info = await deps.client.groupInfo(message.accountIdHex, message.groupIdHex);
     cache.set(message.accountIdHex, message.groupIdHex, info.is_direct);
-    return info.is_direct;
-  } catch {
-    deps.log?.("marmot: group membership lookup failed; skipping turn (fail-closed)");
-    return false;
+    return info.is_direct
+      ? { proceed: true, groupInfo: info, needsMembershipCheck: false }
+      : { proceed: false, kind: "not_addressed" };
+  } catch (err) {
+    if (isRetryable(err)) {
+      return { proceed: true, needsMembershipCheck: true };
+    }
+    deps.log?.("marmot: outbound group readiness check failed (non-retryable)");
+    return { proceed: false, kind: "not_ready", reason: "non_retryable" };
   }
 }
 
@@ -673,12 +769,56 @@ export function createMarmotInboundDispatcher(
   // it lives exactly as long as the inbound subscription that owns it.
   const activationCache = new GroupActivationCache();
   const dispatch = async (message: MarmotInboundMessage): Promise<void> => {
-    // Activation gating: in a multi-party group, only run a turn when addressed.
-    if (!(await shouldRunTurn(deps, activationCache, message))) {
+    const gate = await resolveInboundTurnGate(deps, activationCache, message);
+    if (!gate.proceed) {
+      if (gate.kind === "not_ready") {
+        throw new MarmotDispatchNotReadyError(gate.reason);
+      }
       deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
       return;
     }
+
+    let groupInfo = gate.groupInfo;
+    if (!groupInfo) {
+      const readiness = await waitForGroupReadiness({
+        client: deps.client,
+        accountIdHex: message.accountIdHex,
+        groupIdHex: message.groupIdHex,
+        log: deps.log,
+      });
+      if (readiness.status !== "ready") {
+        throw new MarmotDispatchNotReadyError(readiness.reason);
+      }
+      groupInfo = readiness.groupInfo;
+    }
+
+    if (gate.needsMembershipCheck) {
+      activationCache.set(message.accountIdHex, message.groupIdHex, groupInfo.is_direct);
+      if (!groupInfo.is_direct) {
+        deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
+        return;
+      }
+    }
+
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+    const turnRoute: MarmotTurnRoute = {
+      channelAccountId,
+      marmotAccountIdHex: message.accountIdHex,
+      groupIdHex: message.groupIdHex,
+      replyToMessageIdHex: message.messageIdHex,
+      idempotencyKey: randomUUID(),
+    };
+
+    await runInMarmotTurn(turnRoute, async () => {
+      await dispatchTurn(deps, message, channelAccountId);
+    });
+  };
+
+  const dispatchTurn = async (
+    deps: MarmotDispatchDeps,
+    message: MarmotInboundMessage,
+    channelAccountId: string,
+  ): Promise<void> => {
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
       cfg: deps.cfg,
       channel: "marmot",
@@ -737,6 +877,7 @@ export function createMarmotInboundDispatcher(
 
     deps.log?.("marmot: agent turn starting");
     await sink.prewarm();
+    const turnCfg = buildMarmotTurnConfigOverlay(deps.cfg);
     await runChannelInboundEvent({
       channel: "marmot",
       accountId: channelAccountId,
@@ -757,12 +898,16 @@ export function createMarmotInboundDispatcher(
           runDispatch: () =>
             deps.runtimeChannel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: ctxPayload,
-              cfg: deps.cfg,
+              cfg: turnCfg,
               dispatcherOptions: {
                 deliver: (payload: ReplyPayloadLike, info: ReplyDelivery) =>
                   sink.deliver(payload, info),
               },
               replyOptions: {
+                // Keep the bound Marmot reply sink as the durable owner for this
+                // turn. sessions_send / message_tool_only must not suppress an
+                // assistant final that never reached send_final.
+                sourceReplyDeliveryMode: "automatic",
                 disableBlockStreaming: deps.blockStreaming ? false : true,
                 onPartialReply: (payload: PartialReplyPayloadLike) => sink.partial(payload),
                 onAssistantMessageStart: () => sink.status("Thinking..."),

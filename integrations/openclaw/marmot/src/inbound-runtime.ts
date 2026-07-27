@@ -12,18 +12,27 @@
 
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 
+import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
+
 import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
-import { MarmotInboundBridge, type MarmotInboundMessage } from "./inbound.js";
+import { MarmotDispatchNotReadyError } from "./dispatch-errors.js";
+import {
+  inboundDedupeForAccount,
+  MarmotInboundBridge,
+  resetInboundDedupeForTests,
+  type MarmotInboundMessage,
+} from "./inbound.js";
 import {
   maybeHandleProfileOnboardingInbound,
   maybeSendProfilePromptOnJoin,
   ProfileNameOnboardingStore,
 } from "./profile-onboarding.js";
 import {
+  DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   markMarmotInboundReady,
   markMarmotInboundReceived,
   markMarmotInboundReconnect,
@@ -47,10 +56,13 @@ export interface InboundPluginApi {
 
 type ClientFactory = (resolved: ResolvedMarmotAccount) => MarmotAgentControlClient;
 
-function resolveAccount(api: InboundPluginApi): ResolvedMarmotAccount {
+function resolveConfiguredAccount(
+  api: InboundPluginApi,
+  channelAccountId?: string | null,
+): ResolvedMarmotAccount {
   return resolveMarmotChannelAccount(
     api.config as Parameters<typeof resolveMarmotChannelAccount>[0],
-    null,
+    channelAccountId ?? null,
   );
 }
 
@@ -120,6 +132,7 @@ function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMe
     mentionsSelf: items.some((item) => item.mentionsSelf === true),
     replyToMessageIdHex,
     media,
+    coalescedMessageIdsHex: items.map((item) => item.messageIdHex),
   };
 }
 
@@ -142,6 +155,10 @@ export type MarmotAmbientSurfacer = (event: {
 
 export interface StartMarmotInboundOptions {
   signal?: AbortSignal;
+  /** OpenClaw channel account id for multi-account deployments. */
+  channelAccountId?: string;
+  /** Gateway-owned status writer; preferred over the legacy runtime-state shim. */
+  statusSink?: (patch: Partial<ChannelAccountSnapshot>) => void;
   /** Override the control-client factory (tests inject a stub). */
   clientFactory?: ClientFactory;
   /**
@@ -167,15 +184,38 @@ export interface StartMarmotInboundOptions {
    * have been missed, so no cached membership can be trusted.
    */
   clearGroupActivationCache?: () => void;
+  /** Override per-group inbound dispatch queue depth (tests). */
+  inboundQueueMaxDepth?: number;
 }
 
-// The gateway can full-load the plugin in more than one in-process context
-// (the HTTP server and the agent-runtime pre-warm each invoke `registerFull`),
-// so `startMarmotInbound` can be called more than once in a single process. A
-// second live subscription would deliver — and dispatch an agent turn for —
-// every inbound message twice, so only the first start is honored until it is
-// stopped.
-let inboundActive = false;
+// Per OpenClaw channel account: only one live subscription at a time.
+const inboundActiveByAccount = new Map<string, boolean>();
+
+const DISPATCH_NOT_READY_MAX_ATTEMPTS = 3;
+const DISPATCH_NOT_READY_BACKOFF_MS = [50, 100, 200] as const;
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveInboundAccountKey(
+  api: InboundPluginApi,
+  channelAccountId?: string | null,
+): string {
+  if (channelAccountId?.trim()) {
+    return channelAccountId.trim();
+  }
+  try {
+    return resolveConfiguredAccount(api, channelAccountId).accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+  } catch {
+    return DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+  }
+}
+
+export function resetMarmotInboundAccountsForTests(): void {
+  inboundActiveByAccount.clear();
+  resetInboundDedupeForTests();
+}
 
 /**
  * Run the wn-agent inbound subscription, dispatching each mapped message to
@@ -187,21 +227,49 @@ export function startMarmotInbound(
   dispatch: InboundAgentDispatcher,
   options: StartMarmotInboundOptions = {},
 ): () => void {
-  if (inboundActive) {
+  const inboundAccountKey = resolveInboundAccountKey(api, options.channelAccountId);
+  if (inboundActiveByAccount.get(inboundAccountKey)) {
     api.logger.info("marmot: inbound subscription already active; ignoring duplicate start");
     return () => {};
   }
-  const resolved = resolveAccount(api);
-  const statusAccountId = resolved.accountId ?? null;
-  inboundActive = true;
-  markMarmotInboundStarting(statusAccountId);
+  const resolved = resolveMarmotChannelAccount(
+    api.config as Parameters<typeof resolveMarmotChannelAccount>[0],
+    options.channelAccountId ?? null,
+  );
+  // Complete synchronous construction before claiming the per-account guard. A
+  // bad socket/config or onboarding-store path must not poison later restarts.
+  const client = (options.clientFactory ?? clientForAccount)(resolved);
+  const onboardingStore = resolved.profileNameOnboarding
+    ? new ProfileNameOnboardingStore(resolved.profileOnboardingStatePath)
+    : null;
+  const statusAccountId = resolved.accountId ?? inboundAccountKey;
+  inboundActiveByAccount.set(inboundAccountKey, true);
+  const publishStatus = (patch: Partial<ChannelAccountSnapshot>) => {
+    options.statusSink?.({ accountId: statusAccountId, ...patch });
+    if (!options.statusSink) {
+      if (patch.running === true && patch.connected === true) {
+        markMarmotInboundReady(statusAccountId);
+      } else if (patch.running === true && patch.connected === false) {
+        if (patch.lastError) {
+          markMarmotInboundReconnect(statusAccountId);
+        } else {
+          markMarmotInboundStarting(statusAccountId);
+        }
+      } else if (patch.running === false) {
+        markMarmotInboundStopped(statusAccountId);
+      } else if (patch.lastInboundAt) {
+        markMarmotInboundReceived(statusAccountId);
+      }
+    }
+  };
+  publishStatus({ running: true, connected: false, lastStartAt: Date.now(), lastStopAt: null, lastError: null });
   const controller = new AbortController();
   // Release the guard when the loop is stopped so a clean restart can re-subscribe.
   controller.signal.addEventListener(
     "abort",
     () => {
-      inboundActive = false;
-      markMarmotInboundStopped(statusAccountId);
+      inboundActiveByAccount.delete(inboundAccountKey);
+      publishStatus({ running: false, connected: false, lastStopAt: Date.now() });
     },
     { once: true },
   );
@@ -215,12 +283,6 @@ export function startMarmotInbound(
     }
   }
   const signal = controller.signal;
-  const client = (options.clientFactory ?? clientForAccount)(resolved);
-  // One-time, opt-in public profile-name flow (default off). Runs ahead of the
-  // agent turn so a consent prompt/reply isn't fed to the model.
-  const onboardingStore = resolved.profileNameOnboarding
-    ? new ProfileNameOnboardingStore(resolved.profileOnboardingStatePath)
-    : null;
 
   void (async () => {
     let accountIdHex: string;
@@ -228,8 +290,8 @@ export function startMarmotInbound(
       accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
     } catch {
       api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
-      inboundActive = false;
-      markMarmotInboundStopped(statusAccountId);
+      inboundActiveByAccount.delete(inboundAccountKey);
+      publishStatus({ running: false, connected: false, lastStopAt: Date.now() });
       return;
     }
     let readyLogged = false;
@@ -238,9 +300,16 @@ export function startMarmotInbound(
     // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
     // dispatch for every other group (the previous inline `await dispatch` did).
     const dispatchQueue = new BoundedKeyedAsyncQueue(
-      DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+      options.inboundQueueMaxDepth ?? DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
       (message) => api.logger.warn(message),
     );
+    const inboundDedupe = inboundDedupeForAccount(inboundAccountKey);
+    const rollbackInboundDedupe = (message: MarmotInboundMessage): void => {
+      const ids = message.coalescedMessageIdsHex ?? [message.messageIdHex];
+      for (const id of ids) {
+        inboundDedupe.remove(id);
+      }
+    };
     const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
       if (onboardingStore) {
         const intercepted = await maybeHandleProfileOnboardingInbound({
@@ -260,10 +329,35 @@ export function startMarmotInbound(
         }
       }
       api.logger.info("marmot: inbound message received; dispatching agent turn");
-      await dispatch(message);
+      for (let attempt = 0; attempt < DISPATCH_NOT_READY_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          await dispatch(message);
+          return;
+        } catch (error) {
+          if (!(error instanceof MarmotDispatchNotReadyError)) {
+            throw error;
+          }
+          const exhausted =
+            error.reason === "non_retryable" || attempt >= DISPATCH_NOT_READY_MAX_ATTEMPTS - 1;
+          if (exhausted) {
+            rollbackInboundDedupe(message);
+            api.logger.warn(
+              error.reason === "non_retryable"
+                ? "marmot: inbound dispatch failed (readiness non-retryable)"
+                : "marmot: inbound dispatch failed after readiness exhaustion",
+            );
+            throw error;
+          }
+          api.logger.warn("marmot: inbound dispatch not ready; retrying after backoff");
+          await sleepMs(DISPATCH_NOT_READY_BACKOFF_MS[attempt] ?? 100);
+        }
+      }
     };
     const runQueued = (message: MarmotInboundMessage): void => {
-      dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
+      const accepted = dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
+      if (!accepted) {
+        rollbackInboundDedupe(message);
+      }
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
@@ -292,8 +386,15 @@ export function startMarmotInbound(
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
+      dedupe: inboundDedupe,
       onReady: () => {
-        markMarmotInboundReady(statusAccountId);
+        publishStatus({
+          running: true,
+          connected: true,
+          lastStartAt: Date.now(),
+          lastStopAt: null,
+          lastError: null,
+        });
         api.logger.info(
           readyLogged
             ? "marmot: inbound subscription re-established"
@@ -302,17 +403,11 @@ export function startMarmotInbound(
         readyLogged = true;
       },
       onMessage: (message) => {
-        // Non-blocking: record receipt, then hand off to the per-group queue so the
-        // inbound loop keeps reading (enables cross-group concurrency). Dedupe in
-        // MarmotInboundBridge.handle() already ran synchronously before this.
-        markMarmotInboundReceived(statusAccountId);
+        publishStatus({ lastInboundAt: Date.now() });
         submitInbound(message);
       },
       onMessageDeleted: (deletion) => {
-        // A peer retracted a message. Surface it to the agent as quiet ambient
-        // (next-turn) context when a surfacer is wired; always recorded + logged
-        // privacy-safely (no ids/pubkeys in the log).
-        markMarmotInboundReceived(statusAccountId);
+        publishStatus({ lastInboundAt: Date.now() });
         api.logger.info("marmot: inbound message deletion observed");
         void Promise.resolve(
           options.surfaceAmbientEvent?.({
@@ -324,11 +419,7 @@ export function startMarmotInbound(
         ).catch(() => api.logger.warn("marmot: failed to surface message deletion to the agent"));
       },
       onGroupStateChanged: (change) => {
-        // A durable group-state change (membership/admin/rename/avatar) was
-        // observed. The change kind contents are NOT logged; they ARE surfaced to
-        // the agent as quiet ambient context (via the surfacer) when wired. The
-        // mapped sentence never carries a member pubkey.
-        markMarmotInboundReceived(statusAccountId);
+        publishStatus({ lastInboundAt: Date.now() });
         api.logger.info("marmot: inbound group state change observed");
         // Drop the cached is_direct activation fact for this group: a
         // membership change can flip whether the group is an effective DM, so the
@@ -347,7 +438,7 @@ export function startMarmotInbound(
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
-            markMarmotInboundReceived(statusAccountId);
+            publishStatus({ lastInboundAt: Date.now() });
             // Greet on join: offer to publish a public profile name (once).
             await maybeSendProfilePromptOnJoin({
               store: onboardingStore,
@@ -360,7 +451,7 @@ export function startMarmotInbound(
           }
         : undefined,
       onResync: ({ droppedEvents }) => {
-        markMarmotInboundReceived(statusAccountId);
+        publishStatus({ lastInboundAt: Date.now() });
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
@@ -369,7 +460,11 @@ export function startMarmotInbound(
         options.clearGroupActivationCache?.();
       },
       onError: () => {
-        markMarmotInboundReconnect(statusAccountId);
+        publishStatus({
+          running: true,
+          connected: false,
+          lastError: "inbound subscription dropped",
+        });
         api.logger.warn("marmot: inbound subscription dropped; reconnecting");
       },
     });
@@ -381,6 +476,8 @@ export function startMarmotInbound(
 
 export interface SyncAllowlistOptions {
   clientFactory?: ClientFactory;
+  /** OpenClaw channel account id for multi-account deployments. */
+  channelAccountId?: string | null;
 }
 
 /**
@@ -393,7 +490,7 @@ export async function syncMarmotAllowlist(
   options: SyncAllowlistOptions = {},
 ): Promise<void> {
   try {
-    const resolved = resolveAccount(api);
+    const resolved = resolveConfiguredAccount(api, options.channelAccountId);
     if (resolved.allowFrom.length === 0) {
       return;
     }
