@@ -254,6 +254,7 @@ async fn run_search(
             .await;
     }
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
+    emitter.report_tally(&params);
 }
 
 /// Walk outward from the searcher, emitting each radius as it resolves.
@@ -389,6 +390,7 @@ async fn resolve_layer(
 ) -> Result<(), AppError> {
     let now = crate::unix_now_seconds() as i64;
     let (local, missing) = partition_locally_known(app, frontier, now).await?;
+    emitter.tally.resolved_from_cache(local.len());
     emitter.emit_matches(radius, local, query).await;
 
     for batch in missing.chunks(SEARCH_PUBKEY_BATCH_SIZE) {
@@ -401,6 +403,9 @@ async fn resolve_layer(
             .filter(|record| record.profile.is_none())
             .map(|record| record.account_id_hex.clone())
             .collect::<Vec<_>>();
+        emitter
+            .tally
+            .resolved_from_relays(fetched.len() - unresolved.len());
         cache_resolved_profiles(app, &fetched, now).await?;
         emitter.emit_matches(radius, fetched, query).await;
 
@@ -411,6 +416,10 @@ async fn resolve_layer(
         // the relays they say they write to -- the outbox model, and the only
         // way to reach someone whose profile never leaves their own relays.
         let outboxed = resolve_from_write_relays(app, &unresolved).await?;
+        emitter.tally.resolved_from_write_relays(outboxed.len());
+        emitter
+            .tally
+            .unresolved(unresolved.len().saturating_sub(outboxed.len()));
         cache_resolved_profiles(app, &outboxed, now).await?;
         emitter.emit_matches(radius, outboxed, query).await;
     }
@@ -663,6 +672,42 @@ async fn extend_with_follows(
     Ok(())
 }
 
+/// Where one search's profiles came from.
+///
+/// The caches exist on the claim that a warm search avoids relay work; this is
+/// how that claim gets checked in the field instead of assumed. Counts only --
+/// never an account id, a relay, or the query, per the privacy invariant in
+/// `AGENTS.md`.
+#[derive(Default)]
+struct SearchTally {
+    /// Answered from the device: the promoted directory or the search graph.
+    from_cache: usize,
+    /// Needed a `kind:0` fetch from the searcher's own relays.
+    from_relays: usize,
+    /// Reachable only through the author's advertised write relays.
+    from_write_relays: usize,
+    /// No tier produced a profile. Still matchable by npub or pubkey.
+    unresolved: usize,
+}
+
+impl SearchTally {
+    fn resolved_from_cache(&mut self, count: usize) {
+        self.from_cache += count;
+    }
+
+    fn resolved_from_relays(&mut self, count: usize) {
+        self.from_relays += count;
+    }
+
+    fn resolved_from_write_relays(&mut self, count: usize) {
+        self.from_write_relays += count;
+    }
+
+    fn unresolved(&mut self, count: usize) {
+        self.unresolved += count;
+    }
+}
+
 /// The candidates one radius contributes to the next, and whether the
 /// per-radius cap cut them short.
 #[derive(Default)]
@@ -786,6 +831,7 @@ async fn cache_resolved_follows(
 struct SearchEmitter {
     updates_tx: mpsc::Sender<UserSearchUpdate>,
     total_result_count: usize,
+    tally: SearchTally,
 }
 
 impl SearchEmitter {
@@ -793,6 +839,7 @@ impl SearchEmitter {
         Self {
             updates_tx,
             total_result_count: 0,
+            tally: SearchTally::default(),
         }
     }
 
@@ -824,6 +871,27 @@ impl SearchEmitter {
         sort_user_search_results(&mut results);
         self.emit_results(SearchUpdateTrigger::ResultsFound { radius }, results)
             .await;
+    }
+
+    /// Report where this search's profiles came from, once, at the end.
+    ///
+    /// The point is to make the caching claim falsifiable in the field: if
+    /// `from_cache` stays near zero on repeat searches, the warm path is not
+    /// working. Counts and the requested radii only — no account id, relay, or
+    /// query text, per the privacy invariant.
+    fn report_tally(&self, params: &UserSearchParams) {
+        tracing::debug!(
+            target: "marmot_app::directory",
+            method = "search_users",
+            radius_start = params.radius_start,
+            radius_end = params.radius_end,
+            from_cache = self.tally.from_cache,
+            from_relays = self.tally.from_relays,
+            from_write_relays = self.tally.from_write_relays,
+            unresolved = self.tally.unresolved,
+            matches = self.total_result_count,
+            "user search finished"
+        );
     }
 
     async fn emit(&mut self, trigger: SearchUpdateTrigger) {
@@ -1250,6 +1318,26 @@ mod tests {
             None,
             "an unanswered contact list must stay re-fetchable"
         );
+    }
+
+    /// The tally exists to answer one question -- do the caches earn their
+    /// keep -- so it has to attribute each resolution to the tier that actually
+    /// produced it, and count the people no tier could resolve.
+    #[test]
+    fn the_tally_attributes_each_profile_to_the_tier_that_resolved_it() {
+        let mut tally = SearchTally::default();
+
+        tally.resolved_from_cache(3);
+        tally.resolved_from_relays(2);
+        tally.resolved_from_write_relays(1);
+        tally.unresolved(4);
+        // A second layer accumulates rather than replacing.
+        tally.resolved_from_cache(1);
+
+        assert_eq!(tally.from_cache, 4);
+        assert_eq!(tally.from_relays, 2);
+        assert_eq!(tally.from_write_relays, 1);
+        assert_eq!(tally.unresolved, 4);
     }
 
     /// A layer that overflows the candidate cap is a prefix of the real one.
