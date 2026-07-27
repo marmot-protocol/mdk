@@ -1,3 +1,4 @@
+use crate::account_projection::chat_mute_is_effective;
 use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
     SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
@@ -1271,16 +1272,8 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 row.last_read_timeline_at, row.conversation_created_at,
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
-                CASE
-                    WHEN mute.group_id_hex IS NULL THEN 0
-                    WHEN mute.muted_until_ms IS NULL THEN 1
-                    WHEN mute.muted_until_ms > ?1 THEN 1
-                    ELSE 0
-                END,
-                CASE
-                    WHEN mute.muted_until_ms > ?1 THEN mute.muted_until_ms
-                    ELSE NULL
-                END
+                mute.group_id_hex IS NOT NULL,
+                mute.muted_until_ms
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
@@ -1301,16 +1294,8 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 row.last_read_timeline_at, row.conversation_created_at,
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
-                CASE
-                    WHEN mute.group_id_hex IS NULL THEN 0
-                    WHEN mute.muted_until_ms IS NULL THEN 1
-                    WHEN mute.muted_until_ms > ?1 THEN 1
-                    ELSE 0
-                END,
-                CASE
-                    WHEN mute.muted_until_ms > ?1 THEN mute.muted_until_ms
-                    ELSE NULL
-                END
+                mute.group_id_hex IS NOT NULL,
+                mute.muted_until_ms
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
@@ -1318,9 +1303,10 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
          WHERE row.archived = 0
          ORDER BY row.activity_sort_at DESC, row.group_id_hex"
     };
+    let now_ms = unix_now_ms();
     let mut stmt = tx.prepare(sql).storage()?;
     let mut rows = stmt
-        .query_map(params![unix_now_ms()], chat_list_row_from_row)
+        .query_map([], |row| chat_list_row_from_row(row, now_ms))
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
@@ -1336,6 +1322,7 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
 }
 
 fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
+    let now_ms = unix_now_ms();
     tx.query_row(
         "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
                 row.title, row.group_name, row.avatar_url,
@@ -1351,23 +1338,15 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
                 row.last_read_timeline_at, row.conversation_created_at,
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
-                CASE
-                    WHEN mute.group_id_hex IS NULL THEN 0
-                    WHEN mute.muted_until_ms IS NULL THEN 1
-                    WHEN mute.muted_until_ms > ?2 THEN 1
-                    ELSE 0
-                END,
-                CASE
-                    WHEN mute.muted_until_ms > ?2 THEN mute.muted_until_ms
-                    ELSE NULL
-                END
+                mute.group_id_hex IS NOT NULL,
+                mute.muted_until_ms
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
             ON mute.group_id_hex = row.group_id_hex
          WHERE row.group_id_hex = ?1",
-        params![group_id_hex, unix_now_ms()],
-        chat_list_row_from_row,
+        params![group_id_hex],
+        |row| chat_list_row_from_row(row, now_ms),
     )
     .optional()
     .storage()?
@@ -1381,7 +1360,7 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
     .transpose()
 }
 
-fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListRow> {
+fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Result<ChatListRow> {
     let group_name: String = row.get(4)?;
     let avatar_url: Option<String> = row.get(5)?;
     let image_hash_hex: String = row.get(6)?;
@@ -1430,6 +1409,9 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
     let member_count = row
         .get::<_, Option<i64>>(29)?
         .and_then(|value| u64::try_from(value).ok());
+    let mute_row_exists = row.get::<_, i64>(30)? != 0;
+    let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
+    let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
         archived: row.get::<_, i64>(1)? != 0,
@@ -1460,8 +1442,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         updated_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
         self_membership: SelfMembership::from_storage(&row.get::<_, String>(28)?),
         conversation_kind: conversation_kind(&group_name, member_count),
-        muted: row.get::<_, i64>(30)? != 0,
-        muted_until_ms: row.get(31)?,
+        muted,
+        muted_until_ms: muted.then_some(stored_muted_until_ms).flatten(),
         // Not a `chat_list_rows` column; the callers above stamp it from
         // `cgka_leave_requests` after the row is decoded.
         leave_requested_at_ms: None,

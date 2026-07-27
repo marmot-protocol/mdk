@@ -10,6 +10,18 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Whether a stored per-chat mute row is effective at `now_ms`.
+///
+/// Missing rows are unmuted, `NULL` means an indefinite mute, and finite
+/// mutes expire exactly at their stored boundary.
+pub(crate) fn chat_mute_is_effective(
+    row_exists: bool,
+    muted_until_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    row_exists && muted_until_ms.is_none_or(|until| until > now_ms)
+}
+
 /// The local account's own membership in a projected group.
 ///
 /// `Member` is the default and the fallback for unknown/forward-incompatible
@@ -1131,10 +1143,11 @@ impl SqliteAccountStorage {
             .storage()?;
         // Missing rows are unmuted. `None` means "muted forever", so the
         // absent-row default must be a timestamp that is already expired.
+        let row_exists = row.is_some();
         let (muted_until_ms, updated_at_ms) = row.unwrap_or((Some(0), 0));
         Ok(AccountChatNotificationSettings {
             group_id_hex: group_id_hex.to_owned(),
-            muted: muted_until_ms.is_none_or(|until| until > now_ms),
+            muted: chat_mute_is_effective(row_exists, muted_until_ms, now_ms),
             muted_until_ms,
             updated_at_ms,
         })
