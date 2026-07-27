@@ -1641,9 +1641,23 @@ impl MarmotAppRuntime {
         group_id_hex: &str,
         muted_until_ms: Option<i64>,
     ) -> Result<ChatNotificationSettings, AppError> {
-        self.accounts
+        let account = self.accounts.resolve(account_ref)?;
+        let settings =
+            self.accounts
+                .app
+                .set_chat_muted(&account.label, group_id_hex, muted_until_ms)?;
+        let row = self
+            .accounts
             .app
-            .set_chat_muted(account_ref, group_id_hex, muted_until_ms)
+            .refresh_chat_list_row(&account.label, group_id_hex)?;
+        self.publish_chat_list_projection_update(
+            account.account_id_hex,
+            account.label,
+            group_id_hex.to_owned(),
+            row,
+            ChatListUpdateTrigger::MuteChanged,
+        );
+        Ok(settings)
     }
 
     pub fn clear_chat_muted(
@@ -1651,9 +1665,23 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<ChatNotificationSettings, AppError> {
-        self.accounts
+        let account = self.accounts.resolve(account_ref)?;
+        let settings = self
+            .accounts
             .app
-            .clear_chat_muted(account_ref, group_id_hex)
+            .clear_chat_muted(&account.label, group_id_hex)?;
+        let row = self
+            .accounts
+            .app
+            .refresh_chat_list_row(&account.label, group_id_hex)?;
+        self.publish_chat_list_projection_update(
+            account.account_id_hex,
+            account.label,
+            group_id_hex.to_owned(),
+            row,
+            ChatListUpdateTrigger::MuteChanged,
+        );
+        Ok(settings)
     }
 
     pub async fn set_native_push_enabled(
@@ -2702,6 +2730,30 @@ impl MarmotAppRuntime {
                 group_id_hex.to_owned(),
                 row.clone(),
                 ChatListUpdateTrigger::UnreadChanged,
+            );
+        }
+        Ok(row)
+    }
+
+    pub fn set_chat_manually_unread(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        manually_unread: bool,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let row = self.accounts.app.set_chat_manually_unread(
+            &account.label,
+            group_id_hex,
+            manually_unread,
+        )?;
+        if row.is_some() {
+            self.publish_chat_list_projection_update(
+                account.account_id_hex,
+                account.label,
+                group_id_hex.to_owned(),
+                row.clone(),
+                ChatListUpdateTrigger::ManualUnreadChanged,
             );
         }
         Ok(row)

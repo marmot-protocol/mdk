@@ -10,6 +10,18 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Whether a stored per-chat mute row is effective at `now_ms`.
+///
+/// Missing rows are unmuted, `NULL` means an indefinite mute, and finite
+/// mutes expire exactly at their stored boundary.
+pub(crate) fn chat_mute_is_effective(
+    row_exists: bool,
+    muted_until_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    row_exists && muted_until_ms.is_none_or(|until| until > now_ms)
+}
+
 /// The local account's own membership in a projected group.
 ///
 /// `Member` is the default and the fallback for unknown/forward-incompatible
@@ -69,6 +81,9 @@ pub struct StoredAccountGroup {
     pub admin_keys_hex: String,
     pub archived: bool,
     pub pending_confirmation: bool,
+    /// Current locally observed MLS roster size. `None` for legacy rows until a
+    /// live group hydration persists the projection.
+    pub member_count: Option<u64>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
     pub nostr_routing_last_epoch: u64,
@@ -274,6 +289,7 @@ struct RawStoredAccountGroup {
     admin_keys_hex: String,
     archived: bool,
     pending_confirmation: bool,
+    member_count: Option<i64>,
     welcomer_account_id_hex: Option<String>,
     via_welcome_message_id_hex: Option<String>,
     nostr_routing_last_epoch: i64,
@@ -335,7 +351,7 @@ impl SqliteAccountStorage {
                         image_upload_key_hex, image_media_type, admin_keys_hex,
                         archived, pending_confirmation, welcomer_account_id_hex,
                         via_welcome_message_id_hex, nostr_routing_last_epoch,
-                        prior_nostr_routes_json, self_membership
+                        prior_nostr_routes_json, self_membership, member_count
                  FROM account_groups
                  ORDER BY updated_at, group_id_hex",
             )
@@ -360,6 +376,7 @@ impl SqliteAccountStorage {
                     nostr_routing_last_epoch: row.get(14)?,
                     prior_nostr_routes_json: row.get(15)?,
                     self_membership: SelfMembership::from_storage(&row.get::<_, String>(16)?),
+                    member_count: row.get(17)?,
                 })
             })
             .storage()?
@@ -388,6 +405,7 @@ impl SqliteAccountStorage {
                 admin_keys_hex: raw.admin_keys_hex,
                 archived: raw.archived,
                 pending_confirmation: raw.pending_confirmation,
+                member_count: raw.member_count.and_then(|value| value.try_into().ok()),
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
                 nostr_routing_last_epoch: raw
@@ -541,9 +559,9 @@ impl SqliteAccountStorage {
                         image_upload_key_hex, image_media_type, admin_keys_hex, archived,
                         pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
                         nostr_routing_last_epoch, prior_nostr_routes_json,
-                        conversation_created_at, updated_at
+                        conversation_created_at, updated_at, member_count
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                      ON CONFLICT(group_id_hex) DO UPDATE SET
                         endpoint = excluded.endpoint,
                         profile_name = excluded.profile_name,
@@ -560,6 +578,7 @@ impl SqliteAccountStorage {
                         via_welcome_message_id_hex = excluded.via_welcome_message_id_hex,
                         nostr_routing_last_epoch = excluded.nostr_routing_last_epoch,
                         prior_nostr_routes_json = excluded.prior_nostr_routes_json,
+                        member_count = excluded.member_count,
                         updated_at = excluded.updated_at
                      WHERE account_groups.endpoint IS NOT excluded.endpoint
                         OR account_groups.profile_name IS NOT excluded.profile_name
@@ -575,7 +594,8 @@ impl SqliteAccountStorage {
                         OR account_groups.welcomer_account_id_hex IS NOT excluded.welcomer_account_id_hex
                         OR account_groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex
                         OR account_groups.nostr_routing_last_epoch IS NOT excluded.nostr_routing_last_epoch
-                        OR account_groups.prior_nostr_routes_json IS NOT excluded.prior_nostr_routes_json",
+                        OR account_groups.prior_nostr_routes_json IS NOT excluded.prior_nostr_routes_json
+                        OR account_groups.member_count IS NOT excluded.member_count",
                     params![
                         &group.group_id_hex,
                         &group.endpoint,
@@ -594,7 +614,8 @@ impl SqliteAccountStorage {
                         nostr_routing_last_epoch,
                         prior_nostr_routes_json,
                         now_i64,
-                        now_i64
+                        now_i64,
+                        group.member_count.and_then(|count| i64::try_from(count).ok())
                     ],
                 )
                 .storage()?;
@@ -1122,10 +1143,11 @@ impl SqliteAccountStorage {
             .storage()?;
         // Missing rows are unmuted. `None` means "muted forever", so the
         // absent-row default must be a timestamp that is already expired.
+        let row_exists = row.is_some();
         let (muted_until_ms, updated_at_ms) = row.unwrap_or((Some(0), 0));
         Ok(AccountChatNotificationSettings {
             group_id_hex: group_id_hex.to_owned(),
-            muted: muted_until_ms.is_none_or(|until| until > now_ms),
+            muted: chat_mute_is_effective(row_exists, muted_until_ms, now_ms),
             muted_until_ms,
             updated_at_ms,
         })

@@ -31,6 +31,33 @@ fn valid_hash() -> String {
 }
 
 #[test]
+fn chat_list_attachment_projection_is_bounded_and_typed() {
+    let image = valid_imeta_tag();
+    let mut video = valid_imeta_tag();
+    video[6] = "m video/mp4".to_owned();
+    video[7] = "filename clip.mp4".to_owned();
+    let raw = serde_json::json!({ "imeta": [image, video] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Mixed), 2)
+    );
+}
+
+#[test]
+fn chat_list_attachment_projection_drops_malformed_siblings_safely() {
+    let valid = valid_imeta_tag();
+    let malformed = vec!["imeta".to_owned(), "m audio/mpeg".to_owned()];
+    let raw = serde_json::json!({ "imeta": [malformed, valid] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Photo), 1)
+    );
+    assert_eq!(classify_chat_list_attachments(Some("{not-json")), (None, 0));
+}
+
+#[test]
 fn encrypted_media_integrity_accepts_uppercase_hex() {
     let encrypted = b"encrypted media bytes";
     let uppercase_hash = hex::encode(Sha256::digest(encrypted)).to_ascii_uppercase();

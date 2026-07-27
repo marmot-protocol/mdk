@@ -1307,10 +1307,14 @@ mod tests {
                 "plaintext": "hello alice",
                 "kind": 9,
                 "timeline_at": 1_700_000_050_u64,
-                "deleted": false
+                "deleted": false,
+                "attachment_kind": null,
+                "attachment_count": 0,
+                "delivery_state": "not_applicable"
             },
             "unread_count": 3_u64,
             "has_unread": true,
+            "manually_marked_unread": false,
             "unread_mention_count": 1_u64,
             "has_unread_mention": true,
             "first_unread_message_id_hex": "m0",
@@ -1319,7 +1323,10 @@ mod tests {
             "conversation_created_at": 1_699_999_000_u64,
             "activity_sort_at": 1_700_000_050_u64,
             "updated_at": 1_700_000_060_u64,
-            "self_membership": "Member"
+            "self_membership": "Member",
+            "conversation_kind": "group",
+            "muted": false,
+            "muted_until_ms": null
         }))
         .expect("valid chat list row");
 
