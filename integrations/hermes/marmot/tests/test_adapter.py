@@ -1980,6 +1980,120 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             "Based on my research, here's the answer",
         )
 
+    async def test_markdown_balancers_after_cursor_stay_a_preview(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_appends = []
+                self.stream_finalizes = []
+                self.final_sends = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+            async def stream_finalize(
+                self,
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+                idempotency_key=None,
+            ):
+                self.stream_finalizes.append((stream_id_hex, final_text))
+                return {
+                    "type": "stream_finalized",
+                    "stream_id_hex": stream_id_hex,
+                    "message_ids_hex": ["77" * 32],
+                }
+
+            async def send_final(
+                self,
+                account_id_hex,
+                group_id_hex,
+                text,
+                reply_to_message_id_hex=None,
+                idempotency_key=None,
+            ):
+                self.final_sends.append((account_id_hex, group_id_hex, text))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        # Hermes balances an open inline-code span after adding its cursor. The
+        # trailing backtick is display-only and must not hide the preview marker.
+        preview = await adapter.send("22" * 32, "Result: `partial \u2589`")
+        final = await adapter.send("22" * 32, "Result: `partial value`")
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_appends[0][1], "Result: `partial ")
+        self.assertEqual(
+            fake_client.stream_finalizes,
+            [("55" * 32, "Result: `partial value`")],
+        )
+
+        # Fenced blocks are balanced with a newline plus three backticks.
+        append_offset = len(fake_client.stream_appends)
+        finalize_offset = len(fake_client.stream_finalizes)
+        fenced_preview = await adapter.send("22" * 32, "```text\npartial \u2589\n```")
+        fenced_final = await adapter.send("22" * 32, "```text\npartial value\n```")
+
+        self.assertTrue(fenced_preview.success)
+        self.assertTrue(fenced_final.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_appends[append_offset][1], "```text\npartial ")
+        self.assertEqual(len(fake_client.stream_finalizes), finalize_offset + 1)
+        self.assertEqual(
+            fake_client.stream_finalizes[finalize_offset],
+            ("55" * 32, "```text\npartial value\n```"),
+        )
+
+        both_balancers = "`outside\n```text\npartial \u2589\n````"
+        self.assertTrue(adapter._looks_like_stream_preview(both_balancers))
+        self.assertEqual(
+            adapter._strip_streaming_cursor(both_balancers),
+            "`outside\n```text\npartial ",
+        )
+
+        # Whitespace after the cursor is part of the visible snapshot. Preserve
+        # its exact bytes so later append-only comparisons see the same text.
+        for trailing_whitespace in (" ", "\t", "\r\n", " \t\r\n"):
+            with self.subTest(trailing_whitespace=repr(trailing_whitespace)):
+                preview_with_whitespace = "partial \u2589`" + trailing_whitespace
+                self.assertEqual(
+                    adapter._split_stream_preview(preview_with_whitespace),
+                    ("partial " + trailing_whitespace, True),
+                )
+
     async def test_whitespace_mismatched_final_replaces_preview_without_duplication(self):
         class FakeClient:
             def __init__(self):
