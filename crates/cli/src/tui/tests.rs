@@ -2628,6 +2628,7 @@ fn projected_chat(
         projection: ChatProjection {
             unread_count: unread,
             has_unread: unread > 0,
+            activity_sort_at: last_activity.unwrap_or(0),
             last_message: last_activity.map(|timeline_at| ChatLastMessage {
                 sender: Some("bob".to_owned()),
                 sender_display_name: Some("Bob".to_owned()),
@@ -2799,13 +2800,12 @@ fn chats_order_by_last_activity_preserving_selection() {
 }
 
 #[test]
-fn message_less_chats_keep_the_list_order_as_a_stable_fallback() {
-    // Equal-activity rows (here: all message-less) keep the order they came in —
-    // the documented stable fallback.
+fn message_less_chats_tie_break_on_group_id() {
+    // Equal `activity_sort_at` rows follow storage: ascending `group_id_hex`.
     let mut chats = vec![
+        projected_chat("cc", "third", 0, None),
         projected_chat("aa", "first", 0, None),
         projected_chat("bb", "second", 0, None),
-        projected_chat("cc", "third", 0, None),
     ];
     sort_chats_by_activity(&mut chats);
     assert_eq!(
@@ -2814,6 +2814,33 @@ fn message_less_chats_keep_the_list_order_as_a_stable_fallback() {
             .map(|chat| chat.group_id.as_str())
             .collect::<Vec<_>>(),
         vec!["aa", "bb", "cc"]
+    );
+}
+
+#[test]
+fn all_pruned_chat_orders_by_durable_activity_sort_at() {
+    // Storage keeps a nonzero `activity_sort_at` after secure prune even when
+    // `last_message` is null; the TUI must not sink the row to the bottom.
+    let mut chats = vec![
+        projected_chat("bb", "recent-preview", 0, Some(10)),
+        ChatRow {
+            group_id: "aa".to_owned(),
+            name: "pruned".to_owned(),
+            archived: false,
+            projection: ChatProjection {
+                activity_sort_at: 30,
+                ..ChatProjection::default()
+            },
+        },
+    ];
+    sort_chats_by_activity(&mut chats);
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aa", "bb"],
+        "durable activity_sort_at beats a younger preview-only row"
     );
 }
 
@@ -2830,6 +2857,7 @@ fn timeline_chat_list_row_folds_into_the_loaded_chat() {
         "chat_list_row": {
             "unread_count": 3,
             "has_unread": true,
+            "activity_sort_at": 30,
             "last_message": {
                 "sender_display_name": "Bob",
                 "plaintext": "new here",
