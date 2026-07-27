@@ -72,6 +72,8 @@ mod migration_0035_durable_convergence_passes;
 mod migration_0036_agent_stream_publisher_sequences;
 #[path = "migrations/0037_chat_list_semantic_timestamps.rs"]
 mod migration_0037_chat_list_semantic_timestamps;
+#[path = "migrations/0038_chat_list_interaction_state.rs"]
+mod migration_0038_chat_list_interaction_state;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -268,6 +270,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 37,
         name: "0037_chat_list_semantic_timestamps",
         apply: migration_0037_chat_list_semantic_timestamps::apply,
+    },
+    Migration {
+        version: 38,
+        name: "0038_chat_list_interaction_state",
+        apply: migration_0038_chat_list_interaction_state::apply,
     },
 ];
 
@@ -729,6 +736,34 @@ mod tests {
             "chat_notification_settings",
             "muted_until_ms"
         ));
+    }
+
+    #[test]
+    fn chat_list_interaction_state_columns_are_migrated_with_safe_defaults() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert_eq!(
+            column_default(&conn, "conversation_read_state", "manually_marked_unread").as_deref(),
+            Some("0")
+        );
+        assert!(connection_has_column(
+            &conn,
+            "account_groups",
+            "member_count"
+        ));
+        assert_eq!(
+            column_default(&conn, "chat_list_rows", "manually_marked_unread").as_deref(),
+            Some("0")
+        );
+        assert!(connection_has_column(
+            &conn,
+            "chat_list_rows",
+            "last_message_media_json"
+        ));
+        assert_eq!(
+            column_default(&conn, "chat_list_rows", "last_message_delivery_state").as_deref(),
+            Some("'not_applicable'")
+        );
     }
 
     #[test]

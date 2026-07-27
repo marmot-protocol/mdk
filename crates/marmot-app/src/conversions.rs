@@ -70,6 +70,7 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
         admin_keys_hex: group.admin_policy.admins.join(","),
         archived: group.archived,
         pending_confirmation: group.pending_confirmation,
+        member_count: group.member_count,
         // Ignored by the projection save (owned by `set_group_self_membership`);
         // carried for struct completeness and round-trip symmetry.
         self_membership: group.self_membership,
@@ -238,6 +239,7 @@ pub(crate) fn app_group_from_stored_group(
     group.archived = stored.archived;
     group.pending_confirmation = stored.pending_confirmation;
     group.self_membership = stored.self_membership;
+    group.member_count = stored.member_count;
     group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
     group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
     group.nostr_routing_last_epoch = stored.nostr_routing_last_epoch;

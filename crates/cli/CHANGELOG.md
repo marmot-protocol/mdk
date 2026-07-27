@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- MarmotKit chat-list rows now expose a durable manual-unread reminder,
+  effective timed/indefinite MDK mute state, current direct/group
+  classification, bounded latest-message attachment kind/count, and exact
+  latest-message delivery state. New commands set/clear manual unread and
+  read/set/clear MDK chat mute state; chat-list subscriptions publish these
+  changes, including automatic finite-mute expiry. Manual unread remains
+  separate from the monotonic message read marker, MDK mute remains separate
+  from host notification modes such as all/mentions/nothing, and no wire
+  protocol changes are involved.
 - The Hermes and OpenClaw release installers can now securely import an existing
   Nostr identity from an owner-only file, optionally pin it to an expected npub,
   and bootstrap that exact account without creating a replacement identity.

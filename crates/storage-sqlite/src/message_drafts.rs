@@ -538,6 +538,7 @@ mod tests {
             admin_keys_hex: String::new(),
             archived: false,
             pending_confirmation: false,
+            member_count: None,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,

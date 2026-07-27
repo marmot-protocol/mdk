@@ -8,9 +8,10 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{AppError, SendSummary};
+use crate::{AppError, ChatListAttachmentKind, SendSummary};
 
 mod blossom;
 mod crypto;
@@ -29,6 +30,52 @@ use host_safety::validate_locator;
 pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;
+
+/// Validate and compact the latest-message encrypted-media metadata for the
+/// chat-list surface. Malformed attachments are dropped independently; raw
+/// tags and metadata never cross the app boundary.
+pub(crate) fn classify_chat_list_attachments(
+    media_json: Option<&str>,
+) -> (Option<ChatListAttachmentKind>, u32) {
+    let Some(imeta) = media_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("imeta").and_then(Value::as_array).cloned())
+    else {
+        return (None, 0);
+    };
+
+    let mut kinds = Vec::new();
+    for raw_tag in imeta {
+        let Ok(tag) = serde_json::from_value::<Vec<String>>(raw_tag) else {
+            continue;
+        };
+        let Ok(reference) = media_attachment_from_imeta_tag(&tag, None, false) else {
+            continue;
+        };
+        let media_type = reference.media_type.to_ascii_lowercase();
+        let kind = if media_type.starts_with("image/") {
+            ChatListAttachmentKind::Photo
+        } else if media_type.starts_with("video/") {
+            ChatListAttachmentKind::Video
+        } else if media_type.starts_with("audio/") {
+            ChatListAttachmentKind::Audio
+        } else {
+            ChatListAttachmentKind::File
+        };
+        kinds.push(kind);
+    }
+
+    let count = u32::try_from(kinds.len()).unwrap_or(u32::MAX);
+    let Some(first) = kinds.first().copied() else {
+        return (None, 0);
+    };
+    let kind = if kinds.iter().all(|candidate| *candidate == first) {
+        first
+    } else {
+        ChatListAttachmentKind::Mixed
+    };
+    (Some(kind), count)
+}
 
 /// Built-in encrypted-media endpoints, in upload fallback order.
 ///

@@ -27,7 +27,8 @@ pub use account_projection::{
     clamp_to_max_future_skew,
 };
 pub use chat_list::{
-    AccountUnreadTotal, ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow,
+    AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
+    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
