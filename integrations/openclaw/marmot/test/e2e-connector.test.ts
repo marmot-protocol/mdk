@@ -3,6 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  clearActivatedPluginRuntimeState,
+  clearPluginLoaderCache,
+  clearPluginRegistryLoadCache,
+  loadOpenClawPlugins,
+} from "../node_modules/openclaw/dist/plugins/loader.js";
 
 import { MarmotAgentControlClient } from "../src/client.js";
 import {
@@ -15,7 +21,6 @@ import {
   startMarmotInbound,
   type InboundPluginApi,
 } from "../src/inbound-runtime.js";
-import { createMarmotMessageAdapter } from "../src/outbound.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
 
 const RUN_CONNECTOR_E2E = process.env.MARMOT_OPENCLAW_CONNECTOR_E2E === "1";
@@ -88,6 +93,9 @@ async function recordedFinals(
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
+  clearActivatedPluginRuntimeState();
+  clearPluginRegistryLoadCache();
+  clearPluginLoaderCache();
 });
 
 maybeDescribe("OpenClaw Marmot connector E2E", () => {
@@ -138,8 +146,14 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
         );
 
         let readyCount = 0;
+        const pluginRoot = join(import.meta.dirname, "..");
         const api: InboundPluginApi = {
           config: {
+            plugins: {
+              allow: ["marmot"],
+              load: { paths: [pluginRoot] },
+              entries: { marmot: { enabled: true } },
+            },
             channels: {
               marmot: {
                 socketPath,
@@ -159,12 +173,23 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           },
         };
 
-        const adapter = createMarmotMessageAdapter({
-          resolveTarget: async () => ({
-            client,
-            marmotAccountIdHex: ACCOUNT_ID_HEX,
-          }),
+        // Load and activate the actual plugin so OpenClaw's production helper
+        // resolves the registered Marmot message adapter and checks its declared
+        // durable-final capabilities before sending.
+        const registry = loadOpenClawPlugins({
+          config: api.config as never,
+          activationSourceConfig: api.config as never,
+          workspaceDir: tempRoot,
+          onlyPluginIds: ["marmot"],
+          activate: true,
+          loadModules: true,
+          cache: false,
+          mode: "full",
+          throwOnLoadError: true,
         });
+        expect(registry.channels.find((entry) => entry.plugin.id === "marmot")?.plugin.message)
+          .toBeDefined();
+
         const runtimeChannel: OpenClawChannelRuntime = {
           routing: {
             resolveAgentRoute: () => ({
@@ -202,24 +227,6 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           channelAccountId: "default",
           groupActivation: "always",
           mentionPatterns: [],
-          deliverInboundReply: async (params) => {
-            const context = params.ctxPayload as {
-              OriginatingTo?: string;
-              To?: string;
-            };
-            const to = context.OriginatingTo ?? context.To;
-            if (!to) {
-              return { status: "unsupported", reason: "missing_target" };
-            }
-            await adapter.send.text({
-              cfg: params.cfg,
-              to,
-              text: params.payload.text ?? "",
-              accountId: params.accountId,
-              replyToId: params.replyToId,
-            } as never);
-            return { status: "handled_visible", delivery: {} as never };
-          },
         });
         const runInbound = () =>
           startMarmotInbound(api, dispatch, {

@@ -111,11 +111,16 @@ describe("createMarmotMessageAdapter", () => {
     expect(result.receipt.sentAt).toBe(1234);
   });
 
-  it("declares durable text + media + replyTo capabilities (no unproven live caps)", () => {
+  it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
     const adapter = createMarmotMessageAdapter({
       resolveTarget: () => ({ client: stubClient(emptyClientCalls()), marmotAccountIdHex: HEX32("aa") }),
     });
-    expect(adapter.durableFinal?.capabilities).toEqual({ text: true, media: true, replyTo: true });
+    expect(adapter.durableFinal?.capabilities).toEqual({
+      text: true,
+      media: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
   });
 
