@@ -592,6 +592,12 @@ impl MarmotApp {
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
     }
 
+    /// Accounts to fall back to when a searcher's own web of trust is empty.
+    /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
+    pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
+        &self.config.directory_search_fallback_seeds
+    }
+
     /// Narrow relay endpoints discovered from another account's published
     /// relay list to the ones this device is willing to dial.
     ///

@@ -75,6 +75,31 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Reported distance for matches that are not on the searcher's graph at all.
+///
+/// Every consumer renders `radius` as provenance -- "via someone you follow".
+/// When a search falls back to a configured seed because the searcher follows
+/// nobody, the people it finds are one hop from *the seed*, not from the
+/// searcher, and labelling them radius 1 would make that provenance a lie.
+/// They are not a measurable distance away, so they are reported as off-graph.
+/// `u8::MAX` also sorts last, which is where an off-graph match belongs.
+pub const OFF_GRAPH_SEARCH_RADIUS: u8 = u8::MAX;
+
+/// How far a layer has walked, and how that distance is reported.
+///
+/// The two diverge exactly once: after a search falls back to a configured
+/// seed, the traversal keeps counting hops so the radius window still bounds
+/// it, while every match reports as off-graph because those hops are measured
+/// from the seed rather than from the searcher. Carrying them together keeps
+/// the pair from being transposed at a call site.
+#[derive(Clone, Copy)]
+struct LayerDepth {
+    /// Hops from the traversal's starting point. Drives loop and window logic.
+    hop: u8,
+    /// Distance reported to the consumer.
+    reported: u8,
+}
+
 /// Write relays honoured from any one account's published NIP-65 list.
 ///
 /// A relay list is attacker-controlled, so an account advertising hundreds of
@@ -241,33 +266,74 @@ async fn traverse_graph(
 ) -> Result<(), AppError> {
     let mut frontier = vec![searcher_account_id_hex.to_owned()];
     let mut seen: HashSet<String> = frontier.iter().cloned().collect();
+    // Set once the traversal leaves the searcher's own graph for a configured
+    // seed. From then on every layer reports as off-graph, however many hops
+    // it has walked: the hop count is a distance from the seed, not from the
+    // searcher, and only the latter is what `radius` promises.
+    let mut off_graph = false;
 
     for radius in 0..=params.radius_end {
         if frontier.is_empty() || emitter.is_cancelled() {
             break;
         }
+        let depth = LayerDepth {
+            hop: radius,
+            reported: if off_graph {
+                OFF_GRAPH_SEARCH_RADIUS
+            } else {
+                radius
+            },
+        };
         emitter
-            .emit(SearchUpdateTrigger::RadiusStarted { radius })
+            .emit(SearchUpdateTrigger::RadiusStarted {
+                radius: depth.reported,
+            })
             .await;
 
         // One timeout per radius, covering every relay round trip the radius
         // makes: resolving its profiles and reading the follow lists that
         // become the next layer.
-        let advance = advance_radius(app, &frontier, query, radius, params, &mut seen, emitter);
+        let advance = advance_radius(app, &frontier, query, depth, params, &mut seen, emitter);
         frontier = match timeout(SEARCH_RADIUS_TIMEOUT, advance).await {
             Ok(result) => result?,
             Err(_elapsed) => {
                 emitter
-                    .emit(SearchUpdateTrigger::RadiusTimeout { radius })
+                    .emit(SearchUpdateTrigger::RadiusTimeout {
+                        radius: depth.reported,
+                    })
                     .await;
                 return Ok(());
             }
         };
         emitter
-            .emit(SearchUpdateTrigger::RadiusCompleted { radius })
+            .emit(SearchUpdateTrigger::RadiusCompleted {
+                radius: depth.reported,
+            })
             .await;
+
+        // The searcher's own graph is exhausted at its first layer: they follow
+        // nobody and share no group. Fall back to the configured seeds rather
+        // than answering "nothing" forever -- but only here, so a searcher with
+        // any graph of their own is never given a stranger's.
+        if radius == 0 && frontier.is_empty() {
+            frontier = fallback_seed_frontier(app, &mut seen);
+            off_graph = !frontier.is_empty();
+        }
     }
     Ok(())
+}
+
+/// The configured fallback seeds that are usable and not already visited.
+///
+/// Malformed entries are skipped rather than failing the search: a seed list is
+/// deployment configuration for a best-effort last resort, and a typo in it
+/// should cost that one seed, not every search on the device.
+fn fallback_seed_frontier(app: &MarmotApp, seen: &mut HashSet<String>) -> Vec<String> {
+    app.directory_search_fallback_seeds()
+        .iter()
+        .filter_map(|seed| parse_account_id_hex(seed).ok())
+        .filter(|seed| seen.insert(seed.clone()))
+        .collect()
 }
 
 /// Emit one radius's matches and return the layer beyond it.
@@ -275,7 +341,7 @@ async fn advance_radius(
     app: &MarmotApp,
     frontier: &[String],
     query: &str,
-    radius: u8,
+    depth: LayerDepth,
     params: &UserSearchParams,
     seen: &mut HashSet<String>,
     emitter: &mut SearchEmitter,
@@ -283,10 +349,10 @@ async fn advance_radius(
     // Radii below the requested window are traversed but not reported: they
     // are only the path to the layers the caller did ask for, so resolving
     // their profiles would be relay traffic for results nobody receives.
-    if radius >= params.radius_start {
-        resolve_layer(app, frontier, query, radius, emitter).await?;
+    if depth.hop >= params.radius_start {
+        resolve_layer(app, frontier, query, depth.reported, emitter).await?;
     }
-    if radius == params.radius_end {
+    if depth.hop == params.radius_end {
         return Ok(Vec::new());
     }
 
@@ -295,13 +361,15 @@ async fn advance_radius(
     // are admitted first: sharing a group is at least as strong a signal of
     // closeness as a follow, so a long follow list must not crowd them out of
     // the per-radius cap.
-    if radius == 0 {
+    if depth.hop == 0 {
         layer.admit(params.radius_one_seeds.clone(), seen);
     }
     extend_with_follows(app, frontier, seen, &mut layer).await?;
     if layer.truncated {
         emitter
-            .emit(SearchUpdateTrigger::RadiusTruncated { radius })
+            .emit(SearchUpdateTrigger::RadiusTruncated {
+                radius: depth.reported,
+            })
             .await;
     }
     Ok(layer.candidates)
@@ -1364,6 +1432,133 @@ mod tests {
                 .flat_map(|update| &update.new_results)
                 .any(|result| result.account_id_hex == stranger.account_id_hex),
             "the profile must be resolved from the author's own write relay: {updates:?}"
+        );
+    }
+
+    /// A brand-new account follows nobody and shares no group, so its own web
+    /// of trust can only ever answer "nothing". A configured seed gives the
+    /// traversal somewhere to start -- but those people are not one hop from
+    /// the searcher, they are not on the searcher's graph at all, so they are
+    /// reported off-graph rather than dressed up as follows.
+    #[tokio::test]
+    async fn an_empty_graph_falls_back_to_the_configured_seed_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let seed = format!("{:064x}", 91);
+        let stranger = format!("{:064x}", 92);
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default()
+                .with_directory_search_fallback_seeds(vec![seed.clone()]),
+        );
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        // Alice follows nobody. The seed follows someone worth finding.
+        cache
+            .remember_search_graph_follows(
+                &seed,
+                &npub_for_account_id_lossy(&seed),
+                std::slice::from_ref(&stranger),
+            )
+            .unwrap();
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: stranger.clone(),
+                    npub: npub_for_account_id_lossy(&stranger),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (0, 2)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == stranger)
+            .expect("the seed's network must be reachable when the graph is empty");
+        assert_eq!(
+            matched.radius, OFF_GRAPH_SEARCH_RADIUS,
+            "a fallback match is not a measurable distance from the searcher"
+        );
+    }
+
+    /// The seed is a last resort, not a supplement. Someone with a real graph
+    /// must never have a stranger's network folded into their results.
+    #[tokio::test]
+    async fn a_searcher_with_follows_never_reaches_the_fallback_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let friend = format!("{:064x}", 93);
+        let seed = format!("{:064x}", 94);
+        let seeded_stranger = format!("{:064x}", 95);
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default()
+                .with_directory_search_fallback_seeds(vec![seed.clone()]),
+        );
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![friend.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+        cache
+            .remember_search_graph_follows(
+                &seed,
+                &npub_for_account_id_lossy(&seed),
+                std::slice::from_ref(&seeded_stranger),
+            )
+            .unwrap();
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: seeded_stranger.clone(),
+                    npub: npub_for_account_id_lossy(&seeded_stranger),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (0, 2)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        assert!(
+            !updates
+                .iter()
+                .flat_map(|update| &update.new_results)
+                .any(|result| result.account_id_hex == seeded_stranger),
+            "a searcher with their own graph must not be given a stranger's"
         );
     }
 

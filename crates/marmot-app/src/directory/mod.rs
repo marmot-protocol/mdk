@@ -15,7 +15,7 @@ pub use records::{
     UserProfileMetadata,
 };
 pub use search::{
-    SearchUpdateTrigger, UserSearchParams, UserSearchSubscription, UserSearchUpdate,
-    sort_user_search_results,
+    OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
+    UserSearchUpdate, sort_user_search_results,
 };
 pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};

@@ -134,7 +134,7 @@ pub use config::{
     RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
-    DirectoryKeyPackage, MatchQuality, MatchedField, SearchUpdateTrigger,
+    DirectoryKeyPackage, MatchQuality, MatchedField, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
     UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
     UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,

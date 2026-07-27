@@ -61,6 +61,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   change in who you know. No host API change. `wn users search` is unaffected:
   it runs without an app runtime and so has no live MLS session to read
   membership from.
+- User search can fall back to configured seed accounts when the searcher's own
+  web of trust is empty, so a brand-new account that follows nobody and shares
+  no group gets results instead of nothing. Seeds are consulted only when the
+  searcher's own graph yields nothing at all — anyone with follows or a shared
+  group never has a stranger's network folded into their results. Matches found
+  this way report `radius` 255, meaning off-graph: they are one hop from the
+  seed, not from the searcher, and presenting them as follows would make the
+  provenance every surface renders a lie. They sort last. Off by default; whose
+  network to fall back to is a deployment decision.
 - User search now follows the outbox model: an account whose `kind:0` profile
   is not on any relay you read is resolved from the write relays its own NIP-65
   list advertises, so following someone is enough to find them. Relay URLs

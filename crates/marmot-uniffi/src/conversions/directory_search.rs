@@ -57,6 +57,11 @@ impl From<MatchedField> for MatchedFieldFfi {
 ///
 /// `radius` is social distance from the searcher: 0 is the searcher, 1 a
 /// direct follow. Render it as provenance ("via someone you follow").
+///
+/// `255` is the exception and means *off-graph*: the searcher has no social
+/// graph of their own, so this person was found through a configured fallback
+/// rather than through anyone they know. Present those as discovery, never as
+/// a connection -- they are not a distance from the user at all.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct UserDirectorySearchResultFfi {
     pub account_id_hex: String,
