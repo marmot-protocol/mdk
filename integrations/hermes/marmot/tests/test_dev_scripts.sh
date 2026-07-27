@@ -47,6 +47,8 @@ for helper in \
     "$dev_root/bootstrap-agent.sh"; do
     bash -n "$helper"
 done
+grep -F 'hermes_marmot_verify_persisted_config.sh" "$@" --root "$dev_root"' \
+    "$dev_root/verify-persisted-config.sh" >/dev/null
 
 # shellcheck disable=SC1091
 source "$dev_root/env.sh"

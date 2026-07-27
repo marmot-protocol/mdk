@@ -95,14 +95,9 @@ hermes-dev-teardown args="":
 hermes-dev-script-test:
     integrations/hermes/marmot/tests/test_dev_scripts.sh
 
+[positional-arguments]
 hermes-verify-persisted-config root="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -z "{{root}}" ]; then
-        ./scripts/hermes_marmot_verify_persisted_config.sh
-    else
-        ./scripts/hermes_marmot_verify_persisted_config.sh --root "{{root}}"
-    fi
+    ./scripts/hermes_marmot_verify_persisted_config.sh {{ if root == "" { "" } else { "--root \"$1\"" } }}
 
 release-all version:
     ./scripts/cut-full-release.sh {{version}}

@@ -152,8 +152,9 @@ Smoke-test the plugin import against the isolated Hermes venv:
 just hermes-dev-smoke
 ```
 
-Verify Marmot loads from persisted Hermes config after a gateway restart with no
-inherited `MARMOT_*` environment (installer/configure + fresh subprocess probe):
+Verify Marmot loads from persisted Hermes config in a fresh Hermes subprocess
+with no inherited `MARMOT_*` environment (installer/configure + fresh subprocess
+probe):
 
 ```sh
 just hermes-dev-setup --hermes-ref c7b75a7849cb260e6f17a045473bfdd0ea21ca81 --install-uv --print-env

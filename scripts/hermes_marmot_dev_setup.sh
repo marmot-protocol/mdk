@@ -397,7 +397,7 @@ SCRIPT
 set -euo pipefail
 dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$dev_root/env.sh"
-exec "$MDK_REPO/scripts/hermes_marmot_verify_persisted_config.sh" --root "$dev_root" "$@"
+exec "$MDK_REPO/scripts/hermes_marmot_verify_persisted_config.sh" "$@" --root "$dev_root"
 SCRIPT
 
     cat >"$dev_root/bootstrap-agent.sh" <<'SCRIPT'

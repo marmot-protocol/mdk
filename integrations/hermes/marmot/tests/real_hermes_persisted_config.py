@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 def main() -> int:
+    """Exercise persisted-config adapter construction in a fresh Hermes process."""
     expected_socket = Path(os.environ["HERMES_MARMOT_EXPECTED_SOCKET"])
     inherited_marmot_env = sorted(key for key in os.environ if key.startswith("MARMOT_"))
     if inherited_marmot_env:
@@ -53,19 +54,15 @@ def main() -> int:
     extra = platform_config.extra or {}
     socket_path = extra.get("socket_path") or extra.get("agent_socket") or extra.get("socket")
     if str(socket_path) != str(expected_socket):
-        print(
-            "persisted socket_path mismatch: "
-            f"expected {expected_socket}, got {socket_path!r}",
-            file=sys.stderr,
-        )
+        print("persisted socket configuration did not match the probe socket", file=sys.stderr)
         return 1
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2.0)
             client.connect(str(expected_socket))
-    except OSError as exc:
-        print(f"configured wn-agent socket is not healthy: {exc}", file=sys.stderr)
+    except OSError:
+        print("configured wn-agent socket is not healthy", file=sys.stderr)
         return 1
 
     adapter = platform_registry.create_adapter("marmot", platform_config)
@@ -75,11 +72,7 @@ def main() -> int:
 
     adapter_socket = getattr(adapter, "socket_path", None)
     if str(adapter_socket) != str(expected_socket):
-        print(
-            "adapter socket_path mismatch: "
-            f"expected {expected_socket}, got {adapter_socket!r}",
-            file=sys.stderr,
-        )
+        print("adapter socket configuration did not match the probe socket", file=sys.stderr)
         return 1
 
     print("real hermes persisted-config probe ok")
