@@ -52,6 +52,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `users search --json` now reports whether the traversal actually finished:
+  `complete` is `false` and `incomplete_reason` names the cause
+  (`radius_timeout` or `radius_truncated`) when a radius ran out of time or a
+  layer hit the candidate cap. The matches are still returned — they are valid,
+  just not all of them — and the human-readable output gains a
+  `(partial results: …)` line. Previously both cases returned a short list
+  indistinguishable from a complete one.
 - `users search --radius` now reaches radius 2 (follows-of-follows). The
   default stays `0..1`: radius 2 reads a contact list for every account you
   follow, so it is opt-in rather than a silent slowdown on every search. Each
