@@ -22,6 +22,8 @@ pub(crate) enum AppPerformanceOperation {
     DirectorySubscriptionSync,
     AccountReconcile,
     AccountOpen,
+    AccountTransportActivation,
+    AccountSubscriptionRegistration,
     AccountCatchUp,
     AccountSync,
     AccountSetupAdvisoryStep,
@@ -39,6 +41,25 @@ pub(crate) enum AppPerformanceOperation {
     GroupMlsStateRead,
     MediaUpload,
     MediaDownload,
+    HostSplashReady,
+    HostForegroundLocalReady,
+}
+
+/// Host-app milestones accepted by [`AppPerformanceTelemetry::record_host_performance`].
+///
+/// This is deliberately a closed enum rather than a caller-supplied metric or
+/// label name. Adding an operation therefore requires an MDK review and cannot
+/// silently create unbounded Prometheus cardinality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPerformanceOperation {
+    SplashReady,
+    ForegroundLocalReady,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPerformanceOutcome {
+    Success,
+    Failure,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +80,10 @@ pub struct AppPerformanceSnapshot {
     pub directory_subscription_sync: AppPerformanceOperationSnapshot,
     pub account_reconcile: AppPerformanceOperationSnapshot,
     pub account_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_transport_activation: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_subscription_registration: AppPerformanceOperationSnapshot,
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
@@ -87,6 +112,10 @@ pub struct AppPerformanceSnapshot {
     pub group_mls_state_read: AppPerformanceOperationSnapshot,
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_splash_ready: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_foreground_local_ready: AppPerformanceOperationSnapshot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +129,8 @@ struct AppPerformanceTelemetryInner {
     directory_subscription_sync: AppPerformanceOperationTelemetry,
     account_reconcile: AppPerformanceOperationTelemetry,
     account_open: AppPerformanceOperationTelemetry,
+    account_transport_activation: AppPerformanceOperationTelemetry,
+    account_subscription_registration: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
     account_setup_advisory_step: AppPerformanceOperationTelemetry,
@@ -117,6 +148,8 @@ struct AppPerformanceTelemetryInner {
     group_mls_state_read: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
+    host_splash_ready: AppPerformanceOperationTelemetry,
+    host_foreground_local_ready: AppPerformanceOperationTelemetry,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,6 +164,7 @@ struct AppPerformanceOperationTelemetry {
 struct DurationHistogram {
     buckets: [u64; APP_DURATION_BUCKET_BOUNDS_MS.len()],
     overflow: u64,
+    sum_ms: u64,
 }
 
 impl Default for DurationHistogram {
@@ -138,6 +172,7 @@ impl Default for DurationHistogram {
         Self {
             buckets: [0; APP_DURATION_BUCKET_BOUNDS_MS.len()],
             overflow: 0,
+            sum_ms: 0,
         }
     }
 }
@@ -145,6 +180,7 @@ impl Default for DurationHistogram {
 impl DurationHistogram {
     fn record(&mut self, duration: Duration) {
         let delta_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.sum_ms = self.sum_ms.saturating_add(delta_ms);
         for (idx, bound) in APP_DURATION_BUCKET_BOUNDS_MS.iter().enumerate() {
             if delta_ms <= *bound {
                 self.buckets[idx] += 1;
@@ -165,6 +201,7 @@ impl DurationHistogram {
                 })
                 .collect(),
             overflow_count: self.overflow,
+            sum_ms: self.sum_ms,
         }
     }
 }
@@ -210,6 +247,14 @@ impl AppPerformanceTelemetry {
                 inner.account_reconcile.record(duration, success);
             }
             AppPerformanceOperation::AccountOpen => inner.account_open.record(duration, success),
+            AppPerformanceOperation::AccountTransportActivation => {
+                inner.account_transport_activation.record(duration, success);
+            }
+            AppPerformanceOperation::AccountSubscriptionRegistration => {
+                inner
+                    .account_subscription_registration
+                    .record(duration, success);
+            }
             AppPerformanceOperation::AccountCatchUp => {
                 inner.account_catch_up.record(duration, success);
             }
@@ -263,7 +308,34 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
             }
+            AppPerformanceOperation::HostSplashReady => {
+                inner.host_splash_ready.record(duration, success);
+            }
+            AppPerformanceOperation::HostForegroundLocalReady => {
+                inner.host_foreground_local_ready.record(duration, success);
+            }
         }
+    }
+
+    /// Record one approved host-app milestone without accepting arbitrary
+    /// metric names, label names, or label values.
+    pub fn record_host_performance(
+        &self,
+        operation: HostPerformanceOperation,
+        duration: Duration,
+        outcome: HostPerformanceOutcome,
+    ) {
+        let operation = match operation {
+            HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
+            HostPerformanceOperation::ForegroundLocalReady => {
+                AppPerformanceOperation::HostForegroundLocalReady
+            }
+        };
+        self.record(
+            operation,
+            duration,
+            matches!(outcome, HostPerformanceOutcome::Success),
+        );
     }
 
     pub fn snapshot(&self) -> AppPerformanceSnapshot {
@@ -276,6 +348,8 @@ impl AppPerformanceTelemetry {
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),
             account_open: inner.account_open.snapshot(),
+            account_transport_activation: inner.account_transport_activation.snapshot(),
+            account_subscription_registration: inner.account_subscription_registration.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
@@ -295,6 +369,8 @@ impl AppPerformanceTelemetry {
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
+            host_splash_ready: inner.host_splash_ready.snapshot(),
+            host_foreground_local_ready: inner.host_foreground_local_ready.snapshot(),
         }
     }
 }
@@ -362,16 +438,41 @@ mod tests {
             Duration::from_millis(750),
             true,
         );
+        telemetry.record(
+            AppPerformanceOperation::AccountTransportActivation,
+            Duration::from_millis(5_000),
+            false,
+        );
+        telemetry.record(
+            AppPerformanceOperation::AccountSubscriptionRegistration,
+            Duration::from_millis(250),
+            true,
+        );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.app_start.attempts, 2);
         assert_eq!(snapshot.app_start.successes, 1);
         assert_eq!(snapshot.app_start.failures, 1);
         assert_eq!(snapshot.app_start.duration_ms.sample_count(), 2);
+        assert_eq!(snapshot.app_start.duration_ms.sum_ms, 400_050);
         assert_eq!(snapshot.group_invite_members.attempts, 1);
         assert_eq!(snapshot.group_invite_members.successes, 1);
         assert_eq!(snapshot.group_invite_members.failures, 0);
         assert_eq!(snapshot.group_invite_members.duration_ms.sample_count(), 1);
+        assert_eq!(snapshot.group_invite_members.duration_ms.sum_ms, 750);
+        assert_eq!(snapshot.account_transport_activation.failures, 1);
+        assert_eq!(
+            snapshot.account_transport_activation.duration_ms.sum_ms,
+            5_000
+        );
+        assert_eq!(snapshot.account_subscription_registration.successes, 1);
+        assert_eq!(
+            snapshot
+                .account_subscription_registration
+                .duration_ms
+                .sum_ms,
+            250
+        );
         assert!(
             snapshot
                 .app_start
@@ -381,6 +482,35 @@ mod tests {
                 .any(|bucket| bucket.upper_bound_ms == 50 && bucket.count == 1)
         );
         assert_eq!(snapshot.app_start.duration_ms.overflow_count, 1);
+    }
+
+    #[test]
+    fn records_each_closed_host_performance_operation() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms, outcome) in [
+            (
+                HostPerformanceOperation::SplashReady,
+                100,
+                HostPerformanceOutcome::Success,
+            ),
+            (
+                HostPerformanceOperation::ForegroundLocalReady,
+                200,
+                HostPerformanceOutcome::Success,
+            ),
+        ] {
+            telemetry.record_host_performance(
+                operation,
+                Duration::from_millis(duration_ms),
+                outcome,
+            );
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.host_splash_ready.successes, 1);
+        assert_eq!(snapshot.host_splash_ready.duration_ms.sum_ms, 100);
+        assert_eq!(snapshot.host_foreground_local_ready.successes, 1);
+        assert_eq!(snapshot.host_foreground_local_ready.duration_ms.sum_ms, 200);
     }
 
     #[tokio::test]

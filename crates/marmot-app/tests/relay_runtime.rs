@@ -1071,6 +1071,17 @@ async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
         })
         .await
         .unwrap();
+    // Identity creation now returns at local readiness. Use a worker mutation
+    // as a barrier so the asynchronous startup sync and open maintenance have
+    // completed before this test injects a synthetic legacy cache file.
+    runtime
+        .pause_maintenance(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime
+        .resume_maintenance(&created.account.account_id_hex)
+        .await
+        .unwrap();
     let cache_path = dir
         .path()
         .join("key-packages")
@@ -2732,7 +2743,19 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
 
     runtime.start().await.unwrap();
 
-    let health = runtime.shared_services().relay_plane().relay_health().await;
+    let health = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let health = runtime.shared_services().relay_plane().relay_health().await;
+            if health.directory_active_subscriptions == 1
+                && health.directory_completed_subscription_syncs == 1
+            {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("directory subscriptions should complete asynchronously");
     assert_eq!(health.directory_active_subscriptions, 1);
     assert_eq!(health.directory_completed_subscription_syncs, 1);
     runtime.shutdown().await;

@@ -51,14 +51,14 @@ pub use conversions::{
     ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, CursorPersistenceFfi,
     EncryptedMediaVersionFfi, GroupEvolutionStatusFfi, GroupMaintenanceStatusFfi,
     GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi, GroupSystemEventFfi,
-    KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi, MaintenanceObligationFfi,
-    MaintenancePhaseFfi, MaintenanceTriggerFfi, MediaAttachmentReferenceFfi,
-    MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
-    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
-    MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    HostPerformanceOperationFfi, HostPerformanceOutcomeFfi, KeyPackageMaintenanceStatusFfi,
+    LocalPushRegistrationDebugFfi, MaintenanceObligationFfi, MaintenancePhaseFfi,
+    MaintenanceTriggerFfi, MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi,
+    MediaRecordFfi, MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi,
+    MediaUploadRequestFfi, MediaUploadResultFfi, MessageDraftAttachmentFfi,
+    MessageDraftAttachmentSummaryFfi, MessageDraftFfi, MessageDraftSummaryFfi, MessageTagFfi,
+    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTrafficClassFfi,
+    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
     PeriodicMaintenancePolicyFfi, PushPlatformFfi, PushRegistrationFfi,
     PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
     RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
@@ -185,8 +185,16 @@ impl Marmot {
         )
     }
 
-    /// Bring the runtime online: reconcile known accounts, start workers,
-    /// subscribe to transport events.
+    /// Bring the runtime to local readiness.
+    ///
+    /// On success, persisted account state is hydrated and worker-routed local
+    /// reads are available. Relay activation, group-subscription registration,
+    /// shared-directory synchronization, and initial catch-up continue
+    /// asynchronously. Hosts should render local projections immediately and
+    /// represent network progress separately.
+    ///
+    /// The binding signature and result type are unchanged; this local-ready
+    /// completion point is the behavioral contract for this implementation.
     pub async fn start(&self) -> Result<(), MarmotKitError> {
         self.runtime.start().await?;
         Ok(())

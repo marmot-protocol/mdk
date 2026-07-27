@@ -123,6 +123,22 @@ pub mod metric_names {
     pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
     /// Failed account opens.
     pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION: &str =
+        "app_account_transport_activation_duration_ms";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS: &str =
+        "app_account_transport_activation_attempts";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES: &str =
+        "app_account_transport_activation_successes";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES: &str =
+        "app_account_transport_activation_failures";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION: &str =
+        "app_account_subscription_registration_duration_ms";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS: &str =
+        "app_account_subscription_registration_attempts";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES: &str =
+        "app_account_subscription_registration_successes";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES: &str =
+        "app_account_subscription_registration_failures";
     /// Multi-account catch-up duration histogram.
     pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
     /// Multi-account catch-up attempts.
@@ -287,6 +303,18 @@ pub mod metric_names {
     pub const APP_MEDIA_DOWNLOAD_SUCCESSES: &str = "app_media_download_successes";
     /// Failed media downloads.
     pub const APP_MEDIA_DOWNLOAD_FAILURES: &str = "app_media_download_failures";
+    pub const APP_HOST_SPLASH_READY_DURATION: &str = "app_host_splash_ready_duration_ms";
+    pub const APP_HOST_SPLASH_READY_ATTEMPTS: &str = "app_host_splash_ready_attempts";
+    pub const APP_HOST_SPLASH_READY_SUCCESSES: &str = "app_host_splash_ready_successes";
+    pub const APP_HOST_SPLASH_READY_FAILURES: &str = "app_host_splash_ready_failures";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_DURATION: &str =
+        "app_host_foreground_local_ready_duration_ms";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS: &str =
+        "app_host_foreground_local_ready_attempts";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES: &str =
+        "app_host_foreground_local_ready_successes";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_FAILURES: &str =
+        "app_host_foreground_local_ready_failures";
 }
 
 /// A fixed-bucket cumulative histogram in the export batch.
@@ -301,6 +329,8 @@ pub struct ExportHistogram {
     pub bucket_counts: Vec<u64>,
     /// Samples above the largest bound.
     pub overflow_count: u64,
+    /// Saturating sum of all observed durations, in milliseconds.
+    pub sum_ms: u64,
 }
 
 impl ExportHistogram {
@@ -313,6 +343,7 @@ impl ExportHistogram {
                 .collect(),
             bucket_counts: snapshot.buckets.iter().map(|bucket| bucket.count).collect(),
             overflow_count: snapshot.overflow_count,
+            sum_ms: snapshot.sum_ms,
         }
     }
 
@@ -581,6 +612,22 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.account_transport_activation,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_subscription_registration,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.account_catch_up,
         metric_names::APP_ACCOUNT_CATCH_UP_DURATION,
         metric_names::APP_ACCOUNT_CATCH_UP_ATTEMPTS,
@@ -714,6 +761,22 @@ fn append_app_performance_points(
         metric_names::APP_MEDIA_DOWNLOAD_ATTEMPTS,
         metric_names::APP_MEDIA_DOWNLOAD_SUCCESSES,
         metric_names::APP_MEDIA_DOWNLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_splash_ready,
+        metric_names::APP_HOST_SPLASH_READY_DURATION,
+        metric_names::APP_HOST_SPLASH_READY_ATTEMPTS,
+        metric_names::APP_HOST_SPLASH_READY_SUCCESSES,
+        metric_names::APP_HOST_SPLASH_READY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_foreground_local_ready,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_DURATION,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_FAILURES,
     );
 }
 
@@ -979,6 +1042,7 @@ mod otlp {
                                 start_time_unix_nano: start_ns,
                                 time_unix_nano: now_ns,
                                 count,
+                                sum: Some(histogram.sum_ms as f64),
                                 bucket_counts,
                                 explicit_bounds: histogram
                                     .bounds_ms
@@ -1086,6 +1150,7 @@ mod otlp {
                             bounds_ms: vec![10, 50],
                             bucket_counts: vec![1, 2],
                             overflow_count: 3,
+                            sum_ms: 123,
                         }),
                     },
                 ],
@@ -1159,7 +1224,7 @@ mod otlp {
             assert_eq!(point.time_unix_nano, 200);
             assert_eq!(point.attributes[0].key, "relay");
 
-            // Histogram -> bucket_counts = per-bucket + overflow, same bounds, no label.
+            // Histogram -> bucket_counts = per-bucket + overflow, same bounds and sum, no label.
             let histogram = match &scope_metrics.metrics[2].data {
                 Some(metric::Data::Histogram(histogram)) => histogram,
                 other => panic!("expected histogram, got {other:?}"),
@@ -1172,6 +1237,7 @@ mod otlp {
             assert_eq!(point.bucket_counts, vec![1, 2, 3]);
             assert_eq!(point.explicit_bounds, vec![10.0, 50.0]);
             assert_eq!(point.count, 6);
+            assert_eq!(point.sum, Some(123.0));
         }
     }
 }

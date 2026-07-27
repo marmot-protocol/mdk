@@ -21,7 +21,7 @@ use crate::agent_streams::AgentStreamWatchManager;
 use crate::app_telemetry::{
     AppPerformanceOperation, AppPerformanceTelemetry, bounded_advisory_step,
 };
-use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
+use crate::directory::DirectorySyncHandle;
 use crate::ids::normalize_group_id_hex_app;
 use crate::messages::AppMessageIntent;
 use crate::notifications;
@@ -106,6 +106,7 @@ pub struct MarmotAppRuntime {
     shared: RuntimeSharedServices,
     accounts: AccountManager,
     directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
+    initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -819,6 +820,7 @@ impl MarmotAppRuntime {
             shared,
             accounts,
             directory_sync: Arc::new(Mutex::new(None)),
+            initial_directory_sync: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -876,6 +878,12 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().is_stopping()
     }
 
+    /// Starts the runtime through local account readiness.
+    ///
+    /// A successful return guarantees that persisted account state is
+    /// hydrated and worker-routed local reads are available. Relay activation,
+    /// group-subscription registration, directory synchronization, and initial
+    /// catch-up continue asynchronously after this method returns.
     pub async fn start(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
         let result: Result<RelayTelemetryExportConfig, AppError> = async {
@@ -890,7 +898,6 @@ impl MarmotAppRuntime {
                     self.shared.relay_telemetry_runtime_config(),
                     self.shared.service_endpoints(),
                 );
-            self.sync_user_directory_subscriptions().await?;
             self.reconcile_accounts().await?;
             self.shared.lifecycle().mark_running();
             Ok(config)
@@ -903,25 +910,35 @@ impl MarmotAppRuntime {
         );
         let config = result?;
         self.shared.configure_relay_telemetry_exporter(config);
+        self.schedule_user_directory_subscription_sync().await;
         Ok(())
     }
 
-    pub(crate) async fn sync_user_directory_subscriptions(
-        &self,
-    ) -> Result<DirectorySyncRunSummary, AppError> {
-        let started_at = Instant::now();
-        let result = async {
-            self.shared.lifecycle().ensure_running()?;
-            let directory_sync = self.ensure_directory_sync_worker().await;
-            directory_sync.request_rebuild_and_wait().await
+    async fn schedule_user_directory_subscription_sync(&self) {
+        let directory_sync = self.ensure_directory_sync_worker().await;
+        let telemetry = self.shared.app_performance_telemetry();
+        let handle = tokio::spawn(async move {
+            let started_at = Instant::now();
+            let result = directory_sync.request_rebuild_and_wait().await;
+            telemetry.record(
+                AppPerformanceOperation::DirectorySubscriptionSync,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "schedule_user_directory_subscription_sync",
+                    error_kind = error.privacy_safe_kind(),
+                    "initial directory subscription sync deferred after startup"
+                );
+            }
+        });
+        let previous = self.initial_directory_sync.lock().await.replace(handle);
+        if let Some(previous) = previous {
+            previous.abort();
+            let _ = previous.await;
         }
-        .await;
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::DirectorySubscriptionSync,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
-        result
     }
 
     async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
@@ -1488,6 +1505,19 @@ impl MarmotAppRuntime {
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
         self.accounts.app.telemetry_install_id()
+    }
+
+    /// Record a duration measured by the host application for one of MDK's
+    /// approved, low-cardinality performance milestones.
+    pub fn record_host_performance(
+        &self,
+        operation: crate::HostPerformanceOperation,
+        duration: Duration,
+        outcome: crate::HostPerformanceOutcome,
+    ) {
+        self.shared
+            .app_performance_telemetry()
+            .record_host_performance(operation, duration, outcome);
     }
 
     pub fn set_relay_telemetry_settings(
@@ -2779,6 +2809,9 @@ impl MarmotAppRuntime {
         if let Some(directory_sync) = self.directory_sync.lock().await.take() {
             directory_sync.shutdown().await;
         }
+        if let Some(initial_directory_sync) = self.initial_directory_sync.lock().await.take() {
+            let _ = initial_directory_sync.await;
+        }
         self.accounts.app.set_directory_sync_handle(None);
         let accounts = self.accounts.shutdown();
         let relay_plane = self.shared.relay_plane.shutdown();
@@ -3242,6 +3275,13 @@ impl AccountManager {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.resolve(account_ref)?;
+        if account.can_sign() && !account.signed_out {
+            // Unlike local runtime reads, this API reports relay visibility.
+            // Wait for the managed worker's initial activation, catch-up, and
+            // open maintenance before issuing the directory query.
+            self.wait_for_account_network_startup_to_settle(&account.label)
+                .await?;
+        }
         let owned = cgka_engine::key_package::durably_owned_key_packages(
             &self.app.account_storage(&account.label)?,
             cgka_traits::group::ProtocolProfile::Current,
@@ -3403,6 +3443,25 @@ impl AccountManager {
             key_package_bytes,
             profile,
         })
+    }
+
+    async fn wait_for_account_network_startup_to_settle(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::NetworkStartupSettled { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::BlockingTask(
+                "account worker startup settlement timed out".into(),
+            )),
+        }
     }
 
     pub async fn login_external_signer<S>(

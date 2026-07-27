@@ -12,4 +12,4 @@ pub use records::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
-pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan, DirectorySyncRunSummary};
+pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};

@@ -41,6 +41,30 @@ MarmotAppRuntime
 - account-scoped group, message, profile, key-package, and stream operations;
 - account inbox subscription state.
 
+## Startup Readiness Contract
+
+`MarmotAppRuntime::start()` and the existing UniFFI `Marmot.start()` method
+complete at local readiness. Their method signatures and result types are
+unchanged.
+
+Successful completion guarantees:
+
+- persisted account sessions and projections have been hydrated;
+- account workers are running;
+- worker-routed local group reads are available from the captured snapshot.
+
+It does not guarantee that relays are connected, group subscriptions are
+registered, directory state is synchronized, or initial catch-up is complete.
+Those operations continue asynchronously. Local reads remain available while
+catch-up runs; mutations are deferred and replayed in arrival order afterward.
+An asynchronous startup-sync failure emits the existing account-error event
+without revoking local readiness.
+
+Host apps should render the locally persisted chat list when `start()` returns,
+show relay progress separately, and apply projection updates as network data
+arrives. No durable account, device, or startup identifier is introduced by
+this contract.
+
 `SharedServices` should hold runtime state shared by every account:
 
 - directory/user cache;
