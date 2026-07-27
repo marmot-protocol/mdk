@@ -1344,6 +1344,7 @@ mod tests {
                 count: 1,
             }],
             overflow_count: 0,
+            sum_ms: upper_bound_ms,
         }
     }
 

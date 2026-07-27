@@ -1490,6 +1490,19 @@ impl MarmotAppRuntime {
         self.accounts.app.telemetry_install_id()
     }
 
+    /// Record a duration measured by the host application for one of MDK's
+    /// approved, low-cardinality performance milestones.
+    pub fn record_host_performance(
+        &self,
+        operation: crate::HostPerformanceOperation,
+        duration: Duration,
+        outcome: crate::HostPerformanceOutcome,
+    ) {
+        self.shared
+            .app_performance_telemetry()
+            .record_host_performance(operation, duration, outcome);
+    }
+
     pub fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettings,

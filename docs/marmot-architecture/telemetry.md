@@ -123,6 +123,7 @@ Relay delivery-spread, first-event, and EOSE histograms use the same inclusive m
 | `buckets[].upper_bound_ms` | Inclusive bucket upper bound. |
 | `buckets[].count` | Samples in that bucket. |
 | `overflow_count` | Samples above `30000ms`. |
+| `sum_ms` | Saturating sum of all observed durations in milliseconds. |
 
 `approx_percentile_ms()` returns the upper bound of the bucket containing the requested percentile, `None` when there
 are no samples, and `None` if the percentile falls in overflow.
@@ -191,7 +192,7 @@ Collected operations:
 | `app_start` | `MarmotAppRuntime::start()`, from method entry through directory-storage warmup, telemetry config construction, directory subscription sync, account reconciliation, and running-state mark. | Success means `start()` reached exporter configuration; the sample is recorded before the exporter task starts so the first export can include it. |
 | `directory_subscription_sync` | `MarmotAppRuntime::sync_user_directory_subscriptions()`, including directory worker creation if needed and `request_rebuild_and_wait()`. | Covers how long the directory subscription rebuild path takes to become ready. |
 | `account_reconcile` | `AccountManager::reconcile()`, including local-signing account enumeration, stale-worker stop, pending-worker spawn, and ready wait. | Recorded every time reconcile runs, including implicit reconcile before catch-up. |
-| `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | The ready signal is sent after runtime client construction and startup `client.sync()`, so this is an account-ready envelope rather than just database/session open. |
+| `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | Runtime client construction currently includes local hydration, signer setup, relay transport activation, and group-subscription registration. The initial `client.sync()` runs after the ready signal. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
 | `account_sync` | Each account worker `client.sync()` during startup and catch-up. | Coarse envelope for transport activation, subscription setup, relay data drain, processing, projection/state update, and returning a `SyncSummary`. |
 | `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
@@ -208,6 +209,8 @@ Collected operations:
 | `group_mls_state_read` | `AccountManager::group_mls_state()`, from worker command dispatch through the read response. | Captures projection reads used by the conversation developer/debug state surface. |
 | `media_upload` | Worker `UploadMedia` command until `client.upload_media()` returns. | Measures local encryption/upload pipeline and endpoint response time as seen by this device. |
 | `media_download` | Worker `DownloadMedia` command until `client.download_media()` returns. | Measures local fetch/decrypt pipeline and endpoint response time as seen by this device. |
+| `host_splash_ready` | Host-defined launch origin until the primary UI is allowed to leave its splash/loading screen. | Recorded by the host through `record_host_performance`; use success only when the usable local UI is actually presented. |
+| `host_foreground_local_ready` | Foreground activation until locally persisted content is usable. | Excludes relay catch-up; remote refresh continues asynchronously. |
 
 App-performance histograms use wider inclusive millisecond bucket bounds than relay timing so startup and media transfer
 latencies do not immediately fall into overflow:
@@ -220,6 +223,8 @@ latencies do not immediately fall into overflow:
 
 These app-performance samples deliberately do not include account labels, account ids, group ids, member refs, message
 ids, relay URLs, media URLs, payload sizes, content types, upload endpoints, download endpoints, or error strings.
+Host applications can only select the closed `HostPerformanceOperation` enum; callers cannot supply metric names,
+label names, or label values. Adding a new cross-platform operation requires an MDK API change and review.
 
 ## How local relay telemetry is recorded
 
@@ -329,6 +334,7 @@ the batch now carries both relay metrics and app-performance metrics. Each point
 | `bounds_ms` | Millisecond bucket upper bounds copied from local snapshots. |
 | `bucket_counts` | Count per bucket. |
 | `overflow_count` | Samples above the largest bound. |
+| `sum_ms` | Saturating sum of all observed durations in milliseconds. |
 
 Per-relay points are emitted only when an opaque relay index resolves to a relay URL at the opt-in export boundary.
 Unresolved relay indices are skipped rather than exported as opaque ids.
@@ -391,6 +397,14 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_media_download_attempts` | none | Counter | `AppPerformanceSnapshot.media_download.attempts` |
 | `app_media_download_successes` | none | Counter | `AppPerformanceSnapshot.media_download.successes` |
 | `app_media_download_failures` | none | Counter | `AppPerformanceSnapshot.media_download.failures` |
+| `app_host_splash_ready_duration_ms` | none | Histogram | `AppPerformanceSnapshot.host_splash_ready.duration_ms` |
+| `app_host_splash_ready_attempts` | none | Counter | `AppPerformanceSnapshot.host_splash_ready.attempts` |
+| `app_host_splash_ready_successes` | none | Counter | `AppPerformanceSnapshot.host_splash_ready.successes` |
+| `app_host_splash_ready_failures` | none | Counter | `AppPerformanceSnapshot.host_splash_ready.failures` |
+| `app_host_foreground_local_ready_duration_ms` | none | Histogram | `AppPerformanceSnapshot.host_foreground_local_ready.duration_ms` |
+| `app_host_foreground_local_ready_attempts` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.attempts` |
+| `app_host_foreground_local_ready_successes` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.successes` |
+| `app_host_foreground_local_ready_failures` | none | Counter | `AppPerformanceSnapshot.host_foreground_local_ready.failures` |
 
 Current implementation note: publish telemetry is device-wide attempts/successes/failures. It is not currently
 per-relay or per-Nostr-kind, even though the relay observability design doc names those as desired future ranking
@@ -402,8 +416,8 @@ When the `otlp-export` feature is enabled:
 
 - counters encode as monotonic cumulative OTLP sums;
 - gauges encode as OTLP gauges;
-- histograms encode as cumulative OTLP histograms with the same explicit bounds as local snapshots plus an overflow
-  bucket;
+- histograms encode as cumulative OTLP histograms with the same explicit bounds and duration sum as local snapshots,
+  plus an overflow bucket;
 - metric unit is `ms` for histograms and `1` for counters/gauges;
 - instrumentation scope name is `marmot.relay_telemetry`;
 - HTTP body content type is `application/x-protobuf`;

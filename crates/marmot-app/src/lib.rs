@@ -119,6 +119,7 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+    HostPerformanceOperation, HostPerformanceOutcome,
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,

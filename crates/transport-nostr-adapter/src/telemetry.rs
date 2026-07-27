@@ -172,10 +172,12 @@ impl RelayLabelResolution {
 struct DurationHistogram {
     buckets: [u64; BUCKET_BOUNDS_MS.len()],
     overflow: u64,
+    sum_ms: u64,
 }
 
 impl DurationHistogram {
     fn record(&mut self, delta_ms: u64) {
+        self.sum_ms = self.sum_ms.saturating_add(delta_ms);
         for (idx, bound) in BUCKET_BOUNDS_MS.iter().enumerate() {
             if delta_ms <= *bound {
                 self.buckets[idx] += 1;
@@ -197,6 +199,7 @@ impl DurationHistogram {
         DurationHistogramSnapshot {
             buckets,
             overflow_count: self.overflow,
+            sum_ms: self.sum_ms,
         }
     }
 }
@@ -207,11 +210,13 @@ fn aggregate_histograms<'a>(
 ) -> DurationHistogramSnapshot {
     let mut buckets = [0u64; BUCKET_BOUNDS_MS.len()];
     let mut overflow = 0;
+    let mut sum_ms = 0u64;
     for histogram in histograms {
         for (idx, count) in histogram.buckets.iter().enumerate() {
             buckets[idx] += count;
         }
         overflow += histogram.overflow;
+        sum_ms = sum_ms.saturating_add(histogram.sum_ms);
     }
     DurationHistogramSnapshot {
         buckets: BUCKET_BOUNDS_MS
@@ -223,6 +228,7 @@ fn aggregate_histograms<'a>(
             })
             .collect(),
         overflow_count: overflow,
+        sum_ms,
     }
 }
 
@@ -237,14 +243,17 @@ pub struct HistogramBucket {
 
 /// Aggregate duration histogram snapshot.
 ///
-/// Contains only counts and millisecond bucket bounds: no message ids, relay
-/// endpoints, subscription ids, or payload-derived values.
+/// Contains only counts, a duration sum, and millisecond bucket bounds: no
+/// message ids, relay endpoints, subscription ids, or payload-derived values.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurationHistogramSnapshot {
     /// Histogram by ascending upper bound.
     pub buckets: Vec<HistogramBucket>,
     /// Samples whose duration exceeded the largest bucket bound.
     pub overflow_count: u64,
+    /// Saturating sum of all observed durations, in milliseconds.
+    #[serde(default)]
+    pub sum_ms: u64,
 }
 
 impl DurationHistogramSnapshot {
@@ -746,6 +755,7 @@ mod tests {
         let snap = telem.snapshot();
         assert_eq!(snap.corroborated, 1);
         assert_eq!(snap.spread.sample_count(), 2);
+        assert_eq!(snap.spread.sum_ms, 320);
     }
 
     #[test]
@@ -804,6 +814,7 @@ mod tests {
         let snap = telem.snapshot();
         assert_eq!(snap.spread.overflow_count, 1);
         assert_eq!(snap.spread.sample_count(), 1);
+        assert_eq!(snap.spread.sum_ms, 40_000);
         assert_eq!(snap.spread.approx_percentile_ms(1.0), None);
     }
 
@@ -829,10 +840,13 @@ mod tests {
         assert_eq!(snap.tracked_subscriptions, 1);
         assert_eq!(snap.synced_subscriptions, 1);
         assert_eq!(snap.eose.sample_count(), 2);
+        assert_eq!(snap.eose.sum_ms, 100);
         // Per-relay EOSE latency is attributed to both relays.
         assert_eq!(snap.per_relay.len(), 2);
         assert_eq!(snap.per_relay[0].eose.sample_count(), 1);
         assert_eq!(snap.per_relay[1].eose.sample_count(), 1);
+        assert_eq!(snap.per_relay[0].eose.sum_ms, 30);
+        assert_eq!(snap.per_relay[1].eose.sum_ms, 70);
     }
 
     #[test]
@@ -844,8 +858,10 @@ mod tests {
 
         let snap = telem.snapshot();
         assert_eq!(snap.first_event.sample_count(), 1);
+        assert_eq!(snap.first_event.sum_ms, 40);
         assert_eq!(snap.per_relay[0].relay_index, 0);
         assert_eq!(snap.per_relay[0].first_event.sample_count(), 1);
+        assert_eq!(snap.per_relay[0].first_event.sum_ms, 40);
         let bucket = snap
             .first_event
             .buckets
