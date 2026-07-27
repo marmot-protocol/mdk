@@ -105,10 +105,16 @@ pub struct ChatListRow {
     ///
     /// This is *not* a `chat_list_rows` column. It is derived at read time from
     /// the engine-owned `cgka_leave_requests` table, which is the only source of
-    /// truth: `self_membership` does not reach a terminal `Left` until a commit
-    /// actually removes us, so between the request and that commit — across a
-    /// publish failure or a process restart — this is the only durable record
-    /// that the user asked to leave.
+    /// truth for unresolved intent.
+    ///
+    /// Orthogonal to [`Self::self_membership`], and the two combine freely.
+    /// `self_membership` records the locally *classified departure*: the leave
+    /// path writes `Left` as soon as the SelfRemove proposal publishes, without
+    /// waiting for another member to commit it. This field tracks whether the
+    /// request itself has *resolved*. So `Left` + `Some(..)` means the leave
+    /// published and is awaiting a committer, `Member` + `Some(..)` means the
+    /// publish failed (or the process died before the membership write), and
+    /// `None` means no leave is outstanding.
     #[serde(default)]
     pub leave_requested_at_ms: Option<u64>,
 }

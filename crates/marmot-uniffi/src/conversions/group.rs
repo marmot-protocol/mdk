@@ -48,8 +48,9 @@ pub struct AppGroupRecordFfi {
     /// whether it left voluntarily or was removed.
     pub self_membership: SelfMembershipFfi,
     /// The local account asked to leave this group and the request has not
-    /// resolved yet. See `ChatListRowFfi::leave_request_pending` for why this is
-    /// distinct from a terminal `self_membership` of `Left`.
+    /// resolved yet. Orthogonal to `self_membership`, which records the locally
+    /// classified departure rather than whether the request resolved — see
+    /// `ChatListRowFfi::leave_request_pending` for the full state table.
     ///
     /// Always equal to `leave_requested_at_ms != null`.
     pub leave_request_pending: bool,

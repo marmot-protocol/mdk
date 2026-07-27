@@ -115,8 +115,13 @@ pub struct AppGroupRecord {
     /// Derived from the engine-owned `cgka_leave_requests` table when the record
     /// is read; not part of the stored `account_groups` projection. MLS
     /// SelfRemove proposals are epoch-bound while the product intent is not, so
-    /// `self_membership` does not reach `Left` until a commit actually removes
-    /// us — until then this is the only durable evidence of the request, and the
+    /// the engine keeps re-proposing until a commit removes the local member.
+    ///
+    /// Orthogonal to [`Self::self_membership`]: that field records the locally
+    /// classified departure (`Left` is written as soon as the proposal
+    /// publishes, before anyone commits it), while this one tracks whether the
+    /// request has resolved. Both can be set at once, and this is the only
+    /// durable evidence of the intent when a publish failed — so it is also the
     /// only way a cold launch can rediscover it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leave_requested_at_ms: Option<u64>,

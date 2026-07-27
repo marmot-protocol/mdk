@@ -3510,12 +3510,14 @@ async fn local_leave_suppresses_account_unread_total() {
 async fn pending_leave_request_survives_a_cold_launch() {
     // The durable `LeaveRequest` is recorded before the leave publishes, but
     // nothing above the engine could see it, so a cold launch could not
-    // rediscover the intent: `self_membership` only reaches a terminal `Left`
-    // once a commit actually removes the local member, which in a two-party
-    // group needs the other side to commit bob's SelfRemove proposal. This
-    // asserts the read-time projection makes that window visible on both the
-    // chat-list row and the group record, and that reopening the app over the
-    // same database still reports it.
+    // rediscover the intent.
+    //
+    // The two states are orthogonal, and this pins that: `self_membership`
+    // becomes `Left` as soon as the proposal publishes (the local classification
+    // of a voluntary departure), while the request stays outstanding until some
+    // member commits the SelfRemove — which in this two-party group alice never
+    // does. So `Left` and a pending request coexist here, and a host must read
+    // the pending flag rather than infer resolution from `Left`.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -3558,6 +3560,14 @@ async fn pending_leave_request_survives_a_cold_launch() {
     assert!(
         requested_at > 0,
         "requested_at_ms should be a real clock reading"
+    );
+    // The documented coexistence, asserted rather than merely narrated: an
+    // optimistic `Left` alongside an unresolved request. If a future change made
+    // `Left` imply resolution, this is what would catch it.
+    assert_eq!(
+        row.self_membership,
+        SelfMembership::Left,
+        "a published leave classifies as Left immediately, while the request stays pending"
     );
     let group = app
         .group("bob", &group_id_hex)
@@ -6178,4 +6188,85 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
     );
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
+    // PR #1138 review (P1): `Marmot::leave_group` prechecks the pending flag, but
+    // that read is not atomic with the send it guards. Two concurrent leaves — a
+    // rapid double tap launching two async tasks — can both observe "not
+    // pending". The account worker then serializes them, and the loser used to
+    // receive `EngineError::InvalidTransition`, which flattens to an opaque error
+    // at the UniFFI boundary: exactly what surfacing this state was meant to
+    // remove. The classification is now made inside the engine, so the loser
+    // learns the real reason by name no matter who wins the race.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(&alice_id, "double tap", std::slice::from_ref(&bob_id), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+
+    // Both leaves are in flight before either worker command runs, so neither
+    // can benefit from the other having recorded the request.
+    let (first, second) = tokio::join!(
+        runtime.leave_group(&bob_id, &group_id),
+        runtime.leave_group(&bob_id, &group_id),
+    );
+
+    // Exactly one wins; the ordering is genuinely racy, so accept either.
+    let (winner, loser) = match (&first, &second) {
+        (Ok(_), Err(err)) => (&first, err),
+        (Err(err), Ok(_)) => (&second, err),
+        (a, b) => panic!("exactly one concurrent leave should succeed; got {a:?} and {b:?}"),
+    };
+    assert!(winner.is_ok());
+
+    let engine_error = loser
+        .as_engine_error()
+        .unwrap_or_else(|| panic!("the losing leave should carry an engine error; got {loser:?}"));
+    match engine_error {
+        cgka_traits::error::EngineError::LeaveAlreadyRequested { group_id: refused } => {
+            assert_eq!(
+                *refused, group_id,
+                "the error must name the group it refused"
+            );
+        }
+        other => panic!(
+            "the losing leave must be typed as already-requested, never an opaque \
+             InvalidTransition; got {other:?}"
+        ),
+    }
+
+    // The race resolved into one durable request, and it is visible to hosts.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    assert!(
+        app.chat_list_row(&bob.account.label, &group_id_hex)
+            .unwrap()
+            .expect("bob's row survives the leave")
+            .leave_requested_at_ms
+            .is_some(),
+        "the winning leave leaves exactly one durable request behind"
+    );
 }

@@ -102,10 +102,24 @@ pub struct ChatListRowFfi {
     /// resolved yet. Render the conversation as leaving, and do not offer Leave
     /// again — see `GroupManagementStateFfi::can_leave`.
     ///
-    /// `self_membership` only reaches a terminal `Left` once a commit actually
-    /// removes the local member, which may be many epochs later or never (a
-    /// publish can fail, and the intent survives app termination). This flag is
-    /// the durable intent in between, so a cold launch can rediscover it.
+    /// Durable unresolved *intent*, which survives a failed publish and app
+    /// termination — so a cold launch can rediscover it. Read this rather than
+    /// `self_membership` to decide whether to show a leave in progress.
+    ///
+    /// This is orthogonal to `self_membership`, not a precursor to it. The two
+    /// answer different questions and combine freely:
+    ///
+    /// | `self_membership` | this flag | meaning |
+    /// |---|---|---|
+    /// | `Member` | `true`  | leave requested, publish failed or was interrupted |
+    /// | `Left`   | `true`  | leave published, still waiting for a member to commit it |
+    /// | `Left`   | `false` | leave resolved |
+    /// | `Removed`| `false` | removed by someone else |
+    ///
+    /// `self_membership` is the locally *classified departure* — `Left` is
+    /// recorded as soon as the SelfRemove proposal publishes, so it does **not**
+    /// imply a commit removed the member, and `Removed` marks an involuntary
+    /// removal. This flag is about whether the request is still outstanding.
     ///
     /// Always equal to `leave_requested_at_ms != null`.
     pub leave_request_pending: bool,

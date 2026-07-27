@@ -217,6 +217,13 @@ impl MarmotKitError {
             EngineError::AdminCannotSelfRemove { group_id } => Self::AdminCannotSelfRemove {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            // The authoritative already-leaving signal. `Marmot::leave_group`
+            // prechecks the pending flag for fast UX, but that check is a
+            // check-then-act race, so the engine's verdict must map to the same
+            // named error rather than falling through to `Runtime`.
+            EngineError::LeaveAlreadyRequested { group_id } => Self::LeaveAlreadyRequested {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             EngineError::AdminDepletion { group_id } => Self::WouldRemoveLastAdmin {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
@@ -267,6 +274,49 @@ mod tests {
             }
             other => panic!("expected AccountCatchUp, got {other:?}"),
         }
+    }
+
+    // The `leave_group` precheck on `leave_request_pending` is not atomic with
+    // the send it guards, so two concurrent leaves can both pass it. The engine
+    // settles the race under its own lock, and the loser's verdict has to reach
+    // the host as the same named error the precheck would have produced — never
+    // the untyped `Runtime` bucket, which is exactly the opaque failure this
+    // field was added to eliminate.
+    // Asserted against `from_engine_error` directly rather than through an
+    // `AppError`: a leave failure arrives wrapped as
+    // `AppError::Session(SessionError::Engine(..))`, and `cgka-session` is not a
+    // dependency of this crate. `From<AppError>` funnels every such error through
+    // `as_engine_error()` into this same function (see above), so this covers the
+    // mapping without pulling in a crate just to construct a wrapper.
+    #[test]
+    fn leave_already_requested_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x11; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::LeaveAlreadyRequested {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::LeaveAlreadyRequested { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected LeaveAlreadyRequested, got {other:?}"),
+        }
+    }
+
+    // The variant it replaced must not regress into the opaque bucket by way of
+    // some future refactor reusing `InvalidTransition` for this case.
+    #[test]
+    fn invalid_transition_remains_the_untyped_engine_bug_signal() {
+        let ffi = MarmotKitError::from_engine_error(&EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "Leaving",
+                to: "AppMessage",
+                reason: "leave request is current",
+            },
+        ));
+        assert!(
+            matches!(ffi, MarmotKitError::Runtime { .. }),
+            "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
+        );
     }
 
     #[test]

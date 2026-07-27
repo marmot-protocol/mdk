@@ -640,13 +640,16 @@ impl<S: StorageProvider> Engine<S> {
             == Some(current_epoch)
         {
             self.leaving_groups.insert(group_id.clone());
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "Leaving",
-                    to: "Leave",
-                    reason: "leave already requested for current epoch",
-                },
-            ));
+            // Authoritative classification for "already leaving". Decided here
+            // rather than by a caller-side precheck because this read and the
+            // durable write below happen under the same lock: two concurrent
+            // leaves can both observe "not pending" above this layer, and the
+            // loser has to learn the real reason from here. Typed rather than
+            // `InvalidTransition` (an engine-bug signal) so it can cross the FFI
+            // boundary as a named error instead of an opaque runtime failure.
+            return Err(EngineError::LeaveAlreadyRequested {
+                group_id: group_id.clone(),
+            });
         }
 
         let (msg, proposal_bytes, proposed_epoch) =
