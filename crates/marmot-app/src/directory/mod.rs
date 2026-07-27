@@ -10,8 +10,9 @@ pub(crate) use cache::DirectorySearchGraphRecord;
 #[cfg(test)]
 pub(crate) use methods::cached_or_unknown_follow_list;
 pub use records::{
-    DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
-    UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
+    DirectoryKeyPackage, MatchQuality, MatchedField, UserDirectoryLocalAccount,
+    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
+    UserProfileMetadata,
 };
 pub use search::{
     SearchUpdateTrigger, UserSearchParams, UserSearchSubscription, UserSearchUpdate,

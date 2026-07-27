@@ -24,8 +24,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::records::{
-    UserDirectoryRecord, UserDirectorySearchResult, field_rank, match_quality_rank,
-    profile_from_record, user_record_match,
+    UserDirectoryRecord, UserDirectorySearchResult, profile_from_record, user_record_match,
 };
 use crate::error::AppError;
 use crate::ids::parse_account_id_hex;
@@ -426,10 +425,8 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
     results.sort_by(|a, b| {
         a.radius
             .cmp(&b.radius)
-            .then_with(|| {
-                match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
-            })
-            .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
+            .then_with(|| a.match_quality.cmp(&b.match_quality))
+            .then_with(|| a.matched_field.cmp(&b.matched_field))
             .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
     });
 }
@@ -437,6 +434,7 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MatchQuality, MatchedField};
     use crate::AccountRelayListStatus;
     use crate::ids::npub_for_account_id_lossy;
     use marmot_account::AccountHome;
@@ -577,8 +575,8 @@ mod tests {
         assert_eq!(found.new_results.len(), 1);
         assert_eq!(found.new_results[0].account_id_hex, account.account_id_hex);
         assert_eq!(found.new_results[0].radius, 0);
-        assert_eq!(found.new_results[0].matched_field, "name");
-        assert_eq!(found.new_results[0].match_quality, "exact");
+        assert_eq!(found.new_results[0].matched_field, MatchedField::Name);
+        assert_eq!(found.new_results[0].match_quality, MatchQuality::Exact);
         // The running total is cumulative and survives to the terminal update.
         assert_eq!(found.total_result_count, 1);
         assert_eq!(updates.last().unwrap().total_result_count, 1);
@@ -617,24 +615,24 @@ mod tests {
                 account_id_hex: format!("{:064x}", 1),
                 npub: "npub-contains-name".into(),
                 radius: 1,
-                matched_field: "name".into(),
-                match_quality: "contains".into(),
+                matched_field: MatchedField::Name,
+                match_quality: MatchQuality::Contains,
                 profile: None,
             },
             UserDirectorySearchResult {
                 account_id_hex: format!("{:064x}", 2),
                 npub: "npub-exact-about".into(),
                 radius: 1,
-                matched_field: "about".into(),
-                match_quality: "exact".into(),
+                matched_field: MatchedField::About,
+                match_quality: MatchQuality::Exact,
                 profile: None,
             },
             UserDirectorySearchResult {
                 account_id_hex: format!("{:064x}", 3),
                 npub: "npub-exact-name".into(),
                 radius: 1,
-                matched_field: "name".into(),
-                match_quality: "exact".into(),
+                matched_field: MatchedField::Name,
+                match_quality: MatchQuality::Exact,
                 profile: None,
             },
         ];
