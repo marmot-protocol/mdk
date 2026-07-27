@@ -16,6 +16,7 @@ import {
   PROFILE_NAME_SKIPPED,
   PROFILE_NAME_TOO_LONG,
   PROFILE_PROMPT_NO_NAME,
+  ProfileLookupGate,
   ProfileNameOnboardingStore,
   type OnboardingRecord,
   type ProfileOnboardingClient,
@@ -28,19 +29,32 @@ const GROUP = HEX("cc");
 const MSG = HEX("11");
 
 interface Calls {
+  lookup: number;
   sendFinal: string[];
   publish: { name: string; displayName: string | null }[];
 }
 
 function emptyCalls(): Calls {
-  return { sendFinal: [], publish: [] };
+  return { lookup: 0, sendFinal: [], publish: [] };
 }
 
 function stubClient(
   calls: Calls,
-  opts: { failPublish?: boolean; failSend?: boolean } = {},
+  opts: {
+    failPublish?: boolean;
+    failSend?: boolean;
+    profileStatus?: "profile_found" | "profile_not_found" | "indeterminate";
+  } = {},
 ): ProfileOnboardingClient {
   return {
+    async accountLookupProfile() {
+      calls.lookup += 1;
+      return {
+        type: "profile_lookup",
+        status: opts.profileStatus ?? "profile_not_found",
+        retryable: opts.profileStatus === "indeterminate",
+      };
+    },
     async sendFinal(_account, _group, text) {
       if (opts.failSend) {
         throw new Error("send failed");
@@ -83,6 +97,9 @@ class MemStore implements ProfileOnboardingStateStore {
   }
   async markSkipped(): Promise<void> {
     this.rec = { status: "skipped" };
+  }
+  async markProfileExists(): Promise<void> {
+    this.rec = { status: "profile_exists" };
   }
   async clear(): Promise<void> {
     this.rec = {};
@@ -136,6 +153,98 @@ describe("buildProfilePrompt", () => {
 });
 
 describe("maybeSendProfilePromptOnJoin", () => {
+  it("persists profile_exists and stays quiet when kind-0 already exists", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const client = stubClient(calls, { profileStatus: "profile_found" });
+
+    await maybeSendProfilePromptOnJoin({
+      store,
+      client,
+      accountIdHex: ACCOUNT,
+      groupIdHex: GROUP,
+      configuredName: "Marmot Bot",
+    });
+    await maybeSendProfilePromptOnJoin({
+      store,
+      client,
+      accountIdHex: ACCOUNT,
+      groupIdHex: HEX("dd"),
+      configuredName: "Marmot Bot",
+    });
+
+    expect(calls.lookup).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toEqual({ status: "profile_exists" });
+  });
+
+  it("backs off an indeterminate lookup without prompting, then retries later", async () => {
+    let now = 10_000;
+    const gate = new ProfileLookupGate({ now: () => now, backoffMs: [1_000, 5_000] });
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const statuses = ["indeterminate", "profile_not_found"] as const;
+    const client = stubClient(calls);
+    client.accountLookupProfile = async () => {
+      calls.lookup += 1;
+      const status = statuses[Math.min(calls.lookup - 1, statuses.length - 1)]!;
+      return { type: "profile_lookup", status, retryable: status === "indeterminate" };
+    };
+
+    const trigger = () =>
+      maybeSendProfilePromptOnJoin({
+        store,
+        client,
+        lookupGate: gate,
+        accountIdHex: ACCOUNT,
+        groupIdHex: GROUP,
+      });
+    await trigger();
+    await trigger();
+    expect(calls.lookup).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toEqual({});
+
+    now += 1_000;
+    await trigger();
+    expect(calls.lookup).toBe(2);
+    expect(calls.sendFinal).toEqual([PROFILE_PROMPT_NO_NAME]);
+  });
+
+  it("deduplicates concurrent account lookups and prompts once", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    let releaseLookup!: () => void;
+    const lookupReleased = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const client = stubClient(calls);
+    client.accountLookupProfile = async () => {
+      calls.lookup += 1;
+      await lookupReleased;
+      return { type: "profile_lookup", status: "profile_not_found", retryable: false };
+    };
+
+    const first = maybeSendProfilePromptOnJoin({
+      store,
+      client,
+      accountIdHex: ACCOUNT,
+      groupIdHex: GROUP,
+    });
+    const second = maybeSendProfilePromptOnJoin({
+      store,
+      client,
+      accountIdHex: ACCOUNT,
+      groupIdHex: HEX("dd"),
+    });
+    await Promise.resolve();
+    releaseLookup();
+    await Promise.all([first, second]);
+
+    expect(calls.lookup).toBe(1);
+    expect(calls.sendFinal).toHaveLength(1);
+  });
+
   it("prompts with the configured name and records the suggestion", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
@@ -193,6 +302,36 @@ describe("maybeSendProfilePromptOnJoin", () => {
 });
 
 describe("maybeHandleProfileOnboardingInbound", () => {
+  it("does not consume the triggering message when a profile already exists", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls, { profileStatus: "profile_found" }),
+      message: msg("hello"),
+    });
+
+    expect(intercepted).toBe(false);
+    expect(calls.lookup).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toEqual({ status: "profile_exists" });
+  });
+
+  it("does not consume the triggering message when profile lookup is indeterminate", async () => {
+    const calls = emptyCalls();
+    const store = new MemStore();
+    const intercepted = await maybeHandleProfileOnboardingInbound({
+      store,
+      client: stubClient(calls, { profileStatus: "indeterminate" }),
+      message: msg("hello"),
+    });
+
+    expect(intercepted).toBe(false);
+    expect(calls.lookup).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+    expect(store.rec).toEqual({});
+  });
+
   it("publishes the suggested name on an affirmative reply", async () => {
     const calls = emptyCalls();
     const store = new MemStore();
@@ -284,7 +423,7 @@ describe("maybeHandleProfileOnboardingInbound", () => {
   });
 
   it("does nothing once published or skipped", async () => {
-    for (const status of ["published", "skipped"] as const) {
+    for (const status of ["profile_exists", "published", "skipped"] as const) {
       const calls = emptyCalls();
       const store = new MemStore();
       store.rec = { status };
@@ -329,8 +468,13 @@ describe("ProfileNameOnboardingStore", () => {
     expect(await reopened.get(ACCOUNT)).toEqual({ status: "published", name: "Ada" });
 
     await reopened.clear(ACCOUNT);
-    expect(await reopened.get(ACCOUNT)).toEqual({});
+    await reopened.markProfileExists(ACCOUNT);
+    const reopenedWithProfile = new ProfileNameOnboardingStore(path);
+    expect(await reopenedWithProfile.get(ACCOUNT)).toEqual({ status: "profile_exists" });
+
+    await reopenedWithProfile.clear(ACCOUNT);
+    expect(await reopenedWithProfile.get(ACCOUNT)).toEqual({});
     // after clear, a fresh claim succeeds again
-    expect(await reopened.tryClaimPrompt(ACCOUNT, GROUP, undefined)).toBe(true);
+    expect(await reopenedWithProfile.tryClaimPrompt(ACCOUNT, GROUP, undefined)).toBe(true);
   });
 });

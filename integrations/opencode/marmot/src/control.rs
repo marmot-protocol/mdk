@@ -302,6 +302,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::AccountCreated { .. } => "account_created",
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",
+        AgentControlResponse::ProfileLookup { .. } => "profile_lookup",
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",

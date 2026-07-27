@@ -246,6 +246,7 @@ pub(crate) fn profile_from_record(
     record: RelayEventRecord,
 ) -> Option<(String, UserProfileMetadata)> {
     let content = serde_json::from_str::<serde_json::Value>(&record.event.content).ok()?;
+    content.as_object()?;
     Some((
         record.event.pubkey.clone(),
         UserProfileMetadata {
@@ -535,6 +536,9 @@ pub(crate) fn latest_fresh_profiles_from_records(
 
 #[cfg(test)]
 mod tests {
+    use cgka_traits::TransportEndpoint;
+    use transport_nostr_peeler::NostrTransportEvent;
+
     use super::*;
 
     #[test]
@@ -549,6 +553,27 @@ mod tests {
             Some("alice[2Jadmin")
         );
         assert_eq!(string_field(&content, "about"), None);
+    }
+
+    #[test]
+    fn malformed_profile_content_is_not_treated_as_an_existing_profile() {
+        for malformed in ["not-json", "null", "[]", r#""string""#] {
+            let account_id = "11".repeat(32);
+            let records = vec![RelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
+                event: NostrTransportEvent::new_unsigned(
+                    account_id.clone(),
+                    KIND_NOSTR_METADATA,
+                    Vec::new(),
+                    malformed.to_owned(),
+                ),
+            }];
+
+            assert!(
+                !latest_profiles_from_records(records).contains_key(&account_id),
+                "accepted malformed kind-0 content: {malformed}"
+            );
+        }
     }
 
     #[test]

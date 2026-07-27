@@ -105,7 +105,7 @@ export function parseProfileNameReply(text: string): ProfileNameReply {
 
 // --- persisted per-account status ------------------------------------------
 
-export type OnboardingStatus = "prompted" | "published" | "skipped";
+export type OnboardingStatus = "profile_exists" | "prompted" | "published" | "skipped";
 
 export interface OnboardingRecord {
   status: OnboardingStatus;
@@ -125,6 +125,7 @@ export interface ProfileOnboardingStateStore {
   ): Promise<boolean>;
   markPublished(accountIdHex: string, name: string): Promise<void>;
   markSkipped(accountIdHex: string): Promise<void>;
+  markProfileExists(accountIdHex: string): Promise<void>;
   /** Reset an account's record (used to retry after a prompt send fails). */
   clear(accountIdHex: string): Promise<void>;
 }
@@ -216,6 +217,10 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
     return this.set(accountIdHex, { status: "skipped" });
   }
 
+  markProfileExists(accountIdHex: string): Promise<void> {
+    return this.set(accountIdHex, { status: "profile_exists" });
+  }
+
   clear(accountIdHex: string): Promise<void> {
     return this.serialize(async () => {
       const data = await this.load();
@@ -227,7 +232,99 @@ export class ProfileNameOnboardingStore implements ProfileOnboardingStateStore {
 
 // --- the runtime entry points ------------------------------------------------
 
+export type ProfileLookupStatus = "profile_found" | "profile_not_found" | "indeterminate";
+
+interface ProfileLookupGateOptions {
+  now?: () => number;
+  backoffMs?: readonly number[];
+}
+
+const DEFAULT_PROFILE_LOOKUP_BACKOFF_MS = [1_000, 5_000, 30_000] as const;
+
+export class ProfileLookupGate {
+  private readonly inFlight = new Map<string, Promise<ProfileLookupStatus>>();
+  private readonly failures = new Map<string, { attempts: number; retryAt: number }>();
+  private readonly now: () => number;
+  private readonly backoffMs: readonly number[];
+
+  constructor(options: ProfileLookupGateOptions = {}) {
+    this.now = options.now ?? Date.now;
+    this.backoffMs = options.backoffMs?.length ? options.backoffMs : DEFAULT_PROFILE_LOOKUP_BACKOFF_MS;
+  }
+
+  async lookup(
+    accountIdHex: string,
+    lookup: () => Promise<{
+      type: "profile_lookup";
+      status: ProfileLookupStatus;
+      retryable: boolean;
+    }>,
+  ): Promise<ProfileLookupStatus> {
+    const key = accountIdHex.toLowerCase();
+    const failure = this.failures.get(key);
+    if (failure && this.now() < failure.retryAt) {
+      return "indeterminate";
+    }
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const pending = this.performLookup(key, lookup);
+    this.inFlight.set(key, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.inFlight.get(key) === pending) {
+        this.inFlight.delete(key);
+      }
+    }
+  }
+
+  private async performLookup(
+    key: string,
+    lookup: () => Promise<{
+      type: "profile_lookup";
+      status: ProfileLookupStatus;
+      retryable: boolean;
+    }>,
+  ): Promise<ProfileLookupStatus> {
+    let status: ProfileLookupStatus;
+    try {
+      const response = await lookup();
+      status = response.type === "profile_lookup" ? response.status : "indeterminate";
+    } catch {
+      status = "indeterminate";
+    }
+
+    if (status !== "indeterminate") {
+      this.failures.delete(key);
+      return status;
+    }
+    const attempts = (this.failures.get(key)?.attempts ?? 0) + 1;
+    const delay = this.backoffMs[Math.min(attempts - 1, this.backoffMs.length - 1)] ?? 30_000;
+    this.failures.set(key, { attempts, retryAt: this.now() + delay });
+    return status;
+  }
+}
+
+const PROFILE_LOOKUP_GATES = new WeakMap<ProfileOnboardingStateStore, ProfileLookupGate>();
+
+function profileLookupGateFor(store: ProfileOnboardingStateStore): ProfileLookupGate {
+  let gate = PROFILE_LOOKUP_GATES.get(store);
+  if (!gate) {
+    gate = new ProfileLookupGate();
+    PROFILE_LOOKUP_GATES.set(store, gate);
+  }
+  return gate;
+}
+
 export interface ProfileOnboardingClient {
+  accountLookupProfile(accountIdHex: string): Promise<{
+    type: "profile_lookup";
+    status: ProfileLookupStatus;
+    retryable: boolean;
+  }>;
   sendFinal(
     accountIdHex: string,
     groupIdHex: string,
@@ -254,23 +351,43 @@ interface OnboardingLogger {
 async function sendProfilePrompt(deps: {
   store: ProfileOnboardingStateStore;
   client: ProfileOnboardingClient;
+  lookupGate?: ProfileLookupGate;
   accountIdHex: string;
   groupIdHex: string;
   configuredName?: string | null;
   logger?: OnboardingLogger;
-}): Promise<void> {
+}): Promise<boolean> {
+  const current = await deps.store.get(deps.accountIdHex);
+  if (current.status) {
+    return false;
+  }
+
+  const lookupStatus = await (deps.lookupGate ?? profileLookupGateFor(deps.store)).lookup(
+    deps.accountIdHex,
+    () => deps.client.accountLookupProfile(deps.accountIdHex),
+  );
+  if (lookupStatus === "profile_found") {
+    await deps.store.markProfileExists(deps.accountIdHex);
+    return false;
+  }
+  if (lookupStatus === "indeterminate") {
+    return false;
+  }
+
   const suggested = validProfileName(deps.configuredName);
   const claimed = await deps.store.tryClaimPrompt(deps.accountIdHex, deps.groupIdHex, suggested);
   if (!claimed) {
-    return;
+    return false;
   }
   try {
     await deps.client.sendFinal(deps.accountIdHex, deps.groupIdHex, buildProfilePrompt(suggested));
     deps.logger?.info?.("marmot: profile onboarding prompt sent");
+    return true;
   } catch {
     // Could not deliver the prompt; release the slot so a later trigger retries.
     await deps.store.clear(deps.accountIdHex).catch(() => undefined);
     deps.logger?.warn?.("marmot: failed to send profile onboarding prompt");
+    return false;
   }
 }
 
@@ -278,11 +395,12 @@ async function sendProfilePrompt(deps: {
 export function maybeSendProfilePromptOnJoin(deps: {
   store: ProfileOnboardingStateStore;
   client: ProfileOnboardingClient;
+  lookupGate?: ProfileLookupGate;
   accountIdHex: string;
   groupIdHex: string;
   configuredName?: string | null;
   logger?: OnboardingLogger;
-}): Promise<void> {
+}): Promise<boolean> {
   return sendProfilePrompt(deps);
 }
 
@@ -330,6 +448,7 @@ async function publishAndConfirm(
 export async function maybeHandleProfileOnboardingInbound(deps: {
   store: ProfileOnboardingStateStore;
   client: ProfileOnboardingClient;
+  lookupGate?: ProfileLookupGate;
   message: ProfileOnboardingMessage;
   configuredName?: string | null;
   logger?: OnboardingLogger;
@@ -337,7 +456,11 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
   const { store, client, message, logger } = deps;
   const record = await store.get(message.accountIdHex);
 
-  if (record.status === "published" || record.status === "skipped") {
+  if (
+    record.status === "profile_exists" ||
+    record.status === "published" ||
+    record.status === "skipped"
+  ) {
     return false;
   }
 
@@ -371,13 +494,13 @@ export async function maybeHandleProfileOnboardingInbound(deps: {
 
   // No status yet: the agent is already in this group (no join event replayed),
   // so fall back to prompting now and consume this message.
-  await sendProfilePrompt({
+  return sendProfilePrompt({
     store,
     client,
+    lookupGate: deps.lookupGate,
     accountIdHex: message.accountIdHex,
     groupIdHex: message.groupIdHex,
     configuredName: deps.configuredName,
     logger,
   });
-  return true;
 }

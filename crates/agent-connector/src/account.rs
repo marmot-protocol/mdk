@@ -1,6 +1,6 @@
 //! Account listing/creation, profile publishing, and welcomer-allowlist operations.
 
-use agent_control::{AgentControlAccount, AgentControlResponse};
+use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{AccountRelayListBootstrap, UserProfileMetadata};
 
@@ -74,6 +74,36 @@ impl AgentConnector {
             account_id_hex: account.account_id_hex,
             name,
             display_name: Some(display_name),
+        })
+    }
+
+    pub(crate) async fn profile_lookup_response(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let source_relays = self.configured_relay_endpoints();
+        if source_relays.is_empty() {
+            return Ok(AgentControlResponse::ProfileLookup {
+                account_id_hex: account.account_id_hex,
+                status: AgentControlProfileLookupStatus::Indeterminate,
+                retryable: true,
+            });
+        }
+
+        let status = match self
+            .runtime
+            .fetch_current_user_profile_for_account_id(&account.account_id_hex, source_relays)
+            .await
+        {
+            Ok(Some(_)) => AgentControlProfileLookupStatus::ProfileFound,
+            Ok(None) => AgentControlProfileLookupStatus::ProfileNotFound,
+            Err(_) => AgentControlProfileLookupStatus::Indeterminate,
+        };
+        Ok(AgentControlResponse::ProfileLookup {
+            account_id_hex: account.account_id_hex,
+            status,
+            retryable: status == AgentControlProfileLookupStatus::Indeterminate,
         })
     }
 
