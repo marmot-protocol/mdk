@@ -18,8 +18,8 @@ use marmot_app::{
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
     MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
-    PushPlatform, RuntimeMessageUpdate, SelfMembership, SignOutOptions, TimelineMessageQuery,
-    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
+    PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate, SelfMembership, SignOutOptions,
+    TimelineMessageQuery, TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -4009,6 +4009,48 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
     );
     assert_eq!(bob_parsed.old_retention_seconds, Some(0));
     assert_eq!(bob_parsed.new_retention_seconds, Some(60));
+}
+
+#[tokio::test]
+async fn app_runtime_retention_sweep_prunes_with_the_supplied_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("retention sweep", &["bob"])
+        .await
+        .unwrap();
+    alice.update_message_retention(&group_id, 60).await.unwrap();
+    alice
+        .send(&group_id, b"expire through runtime")
+        .await
+        .unwrap();
+    drop(alice);
+    drop(bob);
+
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.start().await.unwrap();
+    let supplied_now_seconds = test_unix_now_seconds().saturating_add(120);
+    let report = runtime
+        .sweep_expired_retention("alice", supplied_now_seconds.saturating_mul(1_000))
+        .await
+        .unwrap();
+
+    assert_eq!(report.groups.len(), 1);
+    let outcome = &report.groups[0];
+    assert_eq!(outcome.group_id_hex, hex::encode(group_id.as_slice()));
+    assert_eq!(outcome.status, RetentionSweepStatus::Pruned);
+    assert!(outcome.pruned_messages > 0);
+    assert_eq!(outcome.failure_kind, None);
+
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

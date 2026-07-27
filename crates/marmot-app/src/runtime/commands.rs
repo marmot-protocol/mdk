@@ -22,7 +22,7 @@ use crate::{
     GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, SecureDeleteExpiredResult, SendSummary,
+    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -993,6 +993,20 @@ impl AccountManager {
                 group_id: group_id.clone(),
                 respond,
             })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub(crate) async fn sweep_expired_retention(
+        &self,
+        account_ref: &str,
+        now_ms: u64,
+    ) -> Result<RetentionSweepReport, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SweepExpiredRetention { now_ms, respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await

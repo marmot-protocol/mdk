@@ -53,6 +53,7 @@ mod audit;
 mod epoch_stall;
 mod projection;
 mod push;
+mod retention;
 mod sync;
 
 use epoch_stall::EpochStallDetector;

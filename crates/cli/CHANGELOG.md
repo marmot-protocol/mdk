@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- MarmotKit now exposes an engine-owned, per-account disappearing-message
+  retention sweep with a caller-supplied Unix-millisecond clock. The sweep
+  preserves the Android background policy's current-timer gating, five-second
+  skew tolerance, bounded timeline pagination, and unread-received deferral;
+  returns stable per-group prune, deferral, and privacy-safe failure outcomes;
+  and includes pruned media ciphertext hashes for host cache eviction.
 - MarmotKit chat-list rows now expose a durable manual-unread reminder,
   effective timed/indefinite MDK mute state, current direct/group
   classification, bounded latest-message attachment kind/count, and exact

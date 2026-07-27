@@ -1,8 +1,8 @@
 //! Message-record and message-subscription-update FFI conversions.
 
 use marmot_app::{
-    AppMessageRecord, ReceivedMessage, RuntimeMessageReceived, RuntimeMessageUpdate,
-    SecureDeleteExpiredResult,
+    AppMessageRecord, ReceivedMessage, RetentionSweepGroupOutcome, RetentionSweepReport,
+    RetentionSweepStatus, RuntimeMessageReceived, RuntimeMessageUpdate, SecureDeleteExpiredResult,
 };
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
@@ -65,6 +65,65 @@ impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
             pruned_messages: value.pruned_messages,
             secrets_deleted: value.secrets_deleted,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RetentionSweepStatusFfi {
+    NoExpiredMessages,
+    Pruned,
+    DeferredClockSkew,
+    DeferredUnread,
+    DeferredScanExhausted,
+    Failed,
+}
+
+impl From<RetentionSweepStatus> for RetentionSweepStatusFfi {
+    fn from(value: RetentionSweepStatus) -> Self {
+        match value {
+            RetentionSweepStatus::NoExpiredMessages => Self::NoExpiredMessages,
+            RetentionSweepStatus::Pruned => Self::Pruned,
+            RetentionSweepStatus::DeferredClockSkew => Self::DeferredClockSkew,
+            RetentionSweepStatus::DeferredUnread => Self::DeferredUnread,
+            RetentionSweepStatus::DeferredScanExhausted => Self::DeferredScanExhausted,
+            RetentionSweepStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RetentionSweepGroupOutcomeFfi {
+    pub group_id_hex: String,
+    pub status: RetentionSweepStatusFfi,
+    pub pruned_messages: u64,
+    pub secrets_deleted: u64,
+    pub media_ciphertext_sha256: Vec<String>,
+    pub failure_kind: Option<String>,
+}
+
+impl From<RetentionSweepGroupOutcome> for RetentionSweepGroupOutcomeFfi {
+    fn from(value: RetentionSweepGroupOutcome) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            status: value.status.into(),
+            pruned_messages: value.pruned_messages,
+            secrets_deleted: value.secrets_deleted,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
+            failure_kind: value.failure_kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RetentionSweepReportFfi {
+    pub groups: Vec<RetentionSweepGroupOutcomeFfi>,
+}
+
+impl From<RetentionSweepReport> for RetentionSweepReportFfi {
+    fn from(value: RetentionSweepReport) -> Self {
+        Self {
+            groups: value.groups.into_iter().map(Into::into).collect(),
         }
     }
 }

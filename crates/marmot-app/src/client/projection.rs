@@ -282,10 +282,18 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
+        self.secure_delete_expired_plaintext_for_group_at(group_id, unix_now_seconds())
+    }
+
+    pub(crate) fn secure_delete_expired_plaintext_for_group_at(
+        &self,
+        group_id: &GroupId,
+        now_seconds: u64,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
         self.app.secure_prune_expired_account_app_events(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
-            unix_now_seconds(),
+            now_seconds,
         )
     }
 
