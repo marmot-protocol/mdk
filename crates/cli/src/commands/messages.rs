@@ -821,6 +821,8 @@ mod tests {
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(3),
+            retention_seconds: None,
+            retention_expires_at: None,
             direction: "system".to_owned(),
             group_id_hex: "11".repeat(32),
             sender: actor.clone(),

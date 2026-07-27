@@ -272,6 +272,122 @@ fn list(store: &SqliteAccountStorage) -> Vec<TimelineMessageRecord> {
         .messages
 }
 
+#[test]
+fn timeline_reads_preserve_every_pinned_retention_state() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+
+    let mut finite = chat("finite", "alice", 10, "expires");
+    finite.source_epoch = Some(4);
+    let finite_update = store
+        .record_app_event_with_retention(
+            &finite,
+            Some(AppMessageRetentionDecision::new(finite.recorded_at, 300)),
+        )
+        .unwrap();
+    assert_eq!(finite_update.messages[0].source_epoch, Some(4));
+    assert_eq!(finite_update.messages[0].retention_seconds, Some(300));
+    assert_eq!(finite_update.messages[0].retention_expires_at, Some(310));
+
+    let disabled = chat("disabled", "alice", 20, "kept");
+    store
+        .record_app_event_with_retention(
+            &disabled,
+            Some(AppMessageRetentionDecision::new(disabled.recorded_at, 0)),
+        )
+        .unwrap();
+    store
+        .record_app_event(&chat("legacy", "alice", 30, "safe retain"))
+        .unwrap();
+    let overflow = chat("overflow", "alice", 40, "no finite expiry");
+    store
+        .record_app_event_with_retention(
+            &overflow,
+            Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
+        )
+        .unwrap();
+
+    let paginated = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id.clone()),
+            pagination: TimelinePagination {
+                after: Some(0),
+                after_message_id: Some(String::new()),
+                limit: Some(10),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap()
+        .messages;
+    let ids = paginated
+        .iter()
+        .map(|record| record.message_id_hex.clone())
+        .collect::<BTreeSet<_>>();
+    let by_id = timeline_records_by_ids_tx(&store.lock().unwrap(), &group_id, ids).unwrap();
+
+    let retention_by_id = |records: &[TimelineMessageRecord]| {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.message_id_hex.clone(),
+                    (record.retention_seconds, record.retention_expires_at),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let expected = BTreeMap::from([
+        ("disabled".to_owned(), (Some(0), None)),
+        ("finite".to_owned(), (Some(300), Some(310))),
+        ("legacy".to_owned(), (None, None)),
+        ("overflow".to_owned(), (Some(1), None)),
+    ]);
+    assert_eq!(retention_by_id(&paginated), expected);
+    assert_eq!(retention_by_id(&by_id), expected);
+
+    store.rebuild_message_timeline_for_group(&group_id).unwrap();
+    assert_eq!(retention_by_id(&list(&store)), expected);
+}
+
+#[test]
+fn incremental_retention_finalization_is_visible_without_stale_projection_data() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    let optimistic = chat("optimistic", "alice", 50, "pending");
+
+    let initial = store.record_app_event(&optimistic).unwrap();
+    assert_eq!(initial.messages[0].source_epoch, None);
+    assert_eq!(initial.messages[0].retention_seconds, None);
+    assert_eq!(initial.messages[0].retention_expires_at, None);
+
+    let finalized = store
+        .finalize_app_event_source_retention(
+            &group_id,
+            "optimistic",
+            Some("source-optimistic"),
+            9,
+            AppMessageRetentionDecision::new(50, 300),
+        )
+        .unwrap()
+        .expect("retention finalization update");
+    assert_eq!(finalized.messages[0].source_epoch, Some(9));
+    assert_eq!(finalized.messages[0].retention_seconds, Some(300));
+    assert_eq!(finalized.messages[0].retention_expires_at, Some(350));
+
+    let mut reprojected = optimistic;
+    reprojected.plaintext = "updated projection".to_owned();
+    let update = store.record_app_event(&reprojected).unwrap();
+    assert_eq!(update.messages[0].source_epoch, Some(9));
+    assert_eq!(update.messages[0].retention_seconds, Some(300));
+    assert_eq!(update.messages[0].retention_expires_at, Some(350));
+
+    let page = list(&store);
+    assert_eq!(page[0].source_epoch, Some(9));
+    assert_eq!(page[0].retention_seconds, Some(300));
+    assert_eq!(page[0].retention_expires_at, Some(350));
+}
+
 fn group_system_from_commit(
     id: &str,
     system_type: &str,
