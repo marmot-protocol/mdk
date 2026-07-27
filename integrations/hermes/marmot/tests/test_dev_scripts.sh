@@ -30,6 +30,7 @@ group_id="$(printf '22%.0s' {1..32})"
 [ -x "$dev_root/smoke-plugin.sh" ]
 [ -x "$dev_root/e2e-deterministic.sh" ]
 [ -x "$dev_root/e2e-connector.sh" ]
+[ -x "$dev_root/verify-persisted-config.sh" ]
 [ -x "$dev_root/bootstrap-agent.sh" ]
 [ -L "$dev_root/hermes-home/plugins/marmot" ]
 
@@ -42,9 +43,12 @@ for helper in \
     "$dev_root/smoke-plugin.sh" \
     "$dev_root/e2e-deterministic.sh" \
     "$dev_root/e2e-connector.sh" \
+    "$dev_root/verify-persisted-config.sh" \
     "$dev_root/bootstrap-agent.sh"; do
     bash -n "$helper"
 done
+grep -F 'hermes_marmot_verify_persisted_config.sh" "$@" --root "$dev_root"' \
+    "$dev_root/verify-persisted-config.sh" >/dev/null
 
 # shellcheck disable=SC1091
 source "$dev_root/env.sh"
