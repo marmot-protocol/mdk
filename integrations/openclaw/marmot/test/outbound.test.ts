@@ -592,6 +592,23 @@ describe("createMarmotMessageAdapter", () => {
     expect(resolvedTargets).toBe(0);
   });
 
+  it("trims whitespace-only accountId to null outside a turn", async () => {
+    const resolveCalls: { accountId?: string | null }[] = [];
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: (_cfg, accountId) => {
+        resolveCalls.push({ accountId });
+        return { client: stubClient(emptyClientCalls()), marmotAccountIdHex: HEX32("aa") };
+      },
+    });
+    await adapter.send!.text!({
+      cfg: {},
+      accountId: "   ",
+      to: HEX32("cc"),
+      text: "hello",
+    } as ChannelMessageSendTextContext);
+    expect(resolveCalls).toEqual([{ accountId: null }]);
+  });
+
   it("inherits group, account, reply-to, and idempotency during a Marmot turn", async () => {
     const calls = emptyClientCalls();
     const route: MarmotTurnRoute = {

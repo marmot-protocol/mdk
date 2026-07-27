@@ -24,12 +24,11 @@ import type {
 } from "openclaw/plugin-sdk/channel-runtime";
 
 import {
-  canonicalizeMarmotGroupTarget,
+  canonicalizeMarmotExternalTarget,
   isMarmotGroupIdHex,
   isMarmotOwnedTargetCandidate,
   MARMOT_TARGET_PREFIX,
   MarmotTargetError,
-  tryCanonicalizeMarmotGroupTarget,
 } from "./target.js";
 
 export { isMarmotGroupIdHex, MARMOT_TARGET_PREFIX } from "./target.js";
@@ -40,13 +39,20 @@ export { isMarmotGroupIdHex, MARMOT_TARGET_PREFIX } from "./target.js";
  * `group:<hex>` announce/fallback routes.
  */
 export function normalizeMarmotTarget(raw: string): string | undefined {
-  return tryCanonicalizeMarmotGroupTarget(raw);
+  try {
+    return canonicalizeMarmotExternalTarget(raw);
+  } catch (error) {
+    if (error instanceof MarmotTargetError) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /**
  * Whether a raw `message`-tool target looks like a Marmot conversation id. An
  * explicit `marmot:` prefix always qualifies (the agent named our channel); a
- * bare value qualifies when it normalizes to a valid group id hex. Used as
+ * bare value qualifies when it is plausible 16–64-byte group-id hex. Used as
  * `targetResolver.looksLikeId` so core short-circuits its directory search
  * (Marmot has none) and treats a group id as an explicit id.
  */
@@ -84,7 +90,7 @@ export function createMarmotMessagingAdapter(): ChannelMessagingAdapter {
         if (!raw?.trim()) {
           throw new MarmotTargetError("empty");
         }
-        const to = canonicalizeMarmotGroupTarget(raw);
+        const to = canonicalizeMarmotExternalTarget(raw);
         return { to, kind: "group", source: "normalized" };
       },
     },

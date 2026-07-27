@@ -71,6 +71,7 @@ describe("normalizeMarmotTarget", () => {
   it("returns undefined for non-group-id input", () => {
     expect(normalizeMarmotTarget("alice")).toBeUndefined();
     expect(normalizeMarmotTarget("@alice")).toBeUndefined();
+    expect(normalizeMarmotTarget("1234567890")).toBeUndefined();
     expect(normalizeMarmotTarget("")).toBeUndefined();
     expect(normalizeMarmotTarget(`${MARMOT_TARGET_PREFIX}:not-hex`)).toBeUndefined();
   });
@@ -85,9 +86,10 @@ describe("looksLikeMarmotTarget", () => {
     expect(looksLikeMarmotTarget(`${MARMOT_TARGET_PREFIX}:whatever`)).toBe(true);
   });
 
-  it("is false for unprefixed non-id input", () => {
+  it("is false for unprefixed non-id input and implausible bare numeric strings", () => {
     expect(looksLikeMarmotTarget("alice")).toBe(false);
     expect(looksLikeMarmotTarget("#general")).toBe(false);
+    expect(looksLikeMarmotTarget("1234567890")).toBe(false);
   });
 
   it("claims session keys and decorated group routes so Marmot can reject them locally", () => {
@@ -154,6 +156,16 @@ describe("createMarmotMessagingAdapter", () => {
       await resolveThroughOpenClawTargetResolver(sensitive);
     } catch (error) {
       expect((error as Error).message).not.toContain(sensitive);
+    }
+  });
+
+  it("does not claim short bare numeric strings through OpenClaw target resolution", async () => {
+    expect(looksLikeMarmotTarget("1234567890")).toBe(false);
+    await expect(resolveThroughOpenClawTargetResolver("1234567890")).rejects.toThrow();
+    try {
+      await resolveThroughOpenClawTargetResolver("1234567890");
+    } catch (error) {
+      expect((error as Error).message).not.toContain("1234567890");
     }
   });
 

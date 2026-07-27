@@ -674,6 +674,56 @@ describe("startMarmotInbound readiness redelivery", () => {
     stopSecond();
     expect(dispatched).toEqual([secondId]);
   });
+
+  it("stops readiness retries on abort and rolls back dedupe without dispatching again", async () => {
+    const messageId = HEX32("f5");
+    const event = inboundEvent("cc", "f5");
+    event.message_id_hex = messageId;
+    let attempts = 0;
+    const controller = new AbortController();
+    let releaseAttempt: (() => void) | undefined;
+    const attemptGate = new Promise<void>((resolve) => {
+      releaseAttempt = resolve;
+    });
+    let notifyAttemptStarted: (() => void) | undefined;
+    const attemptStarted = new Promise<void>((resolve) => {
+      notifyAttemptStarted = resolve;
+    });
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    const stop = startMarmotInbound(
+      api,
+      async () => {
+        attempts += 1;
+        notifyAttemptStarted?.();
+        await attemptGate;
+        throw new MarmotDispatchNotReadyError("timeout");
+      },
+      { clientFactory: () => inboundStubClient([event]), signal: controller.signal },
+    );
+    await attemptStarted;
+    controller.abort();
+    releaseAttempt?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    stop();
+
+    expect(attempts).toBe(1);
+
+    let replayAttempts = 0;
+    const stopReplay = startMarmotInbound(
+      api,
+      async (message) => {
+        replayAttempts += 1;
+        expect(message.messageIdHex).toBe(messageId);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await waitFor(() => replayAttempts === 1);
+    stopReplay();
+  });
 });
 
 describe("startMarmotInbound queue shedding", () => {

@@ -123,17 +123,24 @@ async function startWnAgent(tempRoot: string): Promise<{
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  proc.stdout?.resume();
+  proc.stderr?.resume();
   const client = new MarmotAgentControlClient({
     socketPath,
     requestTimeoutMs: 5_000,
   });
-  await waitFor(
-    async () => {
-      await recordedFinals(client);
-      return true;
-    },
-    { timeoutMs: 120_000, label: "wn-agent debug control socket" },
-  );
+  try {
+    await waitFor(
+      async () => {
+        await recordedFinals(client);
+        return true;
+      },
+      { timeoutMs: 120_000, label: "wn-agent debug control socket" },
+    );
+  } catch (error) {
+    await stopProcess(proc);
+    throw error;
+  }
   return { client, proc, socketPath };
 }
 

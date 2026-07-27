@@ -32,7 +32,7 @@ import {
 import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import { startMarmotGatewayAccount } from "./gateway.js";
-import { canonicalizeMarmotGroupTarget } from "./target.js";
+import { canonicalizeMarmotGroupTarget, MarmotTargetError } from "./target.js";
 import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   marmotInboundRuntimeSnapshot,
@@ -164,10 +164,20 @@ export function createMarmotDeleteActionAdapter(
       }
       const to = typeof ctx.params.to === "string" ? ctx.params.to : undefined;
       if (to) {
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId ?? null);
-        const groupIdHex = canonicalizeMarmotGroupTarget(to);
-        await client.deleteMessage(marmotAccountIdHex, groupIdHex, messageId);
-        return jsonResult({ ok: true, deleted: true });
+        try {
+          const { client, marmotAccountIdHex } = await deps.resolveTarget(
+            ctx.cfg,
+            ctx.accountId ?? null,
+          );
+          const groupIdHex = canonicalizeMarmotGroupTarget(to);
+          await client.deleteMessage(marmotAccountIdHex, groupIdHex, messageId);
+          return jsonResult({ ok: true, deleted: true });
+        } catch (error) {
+          if (error instanceof MarmotTargetError) {
+            return jsonResult({ ok: false, error: error.message });
+          }
+          throw error;
+        }
       }
       return jsonResult({ ok: false, error: "could not resolve group for this message id" });
     },

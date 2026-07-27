@@ -3,7 +3,7 @@
 // Every wn-agent send/delete path must receive bare lowercase even-length
 // group-id hex (MLS GroupId is variable-length opaque bytes). Internal OpenClaw
 // routes (including announce fallbacks) may arrive as `group:<hex>`; explicit
-// agent targets may use bare hex or `marmot:<hex>`. Invalid forms are rejected
+// agent targets may use plausible bare hex or `marmot:<hex>`. Invalid forms are rejected
 // locally with a privacy-safe category error — never forwarded to
 // sendFinal/sendMedia/delete. Do not conflate MLS group ids with 32-byte Nostr
 // routing ids.
@@ -12,6 +12,9 @@
 export const MARMOT_TARGET_PREFIX = "marmot";
 
 const INTERNAL_GROUP_PREFIX = "group:";
+/** Bare unprefixed targets: plausible MLS group-id byte lengths (16–64 bytes). */
+const MIN_BARE_GROUP_ID_HEX_CHARS = 32;
+const MAX_BARE_GROUP_ID_HEX_CHARS = 128;
 const REJECTED_KIND_PREFIXES = [
   "user:",
   "channel:",
@@ -26,6 +29,15 @@ export function isMarmotGroupIdHex(value: string): boolean {
     return false;
   }
   return /^[0-9a-f]+$/.test(value);
+}
+
+/** True when bare unprefixed hex is a plausible MLS group id (16–64 bytes). */
+export function isPlausibleBareMarmotGroupIdHex(value: string): boolean {
+  return (
+    isMarmotGroupIdHex(value) &&
+    value.length >= MIN_BARE_GROUP_ID_HEX_CHARS &&
+    value.length <= MAX_BARE_GROUP_ID_HEX_CHARS
+  );
 }
 
 export type MarmotTargetRejectCategory =
@@ -88,7 +100,7 @@ export function marmotTargetRejectMessage(category: MarmotTargetRejectCategory):
     case "invalid_hex":
       return (
         "marmot: outbound target must be even-length group-id hex " +
-        "(optionally prefixed marmot: or group:)"
+        "(bare targets: 32–128 hex chars; marmot: or group: prefixes allow shorter ids)"
       );
   }
 }
@@ -131,16 +143,35 @@ export function canonicalizeMarmotGroupTarget(raw: string): string {
     }
   } else if (candidate.startsWith(INTERNAL_GROUP_PREFIX)) {
     candidate = candidate.slice(INTERNAL_GROUP_PREFIX.length);
+    if (candidate.includes(":")) {
+      throw new MarmotTargetError("decorated_route");
+    }
   }
   if (candidate.startsWith("0x")) {
     candidate = candidate.slice(2);
   }
   candidate = candidate.trim().toLowerCase();
 
-  if (isMarmotGroupIdHex(candidate)) {
-    return candidate;
+  if (!isMarmotGroupIdHex(candidate)) {
+    throw new MarmotTargetError("invalid_hex");
   }
-  throw new MarmotTargetError("invalid_hex");
+  return candidate;
+}
+
+/**
+ * Canonicalize user-supplied OpenClaw target input. Bare values use a generous
+ * plausibility band so unrelated numeric ids are not claimed as Marmot groups;
+ * explicit `marmot:`/`group:` routes retain variable-length MLS semantics.
+ */
+export function canonicalizeMarmotExternalTarget(raw: string): string {
+  const trimmed = raw.trim().toLowerCase();
+  const explicitlyPrefixed =
+    trimmed.startsWith(`${MARMOT_TARGET_PREFIX}:`) || trimmed.startsWith(INTERNAL_GROUP_PREFIX);
+  const canonical = canonicalizeMarmotGroupTarget(raw);
+  if (!explicitlyPrefixed && !isPlausibleBareMarmotGroupIdHex(canonical)) {
+    throw new MarmotTargetError("invalid_hex");
+  }
+  return canonical;
 }
 
 /** Whether Marmot should own target resolution for this raw message-tool input. */
@@ -165,7 +196,15 @@ export function isMarmotOwnedTargetCandidate(raw: string): boolean {
   if (looksLikeMarmotCrossChannelTarget(lower)) {
     return true;
   }
-  return tryCanonicalizeMarmotGroupTarget(trimmed) !== undefined;
+  try {
+    canonicalizeMarmotExternalTarget(trimmed);
+    return true;
+  } catch (error) {
+    if (error instanceof MarmotTargetError) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 /** Best-effort normalize for target resolution; returns undefined when invalid. */

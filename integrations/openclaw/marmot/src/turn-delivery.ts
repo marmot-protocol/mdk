@@ -212,23 +212,21 @@ export async function awaitTurnOutboundResolution(state: MarmotTurnDeliveryState
 }
 
 /**
- * Run one same-route outbound send for the turn. Concurrent callers await the
- * first in-flight operation and share its result or failure. Success and
- * retryable/non-retryable failure are recorded before the shared promise settles.
+ * Run one same-route outbound send for the turn. A second sequential or
+ * concurrent caller is rejected because this coordinator has no payload
+ * identity with which to prove it is the same logical send. Success and
+ * retryable/non-retryable failure are recorded before the promise settles.
  */
 export function runTurnOutboundSendOnce(
   state: MarmotTurnDeliveryState,
   send: () => Promise<MarmotTurnOutboundReceipt>,
   isRetryableError: (error: unknown) => boolean = () => true,
 ): Promise<MarmotTurnOutboundReceipt> {
-  if (state.outboundDelivered && state.outboundReceipt) {
-    return Promise.resolve(state.outboundReceipt);
+  if (state.outboundDelivered || state.outboundInFlight) {
+    return Promise.reject(new MarmotTurnDurableOwnershipError());
   }
   if (state.durableOwner === "sink") {
     return Promise.reject(new MarmotTurnDurableOwnershipError());
-  }
-  if (state.outboundInFlight) {
-    return state.outboundInFlight;
   }
   // Reserve outbound ownership synchronously before connector I/O so the sink
   // cannot claim in the scheduling gap after awaitTurnOutboundResolution.

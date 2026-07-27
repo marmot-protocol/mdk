@@ -236,6 +236,28 @@ describe("createMarmotDeleteActionAdapter", () => {
     expect(resultError(result)).toMatch(/could not resolve group/);
   });
 
+  it("returns a structured privacy-safe error for malformed delete targets", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotDeleteActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: { deleteMessage },
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const sensitive = `agent:main:marmot:group:${HEX32("cc")}`;
+    const result = await adapter.handleAction!(
+      deleteCtx({ messageId: HEX32("99"), to: sensitive }),
+    );
+
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(resultOk(result)).toBe(false);
+    expect(resultError(result)).toMatch(/session key/);
+    expect(resultError(result)).not.toContain(sensitive);
+    expect(resultError(result)).not.toContain(HEX32("cc"));
+  });
+
   it("rejects an unsupported action", async () => {
     const adapter = createMarmotDeleteActionAdapter({
       deleteByMessageId: async () => true,

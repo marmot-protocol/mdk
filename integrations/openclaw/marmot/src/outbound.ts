@@ -30,7 +30,6 @@ import { canonicalizeMarmotGroupTarget, MarmotTargetError } from "./target.js";
 import {
   getMarmotTurnDelivery,
   matchesMarmotTurnRoute,
-  MarmotTurnDurableOwnershipError,
   resolveTurnIdempotencyKey,
   runTurnOutboundSendOnce,
   type MarmotTurnDeliveryState,
@@ -335,7 +334,7 @@ function resolveOutboundChannelAccountId(
   if (turn) {
     return turn.route.channelAccountId;
   }
-  return rawAccountId ?? null;
+  return null;
 }
 
 /**
@@ -398,14 +397,6 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
             marmotAccountIdHex,
             groupIdHex,
           });
-        if (sameTurnRoute && turn.outboundDelivered && turn.outboundReceipt) {
-          return {
-            receipt: receiptFromMessageIds(turn.outboundReceipt.messageIdsHex, now()),
-          };
-        }
-        if (sameTurnRoute && turn.durableOwner === "sink") {
-          throw new MarmotTurnDurableOwnershipError();
-        }
         const idempotencyKey =
           sameTurnRoute && resolveTurnIdempotencyKey(turn)
             ? resolveTurnIdempotencyKey(turn)!

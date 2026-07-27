@@ -330,6 +330,10 @@ export function startMarmotInbound(
       }
       api.logger.info("marmot: inbound message received; dispatching agent turn");
       for (let attempt = 0; attempt < DISPATCH_NOT_READY_MAX_ATTEMPTS; attempt += 1) {
+        if (signal.aborted) {
+          rollbackInboundDedupe(message);
+          return;
+        }
         try {
           await dispatch(message);
           return;
@@ -348,8 +352,16 @@ export function startMarmotInbound(
             );
             throw error;
           }
+          if (signal.aborted) {
+            rollbackInboundDedupe(message);
+            return;
+          }
           api.logger.warn("marmot: inbound dispatch not ready; retrying after backoff");
           await sleepMs(DISPATCH_NOT_READY_BACKOFF_MS[attempt] ?? 100);
+          if (signal.aborted) {
+            rollbackInboundDedupe(message);
+            return;
+          }
         }
       }
     };

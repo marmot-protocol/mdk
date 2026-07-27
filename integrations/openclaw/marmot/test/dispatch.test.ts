@@ -419,7 +419,7 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal).toEqual([]);
   });
 
-  it("logs ambiguous finalize failure without send_final fallback for non-retryable errors", async () => {
+  it("falls back to a durable final when preview finalize fails with a definite non-retryable error", async () => {
     const calls = emptyCalls();
     const logs: string[] = [];
     const client = stubClient(calls);
@@ -443,13 +443,11 @@ describe("MarmotReplySink", () => {
     });
 
     await sink.deliver({ text: "hel" }, { kind: "block" });
-    await expect(sink.deliver({ text: "hello world" }, { kind: "final" })).rejects.toThrow(
-      "bad request",
-    );
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
 
     expect(calls.finalize).toHaveLength(1);
-    expect(calls.sendFinal).toEqual([]);
-    expect(logs.some((line) => line.includes("ambiguous"))).toBe(true);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+    expect(logs.some((line) => line.includes("preview_finalize_definite_failure"))).toBe(true);
     expect(logs.some((line) => line.includes("retryable"))).toBe(false);
   });
 

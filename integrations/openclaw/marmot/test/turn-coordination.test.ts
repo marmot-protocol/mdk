@@ -13,8 +13,8 @@ import type { MarmotInboundMessage } from "../src/inbound.js";
 import { createMarmotMessageAdapter } from "../src/outbound.js";
 import * as turnDelivery from "../src/turn-delivery.js";
 import {
-  MarmotTurnDurableOwnershipError,
   awaitTurnOutboundResolution,
+  MarmotTurnDurableOwnershipError,
   recordTurnOutboundDelivery,
   runInMarmotTurn,
   type MarmotTurnRoute,
@@ -326,7 +326,7 @@ describe("inbound turn delivery coordination", () => {
     ]);
   });
 
-  it("dedupes repeated same-route tool sends within one turn", async () => {
+  it("rejects a second same-route tool send within one turn", async () => {
     const sendFinalCalls: string[] = [];
     const client = {
       async sendFinal(_accountIdHex: string, _groupIdHex: string, text: string) {
@@ -362,12 +362,14 @@ describe("inbound turn delivery coordination", () => {
           text: "first tool send",
         } as never;
         await adapter.send!.text!(ctx);
-        await adapter.send!.text!({
-          cfg: {},
-          accountId: "default",
-          to: HEX("cc"),
-          text: "duplicate tool send",
-        } as never);
+        await expect(
+          adapter.send!.text!({
+            cfg: {},
+            accountId: "default",
+            to: HEX("cc"),
+            text: "duplicate tool send",
+          } as never),
+        ).rejects.toBeInstanceOf(MarmotTurnDurableOwnershipError);
       }),
       client,
       channelAccountId: "default",
@@ -389,7 +391,7 @@ describe("inbound turn delivery coordination", () => {
     expect(sendFinalCalls).toEqual(["first tool send"]);
   });
 
-  it("coordinates parallel same-route tool sends through one connector call", async () => {
+  it("rejects parallel same-route tool sends after the first claims durable ownership", async () => {
     let concurrent = 0;
     const sendFinalCalls: string[] = [];
     const client = {
@@ -434,7 +436,16 @@ describe("inbound turn delivery coordination", () => {
           to: HEX("cc"),
           text: "parallel text B",
         } as never;
-        await Promise.all([adapter.send!.text!(ctxA), adapter.send!.text!(ctxB)]);
+        const [first, second] = await Promise.allSettled([
+          adapter.send!.text!(ctxA),
+          adapter.send!.text!(ctxB),
+        ]);
+        expect([first.status, second.status].sort()).toEqual(["fulfilled", "rejected"]);
+        const rejected = first.status === "rejected" ? first : second;
+        expect(rejected.status).toBe("rejected");
+        if (rejected.status === "rejected") {
+          expect(rejected.reason).toBeInstanceOf(MarmotTurnDurableOwnershipError);
+        }
       }),
       client,
       channelAccountId: "default",
@@ -453,7 +464,7 @@ describe("inbound turn delivery coordination", () => {
       text: "hello",
     });
 
-    expect(sendFinalCalls).toEqual(["parallel text A"]);
+    expect(sendFinalCalls).toHaveLength(1);
     expect(concurrent).toBe(0);
   });
 
@@ -531,11 +542,16 @@ describe("inbound turn delivery coordination", () => {
     const sinkSendGate = new Promise<void>((resolve) => {
       releaseSinkSend = resolve;
     });
+    let notifySinkClaimed: (() => void) | undefined;
+    const sinkClaimed = new Promise<void>((resolve) => {
+      notifySinkClaimed = resolve;
+    });
     const sendFinalCalls: string[] = [];
     const client = {
       async sendFinal(_accountIdHex: string, _groupIdHex: string, text: string) {
         sendFinalCalls.push(text);
         if (text === "sink-owned reply") {
+          notifySinkClaimed?.();
           await sinkSendGate;
         }
         return { type: "final_sent", message_ids_hex: [HEX("11")] };
@@ -563,7 +579,7 @@ describe("inbound turn delivery coordination", () => {
       cfg: {},
       runtimeChannel: dualPathRuntime(async (deliver) => {
         const sinkSend = deliver({ text: "sink-owned reply" }, { kind: "final" });
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await sinkClaimed;
         await expect(
           adapter.send!.text!({
             cfg: {},
@@ -670,6 +686,7 @@ describe("inbound turn delivery coordination", () => {
 
     expect(sendFinalCalls).toEqual(["tool-owned reply"]);
   });
+
 });
 
 describe("MarmotReplySink turn idempotency", () => {
@@ -847,10 +864,13 @@ describe("outbound adapter omitted-target inheritance", () => {
       }),
     ]);
 
-    expect(sendFinalCalls).toEqual([
-      { groupIdHex: HEX("01"), text: "reply-01" },
-      { groupIdHex: HEX("02"), text: "reply-02" },
-    ]);
+    expect(sendFinalCalls).toEqual(
+      expect.arrayContaining([
+        { groupIdHex: HEX("01"), text: "reply-01" },
+        { groupIdHex: HEX("02"), text: "reply-02" },
+      ]),
+    );
+    expect(sendFinalCalls).toHaveLength(2);
   });
 
   it("allows a same-route tool send after an empty sink final", async () => {

@@ -6,6 +6,7 @@ import {
   claimTurnSinkDelivery,
   getMarmotTurnDelivery,
   matchesMarmotTurnRoute,
+  MarmotTurnDurableOwnershipError,
   recordTurnOutboundDelivery,
   recordTurnOutboundFailure,
   runInMarmotTurn,
@@ -148,6 +149,21 @@ describe("turn delivery coordination", () => {
         groupIdHex: HEX("ff"),
       }),
     ).toBe(false);
+  });
+
+  it("rejects a second same-route outbound send after the first succeeds", async () => {
+    await runInMarmotTurn(sampleRoute(), async () => {
+      const state = getMarmotTurnDelivery()!;
+      const first = await runTurnOutboundSendOnce(state, async () => ({
+        messageIdsHex: [HEX("11")],
+      }));
+      expect(first.messageIdsHex).toEqual([HEX("11")]);
+      await expect(
+        runTurnOutboundSendOnce(state, async () => ({
+          messageIdsHex: [HEX("22")],
+        })),
+      ).rejects.toBeInstanceOf(MarmotTurnDurableOwnershipError);
+    });
   });
 
   it("stores a frozen route copy isolated from caller mutation", async () => {

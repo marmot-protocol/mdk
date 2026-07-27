@@ -477,12 +477,15 @@ export class MarmotReplySink {
           await this.abandonPreview(reason);
         } else {
           const retryable = isRetryable(error);
-          this.log(
-            retryable
-              ? "marmot: preview finalize failed (retryable); not falling back to send_final"
-              : "marmot: preview finalize failed (ambiguous); not falling back to send_final",
-          );
-          throw error;
+          if (retryable) {
+            this.log(
+              "marmot: preview finalize failed (ambiguous); not falling back to send_final",
+            );
+            throw error;
+          }
+          const reason = "preview_finalize_definite_failure";
+          this.log(`marmot: preview finalize failed (${reason}); falling back to a durable send`);
+          await this.abandonPreview(reason);
         }
       }
     }
@@ -698,7 +701,7 @@ async function resolveInboundTurnGate(
     if (isRetryable(err)) {
       return { proceed: true, needsMembershipCheck: true };
     }
-    deps.log?.("marmot: outbound group readiness check failed (non-retryable)");
+    deps.log?.("marmot: inbound activation membership lookup failed (non-retryable)");
     return { proceed: false, kind: "not_ready", reason: "non_retryable" };
   }
 }
