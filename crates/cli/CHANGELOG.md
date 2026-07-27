@@ -52,6 +52,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `users search` now counts people you share a group with as socially close
+  (radius 1) when a daemon is running, which includes every search from
+  `wn tui`. Previously `users` was the one account-touching command the daemon
+  did not answer with its app runtime, so it never saw group membership even
+  with `wnd` alive. A standalone `wn` with no daemon is unchanged: it searches
+  the follow graph, which is all it can know without a live MLS session, and
+  starts no session to find out. Watch-only and signed-out accounts are
+  unaffected — they have no MLS sessions, so they are never asked.
 - MarmotKit user search now treats people you share a group with as radius 1,
   alongside the accounts you follow: sharing a group is social proximity even
   when neither of you has followed the other. Only groups you are currently a

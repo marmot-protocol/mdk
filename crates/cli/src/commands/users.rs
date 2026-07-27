@@ -1,9 +1,9 @@
 //! `users` command namespace handlers.
 
-use marmot_account::AccountHome;
+use marmot_account::{AccountHome, AccountSummary};
 use marmot_app::{
-    AppError, MarmotApp, SearchUpdateTrigger, UserDirectorySearchResult, UserSearchParams,
-    sort_user_search_results,
+    AppError, MarmotApp, MarmotAppRuntime, SearchUpdateTrigger, UserDirectorySearchResult,
+    UserSearchParams, sort_user_search_results,
 };
 use serde_json::json;
 
@@ -11,9 +11,40 @@ use crate::{
     CommandOutput, UsersCommand, WnError, npub_for_account_id, parse_public_key, resolve_account,
 };
 
+/// `users` without a running app runtime.
+///
+/// Search still walks the follow graph; what it cannot do is widen radius 1
+/// with group co-members, because membership is live MLS state and there is no
+/// account worker here to ask. Running `wnd` routes the command through
+/// [`users_command_with_runtime`] instead, which can.
 pub(crate) async fn users_command(
     account_home: &AccountHome,
     app: &MarmotApp,
+    command: UsersCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, WnError> {
+    run_users_command(account_home, app, None, command, account_flag).await
+}
+
+/// `users` answered with the daemon's live app runtime.
+///
+/// The runtime already holds hydrated MLS sessions, so group co-members cost a
+/// command-RPC rather than opening anything, and search can count the people
+/// you share a group with as socially close.
+pub(crate) async fn users_command_with_runtime(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    command: UsersCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, WnError> {
+    run_users_command(account_home, app, Some(runtime), command, account_flag).await
+}
+
+async fn run_users_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime: Option<&MarmotAppRuntime>,
     command: UsersCommand,
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
@@ -38,17 +69,7 @@ pub(crate) async fn users_command(
                     query: query.clone(),
                     radius_start: radius.0,
                     radius_end: radius.1,
-                    // Group co-members would widen radius 1, but reading
-                    // membership means asking an account worker, and asking for
-                    // one here would spawn it: `users` is not a daemon-hosted
-                    // command, so this runs in the `wn` process rather than in
-                    // `wnd`. A name lookup would then hydrate every group's MLS
-                    // session in a second process while the daemon may already
-                    // own that account-device database. Every other
-                    // session-touching command forwards to the daemon for
-                    // exactly that reason. Searching the follow graph alone
-                    // keeps this a directory read, which is what it should be.
-                    radius_one_seeds: Vec::new(),
+                    radius_one_seeds: radius_one_seeds(runtime, &account).await?,
                 },
             )
             .await?;
@@ -75,6 +96,28 @@ pub(crate) async fn users_command(
             Ok(CommandOutput { plain, json })
         }
     }
+}
+
+/// Accounts to widen radius 1 with, when there is anyone to ask about.
+///
+/// Sharing a group is social proximity even when neither person has followed
+/// the other, but that membership is live MLS state, so it takes both a running
+/// runtime and an account that actually has sessions. Neither absence is a
+/// degraded answer:
+///
+/// - no runtime (a standalone `wn` with no daemon) means this process cannot
+///   know, so search covers the follow graph, which is everything it can know;
+/// - a watch-only or signed-out account has no MLS sessions at all, so it
+///   shares no groups. Asking anyway would make the runtime refuse and turn an
+///   enhancement into a failed search for accounts that search fine today.
+async fn radius_one_seeds(
+    runtime: Option<&MarmotAppRuntime>,
+    account: &AccountSummary,
+) -> Result<Vec<String>, WnError> {
+    let Some(runtime) = runtime.filter(|_| account.is_active_signing()) else {
+        return Ok(Vec::new());
+    };
+    Ok(runtime.group_co_members(&account.account_id_hex).await?)
 }
 
 /// Whether a traversal delivered everything it was asked for.
@@ -147,6 +190,40 @@ async fn collect_user_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account(local_signing: bool, signed_out: bool) -> AccountSummary {
+        AccountSummary {
+            label: "alice".to_owned(),
+            account_id_hex: "aa".repeat(32),
+            local_signing,
+            external_signing: false,
+            signed_out,
+        }
+    }
+
+    /// Group co-members come from live MLS sessions, which only an account
+    /// with a usable signing identity has. Asking on behalf of a watch-only or
+    /// signed-out account is a category error, and the runtime refuses it --
+    /// so a search for one of those accounts must not ask, or the enhancement
+    /// would turn into a failed search for people who can still search fine
+    /// today.
+    #[tokio::test]
+    async fn an_account_that_cannot_sign_is_never_asked_for_co_members() {
+        for summary in [account(false, false), account(true, true)] {
+            let seeds = radius_one_seeds(None, &summary)
+                .await
+                .expect("no MLS session means no co-members, not an error");
+            assert!(seeds.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_without_a_runtime_asks_for_no_co_members() {
+        let seeds = radius_one_seeds(None, &account(true, false))
+            .await
+            .expect("no runtime yields no seeds rather than failing");
+        assert!(seeds.is_empty());
+    }
 
     #[test]
     fn a_clean_traversal_reports_complete() {

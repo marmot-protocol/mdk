@@ -266,6 +266,16 @@ async fn dispatch_hosted_runtime_command(
             )
             .await
         }
+        crate::Command::Users { command } => {
+            crate::commands::users::users_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
         crate::Command::Media { command } => {
             crate::commands::media::media_command_with_runtime(
                 &account_home,
@@ -309,6 +319,7 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
         | crate::Command::Profile { .. }
         | crate::Command::Relays { .. }
         | crate::Command::RelayStats
+        | crate::Command::Users { .. }
         | crate::Command::Media { .. } => true,
         _ => false,
     }
@@ -848,5 +859,59 @@ pub(crate) fn apply_default_account_relays(cli: &mut Cli, defaults: &DaemonDefau
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli(argv: &[&str]) -> Cli {
+        Cli::try_parse_from(argv.iter().copied()).expect("argv parses")
+    }
+
+    /// This predicate decides whether the daemon answers a command with its
+    /// live app runtime or falls through to a runtime-less local run. Getting
+    /// it wrong is silent: the command still succeeds, just without whatever
+    /// the runtime knows.
+    #[test]
+    fn user_search_is_answered_with_the_daemons_runtime() {
+        // Group co-members are live MLS state only the runtime holds, so a
+        // search dispatched without it silently loses them.
+        assert!(is_hosted_runtime_command(&cli(&[
+            "wn", "users", "search", "alice"
+        ])));
+    }
+
+    #[test]
+    fn user_show_is_answered_with_the_daemons_runtime() {
+        assert!(is_hosted_runtime_command(&cli(&[
+            "wn",
+            "users",
+            "show",
+            &"aa".repeat(32)
+        ])));
+    }
+
+    /// Commands that touch no runtime state must keep falling through, so the
+    /// daemon does not reconcile accounts to answer a local question.
+    #[test]
+    fn purely_local_commands_are_not_hosted() {
+        assert!(!is_hosted_runtime_command(&cli(&[
+            "wn", "settings", "show"
+        ])));
+        assert!(!is_hosted_runtime_command(&cli(&["wn", "whoami"])));
+    }
+
+    /// Streaming subscriptions have their own socket entry points; routing them
+    /// through the one-shot hosted path would answer once and hang up.
+    #[test]
+    fn streaming_subscriptions_are_not_hosted() {
+        assert!(!is_hosted_runtime_command(&cli(&[
+            "wn",
+            "chats",
+            "subscribe"
+        ])));
     }
 }
