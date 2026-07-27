@@ -523,24 +523,9 @@ fn chat_list_projection_complete_tx(
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 0)
-                   OR row.activity_sort_at < COALESCE((
-                        SELECT mt.timeline_at
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND mt.kind = ?1
-                          AND mt.invalidation_status IS NULL
-                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
-                        LIMIT 1
-                     ), ag.conversation_created_at)
-                   -- A phantom-high anchor cannot self-heal on the too-low
-                   -- check above, so detect it explicitly: the stored anchor
-                   -- exceeds the durable recompute (latest non-invalidated
-                   -- kind-9, else conversation creation) AND an invalidated
-                   -- tombstone accounts for that excess. A legitimately
-                   -- preserved prune anchor has no such tombstone and is left
-                   -- untouched.
-                   OR (
-                        row.activity_sort_at > COALESCE((
+                   OR row.activity_sort_at IS NOT MAX(
+                        row.retained_activity_sort_at,
+                        COALESCE((
                             SELECT mt.timeline_at
                             FROM message_timeline AS mt
                             WHERE mt.group_id_hex = ag.group_id_hex
@@ -548,15 +533,13 @@ fn chat_list_projection_complete_tx(
                               AND mt.invalidation_status IS NULL
                             ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                             LIMIT 1
-                        ), ag.conversation_created_at)
-                        AND EXISTS (
-                            SELECT 1
-                            FROM message_timeline AS mt
-                            WHERE mt.group_id_hex = ag.group_id_hex
-                              AND mt.kind = ?1
-                              AND mt.invalidation_status IS NOT NULL
-                              AND mt.timeline_at >= row.activity_sort_at
-                        )
+                        ), 0),
+                        COALESCE((
+                            SELECT read_state.last_read_timeline_at
+                            FROM conversation_read_state AS read_state
+                            WHERE read_state.group_id_hex = ag.group_id_hex
+                        ), 0),
+                        ag.conversation_created_at
                      )
              )",
         params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
@@ -651,12 +634,13 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_kind, last_message_timeline_at, last_message_deleted,
             unread_count, unread_mention_count, first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
-            conversation_created_at, activity_sort_at, updated_at, self_membership
+            conversation_created_at, activity_sort_at, retained_activity_sort_at,
+            updated_at, self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26
+            ?21, ?22, ?23, ?24, 0, ?25, ?26
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -681,29 +665,11 @@ fn rebuild_chat_list_row_for_group_tx(
             last_read_message_id_hex = excluded.last_read_message_id_hex,
             last_read_timeline_at = excluded.last_read_timeline_at,
             conversation_created_at = excluded.conversation_created_at,
-            -- Preserve a durable activity anchor across prune/delete (the preview
-            -- may be gone yet the row must keep its last visible position), but do
-            -- NOT conflate that with convergence invalidation. A pruned message
-            -- leaves no trace, so the prior anchor is the only durable record and
-            -- is preserved. An invalidated message is retained as a tombstone with
-            -- a non-NULL invalidation_status; when such a tombstone's timeline_at
-            -- accounts for the prior anchor, that anchor is phantom (the recompute
-            -- at ?24 already excludes invalidated rows) and must fall to the
-            -- recomputed value rather than staying permanently pinned.
             activity_sort_at = MAX(
                 excluded.activity_sort_at,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = excluded.group_id_hex
-                          AND mt.kind = ?27
-                          AND mt.invalidation_status IS NOT NULL
-                          AND mt.timeline_at >= chat_list_rows.activity_sort_at
-                    ) THEN 0
-                    ELSE chat_list_rows.activity_sort_at
-                END
+                chat_list_rows.retained_activity_sort_at
             ),
+            retained_activity_sort_at = chat_list_rows.retained_activity_sort_at,
             updated_at = excluded.updated_at,
             self_membership = excluded.self_membership",
         params![
@@ -763,7 +729,6 @@ fn rebuild_chat_list_row_for_group_tx(
             u64_to_i64(activity_sort_at)?,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
-            u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
         ],
     )
     .storage()?;

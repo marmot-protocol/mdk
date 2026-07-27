@@ -468,6 +468,29 @@ mod tests {
             .collect()
     }
 
+    fn semantic_chat_list_timestamps(store: &SqliteAccountStorage) -> Vec<(String, u64, u64)> {
+        let mut rows = store
+            .chat_list_rows(crate::ChatListQuery {
+                include_archived: true,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.group_id_hex,
+                    row.conversation_created_at,
+                    row.activity_sort_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+        false
+    }
+
     #[test]
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -653,6 +676,32 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(after_second_run, rows);
+
+        let store = SqliteAccountStorage::from_connection_with_options(
+            conn,
+            crate::SqliteStorageOptions::default(),
+        )
+        .unwrap();
+        let expected = rows
+            .into_iter()
+            .map(|(group_id, created_at, activity_at)| {
+                (
+                    group_id,
+                    u64::try_from(created_at).unwrap(),
+                    u64::try_from(activity_at).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store
+            .refresh_chat_list_rows("local-account", &no_mentions)
+            .unwrap();
+        assert_eq!(semantic_chat_list_timestamps(&store), expected);
+
+        store
+            .refresh_chat_list_rows("local-account", &no_mentions)
+            .unwrap();
+        assert_eq!(semantic_chat_list_timestamps(&store), expected);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! use that persisted group timestamp. `activity_sort_at` starts at the latest
 //! visible chat timeline time, then falls back to the durable read cursor and
 //! finally conversation creation. No migration wall clock participates.
+//! `retained_activity_sort_at` is an internal floor advanced transactionally
+//! before visible timeline rows are securely pruned.
 
 use crate::{SqliteResultExt, u64_to_i64};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
@@ -21,6 +23,8 @@ ALTER TABLE chat_list_rows
     ADD COLUMN conversation_created_at INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE chat_list_rows
     ADD COLUMN activity_sort_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE chat_list_rows
+    ADD COLUMN retained_activity_sort_at INTEGER NOT NULL DEFAULT 0;
 "#,
     )
     .storage()?;

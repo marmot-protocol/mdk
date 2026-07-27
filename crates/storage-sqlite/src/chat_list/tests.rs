@@ -325,25 +325,31 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
             .unwrap()
             .expect("chat row");
         assert_eq!(row.activity_sort_at, 200);
+
+        store
+            .invalidate_app_event_by_message_id(GROUP, "new-visible", "LosingBranch")
+            .unwrap();
+        row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(row.last_message, None);
+        assert_eq!(row.activity_sort_at, 100);
     }
 }
 
 #[test]
-fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
-    // Migration 0037 backfills `activity_sort_at` in pure SQL. This proves the
-    // compatibility seam between a migrated row and the Rust upsert
-    // (`rebuild_chat_list_row_for_group_tx`): a durable anchor whose preview has
-    // since been pruned must be preserved across a real `refresh_chat_list_rows`
-    // cycle — not overwritten with the conversation-creation fallback — while a
-    // phantom anchor left over from a now-invalidated tombstone is still lowered.
+fn retained_pruned_anchor_survives_a_real_rebuild_cycle() {
+    // A securely pruned message leaves an explicit internal retained-activity
+    // floor. This proves the compatibility seam between that durable floor and
+    // `rebuild_chat_list_row_for_group_tx`: a retained anchor whose preview has
+    // been pruned must survive a real `refresh_chat_list_rows` cycle rather than
+    // being overwritten with the conversation-creation fallback.
     let store = setup_store();
 
-    // Emulate the migration-backfilled state directly: create the row the way
-    // migration 0037 leaves it (SQL-populated, defaults elsewhere) carrying a
-    // durable anchor (350) and a low creation time (5), but with no kind-9
-    // preview in the timeline — its message was securely pruned, so nothing
-    // remains to reproduce 350. A read cursor at 300 is the only surviving
-    // durable history below the anchor.
+    // Emulate the post-prune state directly: the public and retained anchors are
+    // 350 and creation is 5, but there is no kind-9 preview in the timeline.
+    // A read cursor at 300 is the only other durable history below the anchor.
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -361,8 +367,9 @@ fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
         .unwrap();
         conn.execute(
             "INSERT INTO chat_list_rows (
-                group_id_hex, conversation_created_at, activity_sort_at, updated_at
-             ) VALUES (?1, 5, 350, 500)",
+                group_id_hex, conversation_created_at, activity_sort_at,
+                retained_activity_sort_at, updated_at
+             ) VALUES (?1, 5, 350, 350, 500)",
             params![GROUP],
         )
         .unwrap();
@@ -377,14 +384,13 @@ fn migrated_durable_anchor_survives_a_real_rebuild_cycle() {
     assert_eq!(row.conversation_created_at, 5);
     assert_eq!(row.activity_sort_at, 350);
 
-    // The completeness check must treat the migrated-then-rebuilt row as current
-    // (there is no invalidated tombstone accounting for 350), so ensure is a
-    // no-op rather than perpetually rebuilding.
+    // The completeness check must treat the retained-then-rebuilt row as current,
+    // so ensure is a no-op rather than perpetually rebuilding.
     store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let after_ensure = store.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(after_ensure.activity_sort_at, 350);
 
-    // Now introduce a visible message strictly above the migrated anchor; the
+    // Now introduce a visible message strictly above the retained anchor; the
     // rebuild must advance to it, proving preservation is a floor, not a freeze.
     store
         .record_app_event(&chat("newer", REMOTE, 400, "newer activity"))
