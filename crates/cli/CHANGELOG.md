@@ -1,11 +1,15 @@
 # Changelog
 
-All notable changes to `wn-cli` (previously `darkmatter-cli`) are tracked here.
+All notable user-facing changes in the MDK compatibility cohort are tracked
+here, including `wn-cli` (previously `darkmatter-cli`), WN Agent, and generated
+MarmotKit bindings.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses semantic
 versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
+
+## [0.9.8] - 2026-07-27
 
 ### Added
 
@@ -15,15 +19,19 @@ versioning through the workspace version in the root `Cargo.toml`.
   skew tolerance, bounded timeline pagination, and unread-received deferral;
   returns stable per-group prune, deferral, and privacy-safe failure outcomes;
   and includes pruned media ciphertext hashes for host cache eviction.
-- MarmotKit chat-list rows now expose a durable manual-unread reminder,
-  effective timed/indefinite MDK mute state, current direct/group
-  classification, bounded latest-message attachment kind/count, and exact
-  latest-message delivery state. New commands set/clear manual unread and
-  read/set/clear MDK chat mute state; chat-list subscriptions publish these
-  changes, including automatic finite-mute expiry. Manual unread remains
-  separate from the monotonic message read marker, MDK mute remains separate
-  from host notification modes such as all/mentions/nothing, and no wire
-  protocol changes are involved.
+- MarmotKit timeline records now expose the authenticated `source_epoch` plus
+  the exact pinned `retention_seconds` and `retention_expires_at` decision for
+  each message. Legacy rows remain distinguishable from explicitly disabled
+  retention, and overflow-safe unbounded retention is not recomputed by hosts.
+- MarmotKit chat-list rows now expose durable semantic conversation/activity
+  timestamps, a manual-unread reminder, effective timed/indefinite MDK mute
+  state, current direct/group classification, bounded latest-message attachment
+  kind/count, and exact latest-message delivery state. New commands set/clear
+  manual unread and read/set/clear MDK chat mute state; chat-list subscriptions
+  publish these changes, including automatic finite-mute expiry. Manual unread
+  remains separate from the monotonic message read marker, MDK mute remains
+  separate from host notification modes such as all/mentions/nothing, and no
+  wire protocol changes are involved.
 - The Hermes and OpenClaw release installers can now securely import an existing
   Nostr identity from an owner-only file, optionally pin it to an expected npub,
   and bootstrap that exact account without creating a replacement identity.
@@ -77,6 +85,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- `Marmot.start()` now returns when persisted account sessions and projections
+  are locally ready. Relay activation, subscriptions, directory sync, and
+  initial catch-up continue asynchronously; local reads remain available while
+  mutating commands are deferred and replayed in order. New privacy-safe host
+  performance telemetry separates local-ready and network-ready timing.
 - A leave request that already covers the current epoch is now reported as
   `EngineError::LeaveAlreadyRequested` instead of
   `EngineError::InvalidTransition`, which is documented as indicating an engine
@@ -180,6 +193,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- OpenClaw inbound agent replies now travel through the registered message
+  adapter and are durably routed back to the source Marmot channel with reply
+  threading and idempotent retry. Inbound live previews are temporarily
+  final-only so durable delivery has a single owner.
+- Hermes setup now uses persisted gateway configuration for readiness, installs
+  the Marmot sender-authorization policy without losing rollback metadata, and
+  rejects ambiguous environment-only dry runs. Hermes and OpenClaw also detect
+  existing account profiles before onboarding instead of overwriting them when
+  relay lookup succeeds.
+- Hermes streaming previews now recognize and remove Markdown-balancing
+  backticks that Hermes appends after its streaming cursor, preserving the
+  append-only preview transcript instead of misclassifying the update as a
+  durable final.
 - TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on
   `chats list`/`subscribe`/`mark-read` rows (and timeline `chat_list_row`
   updates) instead of re-sorting by `last_message.timeline_at`, so all-pruned
@@ -933,7 +959,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/marmot-protocol/mdk/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/marmot-protocol/mdk/compare/v0.9.4...v0.9.5
