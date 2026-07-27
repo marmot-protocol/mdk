@@ -147,6 +147,12 @@ pub enum AgentControlRequest {
         name: String,
         display_name: Option<String>,
     },
+    /// Resolve whether the selected account already has a valid published
+    /// Nostr kind-0 profile. The connector returns a typed outcome so relay
+    /// failures can never be mistaken for a confirmed absence.
+    AccountProfileLookup {
+        account_id_hex: String,
+    },
     SendAgentActivity {
         account_id_hex: String,
         group_id_hex: String,
@@ -310,6 +316,11 @@ pub enum AgentControlResponse {
         name: String,
         display_name: Option<String>,
     },
+    ProfileLookup {
+        account_id_hex: String,
+        status: AgentControlProfileLookupStatus,
+        retryable: bool,
+    },
     FinalSent {
         message_ids_hex: Vec<String>,
         #[serde(default)]
@@ -387,6 +398,14 @@ pub enum AgentControlSendMaintenanceDisposition {
     #[default]
     Ready,
     PostJoinRotationPendingRetryable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlProfileLookupStatus {
+    ProfileFound,
+    ProfileNotFound,
+    Indeterminate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,10 +646,10 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-        AgentControlResponse, AgentControlSendMaintenanceDisposition,
-        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
-        write_frame,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent,
+        AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
+        AgentControlSendMaintenanceDisposition, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope,
+        encode_frame, read_envelope, read_frame, write_frame,
     };
 
     #[test]
@@ -1059,6 +1078,12 @@ mod tests {
                 "account_publish_profile",
             ),
             (
+                AgentControlRequest::AccountProfileLookup {
+                    account_id_hex: account(),
+                },
+                "account_profile_lookup",
+            ),
+            (
                 AgentControlRequest::SendAgentActivity {
                     account_id_hex: account(),
                     group_id_hex: group(),
@@ -1233,6 +1258,34 @@ mod tests {
         for (request, expected_type) in requests {
             let value = serde_json::to_value(request).unwrap();
             assert_eq!(value["type"], expected_type);
+        }
+    }
+
+    #[test]
+    fn account_profile_lookup_has_typed_found_absent_and_indeterminate_outcomes() {
+        let request = AgentControlRequest::AccountProfileLookup {
+            account_id_hex: account(),
+        };
+        let request_json = serde_json::to_value(&request).unwrap();
+        assert_eq!(request_json["type"], "account_profile_lookup");
+        assert_eq!(request_json["account_id_hex"], account());
+
+        for (status, retryable) in [
+            (AgentControlProfileLookupStatus::ProfileFound, false),
+            (AgentControlProfileLookupStatus::ProfileNotFound, false),
+            (AgentControlProfileLookupStatus::Indeterminate, true),
+        ] {
+            let response = AgentControlResponse::ProfileLookup {
+                account_id_hex: account(),
+                status,
+                retryable,
+            };
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(value["type"], "profile_lookup");
+            assert_eq!(value["account_id_hex"], account());
+            assert_eq!(value["retryable"], retryable);
+            let round_tripped: AgentControlResponse = serde_json::from_value(value).unwrap();
+            assert_eq!(round_tripped, response);
         }
     }
 

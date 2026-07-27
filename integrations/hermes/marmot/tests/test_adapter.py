@@ -321,6 +321,33 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["type"], "account_list")
         self.assertEqual(requests[0]["auth_token"], "test-token")
 
+    async def test_account_lookup_profile_writes_typed_lookup_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "profile_lookup",
+                    "account_id_hex": request["account_id_hex"],
+                    "status": "profile_found",
+                    "retryable": False,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.account_lookup_profile("11" * 32)
+
+        self.assertEqual(response["status"], "profile_found")
+        self.assertEqual(requests[0]["type"], "account_profile_lookup")
+        self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
+
     async def test_account_publish_profile_writes_public_profile_request(self):
         requests = []
 
@@ -1185,6 +1212,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 for event in events:
                     yield event
 
+            async def account_lookup_profile(self, account_id_hex):
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
+
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
                 return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
@@ -1211,6 +1241,107 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(group_id, "22" * 32)
         self.assertIn("public Nostr profile", text)
         self.assertEqual(reply_to, "33" * 32)
+
+    async def test_existing_public_profile_suppresses_prompt_and_persists_state(self):
+        account_id = "11" * 32
+        group_id = "22" * 32
+
+        class FakeClient:
+            def __init__(self):
+                self.lookup_calls = 0
+                self.final_sends = []
+
+            async def account_lookup_profile(self, requested_account_id):
+                self.lookup_calls += 1
+                self.asserted_account = requested_account_id
+                return {"type": "profile_lookup", "status": "profile_found", "retryable": False}
+
+            async def send_final(self, *args, **kwargs):
+                self.final_sends.append((args, kwargs))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            state_path = Path(tempdir) / "profile-state.json"
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account_id,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(state_path),
+                    }
+                ),
+                client=fake_client,
+            )
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": account_id,
+                "group_id_hex": group_id,
+                "message_id_hex": "33" * 32,
+                "text": "hello",
+            }
+
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 1)
+            self.assertEqual(fake_client.final_sends, [])
+            self.assertEqual((await adapter.profile_name_onboarding.get(account_id)).get("status"), "profile_exists")
+
+            reopened = self.adapter_module.ProfileNameOnboardingStore(state_path)
+            self.assertEqual((await reopened.get(account_id)).get("status"), "profile_exists")
+
+    async def test_indeterminate_profile_lookup_backs_off_without_prompting_then_retries(self):
+        account_id = "11" * 32
+        group_id = "22" * 32
+        now = [100.0]
+
+        class FakeClient:
+            def __init__(self):
+                self.lookup_calls = 0
+                self.final_sends = []
+
+            async def account_lookup_profile(self, requested_account_id):
+                self.lookup_calls += 1
+                status = "indeterminate" if self.lookup_calls == 1 else "profile_not_found"
+                return {"type": "profile_lookup", "status": status, "retryable": status == "indeterminate"}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account_id,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(Path(tempdir) / "profile-state.json"),
+                    }
+                ),
+                client=fake_client,
+            )
+            adapter._profile_lookup_gate = self.adapter_module.ProfileLookupGate(
+                now=lambda: now[0], backoff_seconds=(1.0, 5.0)
+            )
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": account_id,
+                "group_id_hex": group_id,
+                "message_id_hex": "33" * 32,
+                "text": "hello",
+            }
+
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertFalse(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 1)
+            self.assertEqual(fake_client.final_sends, [])
+            self.assertEqual(await adapter.profile_name_onboarding.get(account_id), {})
+
+            now[0] += 1.0
+            self.assertTrue(await adapter._maybe_handle_profile_name_onboarding(event))
+            self.assertEqual(fake_client.lookup_calls, 2)
+            self.assertEqual(len(fake_client.final_sends), 1)
 
     async def test_profile_name_reply_publishes_profile_and_acknowledges(self):
         account_id = "11" * 32
@@ -1398,12 +1529,21 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             def __init__(self):
                 self.final_sends = []
+                self.lookup_calls = 0
+                self._lookup_started = asyncio.Event()
+                self._release_lookup = asyncio.Event()
                 self._prompt_started = asyncio.Event()
                 self._release = asyncio.Event()
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
+
+            async def account_lookup_profile(self, account_id_hex):
+                self.lookup_calls += 1
+                self._lookup_started.set()
+                await self._release_lookup.wait()
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
 
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 # Make the first prompt-send slow so both groups are in flight concurrently:
@@ -1443,7 +1583,12 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 group_b, lambda: adapter._dispatch_inbound_message(make_event(group_b, "02" * 32, "hi from B"))
             )
 
-            # Let both dispatch tasks reach the prompt-claim/send seam, then release the slow send.
+            # Let both groups share the same in-flight lookup, then release the slow prompt send.
+            for _ in range(200):
+                if fake_client._lookup_started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            fake_client._release_lookup.set()
             for _ in range(200):
                 if fake_client._prompt_started.is_set():
                     break
@@ -1451,6 +1596,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             fake_client._release.set()
             await adapter._inbound_queue.join()
 
+        self.assertEqual(fake_client.lookup_calls, 1, "concurrent groups must share one profile lookup")
         # Exactly one prompt was sent (the claim winner); the loser did NOT also prompt.
         self.assertEqual(
             len(fake_client.final_sends), 1, f"expected exactly one prompt, got {fake_client.final_sends}"
@@ -1479,6 +1625,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
+
+            async def account_lookup_profile(self, account_id_hex):
+                return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
 
             async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                 self.calls += 1
@@ -3802,6 +3951,9 @@ class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
             state_path = Path(tmpdir) / "profile-onboarding.json"
 
             class FakeClient:
+                async def account_lookup_profile(self, account_id_hex):
+                    return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
+
                 async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
                     self.last = (account_id_hex, group_id_hex, text, reply_to_message_id_hex)
                     return {"type": "final_sent", "message_ids_hex": ["55" * 32]}

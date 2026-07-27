@@ -16,11 +16,12 @@ import os
 import re
 import shutil
 import stat
+import time
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Literal, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Literal, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -723,6 +724,9 @@ class ProfileNameOnboardingStore:
     async def mark_skipped(self, account_id_hex: str) -> None:
         await self._set(account_id_hex, {"status": "skipped"})
 
+    async def mark_profile_exists(self, account_id_hex: str) -> None:
+        await self._set(account_id_hex, {"status": "profile_exists"})
+
     async def _set(self, account_id_hex: str, record: Dict[str, Any]) -> None:
         async with self._lock:
             data = self._read()
@@ -790,6 +794,72 @@ class AgentTextStreamTranscript:
             self.chunk_count += 1
 
 
+ProfileLookupStatus = Literal["profile_found", "profile_not_found", "indeterminate"]
+PROFILE_LOOKUP_BACKOFF_S = (1.0, 5.0, 30.0)
+
+
+class ProfileLookupGate:
+    """Deduplicate account profile lookups and back off indeterminate results."""
+
+    def __init__(
+        self,
+        *,
+        now: Callable[[], float] = time.monotonic,
+        backoff_seconds: Tuple[float, ...] = PROFILE_LOOKUP_BACKOFF_S,
+    ):
+        self._now = now
+        self._backoff_seconds = backoff_seconds or PROFILE_LOOKUP_BACKOFF_S
+        self._lock = asyncio.Lock()
+        self._in_flight: Dict[str, asyncio.Task[ProfileLookupStatus]] = {}
+        self._failures: Dict[str, Tuple[int, float]] = {}
+
+    async def lookup(
+        self,
+        account_id_hex: str,
+        lookup: Callable[[], Awaitable[Dict[str, Any]]],
+    ) -> ProfileLookupStatus:
+        key = account_id_hex.lower()
+        async with self._lock:
+            failure = self._failures.get(key)
+            if failure is not None and self._now() < failure[1]:
+                return "indeterminate"
+            task = self._in_flight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._perform_lookup(key, lookup))
+                self._in_flight[key] = task
+                task.add_done_callback(
+                    lambda completed, lookup_key=key: self._discard_completed(lookup_key, completed)
+                )
+
+        return await asyncio.shield(task)
+
+    def _discard_completed(self, key: str, task: asyncio.Task[ProfileLookupStatus]) -> None:
+        if self._in_flight.get(key) is task:
+            self._in_flight.pop(key, None)
+
+    async def _perform_lookup(
+        self,
+        key: str,
+        lookup: Callable[[], Awaitable[Dict[str, Any]]],
+    ) -> ProfileLookupStatus:
+        try:
+            response = await lookup()
+            status = response.get("status") if response.get("type") == "profile_lookup" else None
+            if status not in {"profile_found", "profile_not_found", "indeterminate"}:
+                status = "indeterminate"
+        except Exception:
+            status = "indeterminate"
+
+        if status != "indeterminate":
+            self._failures.pop(key, None)
+            return status
+
+        attempts = self._failures.get(key, (0, 0.0))[0] + 1
+        delay = self._backoff_seconds[min(attempts - 1, len(self._backoff_seconds) - 1)]
+        self._failures[key] = (attempts, self._now() + delay)
+        return "indeterminate"
+
+
 class MarmotAgentControlClient:
     """Small NDJSON client for ``crates/agent-control``."""
 
@@ -833,6 +903,22 @@ class MarmotAgentControlClient:
 
     async def account_list(self) -> Dict[str, Any]:
         return await self.request({"type": "account_list"})
+
+    async def account_lookup_profile(self, account_id_hex: str) -> Dict[str, Any]:
+        response = await self.request(
+            {
+                "type": "account_profile_lookup",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            }
+        )
+        status = response.get("status")
+        if (
+            response.get("type") != "profile_lookup"
+            or status not in {"profile_found", "profile_not_found", "indeterminate"}
+            or not isinstance(response.get("retryable"), bool)
+        ):
+            raise AgentControlError("wn-agent returned invalid profile_lookup response", code="protocol_error")
+        return response
 
     async def account_publish_profile(
         self,
@@ -1435,6 +1521,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if self.profile_name_onboarding_enabled
             else None
         )
+        self._profile_lookup_gate = ProfileLookupGate()
         self._sent_targets = SentMessageTargetCache()
         self._activation_cache = GroupActivationCache()
         self._listener_task: Optional[asyncio.Task] = None
@@ -2764,21 +2851,45 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         return "\n".join(pending)
 
     async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
+        await self._maybe_prompt_for_missing_profile(account_id_hex, group_id_hex)
+
+    async def _maybe_prompt_for_missing_profile(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        *,
+        reply_to_message_id_hex: Optional[str] = None,
+    ) -> bool:
         store = self.profile_name_onboarding
         if store is None:
-            return
+            return False
+        if (await store.get(account_id_hex)).get("status"):
+            return False
+
+        lookup_status = await self._profile_lookup_gate.lookup(
+            account_id_hex,
+            lambda: self.client.account_lookup_profile(account_id_hex),
+        )
+        if lookup_status == "profile_found":
+            await store.mark_profile_exists(account_id_hex)
+            return False
+        if lookup_status == "indeterminate":
+            return False
 
         suggested = valid_profile_name(self.agent_name)
         if not await store.try_claim_prompt(account_id_hex, group_id_hex, suggested):
-            return
-
+            return False
         result = await self._send_final_direct(
             group_id_hex,
             build_profile_prompt(suggested),
+            reply_to_message_id_hex=reply_to_message_id_hex,
         )
-        if not result.success:
-            logger.debug("Marmot profile-name prompt send failed on join: %s", result.error)
-            await store.clear(account_id_hex)
+        if result.success:
+            return True
+
+        logger.debug("Marmot profile-name prompt send failed: %s", result.error)
+        await store.clear(account_id_hex)
+        return False
 
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding
@@ -2791,7 +2902,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             message_id_hex = _normalize_hex(event["message_id_hex"], "message_id_hex")
             state = await store.get(account_id_hex)
             status = state.get("status")
-            if status in {"published", "skipped"}:
+            if status in {"profile_exists", "published", "skipped"}:
                 return False
             if status == "prompted":
                 if state.get("group_id_hex") != group_id_hex:
@@ -2803,31 +2914,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     str(event.get("text") or ""),
                 )
 
-            # Claim the one-time prompt slot atomically BEFORE sending. Under the new
-            # per-group concurrency (#513), two first messages for the same account in
-            # different groups could otherwise both read empty state and both prompt
-            # (double-prompting and swallowing both user messages). try_claim_prompt() is
-            # the single-lock claim that lets exactly one caller win; everyone else returns
-            # False here and falls through to a normal turn.
-            if not await store.try_claim_prompt(
+            return await self._maybe_prompt_for_missing_profile(
                 account_id_hex,
                 group_id_hex,
-                valid_profile_name(self.agent_name),
-            ):
-                return False
-
-            result = await self._send_final_direct(
-                group_id_hex,
-                build_profile_prompt(valid_profile_name(self.agent_name)),
                 reply_to_message_id_hex=message_id_hex,
             )
-            if not result.success:
-                # We claimed the slot but could not deliver the prompt; release it so a
-                # later inbound message retries, instead of permanently swallowing this one.
-                logger.debug("Marmot profile-name prompt send failed: %s", result.error)
-                await store.clear(account_id_hex)
-                return False
-            return True
         except Exception as exc:
             logger.debug("Marmot profile-name onboarding failed: %s", exc)
             return False

@@ -27,6 +27,14 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
       });
       break;
+    case "account_profile_lookup":
+      send(socket, id, {
+        type: "profile_lookup",
+        account_id_hex: req.account_id_hex,
+        status: "profile_found",
+        retryable: false,
+      });
+      break;
     case "send_final":
       // Echo back the idempotency_key (when present) so a test can assert the
       // client forwarded it; real wn-agent never returns it.
@@ -162,6 +170,15 @@ describe("MarmotAgentControlClient", () => {
     const res = await client.accountList();
     expect(res.accounts).toHaveLength(1);
     expect(res.accounts[0]?.label).toBe("agent");
+  });
+
+  it("round-trips the typed account profile lookup", async () => {
+    const res = await client.accountLookupProfile(HEX32("aa"));
+    expect(res).toMatchObject({
+      type: "profile_lookup",
+      status: "profile_found",
+      retryable: false,
+    });
   });
 
   it("returns durable message ids from send_final", async () => {

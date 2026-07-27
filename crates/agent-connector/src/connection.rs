@@ -354,6 +354,9 @@ impl AgentConnector {
                 self.publish_profile_response(&account_id_hex, name, display_name)
                     .await
             }
+            AgentControlRequest::AccountProfileLookup { account_id_hex } => {
+                self.profile_lookup_response(&account_id_hex).await
+            }
             AgentControlRequest::SendAgentActivity {
                 account_id_hex,
                 group_id_hex,

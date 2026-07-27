@@ -2350,6 +2350,20 @@ impl MarmotAppRuntime {
         Ok(outcome)
     }
 
+    /// Read the selected account's current published kind-0 profile through the
+    /// same validated directory path used by app clients. Relay failures remain
+    /// errors so callers can distinguish them from a confirmed absence.
+    pub async fn fetch_current_user_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
+        self.accounts
+            .app
+            .fetch_current_user_profile_for_account_id(account_id_hex, source_relays)
+            .await
+    }
+
     pub async fn publish_user_profile(
         &self,
         account_ref: &str,
