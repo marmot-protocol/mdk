@@ -388,7 +388,13 @@ jobs:
           # Build dist/ before packing: package.json#files ships dist (which is
           # gitignored), and the gateway requires compiled runtime output rather
           # than the TypeScript sources.
-          ( cd integrations/openclaw/marmot && pnpm install --frozen-lockfile && pnpm build )
+          (
+            cd integrations/openclaw/marmot
+            pnpm install --frozen-lockfile
+            pnpm typecheck
+            pnpm test
+            pnpm build
+          )
           # Provenance manifest (release.md requires one in each artifact); ships
           # via package.json#files alongside the built plugin.
           cat > integrations/openclaw/marmot/manifest.json <<EOF

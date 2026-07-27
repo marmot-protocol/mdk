@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+// Deliberate test-only internal import: openclaw@2026.6.11 exposes no supported
+// plugin-loader subpath. Re-verify this path whenever the pinned SDK is bumped.
 import {
   clearActivatedPluginRuntimeState,
   clearPluginLoaderCache,

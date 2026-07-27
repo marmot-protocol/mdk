@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import type {
-  ChannelMessageSendMediaContext,
-  ChannelMessageSendTextContext,
+import {
+  deriveDurableFinalDeliveryRequirements,
+  type ChannelMessageSendMediaContext,
+  type ChannelMessageSendTextContext,
 } from "openclaw/plugin-sdk/channel-outbound";
 
 import type {
@@ -121,6 +122,16 @@ describe("createMarmotMessageAdapter", () => {
       replyTo: true,
       messageSendingHooks: true,
     });
+    const required = deriveDurableFinalDeliveryRequirements({
+      payload: { text: "done" },
+      replyToId: HEX32("dd"),
+    });
+    expect(required).toEqual({
+      text: true,
+      replyTo: true,
+      messageSendingHooks: true,
+    });
+    expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
   });
 
