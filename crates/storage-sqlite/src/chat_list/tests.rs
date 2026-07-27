@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::test_support::sample_group;
 use crate::{
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppEvent,
@@ -10,6 +11,8 @@ use cgka_traits::app_components::{
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
 };
+use cgka_traits::storage::{GroupStorage, LeaveRequest, LeaveRequestStorage};
+use cgka_traits::types::{EpochId, GroupId};
 
 const LOCAL: &str = "aa";
 const REMOTE: &str = "bb";
@@ -1410,5 +1413,77 @@ fn set_group_self_membership_propagates_backend_errors() {
     assert!(
         result.is_err(),
         "a failed self_membership projection write must return an error, not silently succeed"
+    );
+}
+
+#[test]
+fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
+    // A leave is durable in `cgka_leave_requests` from the moment the engine
+    // mints the SelfRemove proposal, but `self_membership` stays `Member` until a
+    // commit actually removes us. Between those two points — across a publish
+    // failure or a cold launch — this read-time derivation is the only way the
+    // chat list can tell that the user asked to leave.
+    let store = setup_store();
+    let group_id = GroupId::new(hex::decode(GROUP).unwrap());
+    store
+        .put_group(&sample_group(group_id.clone(), 3, 0))
+        .unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    // No request yet: the field is absent, not defaulted to some sentinel.
+    let row = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(row.leave_requested_at_ms, None);
+    assert_eq!(row.self_membership, SelfMembership::Member);
+
+    store
+        .put_leave_request(&LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 1_700_000_000_123,
+            last_proposed_epoch: Some(EpochId(3)),
+        })
+        .unwrap();
+
+    // Visible through both read paths without any projection rebuild, and while
+    // membership is still `Member` — that is the whole point.
+    let row = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(row.leave_requested_at_ms, Some(1_700_000_000_123));
+    assert_eq!(row.self_membership, SelfMembership::Member);
+    let rows = store
+        .chat_list_rows(ChatListQuery {
+            include_archived: true,
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].leave_requested_at_ms, Some(1_700_000_000_123));
+
+    // Read-time derivation means a rebuild neither clears nor staleness-flags the
+    // value: the projection has no column for it.
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .unwrap()
+            .leave_requested_at_ms,
+        Some(1_700_000_000_123)
+    );
+    {
+        let conn = store.lock().unwrap();
+        assert!(
+            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            "a pending leave request must not make the projection look stale"
+        );
+    }
+
+    // The engine clears the request from paths that never touch the projection,
+    // so the derived value has to disappear with it and not linger.
+    store.clear_leave_request(&group_id).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .unwrap()
+            .leave_requested_at_ms,
+        None
     );
 }

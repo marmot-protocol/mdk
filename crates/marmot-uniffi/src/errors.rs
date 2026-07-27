@@ -45,6 +45,12 @@ pub enum MarmotKitError {
     NotGroupAdmin { group_id_hex: String },
     #[error("admin must self-demote before leaving group {group_id_hex}")]
     AdminCannotSelfRemove { group_id_hex: String },
+    /// A leave is already in flight for this group. The durable request survives
+    /// restarts and the engine keeps re-proposing until a commit removes us, so
+    /// this is not a failure to retry — surface progress instead. Check
+    /// `GroupManagementStateFfi::leave_request_pending` before offering Leave.
+    #[error("a leave request is already pending for group {group_id_hex}")]
+    LeaveAlreadyRequested { group_id_hex: String },
     #[error("operation would remove the last admin from group {group_id_hex}")]
     WouldRemoveLastAdmin { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]

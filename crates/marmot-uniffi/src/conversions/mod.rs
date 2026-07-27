@@ -93,6 +93,8 @@ mod tests {
             pending_confirmation: false,
             unrecoverable: false,
             self_membership: SelfMembershipFfi::Member,
+            leave_request_pending: false,
+            leave_requested_at_ms: None,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
@@ -176,6 +178,40 @@ mod tests {
         assert!(bob_action.can_remove);
         assert!(bob_action.can_promote);
         assert!(!bob_action.can_demote);
+    }
+
+    #[test]
+    fn group_management_state_suppresses_leave_while_a_request_is_pending() {
+        // A non-admin member normally has `can_leave`. Once a leave is durable the
+        // engine rejects a second same-epoch request, so the affordance has to go
+        // away — but `requires_self_demote_before_leave` must stay false, since
+        // that is how hosts tell "demote first" from "already leaving".
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let mut leaving = group(vec![bob_id]);
+        leaving.leave_request_pending = true;
+        leaving.leave_requested_at_ms = Some(1_700_000_000_123);
+        let details = GroupDetailsFfi {
+            group: leaving,
+            members: vec![member(self_id, false, true), member(bob_id, true, false)],
+        };
+
+        let state = group_management_state_ffi(self_id, &details);
+
+        assert!(!state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
+        assert!(state.leave_request_pending);
+        assert_eq!(state.leave_requested_at_ms, Some(1_700_000_000_123));
+
+        // Same roster without the pending request: Leave is offered again.
+        let details = GroupDetailsFfi {
+            group: group(vec![bob_id]),
+            members: details.members,
+        };
+        let state = group_management_state_ffi(self_id, &details);
+        assert!(state.can_leave);
+        assert!(!state.leave_request_pending);
+        assert_eq!(state.leave_requested_at_ms, None);
     }
 
     #[test]

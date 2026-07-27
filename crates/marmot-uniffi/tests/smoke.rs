@@ -355,6 +355,31 @@ async fn delete_group_local_binding_is_public_and_validates_group_hex() {
 }
 
 #[tokio::test]
+async fn leave_group_binding_is_public_and_validates_group_hex() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    // Group-hex validation runs before the account lookup, so a malformed id
+    // never reaches the runtime.
+    let error = kit
+        .leave_group("alice".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before the leave");
+    assert!(format!("{error}").contains("invalid hex"));
+
+    let error = kit
+        .leave_group("alice".into(), "11".repeat(16))
+        .await
+        .expect_err("a missing account cannot leave a group");
+    assert!(matches!(error, MarmotKitError::UnknownAccount { .. }));
+}
+
+#[tokio::test]
 async fn group_image_binding_methods_are_public_and_validate_inputs() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

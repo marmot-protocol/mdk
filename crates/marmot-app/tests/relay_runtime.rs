@@ -3484,6 +3484,102 @@ async fn local_leave_suppresses_account_unread_total() {
 }
 
 #[tokio::test]
+async fn pending_leave_request_survives_a_cold_launch() {
+    // The durable `LeaveRequest` is recorded before the leave publishes, but
+    // nothing above the engine could see it, so a cold launch could not
+    // rediscover the intent: `self_membership` only reaches a terminal `Left`
+    // once a commit actually removes the local member, which in a two-party
+    // group needs the other side to commit bob's SelfRemove proposal. This
+    // asserts the read-time projection makes that window visible on both the
+    // chat-list row and the group record, and that reopening the app over the
+    // same database still reports it.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("pending departures", &["bob"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Nothing pending before the leave.
+    assert_eq!(
+        app.chat_list_row("bob", &group_id_hex)
+            .unwrap()
+            .expect("bob's row exists before the leave")
+            .leave_requested_at_ms,
+        None
+    );
+
+    bob.leave_group(&group_id).await.unwrap();
+    drop(bob);
+    drop(alice);
+
+    // Alice has not committed the SelfRemove yet, so the request is still
+    // outstanding even though the local projection optimistically reads `Left`.
+    let row = app
+        .chat_list_row("bob", &group_id_hex)
+        .unwrap()
+        .expect("bob's row survives the leave");
+    let requested_at = row
+        .leave_requested_at_ms
+        .expect("the durable leave request must be visible on the chat-list row");
+    assert!(
+        requested_at > 0,
+        "requested_at_ms should be a real clock reading"
+    );
+    let group = app
+        .group("bob", &group_id_hex)
+        .unwrap()
+        .expect("bob's group record survives the leave");
+    assert_eq!(group.leave_requested_at_ms, Some(requested_at));
+
+    // Cold launch: a fresh `MarmotApp` over the same directory, as if the process
+    // had been terminated mid-leave. This is the case that was previously
+    // unrecoverable.
+    drop(app);
+    let reopened = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true),
+    );
+    assert_eq!(
+        reopened
+            .chat_list_row("bob", &group_id_hex)
+            .unwrap()
+            .expect("bob's row survives the reopen")
+            .leave_requested_at_ms,
+        Some(requested_at),
+        "a cold launch must rediscover the pending leave intent"
+    );
+    assert_eq!(
+        reopened
+            .group("bob", &group_id_hex)
+            .unwrap()
+            .expect("bob's group record survives the reopen")
+            .leave_requested_at_ms,
+        Some(requested_at)
+    );
+    assert_eq!(
+        reopened
+            .pending_leave_requests("bob")
+            .unwrap()
+            .get(&group_id_hex),
+        Some(&requested_at)
+    );
+}
+
+#[tokio::test]
 async fn open_backfill_preserves_unread_for_still_member_account() {
     // mdk#573 review follow-up (blocking finding 1): the one-time
     // open/upgrade backfill derives `self_membership` from current engine

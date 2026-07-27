@@ -109,6 +109,17 @@ pub struct AppGroupRecord {
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
     pub self_membership: SelfMembership,
+    /// When the local account asked to leave this group, if a durable leave
+    /// request is still outstanding.
+    ///
+    /// Derived from the engine-owned `cgka_leave_requests` table when the record
+    /// is read; not part of the stored `account_groups` projection. MLS
+    /// SelfRemove proposals are epoch-bound while the product intent is not, so
+    /// `self_membership` does not reach `Left` until a commit actually removes
+    /// us — until then this is the only durable evidence of the request, and the
+    /// only way a cold launch can rediscover it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leave_requested_at_ms: Option<u64>,
     /// The engine has frozen this local group copy because it cannot safely
     /// select canonical state from retained material. Sending and applying
     /// group traffic remain blocked until a verified repair replaces it.
@@ -448,6 +459,7 @@ impl AppGroupRecord {
             archived: false,
             pending_confirmation: false,
             self_membership: SelfMembership::Member,
+            leave_requested_at_ms: None,
             unrecoverable: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,

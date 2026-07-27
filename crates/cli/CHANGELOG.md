@@ -7,6 +7,23 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- MarmotKit now exposes the durable pending leave intent, so a cold launch can
+  rediscover a leave that has not reached terminal `Left` membership yet.
+  `ChatListRowFfi`, `AppGroupRecordFfi`, and `GroupManagementStateFfi` carry
+  `leave_request_pending` plus `leave_requested_at_ms` (always equal to
+  `leave_requested_at_ms != null`), derived at read time from the engine-owned
+  `cgka_leave_requests` rows rather than a denormalized projection column, so the
+  value cannot go stale when the engine clears a request without notifying the app
+  layer. `GroupManagementStateFfi.can_leave` is now `false` while a leave is
+  pending, and `Marmot::leave_group` returns the new
+  `MarmotKitError::LeaveAlreadyRequested` instead of an opaque runtime error when
+  the engine would reject a same-epoch repeat. A failed leave now also publishes
+  a group-state update, so subscribers see the pending flag without waiting for an
+  unrelated refresh. `chats list --json` / `chat_list_row` rows gain a matching
+  `leave_requested_at_ms` field; no other JSON response shapes changed.
+
 ### Fixed
 
 - TUI chat ordering now follows the durable `activity_sort_at` anchor exposed on

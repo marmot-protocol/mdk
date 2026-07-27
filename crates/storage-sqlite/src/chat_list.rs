@@ -1,3 +1,4 @@
+use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
     SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
     optional_u64_to_i64, u64_to_i64, unix_now_seconds,
@@ -99,6 +100,17 @@ pub struct ChatListRow {
     /// The local account's membership in this group (active member, left, or
     /// removed). Denormalized from `account_groups.self_membership`.
     pub self_membership: SelfMembership,
+    /// When the local account asked to leave this group, if a durable leave
+    /// request is still outstanding.
+    ///
+    /// This is *not* a `chat_list_rows` column. It is derived at read time from
+    /// the engine-owned `cgka_leave_requests` table, which is the only source of
+    /// truth: `self_membership` does not reach a terminal `Left` until a commit
+    /// actually removes us, so between the request and that commit — across a
+    /// publish failure or a process restart — this is the only durable record
+    /// that the user asked to leave.
+    #[serde(default)]
+    pub leave_requested_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +384,10 @@ fn set_chat_list_mention_counts_version_tx(tx: &Connection, version: i64) -> Sto
     Ok(())
 }
 
+/// Deliberately does not consider pending-leave state.
+/// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
+/// materialized, so there is no stored value that can drift out of date — and
+/// comparing a read-time-only field here would mark every row stale forever.
 fn chat_list_projection_complete_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -598,6 +614,10 @@ fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> S
     Ok(exists != 0)
 }
 
+/// Deliberately writes no pending-leave state. `ChatListRow::leave_requested_at_ms`
+/// is derived from `cgka_leave_requests` when the row is *read*, so there is no
+/// column here to keep in sync and no rebuild to trigger when the engine clears a
+/// leave request behind the projection's back.
 fn rebuild_chat_list_row_for_group_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -997,10 +1017,20 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
          ORDER BY activity_sort_at DESC, group_id_hex"
     };
     let mut stmt = tx.prepare(sql).storage()?;
-    stmt.query_map([], chat_list_row_from_row)
+    let mut rows = stmt
+        .query_map([], chat_list_row_from_row)
         .storage()?
         .collect::<Result<Vec<_>, _>>()
-        .storage()
+        .storage()?;
+    // Derived at read time, inside the same transaction as the projection read,
+    // so the pending-leave stamp is always consistent with the row it rides on.
+    let pending = pending_leave_requests_by_group_hex_tx(tx)?;
+    if !pending.is_empty() {
+        for row in &mut rows {
+            row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
+        }
+    }
+    Ok(rows)
 }
 
 fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
@@ -1021,7 +1051,15 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         chat_list_row_from_row,
     )
     .optional()
-    .storage()
+    .storage()?
+    .map(|mut row| {
+        // Same read-time derivation as `chat_list_rows_tx`; see there.
+        row.leave_requested_at_ms = pending_leave_requests_by_group_hex_tx(tx)?
+            .get(&row.group_id_hex)
+            .copied();
+        Ok(row)
+    })
+    .transpose()
 }
 
 fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListRow> {
@@ -1090,6 +1128,9 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         activity_sort_at: row.get::<_, i64>(23)?.try_into().unwrap_or_default(),
         updated_at: row.get::<_, i64>(24)?.try_into().unwrap_or_default(),
         self_membership: SelfMembership::from_storage(&row.get::<_, String>(25)?),
+        // Not a `chat_list_rows` column; the callers above stamp it from
+        // `cgka_leave_requests` after the row is decoded.
+        leave_requested_at_ms: None,
     })
 }
 
