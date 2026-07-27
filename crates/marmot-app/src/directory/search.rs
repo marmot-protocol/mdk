@@ -434,9 +434,9 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MatchQuality, MatchedField};
     use crate::AccountRelayListStatus;
     use crate::ids::npub_for_account_id_lossy;
+    use crate::{MatchQuality, MatchedField};
     use marmot_account::AccountHome;
 
     /// A cached directory record for `account_id_hex` whose profile name is

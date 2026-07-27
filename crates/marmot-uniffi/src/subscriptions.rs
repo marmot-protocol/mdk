@@ -21,6 +21,7 @@ use marmot_app::{
     RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
     RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
+    UserSearchSubscription as AppUserSearchSubscription,
 };
 use tokio::sync::Mutex;
 
@@ -28,7 +29,7 @@ use crate::MarmotKitError;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
-    TimelinePageFfi, TimelineSubscriptionUpdateFfi,
+    TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -361,6 +362,36 @@ mod tests {
     // tested in `marmot-app` (`apply_projection_to_window`, `merge_timeline_window`,
     // `paginate_*`); the FFI no longer re-materializes the window, so its former
     // delta-application tests moved there.
+}
+
+/// A live user search. Dropping it cancels the traversal.
+///
+/// Unlike the runtime subscriptions above there is no `snapshot()`: a search
+/// has no initial state, only results that arrive as each radius resolves.
+#[derive(uniffi::Object)]
+pub struct UserSearchSubscription {
+    inner: Mutex<AppUserSearchSubscription>,
+}
+
+impl UserSearchSubscription {
+    pub(crate) fn new(inner: AppUserSearchSubscription) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl UserSearchSubscription {
+    /// Await the next step of the search, or `None` once it is over.
+    ///
+    /// `None` follows the `SearchCompleted` trigger, so a host can loop until
+    /// either signal. Dropping this object stops the traversal at its next
+    /// checkpoint.
+    pub async fn next_update(&self) -> Option<UserSearchUpdateFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.next_update().await.map(Into::into)
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]

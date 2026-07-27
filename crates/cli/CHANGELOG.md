@@ -52,6 +52,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- MarmotKit now exposes streaming web-of-trust user search: `search_users`
+  returns a `UserSearchSubscription` whose `next_update` yields matches as each
+  social-distance radius resolves, ending with a `SearchCompleted` trigger and
+  then `null`. Dropping the subscription cancels the traversal. Results carry
+  the searcher-relative `radius` plus typed `MatchedField`/`MatchQuality`
+  attribution rather than strings, so hosts branch on checked cases. People
+  found by search are deliberately not added to the local directory — a search
+  result is not a relationship, and `user_profile` still answers only for
+  accounts the user has actually interacted with.
 - MarmotKit now exposes an engine-owned, per-account disappearing-message
   retention sweep with a caller-supplied Unix-millisecond clock. The sweep
   preserves the Android background policy's current-timer gating, five-second
