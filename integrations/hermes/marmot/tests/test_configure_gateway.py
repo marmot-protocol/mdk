@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import os
 import socket
@@ -842,6 +843,69 @@ class ConfigureGatewayEnvDryRunTests(unittest.TestCase):
 
 
 class ConfigureGatewayCliTests(unittest.TestCase):
+    def test_streamed_auth_validator_matches_canonical_helper(self):
+        canonical_source = SCRIPT_PATH.read_text(encoding="utf-8")
+        installer_source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        heredoc_start = installer_source.index(
+            "        python3 - \"${args[@]+\"${args[@]}\"}\" <<'PY'\n"
+        )
+        embedded_start = installer_source.index("\n", heredoc_start) + 1
+        embedded_end = installer_source.index("\nPY\n}", embedded_start)
+        embedded_source = installer_source[embedded_start:embedded_end]
+
+        canonical_tree = ast.parse(canonical_source)
+        embedded_tree = ast.parse(embedded_source)
+
+        def definitions(tree: ast.Module) -> dict[str, str]:
+            return {
+                node.name: ast.dump(node, include_attributes=False)
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
+        def assignments(tree: ast.Module) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for node in tree.body:
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    result[target.id] = ast.dump(node.value, include_attributes=False)
+            return result
+
+        canonical_definitions = definitions(canonical_tree)
+        embedded_definitions = definitions(embedded_tree)
+        for name in (
+            "_bech32_polymod",
+            "_convert_bits",
+            "_npub_to_hex",
+            "normalize_account_id",
+            "_validate_account_id",
+            "validate_sender_auth_entries",
+            "_parse_dotenv_scalar",
+            "_parse_allowed_users_value",
+            "_managed_env_key",
+        ):
+            with self.subTest(definition=name):
+                self.assertEqual(
+                    embedded_definitions[name],
+                    canonical_definitions[name],
+                )
+
+        canonical_assignments = assignments(canonical_tree)
+        embedded_assignments = assignments(embedded_tree)
+        for name in (
+            "ACCOUNT_ID_HEX_RE",
+            "_BECH32_CHARSET",
+            "_BECH32_VALUES",
+            "MANAGED_ENV_KEYS",
+        ):
+            with self.subTest(assignment=name):
+                self.assertEqual(
+                    embedded_assignments[name],
+                    canonical_assignments[name],
+                )
+
     def _write_mock_curl(self, tempdir: Path) -> tuple[Path, Path]:
         mock_bin = tempdir / "mock-bin"
         mock_bin.mkdir()
@@ -1007,6 +1071,26 @@ class ConfigureGatewayCliTests(unittest.TestCase):
         output = completed.stdout + completed.stderr
         self.assertIn("would configure Marmot message-sender authorization", output)
         self.assertNotIn(NPUB_HEX, output)
+
+    def test_streamed_dry_run_accepts_comma_separated_users_without_helper(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            hermes_home = Path(tempdir) / "hermes-home"
+            completed = self._run_streamed_installer(
+                Path(tempdir),
+                [
+                    "--dry-run",
+                    "--yes",
+                    "--hermes-home",
+                    str(hermes_home),
+                    "--allow-user",
+                    f"{USER_A},{USER_B}",
+                ],
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout + completed.stderr
+        self.assertIn("would configure Marmot message-sender authorization", output)
+        self.assertNotIn(USER_A, output)
+        self.assertNotIn(USER_B, output)
 
     def test_streamed_non_dry_rejects_blank_allow_user_before_download(self):
         with tempfile.TemporaryDirectory() as tempdir:

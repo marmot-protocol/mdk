@@ -257,16 +257,21 @@ validate_welcomer_inputs() {
 }
 
 validate_user_inputs() {
-    local user
+    local user entry remaining
     if [ "${#ALLOW_USERS[@]}" -eq 0 ]; then
         return 0
     fi
     for user in "${ALLOW_USERS[@]}"; do
-        if ! is_user_ref_syntax "$user"; then
-            echo "error: invalid message sender allowlist entry" >&2
-            echo "expected a Nostr npub or 64-character hex account id" >&2
-            exit 1
-        fi
+        remaining="$user,"
+        while [[ "$remaining" == *,* ]]; do
+            entry="${remaining%%,*}"
+            remaining="${remaining#*,}"
+            if ! is_user_ref_syntax "$entry"; then
+                echo "error: invalid message sender allowlist entry" >&2
+                echo "expected a Nostr npub or 64-character hex account id" >&2
+                exit 1
+            fi
+        done
     done
 }
 
@@ -307,6 +312,9 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
+# These constants and the identity-parsing functions below intentionally mirror
+# scripts/hermes_marmot_configure_gateway.py. A semantic parity test guards this
+# streamed-install fallback against drifting from the installed helper.
 ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 _BECH32_VALUES = {character: index for index, character in enumerate(_BECH32_CHARSET)}
@@ -375,13 +383,20 @@ def normalize_account_id(entry: str) -> str:
     return normalized.lower().removeprefix("0x")
 
 
-def validate_account_id(entry: str, *, label: str) -> str:
+def _validate_account_id(entry: str, *, label: str) -> str:
     normalized = normalize_account_id(entry)
     if not ACCOUNT_ID_HEX_RE.fullmatch(normalized):
         raise ValueError(
             f"invalid {label}: expected a Nostr npub or 64-character hex account id"
         )
     return normalized
+
+
+def validate_sender_auth_entries(entries: list[str]) -> None:
+    for entry in entries:
+        if not str(entry).strip():
+            raise ValueError("invalid allowed user: empty value is not allowed")
+        _validate_account_id(entry, label="allowed user")
 
 
 def _parse_dotenv_scalar(raw_value: str) -> str:
@@ -469,22 +484,21 @@ def validate_existing_env_auth(env_path: Path) -> None:
 
 args = sys.argv[1:]
 index = 0
+allowed_users: list[str] = []
 while index < len(args):
     if args[index] == "--allow-user":
         index += 1
         if index >= len(args):
             print("error: missing value for --allow-user", file=sys.stderr)
             raise SystemExit(2)
-        entry = args[index]
-        if not str(entry).strip():
-            print("error: invalid allowed user: empty value is not allowed", file=sys.stderr)
-            raise SystemExit(2)
-        try:
-            validate_account_id(entry, label="allowed user")
-        except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            raise SystemExit(2) from exc
+        allowed_users.extend(args[index].split(","))
     index += 1
+
+try:
+    validate_sender_auth_entries(allowed_users)
+except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 hermes_home = Path(os.environ.get("HERMES_HOME", ""))
 if hermes_home:
@@ -1107,6 +1121,8 @@ configure_hermes_gateway() {
 }
 
 print_next_steps() {
+    # Account ids stay in the bootstrap/config files but are intentionally
+    # omitted here to keep installer diagnostics privacy-safe.
     cat <<EOF
 
 Install complete.
