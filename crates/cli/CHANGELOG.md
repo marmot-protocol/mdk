@@ -61,6 +61,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   change in who you know. No host API change. `wn users search` is unaffected:
   it runs without an app runtime and so has no live MLS session to read
   membership from.
+- User search now follows the outbox model: an account whose `kind:0` profile
+  is not on any relay you read is resolved from the write relays its own NIP-65
+  list advertises, so following someone is enough to find them. Relay URLs
+  discovered this way are checked against the same host-safety rule configured
+  relays face, but one unusable entry drops itself instead of the whole list —
+  nobody can make themselves unresolvable, or take the path down for others, by
+  publishing a single bad URL. Bounded on both axes: at most four write relays
+  are honoured per account and at most eight distinct relays are queried per
+  batch, widest coverage first, and each relay is asked only about accounts
+  that named it.
 - `users search --json` now reports whether the traversal actually finished:
   `complete` is `false` and `incomplete_reason` names the cause
   (`radius_timeout` or `radius_truncated`) when a radius ran out of time or a

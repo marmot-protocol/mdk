@@ -406,6 +406,22 @@ impl MarmotRelayPlane {
             .await
     }
 
+    /// Narrow discovered relay endpoints to the safe ones, dropping the rest.
+    ///
+    /// Unlike the fail-closed sanitize on the dial path, this is for endpoints
+    /// another account published; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`]. What survives is still
+    /// sanitized at the dial chokepoint.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        self.inner
+            .relay_safety
+            .retain_safe_endpoints(endpoints, context)
+    }
+
     pub(crate) fn subscribe_directory_events(
         &self,
     ) -> broadcast::Receiver<DirectoryRelayEventRecord> {

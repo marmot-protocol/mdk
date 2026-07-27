@@ -16,8 +16,11 @@
 //! The synchronous [`MarmotApp::search_user_directory`] remains the offline
 //! path over already-cached follow edges; this module is the live one.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
+
+use cgka_traits::TransportEndpoint;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -32,7 +35,10 @@ use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 use crate::runtime::blocking_app_task;
-use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp};
+use crate::{
+    KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
+    relay_list_state_from_event,
+};
 
 /// Deepest radius the traversal producer currently answers.
 ///
@@ -68,6 +74,18 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Write relays honoured from any one account's published NIP-65 list.
+///
+/// A relay list is attacker-controlled, so an account advertising hundreds of
+/// relays must not turn one profile lookup into hundreds of connections.
+const SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR: usize = 4;
+
+/// Distinct write relays queried while resolving one batch.
+///
+/// Bounds the outbox tier to a fixed number of round trips no matter how many
+/// distinct relays a layer's accounts name between them.
+const SEARCH_MAX_WRITE_RELAYS_PER_BATCH: usize = 8;
 
 /// What a search is looking for, and how far out to look.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,10 +328,108 @@ async fn resolve_layer(
             return Ok(());
         }
         let fetched = fetch_profile_records(app, batch).await?;
+        let unresolved = fetched
+            .iter()
+            .filter(|record| record.profile.is_none())
+            .map(|record| record.account_id_hex.clone())
+            .collect::<Vec<_>>();
         cache_resolved_profiles(app, &fetched, now).await?;
         emitter.emit_matches(radius, fetched, query).await;
+
+        if emitter.is_cancelled() || unresolved.is_empty() {
+            continue;
+        }
+        // Everyone still unresolved publishes nowhere the searcher reads. Ask
+        // the relays they say they write to -- the outbox model, and the only
+        // way to reach someone whose profile never leaves their own relays.
+        let outboxed = resolve_from_write_relays(app, &unresolved).await?;
+        cache_resolved_profiles(app, &outboxed, now).await?;
+        emitter.emit_matches(radius, outboxed, query).await;
     }
     Ok(())
+}
+
+/// Resolve profiles from the authors' own NIP-65 write relays.
+///
+/// Each relay is asked only about the authors who published it, so a relay
+/// learns nothing about accounts that never named it. Bounded on both axes
+/// that could otherwise grow with the graph: at most
+/// [`SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR`] relays are taken from any one list,
+/// and at most [`SEARCH_MAX_WRITE_RELAYS_PER_BATCH`] relays are queried per
+/// batch, widest coverage first.
+async fn resolve_from_write_relays(
+    app: &MarmotApp,
+    account_ids: &[String],
+) -> Result<Vec<UserDirectoryRecord>, AppError> {
+    let mut authors_by_relay: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for record in app
+        .fetch_events_for_account_ids(account_ids, KIND_NIP65_RELAY_LIST, &[])
+        .await?
+    {
+        let Some((account_id_hex, relays)) = write_relays_from_record(app, record) else {
+            continue;
+        };
+        for relay in relays.into_iter().take(SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR) {
+            authors_by_relay
+                .entry(relay)
+                .or_default()
+                .push(account_id_hex.clone());
+        }
+    }
+    if authors_by_relay.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Widest coverage first, so a per-batch cap keeps the relays that answer
+    // for the most people rather than an arbitrary few.
+    let mut by_coverage = authors_by_relay.into_iter().collect::<Vec<_>>();
+    by_coverage.sort_by_key(|(relay, authors)| (Reverse(authors.len()), relay.clone()));
+
+    let mut resolved = Vec::new();
+    for (relay, authors) in by_coverage
+        .into_iter()
+        .take(SEARCH_MAX_WRITE_RELAYS_PER_BATCH)
+    {
+        let endpoint = vec![TransportEndpoint(relay)];
+        let profiles = app
+            .fetch_events_for_account_ids(&authors, KIND_NOSTR_METADATA, &endpoint)
+            .await?
+            .into_iter()
+            .filter_map(profile_from_record)
+            .collect::<HashMap<_, _>>();
+        for (account_id_hex, profile) in profiles {
+            let mut record = app.empty_directory_record(&account_id_hex);
+            record.profile = Some(profile);
+            resolved.push(record);
+        }
+    }
+    Ok(resolved)
+}
+
+/// The safe write relays a `kind:10002` record publishes, if any.
+///
+/// Relay URLs here are another account's data, so they are filtered through
+/// the same host-safety rule configured endpoints face; one unusable entry
+/// drops itself rather than the whole list.
+fn write_relays_from_record(
+    app: &MarmotApp,
+    record: RelayEventRecord,
+) -> Option<(String, Vec<String>)> {
+    let account_id_hex = record.event.pubkey.clone();
+    let relay_list = relay_list_state_from_event(&record.event)?;
+    let safe = app.retain_safe_discovered_endpoints(
+        relay_list
+            .write_relays
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect(),
+    );
+    (!safe.is_empty()).then(|| {
+        (
+            account_id_hex,
+            safe.into_iter().map(|endpoint| endpoint.0).collect(),
+        )
+    })
 }
 
 /// Keep the profiles this layer resolved so the next search for the same
@@ -1180,6 +1296,75 @@ mod tests {
             .map(|result| result.radius)
             .collect();
         assert_eq!(radii, vec![0], "the searcher is radius 0 and only radius 0");
+    }
+
+    /// The outbox model: a profile published only to its author's own relays
+    /// is unreachable from the searcher's relay set, and the author's NIP-65
+    /// list is the map to it. Here the searcher and the stranger share no relay
+    /// at all, so the only route to the profile is via the published write
+    /// relay -- if the search finds them, tier 5 did the work.
+    #[tokio::test]
+    async fn a_profile_only_on_its_authors_write_relay_is_still_found() {
+        let searcher_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let searcher_relay_url = searcher_relay.url().await.to_string();
+        let author_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let author_relay_url = author_relay.url().await.to_string();
+
+        // The stranger writes to their own relay only, but publishes that fact
+        // where it can be found -- which is exactly what NIP-65 asks for: the
+        // relay list is the discoverable map, the content behind it is not.
+        let author_endpoint = cgka_traits::TransportEndpoint(author_relay_url.clone());
+        let searcher_endpoint = cgka_traits::TransportEndpoint(searcher_relay_url.clone());
+        let stranger_dir = tempfile::tempdir().unwrap();
+        let stranger_app = MarmotApp::with_relay(stranger_dir.path(), author_relay_url.clone());
+        let stranger = stranger_app
+            .runtime()
+            .create_identity(crate::AccountSetupRequest {
+                default_relays: vec![author_endpoint.clone()],
+                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint],
+                publish_missing_relay_lists: true,
+                ..crate::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create the stranger's identity")
+            .account;
+        stranger_app
+            .publish_user_profile(
+                &stranger.account_id_hex,
+                UserProfileMetadata {
+                    name: Some("needle".to_owned()),
+                    ..UserProfileMetadata::default()
+                },
+                crate::AccountRelayListBootstrap::new(vec![author_endpoint], Vec::new()),
+            )
+            .await
+            .expect("publish the stranger's profile");
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), searcher_relay_url.clone());
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.account_id_hex.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (1, 1)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        assert!(
+            updates
+                .iter()
+                .flat_map(|update| &update.new_results)
+                .any(|result| result.account_id_hex == stranger.account_id_hex),
+            "the profile must be resolved from the author's own write relay: {updates:?}"
+        );
     }
 
     #[tokio::test]

@@ -592,6 +592,20 @@ impl MarmotApp {
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
     }
 
+    /// Narrow relay endpoints discovered from another account's published
+    /// relay list to the ones this device is willing to dial.
+    ///
+    /// Routes to the same host-safety rule configured endpoints face; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
+    /// filters rather than fails.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
+            .retain_safe_discovered_endpoints(endpoints, "directory write-relay discovery")
+    }
+
     pub(crate) fn directory_source_relays(
         &self,
         source_relays: &[TransportEndpoint],
