@@ -63,7 +63,8 @@ Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel
 Both install scripts verify SHA256 checksums for downloaded release assets.
 
 The installer prints restart guidance for your existing Hermes gateway. It does
-not restart Hermes automatically.
+not restart Hermes automatically. Restart a managed gateway with
+`hermes gateway restart`.
 
 Manual equivalent:
 
