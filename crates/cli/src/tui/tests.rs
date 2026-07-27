@@ -3260,8 +3260,11 @@ fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
     let group_a = "aa".repeat(32);
     let group_b = "bb".repeat(32);
     // The re-read returns B as the most-active chat (a reorder): B first, A last.
+    // `activity_sort_at` is the durable ordering anchor the fold sorts by — a
+    // `last_message.timeline_at` alone leaves both rows at activity 0, where the
+    // ascending group-id tie-break would keep A first and the reorder never happens.
     let response = format!(
-        r#"{{"ok":true,"result":{{"chats":[{{"group_id":"{group_b}","profile":{{"name":"b"}},"last_message":{{"timeline_at":200,"plaintext":"hi","sender":"x"}}}},{{"group_id":"{group_a}","profile":{{"name":"a"}},"last_message":{{"timeline_at":100,"plaintext":"yo","sender":"x"}}}}]}}}}"#
+        r#"{{"ok":true,"result":{{"chats":[{{"group_id":"{group_b}","profile":{{"name":"b"}},"activity_sort_at":200,"last_message":{{"timeline_at":200,"plaintext":"hi","sender":"x"}}}},{{"group_id":"{group_a}","profile":{{"name":"a"}},"activity_sort_at":100,"last_message":{{"timeline_at":100,"plaintext":"yo","sender":"x"}}}}]}}}}"#
     );
     let tempdir = tempfile::tempdir().expect("tempdir");
     let (exe, args_file) = test_appending_arg_executable(tempdir.path(), &response);
