@@ -69,7 +69,7 @@ async fn run_users_command(
                     query: query.clone(),
                     radius_start: radius.0,
                     radius_end: radius.1,
-                    radius_one_seeds: radius_one_seeds(runtime, &account).await?,
+                    radius_one_seeds: radius_one_seeds(runtime, &account, radius.1).await?,
                 },
             )
             .await?;
@@ -110,11 +110,15 @@ async fn run_users_command(
 /// - a watch-only or signed-out account has no MLS sessions at all, so it
 ///   shares no groups. Asking anyway would make the runtime refuse and turn an
 ///   enhancement into a failed search for accounts that search fine today.
+/// - a window that stops at radius 0 cannot use radius-1 seeds, and gathering
+///   them costs a membership read per group.
 async fn radius_one_seeds(
     runtime: Option<&MarmotAppRuntime>,
     account: &AccountSummary,
+    radius_end: u8,
 ) -> Result<Vec<String>, WnError> {
-    let Some(runtime) = runtime.filter(|_| account.is_active_signing()) else {
+    let usable = radius_end >= 1 && account.is_active_signing();
+    let Some(runtime) = runtime.filter(|_| usable) else {
         return Ok(Vec::new());
     };
     Ok(runtime.group_co_members(&account.account_id_hex).await?)
@@ -210,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn an_account_that_cannot_sign_is_never_asked_for_co_members() {
         for summary in [account(false, false), account(true, true)] {
-            let seeds = radius_one_seeds(None, &summary)
+            let seeds = radius_one_seeds(None, &summary, 1)
                 .await
                 .expect("no MLS session means no co-members, not an error");
             assert!(seeds.is_empty());
@@ -219,9 +223,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_search_without_a_runtime_asks_for_no_co_members() {
-        let seeds = radius_one_seeds(None, &account(true, false))
+        let seeds = radius_one_seeds(None, &account(true, false), 1)
             .await
             .expect("no runtime yields no seeds rather than failing");
+        assert!(seeds.is_empty());
+    }
+
+    /// Radius-1 seeds cannot affect a window that stops at radius 0, so the
+    /// per-group membership read is skipped rather than paid for nothing.
+    #[tokio::test]
+    async fn a_radius_zero_window_asks_for_no_co_members() {
+        let seeds = radius_one_seeds(None, &account(true, false), 0)
+            .await
+            .expect("a radius-0 window needs no seeds");
         assert!(seeds.is_empty());
     }
 

@@ -200,9 +200,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `users search` now searches your live follow graph instead of only the locally cached directory, so it finds people
   whose profile has never been cached on this device. Results still stream out of the app runtime ranked by social
   distance, and the command's JSON shape is unchanged (`users[]` rows keep `account_id_hex`, `npub`, `radius`,
-  `matched_field`, `match_quality`, and `profile`). Two consequences worth knowing: `--radius` now defaults to `0..1`
-  (you, then who you follow) and rejects an end above `1` until deeper traversal ships, and a traversal that cannot
-  finish reports `user_search_failed` rather than returning a short list that looks complete. Discovered strangers are
+  `matched_field`, `match_quality`, and `profile`). Two consequences worth knowing: `--radius` defaults to `0..1`
+  (you, then who you follow), and a traversal that *fails* reports `user_search_failed` rather than returning a short
+  list that looks complete. Discovered strangers are
   never written into the local directory, so `users show` still only knows accounts you have actually interacted with.
 - TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
   after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders

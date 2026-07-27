@@ -238,7 +238,14 @@ impl DirectoryCache {
         })
     }
 
-    fn search_graph_record(
+    /// The un-promoted search-graph record for an account, ignoring the
+    /// promoted directory entirely.
+    ///
+    /// Callers that have already consulted the promoted tier want this rather
+    /// than [`Self::search_record`]: a promoted row exists for reasons that
+    /// carry no profile, and letting it answer would hide the profile cached
+    /// here.
+    pub(crate) fn search_graph_record(
         &self,
         account_id_hex: &str,
         now: i64,

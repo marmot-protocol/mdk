@@ -596,13 +596,19 @@ async fn partition_locally_known(
 }
 
 /// The first un-promoted search-graph record carrying an unexpired profile.
+///
+/// Reads the search graph directly rather than through
+/// [`DirectoryCache::search_record`]. That helper answers from the promoted
+/// directory first, and the only callers who reach here have already found a
+/// promoted row without a profile -- so going through it would hand the same
+/// profile-less row straight back and hide the cached profile behind it.
 fn search_graph_profile(
     caches: &[DirectoryCache],
     account_id_hex: &str,
     now: i64,
 ) -> Result<Option<UserDirectoryRecord>, AppError> {
     for cache in caches {
-        if let Some(record) = cache.search_record(account_id_hex, now)?
+        if let Some(record) = cache.search_graph_record(account_id_hex, now)?
             && record.profile.is_some()
         {
             return Ok(Some(record));
@@ -1647,6 +1653,71 @@ mod tests {
                 .flat_map(|update| &update.new_results)
                 .any(|result| result.account_id_hex == seeded_stranger),
             "a searcher with their own graph must not be given a stranger's"
+        );
+    }
+
+    /// A promoted row without a profile must not hide the profile the search
+    /// graph has cached for the same account.
+    ///
+    /// Accounts get promoted rows for reasons that carry no profile at all --
+    /// being a message sender, for one -- so this is the ordinary state, not a
+    /// corner case. If the profile-less row masks the cached one, every search
+    /// re-fetches those people from relays and the warm path never fires for
+    /// exactly the accounts the user interacts with most.
+    #[tokio::test]
+    async fn a_promoted_row_without_a_profile_does_not_mask_the_cached_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let stranger = format!("{:064x}", 101);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+        // Promoted, but profile-less: the shape `remember_directory_user_with_reason`
+        // leaves behind for a message sender.
+        cache
+            .put(&UserDirectoryRecord {
+                profile: None,
+                ..record_named(&stranger, "ignored")
+            })
+            .unwrap();
+        // The profile an earlier search resolved, cached un-promoted.
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: stranger.clone(),
+                    npub: npub_for_account_id_lossy(&stranger),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (1, 1)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        assert!(
+            updates
+                .iter()
+                .flat_map(|update| &update.new_results)
+                .any(|result| result.account_id_hex == stranger),
+            "the cached profile must be reachable despite the profile-less promoted row"
         );
     }
 

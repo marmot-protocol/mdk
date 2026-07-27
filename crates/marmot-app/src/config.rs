@@ -163,9 +163,6 @@ impl MarmotAppConfig {
         self
     }
 
-    /// Dev/test override for the convergence settlement quiescence window (ms).
-    /// Off by default (the protocol-pinned `1000` ms is used). Normal builds
-    /// ignore this field; explicit test harnesses set `0` for instant settlement.
     /// Set the accounts to fall back to when a searcher's own graph is empty.
     /// See [`Self::directory_search_fallback_seeds`].
     pub fn with_directory_search_fallback_seeds(mut self, seeds: Vec<String>) -> Self {
@@ -173,6 +170,9 @@ impl MarmotAppConfig {
         self
     }
 
+    /// Dev/test override for the convergence settlement quiescence window (ms).
+    /// Off by default (the protocol-pinned `1000` ms is used). Normal builds
+    /// ignore this field; explicit test harnesses set `0` for instant settlement.
     pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
         self.dev_settlement_quiescence_ms = Some(ms);
         self

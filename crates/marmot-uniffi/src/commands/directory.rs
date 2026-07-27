@@ -118,7 +118,14 @@ impl Marmot {
         radius_start: u8,
         radius_end: u8,
     ) -> Result<Arc<UserSearchSubscription>, MarmotKitError> {
-        let radius_one_seeds = self.runtime.group_co_members(&account_id_hex).await?;
+        // Seeds are radius 1 by definition, so a window that stops at radius 0
+        // cannot use them -- and gathering them costs a membership read per
+        // group. Ask only when the answer can matter.
+        let radius_one_seeds = if radius_end >= 1 {
+            self.runtime.group_co_members(&account_id_hex).await?
+        } else {
+            Vec::new()
+        };
         let inner = self
             .app
             .search_users(UserSearchParams {
