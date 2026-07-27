@@ -79,6 +79,11 @@ backend on the same rail.
 - **File:** `sqlite_storage.rs`
   - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
 
+- **File:** `crash_recovery_sqlite.rs`
+  - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
+    boundaries. Reopens encrypted SQLite, observes the stranded pre-hydration state, then verifies hydration restores
+    live state and releases convergence snapshots.
+
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 

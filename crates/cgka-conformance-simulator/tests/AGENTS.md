@@ -32,7 +32,8 @@ Map for simulator tests.
   - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
 
 - **File:** `sqlite_storage_modes.rs`
-  - **Owns:** Harness storage-mode coverage over temp file-backed SQLite.
+  - **Owns:** Harness storage-mode coverage over encrypted file-backed SQLite, including full close/reopen hydration,
+    production WAL defaults, encrypted headers, and busy-writer retry behavior.
 
 - **File:** `tracing_audit.rs`
   - **Owns:** Repo-wide production tracing privacy audit.

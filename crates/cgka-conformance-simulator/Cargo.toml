@@ -39,3 +39,4 @@ tempfile.workspace = true
 # the transport crates' key derivation, AAD, and broker control bytes.
 transport-quic-stream.workspace = true
 transport-quic-broker.workspace = true
+rusqlite.workspace = true

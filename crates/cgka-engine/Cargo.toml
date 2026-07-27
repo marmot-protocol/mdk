@@ -11,6 +11,9 @@ default = []
 # Explicit escape hatch for engine/session integration tests that need custom
 # settlement or rewind policies. Production/app consumers must not enable it.
 test-policy-overrides = []
+# Debug-only subprocess crash points used by the SQLCipher durability tests.
+# Production/app consumers must not enable this feature.
+test-crash-hooks = []
 
 [dependencies]
 cgka-traits.workspace = true

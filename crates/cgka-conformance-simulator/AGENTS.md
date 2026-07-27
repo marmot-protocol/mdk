@@ -16,9 +16,11 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
 
 - **Module:** `src/client.rs`
   - **Role:** `HarnessClient` + `ClientBuilder`. Wraps an `Engine<SqliteAccountStorage>`, a real `NostrMlsPeeler`, and the bus
-    handle. It uses in-memory SQLite by default and can run on temp file-backed SQLite via
-    `MDK_CONFORMANCE_SQLITE_STORAGE=file` or `ClientBuilder::storage_mode`. `tick().await` drains pending inbound
-    for one client. `confirm(pending).await` finishes a `GroupEvolution`.
+    handle. It uses in-memory SQLite by default and can run on temp file-backed SQLite via the report CLI's
+    `--storage file`, `MDK_CONFORMANCE_SQLITE_STORAGE=file`, or `ClientBuilder::storage_mode`. Explicit CLI selection
+    overrides the environment. File-backed `restart()` drops all engine/storage handles, reopens the encrypted database,
+    and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
+    `GroupEvolution`.
 
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for

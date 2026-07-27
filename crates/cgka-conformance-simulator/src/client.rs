@@ -30,9 +30,10 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 use transport_nostr_peeler::NostrMlsPeeler;
 
 const STORAGE_MODE_ENV: &str = "MDK_CONFORMANCE_SQLITE_STORAGE";
@@ -41,11 +42,11 @@ const HARNESS_CONVERGENCE_SETTLED_AT_MS: u64 = 1_000_000;
 const HARNESS_CONVERGENCE_DRAIN_PASSES: usize = 8;
 
 pub struct HarnessClient {
-    pub engine: Engine<SqliteAccountStorage>,
+    engine: Option<Engine<SqliteAccountStorage>>,
     pub bus_id: ClientId,
     bus: TransportBus,
-    storage: SqliteAccountStorage,
-    _storage_dir: Option<tempfile::TempDir>,
+    storage: Option<SqliteAccountStorage>,
+    storage_backing: HarnessStorageBacking,
     identity: Vec<u8>,
     signer: nostr::Keys,
     registry: FeatureRegistry,
@@ -67,6 +68,8 @@ pub struct ClientBuilder {
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     storage_mode: HarnessStorageMode,
+    storage_options: SqliteStorageOptions,
+    explicit_file_storage: Option<ExplicitFileStorage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,34 +79,92 @@ pub enum HarnessStorageMode {
 }
 
 impl HarnessStorageMode {
-    fn from_env() -> Self {
+    pub fn from_env() -> Self {
         match std::env::var(STORAGE_MODE_ENV) {
-            Ok(value) if matches!(value.as_str(), "file" | "file-backed" | "tempfile") => {
-                Self::TempFileBackedSqlite
-            }
-            Ok(value) if matches!(value.as_str(), "memory" | "in-memory" | "sqlite-memory") => {
-                Self::InMemorySqlite
-            }
-            Ok(value) => panic!(
-                "{STORAGE_MODE_ENV} must be one of memory, in-memory, sqlite-memory, file, file-backed, or tempfile; got {value:?}"
-            ),
+            Ok(value) => Self::parse(&value).unwrap_or_else(|err| panic!("{err}")),
             Err(_) => Self::InMemorySqlite,
         }
     }
 
-    fn open(self) -> Result<(SqliteAccountStorage, Option<tempfile::TempDir>), String> {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "file" | "file-backed" | "tempfile" => Ok(Self::TempFileBackedSqlite),
+            "memory" | "in-memory" | "sqlite-memory" => Ok(Self::InMemorySqlite),
+            _ => Err(format!(
+                "{STORAGE_MODE_ENV} and --storage must be one of memory, in-memory, sqlite-memory, file, file-backed, or tempfile; got {value:?}"
+            )),
+        }
+    }
+
+    pub fn report_label(self) -> &'static str {
         match self {
-            Self::InMemorySqlite => SqliteAccountStorage::in_memory()
-                .map(|storage| (storage, None))
-                .map_err(|err| err.to_string()),
-            Self::TempFileBackedSqlite => {
-                let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+            Self::InMemorySqlite => "in-memory-sqlite",
+            Self::TempFileBackedSqlite => "encrypted-file-sqlite",
+        }
+    }
+}
+
+struct ExplicitFileStorage {
+    path: PathBuf,
+    key: SqlCipherKey,
+    options: SqliteStorageOptions,
+}
+
+enum HarnessStorageBacking {
+    InMemory,
+    FileBacked {
+        _storage_dir: Option<tempfile::TempDir>,
+        path: PathBuf,
+        key: SqlCipherKey,
+        options: SqliteStorageOptions,
+    },
+}
+
+impl HarnessStorageBacking {
+    fn from_mode(mode: HarnessStorageMode, options: SqliteStorageOptions) -> Result<Self, String> {
+        match mode {
+            HarnessStorageMode::InMemorySqlite => Ok(Self::InMemory),
+            HarnessStorageMode::TempFileBackedSqlite => {
+                let storage_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+                let path = storage_dir.path().join("client.sqlite3");
                 let key = SqlCipherKey::new(TEMP_FILE_KEY).map_err(|err| err.to_string())?;
-                let storage =
-                    SqliteAccountStorage::open_encrypted(dir.path().join("client.sqlite3"), &key)
-                        .map_err(|err| err.to_string())?;
-                Ok((storage, Some(dir)))
+                Ok(Self::FileBacked {
+                    _storage_dir: Some(storage_dir),
+                    path,
+                    key,
+                    options,
+                })
             }
+        }
+    }
+
+    fn from_explicit(explicit: ExplicitFileStorage) -> Self {
+        Self::FileBacked {
+            _storage_dir: None,
+            path: explicit.path,
+            key: explicit.key,
+            options: explicit.options,
+        }
+    }
+
+    fn open(&self) -> Result<SqliteAccountStorage, String> {
+        match self {
+            Self::InMemory => SqliteAccountStorage::in_memory().map_err(|err| err.to_string()),
+            Self::FileBacked {
+                path, key, options, ..
+            } => SqliteAccountStorage::open_encrypted_with_options(path, key, options.clone())
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    fn is_file_backed(&self) -> bool {
+        matches!(self, Self::FileBacked { .. })
+    }
+
+    fn database_path(&self) -> Option<&Path> {
+        match self {
+            Self::InMemory => None,
+            Self::FileBacked { path, .. } => Some(path),
         }
     }
 }
@@ -120,6 +181,8 @@ impl ClientBuilder {
             registry: FeatureRegistry::new(),
             protocol_profile: ProtocolProfile::Legacy,
             storage_mode: HarnessStorageMode::from_env(),
+            storage_options: SqliteStorageOptions::default(),
+            explicit_file_storage: None,
         }
     }
 
@@ -130,6 +193,27 @@ impl ClientBuilder {
 
     pub fn storage_mode(mut self, mode: HarnessStorageMode) -> Self {
         self.storage_mode = mode;
+        self.explicit_file_storage = None;
+        self
+    }
+
+    pub fn storage_options(mut self, options: SqliteStorageOptions) -> Self {
+        self.storage_options = options;
+        self
+    }
+
+    pub fn file_backed_storage(
+        mut self,
+        path: impl Into<PathBuf>,
+        key: SqlCipherKey,
+        options: SqliteStorageOptions,
+    ) -> Self {
+        self.storage_mode = HarnessStorageMode::TempFileBackedSqlite;
+        self.explicit_file_storage = Some(ExplicitFileStorage {
+            path: path.into(),
+            key,
+            options,
+        });
         self
     }
 
@@ -139,7 +223,12 @@ impl ClientBuilder {
     }
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
-        let (storage, storage_dir) = self.storage_mode.open().expect("storage opens");
+        let storage_backing = match self.explicit_file_storage {
+            Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
+            None => HarnessStorageBacking::from_mode(self.storage_mode, self.storage_options)
+                .expect("storage backing opens"),
+        };
+        let storage = storage_backing.open().expect("storage opens");
         let audit_capture = AuditCapture::default();
         let engine = build_harness_engine(
             &storage,
@@ -151,11 +240,11 @@ impl ClientBuilder {
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         HarnessClient {
-            engine,
+            engine: Some(engine),
             bus_id,
             bus: bus.clone(),
-            storage,
-            _storage_dir: storage_dir,
+            storage: Some(storage),
+            storage_backing,
             identity: self.identity,
             signer: self.signer,
             registry: self.registry,
@@ -313,13 +402,32 @@ fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
 }
 
 impl HarnessClient {
+    pub fn engine(&self) -> &Engine<SqliteAccountStorage> {
+        self.engine.as_ref().expect("harness engine is available")
+    }
+
+    pub fn engine_mut(&mut self) -> &mut Engine<SqliteAccountStorage> {
+        self.engine.as_mut().expect("harness engine is available")
+    }
+
     pub fn storage(&self) -> &SqliteAccountStorage {
-        &self.storage
+        self.storage.as_ref().expect("harness storage is available")
+    }
+
+    pub fn database_path(&self) -> Option<&Path> {
+        self.storage_backing.database_path()
     }
 
     pub fn restart(&mut self) {
+        drop(self.engine.take());
+        let storage = if self.storage_backing.is_file_backed() {
+            drop(self.storage.take());
+            self.storage_backing.open().expect("file storage reopens")
+        } else {
+            self.storage().clone()
+        };
         let mut engine = build_harness_engine(
-            &self.storage,
+            &storage,
             &self.identity,
             &self.signer,
             &self.registry,
@@ -329,7 +437,8 @@ impl HarnessClient {
         engine
             .hydrate_stable_groups_from_storage()
             .expect("engine hydrates from storage");
-        self.engine = engine;
+        self.storage = Some(storage);
+        self.engine = Some(engine);
         self.pending_events.clear();
     }
 
@@ -338,14 +447,14 @@ impl HarnessClient {
     /// engine storage to manufacture the boundary themselves.
     pub fn freeze_convergence_pass(&mut self, group_id: &GroupId) {
         let mut pass = self
-            .storage
+            .storage()
             .convergence_pass(group_id)
             .expect("load durable convergence pass")
             .expect("durable convergence pass exists");
         pass.phase = ConvergencePassPhase::Frozen;
         pass.cutoff_cause = Some(ConvergenceCutoffCause::Quiescence);
         pass.frozen_at_wall_ms = Some(pass.quiescence_deadline_wall_ms);
-        self.storage
+        self.storage()
             .put_convergence_pass(&pass)
             .expect("persist frozen convergence pass");
     }
@@ -354,11 +463,11 @@ impl HarnessClient {
     /// epoch snapshots intentionally exclude.
     pub fn checkpoint_convergence(&mut self, group_id: &GroupId, name: &str) {
         let pass = self
-            .storage
+            .storage()
             .convergence_pass(group_id)
             .expect("load convergence pass for checkpoint")
             .expect("checkpoint requires a convergence pass");
-        self.storage
+        self.storage()
             .create_group_snapshot(group_id, name)
             .expect("create convergence group snapshot");
         self.convergence_checkpoints
@@ -374,7 +483,7 @@ impl HarnessClient {
             .get(name)
             .cloned()
             .expect("convergence checkpoint exists");
-        self.storage
+        self.storage()
             .with_transaction(|storage| {
                 storage.rollback_group_to_snapshot(&group_id, name)?;
                 storage.put_convergence_pass(&pass)
@@ -388,7 +497,7 @@ impl HarnessClient {
         group_id: &GroupId,
         now_ms: u64,
     ) -> CanonicalizationResult {
-        self.engine
+        self.engine_mut()
             .converge_stored_openmls_messages(group_id, now_ms)
             .expect("stored convergence succeeds")
     }
@@ -412,11 +521,11 @@ impl HarnessClient {
     }
 
     pub fn member_id(&self) -> MemberId {
-        self.engine.self_id()
+        self.engine().self_id()
     }
 
     pub async fn fresh_key_package(&mut self) -> KeyPackage {
-        let key_package = self.engine.fresh_key_package().await.expect("kp");
+        let key_package = self.engine_mut().fresh_key_package().await.expect("kp");
         key_package_with_harness_source(key_package)
     }
 
@@ -490,14 +599,15 @@ impl HarnessClient {
         required_features: Vec<cgka_traits::capabilities::Feature>,
         initial_admins: Vec<MemberId>,
     ) -> Result<(GroupId, Option<PendingStateRef>), EngineError> {
+        let routing_component = harness_nostr_routing_component(&self.identity, name);
         let res = self
-            .engine
+            .engine_mut()
             .create_group(CreateGroupRequest {
                 name: name.into(),
                 description: "".into(),
                 members: invitees,
                 required_features,
-                app_components: vec![harness_nostr_routing_component(&self.identity, name)],
+                app_components: vec![routing_component],
                 initial_admins,
             })
             .await?;
@@ -524,7 +634,7 @@ impl HarnessClient {
     /// action (create, invite, upgrade) when the simulated transport
     /// "succeeds."
     pub async fn confirm(&mut self, pending: PendingStateRef) {
-        self.engine
+        self.engine_mut()
             .confirm_published(pending)
             .await
             .expect("confirm_published");
@@ -534,7 +644,7 @@ impl HarnessClient {
     /// discards the staged commit and rewinds to `Stable` at the prior
     /// epoch. Used by the rollback proptest property.
     pub async fn fail(&mut self, pending: PendingStateRef) {
-        self.engine
+        self.engine_mut()
             .publish_failed(pending)
             .await
             .expect("publish_failed");
@@ -546,7 +656,7 @@ impl HarnessClient {
     pub async fn upgrade(&mut self) -> PendingStateRef {
         let gid = self.default_group.clone().expect("group");
         let res = self
-            .engine
+            .engine_mut()
             .upgrade_group_capabilities(&gid)
             .await
             .expect("upgrade");
@@ -569,7 +679,7 @@ impl HarnessClient {
     pub async fn update_group_data(&mut self, name: impl Into<String>) -> PendingStateRef {
         let gid = self.default_group.clone().expect("group");
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::UpdateGroupData {
                 group_id: gid.clone(),
                 name: Some(name.into()),
@@ -601,7 +711,7 @@ impl HarnessClient {
         let gid = self.default_group.clone().expect("group");
         let data = encode_admin_policy(admins)?;
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::UpdateAppComponents {
                 group_id: gid.clone(),
                 updates: vec![AppComponentData {
@@ -631,7 +741,7 @@ impl HarnessClient {
 
     pub fn admin_labels(&self) -> Vec<String> {
         let gid = self.default_group.clone().expect("group");
-        self.engine
+        self.engine()
             .admin_pubkeys(&gid)
             .expect("admin pubkeys")
             .into_iter()
@@ -649,7 +759,7 @@ impl HarnessClient {
             .expect("must create or join a group first");
         let payload = self.next_app_payload(payload.into());
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
@@ -674,7 +784,7 @@ impl HarnessClient {
             .expect("must create or join a group first");
         let payload = self.next_app_payload(payload.into());
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
@@ -703,7 +813,7 @@ impl HarnessClient {
     ) -> Result<PendingStateRef, EngineError> {
         let gid = self.default_group.clone().expect("group");
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::Invite {
                 group_id: gid.clone(),
                 key_packages: kps,
@@ -739,7 +849,7 @@ impl HarnessClient {
     pub async fn leave_capture(&mut self) -> TransportMessage {
         let gid = self.default_group.clone().expect("group");
         let res = self
-            .engine
+            .engine_mut()
             .send(SendIntent::Leave {
                 group_id: gid.clone(),
             })
@@ -760,7 +870,7 @@ impl HarnessClient {
         let mut outcomes = self.tick_ingest_only().await;
         if let Some(gid) = self.default_group.clone() {
             match self
-                .engine
+                .engine_mut()
                 .advance_convergence_inputs_until_settled(&gid, HARNESS_CONVERGENCE_SETTLED_AT_MS)
                 .await
             {
@@ -787,7 +897,7 @@ impl HarnessClient {
         let inbound = self.bus.mailbox(self.bus_id);
         let mut outcomes = Vec::with_capacity(inbound.len());
         for msg in inbound {
-            let result = self.engine.ingest(msg).await;
+            let result = self.engine_mut().ingest(msg).await;
             if result.is_ok() {
                 self.capture_engine_events();
             }
@@ -800,7 +910,7 @@ impl HarnessClient {
     ///
     /// Debug/test harness escape hatch; release builds reject non-v1 policies.
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
-        self.engine
+        self.engine_mut()
             .set_convergence_policy(policy)
             .expect("convergence policy accepted");
     }
@@ -809,7 +919,7 @@ impl HarnessClient {
     /// timer (`CgkaEngine::advance_convergence`), then capture emitted events.
     pub async fn advance_convergence(&mut self) -> Result<(), EngineError> {
         let gid = self.default_group.clone().expect("group");
-        let results = self.engine.advance_convergence(&gid).await?;
+        let results = self.engine_mut().advance_convergence(&gid).await?;
         self.capture_engine_events();
         for result in results {
             self.publish_send_result(result).await?;
@@ -844,7 +954,7 @@ impl HarnessClient {
 
     pub fn has_pending_convergence_inputs(&self) -> bool {
         let gid = self.default_group.clone().expect("group");
-        self.engine
+        self.engine()
             .has_pending_convergence_inputs(&gid)
             .expect("pending convergence probe")
     }
@@ -867,13 +977,13 @@ impl HarnessClient {
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
     ) {
         for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
-            let groups = self.engine.drain_pending_convergence_groups();
+            let groups = self.engine_mut().drain_pending_convergence_groups();
             if groups.is_empty() {
                 return;
             }
             for group_id in groups {
                 let results = match self
-                    .engine
+                    .engine_mut()
                     .converge_and_drain_queued_outbound_intents(
                         &group_id,
                         HARNESS_CONVERGENCE_SETTLED_AT_MS,
@@ -925,14 +1035,14 @@ impl HarnessClient {
                     msg
                 };
                 self.bus.send(self.bus_id, routed);
-                self.engine.confirm_published(pending).await?;
+                self.engine_mut().confirm_published(pending).await?;
                 self.capture_engine_events();
             }
             SendResult::GroupCreated { welcomes, pending } => {
                 for welcome in welcomes {
                     self.bus.send(self.bus_id, welcome);
                 }
-                self.engine.confirm_published(pending).await?;
+                self.engine_mut().confirm_published(pending).await?;
                 self.capture_engine_events();
             }
             SendResult::FoundingGroupCreated { welcomes } => {
@@ -948,7 +1058,7 @@ impl HarnessClient {
 
     async fn drain_auto_publish_confirm(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
         let mut outcomes = Vec::new();
-        let auto = self.engine.drain_auto_publish();
+        let auto = self.engine_mut().drain_auto_publish();
         let gid = self.default_group.clone();
         for auto in auto {
             let routed = if let Some(gid) = &gid {
@@ -957,13 +1067,13 @@ impl HarnessClient {
                 auto.msg
             };
             self.bus.send(self.bus_id, routed);
-            if let Err(e) = self.engine.confirm_published(auto.pending).await {
+            if let Err(e) = self.engine_mut().confirm_published(auto.pending).await {
                 outcomes.push(Err(e));
                 continue;
             }
             self.capture_engine_events();
         }
-        let proposals = self.engine.drain_auto_proposals();
+        let proposals = self.engine_mut().drain_auto_proposals();
         for msg in proposals {
             let routed = if let Some(gid) = &gid {
                 route(msg, gid)
@@ -982,12 +1092,12 @@ impl HarnessClient {
 
     pub fn epoch(&self) -> EpochId {
         let gid = self.default_group.clone().expect("group");
-        self.engine.epoch(&gid).expect("epoch")
+        self.engine().epoch(&gid).expect("epoch")
     }
 
     pub fn members(&self) -> Vec<cgka_traits::group::Member> {
         let gid = self.default_group.clone().expect("group");
-        self.engine.members(&gid).expect("members")
+        self.engine().members(&gid).expect("members")
     }
 
     /// Current app-facing group name mirrored from signed group-profile state.
@@ -1000,7 +1110,7 @@ impl HarnessClient {
     /// catch a permanent fork that epoch/member equality alone would miss.
     pub fn group_name(&self) -> String {
         let gid = self.default_group.clone().expect("group");
-        self.engine.group_record(&gid).expect("group record").name
+        self.engine().group_record(&gid).expect("group record").name
     }
 
     pub fn group_id(&self) -> GroupId {
@@ -1013,7 +1123,7 @@ impl HarnessClient {
             .app_event_counter
             .checked_add(1)
             .expect("app event counter exhausted");
-        encode_harness_app_payload(&self.engine.self_id(), seq, payload)
+        encode_harness_app_payload(&self.engine().self_id(), seq, payload)
     }
 
     /// Return a clone of `msg` whose payload is the peeled MLS wire bytes.
@@ -1035,7 +1145,7 @@ impl HarnessClient {
             }
         };
         let ctx = self
-            .engine
+            .engine()
             .group_context(&group_id)
             .map_err(|e| format!("group context: {e}"))?;
         let snapshot = GroupContextSnapshot::from_context(
@@ -1058,7 +1168,7 @@ impl HarnessClient {
 
 impl HarnessClient {
     fn capture_engine_events(&mut self) {
-        for event in self.engine.drain_events() {
+        for event in self.engine_mut().drain_events() {
             if let GroupEvent::GroupJoined { group_id, .. } = &event
                 && self.default_group.is_none()
             {

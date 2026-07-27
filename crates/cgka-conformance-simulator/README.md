@@ -6,9 +6,11 @@ The engine crate proves local engine rules. This crate asks the bigger question:
 the network behaves badly, do they still end up with the same group state?
 
 The simulator does not use real relays. It runs `Engine<SqliteAccountStorage>` clients against a deterministic in-memory
-`TransportBus`, using in-memory SQLite by default. Set `MDK_CONFORMANCE_SQLITE_STORAGE=file` to run harness
-clients on temporary encrypted SQLite files. Transport wrapping still goes through the real Nostr peeler, so group
-messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
+`TransportBus`, using in-memory SQLite by default. Report runs select storage explicitly with
+`--storage memory|file`; the flag overrides `MDK_CONFORMANCE_SQLITE_STORAGE` when both are present. File mode uses
+temporary encrypted SQLite databases and a restart fully closes and reopens each client database before hydration.
+Transport wrapping still goes through the real Nostr peeler, so group messages use the Marmot kind-445 envelope and
+welcomes use NIP-59 gift wraps before the bus delivers them.
 
 ## What this crate gives you
 
@@ -70,15 +72,19 @@ To run every portable vector fixture and write a report for each one:
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
   --vectors crates/cgka-conformance-simulator/vectors \
-  --out target/cgka-conformance-simulator-reports
+  --out target/cgka-conformance-simulator-reports \
+  --storage file \
+  --strict-oracle
 ```
 
 The normal `cargo test -p cgka-conformance-simulator` run already validates the top-level vector fixtures and checks the
-vector manifest / byte-fixture files. Use the report command when you want saved JSON reports and a human-readable
+vector manifest / byte-fixture files through the default in-memory backend. CI additionally runs every portable vector
+through encrypted file-backed storage. Use the report command when you want saved JSON reports and a human-readable
 pass/fail summary outside the test harness.
 
 The report command exits non-zero when any fixture expectation fails. Each report includes the exact scenario input,
-observed trace, flattened recovery and epoch observations, and the mismatched expected/actual JSON.
+selected storage backend, observed trace, flattened recovery and epoch observations, and the mismatched expected/actual
+JSON.
 
 ## Property tests
 
@@ -268,6 +274,10 @@ Reports are written as one file per case, for example
 candidates such as `target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.
 Pass `--strict-oracle` when a report run should fail on oracle coverage problems (`weak_oracle_warnings` or
 `missing_observed_behaviors`) instead of treating them as advisory metadata.
+
+File-backed restart tests and the engine subprocess-kill tests cover durability when the encrypted database and WAL are
+intact: handles are closed or the process is killed, the database is reopened, and hydration reconciles interrupted
+convergence state. Recovery when required local records are genuinely missing or corrupted remains future work.
 
 ## When to use the harness vs. integration tests
 

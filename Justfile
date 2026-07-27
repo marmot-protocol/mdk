@@ -1,7 +1,7 @@
 set shell := ["bash", "-cu"]
 
 otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,wn-cli/otlp-export"
-test-features := "wn-cli/test-policy-overrides"
+test-features := "wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks"
 
 default:
     @just --list

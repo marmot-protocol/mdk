@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioStimulus, parse_report_command,
-    property_test_coverage_entries, run_report,
+    HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioStimulus,
+    parse_report_command, property_test_coverage_entries, run_report,
 };
 
 #[test]
@@ -19,6 +19,7 @@ fn parse_defaults_to_send_leave_family() {
             },
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: false,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
 }
@@ -47,8 +48,19 @@ fn parse_custom_report_args() {
             },
             out: PathBuf::from("target/custom"),
             strict_oracle: false,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
+}
+
+#[test]
+fn explicit_storage_flag_overrides_environment_default() {
+    let command =
+        parse_report_command(["--storage".into(), "file".into()]).expect("storage mode args parse");
+    let ReportCommand::Run(args) = command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.storage_mode, HarnessStorageMode::TempFileBackedSqlite);
 }
 
 #[test]
@@ -69,6 +81,7 @@ fn parse_vector_fixture_report_args() {
             },
             out: PathBuf::from("target/vector-reports"),
             strict_oracle: false,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
 }
@@ -92,6 +105,7 @@ fn parse_strict_oracle_report_args() {
             },
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: true,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
 }
@@ -167,6 +181,7 @@ async fn report_runner_writes_send_leave_json_reports() {
         },
         out: out_dir.clone(),
         strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
     })
     .await
     .expect("runner writes reports");
@@ -187,6 +202,7 @@ async fn report_runner_writes_send_leave_json_reports() {
     );
     assert_eq!(report["metadata"]["generated"]["seed"], 42);
     assert_eq!(report["metadata"]["generated"]["case_index"], 0);
+    assert_eq!(report["metadata"]["storage_backend"], "in-memory-sqlite");
     assert!(
         report["observed_trace"]["observations"]
             .as_array()
@@ -214,6 +230,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
         },
         out: out_dir.clone(),
         strict_oracle: true,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
     })
     .await
     .expect("strict runner writes reports");
@@ -248,6 +265,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         },
         out: out_dir.clone(),
         strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
     })
     .await
     .expect("runner writes convergence delivery reports");
@@ -299,6 +317,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
         },
         out: out_dir.clone(),
         strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
     })
     .await
     .expect("runner writes convergence chaos reports");
@@ -389,6 +408,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
         },
         out: out_dir.clone(),
         strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
     })
     .await
     .expect("runner writes vector reports");

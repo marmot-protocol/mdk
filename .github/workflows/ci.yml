@@ -169,7 +169,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
 
       - name: Run doctests
         if: matrix.partition == 1
@@ -313,12 +313,15 @@ jobs:
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
-      - name: Run vector report
+      - name: Run encrypted file-backed vector report
         run: |
           cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
             --vectors crates/cgka-conformance-simulator/vectors \
             --out target/cgka-conformance-simulator-reports \
+            --storage file \
             --strict-oracle
+          jq -s -e 'all(.[]; .metadata.storage_backend == "encrypted-file-sqlite")' \
+            target/cgka-conformance-simulator-reports/*-report.json >/dev/null
 
       - name: Upload vector report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

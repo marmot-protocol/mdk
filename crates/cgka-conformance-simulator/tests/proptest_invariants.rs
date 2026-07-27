@@ -989,7 +989,7 @@ fn capability_negotiation_matches_matrix(case: CapabilityNegotiationCase) {
         alice.confirm(pending).await;
 
         let status = alice
-            .engine
+            .engine_mut()
             .feature_status(&group_id, &PROP_FEATURE)
             .unwrap_or_else(|err| panic!("feature_status should resolve for {case:?}: {err:?}"));
         match (feature_is_required, all_members_support, status) {
@@ -1070,12 +1070,13 @@ async fn drive_intents(
                     continue;
                 }
                 let gid = group_ids[idx].clone();
+                let sender = clients[idx].member_id();
                 let res = clients[idx]
-                    .engine
+                    .engine_mut()
                     .send(cgka_traits::engine::SendIntent::AppMessage {
                         group_id: gid.clone(),
                         payload: cgka_conformance_simulator::client::encode_harness_app_payload(
-                            &clients[idx].member_id(),
+                            &sender,
                             app_event_seq,
                             payload.clone(),
                         ),
@@ -1098,7 +1099,7 @@ async fn drive_intents(
                 }
                 let gid = group_ids[idx].clone();
                 let res = clients[idx]
-                    .engine
+                    .engine_mut()
                     .send(cgka_traits::engine::SendIntent::Leave {
                         group_id: gid.clone(),
                     })
@@ -1276,7 +1277,7 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         let mut clients = setup_group_with_admins(3, &bus, &initial_admin_indices).await;
         let group_id = clients[0].group_id();
         let res = clients[committer_idx]
-            .engine
+            .engine_mut()
             .send(SendIntent::UpdateGroupData {
                 group_id: group_id.clone(),
                 name: Some(name.clone()),
@@ -1291,7 +1292,7 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         clients[committer_idx].confirm(pending).await;
         let commit = reroute(commit, &group_id);
         clients[2]
-            .engine
+            .engine_mut()
             .ingest(commit)
             .await
             .expect("observer buffers stored convergence input");
