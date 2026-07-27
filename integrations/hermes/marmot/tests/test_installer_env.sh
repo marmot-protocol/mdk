@@ -298,10 +298,20 @@ guided_log="$case_root/guided.log"
 if command -v script >/dev/null 2>&1 \
     && command -v timeout >/dev/null 2>&1 \
     && script --version 2>&1 | grep -qi 'util-linux'; then
-    printf '\n\n\nn\n' | timeout 10s script -qefc \
+    guided_status=0
+    printf '\n\n\nn\nn\n%s\n\n' "$user_a" | timeout 10s script -qefc \
         "env -i HOME='$case_root/home' HERMES_HOME='$case_root/hermes-home' PATH=/usr/bin:/bin WN_AGENT_SHA=9.9.9 MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test bash '$installer' --dry-run --hermes-home '$case_root/hermes-home' --allow-welcomer '$user_a'" \
-        /dev/null >"$guided_log" 2>&1 || true
-    grep -Fq "Allow Marmot messages from any sender?" "$guided_log"
+        /dev/null >"$guided_log" 2>&1 || guided_status=$?
+    if [ "$guided_status" -ne 0 ]; then
+        echo "guided prompt integration failed with status $guided_status; captured log:" >&2
+        cat "$guided_log" >&2
+        exit 1
+    fi
+    if ! grep -Fq "Allow Marmot messages from any sender?" "$guided_log"; then
+        echo "guided prompt output missing; captured log:" >&2
+        cat "$guided_log" >&2
+        exit 1
+    fi
 else
     echo "skip: guided prompt integration (util-linux script(1) and timeout required)"
 fi

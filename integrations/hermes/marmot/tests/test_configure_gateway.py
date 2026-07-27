@@ -476,7 +476,10 @@ class ConfigureHermesEnvTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
             with self.assertRaises(ValueError):
-                self.module.validate_sender_auth_entries(["   "])
+                self.module.configure_hermes_env(
+                    hermes_home=home,
+                    add_allowed_users=["   "],
+                )
             self.assertFalse((home / ".env").exists())
 
     def test_requires_explicit_auth_for_fresh_target(self):
@@ -711,6 +714,10 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
             config_original = "model: gpt-4o\n"
             env_path.write_text(env_original, encoding="utf-8")
             config_path.write_text(config_original, encoding="utf-8")
+            env_path.chmod(0o640)
+            config_path.chmod(0o644)
+            env_mode_original = env_path.stat().st_mode & 0o777
+            config_mode_original = config_path.stat().st_mode & 0o777
             real_replace = os.replace
             replace_calls = {"count": 0}
 
@@ -735,6 +742,8 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
             self.assertEqual(replace_calls["count"], 3)
             self.assertEqual(env_path.read_text(encoding="utf-8"), env_original)
             self.assertEqual(config_path.read_text(encoding="utf-8"), config_original)
+            self.assertEqual(env_path.stat().st_mode & 0o777, env_mode_original)
+            self.assertEqual(config_path.stat().st_mode & 0o777, config_mode_original)
             self.assertFalse(
                 config_path.with_suffix(config_path.suffix + ".tmp").exists()
             )
@@ -889,42 +898,43 @@ class ConfigureGatewayCliTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("unrecognized arguments", completed.stderr)
 
-    def test_empty_allow_users_loops_are_guarded_for_bash_3_2(self):
-        source = INSTALL_SCRIPT.read_text(encoding="utf-8")
-        loop = 'for user in "${ALLOW_USERS[@]}"; do'
-        offsets = []
-        start = 0
-        while True:
-            offset = source.find(loop, start)
-            if offset == -1:
-                break
-            offsets.append(offset)
-            start = offset + len(loop)
-
-        self.assertGreater(len(offsets), 0)
-        for offset in offsets:
-            function_start = source.rfind("\n}", 0, offset) + 2
-            prefix = source[function_start:offset]
-            guarded = (
-                'if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then' in prefix
-                or (
-                    'if [ "${#ALLOW_USERS[@]}" -eq 0 ]; then' in prefix
-                    and "return" in prefix
-                )
-            )
-            self.assertTrue(
-                guarded,
-                f"unguarded Bash 3.2 empty-array expansion near byte {offset}",
-            )
-
-        strict_start = source.index("strict_validate_sender_auth_preflight()")
-        strict_end = source.index("\n}\n", strict_start)
-        strict_body = source[strict_start:strict_end]
-        self.assertIn(
-            '"${args[@]+"${args[@]}"}"',
-            strict_body,
-            "empty preflight args must use the Bash 3.2-compatible expansion",
-        )
+    def test_installer_empty_allow_users_paths_run_under_nounset(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            cases = [
+                ("allow-all", ["--allow-all-users"]),
+                ("existing-auth", []),
+            ]
+            for name, extra_args in cases:
+                with self.subTest(name=name):
+                    home = root / name
+                    home.mkdir()
+                    if name == "existing-auth":
+                        (home / ".env").write_text(
+                            f"MARMOT_ALLOWED_USERS={USER_A}\n"
+                            "MARMOT_ALLOW_ALL_USERS=false\n",
+                            encoding="utf-8",
+                        )
+                    completed = subprocess.run(
+                        [
+                            "bash",
+                            str(INSTALL_SCRIPT),
+                            "--dry-run",
+                            "--yes",
+                            "--hermes-home",
+                            str(home),
+                            *extra_args,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        env=scrub_marmot_env(),
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+                    )
+                    self.assertNotIn("unbound variable", completed.stderr)
 
     def test_installer_dry_run_accepts_allow_user(self):
         with tempfile.TemporaryDirectory() as tempdir:

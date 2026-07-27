@@ -331,13 +331,17 @@ def configure_hermes_env(
     return env_state
 
 
-def _restore_path_bytes(path: Path, backup: bytes | None) -> None:
+def _restore_path_bytes(
+    path: Path,
+    backup: bytes | None,
+    backup_mode: int | None,
+) -> None:
     if backup is None:
         if path.exists():
             path.unlink()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    current_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    restore_mode = backup_mode if backup_mode is not None else 0o600
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.rollback.",
         suffix=".tmp",
@@ -346,7 +350,7 @@ def _restore_path_bytes(path: Path, backup: bytes | None) -> None:
     tmp_path = Path(tmp_name)
     owns_fd = True
     try:
-        os.chmod(tmp_path, current_mode)
+        os.chmod(tmp_path, restore_mode)
         with os.fdopen(fd, "wb") as handle:
             owns_fd = False
             handle.write(backup)
@@ -360,6 +364,16 @@ def _restore_path_bytes(path: Path, backup: bytes | None) -> None:
         raise
 
 
+def _read_path_backup(path: Path | None) -> tuple[bytes | None, int | None]:
+    if path is None:
+        return None, None
+    try:
+        with path.open("rb") as handle:
+            return handle.read(), stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+    except FileNotFoundError:
+        return None, None
+
+
 def commit_env_and_config_transaction(
     *,
     env_path: Path | None,
@@ -368,10 +382,8 @@ def commit_env_and_config_transaction(
     config_text: str | None,
     config_backup: bool = True,
 ) -> None:
-    env_backup = env_path.read_bytes() if env_path is not None and env_path.exists() else None
-    config_backup_bytes = (
-        config_path.read_bytes() if config_path is not None and config_path.exists() else None
-    )
+    env_backup, env_backup_mode = _read_path_backup(env_path)
+    config_backup_bytes, config_backup_mode = _read_path_backup(config_path)
 
     wrote_env = False
     wrote_config = False
@@ -391,9 +403,9 @@ def commit_env_and_config_transaction(
             wrote_config = True
     except Exception:
         if wrote_env and env_path is not None:
-            _restore_path_bytes(env_path, env_backup)
+            _restore_path_bytes(env_path, env_backup, env_backup_mode)
         if wrote_config and config_path is not None:
-            _restore_path_bytes(config_path, config_backup_bytes)
+            _restore_path_bytes(config_path, config_backup_bytes, config_backup_mode)
         for cleanup_path in (config_tmp_path, config_backup_path):
             if cleanup_path is None:
                 continue
@@ -882,22 +894,14 @@ def main(argv: list[str] | None = None) -> int:
             profile_name_onboarding=profile_name_onboarding,
             configure_global_streaming=args.configure_global_streaming,
         )
-        if env_prepared is not None:
-            commit_env_and_config_transaction(
-                env_path=env_prepared[0],
-                env_lines=env_prepared[1],
-                config_path=config_path,
-                config_text=config_text,
-                config_backup=not args.no_backup,
-            )
-        else:
-            commit_env_and_config_transaction(
-                env_path=None,
-                env_lines=None,
-                config_path=config_path,
-                config_text=config_text,
-                config_backup=not args.no_backup,
-            )
+        env_path, env_lines = env_prepared if env_prepared is not None else (None, None)
+        commit_env_and_config_transaction(
+            env_path=env_path,
+            env_lines=env_lines,
+            config_path=config_path,
+            config_text=config_text,
+            config_backup=not args.no_backup,
+        )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
