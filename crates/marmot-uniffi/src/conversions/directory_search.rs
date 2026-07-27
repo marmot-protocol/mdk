@@ -98,6 +98,12 @@ pub enum SearchUpdateTriggerFfi {
     RadiusTimeout {
         radius: u8,
     },
+    /// Expanding this radius hit the per-radius candidate cap, so deeper
+    /// results are incomplete. Like a timeout, this is partial rather than
+    /// failed: everything already delivered is still correct.
+    RadiusTruncated {
+        radius: u8,
+    },
     /// Terminal: no further updates follow.
     SearchCompleted,
     /// Traversal failed. Always followed by [`Self::SearchCompleted`].
@@ -113,6 +119,7 @@ impl From<SearchUpdateTrigger> for SearchUpdateTriggerFfi {
             SearchUpdateTrigger::ResultsFound { radius } => Self::ResultsFound { radius },
             SearchUpdateTrigger::RadiusCompleted { radius } => Self::RadiusCompleted { radius },
             SearchUpdateTrigger::RadiusTimeout { radius } => Self::RadiusTimeout { radius },
+            SearchUpdateTrigger::RadiusTruncated { radius } => Self::RadiusTruncated { radius },
             SearchUpdateTrigger::SearchCompleted => Self::SearchCompleted,
             SearchUpdateTrigger::Error { message } => Self::Error { message },
         }

@@ -920,7 +920,7 @@ pub(crate) enum UsersCommand {
             long,
             default_value = "0..1",
             value_parser = parse_radius,
-            help = "Follow-graph radius as START..END (0 is you, 1 is who you follow)"
+            help = "Follow-graph radius as START..END (0 is you, 1 who you follow, 2 follows-of-follows)"
         )]
         radius: (u8, u8),
     },

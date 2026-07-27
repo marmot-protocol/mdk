@@ -25,22 +25,37 @@ use tokio::time::timeout;
 
 use super::cache::{DirectoryCache, DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
 use super::records::{
-    UserDirectoryRecord, UserDirectorySearchResult, profile_from_record, user_record_match,
+    UserDirectoryRecord, UserDirectorySearchResult, latest_follow_list_from_records,
+    profile_from_record, user_record_match,
 };
 use crate::error::AppError;
-use crate::ids::parse_account_id_hex;
+use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
+use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 use crate::runtime::blocking_app_task;
-use crate::{KIND_NOSTR_METADATA, MarmotApp};
+use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp};
 
 /// Deepest radius the traversal producer currently answers.
 ///
-/// Radius 0 is the searcher and radius 1 their direct follows, which needs a
-/// single author-scoped follow-list fetch. Reaching radius 2 means fetching a
-/// follow list for every account at radius 1, which only stays inside the
-/// bounded-traversal invariant once the per-radius candidate cap and bounded
-/// fetch concurrency land alongside it. Until then a deeper request is
-/// rejected rather than silently answered with a shallower search.
-const MAX_SUPPORTED_SEARCH_RADIUS: u8 = 1;
+/// Radius 0 is the searcher, 1 their direct follows, 2 follows-of-follows.
+///
+/// Each layer beyond the first is bounded on both axes the traversal can grow
+/// along: [`SEARCH_MAX_CANDIDATES_PER_RADIUS`] caps how many accounts a layer
+/// may contribute, and contact lists are read from the device first and
+/// otherwise fetched `SEARCH_PUBKEY_BATCH_SIZE` authors at a time, so relay
+/// work grows with batches rather than with accounts. Radius 3 is rejected
+/// rather than silently answered shallow: it needs the outbox-model tiers
+/// (NIP-65 relay lists, per-user write relays) to resolve profiles that far
+/// out with acceptable recall.
+const MAX_SUPPORTED_SEARCH_RADIUS: u8 = 2;
+
+/// Ceiling on the candidates one radius may contribute to the next layer.
+///
+/// Follows-of-follows multiplies: a frontier of a few hundred accounts each
+/// following a few hundred more reaches six figures. The cap keeps one search
+/// bounded by construction; hitting it emits
+/// [`SearchUpdateTrigger::RadiusTruncated`] so a short list is never passed
+/// off as a complete one.
+const SEARCH_MAX_CANDIDATES_PER_RADIUS: usize = 25_000;
 
 /// Updates buffered before the producer waits on a slow consumer.
 ///
@@ -97,6 +112,10 @@ pub enum SearchUpdateTrigger {
     RadiusCompleted { radius: u8 },
     /// This radius ran out of time; traversal stops here.
     RadiusTimeout { radius: u8 },
+    /// Expanding this radius hit the per-radius candidate cap, so the layer
+    /// beyond it is a prefix and deeper results are incomplete. Matches
+    /// already delivered stay valid.
+    RadiusTruncated { radius: u8 },
     /// Terminal: no further updates follow.
     SearchCompleted,
     /// Traversal failed. Always followed by [`Self::SearchCompleted`].
@@ -240,7 +259,13 @@ async fn advance_radius(
     if radius == params.radius_end {
         return Ok(Vec::new());
     }
-    next_frontier(app, frontier, seen).await
+    let layer = next_frontier(app, frontier, seen).await?;
+    if layer.truncated {
+        emitter
+            .emit(SearchUpdateTrigger::RadiusTruncated { radius })
+            .await;
+    }
+    Ok(layer.candidates)
 }
 
 /// Resolve one layer's profiles and emit its matches.
@@ -406,19 +431,150 @@ async fn next_frontier(
     app: &MarmotApp,
     frontier: &[String],
     seen: &mut HashSet<String>,
-) -> Result<Vec<String>, AppError> {
-    let mut next = Vec::new();
-    for account_id_hex in frontier {
-        let follow_list = app
-            .fetch_follow_list_for_account_id(account_id_hex, &[])
-            .await?;
-        for follow in follow_list.follows {
-            if seen.insert(follow.clone()) {
-                next.push(follow);
+) -> Result<NextLayer, AppError> {
+    let (cached, unknown) = partition_cached_follows(app, frontier).await?;
+    let mut layer = NextLayer::default();
+
+    // Pass 1: contact lists already on the device. No relay round trip, so the
+    // next layer starts forming immediately.
+    for follows in cached {
+        if !layer.admit(follows, seen) {
+            return Ok(layer);
+        }
+    }
+
+    // Pass 2: everyone whose contact list has never been seen, one batched
+    // author-scoped fetch per `SEARCH_PUBKEY_BATCH_SIZE` rather than a round
+    // trip each. What comes back is cached, so the next search skips this pass.
+    for batch in unknown.chunks(SEARCH_PUBKEY_BATCH_SIZE) {
+        let fetched = fetch_follow_lists(app, batch).await?;
+        cache_resolved_follows(app, &fetched).await?;
+        for (_, follows) in fetched {
+            if !layer.admit(follows, seen) {
+                return Ok(layer);
             }
         }
     }
-    Ok(next)
+    Ok(layer)
+}
+
+/// The candidates one radius contributes to the next, and whether the
+/// per-radius cap cut them short.
+#[derive(Default)]
+struct NextLayer {
+    candidates: Vec<String>,
+    /// The cap was reached, so this layer is a prefix of the real one and
+    /// everything beyond it is incomplete. Reported rather than swallowed: a
+    /// caller shown a short list should know it is short.
+    truncated: bool,
+}
+
+impl NextLayer {
+    /// Take `follows` into the layer, skipping anyone already visited. Returns
+    /// `false` once the cap is reached and nothing further can be admitted.
+    fn admit(&mut self, follows: Vec<String>, seen: &mut HashSet<String>) -> bool {
+        for follow in follows {
+            if self.candidates.len() >= SEARCH_MAX_CANDIDATES_PER_RADIUS {
+                self.truncated = true;
+                return false;
+            }
+            if seen.insert(follow.clone()) {
+                self.candidates.push(follow);
+            }
+        }
+        true
+    }
+}
+
+/// Split a layer into the contact lists already cached and the accounts whose
+/// contact list has never been observed.
+async fn partition_cached_follows(
+    app: &MarmotApp,
+    frontier: &[String],
+) -> Result<(Vec<Vec<String>>, Vec<String>), AppError> {
+    let app = app.clone();
+    let frontier = frontier.to_vec();
+    blocking_app_task(move || {
+        let caches = app.directory_caches()?;
+        let mut cached = Vec::new();
+        let mut unknown = Vec::new();
+        for account_id_hex in frontier {
+            let mut follows = None;
+            for cache in &caches {
+                if let Some(known) = cache.search_graph_follows(&account_id_hex)? {
+                    follows = Some(known);
+                    break;
+                }
+            }
+            match follows {
+                Some(follows) => cached.push(follows),
+                None => unknown.push(account_id_hex),
+            }
+        }
+        Ok((cached, unknown))
+    })
+    .await
+}
+
+/// Fetch one batch of contact lists in a single author-scoped request and pick
+/// each author's latest list.
+///
+/// Only authors a contact list actually came back for are returned. An author
+/// the relays said nothing about is omitted rather than reported as following
+/// nobody: the two are indistinguishable here, and recording the guess would
+/// make a relay hiccup a permanent dead end in the graph. A list that came back
+/// carrying no `p` tags *is* an authoritative "follows nobody" and is kept.
+async fn fetch_follow_lists(
+    app: &MarmotApp,
+    batch: &[String],
+) -> Result<Vec<(String, Vec<String>)>, AppError> {
+    let records = app
+        .fetch_events_for_account_ids(batch, KIND_NOSTR_CONTACT_LIST, &[])
+        .await?;
+    let mut by_author: HashMap<String, Vec<RelayEventRecord>> = HashMap::new();
+    for record in records {
+        by_author
+            .entry(record.event.pubkey.clone())
+            .or_default()
+            .push(record);
+    }
+    let freshness = app.directory_freshness();
+    Ok(batch
+        .iter()
+        .filter_map(|account_id_hex| {
+            let records = by_author.remove(account_id_hex)?;
+            let follows = latest_follow_list_from_records(account_id_hex, records, freshness)
+                .value?
+                .follows;
+            Some((account_id_hex.clone(), follows))
+        })
+        .collect())
+}
+
+/// Keep the contact lists this layer fetched, so the next search expands from
+/// the device instead of the network.
+///
+/// Un-promoted, exactly like [`cache_resolved_profiles`]: recording that
+/// somebody follows somebody is graph data, not a relationship of the user's.
+async fn cache_resolved_follows(
+    app: &MarmotApp,
+    fetched: &[(String, Vec<String>)],
+) -> Result<(), AppError> {
+    let fetched = fetched.to_vec();
+    let app = app.clone();
+    blocking_app_task(move || {
+        for cache in app.directory_caches()? {
+            for (account_id_hex, follows) in &fetched {
+                cache.remember_search_graph_follows(
+                    account_id_hex,
+                    &npub_for_account_id_lossy(account_id_hex),
+                    follows,
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Sends updates to the subscription and keeps the running result total.
@@ -792,6 +948,137 @@ mod tests {
             cache.entry(&stranger.account_id_hex).unwrap().is_none(),
             "caching a search result must not promote them into directory_users"
         );
+    }
+
+    /// Radius 2 is follows-of-follows. Both hops here are already on the
+    /// device, so the whole traversal must complete against an unreachable
+    /// relay -- that is what "Pass 1 reads cached follows" buys, and it is the
+    /// only reason a second radius is affordable.
+    #[tokio::test]
+    async fn radius_two_expands_through_cached_follow_edges_without_a_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let friend = format!("{:064x}", 61);
+        let stranger = format!("{:064x}", 62);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        // alice -> friend (promoted, her own contact list)
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![friend.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+        // friend -> stranger, cached un-promoted by an earlier traversal.
+        cache
+            .remember_search_graph_follows(
+                &friend,
+                &npub_for_account_id_lossy(&friend),
+                std::slice::from_ref(&stranger),
+            )
+            .unwrap();
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: stranger.clone(),
+                    npub: npub_for_account_id_lossy(&stranger),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (2, 2)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == stranger)
+            .expect("a follow-of-a-follow must be reachable at radius 2");
+        assert_eq!(matched.radius, 2);
+    }
+
+    /// An account whose contact list the relays never returned must stay
+    /// *unknown*, not be recorded as following nobody. Recording the guess
+    /// turns a relay hiccup into a permanent dead end, because cached follow
+    /// edges do not expire.
+    #[tokio::test]
+    async fn an_unanswered_contact_list_is_not_cached_as_following_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let friend = format!("{:064x}", 71);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![friend.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+
+        // Radius 2 makes the traversal ask for the friend's contact list. The
+        // relay is unreachable, so nothing comes back for them.
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (2, 2)))
+            .await
+            .unwrap();
+        drain(subscription).await;
+
+        assert_eq!(
+            cache.search_graph_follows(&friend).unwrap(),
+            None,
+            "an unanswered contact list must stay re-fetchable"
+        );
+    }
+
+    /// A layer that overflows the candidate cap is a prefix of the real one.
+    /// The traversal must say so rather than let a short result list pass for a
+    /// complete one.
+    #[test]
+    fn an_overflowing_layer_is_reported_as_truncated() {
+        let mut seen = HashSet::new();
+        let mut layer = NextLayer::default();
+
+        let admitted = layer.admit(
+            (0..SEARCH_MAX_CANDIDATES_PER_RADIUS + 1)
+                .map(|index| format!("{index:064x}"))
+                .collect(),
+            &mut seen,
+        );
+
+        assert!(!admitted, "the cap must stop admitting candidates");
+        assert!(layer.truncated);
+        assert_eq!(layer.candidates.len(), SEARCH_MAX_CANDIDATES_PER_RADIUS);
+    }
+
+    /// Already-visited accounts are skipped rather than counted, so revisiting
+    /// a dense graph cannot exhaust the cap on duplicates alone.
+    #[test]
+    fn a_layer_admits_each_account_once() {
+        let mut seen = HashSet::new();
+        let mut layer = NextLayer::default();
+        let repeated = format!("{:064x}", 9);
+
+        assert!(layer.admit(vec![repeated.clone(), repeated.clone()], &mut seen));
+        assert!(layer.admit(vec![repeated], &mut seen));
+
+        assert_eq!(layer.candidates.len(), 1);
+        assert!(!layer.truncated);
     }
 
     #[tokio::test]

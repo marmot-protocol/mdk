@@ -311,6 +311,32 @@ impl DirectoryCache {
         )
     }
 
+    /// Follow edges recorded for `account_id_hex` in the un-promoted search
+    /// graph.
+    ///
+    /// `None` means no contact list has been observed for them yet, which is
+    /// different from `Some(vec![])` -- an observed list that follows nobody.
+    /// Traversal needs the distinction: the first is a candidate to fetch, the
+    /// second is a settled dead end.
+    pub(crate) fn search_graph_follows(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let conn = self.lock();
+        let known = conn
+            .query_row(
+                "SELECT follows_known FROM directory_search_graph_users WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|known| known != 0);
+        if !known {
+            return Ok(None);
+        }
+        Self::follow_rows(&conn, "directory_search_graph_follows", account_id_hex).map(Some)
+    }
+
     /// Record one account in the un-promoted search graph.
     ///
     /// The counterpart to [`Self::remember_search_graph_follows`] for profile
@@ -944,6 +970,44 @@ mod tests {
         // Follow edges carry their own freshness and are not collateral of a
         // profile expiring -- dropping them would silently shrink the graph.
         assert_eq!(stale.follows, vec![dave]);
+    }
+
+    /// Traversal must tell "we have never seen this account's contact list"
+    /// from "we have, and they follow nobody". Collapsing the two either
+    /// re-fetches a known-empty list on every search, or treats a never-fetched
+    /// account as a dead end and silently truncates the graph.
+    #[test]
+    fn search_graph_follows_separate_unknown_from_known_empty() {
+        let (_dir, cache) = test_cache();
+        let never_seen = account_id(1);
+        let follows_nobody = account_id(2);
+        let follows_someone = account_id(3);
+        let friend = account_id(4);
+
+        cache
+            .remember_search_graph_follows(
+                &follows_nobody,
+                &npub_for_account_id_lossy(&follows_nobody),
+                &[],
+            )
+            .unwrap();
+        cache
+            .remember_search_graph_follows(
+                &follows_someone,
+                &npub_for_account_id_lossy(&follows_someone),
+                std::slice::from_ref(&friend),
+            )
+            .unwrap();
+
+        assert_eq!(cache.search_graph_follows(&never_seen).unwrap(), None);
+        assert_eq!(
+            cache.search_graph_follows(&follows_nobody).unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            cache.search_graph_follows(&follows_someone).unwrap(),
+            Some(vec![friend])
+        );
     }
 
     #[test]

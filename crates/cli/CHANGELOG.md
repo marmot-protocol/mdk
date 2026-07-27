@@ -52,6 +52,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `users search --radius` now reaches radius 2 (follows-of-follows). The
+  default stays `0..1`: radius 2 reads a contact list for every account you
+  follow, so it is opt-in rather than a silent slowdown on every search. Each
+  layer is bounded — at most 25,000 candidates, contact lists read from the
+  device first and otherwise fetched in batches — and a layer that hits the cap
+  reports a new `radius_truncated` update rather than passing a short result
+  list off as complete.
 - MarmotKit now exposes streaming web-of-trust user search: `search_users`
   returns a `UserSearchSubscription` whose `next_update` yields matches as each
   social-distance radius resolves, ending with a `SearchCompleted` trigger and
