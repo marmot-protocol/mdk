@@ -3265,7 +3265,7 @@ impl AccountManager {
             // Unlike local runtime reads, this API reports relay visibility.
             // Wait for the managed worker's initial activation, catch-up, and
             // open maintenance before issuing the directory query.
-            self.wait_for_account_network_startup_to_settle(&account.account_id_hex)
+            self.wait_for_account_network_startup_to_settle(&account.label)
                 .await?;
         }
         let owned = cgka_engine::key_package::durably_owned_key_packages(
