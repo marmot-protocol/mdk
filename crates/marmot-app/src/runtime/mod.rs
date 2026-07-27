@@ -1089,6 +1089,23 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Accounts the searcher currently shares a group with.
+    ///
+    /// Feeds [`UserSearchParams::radius_one_seeds`]: sharing a group is social
+    /// proximity even when neither person has followed the other. It lives here
+    /// rather than in the directory because membership is live MLS state held
+    /// by the per-account worker, so reading it needs a running runtime —
+    /// keeping it out of `MarmotApp::search_users` is what lets search stay a
+    /// pure function of its parameters.
+    ///
+    /// Only groups the local account is still a member of contribute, so a
+    /// group left, declined, or not yet accepted brings nobody. Archived
+    /// groups do contribute: archival is a presentation choice, not a change
+    /// in who you know.
+    pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        self.accounts.group_co_members(account_ref).await
+    }
+
     pub async fn group_members(
         &self,
         account_ref: &str,
@@ -4179,3 +4196,15 @@ fn merge_user_profile_update(
 
 #[cfg(test)]
 mod tests;
+
+/// Whether a group's membership counts as social proximity for user search.
+///
+/// A group only speaks for who you know while you are actually in it: an
+/// invite you have not accepted is not a relationship yet, and one you left or
+/// were removed from has stopped being one. A group the engine froze cannot
+/// answer for its membership at all.
+fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
+    !group.pending_confirmation
+        && !group.unrecoverable
+        && matches!(group.self_membership, crate::SelfMembership::Member)
+}

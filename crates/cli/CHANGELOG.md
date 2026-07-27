@@ -52,6 +52,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- MarmotKit user search now treats people you share a group with as radius 1,
+  alongside the accounts you follow: sharing a group is social proximity even
+  when neither of you has followed the other. Only groups you are currently a
+  member of contribute — an invite you have not accepted, a group you left or
+  were removed from, and a group the engine froze all bring nobody. Archived
+  groups do contribute, since archival is a presentation choice rather than a
+  change in who you know. No host API change. `wn users search` is unaffected:
+  it runs without an app runtime and so has no live MLS session to read
+  membership from.
 - `users search --json` now reports whether the traversal actually finished:
   `complete` is `false` and `incomplete_reason` names the cause
   (`radius_timeout` or `radius_truncated`) when a radius ran out of time or a

@@ -78,6 +78,18 @@ pub struct UserSearchParams {
     pub radius_start: u8,
     /// Last radius whose matches are emitted, inclusive.
     pub radius_end: u8,
+    /// Accounts to treat as radius 1 alongside the searcher's own follows.
+    ///
+    /// The follow graph is not the only evidence that two people know each
+    /// other: sharing a group is social proximity even when neither has
+    /// followed the other. That membership is live MLS state owned by the
+    /// account runtime, not by the directory, so it arrives here as an input
+    /// rather than search reaching across the boundary to read it. Callers
+    /// without a running runtime simply pass none.
+    ///
+    /// The searcher is radius 0; naming them here does not move them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub radius_one_seeds: Vec<String>,
 }
 
 impl UserSearchParams {
@@ -259,7 +271,16 @@ async fn advance_radius(
     if radius == params.radius_end {
         return Ok(Vec::new());
     }
-    let layer = next_frontier(app, frontier, seen).await?;
+
+    let mut layer = NextLayer::default();
+    // Seeded accounts are radius 1 alongside the searcher's own follows, and
+    // are admitted first: sharing a group is at least as strong a signal of
+    // closeness as a follow, so a long follow list must not crowd them out of
+    // the per-radius cap.
+    if radius == 0 {
+        layer.admit(params.radius_one_seeds.clone(), seen);
+    }
+    extend_with_follows(app, frontier, seen, &mut layer).await?;
     if layer.truncated {
         emitter
             .emit(SearchUpdateTrigger::RadiusTruncated { radius })
@@ -425,21 +446,21 @@ async fn fetch_profile_records(
         .collect())
 }
 
-/// Collect the follow lists of the current layer into the next one, skipping
+/// Add the follow lists of the current layer into the next one, skipping
 /// anybody already visited.
-async fn next_frontier(
+async fn extend_with_follows(
     app: &MarmotApp,
     frontier: &[String],
     seen: &mut HashSet<String>,
-) -> Result<NextLayer, AppError> {
+    layer: &mut NextLayer,
+) -> Result<(), AppError> {
     let (cached, unknown) = partition_cached_follows(app, frontier).await?;
-    let mut layer = NextLayer::default();
 
     // Pass 1: contact lists already on the device. No relay round trip, so the
     // next layer starts forming immediately.
     for follows in cached {
         if !layer.admit(follows, seen) {
-            return Ok(layer);
+            return Ok(());
         }
     }
 
@@ -451,11 +472,11 @@ async fn next_frontier(
         cache_resolved_follows(app, &fetched).await?;
         for (_, follows) in fetched {
             if !layer.admit(follows, seen) {
-                return Ok(layer);
+                return Ok(());
             }
         }
     }
-    Ok(layer)
+    Ok(())
 }
 
 /// The candidates one radius contributes to the next, and whether the
@@ -695,6 +716,7 @@ mod tests {
             query: query.to_owned(),
             radius_start: radii.0,
             radius_end: radii.1,
+            radius_one_seeds: Vec::new(),
         }
     }
 
@@ -1079,6 +1101,85 @@ mod tests {
 
         assert_eq!(layer.candidates.len(), 1);
         assert!(!layer.truncated);
+    }
+
+    /// Someone you share a group with is socially close even if neither of you
+    /// has followed the other, so a caller can seed them into radius 1. The
+    /// seeded account here is in no follow list at all -- only the seed puts
+    /// them within reach.
+    #[tokio::test]
+    async fn a_seeded_account_is_searchable_at_radius_one_without_being_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let co_member = format!("{:064x}", 81);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: co_member.clone(),
+                    npub: npub_for_account_id_lossy(&co_member),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(UserSearchParams {
+                radius_one_seeds: vec![co_member.clone()],
+                ..params(&account.account_id_hex, "needle", (1, 1))
+            })
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == co_member)
+            .expect("a seeded account must be reachable at radius 1");
+        assert_eq!(matched.radius, 1);
+    }
+
+    /// The searcher is radius 0. A seed naming them must not re-report them a
+    /// layer out, and must not make the traversal revisit them.
+    #[tokio::test]
+    async fn seeding_the_searcher_does_not_duplicate_them_at_radius_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        cache
+            .put(&record_named(&account.account_id_hex, "needle"))
+            .unwrap();
+
+        let subscription = app
+            .search_users(UserSearchParams {
+                radius_one_seeds: vec![account.account_id_hex.clone()],
+                ..params(&account.account_id_hex, "needle", (0, 1))
+            })
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let radii: Vec<u8> = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .filter(|result| result.account_id_hex == account.account_id_hex)
+            .map(|result| result.radius)
+            .collect();
+        assert_eq!(radii, vec![0], "the searcher is radius 0 and only radius 0");
     }
 
     #[tokio::test]

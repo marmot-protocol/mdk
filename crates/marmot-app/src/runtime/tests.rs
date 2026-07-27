@@ -1423,3 +1423,66 @@ async fn broker_resolve_dev_opt_in_admits_loopback_only() {
         );
     }
 }
+
+/// A group speaks for who you know only while you are actually in it. Each
+/// state here excludes membership for a different reason, and getting any of
+/// them wrong leaks the wrong people into search: an unaccepted invite is not
+/// a relationship yet, a group you left has stopped being one, and a frozen
+/// group cannot answer for its membership at all.
+mod co_member_eligibility {
+    use super::*;
+    use crate::groups::{AppGroupAdminPolicyComponent, AppGroupMessageRetentionComponent};
+    use crate::{AppGroupImageInput, SelfMembership};
+
+    fn group() -> AppGroupRecord {
+        AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            crate::groups::AppGroupNostrRoutingComponent::new(cgka_traits::NostrRoutingV1 {
+                nostr_group_id: [2u8; 32],
+                relays: vec!["wss://relay.example".to_owned()],
+            })
+            .expect("routing component"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    #[test]
+    fn an_active_membership_contributes() {
+        assert!(group_contributes_co_members(&group()));
+    }
+
+    #[test]
+    fn an_archived_group_still_contributes() {
+        // Archival is a presentation choice, not a change in who you know.
+        let mut archived = group();
+        archived.archived = true;
+        assert!(group_contributes_co_members(&archived));
+    }
+
+    #[test]
+    fn an_unaccepted_invite_contributes_nobody() {
+        let mut pending = group();
+        pending.pending_confirmation = true;
+        assert!(!group_contributes_co_members(&pending));
+    }
+
+    #[test]
+    fn a_departed_group_contributes_nobody() {
+        for membership in [SelfMembership::Left, SelfMembership::Removed] {
+            let mut departed = group();
+            departed.self_membership = membership;
+            assert!(!group_contributes_co_members(&departed));
+        }
+    }
+
+    #[test]
+    fn a_frozen_group_contributes_nobody() {
+        let mut frozen = group();
+        frozen.unrecoverable = true;
+        assert!(!group_contributes_co_members(&frozen));
+    }
+}

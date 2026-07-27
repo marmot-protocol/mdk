@@ -102,6 +102,12 @@ impl Marmot {
     /// `None`. Dropping the subscription cancels the traversal, so a host that
     /// abandons a search should release it rather than draining it.
     ///
+    /// Radius 1 covers more than the follow list: people sharing a group with
+    /// the searcher are seeded into it, because sharing a group is social
+    /// proximity even when neither has followed the other. That membership is
+    /// gathered here, where both the app and the runtime are in scope, rather
+    /// than inside the search — hosts pass nothing extra for it.
+    ///
     /// People found this way are deliberately *not* added to the local
     /// directory: a search result is not a relationship. `user_profile` keeps
     /// answering only for accounts the user has actually interacted with.
@@ -112,6 +118,7 @@ impl Marmot {
         radius_start: u8,
         radius_end: u8,
     ) -> Result<Arc<UserSearchSubscription>, MarmotKitError> {
+        let radius_one_seeds = self.runtime.group_co_members(&account_id_hex).await?;
         let inner = self
             .app
             .search_users(UserSearchParams {
@@ -119,6 +126,7 @@ impl Marmot {
                 query,
                 radius_start,
                 radius_end,
+                radius_one_seeds,
             })
             .await?;
         Ok(UserSearchSubscription::new(inner))

@@ -4,6 +4,7 @@
 
 use zeroize::Zeroizing;
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -11,7 +12,7 @@ use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::oneshot;
 
 use super::{
-    AccountManager, AccountWorkerCommand, account_worker_response,
+    AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
     publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
@@ -79,6 +80,28 @@ impl AccountManager {
         self.catch_up_after_committed_mutation("create_group").await;
         self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
+    }
+
+    /// Accounts the local account currently shares a group with, deduplicated
+    /// and excluding the account itself.
+    ///
+    /// See [`MarmotAppRuntime::group_co_members`] for why this lives with the
+    /// worker-backed reads rather than in the directory.
+    pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.resolve(account_ref)?;
+        let mut co_members = BTreeSet::new();
+        for group in self.app.groups(&account.label)? {
+            if !group_contributes_co_members(&group) {
+                continue;
+            }
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            for member in self.group_members(account_ref, &group_id).await? {
+                if member.member_id_hex != account.account_id_hex {
+                    co_members.insert(member.member_id_hex);
+                }
+            }
+        }
+        Ok(co_members.into_iter().collect())
     }
 
     pub async fn group_members(

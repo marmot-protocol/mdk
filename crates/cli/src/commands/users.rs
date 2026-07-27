@@ -38,6 +38,17 @@ pub(crate) async fn users_command(
                     query: query.clone(),
                     radius_start: radius.0,
                     radius_end: radius.1,
+                    // Group co-members would widen radius 1, but reading
+                    // membership means asking an account worker, and asking for
+                    // one here would spawn it: `users` is not a daemon-hosted
+                    // command, so this runs in the `wn` process rather than in
+                    // `wnd`. A name lookup would then hydrate every group's MLS
+                    // session in a second process while the daemon may already
+                    // own that account-device database. Every other
+                    // session-touching command forwards to the daemon for
+                    // exactly that reason. Searching the follow graph alone
+                    // keeps this a directory read, which is what it should be.
+                    radius_one_seeds: Vec::new(),
                 },
             )
             .await?;
