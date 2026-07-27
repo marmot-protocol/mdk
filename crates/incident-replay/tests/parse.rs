@@ -17,3 +17,11 @@ fn unknown_event_kinds_and_absent_projections_are_tolerated() {
             .expect("unknown kinds and absent derived_projections parse");
     assert_eq!(classify(&export), Verdict::Healthy);
 }
+
+#[test]
+fn stream_shaped_lines_are_rejected_as_documents() {
+    // A stream line carrying a `t` discriminator must never be adopted by the
+    // document parser as an empty (healthy) export.
+    assert!(parse(r#"{"t": "error", "complete": false}"#).is_err());
+    assert!(parse(r#"{"t": "manifest", "schema_version": "goggles-group-export/v1"}"#).is_err());
+}
