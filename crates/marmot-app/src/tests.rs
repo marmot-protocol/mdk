@@ -2716,7 +2716,10 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     // The follow edges remain available for bounded directory search via the
     // per-account search graph, even though the follows are not promoted.
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let search_record = cache.search_record(&author).unwrap().unwrap();
+    let search_record = cache
+        .search_record(&author, crate::unix_now_seconds() as i64)
+        .unwrap()
+        .unwrap();
     assert_eq!(search_record.follows.len(), MAX_FOLLOW_LIST_ENTRIES);
 }
 

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use super::cache::{DirectoryCache, DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
 use super::records::{
     UserDirectoryRecord, UserDirectorySearchResult, profile_from_record, user_record_match,
 };
@@ -254,7 +255,8 @@ async fn resolve_layer(
     radius: u8,
     emitter: &mut SearchEmitter,
 ) -> Result<(), AppError> {
-    let (local, missing) = partition_locally_known(app, frontier).await?;
+    let now = crate::unix_now_seconds() as i64;
+    let (local, missing) = partition_locally_known(app, frontier, now).await?;
     emitter.emit_matches(radius, local, query).await;
 
     for batch in missing.chunks(SEARCH_PUBKEY_BATCH_SIZE) {
@@ -262,17 +264,70 @@ async fn resolve_layer(
             return Ok(());
         }
         let fetched = fetch_profile_records(app, batch).await?;
+        cache_resolved_profiles(app, &fetched, now).await?;
         emitter.emit_matches(radius, fetched, query).await;
     }
     Ok(())
 }
 
+/// Keep the profiles this layer resolved so the next search for the same
+/// people is warm.
+///
+/// Writes to the un-promoted search-graph tier only, never `directory_users`:
+/// answering a search is not a relationship, and a promoted stranger would
+/// become a live per-author subscription (mdk#687).
+///
+/// Only records that actually carry a profile are written. A pubkey that came
+/// back empty is left uncached rather than recorded as "has no profile" --
+/// see [`SEARCH_GRAPH_PROFILE_TTL_SECONDS`] for why that absence is not
+/// trustworthy enough to persist.
+async fn cache_resolved_profiles(
+    app: &MarmotApp,
+    records: &[UserDirectoryRecord],
+    now: i64,
+) -> Result<(), AppError> {
+    let resolved = records
+        .iter()
+        .filter(|record| record.profile.is_some())
+        .map(|record| DirectorySearchGraphRecord {
+            account_id_hex: record.account_id_hex.clone(),
+            npub: record.npub.clone(),
+            profile: record.profile.clone(),
+            // This layer resolved profiles, not contact lists. `None` leaves
+            // any follow edges already recorded for them untouched.
+            follows: None,
+            metadata_updated_at: record.profile.as_ref().map(|profile| profile.created_at),
+            metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+        })
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        return Ok(());
+    }
+
+    let app = app.clone();
+    blocking_app_task(move || {
+        for cache in app.directory_caches()? {
+            for record in &resolved {
+                cache.put_search_graph_record(record, now)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Split a layer into records the device can already match and pubkeys that
 /// still need a profile fetched. A cached record without a profile counts as
 /// needing one.
+///
+/// Reads both tiers: the promoted directory for accounts the user has actually
+/// interacted with, then the un-promoted search graph for strangers an earlier
+/// search resolved. The second tier is what makes a repeat search warm; its
+/// profiles expire, so a hit here is fresh by construction.
 async fn partition_locally_known(
     app: &MarmotApp,
     frontier: &[String],
+    now: i64,
 ) -> Result<(Vec<UserDirectoryRecord>, Vec<String>), AppError> {
     let app = app.clone();
     let frontier = frontier.to_vec();
@@ -282,18 +337,39 @@ async fn partition_locally_known(
         let mut known = Vec::new();
         let mut missing = Vec::new();
         for account_id_hex in frontier {
-            match app.directory_entry_for_account_id_with_handles(
+            let promoted = app.directory_entry_for_account_id_with_handles(
                 &account_id_hex,
                 &caches,
                 &shared_storage,
-            )? {
-                Some(record) if record.profile.is_some() => known.push(record),
-                _ => missing.push(account_id_hex),
+            )?;
+            let record = match promoted {
+                Some(record) if record.profile.is_some() => Some(record),
+                _ => search_graph_profile(&caches, &account_id_hex, now)?,
+            };
+            match record {
+                Some(record) => known.push(record),
+                None => missing.push(account_id_hex),
             }
         }
         Ok((known, missing))
     })
     .await
+}
+
+/// The first un-promoted search-graph record carrying an unexpired profile.
+fn search_graph_profile(
+    caches: &[DirectoryCache],
+    account_id_hex: &str,
+    now: i64,
+) -> Result<Option<UserDirectoryRecord>, AppError> {
+    for cache in caches {
+        if let Some(record) = cache.search_record(account_id_hex, now)?
+            && record.profile.is_some()
+        {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 /// Fetch `kind:0` profiles for one batch of pubkeys and shape the batch into
@@ -436,7 +512,7 @@ mod tests {
     use super::*;
     use crate::AccountRelayListStatus;
     use crate::ids::npub_for_account_id_lossy;
-    use crate::{MatchQuality, MatchedField};
+    use crate::{MatchQuality, MatchedField, UserProfileMetadata};
     use marmot_account::AccountHome;
 
     /// A cached directory record for `account_id_hex` whose profile name is
@@ -580,6 +656,142 @@ mod tests {
         // The running total is cumulative and survives to the terminal update.
         assert_eq!(found.total_result_count, 1);
         assert_eq!(updates.last().unwrap().total_result_count, 1);
+    }
+
+    /// The whole point of Phase 2: a stranger resolved by an earlier search
+    /// lives only in the un-promoted search-graph tier, and a later search must
+    /// match them from there rather than paying for the relay round trip again.
+    /// `MarmotApp::with_relay` points at an address nothing answers, so a
+    /// result here can only have come from the cache.
+    #[tokio::test]
+    async fn a_search_matches_a_stranger_cached_in_the_un_promoted_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let stranger = format!("{:064x}", 77);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let now = crate::unix_now_seconds() as i64;
+
+        // The searcher's own follow list is promoted (it is the local account's
+        // own contact list, not a stranger's), so radius 1 expands offline.
+        // What is deliberately *not* promoted is the stranger's profile.
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: stranger.clone(),
+                    npub: npub_for_account_id_lossy(&stranger),
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".to_owned()),
+                        ..UserProfileMetadata::default()
+                    }),
+                    follows: None,
+                    metadata_updated_at: Some(now as u64),
+                    metadata_expires_at: Some((now + SEARCH_GRAPH_PROFILE_TTL_SECONDS) as u64),
+                },
+                now,
+            )
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (1, 1)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == stranger)
+            .expect("the un-promoted cached profile must be searchable");
+        assert_eq!(matched.radius, 1);
+        assert_eq!(matched.matched_field, MatchedField::Name);
+    }
+
+    /// A profile resolved from a relay to answer a search is kept, so the next
+    /// search for the same person is warm -- and it is kept in the un-promoted
+    /// tier only. Caching a stranger must never turn them into a directory
+    /// entry, because that is what feeds live per-author subscriptions
+    /// (mdk#687). The `entry` assertion is the guard on that.
+    #[tokio::test]
+    async fn a_profile_resolved_from_a_relay_is_cached_without_promoting_the_stranger() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+
+        // The stranger publishes a profile from their own device. This needs a
+        // real signing identity, not a bare account row -- the profile is a
+        // signed kind:0 the searcher will fetch back off the relay.
+        let endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
+        let stranger_dir = tempfile::tempdir().unwrap();
+        let stranger_app = MarmotApp::with_relay(stranger_dir.path(), relay_url.clone());
+        let stranger = stranger_app
+            .runtime()
+            .create_identity(crate::AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint.clone()],
+                publish_missing_relay_lists: true,
+                ..crate::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create the stranger's identity")
+            .account;
+        stranger_app
+            .publish_user_profile(
+                &stranger.account_id_hex,
+                UserProfileMetadata {
+                    name: Some("needle".to_owned()),
+                    ..UserProfileMetadata::default()
+                },
+                crate::AccountRelayListBootstrap::new(vec![endpoint.clone()], Vec::new()),
+            )
+            .await
+            .expect("publish the stranger's profile");
+
+        // The searcher follows them but has never cached their profile.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), relay_url);
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.account_id_hex.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (1, 1)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+        assert!(
+            updates
+                .iter()
+                .flat_map(|update| &update.new_results)
+                .any(|result| result.account_id_hex == stranger.account_id_hex),
+            "the search must resolve the stranger from the relay: {updates:?}"
+        );
+
+        let now = crate::unix_now_seconds() as i64;
+        let cached = cache
+            .search_record(&stranger.account_id_hex, now)
+            .unwrap()
+            .expect("the resolved profile must be cached for the next search");
+        assert_eq!(
+            cached.profile.and_then(|profile| profile.name),
+            Some("needle".to_owned())
+        );
+        assert!(
+            cache.entry(&stranger.account_id_hex).unwrap().is_none(),
+            "caching a search result must not promote them into directory_users"
+        );
     }
 
     #[tokio::test]

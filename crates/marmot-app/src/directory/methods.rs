@@ -650,6 +650,9 @@ impl MarmotApp {
         let mut seen = HashSet::new();
         let mut frontier = vec![parse_account_id_hex(searcher_account_id_hex)?];
         let caches = self.directory_caches()?;
+        // One instant for the whole traversal: a layer must not disagree with
+        // itself about whether a cached profile has expired.
+        let now = crate::unix_now_seconds() as i64;
 
         for radius in 0..=radius_end {
             let mut next = Vec::new();
@@ -664,7 +667,8 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) = Self::directory_search_record_from_caches(&caches, &account_id)?
+                let Some(record) =
+                    Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
@@ -718,9 +722,10 @@ impl MarmotApp {
     fn directory_search_record_from_caches(
         caches: &[DirectoryCache],
         account_id_hex: &str,
+        now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         for cache in caches {
-            if let Some(entry) = cache.search_record(account_id_hex)? {
+            if let Some(entry) = cache.search_record(account_id_hex, now)? {
                 return Ok(Some(entry));
             }
         }
