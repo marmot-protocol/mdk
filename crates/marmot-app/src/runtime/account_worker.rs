@@ -111,6 +111,9 @@ pub(crate) enum AccountWorkerCommand {
     QuarantinedGroups {
         respond: oneshot::Sender<Result<Vec<AppQuarantinedGroup>, AppError>>,
     },
+    NetworkStartupSettled {
+        respond: oneshot::Sender<()>,
+    },
     RetryHydrateQuarantinedGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -435,21 +438,24 @@ async fn run_app_runtime_account_worker(
     // transport activation, subscription registration, and catch-up have
     // separate asynchronous measurements below.
     //
-    // Snapshot capture is best-effort: its only failure is the shared profile
-    // load. On failure, surface the error and serve read commands by deferring
-    // them to the live session after catch-up (matching the live path's error
-    // semantics) instead of masking it as empty profiles. Readiness is never
-    // gated on it.
+    // Snapshot capture is part of local readiness: its only failure is the
+    // shared profile load, and acknowledging readiness without it would queue
+    // supposedly-local reads behind relay catch-up. Surface the error and fail
+    // this worker start instead of weakening the readiness contract.
     let read_snapshot = match client.group_read_snapshot() {
-        Ok(snapshot) => Some(snapshot),
+        Ok(snapshot) => snapshot,
         Err(err) => {
+            let message = account_error_message("runtime startup snapshot capture failed", &err);
             publish_app_runtime_account_error(
                 &events,
                 &account_id_hex,
                 &account_label,
-                account_error_message("runtime startup snapshot capture failed", &err),
+                message.clone(),
             );
-            None
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(message));
+            }
+            return;
         }
     };
     if let Some(ready) = ready.take() {
@@ -485,28 +491,13 @@ async fn run_app_runtime_account_worker(
                     match command {
                         None => return,
                         Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.members(&group_id));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::Members { group_id, respond }))),
-                            }
+                            let _ = respond.send(read_snapshot.members(&group_id));
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::GroupMlsState { group_id, respond }))),
-                            }
+                            let _ = respond.send(read_snapshot.group_mls_state(&group_id));
                         }
                         Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                            match &read_snapshot {
-                                Some(snapshot) => {
-                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
-                                }
-                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::QuarantinedGroups { respond }))),
-                            }
+                            let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
                         }
                         Some(AccountWorkerCommand::CatchUp { respond }) => {
                             // Coalesce onto the in-flight initial catch-up rather
@@ -734,21 +725,31 @@ async fn run_app_runtime_account_worker(
                             result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                         } {
                             Ok(mut reopened) => {
-                                // `runtime_local_client` is local-only. Reconnect must
-                                // establish subscriptions and catch up before
-                                // replacing the prior live client.
-                                let reopen_sync = tokio::select! {
+                                // Reconnect restores transport activation and
+                                // subscriptions, then resumes the live receive
+                                // tail. Do not block the command loop on a full
+                                // catch-up; the maintenance path performs
+                                // bounded repair syncs when required.
+                                let prepare_transport = tokio::select! {
                                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                                     _ = &mut shutdown => return,
-                                    result = reopened.sync() => result,
+                                    result = reopened.prepare_transport() => result,
                                 };
-                                if let Err(sync_err) = reopen_sync {
+                                if let Err(transport_err) = prepare_transport {
                                     publish_app_runtime_account_error(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
-                                        account_error_message("runtime restart sync failed", &sync_err),
+                                        account_error_message(
+                                            "runtime restart transport failed",
+                                            &transport_err,
+                                        ),
                                     );
+                                    tokio::select! {
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                        _ = &mut shutdown => return,
+                                        _ = sleep(reconnect_backoff.next_delay()) => {}
+                                    }
                                     continue;
                                 }
                                 app.finish_client_open_network_maintenance(&mut reopened)
@@ -870,6 +871,9 @@ async fn handle_account_worker_command(
     shared: &RuntimeSharedServices,
 ) {
     match command {
+        AccountWorkerCommand::NetworkStartupSettled { respond } => {
+            let _ = respond.send(());
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
             let result = match client.sync().await {

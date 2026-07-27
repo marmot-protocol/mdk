@@ -761,8 +761,7 @@ impl AppClient {
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
     /// `account: None` / `local: false` during the catch-up window). The worker
-    /// then falls back to serving those reads from the live session after
-    /// catch-up, matching the live path's error semantics.
+    /// treats that error as a failed local-readiness attempt.
     pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single

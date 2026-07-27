@@ -189,7 +189,7 @@ Collected operations:
 
 | Operation | Measurement envelope | Notes |
 | --- | --- | --- |
-| `app_start` | `MarmotAppRuntime::start()`, from method entry through directory-storage warmup, telemetry config construction, asynchronous directory-sync scheduling, locally ready account reconciliation, and running-state mark. | Relay connection, subscription registration, and catch-up continue asynchronously after `start()` returns. |
+| `app_start` | `MarmotAppRuntime::start()`, from method entry through directory-storage warmup, telemetry config construction, locally ready account reconciliation, and running-state mark. | Relay connection, subscription registration, directory sync, and catch-up continue asynchronously after `start()` returns. |
 | `directory_subscription_sync` | One directory worker `request_rebuild_and_wait()` pass. | Initial startup schedules this pass asynchronously, so slow directory relays do not hold the splash screen. |
 | `account_reconcile` | `AccountManager::reconcile()`, including local-signing account enumeration, stale-worker stop, pending-worker spawn, and ready wait. | Recorded every time reconcile runs, including implicit reconcile before catch-up. |
 | `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | Covers SQLCipher/session hydration, local engine-group reconciliation, local projection backfill, and read-snapshot capture. It does not include relay work. |

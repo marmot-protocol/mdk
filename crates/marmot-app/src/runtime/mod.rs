@@ -106,6 +106,7 @@ pub struct MarmotAppRuntime {
     shared: RuntimeSharedServices,
     accounts: AccountManager,
     directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
+    initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -819,6 +820,7 @@ impl MarmotAppRuntime {
             shared,
             accounts,
             directory_sync: Arc::new(Mutex::new(None)),
+            initial_directory_sync: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -915,7 +917,7 @@ impl MarmotAppRuntime {
     async fn schedule_user_directory_subscription_sync(&self) {
         let directory_sync = self.ensure_directory_sync_worker().await;
         let telemetry = self.shared.app_performance_telemetry();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let started_at = Instant::now();
             let result = directory_sync.request_rebuild_and_wait().await;
             telemetry.record(
@@ -932,6 +934,11 @@ impl MarmotAppRuntime {
                 );
             }
         });
+        let previous = self.initial_directory_sync.lock().await.replace(handle);
+        if let Some(previous) = previous {
+            previous.abort();
+            let _ = previous.await;
+        }
     }
 
     async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
@@ -2788,6 +2795,9 @@ impl MarmotAppRuntime {
         if let Some(directory_sync) = self.directory_sync.lock().await.take() {
             directory_sync.shutdown().await;
         }
+        if let Some(initial_directory_sync) = self.initial_directory_sync.lock().await.take() {
+            let _ = initial_directory_sync.await;
+        }
         self.accounts.app.set_directory_sync_handle(None);
         let accounts = self.accounts.shutdown();
         let relay_plane = self.shared.relay_plane.shutdown();
@@ -3251,6 +3261,13 @@ impl AccountManager {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.resolve(account_ref)?;
+        if account.can_sign() && !account.signed_out {
+            // Unlike local runtime reads, this API reports relay visibility.
+            // Wait for the managed worker's initial activation, catch-up, and
+            // open maintenance before issuing the directory query.
+            self.wait_for_account_network_startup_to_settle(&account.account_id_hex)
+                .await?;
+        }
         let owned = cgka_engine::key_package::durably_owned_key_packages(
             &self.app.account_storage(&account.label)?,
             cgka_traits::group::ProtocolProfile::Current,
@@ -3412,6 +3429,25 @@ impl AccountManager {
             key_package_bytes,
             profile,
         })
+    }
+
+    async fn wait_for_account_network_startup_to_settle(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::NetworkStartupSettled { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::BlockingTask(
+                "account worker startup settlement timed out".into(),
+            )),
+        }
     }
 
     pub async fn login_external_signer<S>(
