@@ -6,6 +6,8 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import { MarmotDispatchAmbiguousDeliveryError } from "./dispatch-errors.js";
+
 /** Immutable route identity for one inbound Marmot agent turn. */
 export interface MarmotTurnRoute {
   readonly channelAccountId: string;
@@ -138,6 +140,19 @@ export function recordTurnOutboundFailure(state: MarmotTurnDeliveryState, retrya
 /** Whether the bound sink must not commit a durable reply for this turn. */
 export function shouldSuppressSinkDurableDelivery(state: MarmotTurnDeliveryState): boolean {
   return state.outboundDelivered || state.outboundAmbiguousFailure;
+}
+
+/**
+ * Fail closed when a same-route outbound send ended ambiguously without a
+ * durable receipt. Successful outbound delivery is not an error.
+ */
+export function assertTurnDurableDeliveryResolved(state: MarmotTurnDeliveryState): void {
+  if (state.outboundDelivered) {
+    return;
+  }
+  if (state.outboundAmbiguousFailure) {
+    throw new MarmotDispatchAmbiguousDeliveryError();
+  }
 }
 
 /** Claim sink ownership before committing (no-op when outbound already owns delivery). */

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { createMarmotChannelPlugin } from "../src/channel.js";
 import {
   createMarmotMessagingAdapter,
   isMarmotGroupIdHex,
@@ -7,6 +8,33 @@ import {
   MARMOT_TARGET_PREFIX,
   normalizeMarmotTarget,
 } from "../src/messaging.js";
+import { MarmotTargetError } from "../src/target.js";
+
+async function resolveThroughOpenClawTargetResolver(input: string): Promise<unknown> {
+  const plugin = createMarmotChannelPlugin();
+  const resolverUrl = new URL(
+    "../node_modules/openclaw/dist/target-resolver-BWTwFOHy.js",
+    import.meta.url,
+  ).href;
+  const resolver = (await import(/* @vite-ignore */ resolverUrl)) as {
+    i: (params: {
+      cfg: Record<string, never>;
+      channel: string;
+      input: string;
+      plugin: ReturnType<typeof createMarmotChannelPlugin>;
+    }) => Promise<{ ok: boolean; error?: unknown; target?: unknown }>;
+  };
+  const resolved = await resolver.i({
+    cfg: {},
+    channel: "marmot",
+    input,
+    plugin,
+  });
+  if (!resolved.ok) {
+    throw resolved.error;
+  }
+  return resolved.target;
+}
 
 // 16-byte (OpenMLS default) and 32-byte group ids, lowercase hex.
 const GID16 = "a".repeat(32);
@@ -61,6 +89,11 @@ describe("looksLikeMarmotTarget", () => {
     expect(looksLikeMarmotTarget("alice")).toBe(false);
     expect(looksLikeMarmotTarget("#general")).toBe(false);
   });
+
+  it("claims session keys and decorated group routes so Marmot can reject them locally", () => {
+    expect(looksLikeMarmotTarget(`agent:main:${MARMOT_TARGET_PREFIX}:group:${GID16}`)).toBe(true);
+    expect(looksLikeMarmotTarget(`group:zz${"a".repeat(30)}`)).toBe(true);
+  });
 });
 
 describe("createMarmotMessagingAdapter", () => {
@@ -91,10 +124,50 @@ describe("createMarmotMessagingAdapter", () => {
     ).resolves.toEqual({ to: GID16, kind: "group", source: "normalized" });
   });
 
-  it("returns null from resolveTarget for a non-group-id target", async () => {
+  it("throws MarmotTargetError from resolveTarget for a non-group-id target", async () => {
     const resolveTarget = adapter.targetResolver?.resolveTarget;
     await expect(
       resolveTarget!({ cfg: {} as never, input: "alice", normalized: "alice" }),
-    ).resolves.toBeNull();
+    ).rejects.toBeInstanceOf(MarmotTargetError);
+  });
+
+  it("rejects session keys through OpenClaw target resolution without leaking the raw target", async () => {
+    const sensitive = `agent:main:${MARMOT_TARGET_PREFIX}:group:${GID16}`;
+    await expect(resolveThroughOpenClawTargetResolver(sensitive)).rejects.toMatchObject({
+      name: "MarmotTargetError",
+      category: "session_key",
+    });
+    try {
+      await resolveThroughOpenClawTargetResolver(sensitive);
+    } catch (error) {
+      expect((error as Error).message).not.toContain(sensitive);
+      expect((error as Error).message).not.toContain(GID16);
+    }
+  });
+
+  it("rejects malformed group routes through OpenClaw target resolution without leaking the raw target", async () => {
+    const sensitive = `group:zz${"a".repeat(30)}`;
+    await expect(resolveThroughOpenClawTargetResolver(sensitive)).rejects.toBeInstanceOf(
+      MarmotTargetError,
+    );
+    try {
+      await resolveThroughOpenClawTargetResolver(sensitive);
+    } catch (error) {
+      expect((error as Error).message).not.toContain(sensitive);
+    }
+  });
+
+  it("rejects cross-channel targets through OpenClaw target resolution without leaking the raw target", async () => {
+    const sensitive = `telegram:${GID16}`;
+    await expect(resolveThroughOpenClawTargetResolver(sensitive)).rejects.toMatchObject({
+      name: "MarmotTargetError",
+      category: "cross_channel",
+    });
+    try {
+      await resolveThroughOpenClawTargetResolver(sensitive);
+    } catch (error) {
+      expect((error as Error).message).not.toContain(sensitive);
+      expect((error as Error).message).not.toContain(GID16);
+    }
   });
 });

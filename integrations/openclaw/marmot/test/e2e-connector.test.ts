@@ -467,4 +467,156 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
     },
     120_000,
   );
+
+  it(
+    "reuses a derived idempotency key across independent plugin processes without duplicating durable sends",
+    async () => {
+      const tempRoot = await mkdtemp("/tmp/omce-restart-");
+      const { client, proc, socketPath } = await startWnAgent(tempRoot);
+
+      try {
+        const inbound = {
+          accountIdHex: ACCOUNT_ID_HEX,
+          groupIdHex: GROUP_ID_HEX,
+          messageIdHex: MESSAGE_ID_HEX,
+          coalescedMessageIdsHex: [MESSAGE_ID_HEX],
+        };
+        const replyText = "restart-idempotency-reply";
+        const childEnv = {
+          ...process.env,
+          MARMOT_E2E_SOCKET: socketPath,
+          MARMOT_E2E_ACCOUNT: ACCOUNT_ID_HEX,
+          MARMOT_E2E_GROUP: GROUP_ID_HEX,
+          MARMOT_E2E_MESSAGE: MESSAGE_ID_HEX,
+          MARMOT_E2E_REPLY: replyText,
+        };
+        const pluginRoot = join(import.meta.dirname, "..");
+        const clientModule = join(pluginRoot, "dist/src/client.js");
+        const idempotencyModule = join(pluginRoot, "dist/src/turn-idempotency.js");
+        const commitChildScript = `
+          import { createConnection } from "node:net";
+          import { randomUUID } from "node:crypto";
+          import { AGENT_CONTROL_PROTOCOL_V2 } from ${JSON.stringify(clientModule)};
+          import { deriveTurnIdempotencyKeyFromInbound } from ${JSON.stringify(idempotencyModule)};
+          const inbound = {
+            accountIdHex: process.env.MARMOT_E2E_ACCOUNT,
+            groupIdHex: process.env.MARMOT_E2E_GROUP,
+            messageIdHex: process.env.MARMOT_E2E_MESSAGE,
+            coalescedMessageIdsHex: [process.env.MARMOT_E2E_MESSAGE],
+          };
+          const key = deriveTurnIdempotencyKeyFromInbound(inbound);
+          const envelope = {
+            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V2,
+            id: randomUUID(),
+            type: "send_final",
+            account_id_hex: inbound.accountIdHex,
+            group_id_hex: inbound.groupIdHex,
+            text: process.env.MARMOT_E2E_REPLY,
+            reply_to_message_id_hex: inbound.messageIdHex,
+            idempotency_key: key,
+          };
+          await new Promise((resolve, reject) => {
+            const socket = createConnection({ path: process.env.MARMOT_E2E_SOCKET });
+            socket.once("error", reject);
+            socket.once("connect", () => {
+              const frame = Buffer.from(\`\${JSON.stringify(envelope)}\\n\`, "utf8");
+              socket.write(frame, (err) => {
+                if (err) {
+                  reject(err);
+                  return;
+                }
+                socket.end();
+                resolve(undefined);
+              });
+            });
+          });
+          console.log(JSON.stringify({ key }));
+        `;
+        const replayChildScript = `
+          import { MarmotAgentControlClient } from ${JSON.stringify(clientModule)};
+          import { deriveTurnIdempotencyKeyFromInbound } from ${JSON.stringify(idempotencyModule)};
+          const inbound = {
+            accountIdHex: process.env.MARMOT_E2E_ACCOUNT,
+            groupIdHex: process.env.MARMOT_E2E_GROUP,
+            messageIdHex: process.env.MARMOT_E2E_MESSAGE,
+            coalescedMessageIdsHex: [process.env.MARMOT_E2E_MESSAGE],
+          };
+          const key = deriveTurnIdempotencyKeyFromInbound(inbound);
+          const client = new MarmotAgentControlClient({
+            socketPath: process.env.MARMOT_E2E_SOCKET,
+            requestTimeoutMs: 5_000,
+          });
+          const response = await client.sendFinal(
+            inbound.accountIdHex,
+            inbound.groupIdHex,
+            process.env.MARMOT_E2E_REPLY,
+            inbound.messageIdHex,
+            key,
+          );
+          console.log(JSON.stringify({ key, messageIdsHex: response.message_ids_hex }));
+        `;
+
+        const runChild = <T>(script: string) =>
+          new Promise<T>((resolve, reject) => {
+            const child = spawn(
+              process.execPath,
+              ["--input-type=module", "-e", script],
+              { env: childEnv, stdio: ["ignore", "pipe", "pipe"] },
+            );
+            let stdout = "";
+            let stderr = "";
+            child.stdout.on("data", (chunk) => {
+              stdout += String(chunk);
+            });
+            child.stderr.on("data", (chunk) => {
+              stderr += String(chunk);
+            });
+            child.on("error", reject);
+            child.on("close", (code) => {
+              if (code !== 0) {
+                reject(new Error(`child exited ${code}: ${stderr}`));
+                return;
+              }
+              try {
+                resolve(JSON.parse(stdout.trim()) as T);
+              } catch (error) {
+                reject(new Error(`child output parse failed: ${stdout}\n${stderr}\n${error}`));
+              }
+            });
+          });
+
+        const matchesReply = (send: DebugRecordedFinalSend) =>
+          send.text === replyText &&
+          send.group_id_hex === GROUP_ID_HEX &&
+          send.reply_to_message_id_hex === MESSAGE_ID_HEX;
+
+        const { key: committedKey } = await runChild<{ key: string }>(commitChildScript);
+        const committed = await waitFor(
+          async () => {
+            const finals = await recordedFinals(client);
+            const matching = finals.sends.filter(matchesReply);
+            const committedSend = matching[0];
+            if (matching.length === 1 && committedSend && committedSend.message_ids_hex.length > 0) {
+              return committedSend;
+            }
+            return null;
+          },
+          { label: "post-commit debug_recorded_finals", timeoutMs: 10_000 },
+        );
+        const committedMessageIdsHex = committed.message_ids_hex;
+
+        const replay = await runChild<{ key: string; messageIdsHex: string[] }>(replayChildScript);
+        expect(replay.key).toBe(committedKey);
+        expect(replay.messageIdsHex).toEqual(committedMessageIdsHex);
+
+        const finals = await recordedFinals(client);
+        expect(finals.sends.filter(matchesReply)).toHaveLength(1);
+        expect(finals.sends.filter(matchesReply)[0]?.message_ids_hex).toEqual(committedMessageIdsHex);
+      } finally {
+        await stopProcess(proc);
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
 });

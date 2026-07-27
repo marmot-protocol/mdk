@@ -12,7 +12,7 @@ import {
   type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
-import { MarmotDispatchNotReadyError } from "../src/dispatch-errors.js";
+import { MarmotDispatchAmbiguousDeliveryError, MarmotDispatchDeliveryFailedError, MarmotDispatchNotReadyError } from "../src/dispatch-errors.js";
 import {
   getMarmotTurnDelivery,
   recordTurnOutboundDelivery,
@@ -26,7 +26,7 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   buildChannelInboundEventContext: vi.fn((params: unknown) => params),
   runChannelInboundEvent: vi.fn(
     async (params: { adapter: { resolveTurn: () => { runDispatch: () => Promise<unknown> } } }) => {
-      await params.adapter.resolveTurn().runDispatch();
+      return await params.adapter.resolveTurn().runDispatch();
     },
   ),
 }));
@@ -570,6 +570,32 @@ describe("MarmotReplySink", () => {
 
     await expect(sink.deliver({ text: "hello" }, { kind: "final" })).rejects.toThrow("bad request");
     expect(attempts).toBe(1);
+  });
+
+  it("does not treat ambiguous outbound suppression as a successful sink commit", async () => {
+    const calls = emptyCalls();
+    const route: MarmotTurnRoute = {
+      channelAccountId: "default",
+      marmotAccountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      replyToMessageIdHex: HEX32("dd"),
+      idempotencyKey: "turn-key",
+    };
+    await runInMarmotTurn(route, async () => {
+      const state = getMarmotTurnDelivery()!;
+      state.outboundAmbiguousFailure = true;
+      const sink = new MarmotReplySink({
+        client: stubClient(calls),
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        streamMode: "off",
+        quicCandidates: [],
+      });
+      await expect(sink.deliver({ text: "must fail" }, { kind: "final" })).rejects.toBeInstanceOf(
+        MarmotDispatchAmbiguousDeliveryError,
+      );
+      expect(calls.sendFinal).toEqual([]);
+    });
   });
 
   it("cancels a prewarmed preview when tool-owned delivery suppresses sink commit", async () => {
@@ -1266,5 +1292,105 @@ describe("createMarmotInboundDispatcher inbound media", () => {
     expect(downloads).toHaveLength(0);
     const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
     expect("media" in ctxArg).toBe(false);
+  });
+});
+
+describe("createMarmotInboundDispatcher delivery failures", () => {
+  it("fails closed when OpenClaw reports a failed final delivery", async () => {
+    const calls = emptyCalls();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-dispatch-failure-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async () => ({
+          queuedFinal: false,
+          counts: { tool: 0, block: 0, final: 0 },
+          failedCounts: { final: 1 },
+        }),
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(calls) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await expect(
+      dispatch({
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        messageIdHex: HEX32("dd"),
+        senderAccountIdHex: HEX32("bb"),
+        text: "hello",
+      }),
+    ).rejects.toBeInstanceOf(MarmotDispatchDeliveryFailedError);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("does not fail the turn when OpenClaw reports failed tool or block deliveries", async () => {
+    const calls = emptyCalls();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-dispatch-tool-block-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "done" }, { kind: "final" });
+          return {
+            queuedFinal: false,
+            counts: { tool: 0, block: 0, final: 1 },
+            failedCounts: { tool: 1, block: 1 },
+          };
+        },
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(calls) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "hello",
+    });
+    expect(calls.sendFinal).toHaveLength(1);
   });
 });

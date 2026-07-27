@@ -23,7 +23,7 @@ import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import { NonAppendOnlyUpdateError } from "./append-only.js";
 import { isRetryable, type GroupInfoResponse, type MarmotAgentControlClient } from "./client.js";
 import type { GroupActivation, StreamMode } from "./config.js";
-import { MarmotDispatchNotReadyError } from "./dispatch-errors.js";
+import { MarmotDispatchAmbiguousDeliveryError, MarmotDispatchDeliveryFailedError, MarmotDispatchNotReadyError } from "./dispatch-errors.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
 import { waitForGroupReadiness } from "./readiness.js";
@@ -36,8 +36,10 @@ import {
   resolveTurnIdempotencyKey,
   runInMarmotTurn,
   shouldSuppressSinkDurableDelivery,
+  assertTurnDurableDeliveryResolved,
   type MarmotTurnRoute,
 } from "./turn-delivery.js";
+import { deriveTurnIdempotencyKeyFromInbound } from "./turn-idempotency.js";
 
 // --- reply sink (unit-tested) -----------------------------------------------
 
@@ -75,6 +77,25 @@ export interface MarmotReplySinkOptions {
 
 const MIN_TRUNCATED_FINAL_PREFIX_CHARS = 48;
 const MIN_TRUNCATED_FINAL_CONTINUATION_CHARS = 24;
+
+interface BufferedDispatchResult {
+  failedCounts?: Partial<Record<ReplyDelivery["kind"], number>>;
+}
+
+function assertBufferedDispatchDeliverySucceeded(result: unknown): void {
+  const failedCounts = (result as BufferedDispatchResult | undefined)?.failedCounts;
+  if ((failedCounts?.final ?? 0) > 0) {
+    throw new MarmotDispatchDeliveryFailedError();
+  }
+}
+
+function assertTurnDispatchDeliverySettled(): void {
+  const turn = getMarmotTurnDelivery();
+  if (!turn) {
+    return;
+  }
+  assertTurnDurableDeliveryResolved(turn);
+}
 
 function stripTrailingEllipsis(text: string): string {
   return text.replace(/(?:\s*(?:\.{3}|…))+$/u, "").trimEnd();
@@ -323,7 +344,11 @@ export class MarmotReplySink {
     if (!turn) {
       return "proceed";
     }
-    return acquireSinkDeliveryOrSuppress(turn);
+    const gate = await acquireSinkDeliveryOrSuppress(turn);
+    if (gate === "suppress") {
+      assertTurnDurableDeliveryResolved(turn);
+    }
+    return gate;
   }
 
   private async sendFinal(text: string): Promise<void> {
@@ -415,7 +440,7 @@ export class MarmotReplySink {
     const turn = getMarmotTurnDelivery();
     if (turn) {
       await awaitTurnOutboundResolution(turn);
-      if (shouldSuppressSinkDurableDelivery(turn)) {
+      if (turn.outboundDelivered) {
         if (this.preview?.isActive && !this.previewAbandoned) {
           await this.abandonPreview("sink_delivery_suppressed");
         }
@@ -423,6 +448,7 @@ export class MarmotReplySink {
         this.log("marmot: durable reply already owned for this turn; skipping sink commit");
         return true;
       }
+      assertTurnDurableDeliveryResolved(turn);
     }
     const finalText = await this.bestFinalText(text);
     if (!finalText.trim()) {
@@ -437,11 +463,11 @@ export class MarmotReplySink {
       this.log("marmot: durable reply already owned for this turn; skipping sink commit");
       return true;
     }
-    this.finalized = true;
     this.logPartialSummary();
     if (this.preview && this.preview.isActive && !this.previewAbandoned) {
       try {
         await this.preview.finalize(finalText);
+        this.finalized = true;
         this.log(`marmot: live preview finalized (${finalText.length} chars)`);
         return true;
       } catch (error) {
@@ -461,6 +487,7 @@ export class MarmotReplySink {
       }
     }
     await this.sendFinal(finalText);
+    this.finalized = true;
     return true;
   }
 
@@ -806,7 +833,7 @@ export function createMarmotInboundDispatcher(
       marmotAccountIdHex: message.accountIdHex,
       groupIdHex: message.groupIdHex,
       replyToMessageIdHex: message.messageIdHex,
-      idempotencyKey: randomUUID(),
+      idempotencyKey: deriveTurnIdempotencyKeyFromInbound(message),
     };
 
     await runInMarmotTurn(turnRoute, async () => {
@@ -878,7 +905,7 @@ export function createMarmotInboundDispatcher(
     deps.log?.("marmot: agent turn starting");
     await sink.prewarm();
     const turnCfg = buildMarmotTurnConfigOverlay(deps.cfg);
-    await runChannelInboundEvent({
+    const dispatchResult = await runChannelInboundEvent({
       channel: "marmot",
       accountId: channelAccountId,
       raw: message,
@@ -895,8 +922,8 @@ export function createMarmotInboundDispatcher(
           storePath,
           ctxPayload,
           recordInboundSession: deps.runtimeChannel.session.recordInboundSession as never,
-          runDispatch: () =>
-            deps.runtimeChannel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          runDispatch: async () => {
+            const result = await deps.runtimeChannel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: ctxPayload,
               cfg: turnCfg,
               dispatcherOptions: {
@@ -921,13 +948,18 @@ export function createMarmotInboundDispatcher(
                 onToolStart: () => sink.progress("Working..."),
                 onCommandOutput: () => sink.progress("Working..."),
               },
-            }) as never,
+            });
+            assertBufferedDispatchDeliverySucceeded(result);
+            return result;
+          },
         }),
       },
     });
+    assertBufferedDispatchDeliverySucceeded(dispatchResult);
     // Block streaming can finish a turn with only `block` deliveries; commit the
     // accumulated reply durably if no explicit `final` did.
     await sink.flush();
+    assertTurnDispatchDeliverySettled();
     deps.log?.(`marmot: agent turn done (sink deliveries=${sink.deliveries})`);
   };
 

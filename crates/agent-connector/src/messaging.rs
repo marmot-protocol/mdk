@@ -103,12 +103,15 @@ impl AgentConnector {
     ) -> Result<AgentControlResponse, ConnectorError> {
         let group_id_hex = normalize_hex(group_id_hex)?;
         if self.debug_controls {
-            return self.debug_record_final_send_response(
-                account_id_hex,
-                &group_id_hex,
-                text,
-                reply_to_message_id_hex,
-            );
+            return self
+                .debug_record_final_send_response(
+                    account_id_hex,
+                    &group_id_hex,
+                    text,
+                    reply_to_message_id_hex,
+                    idempotency_key,
+                )
+                .await;
         }
 
         // Reject unknown accounts and malformed group ids before a request can
@@ -257,14 +260,37 @@ impl AgentConnector {
         })
     }
 
-    fn debug_record_final_send_response(
+    async fn debug_record_final_send_response(
         &self,
         account_id_hex: &str,
         group_id_hex: &str,
         text: String,
         reply_to_message_id_hex: Option<String>,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         self.ensure_debug_controls()?;
+        let fingerprint = send_final_fingerprint(
+            account_id_hex,
+            group_id_hex,
+            &text,
+            reply_to_message_id_hex.as_deref(),
+        );
+        let idempotency = if let Some(key) = idempotency_key {
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
+            }
+        } else {
+            None
+        };
         let record = self.debug_final_sends.record(AgentControlDebugFinalSend {
             account_id_hex: normalize_hex(account_id_hex)?,
             group_id_hex: normalize_hex(group_id_hex)?,
@@ -274,6 +300,17 @@ impl AgentConnector {
                 .transpose()?,
             message_ids_hex: Vec::new(),
         });
+        if let Some((key, reservation)) = idempotency {
+            let message_ids = record.message_ids_hex.clone();
+            let maintenance_disposition = AgentControlSendMaintenanceDisposition::Ready;
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids.clone(), maintenance_disposition);
+        }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: record.message_ids_hex,
             maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,

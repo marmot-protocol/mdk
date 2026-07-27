@@ -8,6 +8,7 @@ import {
   type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
+import { MarmotDispatchAmbiguousDeliveryError } from "../src/dispatch-errors.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import { createMarmotMessageAdapter } from "../src/outbound.js";
 import * as turnDelivery from "../src/turn-delivery.js";
@@ -27,7 +28,7 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
         resolveTurn: () => { runDispatch: () => Promise<unknown> };
       };
     }) => {
-      await params.adapter.resolveTurn().runDispatch();
+      return await params.adapter.resolveTurn().runDispatch();
     },
   ),
 }));
@@ -247,13 +248,15 @@ describe("inbound turn delivery coordination", () => {
       mentionPatterns: [],
     });
 
-    await dispatch({
-      accountIdHex: HEX("aa"),
-      groupIdHex: HEX("cc"),
-      messageIdHex: HEX("dd"),
-      senderAccountIdHex: HEX("bb"),
-      text: "hello",
-    });
+    await expect(
+      dispatch({
+        accountIdHex: HEX("aa"),
+        groupIdHex: HEX("cc"),
+        messageIdHex: HEX("dd"),
+        senderAccountIdHex: HEX("bb"),
+        text: "hello",
+      }),
+    ).rejects.toBeInstanceOf(MarmotDispatchAmbiguousDeliveryError);
 
     expect(sendFinalCalls.length).toBeGreaterThan(1);
     expect(sendFinalCalls.every((text) => text === "ambiguous tool send")).toBe(true);

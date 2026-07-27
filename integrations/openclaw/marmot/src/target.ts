@@ -35,7 +35,7 @@ export type MarmotTargetRejectCategory =
   | "decorated_route"
   | "invalid_hex";
 
-function looksLikeSessionKey(value: string): boolean {
+export function looksLikeMarmotSessionKey(value: string): boolean {
   const lower = value.toLowerCase();
   if (lower.startsWith("agent:")) {
     return true;
@@ -44,7 +44,11 @@ function looksLikeSessionKey(value: string): boolean {
   return lower.includes(`:${MARMOT_TARGET_PREFIX}:`);
 }
 
-function looksLikeCrossChannelTarget(value: string): boolean {
+function looksLikeSessionKey(value: string): boolean {
+  return looksLikeMarmotSessionKey(value);
+}
+
+export function looksLikeMarmotCrossChannelTarget(value: string): boolean {
   const match = /^([a-z][a-z0-9-]*):/.exec(value.toLowerCase());
   if (!match) {
     return false;
@@ -53,7 +57,11 @@ function looksLikeCrossChannelTarget(value: string): boolean {
   return prefix !== MARMOT_TARGET_PREFIX && prefix !== "group";
 }
 
-function hasRejectedKindPrefix(value: string): boolean {
+function looksLikeCrossChannelTarget(value: string): boolean {
+  return looksLikeMarmotCrossChannelTarget(value);
+}
+
+export function hasMarmotRejectedKindPrefix(value: string): boolean {
   const lower = value.toLowerCase();
   return REJECTED_KIND_PREFIXES.some((prefix) => lower.startsWith(prefix));
 }
@@ -107,7 +115,7 @@ export function canonicalizeMarmotGroupTarget(raw: string): string {
   if (looksLikeSessionKey(trimmed)) {
     throw new MarmotTargetError("session_key");
   }
-  if (hasRejectedKindPrefix(trimmed)) {
+  if (hasMarmotRejectedKindPrefix(trimmed)) {
     throw new MarmotTargetError("decorated_route");
   }
   if (looksLikeCrossChannelTarget(trimmed)) {
@@ -133,6 +141,31 @@ export function canonicalizeMarmotGroupTarget(raw: string): string {
     return candidate;
   }
   throw new MarmotTargetError("invalid_hex");
+}
+
+/** Whether Marmot should own target resolution for this raw message-tool input. */
+export function isMarmotOwnedTargetCandidate(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith(`${MARMOT_TARGET_PREFIX}:`)) {
+    return true;
+  }
+  if (lower.startsWith(INTERNAL_GROUP_PREFIX)) {
+    return true;
+  }
+  if (looksLikeMarmotSessionKey(lower)) {
+    return true;
+  }
+  if (hasMarmotRejectedKindPrefix(lower)) {
+    return true;
+  }
+  if (looksLikeMarmotCrossChannelTarget(lower)) {
+    return true;
+  }
+  return tryCanonicalizeMarmotGroupTarget(trimmed) !== undefined;
 }
 
 /** Best-effort normalize for target resolution; returns undefined when invalid. */

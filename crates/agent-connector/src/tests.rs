@@ -1233,6 +1233,81 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
 }
 
 #[tokio::test]
+async fn connector_debug_send_final_reuses_idempotency_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let account_id_hex = "11".repeat(32);
+    let group_id_hex = "22".repeat(32);
+    let message_id_hex = "33".repeat(32);
+    let idempotency_key = "turn-replay-key".to_owned();
+    let reply_text = "debug idempotent final".to_owned();
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        true,
+    )));
+
+    let first = send_control_request(
+        &socket,
+        "req-debug-final-idem-1",
+        AgentControlRequest::SendFinal {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: reply_text.clone(),
+            reply_to_message_id_hex: Some(message_id_hex.clone()),
+            idempotency_key: Some(idempotency_key.clone()),
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: first_ids,
+        ..
+    } = first.payload
+    else {
+        panic!("expected first debug final sent response");
+    };
+
+    let second = send_control_request(
+        &socket,
+        "req-debug-final-idem-2",
+        AgentControlRequest::SendFinal {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: reply_text.clone(),
+            reply_to_message_id_hex: Some(message_id_hex.clone()),
+            idempotency_key: Some(idempotency_key.clone()),
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: second_ids,
+        ..
+    } = second.payload
+    else {
+        panic!("expected second debug final sent response");
+    };
+    assert_eq!(second_ids, first_ids);
+
+    let recorded = send_control_request(
+        &socket,
+        "req-debug-finals-idem",
+        AgentControlRequest::DebugRecordedFinals,
+    )
+    .await;
+    let AgentControlResponse::DebugRecordedFinals { sends } = recorded.payload else {
+        panic!("expected recorded debug finals");
+    };
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].text, reply_text);
+    assert_eq!(sends[0].message_ids_hex, first_ids);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn connector_debug_controls_are_disabled_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");

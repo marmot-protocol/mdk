@@ -24,8 +24,11 @@ import type {
 } from "openclaw/plugin-sdk/channel-runtime";
 
 import {
+  canonicalizeMarmotGroupTarget,
   isMarmotGroupIdHex,
+  isMarmotOwnedTargetCandidate,
   MARMOT_TARGET_PREFIX,
+  MarmotTargetError,
   tryCanonicalizeMarmotGroupTarget,
 } from "./target.js";
 
@@ -48,10 +51,7 @@ export function normalizeMarmotTarget(raw: string): string | undefined {
  * (Marmot has none) and treats a group id as an explicit id.
  */
 export function looksLikeMarmotTarget(raw: string): boolean {
-  if (raw.trim().toLowerCase().startsWith(`${MARMOT_TARGET_PREFIX}:`)) {
-    return true;
-  }
-  return normalizeMarmotTarget(raw) !== undefined;
+  return isMarmotOwnedTargetCandidate(raw);
 }
 
 /**
@@ -64,8 +64,8 @@ export function looksLikeMarmotTarget(raw: string): boolean {
  * - `targetResolver.looksLikeId` lets a bare or `marmot:`-prefixed group id skip
  *   directory search and resolve as an explicit id.
  * - `targetResolver.resolveTarget` normalizes the input to the bare hex wn-agent
- *   expects and tags it as a group; it returns `null` for anything that is not a
- *   Marmot group id so an invalid target still fails cleanly (with `hint`).
+ *   expects and tags it as a group; invalid targets throw a privacy-safe
+ *   `MarmotTargetError` before OpenClaw can echo the raw target.
  * - `targetPrefixes` lets `marmot:<hex>` self-route to this channel and lets core
  *   reject another channel's prefix.
  * - `normalizeTarget` strips the `marmot:`/`0x` decoration so the resolved `to`
@@ -80,10 +80,11 @@ export function createMarmotMessagingAdapter(): ChannelMessagingAdapter {
       hint: "<marmot group id hex, e.g. marmot:<hex> or the bare hex>",
       looksLikeId: (raw) => looksLikeMarmotTarget(raw),
       resolveTarget: async ({ input, normalized }) => {
-        const to = normalizeMarmotTarget(input) ?? normalizeMarmotTarget(normalized);
-        if (!to) {
-          return null;
+        const raw = input?.trim() ? input : normalized;
+        if (!raw?.trim()) {
+          throw new MarmotTargetError("empty");
         }
+        const to = canonicalizeMarmotGroupTarget(raw);
         return { to, kind: "group", source: "normalized" };
       },
     },
