@@ -271,7 +271,11 @@ fn run_retention_group_sweeps(
     let mut outcomes = Vec::new();
     for input in inputs {
         let Some(retention_seconds) = input.retention_seconds else {
-            outcomes.push(failed_group_outcome(&input.group_id_hex, "unknown_group"));
+            let error = AppError::UnknownGroup(input.group_id_hex.clone());
+            outcomes.push(failed_group_outcome(
+                &input.group_id_hex,
+                error.privacy_safe_kind(),
+            ));
             continue;
         };
         if retention_seconds == 0 {
