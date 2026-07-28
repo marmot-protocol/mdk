@@ -42,6 +42,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   dropped on the send path, so storage showed the new state while live
   subscribers were never notified.
 
+- `wn tui` now scrolls the highlighted row into view on the account picker, the
+  profile, group-detail, and user-search panes, and the picker popup. Past
+  roughly a screenful of rows the highlight fell outside the drawn area, which
+  made the selection invisible rather than merely awkward — the marker and the
+  highlight are drawn inside each row.
+
 ### Changed
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
