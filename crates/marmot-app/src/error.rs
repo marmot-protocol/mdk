@@ -29,6 +29,8 @@ pub enum AppError {
     UnknownGroup(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
+    #[error("group disbanding is pending; local deletion is blocked")]
+    GroupDisbanding(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -135,6 +137,7 @@ impl AppError {
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
+            Self::GroupDisbanding(_) => "group_disbanding",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",

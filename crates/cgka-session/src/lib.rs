@@ -907,6 +907,28 @@ impl AccountDeviceSession {
         self.engine.epoch(group_id)
     }
 
+    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
+        self.engine.epoch_state(group_id)
+    }
+
+    pub fn disband_request(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<cgka_traits::DisbandRequest>, EngineError> {
+        self.engine.disband_request(group_id)
+    }
+
+    pub fn disbanding_support_blockers(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<MemberId>, EngineError> {
+        self.engine.disbanding_support_blockers(group_id)
+    }
+
+    pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        self.engine.acknowledge_disband_failure(group_id)
+    }
+
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
         self.engine.put_outbound_fanout(fanout)?;
         Ok(())
@@ -1007,6 +1029,7 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
+                SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
                 SendResult::ApplicationMessage {
                     msg,
                     group_id,
@@ -1103,11 +1126,15 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+        SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::Disband { .. } => "disband",
     }
 }
 
 fn send_result_kind(result: &SendResult) -> &'static str {
     match result {
+        SendResult::NoChange { .. } => "no_change",
+        SendResult::DisbandRequested { .. } => "disband_requested",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",

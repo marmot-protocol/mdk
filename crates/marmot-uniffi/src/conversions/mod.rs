@@ -150,6 +150,21 @@ mod tests {
         }
     }
 
+    fn mls_state() -> AppGroupMlsStateFfi {
+        AppGroupMlsStateFfi {
+            group_id_hex: "01".repeat(16),
+            protocol_profile: AppProtocolProfileFfi::Current,
+            lifecycle_state: GroupLifecycleStateFfi::Stable,
+            epoch: 1,
+            member_count: 2,
+            unrecoverable: false,
+            required_app_components: vec![],
+            disbanding_enabled: true,
+            disbanding_blockers: vec![],
+            disband_request: None,
+        }
+    }
+
     #[test]
     fn group_management_state_marks_last_admin_self_demote_requirement() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
@@ -157,6 +172,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![self_id]),
             members: vec![member(self_id, true, true), member(bob_id, false, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);
@@ -197,6 +213,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: leaving,
             members: vec![member(self_id, false, true), member(bob_id, true, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);
@@ -210,11 +227,82 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![bob_id]),
             members: details.members,
+            mls_state: mls_state(),
         };
         let state = group_management_state_ffi(self_id, &details);
         assert!(state.can_leave);
         assert!(!state.leave_request_pending);
         assert_eq!(state.leave_requested_at_ms, None);
+    }
+
+    #[test]
+    fn disband_gate_and_terminal_state_disable_every_management_action() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let members = vec![member(self_id, true, true), member(bob_id, false, false)];
+
+        for terminal in [false, true] {
+            let mut mls = mls_state();
+            if terminal {
+                mls.lifecycle_state = GroupLifecycleStateFfi::Disbanded;
+            } else {
+                mls.disband_request = Some(DisbandRequestFfi::Pending {
+                    requested_at_ms: 1_700_000_000_123,
+                });
+            }
+            let state = group_management_state_ffi(
+                self_id,
+                &GroupDetailsFfi {
+                    group: group(vec![self_id]),
+                    members: members.clone(),
+                    mls_state: mls,
+                },
+            );
+
+            assert!(!state.can_invite);
+            assert!(!state.can_leave);
+            assert!(!state.requires_self_demote_before_leave);
+            assert!(!state.can_enable_disbanding);
+            assert!(!state.can_disband);
+            assert!(
+                state.member_actions.iter().all(|action| {
+                    !action.can_remove && !action.can_promote && !action.can_demote
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_ffi_mapping_covers_all_six_canonical_states() {
+        let cases = [
+            (
+                marmot_app::AppGroupLifecycleState::Stable,
+                GroupLifecycleStateFfi::Stable,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::PendingPublish,
+                GroupLifecycleStateFfi::PendingPublish,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Merging,
+                GroupLifecycleStateFfi::Merging,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Recovering,
+                GroupLifecycleStateFfi::Recovering,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Unrecoverable,
+                GroupLifecycleStateFfi::Unrecoverable,
+            ),
+            (
+                marmot_app::AppGroupLifecycleState::Disbanded,
+                GroupLifecycleStateFfi::Disbanded,
+            ),
+        ];
+        for (app, ffi) in cases {
+            assert_eq!(GroupLifecycleStateFfi::from(app), ffi);
+        }
     }
 
     #[test]
@@ -516,6 +604,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![self_id, bob_id]),
             members: vec![member(self_id, true, true), member(bob_id, true, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);
@@ -539,6 +628,7 @@ mod tests {
         let details = GroupDetailsFfi {
             group: group(vec![alice_id]),
             members: vec![member(self_id, false, true), member(alice_id, true, false)],
+            mls_state: mls_state(),
         };
 
         let state = group_management_state_ffi(self_id, &details);

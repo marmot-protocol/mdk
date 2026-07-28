@@ -35,6 +35,7 @@ pub(crate) fn pending_kind_str(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::CreateGroup => "create_group",
         PendingKind::GroupEvolution => "group_evolution",
+        PendingKind::Disband => "disband",
     }
 }
 
@@ -112,6 +113,8 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+        SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::Disband { .. } => "disband",
     }
 }
 
@@ -128,12 +131,16 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => group_id.clone(),
+        | SendIntent::UpdateGroupData { group_id, .. }
+        | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::Disband { group_id } => group_id.clone(),
     }
 }
 
 pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
     match result {
+        SendResult::NoChange { .. } => "no_change",
+        SendResult::DisbandRequested { .. } => "disband_requested",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
@@ -163,6 +170,7 @@ pub(crate) fn epoch_state_name_str(name: &str) -> &'static str {
         "Merging" => "merging",
         "Recovering" => "recovering",
         "Unrecoverable" => "unrecoverable",
+        "Disbanded" => "disbanded",
         _ => "unknown",
     }
 }
@@ -192,6 +200,7 @@ pub(crate) fn group_state_change_kind_str(change: &GroupStateChange) -> &'static
         GroupStateChange::GroupRenamed { .. } => "group_renamed",
         GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
         GroupStateChange::MessageRetentionChanged { .. } => "message_retention_changed",
+        GroupStateChange::GroupDisbanded => "group_disbanded",
     }
 }
 
@@ -205,6 +214,7 @@ fn group_state_change_fields(change: &GroupStateChange) -> Vec<String> {
         GroupStateChange::GroupRenamed { .. } => &["name"],
         GroupStateChange::GroupAvatarChanged => &["avatar"],
         GroupStateChange::MessageRetentionChanged { .. } => &["message_retention"],
+        GroupStateChange::GroupDisbanded => &["lifecycle"],
     };
     fields.iter().map(|field| (*field).to_string()).collect()
 }
@@ -222,6 +232,12 @@ fn group_state_change_component_ids(change: &GroupStateChange) -> Vec<u16> {
         GroupStateChange::MessageRetentionChanged { .. } => {
             vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID]
         }
+        GroupStateChange::GroupDisbanded => {
+            vec![
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ]
+        }
         GroupStateChange::MemberAdded { .. }
         | GroupStateChange::MemberRemoved { .. }
         | GroupStateChange::MemberLeft { .. } => Vec::new(),
@@ -237,7 +253,8 @@ fn group_state_subject_member(change: &GroupStateChange) -> Option<&MemberId> {
         | GroupStateChange::AdminRemoved { member } => Some(member),
         GroupStateChange::GroupRenamed { .. }
         | GroupStateChange::GroupAvatarChanged
-        | GroupStateChange::MessageRetentionChanged { .. } => None,
+        | GroupStateChange::MessageRetentionChanged { .. }
+        | GroupStateChange::GroupDisbanded => None,
     }
 }
 
@@ -544,6 +561,7 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
     }
     let mut messages = Vec::new();
     match result {
+        SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
         SendResult::ApplicationMessage { msg, .. } => {
             messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
         }
@@ -599,6 +617,7 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::AdminDepletion { .. } => "admin_depletion",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",

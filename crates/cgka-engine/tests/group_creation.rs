@@ -17,7 +17,8 @@ use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
     EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_lifecycle_v1,
     default_group_components, encode_components_list, encode_encrypted_media_policy_v2,
     encode_nostr_routing_v1,
 };
@@ -31,7 +32,7 @@ use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    GroupStorage, KeyPackageBundleStorage, MessageStorage, StorageProvider,
+    ConvergencePassStorage, GroupStorage, KeyPackageBundleStorage, MessageStorage, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -1187,6 +1188,22 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
     let group = alice.group_record(&group_id).unwrap();
     assert_eq!(group.epoch, cgka_traits::types::EpochId(0));
     assert_eq!(group.members.len(), 1);
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_LIFECYCLE_COMPONENT_ID)
+    );
+    assert_eq!(
+        decode_group_lifecycle_v1(
+            &alice
+                .app_component(&group_id, GROUP_LIFECYCLE_COMPONENT_ID)
+                .unwrap()
+                .expect("new current group has lifecycle-v1"),
+        )
+        .unwrap(),
+        GroupLifecycleV1::Active
+    );
     assert!(matches!(
         alice.drain_events().as_slice(),
         [cgka_traits::engine::GroupEvent::GroupCreated { group_id: created }]
@@ -1201,6 +1218,161 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
         .await
         .expect("canonical solo group accepts work without confirm_published");
     assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
+}
+
+#[tokio::test]
+async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let identity = b"alice-current-solo-disband";
+    let mut alice =
+        build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "terminal solo".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+    alice.drain_events();
+
+    let requested = alice
+        .send(cgka_traits::engine::SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(requested, SendResult::DisbandRequested { .. }));
+    assert!(matches!(
+        alice.disband_request(&group_id).unwrap().unwrap().status,
+        cgka_traits::DisbandRequestStatus::Pending
+    ));
+    assert!(
+        alice
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, "must be gated"),
+            })
+            .await
+            .is_err(),
+        "durable request acceptance gates ordinary outbound work immediately"
+    );
+
+    let prepared = alice.advance_convergence(&group_id).await.unwrap();
+    let pending = match prepared.as_slice() {
+        [
+            SendResult::GroupEvolution {
+                pending, welcomes, ..
+            },
+        ] => {
+            assert!(welcomes.is_empty());
+            *pending
+        }
+        other => panic!("expected one prepared disband commit, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(
+        !matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ),
+        "publish confirmation alone must not terminalize before convergence"
+    );
+
+    for _ in 0..24 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            alice
+                .advance_convergence(&group_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        if matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ) {
+            break;
+        }
+    }
+    assert!(
+        matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ),
+        "disband did not settle within the bounded convergence pass: state={:?}, pass={:?}",
+        alice.epoch_state(&group_id),
+        storage.convergence_pass(&group_id).unwrap()
+    );
+    let terminal = alice.group_record(&group_id).unwrap();
+    assert!(terminal.disbanded.is_some());
+    assert_eq!(
+        terminal.members.len(),
+        1,
+        "historical pre-disband account roster is retained"
+    );
+    assert!(alice.disband_request(&group_id).unwrap().is_none());
+    let state_changes = alice
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            cgka_traits::engine::GroupEvent::GroupStateChanged { change, .. } => Some(change),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        state_changes,
+        vec![cgka_traits::engine::GroupStateChange::GroupDisbanded],
+        "the terminal commit suppresses member/admin removal changes"
+    );
+
+    drop(alice);
+    let mut reopened =
+        build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    assert!(matches!(
+        reopened.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ));
+    assert!(
+        reopened
+            .group_record(&group_id)
+            .unwrap()
+            .disbanded
+            .is_some()
+    );
+    assert!(reopened.quarantined_groups().is_empty());
+
+    drop(reopened);
+    assert!(
+        storage
+            .delete_local_group_data(&hex::encode(group_id.as_slice()))
+            .unwrap(),
+        "terminal local deletion should remove history and the full group row"
+    );
+    let mut tombstone_only =
+        build_profile_client_on_storage(identity, storage, ProtocolProfile::Current);
+    tombstone_only.hydrate_stable_groups_from_storage().unwrap();
+    assert!(matches!(
+        tombstone_only.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ));
+    assert!(
+        tombstone_only.live_group_ids().unwrap().is_empty(),
+        "a tombstone-only group is terminal but never live/routable"
+    );
+    assert!(tombstone_only.quarantined_groups().is_empty());
+    assert!(
+        tombstone_only.group_record(&group_id).is_err(),
+        "full group metadata is optional after the user deletes local history"
+    );
 }
 
 #[tokio::test]

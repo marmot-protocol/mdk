@@ -73,6 +73,11 @@ pub struct Group {
     /// before this field existed.
     #[serde(default)]
     pub unrecoverable: bool,
+    /// Authenticated terminal tombstone. When present, live OpenMLS state has
+    /// been deleted and the group must never hydrate, route, send, converge, or
+    /// rejoin under this group id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disbanded: Option<DisbandTombstone>,
     /// Epoch at which this device's membership began (welcome-join or group
     /// creation), refreshed on an authenticated re-join. Post-peel
     /// classification lower bound: an application message whose MLS epoch
@@ -81,6 +86,21 @@ pub struct Group {
     /// persisted before this field existed) means "unknown — no bound".
     #[serde(default)]
     pub join_epoch: EpochId,
+}
+
+/// Durable evidence and read-only projection material retained after a
+/// selected disband Commit deletes live MLS state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisbandTombstone {
+    pub epoch: EpochId,
+    pub actor: MemberId,
+    pub origin_commit_id: Option<crate::types::MessageId>,
+    pub commit_digest: [u8; 32],
+    /// True only on the exact account-device leaf that authored the selected
+    /// Commit. Sibling leaves for the same account are removed.
+    pub local_was_committer_leaf: bool,
+    /// Deduplicated account roster captured immediately before disbanding.
+    pub former_members: Vec<Member>,
 }
 
 /// One member of a group, as storage sees it.

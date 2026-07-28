@@ -1848,6 +1848,7 @@ fn dummy_group(group_id: GroupId) -> Group {
         protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
         removed: false,
         unrecoverable: false,
+        disbanded: None,
         join_epoch: EpochId(0),
     }
 }

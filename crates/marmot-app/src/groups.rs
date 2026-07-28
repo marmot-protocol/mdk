@@ -168,11 +168,82 @@ pub struct AppGroupMemberRecord {
 pub struct AppGroupMlsState {
     pub group_id_hex: String,
     pub protocol_profile: AppProtocolProfile,
+    pub lifecycle_state: AppGroupLifecycleState,
     pub epoch: u64,
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
+    pub disbanding_enabled: bool,
+    #[serde(default)]
+    pub disbanding_blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disband_request: Option<AppDisbandRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppGroupLifecycleState {
+    #[default]
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
+
+impl From<cgka_traits::GroupLifecycleState> for AppGroupLifecycleState {
+    fn from(value: cgka_traits::GroupLifecycleState) -> Self {
+        match value {
+            cgka_traits::GroupLifecycleState::Stable => Self::Stable,
+            cgka_traits::GroupLifecycleState::PendingPublish => Self::PendingPublish,
+            cgka_traits::GroupLifecycleState::Merging => Self::Merging,
+            cgka_traits::GroupLifecycleState::Recovering => Self::Recovering,
+            cgka_traits::GroupLifecycleState::Unrecoverable => Self::Unrecoverable,
+            cgka_traits::GroupLifecycleState::Disbanded => Self::Disbanded,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDisbandFailureReason {
+    NoLongerAdmin,
+    NoLongerMember,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDisbandRequest {
+    Pending {
+        requested_at_ms: u64,
+    },
+    Failed {
+        requested_at_ms: u64,
+        reason: AppDisbandFailureReason,
+    },
+}
+
+impl From<cgka_traits::DisbandRequest> for AppDisbandRequest {
+    fn from(value: cgka_traits::DisbandRequest) -> Self {
+        match value.status {
+            cgka_traits::DisbandRequestStatus::Pending => Self::Pending {
+                requested_at_ms: value.requested_at_ms,
+            },
+            cgka_traits::DisbandRequestStatus::Failed(reason) => Self::Failed {
+                requested_at_ms: value.requested_at_ms,
+                reason: match reason {
+                    cgka_traits::DisbandFailureReason::NoLongerAdmin => {
+                        AppDisbandFailureReason::NoLongerAdmin
+                    }
+                    cgka_traits::DisbandFailureReason::NoLongerMember => {
+                        AppDisbandFailureReason::NoLongerMember
+                    }
+                },
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -711,6 +782,7 @@ mod prior_nostr_route_tests {
             protocol_profile: ProtocolProfile::Current,
             removed: false,
             unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(0),
         }
     }
@@ -1571,6 +1643,7 @@ mod delete_moderation_grant_tests {
             protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
             unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(0),
         }
     }

@@ -25,10 +25,10 @@ use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
-    AppGroupMlsState, AppGroupRecord, AppInitialGroupImage, AppProjectionUpdate,
-    AppQuarantinedGroup, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
+    AppProjectionUpdate, AppQuarantinedGroup, GroupInviteDeclineResult, MaintenanceRunSummary,
+    MarmotApp, MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
     MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
     PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
@@ -107,6 +107,18 @@ pub(crate) enum AccountWorkerCommand {
     GroupMlsState {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
+    },
+    EnableGroupDisbanding {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    DisbandGroup {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<AppDisbandRequest, AppError>>,
+    },
+    AcknowledgeDisbandFailure {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
     },
     QuarantinedGroups {
         respond: oneshot::Sender<Result<Vec<AppQuarantinedGroup>, AppError>>,
@@ -963,6 +975,40 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
+            let result = client.enable_group_disbanding(&group_id).await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DisbandGroup { group_id, respond } => {
+            let result = client.disband_group(&group_id).await;
+            publish_app_runtime_group_state_updated(
+                events,
+                account_id_hex,
+                account_label,
+                &group_id,
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::AcknowledgeDisbandFailure { group_id, respond } => {
+            let result = client.acknowledge_disband_failure(&group_id);
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {

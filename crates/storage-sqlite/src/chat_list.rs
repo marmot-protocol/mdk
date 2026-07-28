@@ -165,6 +165,11 @@ pub struct ChatListRow {
     pub pinned_position: Option<u32>,
     pub archived: bool,
     pub pending_confirmation: bool,
+    /// Durable lifecycle classification. Ephemeral merge/publish states are
+    /// exposed by the live MLS-state API; the chat-list projection guarantees
+    /// terminal Disbanded survives restarts and local history deletion.
+    #[serde(default)]
+    pub lifecycle_state: cgka_traits::GroupLifecycleState,
     pub title: String,
     pub group_name: String,
     pub avatar_url: Option<String>,
@@ -359,7 +364,11 @@ impl SqliteAccountStorage {
              FROM chat_list_rows AS row
              LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
              WHERE row.archived = 0
-               AND COALESCE(ag.self_membership, 'member') NOT IN ('left', 'removed')",
+               AND COALESCE(ag.self_membership, 'member') NOT IN ('left', 'removed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM cgka_disband_tombstones AS tomb
+                   WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
+               )",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -1487,6 +1496,10 @@ const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
             ag.member_count,
             mute.group_id_hex IS NOT NULL,
             mute.muted_until_ms,
+            EXISTS (
+                SELECT 1 FROM cgka_disband_tombstones AS tomb
+                WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
+            ),
             pin.group_id_hex IS NOT NULL,
             CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
                 SELECT COUNT(*)
@@ -1551,10 +1564,15 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         .and_then(|value| u64::try_from(value).ok());
     let mute_row_exists = row.get::<_, i64>(30)? != 0;
     let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
+    let lifecycle_state = if row.get::<_, i64>(32)? != 0 {
+        cgka_traits::GroupLifecycleState::Disbanded
+    } else {
+        cgka_traits::GroupLifecycleState::Stable
+    };
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
-    let pinned = row.get::<_, i64>(32)? != 0;
+    let pinned = row.get::<_, i64>(33)? != 0;
     let pinned_position = row
-        .get::<_, Option<i64>>(33)?
+        .get::<_, Option<i64>>(34)?
         .and_then(|value| u32::try_from(value).ok());
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
@@ -1562,6 +1580,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         pinned_position,
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
+        lifecycle_state,
         title: row.get(3)?,
         group_name: group_name.clone(),
         avatar_url,

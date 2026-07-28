@@ -2649,6 +2649,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
                 protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
                 unrecoverable: false,
+                disbanded: None,
                 join_epoch: EpochId(0),
             })
             .unwrap();

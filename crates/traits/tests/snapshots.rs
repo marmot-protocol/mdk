@@ -721,6 +721,7 @@ fn snapshot_group_and_member() {
             protocol_profile: ProtocolProfile::Current,
             removed: false,
             unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(2),
         }
     );

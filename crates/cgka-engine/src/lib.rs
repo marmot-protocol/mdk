@@ -44,6 +44,7 @@ pub mod capabilities;
 pub mod capability_manager;
 pub mod convergence;
 pub(crate) mod convergence_input;
+pub mod disband;
 pub mod distributed_convergence;
 pub mod engine;
 pub mod engine_metrics;

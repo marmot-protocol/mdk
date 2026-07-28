@@ -173,6 +173,96 @@ pub trait LeaveRequestStorage {
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 
+// ── DisbandRequestStorage ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisbandFailureReason {
+    NoLongerAdmin,
+    NoLongerMember,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisbandRequestStatus {
+    #[default]
+    Pending,
+    Failed(DisbandFailureReason),
+}
+
+/// Durable irreversible product intent to terminate a group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisbandRequest {
+    pub group_id: GroupId,
+    pub requested_at_ms: u64,
+    #[serde(default)]
+    pub status: DisbandRequestStatus,
+    /// Last epoch for which this client prepared a disband Commit. The product
+    /// intent is not epoch-bound; a losing branch clears this and retries.
+    pub last_prepared_epoch: Option<EpochId>,
+}
+
+pub trait DisbandRequestStorage {
+    fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()>;
+    fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>>;
+    fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()>;
+}
+
+/// Authenticated terminal Commit evidence retained while the Commit competes
+/// in the mandatory bounded convergence pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisbandCandidate {
+    pub group_id: GroupId,
+    pub source_epoch: EpochId,
+    /// Identifier used by the durable convergence record. Locally authored
+    /// commits use the exact signed transport id; inbound commits are already
+    /// rebound to their content-derived id by ingest.
+    pub commit_id: MessageId,
+    /// SHA-256 of the MLS commit bytes, matching convergence's canonical
+    /// cross-transport identifier.
+    pub content_commit_id: MessageId,
+    pub commit_digest: [u8; 32],
+    pub actor: crate::types::MemberId,
+    pub local_was_committer_leaf: bool,
+    /// Deduplicated account roster from the candidate parent.
+    pub former_members: Vec<crate::group::Member>,
+}
+
+pub trait DisbandCandidateStorage {
+    fn put_disband_candidate(&self, candidate: &DisbandCandidate) -> StorageResult<()>;
+    fn disband_candidate(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<DisbandCandidate>>;
+    fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>>;
+    fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()>;
+}
+
+/// Minimal authenticated terminal guard. Unlike the presentation `Group`
+/// record this row deliberately has no foreign key, so deleting local history
+/// cannot make a disbanded MLS group id joinable again.
+pub trait DisbandTombstoneStorage {
+    fn put_disband_tombstone(
+        &self,
+        group_id: &GroupId,
+        tombstone: &crate::group::DisbandTombstone,
+    ) -> StorageResult<()>;
+    fn disband_tombstone(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<crate::group::DisbandTombstone>>;
+
+    /// Enumerate terminal guards independently from live group records. This is
+    /// required after a user deletes local history and only the anti-
+    /// resurrection tombstone remains.
+    fn list_disband_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(GroupId, crate::group::DisbandTombstone)>> {
+        Ok(Vec::new())
+    }
+}
+
 // ── WelcomeStorage ──────────────────────────────────────────────────────────
 
 pub trait WelcomeStorage {
@@ -363,6 +453,9 @@ pub trait StorageProvider:
     + OutboundIntentStorage
     + OutboundFanoutStorage
     + LeaveRequestStorage
+    + DisbandRequestStorage
+    + DisbandCandidateStorage
+    + DisbandTombstoneStorage
     + WelcomeStorage
     + CapabilityStorage
     + ConvergencePolicyStorage

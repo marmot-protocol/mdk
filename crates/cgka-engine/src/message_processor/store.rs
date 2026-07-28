@@ -539,6 +539,7 @@ mod tests {
                 protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
                 unrecoverable: false,
+                disbanded: None,
                 join_epoch: EpochId(0),
             })
             .unwrap();

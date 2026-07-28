@@ -155,6 +155,13 @@ pub enum SendIntent {
         name: Option<String>,
         description: Option<String>,
     },
+    /// Install `marmot.group.lifecycle.v1 = active` and require the component
+    /// in one admin Commit for a compatible existing group.
+    EnableDisbanding { group_id: GroupId },
+    /// Persist the irreversible local intent to terminate the group. Preparing
+    /// and publishing the terminal Commit is driven asynchronously from this
+    /// durable request.
+    Disband { group_id: GroupId },
 }
 
 /// The engine's response to [`CgkaEngine::send`].
@@ -163,6 +170,15 @@ pub enum SendIntent {
 /// member additions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
+    /// The requested idempotent mutation was already reflected by canonical
+    /// state, so no transport publication is necessary.
+    NoChange { group_id: GroupId },
+    /// The irreversible disband request is durable. The engine prepares its
+    /// terminal Commit asynchronously after any staged publish and the
+    /// mandatory convergence gate permit it.
+    DisbandRequested {
+        request: crate::storage::DisbandRequest,
+    },
     /// Pure application message — publish once, no state advance.
     ApplicationMessage {
         msg: TransportMessage,
@@ -349,6 +365,9 @@ pub enum GroupStateChange {
     GroupAvatarChanged,
     /// The per-group disappearing-message retention changed. `0` means disabled.
     MessageRetentionChanged { old_seconds: u64, new_seconds: u64 },
+    /// The selected Commit terminalized the group. The authenticated committer
+    /// is carried as the surrounding event actor.
+    GroupDisbanded,
 }
 
 /// Why a stored group was skipped during session-open hydration.

@@ -28,6 +28,15 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
         let group_id = super::send_intent_group_id(&intent).clone();
+        if self.storage.disband_tombstone(&group_id)?.is_some() {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanded",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "Disbanded is terminal",
+                },
+            ));
+        }
         // A local copy marked removed is terminal for outbound work: the spec
         // forbids preparing/publishing anything for it (member-departure.md,
         // "Realizing removal"), and the underlying OpenMLS state would only
@@ -80,6 +89,10 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_update_group_data(group_id, name, description)
                     .await
             }
+            SendIntent::EnableDisbanding { group_id } => {
+                self.do_enable_group_disbanding(group_id).await
+            }
+            SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         }
     }
 

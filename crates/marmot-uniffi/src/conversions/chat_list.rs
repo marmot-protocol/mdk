@@ -7,6 +7,7 @@ use marmot_app::{
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
+use super::group::GroupLifecycleStateFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
@@ -149,6 +150,7 @@ pub struct ChatListRowFfi {
     pub pinned_position: Option<u32>,
     pub archived: bool,
     pub pending_confirmation: bool,
+    pub lifecycle_state: GroupLifecycleStateFfi,
     pub title: String,
     pub group_name: String,
     pub avatar_url: Option<String>,
@@ -214,6 +216,7 @@ impl From<ChatListRow> for ChatListRowFfi {
             pinned_position: value.pinned_position,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
+            lifecycle_state: value.lifecycle_state.into(),
             title: value.title,
             group_name: value.group_name,
             avatar_url: value.avatar_url,
@@ -379,6 +382,7 @@ mod tests {
             pinned_position: None,
             archived: false,
             pending_confirmation: false,
+            lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
             title: "Marmot Lab".to_owned(),
             group_name: "Marmot Lab".to_owned(),
             avatar_url: None,

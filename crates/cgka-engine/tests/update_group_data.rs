@@ -19,10 +19,10 @@ use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    default_group_components, encode_component_vectors, encode_components_list,
-    encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_component_vectors,
+    encode_components_list, encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent,
@@ -32,7 +32,7 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -424,7 +424,6 @@ async fn routing_rotation_reindexes_inbound_transport_group_id() {
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
-
     // Alice rotates the routing X -> Y and confirms locally.
     let routing_y = NostrRoutingV1::new([0x59; 32], vec!["wss://y.example".into()]).unwrap();
     let res = alice
@@ -1066,6 +1065,71 @@ async fn inbound_commit_cannot_unrequire_current_admin_policy() {
     assert_eq!(
         bob.admin_pubkeys(&gid).unwrap(),
         vec![<[u8; 32]>::try_from(pad32(b"alice")).unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn current_profile_component_update_preserves_active_lifecycle_for_peer() {
+    let mut alice = build_current(b"alice-lifecycle-update");
+    let mut bob = build_current(b"bob-lifecycle-update");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_group_profile_v1(
+                    &cgka_traits::app_components::GroupProfileV1 {
+                        name: "after".into(),
+                        description: String::new(),
+                    },
+                )
+                .unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        bob.ingest(commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    for _ in 0..24 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        bob.advance_convergence(&gid).await.unwrap();
+        if bob.group_record(&gid).unwrap().name == "after" {
+            break;
+        }
+    }
+
+    assert_eq!(bob.group_record(&gid).unwrap().name, "after");
+    assert_eq!(
+        bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+            .unwrap(),
+        Some(vec![0])
     );
 }
 

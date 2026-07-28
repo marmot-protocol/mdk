@@ -163,6 +163,7 @@ fn group_state_change_tag(change: &GroupStateChange) -> &'static str {
         GroupStateChange::GroupRenamed { .. } => "group_renamed",
         GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
         GroupStateChange::MessageRetentionChanged { .. } => "disappearing_timer_changed",
+        GroupStateChange::GroupDisbanded => "group_disbanded",
     }
 }
 

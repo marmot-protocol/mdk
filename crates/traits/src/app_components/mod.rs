@@ -26,6 +26,7 @@ mod codec;
 mod encrypted_media;
 mod encrypted_media_v2;
 mod host_safety;
+mod lifecycle;
 mod profile;
 mod routing;
 
@@ -56,6 +57,7 @@ pub use host_safety::{
     is_loopback_candidate_host, is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4,
     is_public_ipv6, reject_non_public_ip, reject_non_public_socket_addr,
 };
+pub use lifecycle::{GroupLifecycleV1, decode_group_lifecycle_v1, encode_group_lifecycle_v1};
 pub use profile::{
     GROUP_PROFILE_DESCRIPTION_MAX_LEN, GROUP_PROFILE_NAME_MAX_LEN, GroupProfileV1,
     decode_group_profile_v1, encode_group_profile_v1,
@@ -103,6 +105,7 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
 /// `app_components`.
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
+pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
 /// Lookup key for the encrypted-media secret in the
 /// [`crate::group_context::GroupContextSnapshot`] secrets map. This is an
 /// internal cache key, NOT the MLS exporter label/context: the secret is derived
@@ -123,6 +126,7 @@ pub const GROUP_ENCRYPTED_MEDIA_V1_COMPONENT: &str = "marmot.group.encrypted-med
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = GROUP_ENCRYPTED_MEDIA_V1_COMPONENT;
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
+pub const GROUP_LIFECYCLE_COMPONENT: &str = "marmot.group.lifecycle.v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";
@@ -146,9 +150,13 @@ pub struct AppComponentData {
 /// The group-state components this implementation creates by default when
 /// every founding member advertises support for them.
 pub fn default_group_components() -> BTreeSet<AppComponentId> {
-    [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID]
-        .into_iter()
-        .collect()
+    [
+        GROUP_PROFILE_COMPONENT_ID,
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        GROUP_LIFECYCLE_COMPONENT_ID,
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Sorted set of app component ids.

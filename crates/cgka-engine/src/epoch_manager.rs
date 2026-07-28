@@ -52,6 +52,7 @@ struct PendingMeta {
 pub(crate) enum PendingKind {
     CreateGroup,
     GroupEvolution,
+    Disband,
 }
 
 #[derive(Default)]
@@ -109,7 +110,7 @@ impl EpochManager {
     /// Refuses to overwrite `Unrecoverable`: the only legal exit is
     /// [`Self::repair_to_stable`] after a verified repair path (mdk#971).
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
-        if self.is_unrecoverable(&group_id) {
+        if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
             tracing::warn!(
                 target: "cgka_engine::epoch_manager",
                 method = "set_stable",
@@ -382,6 +383,37 @@ impl EpochManager {
         self.states
             .get(group_id)
             .is_some_and(|s| s.is_unrecoverable())
+    }
+
+    pub(crate) fn is_disbanded(&self, group_id: &GroupId) -> bool {
+        self.states
+            .get(group_id)
+            .is_some_and(EpochState::is_disbanded)
+    }
+
+    pub(crate) fn mark_disbanded(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let previous = self
+            .states
+            .get(group_id)
+            .cloned()
+            .unwrap_or_else(|| EpochState::stable(epoch));
+        let next = previous
+            .detect_fork(Vec::new())
+            .settle_to_disbanded(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id.clone(), next);
+        Ok(())
+    }
+
+    pub(crate) fn restore_disbanded(&mut self, group_id: GroupId, epoch: EpochId) {
+        let recovering = EpochState::stable(epoch).detect_fork(Vec::new());
+        if let Ok(disbanded) = recovering.settle_to_disbanded(epoch) {
+            self.states.insert(group_id, disbanded);
+        }
     }
 }
 

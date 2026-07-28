@@ -648,9 +648,20 @@ impl<S: StorageProvider> Engine<S> {
             .collect::<Result<Vec<_>, _>>()?;
         let context =
             ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input)| *input));
-        let has_trigger = projected
+        let candidate_ids: HashSet<MessageId> = self
+            .storage
+            .list_disband_candidates(group_id)
+            .map_err(storage_projection_error)?
+            .into_iter()
+            .flat_map(|candidate| [candidate.commit_id, candidate.content_commit_id])
+            .collect();
+        let has_terminal_trigger = projected
             .iter()
-            .any(|(_, input)| context.opens_pass(*input));
+            .any(|(member, _)| candidate_ids.contains(&member.message_id));
+        let has_trigger = has_terminal_trigger
+            || projected
+                .iter()
+                .any(|(_, input)| context.opens_pass(*input));
         Ok((
             projected.into_iter().map(|(member, _)| member).collect(),
             has_trigger,
@@ -1164,7 +1175,7 @@ impl<S: StorageProvider> Engine<S> {
         let origin_commit_actor =
             single_accepted_commit_actor(&observations, origin_commit_id.as_ref());
 
-        if let Some(selected_tip) = result.selected_tip {
+        let terminalized = if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
             self.epoch_manager
                 .set_stable(group_id.clone(), selected_tip);
@@ -1186,17 +1197,34 @@ impl<S: StorageProvider> Engine<S> {
                     now_ms,
                 );
             }
-            self.emit_convergence_events(
+            let terminalized = self
+                .settle_disband_after_convergence(
+                    group_id,
+                    &result.accepted_commits,
+                    origin_commit_id.as_ref(),
+                )
+                .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?;
+            if !terminalized {
+                self.emit_convergence_events(
+                    group_id,
+                    previous_group.members,
+                    &previous_name,
+                    previous_components,
+                    previous_tip,
+                    selected_tip,
+                    origin_commit_id,
+                    origin_commit_actor,
+                )?;
+            }
+            terminalized
+        } else {
+            self.settle_disband_after_convergence(
                 group_id,
-                previous_group.members,
-                &previous_name,
-                previous_components,
-                previous_tip,
-                selected_tip,
-                origin_commit_id,
-                origin_commit_actor,
-            )?;
-        }
+                &result.accepted_commits,
+                origin_commit_id.as_ref(),
+            )
+            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
+        };
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rejected_proposal_convergence_audits(group_id, &result);
@@ -1206,7 +1234,7 @@ impl<S: StorageProvider> Engine<S> {
         // A selected branch reached the canonical state (Settled): the run is
         // applied/stable. With no selected branch the pass simply settled with
         // nothing to apply.
-        let applied_phase = if result.selected_tip.is_some() {
+        let applied_phase = if terminalized || result.selected_tip.is_some() {
             ConvergencePhase::Applied
         } else {
             ConvergencePhase::Stable

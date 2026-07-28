@@ -662,9 +662,12 @@ impl SqliteAccountStorage {
     /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
     /// because protocol/MLS state is intentionally retained; without it that
     /// state could immediately rederive wiped key bytes. `seen_events` and
-    /// protocol/MLS tables are left intact so old relay deliveries stay
-    /// suppressed while a future fresh group message can re-create the app
-    /// projection.
+    /// protocol/MLS tables are left intact for active groups so old relay
+    /// deliveries stay suppressed while a future fresh group message can
+    /// re-create the app projection. A terminal group is different: its live
+    /// MLS state is already erased, so this transaction also removes the full
+    /// `cgka_groups` row and retains only `cgka_disband_tombstones` as the
+    /// permanent anti-resurrection guard.
     pub fn delete_local_group_data(&self, group_id_hex: &str) -> StorageResult<bool> {
         if group_id_hex.trim().is_empty() {
             return Err(StorageError::Backend(
@@ -696,6 +699,25 @@ impl SqliteAccountStorage {
                         params![group_id_hex],
                     )
                     .storage()?,
+                );
+            }
+            let group_id = hex::decode(group_id_hex).map_err(|error| {
+                StorageError::Serialization(format!("invalid local group id: {error}"))
+            })?;
+            let terminal = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?1
+                     )",
+                    params![&group_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .storage()?
+                != 0;
+            if terminal {
+                deleted = deleted.saturating_add(
+                    conn.execute("DELETE FROM cgka_groups WHERE id = ?1", params![group_id])
+                        .storage()?,
                 );
             }
             Ok(deleted > 0)

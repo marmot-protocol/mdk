@@ -12,7 +12,8 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_EVENT_VERSION,
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED, GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
-    GROUP_SYSTEM_TYPE_GROUP_RENAMED, GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    GROUP_SYSTEM_TYPE_GROUP_DISBANDED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+    GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GroupSystemEvent, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     STREAM_TAG, group_system_canonical_id,
@@ -401,6 +402,7 @@ pub(crate) fn control_event_from_runtime_event(
                     GroupStateChange::MessageRetentionChanged { .. } => {
                         ("disappearing_timer_changed", None)
                     }
+                    GroupStateChange::GroupDisbanded => ("group_disbanded", None),
                 };
                 Some(AgentControlEvent::GroupStateChanged {
                     account_id_hex: group_event.account_id_hex,
@@ -469,6 +471,7 @@ fn group_system_control_parts(event: &GroupSystemEvent) -> Option<(&'static str,
         )),
         GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED => Some(("group_avatar_changed", None)),
         GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED => Some(("disappearing_timer_changed", None)),
+        GROUP_SYSTEM_TYPE_GROUP_DISBANDED => Some(("group_disbanded", None)),
         _ => None,
     }
 }

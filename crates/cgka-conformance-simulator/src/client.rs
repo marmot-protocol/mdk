@@ -1051,7 +1051,9 @@ impl HarnessClient {
                 }
                 self.capture_engine_events();
             }
-            SendResult::Queued { .. } => {}
+            SendResult::NoChange { .. }
+            | SendResult::DisbandRequested { .. }
+            | SendResult::Queued { .. } => {}
         }
         Ok(())
     }

@@ -17,8 +17,8 @@ use super::{
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
+    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
     GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
@@ -123,6 +123,60 @@ impl AccountManager {
             result.is_ok(),
         );
         result
+    }
+
+    pub async fn enable_group_disbanding(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::EnableGroupDisbanding {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_after_committed_mutation("enable_group_disbanding")
+            .await;
+        Ok(summary)
+    }
+
+    pub async fn disband_group(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DisbandGroup {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn acknowledge_disband_failure(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcknowledgeDisbandFailure {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     /// Stored groups that failed session-open hydration and were skipped

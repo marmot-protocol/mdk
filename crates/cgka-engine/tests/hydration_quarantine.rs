@@ -13,10 +13,11 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage,
-    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
-    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
-    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
+    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -184,6 +185,7 @@ fn insert_marmot_group_without_openmls_state(
             protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
             unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(0),
         })
         .expect("insert marmot group record without openmls state");
@@ -470,6 +472,53 @@ impl LeaveRequestStorage for FlakyGroupRecordStorage {
     }
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
         self.inner.clear_leave_request(group_id)
+    }
+}
+
+impl DisbandRequestStorage for FlakyGroupRecordStorage {
+    fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
+        self.inner.put_disband_request(request)
+    }
+    fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
+        self.inner.disband_request(group_id)
+    }
+    fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_request(group_id)
+    }
+}
+
+impl DisbandCandidateStorage for FlakyGroupRecordStorage {
+    fn put_disband_candidate(&self, candidate: &DisbandCandidate) -> StorageResult<()> {
+        self.inner.put_disband_candidate(candidate)
+    }
+    fn disband_candidate(
+        &self,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<DisbandCandidate>> {
+        self.inner.disband_candidate(group_id, commit_id)
+    }
+    fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.inner.list_disband_candidates(group_id)
+    }
+    fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_disband_candidates(group_id)
+    }
+}
+
+impl DisbandTombstoneStorage for FlakyGroupRecordStorage {
+    fn put_disband_tombstone(
+        &self,
+        group_id: &GroupId,
+        tombstone: &cgka_traits::DisbandTombstone,
+    ) -> StorageResult<()> {
+        self.inner.put_disband_tombstone(group_id, tombstone)
+    }
+    fn disband_tombstone(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::DisbandTombstone>> {
+        self.inner.disband_tombstone(group_id)
     }
 }
 

@@ -193,6 +193,21 @@ impl<S: StorageProvider> Engine<S> {
         // stage, queue, or publish anything — a confirm would set_stable and
         // silently un-quarantine it out of band (mdk#364).
         self.ensure_group_live(&group_id)?;
+        if self.storage.disband_tombstone(&group_id)?.is_some() {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanded",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "Disbanded is terminal",
+                },
+            ));
+        }
+        // Disband is an intent-persistence operation, not a Commit-preparation
+        // operation. It remains acceptable while another staged Commit owns
+        // the group and while Unrecoverable is paused.
+        if matches!(&intent, SendIntent::Disband { .. }) {
+            return self.do_request_disband(group_id);
+        }
         // Strict cutover freezes membership growth in legacy groups. Existing
         // members may continue messaging and applying other group changes, but
         // no add (including a re-add) may be staged or queued.
@@ -230,6 +245,15 @@ impl<S: StorageProvider> Engine<S> {
                     from: "Unrecoverable",
                     to: crate::audit_helpers::send_intent_kind_str(&intent),
                     reason: "group is Unrecoverable pending verified repair",
+                },
+            ));
+        }
+        if self.disband_request_pending(&group_id)? || self.disband_candidate_pending(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanding",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "disband requested or awaiting convergence",
                 },
             ));
         }
@@ -284,6 +308,9 @@ impl<S: StorageProvider> Engine<S> {
             .await?
         {
             return Ok(Vec::new());
+        }
+        if let Some(result) = self.prepare_pending_disband(group_id).await? {
+            return Ok(vec![result]);
         }
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
@@ -363,6 +390,8 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
+                | SendResult::NoChange { .. }
+                | SendResult::DisbandRequested { .. }
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
@@ -585,6 +614,9 @@ impl<S: StorageProvider> Engine<S> {
             && pass.is_active()
             && self.convergence_pass_gates_outbound(&pass)
         {
+            return Ok(true);
+        }
+        if self.disband_candidate_pending(group_id)? {
             return Ok(true);
         }
         // The convergence horizon is bounded on BOTH sides (mdk#736). The past
@@ -1271,7 +1303,9 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => group_id,
+        | SendIntent::UpdateGroupData { group_id, .. }
+        | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::Disband { group_id } => group_id,
     }
 }
 
@@ -1282,6 +1316,8 @@ fn is_admin_group_state_fairness_intent(intent: &SendIntent) -> bool {
             | SendIntent::RemoveMembers { .. }
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::UpdateGroupData { .. }
+            | SendIntent::EnableDisbanding { .. }
+            | SendIntent::Disband { .. }
     )
 }
 
