@@ -840,6 +840,42 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Resolve one complete materialized-timeline row by group + message id.
+    /// This reads the user-visible projection (including current edit,
+    /// reaction, delete, and invalidation state), not the raw app-event row.
+    pub fn timeline_message(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<TimelineMessageRecord>> {
+        let conn = self.lock()?;
+        let mut message = conn
+            .query_row(
+                "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                        source.retention_seconds, source.retention_expires_at,
+                        timeline.direction, timeline.group_id_hex, timeline.sender,
+                        timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                        timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                        timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status
+                 FROM message_timeline AS timeline
+                 LEFT JOIN app_events AS source
+                   ON source.group_id_hex = timeline.group_id_hex
+                  AND source.message_id_hex = timeline.message_id_hex
+                 WHERE timeline.group_id_hex = ?1
+                   AND timeline.message_id_hex = ?2
+                 LIMIT 1",
+                params![group_id_hex, message_id_hex],
+                timeline_record_from_row,
+            )
+            .optional()
+            .storage()?;
+        if let Some(message) = message.as_mut() {
+            attach_reply_previews(&conn, std::slice::from_mut(message))?;
+        }
+        Ok(message)
+    }
+
     /// Resolve a single materialized-timeline row by `(group_id_hex,
     /// message_id_hex)` without scanning the timeline. Returns the small
     /// [`TimelineMessageTarget`] view (sender, plaintext, kind, deleted,

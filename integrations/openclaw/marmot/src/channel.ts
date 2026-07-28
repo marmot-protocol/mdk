@@ -245,6 +245,7 @@ export function createMarmotChannelPlugin() {
         messageToolHints: () => [
           "- Marmot replies: to answer the current conversation, just write your reply as normal assistant text — it is delivered to the Marmot group automatically. You do not need the `message` tool to reply.",
           "- Marmot `message` targets: a Marmot conversation is addressed by its group id hex (optionally prefixed `marmot:`). There are no @handles or #channels.",
+          "- Marmot history: use `marmot_history` with the conversation group id when you need an exact durable message id, one referenced message, or an older transcript page.",
         ],
       },
       actions,

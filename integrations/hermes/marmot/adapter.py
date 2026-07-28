@@ -438,17 +438,30 @@ def _normalize_inbound_message_event(event: Dict[str, Any]) -> Dict[str, Any]:
 def _referenced_channel_context(reply: Any) -> Optional[str]:
     if not isinstance(reply, dict):
         return None
-    attachments = reply.get("attachments")
-    if not isinstance(attachments, list) or not attachments:
-        return None
     fact = {
-        "type": "quoted_attachments",
-        "message_id": reply.get("message_id_hex"),
+        "type": "referenced_message",
+        "message_id_hex": reply.get("message_id_hex"),
         "availability": reply.get("availability"),
-        "attachments": attachments,
+        "sender": reply.get("sender"),
+        "recorded_at": reply.get("recorded_at"),
+        "text_excerpt": reply.get("text_excerpt"),
+        "text_truncated": bool(reply.get("text_truncated")),
+        "attachments": reply.get("attachments") or [],
         "attachments_truncated": bool(reply.get("attachments_truncated")),
     }
-    return f"Marmot quoted attachment context (untrusted): {json.dumps(fact, separators=(',', ':'))}"
+    return f"Marmot referenced-message context (untrusted): {json.dumps(fact, separators=(',', ':'))}"
+
+
+def _timeline_channel_context(messages: Any) -> Optional[str]:
+    if not isinstance(messages, list) or not messages:
+        return None
+    fact = {
+        "type": "chat_window",
+        "order": "chronological",
+        "relation": "before_current_message",
+        "messages": messages,
+    }
+    return f"Marmot conversation history (untrusted): {json.dumps(fact, separators=(',', ':'))}"
 
 
 def _mutation_channel_context(event: Dict[str, Any]) -> str:
@@ -1003,6 +1016,54 @@ class MarmotAgentControlClient:
 
     async def account_list(self) -> Dict[str, Any]:
         return await self.request({"type": "account_list"})
+
+    async def timeline_message_get(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        message_id_hex: str,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "timeline_message_get",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "message_id_hex": _normalize_hex(message_id_hex, "message_id_hex"),
+            }
+        )
+
+    async def timeline_list(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        *,
+        before: Optional[Dict[str, Any]] = None,
+        after: Optional[Dict[str, Any]] = None,
+        before_inclusive: bool = False,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        def normalize_cursor(cursor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if cursor is None:
+                return None
+            return {
+                "recorded_at": max(0, int(cursor.get("recorded_at") or 0)),
+                "message_id_hex": _normalize_hex(
+                    cursor.get("message_id_hex"),
+                    "timeline cursor message_id_hex",
+                ),
+            }
+
+        return await self.request(
+            {
+                "type": "timeline_list",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "before": normalize_cursor(before),
+                "after": normalize_cursor(after),
+                "before_inclusive": bool(before_inclusive),
+                "limit": max(1, min(50, int(limit))),
+            }
+        )
 
     async def account_lookup_profile(self, account_id_hex: str) -> Dict[str, Any]:
         response = await self.request(
@@ -2794,6 +2855,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if media_urls:
                 hermes_event.media_urls = media_urls
                 hermes_event.media_types = media_types
+            history_context = None
+            try:
+                history_page = await self.client.timeline_list(
+                    event["account_id_hex"],
+                    group_id_hex,
+                    before={
+                        "recorded_at": int(event.get("recorded_at") or 0),
+                        "message_id_hex": message_id_hex,
+                    },
+                    limit=20,
+                )
+                history_context = _timeline_channel_context(
+                    history_page.get("messages")
+                    if history_page.get("type") == "timeline_page"
+                    else None
+                )
+            except Exception:
+                logger.debug(
+                    "Marmot conversation history lookup failed; continuing without history"
+                )
             # Attach any buffered quiet ambient context (a deletion / group-state
             # change observed since the last turn) as channel_context. The runner
             # prepends channel_context to the trigger text as context without it
@@ -2806,6 +2887,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             contexts = [
                 context
                 for context in (
+                    history_context,
                     ambient_context,
                     _referenced_channel_context(reply),
                 )
@@ -3316,6 +3398,69 @@ def _delete_marmot_message_tool(args: Dict[str, Any]) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
+def _marmot_history_tool(args: Dict[str, Any]) -> str:
+    group_id_hex = str(args.get("group_id_hex") or "").strip()
+    if not group_id_hex:
+        return json.dumps({"ok": False, "error": "group_id_hex required"})
+    message_id_hex = str(args.get("message_id_hex") or "").strip()
+    before_recorded_at = args.get("before_recorded_at")
+    before_message_id_hex = str(args.get("before_message_id_hex") or "").strip()
+    if (before_recorded_at is None) != (not before_message_id_hex):
+        return json.dumps(
+            {
+                "ok": False,
+                "error": (
+                    "before_recorded_at and before_message_id_hex "
+                    "must be supplied together"
+                ),
+            }
+        )
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        if adapter is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "marmot_history requires a live Marmot adapter",
+                }
+            )
+        account_id_hex = _run_async(adapter._ensure_account_id())
+        if message_id_hex:
+            response = _run_async(
+                adapter.client.timeline_message_get(
+                    account_id_hex,
+                    group_id_hex,
+                    message_id_hex,
+                )
+            )
+        else:
+            before = (
+                {
+                    "recorded_at": before_recorded_at,
+                    "message_id_hex": before_message_id_hex,
+                }
+                if before_recorded_at is not None
+                else None
+            )
+            response = _run_async(
+                adapter.client.timeline_list(
+                    account_id_hex,
+                    group_id_hex,
+                    before=before,
+                    limit=max(1, min(50, int(args.get("limit") or 20))),
+                )
+            )
+        return json.dumps({"ok": True, **response})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
 def register(ctx):
     """Hermes plugin entry point."""
     ctx.register_platform(
@@ -3334,7 +3479,8 @@ def register(ctx):
         platform_hint=(
             "You are chatting through Marmot, an end-to-end encrypted group "
             "messaging protocol. Chat ids are Marmot group ids and user ids "
-            "are Marmot account pubkeys."
+            "are Marmot account pubkeys. Use marmot_history with the current "
+            "chat id for exact durable message ids or older transcript pages."
         ),
         emoji="",
     )
@@ -3361,6 +3507,39 @@ def register(ctx):
                 "required": ["message_id"],
             },
             handler=_delete_marmot_message_tool,
+        )
+        register_tool(
+            name="marmot_history",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "group_id_hex": {
+                        "type": "string",
+                        "description": "Marmot group id hex from the current conversation.",
+                    },
+                    "message_id_hex": {
+                        "type": "string",
+                        "description": "Optional exact durable message id to fetch.",
+                    },
+                    "before_recorded_at": {
+                        "type": "number",
+                        "description": "Optional Unix-time cursor for paging older messages.",
+                    },
+                    "before_message_id_hex": {
+                        "type": "string",
+                        "description": "Message id paired with before_recorded_at.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
+                "required": ["group_id_hex"],
+            },
+            handler=_marmot_history_tool,
         )
 
 

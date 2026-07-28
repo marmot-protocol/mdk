@@ -10,6 +10,10 @@ pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
 pub const AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS: usize = 2_000;
 pub const AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX: usize = 16;
+pub const AGENT_CONTROL_TIMELINE_DEFAULT_LIMIT: u32 = 20;
+pub const AGENT_CONTROL_TIMELINE_MAX_LIMIT: u32 = 50;
+pub const AGENT_CONTROL_TIMELINE_TEXT_MAX_CHARS: usize = 8_192;
+pub const AGENT_CONTROL_TIMELINE_REACTIONS_MAX: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentControlError {
@@ -72,6 +76,27 @@ pub enum AgentControlRequest {
     SubscribeInbound {
         account_id_hex: Option<String>,
         group_id_hex: Option<String>,
+    },
+    /// Resolve one row from the materialized, user-visible timeline.
+    TimelineMessageGet {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    },
+    /// Page through the materialized, user-visible timeline in stable
+    /// `(recorded_at, message_id_hex)` order. `before` and `after` are mutually
+    /// exclusive; an omitted cursor returns the newest page.
+    TimelineList {
+        account_id_hex: String,
+        group_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<AgentControlTimelineCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentControlTimelineCursor>,
+        #[serde(default)]
+        before_inclusive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     SendFinal {
         account_id_hex: String,
@@ -306,6 +331,20 @@ pub enum AgentControlResponse {
     AccountList {
         accounts: Vec<AgentControlAccount>,
     },
+    TimelineMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<AgentControlTimelineMessage>,
+    },
+    TimelinePage {
+        account_id_hex: String,
+        group_id_hex: String,
+        messages: Vec<AgentControlTimelineMessage>,
+        has_more_before: bool,
+        has_more_after: bool,
+    },
     AccountCreated {
         account: AgentControlAccount,
     },
@@ -433,6 +472,58 @@ pub struct AgentControlActor {
     pub display_name: Option<String>,
     #[serde(default)]
     pub is_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineCursor {
+    pub recorded_at: u64,
+    pub message_id_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlTimelineMessageAvailability {
+    Available,
+    Deleted,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineReaction {
+    pub reaction_message_id_hex: String,
+    pub actor: AgentControlActor,
+    pub emoji: String,
+    pub reacted_at: u64,
+}
+
+/// A bounded, privacy-aware view of one materialized timeline row. Deleted and
+/// invalidated rows retain identity/attribution but never carry plaintext or
+/// attachment summaries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlTimelineMessage {
+    pub message_id_hex: String,
+    pub sender: AgentControlActor,
+    pub direction: String,
+    pub kind: u64,
+    /// Sender-authenticated timeline time in Unix seconds.
+    pub recorded_at: u64,
+    /// Local observation/creation time in Unix seconds.
+    pub observed_at: u64,
+    pub availability: AgentControlTimelineMessageAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub text_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AgentControlAttachmentSummary>,
+    #[serde(default)]
+    pub attachments_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<AgentControlTimelineReaction>,
+    #[serde(default)]
+    pub reactions_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -735,8 +826,9 @@ mod tests {
     use crate::{
         AgentControlEnvelope, AgentControlError, AgentControlEvent,
         AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
-        AgentControlSendMaintenanceDisposition, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope,
-        encode_frame, read_envelope, read_frame, write_frame,
+        AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
+        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
+        write_frame,
     };
 
     #[test]
@@ -1094,6 +1186,28 @@ mod tests {
                     group_id_hex: None,
                 },
                 "subscribe_inbound",
+            ),
+            (
+                AgentControlRequest::TimelineMessageGet {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    message_id_hex: message(),
+                },
+                "timeline_message_get",
+            ),
+            (
+                AgentControlRequest::TimelineList {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    before: Some(AgentControlTimelineCursor {
+                        recorded_at: 42,
+                        message_id_hex: message(),
+                    }),
+                    after: None,
+                    before_inclusive: false,
+                    limit: Some(20),
+                },
+                "timeline_list",
             ),
             (
                 AgentControlRequest::SendFinal {

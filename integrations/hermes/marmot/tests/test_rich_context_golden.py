@@ -27,7 +27,8 @@ class RichContextGoldenTests(unittest.TestCase):
             and event["reply_to"]["availability"] == "available"
         )
         quoted_context = adapter._referenced_channel_context(available_reply)
-        self.assertIn('"type":"quoted_attachments"', quoted_context)
+        self.assertIn('"type":"referenced_message"', quoted_context)
+        self.assertIn('"text_excerpt":', quoted_context)
         self.assertIn('"file_name":"diagram.png"', quoted_context)
 
         mutations = [

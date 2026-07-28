@@ -22,9 +22,25 @@ begin inputs is an error, and trying to begin another active stream with an occu
 
 ## What this crate does
 
-- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, stream compose, allowlists, etc.).
+- Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, stream compose,
+  allowlists, etc.).
 - Provides newline-delimited JSON framing with a 1 MiB per-frame cap.
 - Stays dependency-light: `serde` and Tokio IO only.
+
+## Materialized timeline reads
+
+`timeline_message_get` resolves one durable message id and `timeline_list` pages a
+group's current materialized timeline with a stable `(recorded_at,
+message_id_hex)` cursor. These are read-only views of current message state:
+edits are reflected, reactions are aggregated, and deleted or invalidated
+messages retain identity/attribution but never expose plaintext or attachment
+metadata. Responses bound text, attachments, reactions, page size, and total
+frame size.
+
+Connectors use the same API both to attach a recent ID-bearing chat window to an
+inbound turn and to expose an on-demand history tool. This is also the recovery
+path after `resync_required`; clients should re-page the materialized timeline
+rather than attempting to reconstruct history from the lossy event stream.
 
 ## What it does not do
 

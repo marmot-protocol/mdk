@@ -21,7 +21,10 @@ import {
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 
-import type { MarmotAgentControlClient } from "./client.js";
+import type {
+  AgentControlTimelineMessage,
+  MarmotAgentControlClient,
+} from "./client.js";
 import type { GroupActivation } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
@@ -76,7 +79,10 @@ export interface OpenClawChannelRuntime {
  * Dispatcher client: the group-info read used for activation gating and the
  * media download used to surface inbound images to the agent.
  */
-export type MarmotDispatchClient = Pick<MarmotAgentControlClient, "groupInfo" | "downloadMedia">;
+export type MarmotDispatchClient = Pick<
+  MarmotAgentControlClient,
+  "groupInfo" | "downloadMedia" | "timelineList"
+>;
 
 export interface MarmotDispatchDeps {
   /** Full OpenClaw config (`api.config`). */
@@ -233,7 +239,10 @@ function replyFallbackBody(availability: string): string {
  * native, explicitly-untrusted supplemental context. None of this data enters a
  * system prompt, and ambient events never invoke this dispatcher themselves.
  */
-function inboundSupplemental(message: MarmotInboundMessage) {
+function inboundSupplemental(
+  message: MarmotInboundMessage,
+  history: AgentControlTimelineMessage[] = [],
+) {
   const reply = message.replyTo;
   const untrustedContext: Array<{
     label: string;
@@ -247,10 +256,26 @@ function inboundSupplemental(message: MarmotInboundMessage) {
       source: "marmot",
       type: "referenced_message",
       payload: {
+        message_id_hex: reply.message_id_hex,
         availability: reply.availability,
+        sender: reply.sender,
+        recorded_at: reply.recorded_at,
+        text_excerpt: reply.text_excerpt,
         attachments: reply.attachments ?? [],
         attachments_truncated: reply.attachments_truncated,
         text_truncated: reply.text_truncated,
+      },
+    });
+  }
+  if (history.length > 0) {
+    untrustedContext.push({
+      label: "Marmot conversation history",
+      source: "marmot",
+      type: "chat_window",
+      payload: {
+        order: "chronological",
+        relation: "before_current_message",
+        messages: history,
       },
     });
   }
@@ -377,9 +402,26 @@ export function createMarmotInboundDispatcher(
     // local path (wn-agent decrypts; the content key never leaves it) and hand
     // the local file facts to OpenClaw, which reads + base64-encodes them.
     const media = await downloadInboundMedia(deps.client, message, deps.log);
-    const supplemental = inboundSupplemental(message);
+    let history: AgentControlTimelineMessage[] = [];
+    try {
+      const page = await deps.client.timelineList(
+        message.accountIdHex,
+        message.groupIdHex,
+        {
+          before: {
+            recorded_at: message.recordedAt ?? 0,
+            message_id_hex: message.messageIdHex,
+          },
+          limit: 20,
+        },
+      );
+      history = page.messages;
+    } catch {
+      deps.log?.("marmot: conversation history lookup failed; continuing without history");
+    }
+    const supplemental = inboundSupplemental(message, history);
 
-    const ctxPayload = buildChannelInboundEventContext({
+    const ctxPayload = await buildChannelInboundEventContext({
       channel: "marmot",
       accountId: channelAccountId,
       messageId: message.messageIdHex,
@@ -402,6 +444,8 @@ export function createMarmotInboundDispatcher(
       message: { rawBody: message.text, bodyForAgent: message.text },
       ...(media ? { media } : {}),
       ...(supplemental ? { supplemental } : {}),
+      resolveSupplementalMedia: true,
+      suppressSelfQuoteBody: false,
     });
 
     const storePath = deps.runtimeChannel.session.resolveStorePath();

@@ -174,6 +174,26 @@ impl AgentConnector {
     ) -> Result<AgentControlResponse, ConnectorError> {
         match request {
             AgentControlRequest::AccountList => self.account_list_response(),
+            AgentControlRequest::TimelineMessageGet {
+                account_id_hex,
+                group_id_hex,
+                message_id_hex,
+            } => self.timeline_message_response(&account_id_hex, &group_id_hex, &message_id_hex),
+            AgentControlRequest::TimelineList {
+                account_id_hex,
+                group_id_hex,
+                before,
+                after,
+                before_inclusive,
+                limit,
+            } => self.timeline_list_response(
+                &account_id_hex,
+                &group_id_hex,
+                before,
+                after,
+                before_inclusive,
+                limit,
+            ),
             AgentControlRequest::AllowlistList { account_id_hex } => {
                 self.allowlist_response(&account_id_hex)
             }

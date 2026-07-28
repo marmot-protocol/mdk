@@ -282,7 +282,7 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use crate::INBOUND_CATCH_UP_INTERVAL;
 use crate::validation::normalize_hex;
 
-fn control_actor(
+pub(crate) fn control_actor(
     account_id_hex: impl Into<String>,
     display_name: Option<String>,
     self_account_id_hex: &str,
@@ -295,7 +295,7 @@ fn control_actor(
     }
 }
 
-fn attachment_summaries_from_tags(
+pub(crate) fn attachment_summaries_from_tags(
     tags: &[Vec<String>],
     source_epoch: Option<u64>,
 ) -> (Vec<AgentControlAttachmentSummary>, bool) {

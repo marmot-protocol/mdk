@@ -102,6 +102,8 @@ pub(crate) fn unsupported_request_message(request: &AgentControlRequest) -> &'st
 pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
     match request {
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
+        AgentControlRequest::TimelineMessageGet { .. } => "timeline_message_get",
+        AgentControlRequest::TimelineList { .. } => "timeline_list",
         AgentControlRequest::SendFinal { .. } => "send_final",
         AgentControlRequest::DeleteMessage { .. } => "delete_message",
         AgentControlRequest::StreamBegin { .. } => "stream_begin",
