@@ -5,6 +5,12 @@ Local control-protocol DTOs and newline-delimited JSON framing for Marmot agent 
 This crate defines the `marmot.agent-control.v2` request/response/event types and the frame codec used over the
 `wn-agent` Unix socket. Hermes and OpenClaw plugins are thin clients of this protocol.
 
+The structured inbound-message, reply-context, and mutation-event schema is the
+final intentionally breaking update shipped under the `v2` label while every
+consumer is still released atomically from this repository. The `v2` schema is
+stable after this change: any later breaking wire change must introduce a new
+protocol label or explicit negotiation rather than silently changing `v2`.
+
 Version 2 is intentionally incompatible with version 1. A successful `StreamBegin` returns a random 32-byte
 `stream_capability` encoded as 64 lowercase hex characters. Every later append, status, progress, finalize, or cancel
 request for that stream must present the capability. Treat it as an in-memory bearer secret: never persist or log it.

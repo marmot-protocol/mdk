@@ -415,6 +415,8 @@ mod tests {
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         }
     }
 

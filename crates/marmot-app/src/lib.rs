@@ -722,6 +722,14 @@ pub struct AppMessageRecord {
     /// older serialized records readable.
     #[serde(default)]
     pub insert_order: i64,
+    /// True when convergence retained this raw row only as an invalidated
+    /// losing-branch tombstone.
+    #[serde(default)]
+    pub invalidated: bool,
+    /// Whether this delete carried an authenticated moderation grant when it
+    /// was recorded. False for every non-delete event.
+    #[serde(default)]
+    pub moderation_grant: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1638,6 +1646,20 @@ impl MarmotApp {
             .into_iter()
             .map(app_message_record_from_stored)
             .collect())
+    }
+
+    /// Resolve one durable raw app event by group/message id.
+    pub fn message_by_id(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_message(group_id_hex, message_id_hex)?
+            .map(app_message_record_from_stored))
     }
 
     /// Resolve the reacted-to target for a reaction notification from the

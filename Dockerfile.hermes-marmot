@@ -3,6 +3,8 @@ FROM rust:1.91-bookworm
 ARG HERMES_AGENT_REPO_URL=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_AGENT_REF=
 
+COPY integrations/hermes/marmot/hermes-agent.lock /tmp/hermes-agent.lock
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -16,11 +18,12 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 "$HERMES_AGENT_REPO_URL" /opt/hermes-agent \
-    && if [ -n "$HERMES_AGENT_REF" ]; then \
-        git -C /opt/hermes-agent fetch --depth 1 origin "$HERMES_AGENT_REF" || true; \
-        git -C /opt/hermes-agent checkout "$HERMES_AGENT_REF"; \
-    fi \
+RUN requested_ref="$HERMES_AGENT_REF" \
+    && . /tmp/hermes-agent.lock \
+    && resolved_ref="${requested_ref:-$HERMES_AGENT_REF}" \
+    && git clone --filter=blob:none --no-checkout "$HERMES_AGENT_REPO_URL" /opt/hermes-agent \
+    && git -C /opt/hermes-agent fetch --depth 1 origin "$resolved_ref" \
+    && git -C /opt/hermes-agent checkout "$resolved_ref" \
     && python3.11 -m venv /opt/hermes-agent/.venv \
     && /opt/hermes-agent/.venv/bin/python -m pip install --upgrade pip \
     && /opt/hermes-agent/.venv/bin/python -m pip install -e "/opt/hermes-agent[all,dev]"

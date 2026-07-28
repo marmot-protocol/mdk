@@ -180,6 +180,114 @@ describe("createMarmotInboundDispatcher", () => {
     );
   });
 
+  it("maps authenticated time, native quote, and ambient facts into supplemental context", async () => {
+    buildCtxMock.mockClear();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-rich-context",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => undefined),
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(emptyCalls()) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "new message",
+      recordedAt: 1_721_000_000,
+      replyToMessageIdHex: HEX32("11"),
+      replyTo: {
+        message_id_hex: HEX32("11"),
+        availability: "available",
+        sender: {
+          account_id_hex: HEX32("aa"),
+          display_name: "Agent",
+          is_self: true,
+        },
+        recorded_at: 1_720_999_900,
+        text_excerpt: "quoted body",
+        text_truncated: false,
+        attachments: [{ media_type: "image/png", file_name: "quote.png" }],
+        attachments_truncated: false,
+      },
+      ambientContext: [
+        {
+          type: "reaction_added",
+          account_id_hex: HEX32("aa"),
+          group_id_hex: HEX32("cc"),
+          event_id_hex: HEX32("22"),
+          target_message_id_hex: HEX32("11"),
+          actor: {
+            account_id_hex: HEX32("bb"),
+            display_name: "Alice",
+            is_self: false,
+          },
+          emoji: "👍",
+          recorded_at: 1_721_000_001,
+          target: {
+            message_id_hex: HEX32("11"),
+            availability: "available",
+            text_excerpt: "quoted body",
+            text_truncated: false,
+            attachments_truncated: false,
+          },
+        },
+      ],
+    });
+
+    const context = buildCtxMock.mock.calls.at(-1)?.[0] as {
+      timestamp: number;
+      reply: { replyToId: string };
+      supplemental: {
+        quote: {
+          id: string;
+          body: string;
+          sender: string;
+          isQuote: boolean;
+          isSelf: boolean;
+        };
+        untrustedContext: Array<{ type: string; payload: unknown }>;
+      };
+    };
+    expect(context.timestamp).toBe(1_721_000_000_000);
+    expect(context.reply.replyToId).toBe(HEX32("11"));
+    expect(context.supplemental.quote).toEqual({
+      id: HEX32("11"),
+      body: "quoted body",
+      sender: "Agent",
+      isQuote: true,
+      isSelf: true,
+    });
+    expect(context.supplemental.untrustedContext).toEqual([
+      expect.objectContaining({
+        type: "referenced_message",
+        payload: expect.objectContaining({
+          attachments: [{ media_type: "image/png", file_name: "quote.png" }],
+        }),
+      }),
+      expect.objectContaining({ type: "reaction_added" }),
+    ]);
+  });
+
   it("keeps three sequential replies bound to the same Marmot group", async () => {
     const groupIdHex = HEX32("cc");
     const runtimeChannel: OpenClawChannelRuntime = {

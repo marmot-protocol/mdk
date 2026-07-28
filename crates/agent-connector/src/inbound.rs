@@ -14,8 +14,8 @@ use crate::connection::write_control_frame;
 use crate::error::ConnectorError;
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpEvent, control_event_from_debug_event,
-    control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
-    runtime_replay_dedup_key,
+    control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
+    resync_required_event, runtime_replay_dedup_key,
 };
 use crate::validation::agent_control_request_type;
 
@@ -106,11 +106,13 @@ impl AgentConnector {
                     match event {
                         Ok(event) => {
                             let replay_id = runtime_replay_dedup_key(&event);
-                            control_event_from_runtime_event(
+                            control_event_from_runtime_event_with_runtime(
+                                &self.runtime,
                                 event,
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),
                             )
+                            .map_err(ConnectorError::from)?
                             .map(|event| (event, replay_id))
                         }
                         Err(broadcast::error::RecvError::Lagged(dropped))
@@ -225,16 +227,19 @@ impl AgentConnector {
                     continue;
                 }
                 delivered.record(replay_id);
-            } else if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
-                if delivered.contains(message_id_hex) {
+            } else if let AgentControlEvent::InboundMessage { message, .. } = &event {
+                if delivered.contains(&message.message_id_hex) {
                     continue;
                 }
-                delivered.record(message_id_hex.clone());
+                delivered.record(message.message_id_hex.clone());
             } else {
                 debug_assert!(
                     !matches!(
                         &event,
-                        AgentControlEvent::MessageDeleted { .. }
+                        AgentControlEvent::MessageEdited { .. }
+                            | AgentControlEvent::MessageDeleted { .. }
+                            | AgentControlEvent::ReactionAdded { .. }
+                            | AgentControlEvent::ReactionRemoved { .. }
                             | AgentControlEvent::GroupStateChanged { .. }
                     ),
                     "debug-injected ambient events need a durable replay id before delivery"
@@ -285,12 +290,15 @@ impl AgentConnector {
                 if delivered.contains(&replay_id) {
                     continue;
                 }
-                let Some(event) = inbound_message_event_from_record(
+                let Some(event) = inbound_message_event_from_record_with_runtime(
+                    &self.runtime,
+                    &account.label,
                     &account.account_id_hex,
                     record,
                     account_filter,
                     group_filter,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 delivered.record(replay_id);

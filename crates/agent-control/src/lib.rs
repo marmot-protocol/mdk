@@ -8,6 +8,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 pub const AGENT_CONTROL_PROTOCOL_V2: &str = "marmot.agent-control.v2";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
+pub const AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS: usize = 2_000;
+pub const AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentControlError {
@@ -425,6 +427,64 @@ pub struct AgentControlDebugFinalSend {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlActor {
+    pub account_id_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub is_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMessage {
+    pub message_id_hex: String,
+    pub sender: AgentControlActor,
+    pub text: String,
+    /// Sender-authenticated inner app-event time in Unix seconds.
+    pub recorded_at: u64,
+    /// Encrypted media references attached to the message. The content key
+    /// remains inside `wn-agent`; connectors pass these refs back to
+    /// `download_media`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<AgentControlMediaRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachmentSummary {
+    pub media_type: String,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlReferencedMessageAvailability {
+    Available,
+    Missing,
+    Deleted,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlReferencedMessage {
+    pub message_id_hex: String,
+    pub availability: AgentControlReferencedMessageAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<AgentControlActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_excerpt: Option<String>,
+    #[serde(default)]
+    pub text_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AgentControlAttachmentSummary>,
+    #[serde(default)]
+    pub attachments_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlMaintenanceObligation {
     pub id_hex: String,
     pub trigger: String,
@@ -487,33 +547,60 @@ pub enum AgentControlEvent {
     InboundMessage {
         account_id_hex: String,
         group_id_hex: String,
-        message_id_hex: String,
-        sender_account_id_hex: String,
-        text: String,
+        message: AgentControlMessage,
         /// True when the message addresses the receiving agent account: a `p`
         /// tag, an inline `nostr:<account-pubkey-hex>` reference, or a visible
         /// `npub` mention parsed from the message body. Lets a channel gate
         /// group replies on being addressed.
         #[serde(default)]
         mentions_self: bool,
-        /// The message id this message replies to (`e` tag), when present.
+        /// Bounded, privacy-aware snapshot of the replied-to message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reply_to_message_id_hex: Option<String>,
-        /// The sender's display name, when resolvable from the directory.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sender_display_name: Option<String>,
-        /// Encrypted media references (`imeta` tags) attached to this message.
-        /// Empty for a plain text message; the content key is never carried here,
-        /// only the fetch + authentication metadata (use `download_media`).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        media: Vec<AgentControlMediaRef>,
+        reply_to: Option<AgentControlReferencedMessage>,
+    },
+    /// An accepted kind-1009 edit changed a prior message.
+    MessageEdited {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        replacement_text: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
     },
     /// A previously-sent group message was deleted (kind-5) by another member.
     MessageDeleted {
         account_id_hex: String,
         group_id_hex: String,
+        event_id_hex: String,
         target_message_id_hex: String,
-        sender_account_id_hex: String,
+        actor: AgentControlActor,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
+    },
+    /// A kind-7 reaction was accepted for a message.
+    ReactionAdded {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        emoji: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
+    },
+    /// A kind-5 deletion retracted a prior kind-7 reaction.
+    ReactionRemoved {
+        account_id_hex: String,
+        group_id_hex: String,
+        event_id_hex: String,
+        reaction_event_id_hex: String,
+        target_message_id_hex: String,
+        actor: AgentControlActor,
+        emoji: String,
+        recorded_at: u64,
+        target: AgentControlReferencedMessage,
     },
     /// A durable, MLS-authenticated change to group state was observed (a member
     /// add/remove/leave, an admin grant/revoke, a group rename/avatar change,
@@ -651,6 +738,30 @@ mod tests {
         AgentControlSendMaintenanceDisposition, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope,
         encode_frame, read_envelope, read_frame, write_frame,
     };
+
+    #[test]
+    fn rich_context_golden_events_decode_and_deleted_targets_are_redacted() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/agent-control-v2-rich-context.json"),
+        )
+        .unwrap();
+        let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();
+        assert_eq!(events.len(), 8);
+        let deleted = events
+            .iter()
+            .find_map(|event| match event {
+                AgentControlEvent::MessageDeleted { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("message_deleted fixture");
+        assert_eq!(
+            deleted.availability,
+            crate::AgentControlReferencedMessageAvailability::Deleted
+        );
+        assert!(deleted.text_excerpt.is_none());
+        assert!(deleted.attachments.is_empty());
+    }
 
     #[test]
     fn stream_append_frame_round_trips_as_append_only_text() {

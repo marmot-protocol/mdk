@@ -1971,6 +1971,8 @@ mod tests {
                 recorded_at: 100 + u64::try_from(index / 2).unwrap(),
                 received_at: 100 + u64::try_from(index / 2).unwrap(),
                 insert_order: i64::try_from(index).unwrap(),
+                invalidated: false,
+                moderation_grant: false,
             })
             .collect::<Vec<_>>();
 

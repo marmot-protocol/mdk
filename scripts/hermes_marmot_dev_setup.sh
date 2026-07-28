@@ -42,10 +42,12 @@ USAGE
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hermes_ref_override="${HERMES_AGENT_REF:-}"
+. "$repo_root/integrations/hermes/marmot/hermes-agent.lock"
 default_tmp="${TMPDIR:-/tmp}"
 dev_root="${HERMES_MARMOT_DEV_ROOT:-${default_tmp%/}/hermes-marmot-test}"
 hermes_url="${HERMES_AGENT_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
-hermes_ref="${HERMES_AGENT_REF:-}"
+hermes_ref="${hermes_ref_override:-${HERMES_AGENT_REF}}"
 marmot_home=""
 account_id="${MARMOT_ACCOUNT_ID_HEX:-}"
 group_id="${MARMOT_GROUP_ID_HEX:-}"

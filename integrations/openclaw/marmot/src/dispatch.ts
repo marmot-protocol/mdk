@@ -215,6 +215,75 @@ function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kin
   return "document";
 }
 
+function replyFallbackBody(availability: string): string {
+  switch (availability) {
+    case "deleted":
+      return "[Referenced message was deleted]";
+    case "invalidated":
+      return "[Referenced message was invalidated]";
+    case "missing":
+      return "[Referenced message is unavailable]";
+    default:
+      return "";
+  }
+}
+
+/**
+ * Convert Marmot reply hydration and buffered ambient facts into OpenClaw's
+ * native, explicitly-untrusted supplemental context. None of this data enters a
+ * system prompt, and ambient events never invoke this dispatcher themselves.
+ */
+function inboundSupplemental(message: MarmotInboundMessage) {
+  const reply = message.replyTo;
+  const untrustedContext: Array<{
+    label: string;
+    source: string;
+    type: string;
+    payload: unknown;
+  }> = [];
+  if (reply) {
+    untrustedContext.push({
+      label: "Marmot referenced-message context",
+      source: "marmot",
+      type: "referenced_message",
+      payload: {
+        availability: reply.availability,
+        attachments: reply.attachments ?? [],
+        attachments_truncated: reply.attachments_truncated,
+        text_truncated: reply.text_truncated,
+      },
+    });
+  }
+  for (const ambient of message.ambientContext ?? []) {
+    untrustedContext.push({
+      label: "Marmot ambient conversation event",
+      source: "marmot",
+      type: ambient.type,
+      payload: ambient,
+    });
+  }
+  if (!reply && untrustedContext.length === 0) {
+    return undefined;
+  }
+  return {
+    ...(reply
+      ? {
+          quote: {
+            id: reply.message_id_hex,
+            body: reply.text_excerpt ?? replyFallbackBody(reply.availability),
+            sender:
+              reply.sender?.display_name ??
+              reply.sender?.account_id_hex ??
+              "Unknown Marmot participant",
+            isQuote: true,
+            isSelf: reply.sender?.is_self ?? false,
+          },
+        }
+      : {}),
+    ...(untrustedContext.length > 0 ? { untrustedContext } : {}),
+  };
+}
+
 /**
  * Best-effort: download each inbound media ref to a local path on the wn-agent
  * host, then re-stage the decrypted bytes through OpenClaw's official media store
@@ -308,11 +377,13 @@ export function createMarmotInboundDispatcher(
     // local path (wn-agent decrypts; the content key never leaves it) and hand
     // the local file facts to OpenClaw, which reads + base64-encodes them.
     const media = await downloadInboundMedia(deps.client, message, deps.log);
+    const supplemental = inboundSupplemental(message);
 
     const ctxPayload = buildChannelInboundEventContext({
       channel: "marmot",
       accountId: channelAccountId,
       messageId: message.messageIdHex,
+      timestamp: (message.recordedAt ?? 0) * 1000,
       from: message.senderAccountIdHex,
       sender: {
         id: message.senderAccountIdHex,
@@ -330,6 +401,7 @@ export function createMarmotInboundDispatcher(
       },
       message: { rawBody: message.text, bodyForAgent: message.text },
       ...(media ? { media } : {}),
+      ...(supplemental ? { supplemental } : {}),
     });
 
     const storePath = deps.runtimeChannel.session.resolveStorePath();

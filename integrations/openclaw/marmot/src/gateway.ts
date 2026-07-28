@@ -5,8 +5,7 @@ import {
   createAccountStatusSink,
   runPassiveAccountLifecycle,
 } from "openclaw/plugin-sdk/channel-lifecycle";
-import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
-import { enqueueSystemEvent } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
@@ -15,7 +14,6 @@ import {
   startMarmotInbound,
   syncMarmotAllowlist,
   type InboundPluginApi,
-  type MarmotAmbientSurfacer,
 } from "./inbound-runtime.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
 
@@ -86,19 +84,6 @@ export async function startMarmotGatewayAccount(
       log: (message) => ctx.log?.info?.(message),
     });
 
-    const surfaceAmbientEvent: MarmotAmbientSurfacer = ({ groupIdHex, text, contextKey }) => {
-      const route = channelRuntime.routing.resolveAgentRoute({
-        cfg: ctx.cfg,
-        channel: "marmot",
-        accountId: account.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
-        peer: { kind: "group", id: groupIdHex },
-      });
-      enqueueSystemEvent(text, {
-        sessionKey: route.sessionKey,
-        contextKey: contextKey ?? null,
-      });
-    };
-
     await runPassiveAccountLifecycle({
       abortSignal: ctx.abortSignal,
       start: async () =>
@@ -106,7 +91,6 @@ export async function startMarmotGatewayAccount(
           signal: ctx.abortSignal,
           channelAccountId: ctx.accountId,
           configuredAgentName,
-          surfaceAmbientEvent,
           invalidateGroupActivation: dispatch.invalidateGroupActivation,
           clearGroupActivationCache: dispatch.clearGroupActivationCache,
           statusSink: (patch) => {

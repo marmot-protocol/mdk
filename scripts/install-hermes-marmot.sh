@@ -33,6 +33,7 @@ MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-hermes-agent}"
 MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-hermes}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.hermes}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
+MIN_HERMES_VERSION="0.19.0"
 
 ASSUME_YES=0
 CONFIGURE_HERMES=1
@@ -147,6 +148,37 @@ run() {
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "error: required command not found: $1" >&2
+        exit 1
+    fi
+}
+
+version_at_least() {
+    awk -v have="$1" -v need="$2" 'BEGIN {
+        split(have, h, "."); split(need, n, ".");
+        for (i = 1; i <= 3; i++) {
+            hv = (h[i] == "" ? 0 : h[i]) + 0;
+            nv = (n[i] == "" ? 0 : n[i]) + 0;
+            if (hv > nv) exit 0;
+            if (hv < nv) exit 1;
+        }
+        exit 0;
+    }'
+}
+
+require_hermes_version() {
+    local output version
+    output="$(hermes --version 2>&1)" || {
+        echo "error: could not determine Hermes version; Hermes $MIN_HERMES_VERSION or newer is required" >&2
+        exit 1
+    }
+    version="$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')"
+    if [ -z "$version" ] || ! version_at_least "$version" "$MIN_HERMES_VERSION"; then
+        echo "error: Hermes $MIN_HERMES_VERSION or newer is required (found ${version:-unknown}); upgrade Hermes separately, then rerun this installer" >&2
         exit 1
     fi
 }
@@ -1453,6 +1485,7 @@ need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then
     need_cmd hermes
+    require_hermes_version
     if [ "$CONFIGURE_HERMES" -eq 1 ]; then
         need_cmd python3
     fi

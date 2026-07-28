@@ -191,12 +191,10 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
         AgentControlEvent::InboundMessage {
             account_id_hex,
             group_id_hex,
-            message_id_hex,
-            sender_account_id_hex,
-            text,
+            message,
             ..
         } => {
-            let sender_ref = sender_account_id_hex.to_ascii_lowercase();
+            let sender_ref = message.sender.account_id_hex.to_ascii_lowercase();
             if sender_ref == ctx.account_ref {
                 debug!(
                     target: TRACE_TARGET,
@@ -228,7 +226,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                         &ctx_for_reply,
                         &account_id_hex,
                         &group_id_hex,
-                        &message_id_hex,
+                        &message.message_id_hex,
                         "[wn-opencode] too many prompts are already queued for this group; try again shortly.",
                         0,
                     )
@@ -244,7 +242,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 });
                 return DispatchOutcome::Continue;
             };
-            if !ctx.dedupe.insert(message_id_hex.clone()).await {
+            if !ctx.dedupe.insert(message.message_id_hex.clone()).await {
                 debug!(
                     target: TRACE_TARGET,
                     method = "dispatch_event",
@@ -257,8 +255,8 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
             let inbound = InboundPrompt {
                 account_ref: account_id_hex,
                 group_ref: group_id_hex,
-                message_ref: message_id_hex,
-                text,
+                message_ref: message.message_id_hex,
+                text: message.text,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue

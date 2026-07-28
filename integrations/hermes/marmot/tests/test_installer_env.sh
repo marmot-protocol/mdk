@@ -92,6 +92,9 @@ EOF
 
 cat >"$mock_bin/hermes" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    printf '%s\n' "Hermes 0.19.0"
+fi
 exit 0
 EOF
 

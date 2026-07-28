@@ -264,16 +264,16 @@ fn control_event_forwards_only_chat_inner_events_as_inbound_messages() {
         ),
     });
 
-    let Some(AgentControlEvent::InboundMessage { text, .. }) =
+    let Some(AgentControlEvent::InboundMessage { message, .. }) =
         control_event_from_runtime_event(event, None, None)
     else {
         panic!("expected kind-9 chat event to become an inbound message");
     };
-    assert_eq!(text, "hello agent");
+    assert_eq!(message.text, "hello agent");
 }
 
 #[test]
-fn control_event_projects_kind5_deletion_as_message_deleted() {
+fn control_event_does_not_project_unhydrated_kind5_deletion() {
     let agent_account_id_hex = "aa".repeat(32);
     let target = "99".repeat(32);
     let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
@@ -286,18 +286,10 @@ fn control_event_projects_kind5_deletion_as_message_deleted() {
         ),
     });
 
-    let Some(AgentControlEvent::MessageDeleted {
-        account_id_hex,
-        target_message_id_hex,
-        sender_account_id_hex,
-        ..
-    }) = control_event_from_runtime_event(event, None, None)
-    else {
-        panic!("expected kind-5 deletion to become MessageDeleted");
-    };
-    assert_eq!(account_id_hex, agent_account_id_hex);
-    assert_eq!(target_message_id_hex, target);
-    assert_eq!(sender_account_id_hex, "bb".repeat(32));
+    assert!(
+        control_event_from_runtime_event(event, None, None).is_none(),
+        "a delete must be classified against durable target state"
+    );
 }
 
 #[test]
@@ -391,13 +383,17 @@ fn control_event_projects_imeta_tag_into_inbound_media_ref() {
         message: received_message(MARMOT_APP_EVENT_KIND_CHAT, "see this", vec![imeta]),
     });
 
-    let Some(AgentControlEvent::InboundMessage { media, .. }) =
+    let Some(AgentControlEvent::InboundMessage { message, .. }) =
         control_event_from_runtime_event(event, None, None)
     else {
         panic!("expected kind-9 chat event to become an inbound message");
     };
-    assert_eq!(media.len(), 1, "one imeta tag should project one media ref");
-    let attachment = &media[0];
+    assert_eq!(
+        message.media.len(),
+        1,
+        "one imeta tag should project one media ref"
+    );
+    let attachment = &message.media[0];
     assert_eq!(attachment.media_type, "image/png");
     assert_eq!(attachment.file_name, "a.png");
     assert_eq!(attachment.ciphertext_sha256, ciphertext_sha256);
@@ -1041,18 +1037,20 @@ async fn connector_socket_subscribes_to_inbound_messages() {
             .unwrap()
             .unwrap()
             .unwrap();
-    assert!(matches!(
-        sent.payload,
-        AgentControlResponse::FinalSent { .. }
-    ));
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent.payload
+    else {
+        panic!("expected human final send");
+    };
+    let human_message_id_hex = message_ids_hex[0].clone();
 
     let inbound = read_matching_inbound_message(&mut subscriber_read, "hello agent").await;
     assert_eq!(inbound.id.as_deref(), Some("req-subscribe"));
     let AgentControlEvent::InboundMessage {
         account_id_hex,
         group_id_hex: event_group_id_hex,
-        sender_account_id_hex,
-        text,
+        message,
         ..
     } = inbound.payload
     else {
@@ -1060,8 +1058,130 @@ async fn connector_socket_subscribes_to_inbound_messages() {
     };
     assert_eq!(account_id_hex, agent.account.account_id_hex);
     assert_eq!(event_group_id_hex, group_id_hex);
-    assert_eq!(sender_account_id_hex, human.account.account_id_hex);
-    assert_eq!(text, "hello agent");
+    assert_eq!(message.sender.account_id_hex, human.account.account_id_hex);
+    assert_eq!(message.text, "hello agent");
+    assert!(message.recorded_at > 0);
+
+    // Let the agent reply, then have the human reply to that agent-authored
+    // message. The next inbound event must hydrate the reference from durable
+    // rows and attribute it as the subscribed account's own message.
+    let agent_reply_sent = send_control_request(
+        &socket,
+        "req-agent-reply",
+        AgentControlRequest::SendFinal {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "agent answer".to_owned(),
+            reply_to_message_id_hex: Some(human_message_id_hex.clone()),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = agent_reply_sent.payload
+    else {
+        panic!("expected agent reply send");
+    };
+    let agent_reply_message_id_hex = message_ids_hex[0].clone();
+
+    let human_reply_sent = send_control_request(
+        &socket,
+        "req-human-reply",
+        AgentControlRequest::SendFinal {
+            account_id_hex: human.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "reply with context".to_owned(),
+            reply_to_message_id_hex: Some(agent_reply_message_id_hex.clone()),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        human_reply_sent.payload,
+        AgentControlResponse::FinalSent { .. }
+    ));
+
+    let reply_inbound =
+        read_matching_inbound_message(&mut subscriber_read, "reply with context").await;
+    let AgentControlEvent::InboundMessage {
+        message, reply_to, ..
+    } = reply_inbound.payload
+    else {
+        panic!("expected rich inbound reply");
+    };
+    assert_eq!(message.sender.account_id_hex, human.account.account_id_hex);
+    let reply_to = reply_to.expect("reply context");
+    assert_eq!(reply_to.message_id_hex, agent_reply_message_id_hex);
+    assert_eq!(
+        reply_to.availability,
+        agent_control::AgentControlReferencedMessageAvailability::Available
+    );
+    assert_eq!(
+        reply_to
+            .sender
+            .as_ref()
+            .map(|actor| actor.account_id_hex.as_str()),
+        Some(agent.account.account_id_hex.as_str())
+    );
+    assert_eq!(
+        reply_to.sender.as_ref().map(|actor| actor.is_self),
+        Some(true)
+    );
+    assert_eq!(reply_to.text_excerpt.as_deref(), Some("agent answer"));
+    assert!(!reply_to.text_truncated);
+    assert!(reply_to.recorded_at.is_some());
+
+    let deleted = send_control_request(
+        &socket,
+        "req-human-delete",
+        AgentControlRequest::DeleteMessage {
+            account_id_hex: human.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        deleted.payload,
+        AgentControlResponse::FinalSent { .. }
+    ));
+
+    let deletion_event = loop {
+        let event: AgentControlEnvelope<AgentControlEvent> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        if matches!(event.payload, AgentControlEvent::MessageDeleted { .. }) {
+            break event;
+        }
+    };
+    let AgentControlEvent::MessageDeleted {
+        event_id_hex,
+        target_message_id_hex,
+        actor,
+        recorded_at,
+        target,
+        ..
+    } = deletion_event.payload
+    else {
+        unreachable!();
+    };
+    assert!(!event_id_hex.is_empty());
+    assert_eq!(target_message_id_hex, human_message_id_hex);
+    assert_eq!(actor.account_id_hex, human.account.account_id_hex);
+    assert!(!actor.is_self);
+    assert!(recorded_at > 0);
+    assert_eq!(
+        target.availability,
+        agent_control::AgentControlReferencedMessageAvailability::Deleted
+    );
+    assert!(target.text_excerpt.is_none());
+    assert!(target.attachments.is_empty());
 
     server.abort();
     let _ = server.await;
@@ -1172,9 +1292,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
     let AgentControlEvent::InboundMessage {
         account_id_hex: event_account_id_hex,
         group_id_hex: event_group_id_hex,
-        message_id_hex: event_message_id_hex,
-        sender_account_id_hex: event_sender_account_id_hex,
-        text,
+        message,
         ..
     } = inbound.payload
     else {
@@ -1182,9 +1300,9 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
     };
     assert_eq!(event_account_id_hex, account_id_hex);
     assert_eq!(event_group_id_hex, group_id_hex);
-    assert_eq!(event_message_id_hex, message_id_hex);
-    assert_eq!(event_sender_account_id_hex, sender_account_id_hex);
-    assert_eq!(text, "ping from connector");
+    assert_eq!(message.message_id_hex, message_id_hex);
+    assert_eq!(message.sender.account_id_hex, sender_account_id_hex);
+    assert_eq!(message.text, "ping from connector");
 
     let sent = send_control_request(
         &socket,
@@ -3222,7 +3340,7 @@ where
                 .unwrap();
         if matches!(
             &event.payload,
-            AgentControlEvent::InboundMessage { text, .. } if text == expected_text
+            AgentControlEvent::InboundMessage { message, .. } if message.text == expected_text
         ) {
             return event;
         }
@@ -3301,6 +3419,8 @@ fn received_chat_record(
         recorded_at: 100,
         received_at: 100,
         insert_order: 0,
+        invalidated: false,
+        moderation_grant: false,
     }
 }
 
@@ -3317,13 +3437,19 @@ fn inbound_message_event_from_record_projects_received_chat() {
         AgentControlEvent::InboundMessage {
             account_id_hex: "acct".to_owned(),
             group_id_hex: "bb".to_owned(),
-            message_id_hex: "aa".to_owned(),
-            sender_account_id_hex: "cc".to_owned(),
-            text: "hello agent".to_owned(),
+            message: agent_control::AgentControlMessage {
+                message_id_hex: "aa".to_owned(),
+                sender: agent_control::AgentControlActor {
+                    account_id_hex: "cc".to_owned(),
+                    display_name: None,
+                    is_self: false,
+                },
+                text: "hello agent".to_owned(),
+                recorded_at: 100,
+                media: Vec::new(),
+            },
             mentions_self: false,
-            reply_to_message_id_hex: None,
-            sender_display_name: None,
-            media: Vec::new(),
+            reply_to: None,
         }
     );
 }
@@ -3337,16 +3463,9 @@ fn inbound_message_event_from_record_projects_received_delete() {
     record.kind = MARMOT_APP_EVENT_KIND_DELETE;
     record.tags = vec![vec!["e".to_owned(), target.clone()]];
 
-    let event =
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
-    assert_eq!(
-        event,
-        AgentControlEvent::MessageDeleted {
-            account_id_hex: "acct".to_owned(),
-            group_id_hex: "bb".to_owned(),
-            target_message_id_hex: target,
-            sender_account_id_hex: "cc".to_owned(),
-        }
+    assert!(
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).is_none(),
+        "a replayed delete must be hydrated against durable target state"
     );
 }
 
@@ -3440,7 +3559,7 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
         inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
     let AgentControlEvent::InboundMessage {
         mentions_self,
-        reply_to_message_id_hex,
+        reply_to,
         ..
     } = event
     else {
@@ -3448,7 +3567,7 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
     };
     assert!(mentions_self, "p-tag for the account should mark a mention");
     assert_eq!(
-        reply_to_message_id_hex.as_deref(),
+        reply_to.as_ref().map(|reply| reply.message_id_hex.as_str()),
         Some(parent_msg_id.as_str())
     );
 }
@@ -3703,10 +3822,10 @@ fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
     assert!(inbound_message_event_from_record("acct", self_authored, None, None).is_none());
 
-    // Unsupported non-chat kinds (reactions, agent stream starts) are not replayed.
-    let mut reaction = received_chat_record("aa", "bb", "cc", "+1");
-    reaction.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
-    assert!(inbound_message_event_from_record("acct", reaction, None, None).is_none());
+    // Agent stream markers are not part of the inbound durable-event feed.
+    let mut stream_start = received_chat_record("aa", "bb", "cc", "+1");
+    stream_start.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
+    assert!(inbound_message_event_from_record("acct", stream_start, None, None).is_none());
 
     // A group-system row that was received as an app message, rather than synthesized locally,
     // is not treated as a durable GroupStateChanged replay event.
@@ -3830,11 +3949,9 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     let recovered: Vec<_> = replayed
         .iter()
         .filter_map(|event| match event {
-            AgentControlEvent::InboundMessage {
-                text,
-                sender_account_id_hex,
-                ..
-            } => Some((text.clone(), sender_account_id_hex.clone())),
+            AgentControlEvent::InboundMessage { message, .. } => {
+                Some((message.text.clone(), message.sender.account_id_hex.clone()))
+            }
             _ => None,
         })
         .collect();
@@ -3857,7 +3974,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     assert!(
         !replayed_again.iter().any(|event| matches!(
             event,
-            AgentControlEvent::InboundMessage { text, .. } if text == "missed while lagging"
+            AgentControlEvent::InboundMessage { message, .. } if message.text == "missed while lagging"
         )),
         "second replay must not duplicate an already-delivered message"
     );

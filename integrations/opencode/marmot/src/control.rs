@@ -330,6 +330,22 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn rich_context_golden_events_decode() {
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../fixtures/agent-control-v2-rich-context.json"),
+        )
+        .unwrap();
+        let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();
+        assert_eq!(events.len(), 8);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentControlEvent::ReactionRemoved { .. }))
+        );
+    }
+
     #[tokio::test]
     async fn call_rejects_mismatched_response_id() {
         let dir = tempfile::tempdir().unwrap();

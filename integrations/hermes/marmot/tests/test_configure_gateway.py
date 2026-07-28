@@ -829,7 +829,7 @@ class ConfigureGatewayTransactionTests(unittest.TestCase):
             env_path = home / ".env"
             config_path = home / "config.yaml"
             env_original = f"MARMOT_ALLOWED_USERS={USER_A}\nMARMOT_ALLOW_ALL_USERS=false\n"
-            config_original = "model: gpt-4o\nplatforms: <<\n"
+            config_original = "model: gpt-4o\nplatforms:\n\tmarmot: {}\n"
             env_path.write_text(env_original, encoding="utf-8")
             config_path.write_text(config_original, encoding="utf-8")
             completed = subprocess.run(

@@ -2631,6 +2631,30 @@ impl MarmotAppRuntime {
         self.accounts.app.messages_with_query(&account.label, query)
     }
 
+    pub fn message_by_id(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppMessageRecord>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .message_by_id(&account.label, group_id_hex, message_id_hex)
+    }
+
+    pub fn message_target(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::TimelineMessageTarget>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .reaction_target(&account.label, group_id_hex, message_id_hex)
+    }
+
     pub fn timeline_messages_with_query(
         &self,
         account_ref: &str,

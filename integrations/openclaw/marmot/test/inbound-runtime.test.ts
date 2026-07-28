@@ -48,9 +48,13 @@ function inboundEvent(groupByte: string, idByte: string): InboundMessageEvent {
     type: "inbound_message",
     account_id_hex: HEX32("aa"),
     group_id_hex: HEX32(groupByte),
-    message_id_hex: HEX32(idByte),
-    sender_account_id_hex: HEX32("bb"),
-    text: "hello agent",
+    message: {
+      message_id_hex: HEX32(idByte),
+      sender: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      text: "hello agent",
+      recorded_at: 123,
+      media: [],
+    },
   };
 }
 
@@ -106,12 +110,7 @@ describe("startMarmotInbound", () => {
         clientFactory: () =>
           inboundStubClient([
             {
-              type: "inbound_message",
-              account_id_hex: HEX32("aa"),
-              group_id_hex: HEX32("cc"),
-              message_id_hex: HEX32("dd"),
-              sender_account_id_hex: HEX32("bb"),
-              text: "hello agent",
+              ...inboundEvent("cc", "dd"),
             },
           ]),
       },
@@ -157,22 +156,27 @@ describe("startMarmotInbound", () => {
           inboundStubClient([
             {
               ...inboundEvent("cc", "d1"),
-              text: "",
+              message: { ...inboundEvent("cc", "d1").message, text: "", media: [mediaA] },
               mentions_self: true,
-              reply_to_message_id_hex: HEX32("e1"),
-              media: [mediaA],
+              reply_to: {
+                message_id_hex: HEX32("e1"),
+                availability: "missing",
+                text_truncated: false,
+                attachments_truncated: false,
+              },
             },
             {
               ...inboundEvent("cc", "d2"),
-              text: "",
-              media: [{ ...mediaA, file_name: "a-duplicate.png" }, mediaB],
+              message: {
+                ...inboundEvent("cc", "d2").message,
+                text: "",
+                media: [{ ...mediaA, file_name: "a-duplicate.png" }, mediaB],
+              },
             },
             {
               ...inboundEvent("cc", "d3"),
-              text: "what is this?",
+              message: { ...inboundEvent("cc", "d3").message, text: "what is this?", media: [] },
               mentions_self: false,
-              reply_to_message_id_hex: null,
-              media: [],
             },
           ]),
       },
@@ -192,45 +196,56 @@ describe("startMarmotInbound", () => {
     expect(dispatched[0]?.media).toEqual([mediaA, mediaB]);
   });
 
-  it("surfaces a message deletion to the ambient surfacer with a stable contextKey", async () => {
-    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+  it("buffers a mutation and attaches it to the next triggering message", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
       config: { channels: { marmot: { profileNameOnboarding: false } } },
       logger: noopLogger,
     };
-    const stop = startMarmotInbound(api, () => {}, {
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
       clientFactory: () =>
         inboundStubClient([
           {
             type: "message_deleted",
             account_id_hex: HEX32("aa"),
             group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("ee"),
             target_message_id_hex: HEX32("dd"),
-            sender_account_id_hex: HEX32("bb"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            recorded_at: 124,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "deleted",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
           },
+          inboundEvent("cc", "ff"),
         ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
     });
 
-    await waitFor(() => surfaced.length > 0);
+    await waitFor(() => dispatched.length > 0);
     stop();
 
-    expect(surfaced[0]).toMatchObject({
-      groupIdHex: HEX32("cc"),
-      text: "A message was deleted.",
-      contextKey: `marmot:message_deleted:${HEX32("cc")}:${HEX32("dd")}`,
+    expect(dispatched[0]?.ambientContext).toHaveLength(1);
+    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({
+      type: "message_deleted",
+      event_id_hex: HEX32("ee"),
+      target_message_id_hex: HEX32("dd"),
     });
   });
 
-  it("surfaces a group rename with the new name and a change-scoped contextKey", async () => {
-    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+  it("buffers group state as structured next-turn context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
       config: { channels: { marmot: { profileNameOnboarding: false } } },
       logger: noopLogger,
     };
-    const stop = startMarmotInbound(api, () => {}, {
+    const stop = startMarmotInbound(api, (message) => {
+      dispatched.push(message);
+    }, {
       clientFactory: () =>
         inboundStubClient([
           {
@@ -240,75 +255,18 @@ describe("startMarmotInbound", () => {
             change: "group_renamed",
             detail: "Project Marmot",
           },
+          inboundEvent("cc", "ff"),
         ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
     });
 
-    await waitFor(() => surfaced.length > 0);
+    await waitFor(() => dispatched.length > 0);
     stop();
 
-    expect(surfaced[0]).toMatchObject({
-      groupIdHex: HEX32("cc"),
-      text: 'The group was renamed to "Project Marmot".',
-      contextKey: `marmot:group_state_changed:${HEX32("cc")}:group_renamed`,
+    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({
+      type: "group_state_changed",
+      change: "group_renamed",
+      detail: "Project Marmot",
     });
-  });
-
-  it("surfaces a disappearing-message timer change", async () => {
-    const surfaced: { text: string }[] = [];
-    const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
-      logger: noopLogger,
-    };
-    const stop = startMarmotInbound(api, () => {}, {
-      clientFactory: () =>
-        inboundStubClient([
-          {
-            type: "group_state_changed",
-            account_id_hex: HEX32("aa"),
-            group_id_hex: HEX32("cc"),
-            change: "disappearing_timer_changed",
-          },
-        ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
-    });
-
-    await waitFor(() => surfaced.length > 0);
-    stop();
-
-    expect(surfaced[0]?.text).toBe("The disappearing-message timer was changed.");
-  });
-
-  it("surfaces a membership change without any member detail", async () => {
-    const surfaced: { text: string }[] = [];
-    const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
-      logger: noopLogger,
-    };
-    const stop = startMarmotInbound(api, () => {}, {
-      clientFactory: () =>
-        inboundStubClient([
-          {
-            type: "group_state_changed",
-            account_id_hex: HEX32("aa"),
-            group_id_hex: HEX32("cc"),
-            change: "member_added",
-            detail: null,
-          },
-        ]),
-      surfaceAmbientEvent: (event) => {
-        surfaced.push(event);
-      },
-    });
-
-    await waitFor(() => surfaced.length > 0);
-    stop();
-
-    expect(surfaced[0]?.text).toBe("A member was added to the group.");
   });
 
   it("invalidates the dispatcher's group-activation cache on a group_state_changed event", async () => {

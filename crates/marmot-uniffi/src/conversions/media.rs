@@ -355,6 +355,8 @@ mod tests {
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         };
 
         let records = media_records_ffi(vec![message]);
@@ -482,6 +484,8 @@ mod tests {
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         };
 
         let from_list: Vec<MediaAttachmentReference> = media_records_ffi(vec![message])

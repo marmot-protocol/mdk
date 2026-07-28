@@ -121,6 +121,12 @@ EOF
 
 cat >"$mock_bin/$host_command" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    case "$(basename "$0")" in
+        hermes) printf '%s\n' "Hermes 0.19.0" ;;
+        openclaw) printf '%s\n' "OpenClaw 2026.7.1" ;;
+    esac
+fi
 exit 0
 EOF
 chmod +x "$mock_bin"/*

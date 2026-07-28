@@ -336,14 +336,11 @@ jobs:
           enable-cache: false
 
       - name: Prepare isolated Hermes dev root
-        env:
-          HERMES_MARMOT_INTEGRATION_REF: c7b75a7849cb260e6f17a045473bfdd0ea21ca81
         run: |
           set -euo pipefail
           dev_root="$RUNNER_TEMP/hermes-marmot-integration"
           ./scripts/hermes_marmot_dev_setup.sh \
             --root "$dev_root" \
-            --hermes-ref "$HERMES_MARMOT_INTEGRATION_REF" \
             --no-enable-plugin
           echo "HERMES_MARMOT_DEV_ROOT=$dev_root" >> "$GITHUB_ENV"
 

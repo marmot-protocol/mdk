@@ -584,6 +584,8 @@ impl LegacyAccountProjectionDb {
                 // the one-time migration and are never used as a replay cursor, so
                 // the value here is immaterial.
                 insert_order: 0,
+                invalidated: false,
+                moderation_grant: false,
             })
         };
         let rows = match (&query.group_id_hex, query.limit) {
