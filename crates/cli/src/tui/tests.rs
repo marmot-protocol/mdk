@@ -10600,12 +10600,32 @@ fn parse_relay_health_reads_counters_histograms_and_per_relay() {
             "eose": {"buckets": [{"upper_bound_ms": 300, "count": 2}], "overflow_count": 0},
             "per_relay": [{"relay_index": 0, "first_event": {"buckets": [{"upper_bound_ms": 100, "count": 2}], "overflow_count": 0}, "eose": {"buckets": [{"upper_bound_ms": 300, "count": 1}], "overflow_count": 0}}]
         },
-        "health": {"sdk_backed": true, "total_relays": 3, "connected": 2, "connecting": 0, "disconnected": 1, "connection_attempts": 5, "connection_successes": 4}
+        "health": {
+            "sdk_backed": true,
+            "total_relays": 3,
+            "connected": 2,
+            "connecting": 0,
+            "disconnected": 1,
+            "connection_attempts": 5,
+            "connection_successes": 4,
+            "notification_forwarder_running": true,
+            "notification_forwarder_restarts": 2,
+            "notification_forwarder_lag_incidents": 1,
+            "notification_forwarder_lagged_notifications": 17,
+            "notification_forwarder_panics": 1,
+            "notification_forwarder_unexpected_exits": 1
+        }
     });
     let data = parse_relay_health(&snapshot, true);
     assert_eq!(data.inbound_seen, 10);
     assert_eq!(data.total_relays, 3);
     assert_eq!(data.connected, 2);
+    assert!(data.notification_forwarder_running);
+    assert_eq!(data.notification_forwarder_restarts, 2);
+    assert_eq!(data.notification_forwarder_lag_incidents, 1);
+    assert_eq!(data.notification_forwarder_lagged_notifications, 17);
+    assert_eq!(data.notification_forwarder_panics, 1);
+    assert_eq!(data.notification_forwarder_unexpected_exits, 1);
     assert_eq!(data.observed, 5);
     assert_eq!(data.spread_samples, 4);
     // p50 of 4 samples: ceil(0.5*4)=2 falls in the first (<=50ms) bucket.

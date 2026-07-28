@@ -162,6 +162,12 @@ pub struct RelayHealthFfi {
     pub sleeping: u32,
     pub connection_attempts: u32,
     pub connection_successes: u32,
+    pub notification_forwarder_running: bool,
+    pub notification_forwarder_restarts: u64,
+    pub notification_forwarder_lag_incidents: u64,
+    pub notification_forwarder_lagged_notifications: u64,
+    pub notification_forwarder_panics: u64,
+    pub notification_forwarder_unexpected_exits: u64,
 }
 
 impl From<RelayPlaneHealth> for RelayHealthFfi {
@@ -179,6 +185,13 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
             sleeping: super::saturating_u32(value.sleeping),
             connection_attempts: super::saturating_u32(value.connection_attempts),
             connection_successes: super::saturating_u32(value.connection_successes),
+            notification_forwarder_running: value.notification_forwarder_running,
+            notification_forwarder_restarts: value.notification_forwarder_restarts,
+            notification_forwarder_lag_incidents: value.notification_forwarder_lag_incidents,
+            notification_forwarder_lagged_notifications: value
+                .notification_forwarder_lagged_notifications,
+            notification_forwarder_panics: value.notification_forwarder_panics,
+            notification_forwarder_unexpected_exits: value.notification_forwarder_unexpected_exits,
         }
     }
 }

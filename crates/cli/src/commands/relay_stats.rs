@@ -109,6 +109,15 @@ pub(crate) fn relay_stats_plain(snapshot: &RelayTelemetrySnapshot) -> String {
         health.connection_attempts,
         health.connection_successes,
     ));
+    lines.push(format!(
+        "notification forwarder: running={} restarts={} lag_incidents={} lagged_notifications={} panics={} unexpected_exits={}",
+        health.notification_forwarder_running,
+        health.notification_forwarder_restarts,
+        health.notification_forwarder_lag_incidents,
+        health.notification_forwarder_lagged_notifications,
+        health.notification_forwarder_panics,
+        health.notification_forwarder_unexpected_exits,
+    ));
     lines.join("\n")
 }
 
