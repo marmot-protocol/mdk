@@ -187,6 +187,7 @@ impl AgentConnector {
                 before_inclusive,
                 limit,
             } => self.timeline_list_response(
+                request_id,
                 &account_id_hex,
                 &group_id_hex,
                 before,

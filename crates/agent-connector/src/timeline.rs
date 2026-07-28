@@ -42,6 +42,7 @@ impl AgentConnector {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn timeline_list_response(
         &self,
+        request_id: Option<&str>,
         account_id_hex: &str,
         group_id_hex: &str,
         before: Option<AgentControlTimelineCursor>,
@@ -71,38 +72,60 @@ impl AgentConnector {
                 },
             },
         )?;
-        let mut messages = page
-            .messages
-            .into_iter()
-            .map(|record| timeline_message(record, &account.account_id_hex))
-            .collect::<Vec<_>>();
-        let mut has_more_before = page.has_more_before;
-        let mut has_more_after = page.has_more_after;
-
-        loop {
-            let response = AgentControlResponse::TimelinePage {
+        bounded_timeline_page_response(
+            request_id,
+            AgentControlResponse::TimelinePage {
                 account_id_hex: account.account_id_hex.clone(),
                 group_id_hex: group_id_hex.clone(),
-                messages: messages.clone(),
-                has_more_before,
-                has_more_after,
-            };
-            // Keep a complete response envelope below the protocol frame cap. When a
-            // requested page is too large, preserve the messages nearest the cursor
-            // and expose the omitted side through the existing pagination flags.
-            let sizing_envelope = AgentControlEnvelope::new(Some("0".repeat(64)), response.clone());
-            if serde_json::to_vec(&sizing_envelope)?.len() < MAX_AGENT_CONTROL_FRAME_BYTES
-                || messages.len() <= 1
-            {
-                return Ok(response);
-            }
-            if after.is_some() {
-                messages.pop();
-                has_more_after = true;
-            } else {
-                messages.remove(0);
-                has_more_before = true;
-            }
+                messages: page
+                    .messages
+                    .into_iter()
+                    .map(|record| timeline_message(record, &account.account_id_hex))
+                    .collect(),
+                has_more_before: page.has_more_before,
+                has_more_after: page.has_more_after,
+            },
+            after.is_some(),
+        )
+    }
+}
+
+fn bounded_timeline_page_response(
+    request_id: Option<&str>,
+    mut response: AgentControlResponse,
+    trim_from_back: bool,
+) -> Result<AgentControlResponse, ConnectorError> {
+    loop {
+        // Size the exact envelope that handle_connection will write, including
+        // the caller-supplied correlation id.
+        let sizing_envelope =
+            AgentControlEnvelope::new(request_id.map(str::to_owned), response.clone());
+        let frame_len = serde_json::to_vec(&sizing_envelope)?.len() + 1;
+        if frame_len <= MAX_AGENT_CONTROL_FRAME_BYTES {
+            return Ok(response);
+        }
+
+        let AgentControlResponse::TimelinePage {
+            messages,
+            has_more_before,
+            has_more_after,
+            ..
+        } = &mut response
+        else {
+            unreachable!("timeline page bounder requires a timeline_page response");
+        };
+        if messages.is_empty() {
+            return Err(agent_control::AgentControlError::FrameTooLarge(frame_len).into());
+        }
+        // Storage returns rows in chronological order. For an `after` page,
+        // discard the newest tail; otherwise discard the oldest head. This
+        // preserves the rows nearest the requested cursor.
+        if trim_from_back {
+            messages.pop();
+            *has_more_after = true;
+        } else {
+            messages.remove(0);
+            *has_more_before = true;
         }
     }
 }
@@ -201,6 +224,10 @@ fn bounded_string(text: &str, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    use agent_control::{
+        AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX, AgentControlActor, AgentControlAttachmentSummary,
+        encode_frame,
+    };
     use marmot_app::{TimelineMessageRecord, TimelineReactionSummary, TimelineUserReaction};
 
     use super::*;
@@ -280,5 +307,144 @@ mod tests {
         );
         assert_eq!(invalidated.text, None);
         assert!(invalidated.reactions.is_empty());
+    }
+
+    fn large_timeline_message(index: usize) -> AgentControlTimelineMessage {
+        let actor = AgentControlActor {
+            account_id_hex: "44".repeat(32),
+            display_name: None,
+            is_self: false,
+        };
+        AgentControlTimelineMessage {
+            message_id_hex: format!("{index:064x}"),
+            sender: actor.clone(),
+            direction: "received".to_owned(),
+            kind: 9,
+            recorded_at: index as u64,
+            observed_at: index as u64,
+            availability: AgentControlTimelineMessageAvailability::Available,
+            text: Some("t".repeat(AGENT_CONTROL_TIMELINE_TEXT_MAX_CHARS)),
+            text_truncated: true,
+            reply_to_message_id_hex: None,
+            attachments: (0..AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX)
+                .map(|_| AgentControlAttachmentSummary {
+                    media_type: "m".repeat(TIMELINE_ATTACHMENT_FIELD_MAX_CHARS),
+                    file_name: "f".repeat(TIMELINE_ATTACHMENT_FIELD_MAX_CHARS),
+                    dim: Some("d".repeat(TIMELINE_ATTACHMENT_FIELD_MAX_CHARS)),
+                })
+                .collect(),
+            attachments_truncated: true,
+            reactions: (0..AGENT_CONTROL_TIMELINE_REACTIONS_MAX)
+                .map(|reaction| AgentControlTimelineReaction {
+                    reaction_message_id_hex: format!("{reaction:064x}"),
+                    actor: actor.clone(),
+                    emoji: "e".repeat(TIMELINE_REACTION_EMOJI_MAX_CHARS),
+                    reacted_at: reaction as u64,
+                })
+                .collect(),
+            reactions_truncated: true,
+        }
+    }
+
+    fn oversized_page() -> AgentControlResponse {
+        AgentControlResponse::TimelinePage {
+            account_id_hex: "11".repeat(32),
+            group_id_hex: "22".repeat(32),
+            messages: (0..AGENT_CONTROL_TIMELINE_MAX_LIMIT as usize)
+                .map(large_timeline_message)
+                .collect(),
+            has_more_before: false,
+            has_more_after: false,
+        }
+    }
+
+    fn page_messages(response: &AgentControlResponse) -> &[AgentControlTimelineMessage] {
+        let AgentControlResponse::TimelinePage { messages, .. } = response else {
+            panic!("expected timeline_page response");
+        };
+        messages
+    }
+
+    #[test]
+    fn oversized_before_page_keeps_newest_rows_nearest_cursor() {
+        let response =
+            bounded_timeline_page_response(Some("request-before"), oversized_page(), false)
+                .unwrap();
+        let messages = page_messages(&response);
+        assert!(!messages.is_empty());
+        assert!(messages.len() < AGENT_CONTROL_TIMELINE_MAX_LIMIT as usize);
+        assert_ne!(messages[0].message_id_hex, format!("{:064x}", 0));
+        assert_eq!(
+            messages.last().unwrap().message_id_hex,
+            format!("{:064x}", AGENT_CONTROL_TIMELINE_MAX_LIMIT - 1)
+        );
+        let AgentControlResponse::TimelinePage {
+            has_more_before,
+            has_more_after,
+            ..
+        } = &response
+        else {
+            unreachable!()
+        };
+        assert!(*has_more_before);
+        assert!(!*has_more_after);
+        assert!(
+            encode_frame(&AgentControlEnvelope::new(
+                Some("request-before".to_owned()),
+                response
+            ))
+            .unwrap()
+            .len()
+                <= MAX_AGENT_CONTROL_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn oversized_after_page_keeps_oldest_rows_nearest_cursor() {
+        let response =
+            bounded_timeline_page_response(Some("request-after"), oversized_page(), true).unwrap();
+        let messages = page_messages(&response);
+        assert!(!messages.is_empty());
+        assert!(messages.len() < AGENT_CONTROL_TIMELINE_MAX_LIMIT as usize);
+        assert_eq!(messages[0].message_id_hex, format!("{:064x}", 0));
+        assert_ne!(
+            messages.last().unwrap().message_id_hex,
+            format!("{:064x}", AGENT_CONTROL_TIMELINE_MAX_LIMIT - 1)
+        );
+        let AgentControlResponse::TimelinePage {
+            has_more_before,
+            has_more_after,
+            ..
+        } = &response
+        else {
+            unreachable!()
+        };
+        assert!(!*has_more_before);
+        assert!(*has_more_after);
+        assert!(
+            encode_frame(&AgentControlEnvelope::new(
+                Some("request-after".to_owned()),
+                response
+            ))
+            .unwrap()
+            .len()
+                <= MAX_AGENT_CONTROL_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn page_budget_accounts_for_actual_request_id() {
+        let short = bounded_timeline_page_response(Some("short"), oversized_page(), false).unwrap();
+        let long_request_id = "r".repeat(100_000);
+        let long = bounded_timeline_page_response(Some(&long_request_id), oversized_page(), false)
+            .unwrap();
+
+        assert!(page_messages(&long).len() < page_messages(&short).len());
+        assert!(
+            encode_frame(&AgentControlEnvelope::new(Some(long_request_id), long))
+                .unwrap()
+                .len()
+                <= MAX_AGENT_CONTROL_FRAME_BYTES
+        );
     }
 }
