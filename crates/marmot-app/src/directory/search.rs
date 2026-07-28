@@ -11,7 +11,7 @@
 //! timeout, and the producer stops the moment its consumer drops the
 //! subscription. Nothing here writes `directory_users` — strangers surfaced by
 //! search stay un-promoted so they can never become live per-author
-//! subscriptions (mdk#687).
+//! subscriptions (mdk#418).
 //!
 //! The synchronous [`MarmotApp::search_user_directory`] remains the offline
 //! path over already-cached follow edges; this module is the live one.
@@ -147,6 +147,14 @@ impl UserSearchParams {
             return Err(AppError::InvalidDirectorySearch(format!(
                 "radius_end must be at most {MAX_SUPPORTED_SEARCH_RADIUS}"
             )));
+        }
+        // Seeds reach an author-scoped fetch that rejects its whole batch on
+        // one unparseable id, so a malformed seed would cost the entire
+        // traversal rather than itself. This field is public API: rejecting it
+        // here tells the caller which input was wrong instead of surfacing a
+        // failed search.
+        for seed in &self.radius_one_seeds {
+            parse_account_id_hex(seed)?;
         }
         parse_account_id_hex(&self.searcher_account_id_hex)
     }
@@ -398,32 +406,63 @@ async fn resolve_layer(
             return Ok(());
         }
         let fetched = fetch_profile_records(app, batch).await?;
-        let unresolved = fetched
-            .iter()
-            .filter(|record| record.profile.is_none())
-            .map(|record| record.account_id_hex.clone())
-            .collect::<Vec<_>>();
-        emitter
-            .tally
-            .resolved_from_relays(fetched.len() - unresolved.len());
-        cache_resolved_profiles(app, &fetched, now).await?;
-        emitter.emit_matches(radius, fetched, query).await;
+        let (resolved, mut pending): (Vec<_>, Vec<_>) = fetched
+            .into_iter()
+            .partition(|record| record.profile.is_some());
+        emitter.tally.resolved_from_relays(resolved.len());
+        cache_resolved_profiles(app, &resolved, now).await?;
+        emitter.emit_matches(radius, resolved, query).await;
 
-        if emitter.is_cancelled() || unresolved.is_empty() {
-            continue;
-        }
         // Everyone still unresolved publishes nowhere the searcher reads. Ask
         // the relays they say they write to -- the outbox model, and the only
         // way to reach someone whose profile never leaves their own relays.
-        let outboxed = resolve_from_write_relays(app, &unresolved).await?;
-        emitter.tally.resolved_from_write_relays(outboxed.len());
+        //
+        // Held back rather than emitted alongside the resolved ones: the
+        // matcher also matches npub and pubkey hex, so a profile-less record
+        // can match a query on its own and would then be reported twice, once
+        // empty and once resolved. One person is one result, however many tiers
+        // it took.
+        if !pending.is_empty() && !emitter.is_cancelled() {
+            let account_ids = pending
+                .iter()
+                .map(|record| record.account_id_hex.clone())
+                .collect::<Vec<_>>();
+            let outboxed = resolve_from_write_relays(app, &account_ids).await?;
+            emitter.tally.resolved_from_write_relays(outboxed.len());
+            cache_resolved_profiles(app, &outboxed, now).await?;
+            replace_resolved_profiles(&mut pending, outboxed);
+        }
+
+        // Still profile-less, and emitted anyway: the matcher can match their
+        // npub or pubkey hex, so dropping them would make a search for a
+        // follow's npub miss somebody whose profile simply is not published.
         emitter
             .tally
-            .unresolved(unresolved.len().saturating_sub(outboxed.len()));
-        cache_resolved_profiles(app, &outboxed, now).await?;
-        emitter.emit_matches(radius, outboxed, query).await;
+            .unresolved(pending.iter().filter(|r| r.profile.is_none()).count());
+        emitter.emit_matches(radius, pending, query).await;
     }
     Ok(())
+}
+
+/// Fold outbox-resolved profiles back into the records awaiting them, so each
+/// account is carried by exactly one record.
+fn replace_resolved_profiles(
+    pending: &mut [UserDirectoryRecord],
+    outboxed: Vec<UserDirectoryRecord>,
+) {
+    let mut profiles = outboxed
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .profile
+                .map(|profile| (record.account_id_hex, profile))
+        })
+        .collect::<HashMap<_, _>>();
+    for record in pending {
+        if let Some(profile) = profiles.remove(&record.account_id_hex) {
+            record.profile = Some(profile);
+        }
+    }
 }
 
 /// Resolve profiles from the authors' own NIP-65 write relays.
@@ -514,7 +553,7 @@ fn write_relays_from_record(
 ///
 /// Writes to the un-promoted search-graph tier only, never `directory_users`:
 /// answering a search is not a relationship, and a promoted stranger would
-/// become a live per-author subscription (mdk#687).
+/// become a live per-author subscription (mdk#418).
 ///
 /// Only records that actually carry a profile are written. A pubkey that came
 /// back empty is left uncached rather than recorded as "has no profile" --
@@ -1154,7 +1193,7 @@ mod tests {
     /// search for the same person is warm -- and it is kept in the un-promoted
     /// tier only. Caching a stranger must never turn them into a directory
     /// entry, because that is what feeds live per-author subscriptions
-    /// (mdk#687). The `entry` assertion is the guard on that.
+    /// (mdk#418). The `entry` assertion is the guard on that.
     #[tokio::test]
     async fn a_profile_resolved_from_a_relay_is_cached_without_promoting_the_stranger() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
@@ -1719,6 +1758,103 @@ mod tests {
                 .any(|result| result.account_id_hex == stranger),
             "the cached profile must be reachable despite the profile-less promoted row"
         );
+    }
+
+    /// A query that matches an account's npub or pubkey matches it whether or
+    /// not a profile was ever found -- that is deliberate, so an npub search
+    /// still finds a follow who publishes no profile. It must not mean the
+    /// account is reported twice when the outbox tier later supplies the
+    /// profile: one person, one result, however many tiers it took to resolve.
+    #[tokio::test]
+    async fn an_npub_match_resolved_by_the_outbox_tier_is_reported_once() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let author_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let author_relay_url = author_relay.url().await.to_string();
+
+        let author_endpoint = cgka_traits::TransportEndpoint(author_relay_url.clone());
+        let searcher_endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
+        let stranger_dir = tempfile::tempdir().unwrap();
+        let stranger_app = MarmotApp::with_relay(stranger_dir.path(), author_relay_url.clone());
+        let stranger = stranger_app
+            .runtime()
+            .create_identity(crate::AccountSetupRequest {
+                default_relays: vec![author_endpoint.clone()],
+                bootstrap_relays: vec![author_endpoint.clone(), searcher_endpoint],
+                publish_missing_relay_lists: true,
+                ..crate::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create the stranger's identity")
+            .account;
+        stranger_app
+            .publish_user_profile(
+                &stranger.account_id_hex,
+                UserProfileMetadata {
+                    name: Some("bob".to_owned()),
+                    ..UserProfileMetadata::default()
+                },
+                crate::AccountRelayListBootstrap::new(vec![author_endpoint], Vec::new()),
+            )
+            .await
+            .expect("publish the stranger's profile");
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), relay_url);
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.account_id_hex.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+
+        // Query the stranger's own pubkey hex: it matches before any profile is
+        // known, and still matches after the outbox tier resolves one.
+        let subscription = app
+            .search_users(params(
+                &account.account_id_hex,
+                &stranger.account_id_hex,
+                (1, 1),
+            ))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+
+        let hits: Vec<&UserDirectorySearchResult> = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .filter(|result| result.account_id_hex == stranger.account_id_hex)
+            .collect();
+        assert_eq!(hits.len(), 1, "one person, one result: {hits:?}");
+        assert!(
+            hits[0].profile.is_some(),
+            "the surviving result must be the resolved one, not the empty first pass"
+        );
+    }
+
+    /// `radius_one_seeds` is public API, and a seed reaches an author-scoped
+    /// fetch that rejects its whole batch on one unparseable id. Rejecting the
+    /// request names the bad input instead of failing the search for reasons a
+    /// caller cannot see.
+    #[tokio::test]
+    async fn a_malformed_seed_is_rejected_rather_than_failing_the_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+
+        let error = app
+            .search_users(UserSearchParams {
+                radius_one_seeds: vec!["not-a-pubkey".to_owned()],
+                ..params(&account.account_id_hex, "needle", (0, 1))
+            })
+            .await
+            .expect_err("a malformed seed is a bad request, not a silent skip");
+
+        assert!(matches!(error, AppError::InvalidPublicKey), "{error:?}");
     }
 
     #[tokio::test]
