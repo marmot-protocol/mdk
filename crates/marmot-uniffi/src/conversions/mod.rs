@@ -279,6 +279,61 @@ mod tests {
     }
 
     #[test]
+    fn disband_management_actions_require_admin_support_and_enablement() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let group = group(vec![self_id]);
+
+        let mut disabled = mls_state();
+        disabled.disbanding_enabled = false;
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: disabled.clone(),
+            },
+        );
+        assert!(state.can_enable_disbanding);
+        assert!(!state.can_disband);
+
+        disabled.disbanding_blockers = vec![bob_id.to_owned()];
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: disabled,
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(!state.can_disband);
+        assert_eq!(state.disbanding_blockers, vec![bob_id]);
+
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group: group.clone(),
+                members: vec![member(self_id, true, true), member(bob_id, false, false)],
+                mls_state: mls_state(),
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(state.can_disband);
+
+        let state = group_management_state_ffi(
+            self_id,
+            &GroupDetailsFfi {
+                group,
+                members: vec![member(self_id, false, true), member(bob_id, true, false)],
+                mls_state: mls_state(),
+            },
+        );
+        assert!(!state.can_enable_disbanding);
+        assert!(!state.can_disband);
+    }
+
+    #[test]
     fn lifecycle_ffi_mapping_covers_all_six_canonical_states() {
         let cases = [
             (

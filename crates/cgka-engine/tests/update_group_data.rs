@@ -21,8 +21,9 @@ use cgka_traits::app_components::{
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_component_vectors,
-    encode_components_list, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    GroupLifecycleV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_group_lifecycle_v1,
+    default_group_components, encode_component_vectors, encode_components_list,
+    encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent,
@@ -1127,9 +1128,57 @@ async fn current_profile_component_update_preserves_active_lifecycle_for_peer() 
 
     assert_eq!(bob.group_record(&gid).unwrap().name, "after");
     assert_eq!(
-        bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
-            .unwrap(),
-        Some(vec![0])
+        decode_group_lifecycle_v1(
+            &bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                .unwrap()
+                .expect("lifecycle component present"),
+        )
+        .unwrap(),
+        GroupLifecycleV1::Active
+    );
+}
+
+#[tokio::test]
+async fn required_lifecycle_component_cannot_be_unrequired() {
+    let mut alice = build_current(b"alice-required-lifecycle");
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "required lifecycle".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+    let mut required = alice
+        .group_record(&gid)
+        .unwrap()
+        .required_capabilities
+        .app_components;
+    assert!(required.ids.remove(&GROUP_LIFECYCLE_COMPONENT_ID));
+
+    let error = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: APP_COMPONENTS_COMPONENT_ID,
+                data: encode_components_list(&required.ids),
+            }],
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("lifecycle-v1 cannot be un-required"),
+        "unexpected error: {error}"
     );
 }
 

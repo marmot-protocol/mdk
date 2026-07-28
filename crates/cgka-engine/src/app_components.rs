@@ -878,6 +878,11 @@ pub(crate) fn validate_group_lifecycle_transition(
     }
 
     let enabling = !before_required && after_required;
+    if before_required && !after_required {
+        return Err(EngineError::Other(
+            "commit is invalid: lifecycle-v1 cannot be un-required".into(),
+        ));
+    }
     if enabling {
         if after != Some(GroupLifecycleV1::Active) {
             return Err(EngineError::Other(

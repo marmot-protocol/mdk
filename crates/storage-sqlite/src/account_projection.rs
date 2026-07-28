@@ -674,6 +674,9 @@ impl SqliteAccountStorage {
                 "local group delete id must not be empty".to_owned(),
             ));
         }
+        let group_id = hex::decode(group_id_hex).map_err(|error| {
+            StorageError::Serialization(format!("invalid local group id: {error}"))
+        })?;
 
         self.connection.with_transaction(|| -> StorageResult<bool> {
             let conn = self.lock()?;
@@ -701,9 +704,6 @@ impl SqliteAccountStorage {
                     .storage()?,
                 );
             }
-            let group_id = hex::decode(group_id_hex).map_err(|error| {
-                StorageError::Serialization(format!("invalid local group id: {error}"))
-            })?;
             let terminal = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -716,7 +716,7 @@ impl SqliteAccountStorage {
                 != 0;
             if terminal {
                 deleted = deleted.saturating_add(
-                    conn.execute("DELETE FROM cgka_groups WHERE id = ?1", params![group_id])
+                    conn.execute("DELETE FROM cgka_groups WHERE id = ?1", params![&group_id])
                         .storage()?,
                 );
             }

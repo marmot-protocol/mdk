@@ -143,6 +143,16 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
 
+        // Authenticated terminal evidence is permanent. Drop late traffic
+        // before the missing-OpenMLS fallback can retain it as retryable
+        // unknown-group input.
+        if self.storage.disband_tombstone(&group_id)?.is_some() {
+            self.storage.put_ingress_dedup_marker(&msg.id)?;
+            return Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            });
+        }
+
         // Quarantine gate (mdk#364): a group frozen by hydration
         // quarantine must not process any input — its OpenMLS state may load
         // fine (e.g. MemberValidationFailed) and a merged commit would call

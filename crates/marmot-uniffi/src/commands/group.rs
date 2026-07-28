@@ -371,6 +371,10 @@ impl Marmot {
         group_id_hex: String,
     ) -> Result<DisbandRequestFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
         let request = self.runtime.disband_group(&account_ref, &group_id).await?;
         Ok(request.into())
     }
@@ -948,7 +952,7 @@ mod tests {
             disbanding: false,
             can_enable_disbanding: false,
             can_disband: self_admin,
-            disband_blockers: vec![],
+            disbanding_blockers: vec![],
             disband_request: None,
             member_actions: vec![
                 GroupMemberActionStateFfi {

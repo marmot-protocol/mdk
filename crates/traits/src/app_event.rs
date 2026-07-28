@@ -146,6 +146,8 @@ pub enum MarmotAppEventError {
     IdMismatch { expected: String, found: String },
     #[error("marmot app event pubkey mismatch")]
     PubkeyMismatch { expected: String, found: String },
+    #[error("group-system event requires an authenticated actor")]
+    MissingAuthenticatedActor,
 }
 
 impl MarmotAppEvent {
@@ -429,6 +431,9 @@ pub fn group_system_event_material(
     actor: Option<&MemberId>,
     change: &GroupStateChange,
 ) -> Result<GroupSystemEventMaterial, MarmotAppEventError> {
+    if matches!(change, GroupStateChange::GroupDisbanded) && actor.is_none() {
+        return Err(MarmotAppEventError::MissingAuthenticatedActor);
+    }
     let parts = group_system_projection_parts(change);
     let system_type = parts.system_type;
     let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
@@ -772,6 +777,18 @@ mod tests {
                 GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED.to_owned(),
             ]]
         );
+    }
+
+    #[test]
+    fn group_disbanded_material_requires_authenticated_actor() {
+        let error = group_system_event_material(
+            &GroupId::new(vec![0x22; 32]),
+            3,
+            None,
+            &GroupStateChange::GroupDisbanded,
+        )
+        .unwrap_err();
+        assert_eq!(error, MarmotAppEventError::MissingAuthenticatedActor);
     }
 
     #[test]

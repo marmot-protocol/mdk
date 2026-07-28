@@ -60,6 +60,8 @@ pub enum MarmotKitError {
         group_id_hex: String,
         member_ids_hex: Vec<String>,
     },
+    #[error("group {group_id_hex} has not enabled disbanding")]
+    DisbandingNotEnabled { group_id_hex: String },
     #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
@@ -247,6 +249,9 @@ impl MarmotKitError {
                         .collect(),
                 }
             }
+            EngineError::DisbandingNotEnabled { group_id } => Self::DisbandingNotEnabled {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             EngineError::UnknownMember { group_id, member } => Self::MemberNotInGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
@@ -319,6 +324,20 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected LeaveAlreadyRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disbanding_not_enabled_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x22; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::DisbandingNotEnabled {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::DisbandingNotEnabled { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected DisbandingNotEnabled, got {other:?}"),
         }
     }
 

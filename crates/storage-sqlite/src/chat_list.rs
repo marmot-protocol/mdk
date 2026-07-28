@@ -1,6 +1,7 @@
 use crate::account_projection::chat_mute_is_effective;
 use crate::storage::disband_requests::{
     disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
+    disbanding_group_ids_hex_with_requests_tx,
 };
 use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
@@ -1489,10 +1490,10 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         row.leave_requested_at_ms = pending_leave_requests_by_group_hex_tx(tx)?
             .get(&row.group_id_hex)
             .copied();
-        row.disbanding = disbanding_group_ids_hex_tx(tx)?.contains(&row.group_id_hex);
-        row.disband_request = disband_requests_by_group_hex_tx(tx)?
-            .get(&row.group_id_hex)
-            .cloned();
+        let disband_requests = disband_requests_by_group_hex_tx(tx)?;
+        row.disbanding = disbanding_group_ids_hex_with_requests_tx(tx, &disband_requests)?
+            .contains(&row.group_id_hex);
+        row.disband_request = disband_requests.get(&row.group_id_hex).cloned();
         Ok(row)
     })
     .transpose()

@@ -107,7 +107,7 @@ impl<S: StorageProvider> Engine<S> {
             || crate::app_components::lifecycle_of_group(&mls_group)?
                 != Some(GroupLifecycleV1::Active)
         {
-            return Err(EngineError::Other("group disbanding is not enabled".into()));
+            return Err(EngineError::DisbandingNotEnabled { group_id });
         }
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
@@ -264,6 +264,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<cgka_traits::MemberId>, EngineError> {
+        self.ensure_group_live(group_id)?;
         if self.storage.disband_tombstone(group_id)?.is_some() {
             return Ok(Vec::new());
         }

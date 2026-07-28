@@ -76,6 +76,11 @@ pub enum EngineError {
         members: Vec<MemberId>,
     },
 
+    /// The group has not yet installed and required lifecycle-v1, so it cannot
+    /// accept a terminal disband request.
+    #[error("group disbanding is not enabled")]
+    DisbandingNotEnabled { group_id: GroupId },
+
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an

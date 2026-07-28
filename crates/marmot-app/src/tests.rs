@@ -11,6 +11,7 @@ use cgka_traits::app_event::{
     STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_PARENT_TAG, STREAM_START_TAG,
     STREAM_TAG, STREAM_TYPE_TAG,
 };
+use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use marmot_account::AccountHomeError;
 use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_nostr_adapter::{
@@ -207,6 +208,48 @@ fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
         "pending-disband-composer-gate",
         pending_disband_composer_gate_body,
     );
+}
+
+#[test]
+fn inbound_disband_candidate_blocks_both_local_delete_entry_points() {
+    run_composed_app_runtime_test(
+        "inbound-disband-local-delete-gate",
+        inbound_disband_candidate_blocks_local_delete_body,
+    );
+}
+
+async fn inbound_disband_candidate_blocks_local_delete_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    app.account_storage("alice")
+        .unwrap()
+        .put_disband_candidate(&DisbandCandidate {
+            group_id: group_id.clone(),
+            source_epoch: cgka_traits::EpochId(0),
+            commit_id: cgka_traits::MessageId::new(vec![0x41; 32]),
+            content_commit_id: cgka_traits::MessageId::new(vec![0x42; 32]),
+            commit_digest: [0x43; 32],
+            actor: cgka_traits::MemberId::new(vec![0x44; 32]),
+            local_was_committer_leaf: false,
+            former_members: vec![],
+        })
+        .unwrap();
+
+    assert!(matches!(
+        client.delete_group_local(&group_id).await,
+        Err(AppError::GroupDisbanding(_))
+    ));
+    assert!(matches!(
+        app.delete_group_local_data("alice", &group_id_hex),
+        Err(AppError::GroupDisbanding(_))
+    ));
 }
 
 async fn pending_disband_composer_gate_body() {
