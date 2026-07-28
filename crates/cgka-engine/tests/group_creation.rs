@@ -1327,6 +1327,27 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         !alice.disbanding_in_progress(&group_id).unwrap(),
         "terminal state is reported by the lifecycle, not as pending work"
     );
+    let late_message_id = MessageId::new(b"late-terminal-group-traffic".to_vec());
+    let late = TransportMessage {
+        id: late_message_id.clone(),
+        payload: b"never peel terminal traffic".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    assert!(matches!(
+        alice.ingest(late).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::UnknownGroup,
+        }
+    ));
+    assert!(
+        storage.get_message(&late_message_id).is_err(),
+        "late terminal traffic must not become a retryable message row"
+    );
     let state_changes = alice
         .drain_events()
         .into_iter()

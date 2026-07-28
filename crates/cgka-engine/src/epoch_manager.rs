@@ -107,14 +107,16 @@ impl EpochManager {
     /// Set a group's state to `Stable { epoch }`. Used by the join-welcome
     /// path (no prior state) and by the merge-to-stable path post-confirm.
     ///
-    /// Refuses to overwrite `Unrecoverable`: the only legal exit is
-    /// [`Self::repair_to_stable`] after a verified repair path (mdk#971).
+    /// Refuses to overwrite `Unrecoverable` or terminal `Disbanded`: the only
+    /// legal exit from `Unrecoverable` is [`Self::repair_to_stable`] after a
+    /// verified repair path (mdk#971), while `Disbanded` has no outgoing
+    /// transition.
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
         if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
             tracing::warn!(
                 target: "cgka_engine::epoch_manager",
                 method = "set_stable",
-                "refusing set_stable while Unrecoverable; verified repair must use repair_to_stable"
+                "refusing set_stable while Unrecoverable or Disbanded; verified repair must use repair_to_stable"
             );
             return;
         }
@@ -409,11 +411,17 @@ impl EpochManager {
         Ok(())
     }
 
-    pub(crate) fn restore_disbanded(&mut self, group_id: GroupId, epoch: EpochId) {
+    pub(crate) fn restore_disbanded(
+        &mut self,
+        group_id: GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
         let recovering = EpochState::stable(epoch).detect_fork(Vec::new());
-        if let Ok(disbanded) = recovering.settle_to_disbanded(epoch) {
-            self.states.insert(group_id, disbanded);
-        }
+        let disbanded = recovering
+            .settle_to_disbanded(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id, disbanded);
+        Ok(())
     }
 }
 

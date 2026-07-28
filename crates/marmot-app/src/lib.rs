@@ -40,10 +40,7 @@ pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
-use cgka_traits::storage::{
-    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, KeyPackageBundleStorage,
-    MaintenanceStorage,
-};
+use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
@@ -2629,6 +2626,11 @@ impl MarmotApp {
 
         let account = self.account_home().account(&state.label)?;
         let account_storage = self.account_storage(&state.label)?;
+        let disbanded_group_ids = account_storage
+            .list_disband_tombstones()?
+            .into_iter()
+            .map(|(group_id, _)| hex::encode(group_id.as_slice()))
+            .collect::<HashSet<_>>();
         let relay_lists = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let mut group_routes = Vec::new();
         for group in &state.groups {
@@ -2642,7 +2644,7 @@ impl MarmotApp {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if account_storage.disband_tombstone(&group_id)?.is_some() {
+            if disbanded_group_ids.contains(&hex::encode(group_id.as_slice())) {
                 continue;
             }
             match group.transport_subscriptions(&group_id) {
@@ -3622,12 +3624,11 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
         let group_id = GroupId::new(hex::decode(group_id_hex)?);
-        if matches!(
-            storage
-                .disband_request(&group_id)?
-                .map(|request| request.status),
-            Some(DisbandRequestStatus::Pending)
-        ) {
+        let normalized_group_id_hex = hex::encode(group_id.as_slice());
+        if storage
+            .disbanding_group_ids_hex()?
+            .contains(&normalized_group_id_hex)
+        {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?;

@@ -648,16 +648,20 @@ impl<S: StorageProvider> Engine<S> {
             .collect::<Result<Vec<_>, _>>()?;
         let context =
             ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input)| *input));
-        let candidate_ids: HashSet<MessageId> = self
-            .storage
-            .list_disband_candidates(group_id)
-            .map_err(storage_projection_error)?
-            .into_iter()
-            .flat_map(|candidate| [candidate.commit_id, candidate.content_commit_id])
-            .collect();
-        let has_terminal_trigger = projected
-            .iter()
-            .any(|(member, _)| candidate_ids.contains(&member.message_id));
+        let has_terminal_trigger = if projected.is_empty() {
+            false
+        } else {
+            let candidate_ids: HashSet<MessageId> = self
+                .storage
+                .list_disband_candidates(group_id)
+                .map_err(storage_projection_error)?
+                .into_iter()
+                .flat_map(|candidate| [candidate.commit_id, candidate.content_commit_id])
+                .collect();
+            projected
+                .iter()
+                .any(|(member, _)| candidate_ids.contains(&member.message_id))
+        };
         let has_trigger = has_terminal_trigger
             || projected
                 .iter()

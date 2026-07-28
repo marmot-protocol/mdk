@@ -258,9 +258,7 @@ pub trait DisbandTombstoneStorage {
     /// resurrection tombstone remains.
     fn list_disband_tombstones(
         &self,
-    ) -> StorageResult<Vec<(GroupId, crate::group::DisbandTombstone)>> {
-        Ok(Vec::new())
-    }
+    ) -> StorageResult<Vec<(GroupId, crate::group::DisbandTombstone)>>;
 }
 
 // ── WelcomeStorage ──────────────────────────────────────────────────────────

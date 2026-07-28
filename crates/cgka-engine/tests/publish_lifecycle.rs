@@ -35,8 +35,8 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage,
-    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    DisbandRequest, DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage,
+    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
     MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
@@ -951,6 +951,7 @@ struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: ProcessedFault,
     lifecycle_fault: ProcessedFault,
+    disband_request_fault: ProcessedFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -1061,6 +1062,14 @@ impl LeaveRequestStorage for FaultStorage {
 
 impl DisbandRequestStorage for FaultStorage {
     fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
+        if request.status == DisbandRequestStatus::Pending
+            && request.last_prepared_epoch.is_none()
+            && self.disband_request_fault.should_fail()
+        {
+            return Err(StorageError::Busy(
+                "injected disband rollback reconciliation lock".into(),
+            ));
+        }
         self.inner.put_disband_request(request)
     }
     fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
@@ -1103,6 +1112,11 @@ impl DisbandTombstoneStorage for FaultStorage {
         group_id: &GroupId,
     ) -> StorageResult<Option<cgka_traits::DisbandTombstone>> {
         self.inner.disband_tombstone(group_id)
+    }
+    fn list_disband_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
+        self.inner.list_disband_tombstones()
     }
 }
 
@@ -1357,6 +1371,7 @@ fn build_fault_engine(
         inner,
         fault,
         lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: ProcessedFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1368,6 +1383,93 @@ fn build_fault_engine(
     (engine, handle)
 }
 
+#[tokio::test]
+async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let disband_request_fault = ProcessedFault::default();
+    let mut alice = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: ProcessedFault::default(),
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: disband_request_fault.clone(),
+    })
+    .identity(pad32(b"alice-disband-rollback"))
+    .account_identity_proof_signer(proof_signer(b"alice-disband-rollback"))
+    .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "terminal rollback".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+
+    assert!(matches!(
+        alice
+            .send(SendIntent::Disband {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        SendResult::DisbandRequested { .. }
+    ));
+    let prepared = alice.advance_convergence(&group_id).await.unwrap();
+    let pending = match prepared.as_slice() {
+        [SendResult::GroupEvolution { pending, .. }] => *pending,
+        other => panic!("expected prepared disband commit, got {other:?}"),
+    };
+    assert!(
+        handle
+            .disband_request(&group_id)
+            .unwrap()
+            .unwrap()
+            .last_prepared_epoch
+            .is_some()
+    );
+
+    disband_request_fault.arm(1);
+    let error = alice.publish_failed(pending).await.unwrap_err();
+    assert!(error.is_transient(), "unexpected rollback error: {error:?}");
+    assert!(matches!(
+        alice.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+    assert!(
+        handle
+            .disband_request(&group_id)
+            .unwrap()
+            .unwrap()
+            .last_prepared_epoch
+            .is_some(),
+        "failed transaction must retain the prepared request state"
+    );
+
+    alice
+        .publish_failed(pending)
+        .await
+        .expect("same pending slot remains retryable");
+    let request = handle.disband_request(&group_id).unwrap().unwrap();
+    assert_eq!(request.status, DisbandRequestStatus::Pending);
+    assert_eq!(request.last_prepared_epoch, None);
+    assert!(matches!(
+        alice.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+}
+
 #[test]
 fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     let inner = SqliteAccountStorage::in_memory().unwrap();
@@ -1377,6 +1479,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         inner,
         fault: ProcessedFault::default(),
         lifecycle_fault: lifecycle_fault.clone(),
+        disband_request_fault: ProcessedFault::default(),
     })
     .identity(pad32(b"alice-maintenance"))
     .account_identity_proof_signer(proof_signer(b"alice-maintenance"))

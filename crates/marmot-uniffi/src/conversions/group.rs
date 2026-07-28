@@ -262,9 +262,12 @@ pub struct GroupManagementStateFfi {
     ///
     /// When this is `false`, the reason is one of
     /// `requires_self_demote_before_leave` (demote first) or
-    /// `leave_request_pending` (already leaving) — or the account is not a member
-    /// at all. Check those before reporting an error to the user.
+    /// `leave_request_pending` (already leaving), or `disbanding` / terminal
+    /// `lifecycle_state` (ordinary group actions are unavailable) — or the
+    /// account is not a member at all. Check those before reporting an error.
     pub can_leave: bool,
+    /// Whether an admin must self-demote before leaving. Disbanding and a
+    /// terminal lifecycle take precedence and keep this false.
     pub requires_self_demote_before_leave: bool,
     /// A leave is already in flight for this group; `Marmot::leave_group` would
     /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather
@@ -280,7 +283,7 @@ pub struct GroupManagementStateFfi {
     pub disbanding: bool,
     pub can_enable_disbanding: bool,
     pub can_disband: bool,
-    pub disband_blockers: Vec<String>,
+    pub disbanding_blockers: Vec<String>,
     pub disband_request: Option<DisbandRequestFfi>,
     pub member_actions: Vec<GroupMemberActionStateFfi>,
 }
@@ -457,7 +460,7 @@ pub(crate) fn group_management_state_ffi(
                 GroupLifecycleStateFfi::Stable
             )
             && details.mls_state.disbanding_enabled,
-        disband_blockers: details.mls_state.disbanding_blockers.clone(),
+        disbanding_blockers: details.mls_state.disbanding_blockers.clone(),
         disband_request: details.mls_state.disband_request.clone(),
         member_actions,
     }

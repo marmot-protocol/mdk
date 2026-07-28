@@ -1088,7 +1088,8 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
-        self.queue_own_group_system_projection_updates(&effects);
+        // Enabling lifecycle-v1 changes eligibility, not group history. It
+        // intentionally emits no kind-1210 system row.
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -1153,11 +1154,7 @@ impl AppClient {
     /// The live transport route is removed and synced before the DB wipe so the
     /// account stops actively subscribing to the group before local rows vanish.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
-        if self
-            .runtime
-            .disband_request(group_id)?
-            .is_some_and(|request| request.status == cgka_traits::DisbandRequestStatus::Pending)
-        {
+        if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
         // A local wipe removes this group's transport route. Any already-durable

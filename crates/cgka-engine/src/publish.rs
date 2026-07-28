@@ -331,6 +331,10 @@ impl<S: StorageProvider> Engine<S> {
             .epoch_manager
             .group_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
+        let kind = self
+            .epoch_manager
+            .kind_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
 
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
@@ -409,16 +413,19 @@ impl<S: StorageProvider> Engine<S> {
                     // evolution in the same transaction as the MLS clear.
                     maintenance.delete_group_evolution(&evolution.id)?;
                 }
+                if kind == crate::epoch_manager::PendingKind::Disband {
+                    storage.clear_disband_candidates(&group_id)?;
+                    if let Some(mut request) = storage.disband_request(&group_id)? {
+                        request.last_prepared_epoch = None;
+                        storage.put_disband_request(&request)?;
+                    }
+                }
                 Ok(())
             })?;
 
         if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
             *fanout = rolled_back;
         }
-        let kind = self
-            .epoch_manager
-            .kind_for_pending(pending)
-            .ok_or(EngineError::UnknownPending)?;
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
@@ -445,11 +452,6 @@ impl<S: StorageProvider> Engine<S> {
         );
         self.pending_state_changes.remove(&pending);
         if kind == crate::epoch_manager::PendingKind::Disband {
-            self.storage.clear_disband_candidates(&group_id)?;
-            if let Some(mut request) = self.storage.disband_request(&group_id)? {
-                request.last_prepared_epoch = None;
-                self.storage.put_disband_request(&request)?;
-            }
             self.schedule_pending_convergence_group(&group_id);
         }
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {

@@ -342,6 +342,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
     fail_get_group: Arc<AtomicBool>,
+    fail_disband_tombstone: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
 }
 
@@ -350,12 +351,17 @@ impl FlakyGroupRecordStorage {
         Self {
             inner,
             fail_get_group: Arc::new(AtomicBool::new(false)),
+            fail_disband_tombstone: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn set_fail_get_group(&self, fail: bool) {
         self.fail_get_group.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_disband_tombstone(&self, fail: bool) {
+        self.fail_disband_tombstone.store(fail, Ordering::SeqCst);
     }
 
     fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
@@ -518,7 +524,17 @@ impl DisbandTombstoneStorage for FlakyGroupRecordStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Option<cgka_traits::DisbandTombstone>> {
+        if self.fail_disband_tombstone.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected disband_tombstone failure".into(),
+            ));
+        }
         self.inner.disband_tombstone(group_id)
+    }
+    fn list_disband_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
+        self.inner.list_disband_tombstones()
     }
 }
 
@@ -802,6 +818,36 @@ async fn retry_recovers_a_transiently_quarantined_group() {
                 if gid == &group_id && *recovered_epoch == group_epoch
         )),
         "recovery event missing or carried the wrong epoch (expected {group_epoch:?}): {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    drop(initial);
+
+    storage.set_fail_disband_tombstone(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("per-group tombstone failure is quarantined");
+
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed,
+        )]
+    );
+    assert!(reopened.epoch_state(&group_id).is_none());
+
+    storage.set_fail_disband_tombstone(false);
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry succeeds")
     );
 }
 
@@ -1190,6 +1236,10 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
 
     unknown(alice.members(&group_id).map(drop), "members");
     unknown(alice.epoch(&group_id).map(drop), "epoch");
+    assert!(
+        alice.epoch_state(&group_id).is_none(),
+        "epoch_state must hide quarantined groups"
+    );
     unknown(alice.group_record(&group_id).map(drop), "group_record");
     unknown(alice.admin_pubkeys(&group_id).map(drop), "admin_pubkeys");
     unknown(alice.group_context(&group_id).map(drop), "group_context");
@@ -1206,6 +1256,10 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
     unknown(
         alice.upgradeable_capabilities(&group_id).map(drop),
         "upgradeable_capabilities",
+    );
+    unknown(
+        alice.disbanding_support_blockers(&group_id).map(drop),
+        "disbanding_support_blockers",
     );
     unknown(
         alice.upgrade_group_capabilities(&group_id).await.map(drop),

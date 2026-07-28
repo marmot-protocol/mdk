@@ -526,6 +526,9 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
 impl<S: StorageProvider> Engine<S> {
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
+        if self.ensure_group_live(group_id).is_err() {
+            return None;
+        }
         self.epoch_manager.state(group_id).cloned()
     }
 
@@ -985,7 +988,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         for (group_id, tombstone) in self.storage.list_disband_tombstones()? {
             if !stored_group_ids.contains(&group_id) {
-                self.restore_disband_tombstone(group_id, tombstone);
+                self.restore_disband_tombstone(group_id, tombstone)?;
             }
         }
         Ok(())
@@ -1011,9 +1014,9 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         tombstone: cgka_traits::DisbandTombstone,
-    ) {
+    ) -> Result<(), EngineError> {
         self.epoch_manager
-            .restore_disbanded(group_id.clone(), tombstone.epoch);
+            .restore_disbanded(group_id.clone(), tombstone.epoch)?;
         self.events_buf.push_back(GroupEvent::GroupStateChanged {
             group_id,
             epoch: tombstone.epoch,
@@ -1021,6 +1024,7 @@ impl<S: StorageProvider> Engine<S> {
             change: GroupStateChange::GroupDisbanded,
             origin_commit_id: tombstone.origin_commit_id,
         });
+        Ok(())
     }
 
     fn hydrate_one_stored_group(
@@ -1031,16 +1035,20 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let tombstone = group
-            .disbanded
-            .clone()
-            .or_else(|| self.storage.disband_tombstone(group_id).ok().flatten());
+        let tombstone = match group.disbanded.clone() {
+            Some(tombstone) => Some(tombstone),
+            None => self
+                .storage
+                .disband_tombstone(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?,
+        };
         if let Some(tombstone) = tombstone {
             // Reconcile the single deterministic system row after a crash. The
             // application projection canonicalizes this event, so replaying it
             // on open is idempotent.
             let epoch = tombstone.epoch;
-            self.restore_disband_tombstone(group_id.clone(), tombstone);
+            self.restore_disband_tombstone(group_id.clone(), tombstone)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
             return Ok(epoch);
         }
         // A retained-anchor convergence probe durably rewinds the group while

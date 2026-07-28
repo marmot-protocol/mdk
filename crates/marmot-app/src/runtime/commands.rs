@@ -142,6 +142,7 @@ impl AccountManager {
         let summary = account_worker_response(response).await?;
         self.catch_up_after_committed_mutation("enable_group_disbanding")
             .await;
+        self.schedule_audit_log_tracker_update("enable_group_disbanding");
         Ok(summary)
     }
 
@@ -159,7 +160,11 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let request = account_worker_response(response).await?;
+        self.catch_up_after_committed_mutation("disband_group")
+            .await;
+        self.schedule_audit_log_tracker_update("disband_group");
+        Ok(request)
     }
 
     pub async fn acknowledge_disband_failure(

@@ -618,6 +618,7 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::AdminDepletion { .. } => "admin_depletion",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
+        EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",

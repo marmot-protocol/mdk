@@ -34,10 +34,18 @@ pub(crate) fn disband_requests_by_group_hex_tx(
 /// Groups whose ordinary outbound work is currently gated by either a local
 /// request or an authenticated terminal candidate awaiting convergence.
 pub(crate) fn disbanding_group_ids_hex_tx(tx: &Connection) -> StorageResult<HashSet<String>> {
-    let mut group_ids = disband_requests_by_group_hex_tx(tx)?
-        .into_iter()
+    let requests = disband_requests_by_group_hex_tx(tx)?;
+    disbanding_group_ids_hex_with_requests_tx(tx, &requests)
+}
+
+pub(crate) fn disbanding_group_ids_hex_with_requests_tx(
+    tx: &Connection,
+    requests: &HashMap<String, DisbandRequest>,
+) -> StorageResult<HashSet<String>> {
+    let mut group_ids = requests
+        .iter()
         .filter_map(|(group_id, request)| {
-            (request.status == DisbandRequestStatus::Pending).then_some(group_id)
+            (request.status == DisbandRequestStatus::Pending).then_some(group_id.clone())
         })
         .collect::<HashSet<_>>();
     let mut statement = tx
