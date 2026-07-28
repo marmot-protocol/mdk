@@ -188,7 +188,48 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
-        let group_id = send_intent_group_id(&intent).clone();
+        let group_id = self.validate_send_acceptance(&intent)?;
+        // Disband is an intent-persistence operation, not a Commit-preparation
+        // operation. It remains acceptable while another staged Commit owns
+        // the group and while Unrecoverable is paused.
+        if matches!(&intent, SendIntent::Disband { .. }) {
+            return self.do_request_disband(group_id);
+        }
+        if self.should_queue_outbound_intent(&group_id).await? {
+            return self.queue_outbound_intent(group_id, intent);
+        }
+
+        self.do_send_ready(intent).await
+    }
+
+    pub(crate) fn do_queue_app_message(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        let intent = SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        };
+        self.validate_send_acceptance(&intent)?;
+        if let Some(state) = self.epoch_manager.state(&group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: state.name(),
+                    to: "queue_app_message",
+                    reason: "queue_app_message requires Stable",
+                },
+            ));
+        }
+        let queued = self.queue_outbound_intent(group_id.clone(), intent)?;
+        self.schedule_pending_convergence_group(&group_id);
+        Ok(queued)
+    }
+
+    fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
+        let group_id = send_intent_group_id(intent).clone();
         // Quarantine gate: a group frozen by hydration quarantine must not
         // stage, queue, or publish anything — a confirm would set_stable and
         // silently un-quarantine it out of band (mdk#364).
@@ -197,16 +238,15 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanded",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "Disbanded is terminal",
                 },
             ));
         }
-        // Disband is an intent-persistence operation, not a Commit-preparation
-        // operation. It remains acceptable while another staged Commit owns
-        // the group and while Unrecoverable is paused.
-        if matches!(&intent, SendIntent::Disband { .. }) {
-            return self.do_request_disband(group_id);
+        // Disband has its own durable acceptance gates and intentionally
+        // remains available while the ordinary send lifecycle is paused.
+        if matches!(intent, SendIntent::Disband { .. }) {
+            return Ok(group_id);
         }
         // Strict cutover freezes membership growth in legacy groups. Existing
         // members may continue messaging and applying other group changes, but
@@ -232,7 +272,7 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Removed",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "local group copy is marked removed (self-evicted)",
                 },
             ));
@@ -243,7 +283,7 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Unrecoverable",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "group is Unrecoverable pending verified repair",
                 },
             ));
@@ -252,7 +292,7 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanding",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "disband requested or awaiting convergence",
                 },
             ));
@@ -261,16 +301,12 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Leaving",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "leave requested",
                 },
             ));
         }
-        if self.should_queue_outbound_intent(&group_id).await? {
-            return self.queue_outbound_intent(group_id, intent);
-        }
-
-        self.do_send_ready(intent).await
+        Ok(group_id)
     }
 
     pub async fn converge_and_drain_queued_outbound_intents(

@@ -123,6 +123,16 @@ impl From<TransportAdapterError> for AppError {
 }
 
 impl AppError {
+    pub(crate) fn is_account_not_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(TransportAdapterError::AccountNotActive(_))
+                | Self::Account(AccountError::Transport(
+                    TransportAdapterError::AccountNotActive(_)
+                ))
+        )
+    }
+
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         match self {
             Self::Account(error) => account_error_kind(error),

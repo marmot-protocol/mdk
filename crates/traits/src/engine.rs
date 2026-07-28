@@ -654,6 +654,21 @@ pub trait CgkaEngine: Send + Sync {
     /// `PendingPublish` / `Merging`.
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
 
+    /// Durably accept an application-message intent without preparing MLS or
+    /// transport bytes yet.
+    ///
+    /// This is the transport-lifecycle fallback for a locally ready signing
+    /// account whose transport is not active. The same authoritative
+    /// quarantine, disband, removal, unrecoverable, leave, and epoch-state
+    /// gates as [`Self::send`] still apply. On success the group is scheduled
+    /// for convergence so the intent is regenerated from current canonical
+    /// state before publication.
+    async fn queue_app_message(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+    ) -> Result<SendResult, EngineError>;
+
     /// Advance convergence for a group and release any queued outbound work
     /// that is now safe to regenerate from the selected canonical state.
     /// Accepted inbound application messages from the canonical branch are

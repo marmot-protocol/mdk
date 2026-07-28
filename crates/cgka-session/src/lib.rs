@@ -731,6 +731,24 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![result]))
     }
 
+    pub async fn queue_app_message_with_audit_context(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+        context: AuditEventContext,
+    ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "queue_app_message_with_audit_context",
+            "durably queueing local application-message intent"
+        );
+        let result = self
+            .engine
+            .queue_app_message_with_audit_context(group_id, payload, Some(context))
+            .await?;
+        Ok(self.collect_effects(vec![result]))
+    }
+
     pub async fn ingest(&mut self, msg: TransportMessage) -> SessionResult<IngestEffects> {
         tracing::debug!(
             target: TRACE_TARGET,

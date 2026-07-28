@@ -1427,6 +1427,26 @@ where
         Ok(output)
     }
 
+    pub async fn queue_app_message_with_audit_context(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let effects = self
+            .session
+            .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone())
+            .await?;
+        let mut output = self
+            .publish_session_effects_with_audit_context(effects, Some(context))
+            .await?;
+        if self.post_join_rotation_pending(&group_id)? {
+            output.maintenance_disposition =
+                SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
+        }
+        Ok(output)
+    }
+
     fn post_join_rotation_pending(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self
             .session

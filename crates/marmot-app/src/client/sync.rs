@@ -511,6 +511,19 @@ impl AppClient {
         self.remember_pending_convergence_effects(&effects);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        let publish_new_message_notification =
+            effects.published_app_messages.iter().any(|published| {
+                let group_id_hex = hex::encode(published.group_id.as_slice());
+                self.app
+                    .reaction_target(&self.state.label, &group_id_hex, &published.app_event_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|message| {
+                        message.kind == MARMOT_APP_EVENT_KIND_CHAT
+                            && !message.deleted
+                            && !message.invalidated
+                    })
+            });
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
@@ -534,6 +547,13 @@ impl AppClient {
         }
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        if publish_new_message_notification {
+            self.publish_notification_trigger_best_effort(
+                group_id,
+                notifications::NotificationTrigger::NewMessage,
+            )
+            .await;
+        }
         Ok(summary)
     }
 

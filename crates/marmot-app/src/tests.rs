@@ -36,7 +36,9 @@ use crate::messages::{AppMessageIntent, build_inner_event};
 #[derive(Default)]
 struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
+    fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
@@ -51,6 +53,15 @@ impl ScriptedPushRelayClient {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
 
+    fn published_event_ids(&self) -> Vec<String> {
+        self.published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.id.clone())
+            .collect()
+    }
+
     fn block_next_publish(&self) {
         self.block_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -59,6 +70,12 @@ impl ScriptedPushRelayClient {
     fn block_next_subscribe(&self) {
         self.block_next_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn block_and_fail_next_subscribe(&self) {
+        self.fail_blocked_subscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.block_next_subscribe();
     }
 
     async fn wait_for_blocked_subscribe(&self) {
@@ -89,12 +106,20 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         _subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        if self
+        let blocked = self
             .block_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if blocked {
             self.subscribe_started.notify_one();
             self.subscribe_release.notified().await;
+            if self
+                .fail_blocked_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(cgka_traits::TransportAdapterError::Subscription(
+                    "injected startup activation failure".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -116,7 +141,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     async fn publish_event(
         &self,
         endpoints: &[TransportEndpoint],
-        _event: &NostrTransportEvent,
+        event: &NostrTransportEvent,
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
         if self
@@ -139,6 +164,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .pop_front()
             .unwrap_or(true)
         {
+            self.published_events.lock().unwrap().push(event.clone());
             Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
@@ -199,6 +225,30 @@ fn account_reconcile_returns_local_readiness_before_relay_subscription_registrat
     run_composed_app_runtime_test(
         "account-local-ready-before-subscribe",
         account_local_ready_before_subscribe_body,
+    );
+}
+
+#[test]
+fn local_ready_send_remains_pending_when_transport_activation_fails() {
+    run_composed_app_runtime_test(
+        "local-ready-send-pending-on-activation-failure",
+        local_ready_send_pending_on_activation_failure_body,
+    );
+}
+
+#[test]
+fn local_ready_queued_sends_publish_once_in_order_after_activation_recovers() {
+    run_composed_app_runtime_test(
+        "local-ready-queued-send-ordering",
+        local_ready_queued_send_ordering_body,
+    );
+}
+
+#[test]
+fn locally_queued_send_survives_runtime_restart_and_failed_reactivation() {
+    run_composed_app_runtime_test(
+        "local-ready-queued-send-restart",
+        locally_queued_send_restart_body,
     );
 }
 
@@ -380,6 +430,375 @@ async fn account_local_ready_before_subscribe_body() {
     assert_eq!(telemetry.account_transport_activation.successes, 1);
     assert_eq!(telemetry.account_subscription_registration.successes, 1);
     runtime.shutdown().await;
+}
+
+async fn local_ready_send_pending_on_activation_failure_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+
+    // Seed the persisted conversation using an independently activated client.
+    // The runtime below receives a fresh relay plane and must activate it after
+    // reporting local readiness.
+    let mut setup_client = app.client("alice").await.unwrap();
+    let group_id = setup_client
+        .create_group("local-ready send", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+    let publishes_before_runtime = relay.published_event_ids().len();
+
+    relay.block_and_fail_next_subscribe();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.reconcile_accounts(),
+    )
+    .await
+    .expect("local readiness must not wait for transport activation")
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("transport activation should continue after local readiness");
+
+    let send_runtime = runtime.clone();
+    let send_group_id = group_id.clone();
+    let mut send = tokio::spawn(async move {
+        send_runtime
+            .send_message(
+                "alice",
+                &send_group_id,
+                b"retain while transport activates".to_vec(),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut send)
+            .await
+            .is_err(),
+        "the send should remain deferred while initial activation is blocked"
+    );
+
+    // Hold the reconnect activation too, so the test can observe the accepted
+    // local row before background convergence publishes it.
+    relay.block_next_subscribe();
+    relay.release_subscribe();
+    let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
+        .await
+        .expect("deferred send should settle after activation failure")
+        .expect("send task should not panic");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("transport reconnect should continue in the background");
+    let timeline = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let chat_list = app.chat_list("alice", false).unwrap();
+    let chat_row = chat_list
+        .iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .expect("persisted conversation should remain in the chat list");
+    let last_message = chat_row
+        .last_message
+        .as_ref()
+        .expect("the locally accepted send should remain projected");
+
+    assert_eq!(timeline.messages.len(), 1);
+    assert_eq!(
+        timeline.messages[0].plaintext,
+        "retain while transport activates"
+    );
+    assert_eq!(
+        last_message.delivery_state,
+        ChatListMessageDeliveryState::Pending,
+        "the app-facing projection must stay pending while activation recovers; \
+         invalidation: {:?}; send result: {send_result:?}",
+        timeline.messages[0].invalidation_status
+    );
+    assert_eq!(
+        timeline.messages[0].invalidation_status, None,
+        "a locally accepted send must remain pending while activation recovers; send result: {send_result:?}"
+    );
+    assert!(
+        send_result.is_ok(),
+        "transport lifecycle state must not become a terminal send error: {send_result:?}"
+    );
+
+    relay.release_subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "alice",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 1 && timeline.messages[0].source_message_id_hex.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reconnect should publish and finalize the queued row");
+    let recovered_timeline = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let published_ids = relay.published_event_ids();
+    assert_eq!(
+        published_ids.len() - publishes_before_runtime,
+        1,
+        "recovery must publish exactly one transport event"
+    );
+    assert_eq!(
+        recovered_timeline.messages[0]
+            .source_message_id_hex
+            .as_deref(),
+        published_ids.last().map(String::as_str),
+        "the pending row must finalize with the one recovered transport event"
+    );
+
+    runtime.shutdown().await;
+}
+
+async fn local_ready_queued_send_ordering_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("alice").await.unwrap();
+    let group_id = setup_client
+        .create_group("local-ready ordering", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+    let publishes_before_runtime = relay.published_event_ids().len();
+
+    relay.block_and_fail_next_subscribe();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("initial activation should be in flight");
+
+    let first_runtime = runtime.clone();
+    let first_group = group_id.clone();
+    let first = tokio::spawn(async move {
+        first_runtime
+            .send_message("alice", &first_group, b"first queued".to_vec())
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let second_runtime = runtime.clone();
+    let second_group = group_id.clone();
+    let second = tokio::spawn(async move {
+        second_runtime
+            .send_message("alice", &second_group, b"second queued".to_vec())
+            .await
+    });
+
+    relay.block_next_subscribe();
+    relay.release_subscribe();
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.await.unwrap().is_ok());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("background transport reactivation should be attempted");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.messages.len(), 2);
+    assert!(
+        pending
+            .messages
+            .iter()
+            .all(|message| message.source_message_id_hex.is_none()
+                && message.invalidation_status.is_none()),
+        "both accepted sends must remain pending before activation recovers"
+    );
+
+    relay.release_subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "alice",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 2
+                && timeline
+                    .messages
+                    .iter()
+                    .all(|message| message.source_message_id_hex.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both queued sends should finalize after activation");
+
+    let delivered = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let source_for = |plaintext: &str| {
+        delivered
+            .messages
+            .iter()
+            .find(|message| message.plaintext == plaintext)
+            .and_then(|message| message.source_message_id_hex.clone())
+            .expect("queued message should have one finalized source id")
+    };
+    let first_source = source_for("first queued");
+    let second_source = source_for("second queued");
+    assert_ne!(first_source, second_source);
+    let published_ids = relay.published_event_ids();
+    let recovered_ids = &published_ids[publishes_before_runtime..];
+    assert_eq!(
+        recovered_ids,
+        &[first_source, second_source],
+        "durable queue insertion order must be transport publication order"
+    );
+
+    runtime.shutdown().await;
+}
+
+async fn locally_queued_send_restart_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("alice").await.unwrap();
+    let group_id = setup_client
+        .create_group("local-ready restart", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    relay.block_and_fail_next_subscribe();
+    let first_runtime = MarmotAppRuntime::new(app.clone());
+    first_runtime.reconcile_accounts().await.unwrap();
+    relay.wait_for_blocked_subscribe().await;
+    let send_runtime = first_runtime.clone();
+    let send_group = group_id.clone();
+    let send = tokio::spawn(async move {
+        send_runtime
+            .send_message("alice", &send_group, b"survives restart".to_vec())
+            .await
+    });
+    relay.release_subscribe();
+    assert!(send.await.unwrap().is_ok());
+    first_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.messages.len(), 1);
+    assert!(pending.messages[0].source_message_id_hex.is_none());
+    assert!(pending.messages[0].invalidation_status.is_none());
+    let publishes_before_restart = relay.published_event_ids().len();
+
+    // Fail the restarted worker's first activation too. Hydration must still
+    // wake the durable queue, and its convergence timer must reactivate the
+    // account without any new user command or inbound event.
+    relay.block_and_fail_next_subscribe();
+    let restarted_runtime = MarmotAppRuntime::new(app.clone());
+    restarted_runtime.reconcile_accounts().await.unwrap();
+    relay.wait_for_blocked_subscribe().await;
+    relay.release_subscribe();
+
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "alice",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 1 && timeline.messages[0].source_message_id_hex.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("hydrated queue should publish after background reactivation");
+    assert_eq!(
+        relay.published_event_ids().len() - publishes_before_restart,
+        1,
+        "restart recovery must publish the logical message exactly once"
+    );
+
+    restarted_runtime.shutdown().await;
 }
 
 async fn disable_native_push_removal_body() {
