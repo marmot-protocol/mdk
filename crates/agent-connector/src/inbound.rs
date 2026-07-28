@@ -106,14 +106,36 @@ impl AgentConnector {
                     match event {
                         Ok(event) => {
                             let replay_id = runtime_replay_dedup_key(&event);
-                            control_event_from_runtime_event_with_runtime(
+                            match control_event_from_runtime_event_with_runtime(
                                 &self.runtime,
                                 event,
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),
-                            )
-                            .map_err(ConnectorError::from)?
-                            .map(|event| (event, replay_id))
+                            ) {
+                                Ok(event) => event.map(|event| (event, replay_id)),
+                                Err(_err) => {
+                                    // Hydration reads are best-effort at this live boundary.
+                                    // A transient storage failure must not tear down the
+                                    // subscription and strand the client outside the adjacent
+                                    // lag-recovery path. Signal one undelivered event so the
+                                    // consumer reconnects and lets durable replay retry it.
+                                    tracing::warn!(
+                                        target: "agent_connector",
+                                        method = "stream_inbound_events",
+                                        dropped_events = 1_u64,
+                                        error_code = "projection_failed",
+                                        "live inbound projection failed; emitting resync_required"
+                                    );
+                                    Some((
+                                        resync_required_event(
+                                            account_id_hex.as_deref(),
+                                            group_id_hex.as_deref(),
+                                            1,
+                                        ),
+                                        None,
+                                    ))
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(dropped))
                             if dropped > crate::DELIVERED_INBOUND_CURSOR_CAPACITY as u64 =>

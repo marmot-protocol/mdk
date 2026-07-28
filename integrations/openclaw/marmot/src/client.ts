@@ -314,6 +314,32 @@ function requireStringField(value: Record<string, unknown>, field: string): void
   }
 }
 
+function validateReferencedMessage(value: unknown, field: string): void {
+  const target = requireRecord(value, field);
+  requireStringField(target, "message_id_hex");
+  if (
+    target.availability !== "available" &&
+    target.availability !== "missing" &&
+    target.availability !== "deleted" &&
+    target.availability !== "invalidated"
+  ) {
+    throw new AgentControlError(`${field}.availability is invalid`, {
+      code: "wrong_protocol",
+    });
+  }
+  if (
+    typeof target.text_truncated !== "boolean" ||
+    typeof target.attachments_truncated !== "boolean"
+  ) {
+    throw new AgentControlError(`${field} has invalid truncation flags`, {
+      code: "wrong_protocol",
+    });
+  }
+  // The Rust producer owns the optional excerpt/attachment-summary shapes in
+  // this atomic in-repo protocol. Validate the routing and privacy-critical
+  // fields here; downstream renderers still treat all content as untrusted.
+}
+
 /**
  * Validate the intentionally breaking rich-context portion of the v2 event
  * wire before exposing it to the channel bridge. This deliberately rejects the
@@ -322,6 +348,8 @@ function requireStringField(value: Record<string, unknown>, field: string): void
 export function decodeAgentControlEvent(frame: Envelope): AgentControlEvent {
   const type = frame.type;
   if (type === "inbound_message") {
+    requireStringField(frame, "account_id_hex");
+    requireStringField(frame, "group_id_hex");
     const message = requireRecord(frame.message, "inbound_message.message");
     const sender = requireRecord(message.sender, "inbound_message.message.sender");
     requireStringField(message, "message_id_hex");
@@ -332,14 +360,19 @@ export function decodeAgentControlEvent(frame: Envelope): AgentControlEvent {
         code: "wrong_protocol",
       });
     }
+    if (frame.reply_to !== undefined && frame.reply_to !== null) {
+      validateReferencedMessage(frame.reply_to, "inbound_message.reply_to");
+    }
   } else if (
     type === "message_edited" ||
     type === "message_deleted" ||
     type === "reaction_added" ||
     type === "reaction_removed"
   ) {
+    requireStringField(frame, "account_id_hex");
+    requireStringField(frame, "group_id_hex");
     const actor = requireRecord(frame.actor, `${type}.actor`);
-    requireRecord(frame.target, `${type}.target`);
+    validateReferencedMessage(frame.target, `${type}.target`);
     requireStringField(frame, "event_id_hex");
     requireStringField(frame, "target_message_id_hex");
     requireStringField(actor, "account_id_hex");

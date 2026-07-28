@@ -196,7 +196,7 @@ describe("startMarmotInbound", () => {
     expect(dispatched[0]?.media).toEqual([mediaA, mediaB]);
   });
 
-  it("buffers a mutation and attaches it to the next triggering message", async () => {
+  it("buffers every mutation type and attaches them to the next triggering message", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {
       config: { channels: { marmot: { profileNameOnboarding: false } } },
@@ -208,13 +208,65 @@ describe("startMarmotInbound", () => {
       clientFactory: () =>
         inboundStubClient([
           {
+            type: "message_edited",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e1"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            replacement_text: "edited",
+            recorded_at: 122,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          {
+            type: "reaction_added",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e2"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            emoji: "👍",
+            recorded_at: 123,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          {
+            type: "reaction_removed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            event_id_hex: HEX32("e3"),
+            reaction_event_id_hex: HEX32("e2"),
+            target_message_id_hex: HEX32("dd"),
+            actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+            emoji: "👍",
+            recorded_at: 124,
+            target: {
+              message_id_hex: HEX32("dd"),
+              availability: "available",
+              text_excerpt: "before",
+              text_truncated: false,
+              attachments_truncated: false,
+            },
+          },
+          {
             type: "message_deleted",
             account_id_hex: HEX32("aa"),
             group_id_hex: HEX32("cc"),
             event_id_hex: HEX32("ee"),
             target_message_id_hex: HEX32("dd"),
             actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
-            recorded_at: 124,
+            recorded_at: 125,
             target: {
               message_id_hex: HEX32("dd"),
               availability: "deleted",
@@ -229,12 +281,144 @@ describe("startMarmotInbound", () => {
     await waitFor(() => dispatched.length > 0);
     stop();
 
-    expect(dispatched[0]?.ambientContext).toHaveLength(1);
-    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({
-      type: "message_deleted",
-      event_id_hex: HEX32("ee"),
-      target_message_id_hex: HEX32("dd"),
+    expect(dispatched[0]?.ambientContext?.map((event) => event.type)).toEqual([
+      "message_edited",
+      "reaction_added",
+      "reaction_removed",
+      "message_deleted",
+    ]);
+  });
+
+  it("keeps ambient context when a non-triggering message is gated out", async () => {
+    const attempted: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        attempted.push(message);
+        return attempted.length > 1;
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            {
+              type: "reaction_added",
+              account_id_hex: HEX32("aa"),
+              group_id_hex: HEX32("cc"),
+              event_id_hex: HEX32("e1"),
+              target_message_id_hex: HEX32("dd"),
+              actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+              emoji: "👍",
+              recorded_at: 124,
+              target: {
+                message_id_hex: HEX32("dd"),
+                availability: "available",
+                text_excerpt: "target",
+                text_truncated: false,
+                attachments_truncated: false,
+              },
+            },
+            inboundEvent("cc", "f1"),
+            inboundEvent("cc", "f2"),
+          ]),
+      },
+    );
+
+    await waitFor(() => attempted.length === 2);
+    stop();
+
+    expect(attempted[0]?.ambientContext).toHaveLength(1);
+    expect(attempted[1]?.ambientContext).toHaveLength(1);
+    expect(attempted[1]?.ambientContext?.[0]).toMatchObject({
+      type: "reaction_added",
+      event_id_hex: HEX32("e1"),
     });
+  });
+
+  it("bounds pending ambient facts per account and group", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const mutations = Array.from({ length: 20 }, (_, index) => ({
+      type: "message_edited" as const,
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      event_id_hex: index.toString(16).padStart(64, "0"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      replacement_text: `edit-${index}`,
+      recorded_at: 124 + index,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available" as const,
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    }));
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        clientFactory: () => inboundStubClient([...mutations, inboundEvent("cc", "ff")]),
+      },
+    );
+
+    await waitFor(() => dispatched.length === 1);
+    stop();
+
+    expect(dispatched[0]?.ambientContext).toHaveLength(16);
+    expect(dispatched[0]?.ambientContext?.[0]).toMatchObject({ replacement_text: "edit-4" });
+    expect(dispatched[0]?.ambientContext?.at(-1)).toMatchObject({
+      replacement_text: "edit-19",
+    });
+  });
+
+  it("bounds the number of groups holding pending ambient context", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const groupIds = Array.from({ length: 257 }, (_, index) =>
+      index.toString(16).padStart(64, "0"),
+    );
+    const mutations = groupIds.map((groupId, index) => ({
+      type: "group_state_changed" as const,
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupId,
+      change: "group_renamed",
+      detail: `group-${index}`,
+    }));
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            ...mutations,
+            { ...inboundEvent("cc", "f1"), group_id_hex: groupIds[0]! },
+            { ...inboundEvent("cc", "f2"), group_id_hex: groupIds.at(-1)! },
+          ]),
+      },
+    );
+
+    await waitFor(() => dispatched.length === 2);
+    stop();
+
+    const oldest = dispatched.find((message) => message.groupIdHex === groupIds[0]);
+    const newest = dispatched.find((message) => message.groupIdHex === groupIds.at(-1));
+    expect(oldest?.ambientContext).toHaveLength(0);
+    expect(newest?.ambientContext).toHaveLength(1);
   });
 
   it("buffers group state as structured next-turn context", async () => {

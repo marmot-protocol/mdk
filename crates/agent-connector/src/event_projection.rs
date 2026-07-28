@@ -31,7 +31,11 @@ const PUBKEY_MENTION_TAG: &str = "p";
 /// id IS the Nostr pubkey hex), so check the plaintext for that; also honor a
 /// `["p", <pubkey-hex>]` tag in case a client emits one. Used to let a channel
 /// gate group replies on being addressed.
-fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_hex: &str) -> bool {
+pub(crate) fn message_mentions_account(
+    tags: &[Vec<String>],
+    plaintext: &str,
+    account_id_hex: &str,
+) -> bool {
     if account_id_hex.is_empty() {
         return false;
     }
@@ -228,7 +232,7 @@ fn token_boundary_ok(b: u8) -> bool {
 /// The replied-to message id from the first `e` tag, if present. The tag value is
 /// sender-controlled, so it is normalized + validated as hex (a malformed value is
 /// dropped rather than passed through as a reply/delete target).
-fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
+pub(crate) fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
     tags.iter()
         .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
         .and_then(|tag| tag.get(1))
@@ -240,7 +244,10 @@ fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
 /// structural validation is dropped (it would be unfetchable anyway) rather than
 /// failing the whole message. Loopback-HTTP locators are rejected here (the
 /// connector serves real deployments), matching the runtime download policy.
-fn media_refs_from_tags(tags: &[Vec<String>], source_epoch: u64) -> Vec<AgentControlMediaRef> {
+pub(crate) fn media_refs_from_tags(
+    tags: &[Vec<String>],
+    source_epoch: u64,
+) -> Vec<AgentControlMediaRef> {
     tags.iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
         .filter_map(|tag| {
@@ -636,6 +643,11 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 &update.message.message_id_hex,
             )?
             else {
+                // Durable rows are authoritative for the agent feed. Retention
+                // pruning or convergence invalidation can remove a row between
+                // commit and broadcast; falling back to the in-memory plaintext
+                // here would re-expose content the durable projection has already
+                // discarded.
                 return Ok(None);
             };
             project_durable_record(
@@ -738,126 +750,6 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
             _ => Ok(None),
         },
         _ => Ok(None),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn control_event_from_runtime_event(
-    event: MarmotAppEvent,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
-) -> Option<AgentControlEvent> {
-    match event {
-        MarmotAppEvent::MessageReceived(update)
-            if update.message.kind == MARMOT_APP_EVENT_KIND_CHAT =>
-        {
-            let group_id_hex = inbound_event_group_id_hex(
-                account_filter,
-                &update.account_id_hex,
-                group_filter,
-                &update.message.group_id,
-                &update.message.sender,
-            )?;
-            let mentions_self = message_mentions_account(
-                &update.message.tags,
-                &update.message.plaintext,
-                &update.account_id_hex,
-            );
-            Some(AgentControlEvent::InboundMessage {
-                account_id_hex: update.account_id_hex.clone(),
-                group_id_hex,
-                message: AgentControlMessage {
-                    message_id_hex: update.message.message_id_hex,
-                    sender: control_actor(
-                        update.message.sender,
-                        update.message.sender_display_name,
-                        &update.account_id_hex,
-                    ),
-                    text: update.message.plaintext,
-                    recorded_at: update.message.recorded_at,
-                    media: media_refs_from_tags(&update.message.tags, update.message.source_epoch),
-                },
-                mentions_self,
-                reply_to: reply_target_from_tags(&update.message.tags).map(|message_id_hex| {
-                    AgentControlReferencedMessage {
-                        message_id_hex,
-                        availability: AgentControlReferencedMessageAvailability::Missing,
-                        sender: None,
-                        recorded_at: None,
-                        text_excerpt: None,
-                        text_truncated: false,
-                        attachments: Vec::new(),
-                        attachments_truncated: false,
-                    }
-                }),
-            })
-        }
-        MarmotAppEvent::AgentStreamStarted(update)
-            if update.message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START =>
-        {
-            let group_id_hex = inbound_event_group_id_hex(
-                account_filter,
-                &update.account_id_hex,
-                group_filter,
-                &update.message.group_id,
-                &update.message.sender,
-            )?;
-            let stream_id_hex = update
-                .message
-                .tags
-                .iter()
-                .find(|tag| tag.first().is_some_and(|name| name == STREAM_TAG))
-                .and_then(|tag| tag.get(1))
-                .and_then(|value| normalize_hex(value).ok())?;
-            Some(AgentControlEvent::StreamUpdate {
-                account_id_hex: update.account_id_hex,
-                group_id_hex,
-                stream_id_hex,
-                status: AGENT_CONTROL_STREAM_STATUS_STARTED.to_owned(),
-            })
-        }
-        MarmotAppEvent::GroupEvent(group_event) => {
-            // Group events do not require storage hydration; reuse the
-            // production projector against an unreachable runtime branch by
-            // spelling their compact mapping here for projection unit tests.
-            match group_event.event {
-                GroupEvent::GroupStateChanged {
-                    group_id, change, ..
-                } => {
-                    let group_id_hex = hex::encode(group_id.as_slice());
-                    if !inbound_filter_matches(
-                        account_filter,
-                        &group_event.account_id_hex,
-                        group_filter,
-                        &group_id_hex,
-                    ) {
-                        return None;
-                    }
-                    let (change, detail) = match change {
-                        GroupStateChange::MemberAdded { .. } => ("member_added", None),
-                        GroupStateChange::MemberRemoved { .. } => ("member_removed", None),
-                        GroupStateChange::MemberLeft { .. } => ("member_left", None),
-                        GroupStateChange::AdminAdded { .. } => ("admin_added", None),
-                        GroupStateChange::AdminRemoved { .. } => ("admin_removed", None),
-                        GroupStateChange::GroupRenamed { name, .. } => {
-                            ("group_renamed", Some(name))
-                        }
-                        GroupStateChange::GroupAvatarChanged => ("group_avatar_changed", None),
-                        GroupStateChange::MessageRetentionChanged { .. } => {
-                            ("disappearing_timer_changed", None)
-                        }
-                    };
-                    Some(AgentControlEvent::GroupStateChanged {
-                        account_id_hex: group_event.account_id_hex,
-                        group_id_hex,
-                        change: change.to_owned(),
-                        detail,
-                    })
-                }
-                _ => None,
-            }
-        }
-        _ => None,
     }
 }
 
@@ -1061,64 +953,6 @@ pub(crate) fn inbound_message_event_from_record_with_runtime(
         account_filter,
         group_filter,
     )
-}
-
-#[cfg(test)]
-pub(crate) fn inbound_message_event_from_record(
-    account_id_hex: &str,
-    record: AppMessageRecord,
-    account_filter: Option<&str>,
-    group_filter: Option<&str>,
-) -> Option<AgentControlEvent> {
-    if !inbound_filter_matches(
-        account_filter,
-        account_id_hex,
-        group_filter,
-        &record.group_id_hex,
-    ) || record.invalidated
-    {
-        return None;
-    }
-    if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && record.direction == "system" {
-        let system = GroupSystemEvent::parse(&record.plaintext).ok()?;
-        let (change, detail) = group_system_control_parts(&system)?;
-        return Some(AgentControlEvent::GroupStateChanged {
-            account_id_hex: account_id_hex.to_owned(),
-            group_id_hex: record.group_id_hex,
-            change: change.to_owned(),
-            detail,
-        });
-    }
-    if record.kind != MARMOT_APP_EVENT_KIND_CHAT
-        || record.direction != "received"
-        || record.sender == account_id_hex
-    {
-        return None;
-    }
-    let reply_to =
-        reply_target_from_tags(&record.tags).map(|message_id_hex| AgentControlReferencedMessage {
-            message_id_hex,
-            availability: AgentControlReferencedMessageAvailability::Missing,
-            sender: None,
-            recorded_at: None,
-            text_excerpt: None,
-            text_truncated: false,
-            attachments: Vec::new(),
-            attachments_truncated: false,
-        });
-    Some(AgentControlEvent::InboundMessage {
-        account_id_hex: account_id_hex.to_owned(),
-        group_id_hex: record.group_id_hex,
-        message: AgentControlMessage {
-            message_id_hex: record.message_id_hex,
-            sender: control_actor(record.sender, None, account_id_hex),
-            text: record.plaintext.clone(),
-            recorded_at: record.recorded_at,
-            media: media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or_default()),
-        },
-        mentions_self: message_mentions_account(&record.tags, &record.plaintext, account_id_hex),
-        reply_to,
-    })
 }
 
 /// Bounded set of durable replay row ids already delivered on a subscription, used to dedup

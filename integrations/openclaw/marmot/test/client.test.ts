@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AgentControlError,
   MarmotAgentControlClient,
+  decodeAgentControlEvent,
   normalizeHex,
 } from "../src/client.js";
 
@@ -379,5 +380,57 @@ describe("normalizeHex", () => {
     expect(() => normalizeHex("")).toThrow(AgentControlError);
     expect(() => normalizeHex("zz")).toThrow(AgentControlError);
     expect(() => normalizeHex("abc")).toThrow(AgentControlError);
+  });
+});
+
+describe("decodeAgentControlEvent", () => {
+  const referencedMessage = {
+    message_id_hex: HEX32("dd"),
+    availability: "available",
+    sender: null,
+    recorded_at: null,
+    text_excerpt: "quoted",
+    text_truncated: false,
+    attachments: [],
+    attachments_truncated: false,
+  };
+
+  it("accepts a structured reply target", () => {
+    expect(
+      decodeAgentControlEvent({
+        type: "inbound_message",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        message: {
+          message_id_hex: HEX32("ee"),
+          sender: { account_id_hex: HEX32("bb"), is_self: false },
+          text: "hello",
+          recorded_at: 1,
+          media: [],
+        },
+        mentions_self: false,
+        reply_to: referencedMessage,
+      }),
+    ).toMatchObject({ reply_to: referencedMessage });
+  });
+
+  it("rejects malformed referenced-message routing and privacy fields", () => {
+    expect(() =>
+      decodeAgentControlEvent({
+        type: "message_deleted",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        event_id_hex: HEX32("ee"),
+        target_message_id_hex: HEX32("dd"),
+        actor: { account_id_hex: HEX32("bb"), is_self: false },
+        recorded_at: 1,
+        target: {
+          message_id_hex: HEX32("dd"),
+          availability: "available",
+          text_truncated: "false",
+          attachments_truncated: false,
+        },
+      }),
+    ).toThrowError(AgentControlError);
   });
 });

@@ -342,7 +342,7 @@ async function downloadInboundMedia(
  * (driven by the inbound runtime's `group_state_changed` handler), and
  * `clearGroupActivationCache` drops every entry (e.g. on an inbound resync).
  */
-export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promise<void>) & {
+export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promise<boolean>) & {
   invalidateGroupActivation: (accountIdHex: string, groupIdHex: string) => void;
   clearGroupActivationCache: () => void;
 };
@@ -359,11 +359,11 @@ export function createMarmotInboundDispatcher(
   // Per-(account, group) is_direct cache, scoped to this dispatcher instance so
   // it lives exactly as long as the inbound subscription that owns it.
   const activationCache = new GroupActivationCache();
-  const dispatch = async (message: MarmotInboundMessage): Promise<void> => {
+  const dispatch = async (message: MarmotInboundMessage): Promise<boolean> => {
     // Activation gating: in a multi-party group, only run a turn when addressed.
     if (!(await shouldRunTurn(deps, activationCache, message))) {
       deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
-      return;
+      return false;
     }
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
@@ -465,6 +465,7 @@ export function createMarmotInboundDispatcher(
       },
     });
     deps.log?.(`marmot: agent turn done (final deliveries=${finalDeliveries})`);
+    return true;
   };
 
   return Object.assign(dispatch, {
