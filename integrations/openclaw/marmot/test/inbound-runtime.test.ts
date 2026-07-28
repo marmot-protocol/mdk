@@ -381,6 +381,107 @@ describe("startMarmotInbound", () => {
     });
   });
 
+  it("preserves ambient facts that arrive while a full batch is in flight", async () => {
+    const groupIdHex = HEX32("cc");
+    const oldMutations: AgentControlEvent[] = Array.from({ length: 16 }, (_, index) => ({
+      type: "message_edited",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupIdHex,
+      event_id_hex: index.toString(16).padStart(64, "0"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      replacement_text: `old-${index}`,
+      recorded_at: 124 + index,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available",
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    }));
+    const lateMutation: AgentControlEvent = {
+      type: "reaction_added",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupIdHex,
+      event_id_hex: HEX32("e9"),
+      target_message_id_hex: HEX32("dd"),
+      actor: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+      emoji: "🔥",
+      recorded_at: 999,
+      target: {
+        message_id_hex: HEX32("dd"),
+        availability: "available",
+        text_excerpt: "target",
+        text_truncated: false,
+        attachments_truncated: false,
+      },
+    };
+    let markTurnStarted: () => void = () => {};
+    let releaseTurn: () => void = () => {};
+    let markLateProcessed: () => void = () => {};
+    const turnStarted = new Promise<void>((resolve) => {
+      markTurnStarted = resolve;
+    });
+    const turnRelease = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const lateProcessed = new Promise<void>((resolve) => {
+      markLateProcessed = resolve;
+    });
+    const client = {
+      async accountList() {
+        return {
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        };
+      },
+      async *subscribeInbound(
+        _filter?: unknown,
+        _signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        for (const event of oldMutations) {
+          yield event;
+        }
+        yield inboundEvent("cc", "f1");
+        await turnStarted;
+        yield lateMutation;
+        // Reaching the next pull proves the bridge processed lateMutation.
+        markLateProcessed();
+        await turnRelease;
+        yield inboundEvent("cc", "f2");
+      },
+    } as unknown as MarmotAgentControlClient;
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      async (message) => {
+        dispatched.push(message);
+        if (dispatched.length === 1) {
+          markTurnStarted();
+          await turnRelease;
+        }
+        return true;
+      },
+      { clientFactory: () => client },
+    );
+
+    await turnStarted;
+    await lateProcessed;
+    releaseTurn();
+    await waitFor(() => dispatched.length === 2);
+    stop();
+
+    expect(dispatched[0]?.ambientContext).toHaveLength(16);
+    expect(dispatched[1]?.ambientContext).toEqual([lateMutation]);
+  });
+
   it("bounds the number of groups holding pending ambient context", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     const groupIds = Array.from({ length: 257 }, (_, index) =>

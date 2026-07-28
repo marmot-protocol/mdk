@@ -3451,13 +3451,15 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         for index in range(20):
             adapter._append_pending_ambient_context(group_id, f"fact-{index}")
 
-        pending, count = adapter._peek_pending_ambient_context(group_id)
-        self.assertEqual(count, 16)
+        pending_facts = list(adapter._pending_ambient_context[group_id])
+        pending = "\n".join(pending_facts)
+        self.assertEqual(len(pending_facts), 16)
         self.assertNotIn("fact-3\n", pending)
         self.assertTrue(pending.startswith("fact-4\n"))
         self.assertTrue(pending.endswith("fact-19"))
 
         async def fail_turn(event):
+            adapter._append_pending_ambient_context(group_id, "fact-new-on-failure")
             raise RuntimeError("synthetic turn failure")
 
         adapter.handle_message = fail_turn  # type: ignore[assignment]
@@ -3476,9 +3478,41 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        retained, retained_count = adapter._peek_pending_ambient_context(group_id)
-        self.assertEqual(retained_count, 16)
-        self.assertEqual(retained, pending)
+        retained = adapter._pending_ambient_context[group_id]
+        self.assertEqual(len(retained), 16)
+        self.assertNotIn("fact-4", retained)
+        self.assertEqual(retained[-1], "fact-new-on-failure")
+
+        adapter._pending_ambient_context[group_id] = [
+            f"success-fact-{index}" for index in range(16)
+        ]
+        delivered_context = []
+
+        async def successful_turn(event):
+            delivered_context.append(event.channel_context)
+            adapter._append_pending_ambient_context(group_id, "fact-new-on-success")
+
+        adapter.handle_message = successful_turn  # type: ignore[assignment]
+        await adapter._dispatch_inbound_message(
+            self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a2" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "hello again",
+                        "mentions_self": True,
+                    }
+                )
+            )
+        )
+        self.assertIn("success-fact-0", delivered_context[0])
+        self.assertEqual(
+            adapter._pending_ambient_context[group_id],
+            ["fact-new-on-success"],
+        )
 
         for index in range(257):
             adapter._append_pending_ambient_context(
