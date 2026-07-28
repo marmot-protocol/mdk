@@ -3,7 +3,7 @@ use std::sync::{
     Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
@@ -62,6 +62,9 @@ const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
+const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const RELAY_NOTIFICATION_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -73,6 +76,7 @@ struct MarmotRelayPlaneInner {
     relay_safety: RelaySafetyPolicy,
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
+    directory_subscription_sync: Mutex<()>,
 }
 
 struct RelayPlaneTransport {
@@ -241,6 +245,7 @@ impl MarmotRelayPlane {
                 relay_safety: RelaySafetyPolicy::with_allow_loopback(allow_loopback),
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
+                directory_subscription_sync: Mutex::new(()),
             }),
         };
         this.spawn_router();
@@ -465,6 +470,7 @@ impl MarmotRelayPlane {
         plan: DirectorySyncPlan,
         force_rebuild: bool,
     ) -> Result<DirectorySubscriptionSyncSummary, String> {
+        let _sync_guard = self.inner.directory_subscription_sync.lock().await;
         self.spawn_router();
         let endpoints = self
             .inner
@@ -635,17 +641,21 @@ impl MarmotRelayPlane {
             if needs_forwarder
                 && let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client
             {
-                if notification_forwarder.take().is_some() {
-                    recover_relay_notification_forwarder(
-                        &self.inner.transport,
-                        RelayNotificationConsumerExit::Closed,
-                    );
+                if sdk_relay_client.client().pool().is_shutdown() {
+                    notification_forwarder.take();
+                } else {
+                    if notification_forwarder.take().is_some() {
+                        recover_relay_notification_forwarder(
+                            &self.inner.transport,
+                            RelayNotificationConsumerExit::Closed,
+                        );
+                    }
+                    *notification_forwarder = Some(spawn_relay_notification_forwarder(
+                        sdk_relay_client.clone(),
+                        self.inner.transport.clone(),
+                        self.inner.directory.clone(),
+                    ));
                 }
-                *notification_forwarder = Some(spawn_relay_notification_forwarder(
-                    sdk_relay_client.clone(),
-                    self.inner.transport.clone(),
-                    self.inner.directory.clone(),
-                ));
             }
         }
         let Ok(mut router) = self.inner.transport.router.try_lock() else {
@@ -780,6 +790,33 @@ struct RelayNotificationConsumerOutcome {
     exit: RelayNotificationConsumerExit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelayNotificationRestartBackoff {
+    next: Duration,
+}
+
+impl Default for RelayNotificationRestartBackoff {
+    fn default() -> Self {
+        Self {
+            next: RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl RelayNotificationRestartBackoff {
+    fn delay_after_failure(&mut self, consumer_runtime: Duration) -> Duration {
+        if consumer_runtime >= RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME {
+            self.next = RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF;
+        }
+        let delay = self.next;
+        self.next = self
+            .next
+            .saturating_mul(2)
+            .min(RELAY_NOTIFICATION_RESTART_MAX_BACKOFF);
+        delay
+    }
+}
+
 trait RelayNotificationSource: Send + Sync {
     fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification>;
     fn is_shutdown(&self) -> bool;
@@ -821,12 +858,14 @@ fn spawn_relay_notification_supervisor(
             .running
             .store(true, Ordering::SeqCst);
         let mut receiver = None;
+        let mut restart_backoff = RelayNotificationRestartBackoff::default();
         loop {
             let adapter = transport.adapter.clone();
             let directory_events = transport.directory_events.clone();
             let directory = directory.clone();
             let source_for_consumer = source.clone();
             let next_receiver = receiver.take();
+            let consumer_started_at = Instant::now();
             let mut consumer = tokio::spawn(async move {
                 let receiver = next_receiver.unwrap_or_else(|| source_for_consumer.notifications());
                 run_relay_notification_consumer(receiver, adapter, directory_events, directory)
@@ -846,7 +885,10 @@ fn spawn_relay_notification_supervisor(
                     recover_relay_notification_forwarder(&transport, outcome.exit);
                     if outcome.exit == RelayNotificationConsumerExit::Closed {
                         receiver = None;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(
+                            restart_backoff.delay_after_failure(consumer_started_at.elapsed()),
+                        )
+                        .await;
                     }
                 }
                 Err(join_error) => {
@@ -863,6 +905,10 @@ fn spawn_relay_notification_supervisor(
                         &transport,
                         RelayNotificationConsumerExit::Closed,
                     );
+                    tokio::time::sleep(
+                        restart_backoff.delay_after_failure(consumer_started_at.elapsed()),
+                    )
+                    .await;
                 }
             }
         }
@@ -935,7 +981,7 @@ async fn handle_relay_notification(
             if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                 tracing::trace!(
                     target: "marmot_app::relay_plane",
-                    method = "spawn_relay_notification_forwarder",
+                    method = "handle_relay_notification",
                     "forwarding SDK relay event"
                 );
                 let endpoint = TransportEndpoint(relay_url.to_string());
@@ -966,7 +1012,7 @@ async fn handle_relay_notification(
                 } else {
                     tracing::trace!(
                         target: "marmot_app::relay_plane",
-                        method = "spawn_relay_notification_forwarder",
+                        method = "handle_relay_notification",
                         "dropping directory relay event: no matching active directory subscription"
                     );
                 }
@@ -990,7 +1036,7 @@ async fn handle_relay_notification(
             if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                 tracing::trace!(
                     target: "marmot_app::relay_plane",
-                    method = "spawn_relay_notification_forwarder",
+                    method = "handle_relay_notification",
                     "observing per-relay event copy"
                 );
                 adapter
@@ -1011,7 +1057,7 @@ async fn handle_relay_notification(
             // and records EOSE latency. No delivery.
             tracing::trace!(
                 target: "marmot_app::relay_plane",
-                method = "spawn_relay_notification_forwarder",
+                method = "handle_relay_notification",
                 "forwarding SDK relay end-of-stored-events"
             );
             adapter
@@ -1025,7 +1071,7 @@ async fn handle_relay_notification(
         RelayPoolNotification::Shutdown => {
             tracing::debug!(
                 target: "marmot_app::relay_plane",
-                method = "spawn_relay_notification_forwarder",
+                method = "handle_relay_notification",
                 "SDK relay pool shutdown observed"
             );
             true

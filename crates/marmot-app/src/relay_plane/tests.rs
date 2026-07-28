@@ -118,6 +118,31 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
     assert_eq!(account_deliveries_read(&deliveries).len(), 1);
 }
 
+#[test]
+fn notification_restart_backoff_caps_and_resets_after_healthy_runtime() {
+    let mut backoff = RelayNotificationRestartBackoff::default();
+
+    assert_eq!(
+        backoff.delay_after_failure(Duration::ZERO),
+        RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF
+    );
+    assert_eq!(
+        backoff.delay_after_failure(Duration::ZERO),
+        RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF.saturating_mul(2)
+    );
+    for _ in 0..16 {
+        let _ = backoff.delay_after_failure(Duration::ZERO);
+    }
+    assert_eq!(
+        backoff.delay_after_failure(Duration::ZERO),
+        RELAY_NOTIFICATION_RESTART_MAX_BACKOFF
+    );
+    assert_eq!(
+        backoff.delay_after_failure(RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME),
+        RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF
+    );
+}
+
 #[tokio::test]
 async fn notification_consumer_reports_lag_without_silently_ending() {
     let relay = Arc::new(RecordingRelayClient::default());
@@ -392,6 +417,89 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
         stopped.restarts, 1,
         "normal shutdown must not be counted as another restart"
     );
+}
+
+#[tokio::test]
+async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
+    let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let relay = Arc::new(RecordingRelayClient::default());
+    let existing_adapter =
+        relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay.clone());
+
+    timeout(Duration::from_secs(1), async {
+        while !relay_plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .running
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("SDK notification supervisor should start");
+
+    relay_plane
+        .inner
+        .transport
+        .sdk_relay_client
+        .as_ref()
+        .unwrap()
+        .client()
+        .shutdown()
+        .await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let forwarder = relay_plane
+                .inner
+                .transport
+                .notification_forwarder
+                .lock()
+                .await;
+            if forwarder.as_ref().is_some_and(JoinHandle::is_finished) {
+                break;
+            }
+            drop(forwarder);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor should finish after clean pool shutdown");
+
+    let before = relay_plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    relay_plane.account_adapter(MemberId::new(vec![0xB2; 32]), relay);
+    let after = relay_plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+
+    assert_eq!(before.unexpected_exits, 0);
+    assert_eq!(after.unexpected_exits, 0);
+    assert_eq!(after.restarts, 0);
+    assert!(
+        relay_plane
+            .inner
+            .transport
+            .notification_forwarder
+            .lock()
+            .await
+            .is_none(),
+        "a terminal SDK pool must not be respawned"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), existing_adapter.receive())
+            .await
+            .is_err(),
+        "re-entering spawn_router after clean shutdown must not close existing account senders"
+    );
+
+    relay_plane.shutdown().await;
 }
 
 #[async_trait]

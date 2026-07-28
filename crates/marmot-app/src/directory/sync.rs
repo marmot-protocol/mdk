@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::{
     AppError, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -75,6 +75,47 @@ enum DirectorySyncCommand {
         respond: Option<oneshot::Sender<Result<DirectorySyncRunSummary, String>>>,
     },
     Shutdown,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DirectoryRecoveryRebuildQueue {
+    active: bool,
+    pending: bool,
+}
+
+struct DirectoryRecoveryRebuildTask(JoinHandle<Result<DirectorySyncRunSummary, AppError>>);
+
+impl Drop for DirectoryRecoveryRebuildTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl DirectoryRecoveryRebuildQueue {
+    /// Queue one recovery rebuild, coalescing any further requests while a
+    /// rebuild is active into at most one follow-up pass.
+    fn request(&mut self) -> bool {
+        if self.active {
+            self.pending = true;
+            false
+        } else {
+            self.active = true;
+            true
+        }
+    }
+
+    /// Complete the active pass and report whether one coalesced follow-up
+    /// pass must start.
+    fn complete(&mut self) -> bool {
+        debug_assert!(self.active);
+        if self.pending {
+            self.pending = false;
+            true
+        } else {
+            self.active = false;
+            false
+        }
+    }
 }
 
 impl DirectorySyncPlan {
@@ -237,6 +278,8 @@ async fn run_directory_sync_worker(
     >,
     rebuild_queued: Arc<AtomicBool>,
 ) {
+    let mut recovery_rebuilds = DirectoryRecoveryRebuildQueue::default();
+    let mut recovery_task: Option<DirectoryRecoveryRebuildTask> = None;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -249,7 +292,31 @@ async fn run_directory_sync_worker(
                             let _ = respond.send(result.map_err(|err| err.to_string()));
                         }
                     }
-                    Some(DirectorySyncCommand::Shutdown) | None => return,
+                    Some(DirectorySyncCommand::Shutdown) | None => {
+                        drop(recovery_task.take());
+                        return;
+                    }
+                }
+            }
+            recovery_result = async {
+                let task = recovery_task
+                    .as_mut()
+                    .expect("recovery task is present when this select arm is enabled");
+                (&mut task.0).await
+            }, if recovery_task.is_some() => {
+                recovery_task = None;
+                if !matches!(recovery_result, Ok(Ok(_))) {
+                    tracing::warn!(
+                        target: "marmot_app::directory",
+                        method = "run_directory_sync_worker",
+                        "directory subscription recovery rebuild failed",
+                    );
+                }
+                if recovery_rebuilds.complete() {
+                    recovery_task = Some(spawn_directory_recovery_rebuild(
+                        app.clone(),
+                        relay_plane.clone(),
+                    ));
                 }
             }
             event = directory_events.recv() => {
@@ -260,22 +327,32 @@ async fn run_directory_sync_worker(
                     }
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if run_directory_sync_once(app.clone(), relay_plane.clone(), true)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                target: "marmot_app::directory",
-                                method = "run_directory_sync_worker",
-                                "directory subscription recovery rebuild failed",
-                            );
+                        if recovery_rebuilds.request() {
+                            recovery_task = Some(spawn_directory_recovery_rebuild(
+                                app.clone(),
+                                relay_plane.clone(),
+                            ));
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        drop(recovery_task.take());
+                        return;
+                    }
                 }
             }
         }
     }
+}
+
+fn spawn_directory_recovery_rebuild(
+    app: MarmotApp,
+    relay_plane: MarmotRelayPlane,
+) -> DirectoryRecoveryRebuildTask {
+    DirectoryRecoveryRebuildTask(tokio::spawn(run_directory_sync_once(
+        app,
+        relay_plane,
+        true,
+    )))
 }
 
 async fn run_directory_sync_once(
@@ -401,6 +478,27 @@ mod tests {
                 .filter(|batch| batch.authors.contains(&local))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn recovery_rebuild_queue_coalesces_to_one_follow_up_pass() {
+        let mut rebuilds = DirectoryRecoveryRebuildQueue::default();
+
+        assert!(rebuilds.request(), "the first request starts a rebuild");
+        assert!(!rebuilds.request(), "an active rebuild absorbs a request");
+        assert!(!rebuilds.request(), "more requests stay coalesced");
+        assert!(
+            rebuilds.complete(),
+            "completion starts exactly one coalesced follow-up"
+        );
+        assert!(
+            !rebuilds.complete(),
+            "the follow-up completes without another queued pass"
+        );
+        assert!(
+            rebuilds.request(),
+            "a later independent recovery can start normally"
         );
     }
 
