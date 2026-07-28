@@ -1,7 +1,7 @@
 {
   "scenario_name": "current-profile-required-set/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.9",
+  "conformance_version": "0.9.10",
   "seed": null,
   "application_profile": {
     "name": "current",

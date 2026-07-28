@@ -1413,6 +1413,7 @@ async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
         GROUP_PROFILE_COMPONENT_ID,
         GROUP_ADMIN_POLICY_COMPONENT_ID,
         ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        GROUP_LIFECYCLE_COMPONENT_ID,
     ]
     .into_iter()
     .collect();
