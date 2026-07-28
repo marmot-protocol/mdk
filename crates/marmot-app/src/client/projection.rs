@@ -505,6 +505,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Hex(_) => "read_marker_failed:hex",
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+        AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {

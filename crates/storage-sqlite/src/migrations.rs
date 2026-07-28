@@ -74,6 +74,8 @@ mod migration_0036_agent_stream_publisher_sequences;
 mod migration_0037_chat_list_semantic_timestamps;
 #[path = "migrations/0038_chat_list_interaction_state.rs"]
 mod migration_0038_chat_list_interaction_state;
+#[path = "migrations/0039_chat_pin_positions.rs"]
+mod migration_0039_chat_pin_positions;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -275,6 +277,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 38,
         name: "0038_chat_list_interaction_state",
         apply: migration_0038_chat_list_interaction_state::apply,
+    },
+    Migration {
+        version: 39,
+        name: "0039_chat_pin_positions",
+        apply: migration_0039_chat_pin_positions::apply,
     },
 ];
 
@@ -736,6 +743,65 @@ mod tests {
             "chat_notification_settings",
             "muted_until_ms"
         ));
+    }
+
+    #[test]
+    fn chat_pin_positions_are_migrated_with_archive_cleanup() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..38]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups
+                (group_id_hex, endpoint, archived, updated_at)
+             VALUES ('existing-group', 'wss://relay.example', 0, 1)",
+            [],
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert!(connection_has_column(
+            &conn,
+            "chat_pin_positions",
+            "ordinal"
+        ));
+        assert_eq!(
+            foreign_key(&conn, "chat_pin_positions", "group_id_hex"),
+            Some(("account_groups".to_owned(), "CASCADE".to_owned()))
+        );
+        assert!(connection_has_index(
+            &conn,
+            "chat_pin_positions",
+            "idx_chat_pin_positions_order"
+        ));
+        let trigger_exists = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'trigger' AND name = 'unpin_chat_when_archived'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(trigger_exists);
+
+        conn.execute(
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
+             VALUES ('existing-group', 7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE account_groups SET archived = 1 WHERE group_id_hex = 'existing-group'",
+            [],
+        )
+        .unwrap();
+        let pin_count = conn
+            .query_row("SELECT COUNT(*) FROM chat_pin_positions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(pin_count, 0);
     }
 
     #[test]

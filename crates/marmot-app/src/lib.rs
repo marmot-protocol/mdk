@@ -111,7 +111,9 @@ pub use runtime::{
     default_directory_discovery_relays,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
-pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};
+pub use storage_sqlite::{
+    ChatPinState, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
+};
 
 pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
@@ -191,6 +193,19 @@ pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
 };
+
+fn chat_pin_error_from_storage(error: storage_sqlite::ChatPinError) -> AppError {
+    match error {
+        storage_sqlite::ChatPinError::Storage(error) => AppError::Storage(error),
+        storage_sqlite::ChatPinError::UnknownGroup(group_id_hex) => {
+            AppError::UnknownGroup(group_id_hex)
+        }
+        storage_sqlite::ChatPinError::ArchivedChat => {
+            AppError::InvalidChatPin("archived chats cannot be pinned".to_owned())
+        }
+        storage_sqlite::ChatPinError::InvalidOrder(details) => AppError::InvalidChatPin(details),
+    }
+}
 
 use conversions::{
     account_group_push_token_from_app, account_push_registration_from_app,
@@ -1687,6 +1702,29 @@ impl MarmotApp {
             .chat_list_row(group_id_hex)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
+    }
+
+    pub fn set_chat_pinned(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        pinned: bool,
+    ) -> Result<ChatPinState, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .set_chat_pinned(group_id_hex, pinned)
+            .map_err(chat_pin_error_from_storage)
+    }
+
+    pub fn set_pinned_chat_order(
+        &self,
+        label: &str,
+        ordered_group_ids: &[String],
+    ) -> Result<ChatPinState, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .set_pinned_chat_order(ordered_group_ids)
+            .map_err(chat_pin_error_from_storage)
     }
 
     /// Per-account unread aggregate for the account-switcher badge

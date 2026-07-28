@@ -1004,6 +1004,44 @@ async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_miss
     ));
 }
 
+#[tokio::test]
+async fn pin_order_changes_are_sent_as_one_atomic_snapshot() {
+    let (updates_tx, mut updates_rx) = mpsc::channel(1);
+    let mut row_fingerprints = HashMap::from([("stale".to_owned(), "old".to_owned())]);
+    let mut first = chat_list_test_row("first", "First");
+    first.pinned = true;
+    first.pinned_position = Some(0);
+    let mut second = chat_list_test_row("second", "Second");
+    second.pinned = true;
+    second.pinned_position = Some(1);
+
+    assert!(
+        send_atomic_chat_list_snapshot(
+            &updates_tx,
+            &mut row_fingerprints,
+            ChatListUpdateTrigger::PinOrderChanged,
+            vec![first.clone(), second.clone()],
+        )
+        .await
+    );
+    assert_eq!(
+        updates_rx.recv().await,
+        Some(RuntimeChatListUpdate::Snapshot {
+            trigger: ChatListUpdateTrigger::PinOrderChanged,
+            rows: vec![first.clone(), second.clone()],
+        })
+    );
+    assert_eq!(row_fingerprints.len(), 2);
+    assert_eq!(
+        row_fingerprints.get("first"),
+        Some(&chat_list_row_fingerprint(&first))
+    );
+    assert_eq!(
+        row_fingerprints.get("second"),
+        Some(&chat_list_row_fingerprint(&second))
+    );
+}
+
 #[test]
 fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
     let base = chat_list_test_row("group", "title");
@@ -1013,6 +1051,13 @@ fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
     assert_ne!(
         chat_list_row_fingerprint(&base),
         chat_list_row_fingerprint(&manual)
+    );
+    let mut pinned = base.clone();
+    pinned.pinned = true;
+    pinned.pinned_position = Some(0);
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&pinned)
     );
 
     let mut timed = base.clone();
@@ -1059,6 +1104,8 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
 fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
     ChatListRow {
         group_id_hex: group_id_hex.to_owned(),
+        pinned: false,
+        pinned_position: None,
         archived: false,
         pending_confirmation: false,
         title: title.to_owned(),

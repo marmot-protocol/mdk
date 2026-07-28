@@ -10,6 +10,8 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    #[error("invalid chat pin: {details}")]
+    InvalidChatPin { details: String },
     /// Host-supplied draft attachment metadata is malformed.
     #[error("invalid message draft: {details}")]
     InvalidMessageDraft { details: String },
@@ -169,6 +171,7 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download

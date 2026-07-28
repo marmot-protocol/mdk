@@ -9,10 +9,28 @@ use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListQuery {
     pub include_archived: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatPinState {
+    pub ordered_group_ids: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChatPinError {
+    #[error(transparent)]
+    Storage(#[from] cgka_traits::storage::StorageError),
+    #[error("unknown local group")]
+    UnknownGroup(String),
+    #[error("archived chats cannot be pinned")]
+    ArchivedChat,
+    #[error("invalid pinned chat order: {0}")]
+    InvalidOrder(String),
 }
 
 /// Predicate deciding whether a timeline message (by plaintext + tag set)
@@ -136,6 +154,11 @@ pub struct ChatListMessagePreview {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListRow {
     pub group_id_hex: String,
+    pub pinned: bool,
+    /// Normalized zero-based position in the pinned section. The stored
+    /// ordinal is internal and may contain gaps after an archive-triggered
+    /// deletion.
+    pub pinned_position: Option<u32>,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub title: String,
@@ -216,6 +239,89 @@ impl SqliteAccountStorage {
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_row_tx(&conn, group_id_hex)
+    }
+
+    pub fn set_chat_pinned(
+        &self,
+        group_id_hex: &str,
+        pinned: bool,
+    ) -> Result<ChatPinState, ChatPinError> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let archived = conn
+                .query_row(
+                    "SELECT archived FROM account_groups WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .storage()?
+                .ok_or_else(|| ChatPinError::UnknownGroup(group_id_hex.to_owned()))?
+                != 0;
+            if pinned && archived {
+                return Err(ChatPinError::ArchivedChat);
+            }
+
+            let mut ordered_group_ids = pinned_chat_order_tx(&conn)?;
+            let existing = ordered_group_ids
+                .iter()
+                .position(|candidate| candidate == group_id_hex);
+            match (pinned, existing) {
+                (true, None) => {
+                    ordered_group_ids.insert(0, group_id_hex.to_owned());
+                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                }
+                (false, Some(position)) => {
+                    ordered_group_ids.remove(position);
+                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                }
+                _ => {}
+            }
+            Ok(ChatPinState { ordered_group_ids })
+        })
+    }
+
+    pub fn set_pinned_chat_order(
+        &self,
+        ordered_group_ids: &[String],
+    ) -> Result<ChatPinState, ChatPinError> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for group_id_hex in ordered_group_ids {
+                let exists = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
+                         )",
+                        params![group_id_hex],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .storage()?;
+                if !exists {
+                    return Err(ChatPinError::UnknownGroup(group_id_hex.clone()));
+                }
+            }
+            if ordered_group_ids.iter().collect::<HashSet<_>>().len() != ordered_group_ids.len() {
+                return Err(ChatPinError::InvalidOrder(
+                    "group ids must not contain duplicates".to_owned(),
+                ));
+            }
+
+            let current = pinned_chat_order_tx(&conn)?;
+            let current_set = current.iter().collect::<HashSet<_>>();
+            let requested_set = ordered_group_ids.iter().collect::<HashSet<_>>();
+            if current_set != requested_set {
+                return Err(ChatPinError::InvalidOrder(
+                    "order must contain every currently pinned chat exactly once".to_owned(),
+                ));
+            }
+            if current != ordered_group_ids {
+                rewrite_pinned_chat_order_tx(&conn, ordered_group_ids)?;
+            }
+            Ok(ChatPinState {
+                ordered_group_ids: ordered_group_ids.to_vec(),
+            })
+        })
     }
 
     /// Cheap unread aggregate over the materialized `chat_list_rows`
@@ -459,6 +565,42 @@ impl SqliteAccountStorage {
             )
         })
     }
+}
+
+fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT group_id_hex
+             FROM chat_pin_positions
+             ORDER BY ordinal ASC, group_id_hex ASC",
+        )
+        .storage()?;
+    statement
+        .query_map([], |row| row.get(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+        .map_err(Into::into)
+}
+
+fn rewrite_pinned_chat_order_tx(
+    tx: &Connection,
+    ordered_group_ids: &[String],
+) -> Result<(), ChatPinError> {
+    tx.execute("DELETE FROM chat_pin_positions", []).storage()?;
+    for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
+             VALUES (?1, ?2)",
+            params![
+                group_id_hex,
+                i64::try_from(ordinal)
+                    .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?
+            ],
+        )
+        .storage()?;
+    }
+    Ok(())
 }
 
 fn rebuild_all_chat_list_rows_tx(
@@ -1273,12 +1415,21 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
                 mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms
+                mute.muted_until_ms,
+                pin.group_id_hex IS NOT NULL,
+                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                    SELECT COUNT(*)
+                    FROM chat_pin_positions AS earlier_pin
+                    WHERE earlier_pin.ordinal < pin.ordinal
+                ) END
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
             ON mute.group_id_hex = row.group_id_hex
-         ORDER BY row.activity_sort_at DESC, row.group_id_hex"
+         LEFT JOIN chat_pin_positions AS pin
+            ON pin.group_id_hex = row.group_id_hex
+         ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                  row.activity_sort_at DESC, row.group_id_hex"
     } else {
         "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
                 row.title, row.group_name, row.avatar_url,
@@ -1295,13 +1446,22 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
                 mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms
+                mute.muted_until_ms,
+                pin.group_id_hex IS NOT NULL,
+                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                    SELECT COUNT(*)
+                    FROM chat_pin_positions AS earlier_pin
+                    WHERE earlier_pin.ordinal < pin.ordinal
+                ) END
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
             ON mute.group_id_hex = row.group_id_hex
+         LEFT JOIN chat_pin_positions AS pin
+            ON pin.group_id_hex = row.group_id_hex
          WHERE row.archived = 0
-         ORDER BY row.activity_sort_at DESC, row.group_id_hex"
+         ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                  row.activity_sort_at DESC, row.group_id_hex"
     };
     let now_ms = unix_now_ms();
     let mut stmt = tx.prepare(sql).storage()?;
@@ -1339,11 +1499,19 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
                 row.activity_sort_at, row.updated_at, row.self_membership,
                 ag.member_count,
                 mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms
+                mute.muted_until_ms,
+                pin.group_id_hex IS NOT NULL,
+                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                    SELECT COUNT(*)
+                    FROM chat_pin_positions AS earlier_pin
+                    WHERE earlier_pin.ordinal < pin.ordinal
+                ) END
          FROM chat_list_rows AS row
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
          LEFT JOIN chat_notification_settings AS mute
             ON mute.group_id_hex = row.group_id_hex
+         LEFT JOIN chat_pin_positions AS pin
+            ON pin.group_id_hex = row.group_id_hex
          WHERE row.group_id_hex = ?1",
         params![group_id_hex],
         |row| chat_list_row_from_row(row, now_ms),
@@ -1412,8 +1580,14 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let mute_row_exists = row.get::<_, i64>(30)? != 0;
     let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
+    let pinned = row.get::<_, i64>(32)? != 0;
+    let pinned_position = row
+        .get::<_, Option<i64>>(33)?
+        .and_then(|value| u32::try_from(value).ok());
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
+        pinned,
+        pinned_position,
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
         title: row.get(3)?,

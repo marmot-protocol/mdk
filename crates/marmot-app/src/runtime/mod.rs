@@ -33,7 +33,7 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
     AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
+    BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings, ChatPinState,
     GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS,
     MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
@@ -87,7 +87,8 @@ pub(crate) use subscriptions::{
     TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindow,
     TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
     merge_timeline_window, messages_recovery_query, received_message_update_from_record,
-    reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_chat_list_remove_update,
+    reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_atomic_chat_list_snapshot,
+    send_chat_list_remove_update,
 };
 // External items `runtime/tests.rs` reaches through `super::*` that the
 // orchestration core itself no longer references after the split.
@@ -2665,6 +2666,62 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .chat_list_row(&account.label, group_id_hex)
+    }
+
+    pub fn set_chat_pinned(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        pinned: bool,
+    ) -> Result<ChatPinState, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
+        let state = self
+            .accounts
+            .app
+            .set_chat_pinned(&account.label, &group_id_hex, pinned)?;
+        let row = self
+            .accounts
+            .app
+            .chat_list_row(&account.label, &group_id_hex)?;
+        self.publish_chat_list_projection_update(
+            account.account_id_hex,
+            account.label,
+            group_id_hex,
+            row,
+            ChatListUpdateTrigger::PinOrderChanged,
+        );
+        Ok(state)
+    }
+
+    pub fn set_pinned_chat_order(
+        &self,
+        account_ref: &str,
+        ordered_group_ids: Vec<String>,
+    ) -> Result<ChatPinState, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let ordered_group_ids = ordered_group_ids
+            .into_iter()
+            .map(|group_id_hex| normalize_group_id_hex_app(&group_id_hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        let state = self
+            .accounts
+            .app
+            .set_pinned_chat_order(&account.label, &ordered_group_ids)?;
+        if let Some(group_id_hex) = ordered_group_ids.first() {
+            let row = self
+                .accounts
+                .app
+                .chat_list_row(&account.label, group_id_hex)?;
+            self.publish_chat_list_projection_update(
+                account.account_id_hex,
+                account.label,
+                group_id_hex.clone(),
+                row,
+                ChatListUpdateTrigger::PinOrderChanged,
+            );
+        }
+        Ok(state)
     }
 
     /// Per-account unread aggregate for the account-switcher badge
