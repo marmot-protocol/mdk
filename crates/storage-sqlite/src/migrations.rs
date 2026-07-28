@@ -76,6 +76,8 @@ mod migration_0037_chat_list_semantic_timestamps;
 mod migration_0038_chat_list_interaction_state;
 #[path = "migrations/0039_chat_pin_positions.rs"]
 mod migration_0039_chat_pin_positions;
+#[path = "migrations/0040_disband_requests.rs"]
+mod migration_0040_disband_requests;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -282,6 +284,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 39,
         name: "0039_chat_pin_positions",
         apply: migration_0039_chat_pin_positions::apply,
+    },
+    Migration {
+        version: 40,
+        name: "0040_disband_requests",
+        apply: migration_0040_disband_requests::apply,
     },
 ];
 

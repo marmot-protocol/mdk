@@ -1149,6 +1149,30 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    // A valid terminal Commit never takes the direct merge
+                    // shortcut. Persist its authenticated evidence and force
+                    // the same bounded convergence pass used for competing
+                    // branches; terminal cleanup happens only after selection.
+                    if crate::app_components::staged_commit_disbands(&mls_group, &staged)? {
+                        self.record_inbound_disband_candidate(
+                            &group_id,
+                            before,
+                            msg.id.clone(),
+                            mls_bytes.as_slice(),
+                            commit_committer,
+                            committer_index == mls_group.own_leaf_index(),
+                        )?;
+                        let now_ms = self.convergence_now_ms();
+                        let result = self
+                            .converge_stored_openmls_messages(&group_id, now_ms)
+                            .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
+                        return Ok(convergence_ingest_outcome(
+                            &result,
+                            msg,
+                            group_id,
+                            current_epoch,
+                        ));
+                    }
                     // Classify departures before the merge consumes the staged
                     // commit and the leaving leaves disappear: a SelfRemove is a
                     // member leaving (attributed to themselves); a Remove is an
@@ -2180,7 +2204,11 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<GroupId, EngineError> {
         let direct = GroupId::new(transport_group_id.to_vec());
         match self.storage.get_group(&direct) {
-            Ok(group) => return Ok(group.id),
+            Ok(group) => {
+                if self.storage.disband_tombstone(&group.id)?.is_none() {
+                    return Ok(group.id);
+                }
+            }
             Err(StorageError::NotFound) => {}
             Err(err) => return Err(EngineError::Storage(err)),
         }

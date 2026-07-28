@@ -217,6 +217,41 @@ impl AppClient {
         Ok(changed)
     }
 
+    /// Finish the app-local half of durable disband acceptance after a crash
+    /// or a transient projection write failure. The engine request/tombstone is
+    /// the source of truth, so composer drafts must not reappear on reopen.
+    pub(crate) fn reconcile_disband_drafts(&self) {
+        for projected_group in &self.state.groups {
+            let Ok(group_id_bytes) = hex::decode(&projected_group.group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            let request_exists = self
+                .runtime
+                .disband_request(&group_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_disbanded = self
+                .runtime
+                .group_record(&group_id)
+                .ok()
+                .is_some_and(|group| group.disbanded.is_some());
+            if (request_exists || is_disbanded)
+                && let Err(error) = self
+                    .app
+                    .delete_message_draft(&self.state.label, &projected_group.group_id_hex)
+            {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "reconcile_disband_drafts",
+                    error_kind = error.privacy_safe_kind(),
+                    "composer draft cleanup remains pending"
+                );
+            }
+        }
+    }
+
     pub(crate) fn profile_for_group(&self, group_id: &GroupId) -> AppGroupProfileComponent {
         self.runtime
             .app_component(group_id, GROUP_PROFILE_COMPONENT_ID)
@@ -506,6 +541,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
+        AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {

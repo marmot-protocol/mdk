@@ -7,11 +7,13 @@ use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupProfileV1,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
-    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
-    decode_group_blossom_image_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list, encode_group_profile_v1,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GroupLifecycleV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
+    decode_quic_varint, encode_component_vectors, encode_components_list,
+    encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -24,8 +26,8 @@ use openmls::group::{
 };
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
-    BasicCredential, ContentType, ExtensionType, LeafNode, LeafNodeIndex, ProposalType,
-    ProposalValidationError, QueuedProposal, Sender,
+    BasicCredential, ContentType, ExtensionType, LeafNode, LeafNodeIndex, ProposalOrRefType,
+    ProposalType, ProposalValidationError, QueuedProposal, Sender,
 };
 use openmls::treesync::Node;
 use std::collections::{BTreeMap, BTreeSet};
@@ -125,6 +127,12 @@ pub(crate) fn app_data_dictionary_extension_for_group(
             encode_admin_policy(&initial.admins)?,
         );
     }
+    if required.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+        dict.insert(
+            GROUP_LIFECYCLE_COMPONENT_ID,
+            encode_group_lifecycle_v1(GroupLifecycleV1::Active),
+        );
+    }
     let mut seen_initial = BTreeSet::new();
     for component in &initial.app_components {
         if !seen_initial.insert(component.component_id) {
@@ -182,6 +190,17 @@ pub(crate) fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, Eng
         return Ok(Vec::new());
     };
     decode_admin_policy(bytes)
+}
+
+pub(crate) fn lifecycle_of_group(
+    mls_group: &MlsGroup,
+) -> Result<Option<GroupLifecycleV1>, EngineError> {
+    let Some(bytes) = app_component_bytes(mls_group, GROUP_LIFECYCLE_COMPONENT_ID) else {
+        return Ok(None);
+    };
+    decode_group_lifecycle_v1(bytes).map(Some).map_err(|error| {
+        EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+    })
 }
 
 pub(crate) fn app_component_data_of_group(
@@ -431,6 +450,13 @@ fn authorize_proposal(
             if !sender_is_admin {
                 return Err(StandaloneProposalRejection::authorization(
                     "app_data_update_sender_not_admin",
+                ));
+            }
+            if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID
+                && proposal.proposal_or_ref_type() == ProposalOrRefType::Reference
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_lifecycle_update_must_be_inline",
                 ));
             }
             if validate_app_data_payload {
@@ -798,7 +824,193 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     let required_components =
         validate_current_profile_group_context(extensions, "resulting group state")?;
     let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
-    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)
+    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
+    validate_group_lifecycle_transition(group, staged, committer_index)
+}
+
+fn lifecycle_from_extensions(
+    extensions: &Extensions<GroupContext>,
+) -> Result<Option<GroupLifecycleV1>, EngineError> {
+    let Some(bytes) = extensions
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&GROUP_LIFECYCLE_COMPONENT_ID))
+    else {
+        return Ok(None);
+    };
+    decode_group_lifecycle_v1(bytes).map(Some).map_err(|error| {
+        EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+    })
+}
+
+pub(crate) fn staged_commit_disbands(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+) -> Result<bool, EngineError> {
+    Ok(
+        lifecycle_from_extensions(group.extensions())? == Some(GroupLifecycleV1::Active)
+            && lifecycle_from_extensions(staged.group_context().extensions())?
+                == Some(GroupLifecycleV1::Disbanded),
+    )
+}
+
+/// Enforce lifecycle-v1 transition and terminal Commit shape at the shared
+/// staged-Commit chokepoint used by local sends, direct ingest, convergence
+/// replay, and fork recovery.
+pub(crate) fn validate_group_lifecycle_transition(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<(), EngineError> {
+    let before = lifecycle_from_extensions(group.extensions())?;
+    let after = lifecycle_from_extensions(staged.group_context().extensions())?;
+    let before_required =
+        required_app_components_of_group(group)?.contains(GROUP_LIFECYCLE_COMPONENT_ID);
+    let after_required = required_app_components_of_extensions(
+        staged.group_context().extensions(),
+        "resulting group state",
+    )?
+    .contains(GROUP_LIFECYCLE_COMPONENT_ID);
+
+    if before == Some(GroupLifecycleV1::Disbanded) {
+        return Err(EngineError::Other(
+            "commit is invalid: Disbanded has no outgoing transition".into(),
+        ));
+    }
+
+    let enabling = !before_required && after_required;
+    if enabling {
+        if after != Some(GroupLifecycleV1::Active) {
+            return Err(EngineError::Other(
+                "commit is invalid: lifecycle enablement must install Active".into(),
+            ));
+        }
+        for queued in staged.queued_proposals() {
+            if queued.proposal_or_ref_type() != ProposalOrRefType::Proposal {
+                return Err(EngineError::Other(
+                    "commit is invalid: lifecycle enablement proposals must be inline".into(),
+                ));
+            }
+            match queued.proposal() {
+                Proposal::AppDataUpdate(update)
+                    if matches!(
+                        update.component_id(),
+                        APP_COMPONENTS_COMPONENT_ID | GROUP_LIFECYCLE_COMPONENT_ID
+                    ) => {}
+                _ => {
+                    return Err(EngineError::Other(
+                        "commit is invalid: lifecycle enablement contains unrelated proposals"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if before != Some(GroupLifecycleV1::Active) || after != Some(GroupLifecycleV1::Disbanded) {
+        if before != after {
+            return Err(EngineError::Other(
+                "commit is invalid: unsupported group lifecycle transition".into(),
+            ));
+        }
+        if staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::AppDataUpdate(update)
+                    if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID
+            )
+        }) {
+            return Err(EngineError::Other(
+                "commit is invalid: redundant lifecycle update".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if !before_required || !after_required {
+        return Err(EngineError::Other(
+            "commit is invalid: disband requires lifecycle-v1 in the parent and result".into(),
+        ));
+    }
+
+    let committer = group
+        .member_at(committer_index)
+        .ok_or_else(|| EngineError::Other("commit is invalid: committer leaf is absent".into()))?;
+    let committer_id = crate::identity::validated_member_id(&committer.credential)?;
+    let committer_admin = admin_pubkey_from_member_id(&committer_id)?;
+    let mut lifecycle_updates = 0usize;
+    let mut admin_updates = 0usize;
+    let mut removed = BTreeSet::new();
+
+    for queued in staged.queued_proposals() {
+        if queued.proposal_or_ref_type() != ProposalOrRefType::Proposal {
+            return Err(EngineError::Other(
+                "commit is invalid: every disband proposal must be inline".into(),
+            ));
+        }
+        match queued.proposal() {
+            Proposal::Remove(remove) => {
+                removed.insert(remove.removed().u32());
+            }
+            Proposal::AppDataUpdate(update)
+                if update.component_id() == GROUP_LIFECYCLE_COMPONENT_ID =>
+            {
+                let AppDataUpdateOperation::Update(data) = update.operation() else {
+                    return Err(EngineError::Other(
+                        "commit is invalid: lifecycle component cannot be removed".into(),
+                    ));
+                };
+                if decode_group_lifecycle_v1(data.as_slice()).map_err(|error| {
+                    EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+                })? != GroupLifecycleV1::Disbanded
+                {
+                    return Err(EngineError::Other(
+                        "commit is invalid: terminal lifecycle update is not Disbanded".into(),
+                    ));
+                }
+                lifecycle_updates += 1;
+            }
+            Proposal::AppDataUpdate(update)
+                if update.component_id() == GROUP_ADMIN_POLICY_COMPONENT_ID =>
+            {
+                let AppDataUpdateOperation::Update(data) = update.operation() else {
+                    return Err(EngineError::Other(
+                        "commit is invalid: disband must replace the admin policy".into(),
+                    ));
+                };
+                if decode_admin_policy(data.as_slice())? != vec![committer_admin] {
+                    return Err(EngineError::Other(
+                        "commit is invalid: disband admin policy must contain only the committer"
+                            .into(),
+                    ));
+                }
+                admin_updates += 1;
+            }
+            _ => {
+                return Err(EngineError::Other(
+                    "commit is invalid: disband contains a forbidden proposal".into(),
+                ));
+            }
+        }
+    }
+    if lifecycle_updates != 1 || admin_updates != 1 {
+        return Err(EngineError::Other(
+            "commit is invalid: disband needs exactly one lifecycle and one admin-policy update"
+                .into(),
+        ));
+    }
+
+    let expected: BTreeSet<u32> = group
+        .members()
+        .filter_map(|member| (member.index != committer_index).then_some(member.index.u32()))
+        .collect();
+    if removed != expected {
+        return Err(EngineError::Other(
+            "commit is invalid: disband must remove every source-state leaf except the committer"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_current_profile_group_context(
@@ -939,6 +1151,7 @@ fn is_known_group_component(component_id: AppComponentId) -> bool {
             | GROUP_AVATAR_URL_COMPONENT_ID
             | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
             | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+            | GROUP_LIFECYCLE_COMPONENT_ID
     )
 }
 
@@ -962,6 +1175,23 @@ fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafN
             _ => None,
         })
         .collect())
+}
+
+/// Deduplicated account identifiers for current leaves that have not yet
+/// advertised lifecycle-v1 support. The tree walk is leaf-precise, so sibling
+/// devices cannot be hidden by the account-keyed capability cache.
+pub(crate) fn lifecycle_support_blockers(group: &MlsGroup) -> Result<Vec<MemberId>, EngineError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut blockers = Vec::new();
+    for leaf in ratchet_tree_leaves(group.export_ratchet_tree())? {
+        if !app_components_of_leaf(&leaf)?.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+            let member = crate::identity::validated_member_id_of_leaf(&leaf)?;
+            if seen.insert(member.clone()) {
+                blockers.push(member);
+            }
+        }
+    }
+    Ok(blockers)
 }
 
 fn indexed_ratchet_tree_leaves(
@@ -1381,6 +1611,13 @@ fn validate_app_component_bytes(
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(data),
         GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => validate_encrypted_media_policy_v1(data),
         GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => validate_encrypted_media_policy_v2(data),
+        GROUP_LIFECYCLE_COMPONENT_ID => {
+            decode_group_lifecycle_v1(data)
+                .map(|_| ())
+                .map_err(|error| {
+                    EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
+                })
+        }
         _ => Ok(()),
     }
 }
@@ -1480,6 +1717,11 @@ fn validate_app_component_remove_against(
     if component_id == SAFE_AAD_COMPONENT_ID {
         return Err(EngineError::Other(
             "safe_aad group-component state is not supported yet".into(),
+        ));
+    }
+    if component_id == GROUP_LIFECYCLE_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "group lifecycle component cannot be removed".into(),
         ));
     }
     if resulting_required.contains(component_id) {

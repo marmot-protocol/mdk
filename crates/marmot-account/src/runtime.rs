@@ -123,6 +123,25 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
+    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
+        self.session.epoch_state(group_id)
+    }
+
+    pub fn disband_request(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::DisbandRequest>> {
+        Ok(self.session.disband_request(group_id)?)
+    }
+
+    pub fn disbanding_support_blockers(&self, group_id: &GroupId) -> AccountResult<Vec<MemberId>> {
+        Ok(self.session.disbanding_support_blockers(group_id)?)
+    }
+
+    pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.acknowledge_disband_failure(group_id)?)
+    }
+
     pub fn new_protocol_profile(&self) -> cgka_traits::group::ProtocolProfile {
         self.session.new_protocol_profile()
     }

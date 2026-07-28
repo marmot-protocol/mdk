@@ -1126,6 +1126,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         updated_at: 0,
         self_membership: crate::SelfMembership::Member,
         conversation_kind: crate::ChatConversationKind::Unknown,
+        lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
         muted: false,
         muted_until_ms: None,
         leave_requested_at_ms: None,

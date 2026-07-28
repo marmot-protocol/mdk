@@ -29,10 +29,10 @@ use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
     AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
-    AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
-    AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
-    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest, AppError,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
+    AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
     BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings, ChatPinState,
     GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS,
     MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
@@ -1103,6 +1103,34 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<AppGroupMlsState, AppError> {
         self.accounts.group_mls_state(account_ref, group_id).await
+    }
+
+    pub async fn enable_group_disbanding(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .enable_group_disbanding(account_ref, group_id)
+            .await
+    }
+
+    pub async fn disband_group(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        self.accounts.disband_group(account_ref, group_id).await
+    }
+
+    pub async fn acknowledge_disband_failure(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .acknowledge_disband_failure(account_ref, group_id)
+            .await
     }
 
     /// Stored groups that failed session-open hydration and were skipped

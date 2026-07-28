@@ -55,6 +55,13 @@ pub enum MarmotKitError {
     LeaveAlreadyRequested { group_id_hex: String },
     #[error("operation would remove the last admin from group {group_id_hex}")]
     WouldRemoveLastAdmin { group_id_hex: String },
+    #[error("group {group_id_hex} cannot enable disbanding until all members support it")]
+    DisbandingUnsupportedMembers {
+        group_id_hex: String,
+        member_ids_hex: Vec<String>,
+    },
+    #[error("group {group_id_hex} has a pending disband request")]
+    GroupDisbanding { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -172,6 +179,7 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
+            AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download
@@ -230,6 +238,15 @@ impl MarmotKitError {
             EngineError::AdminDepletion { group_id } => Self::WouldRemoveLastAdmin {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            EngineError::DisbandingUnsupportedMembers { group_id, members } => {
+                Self::DisbandingUnsupportedMembers {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex: members
+                        .iter()
+                        .map(|member| hex::encode(member.as_slice()))
+                        .collect(),
+                }
+            }
             EngineError::UnknownMember { group_id, member } => Self::MemberNotInGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),

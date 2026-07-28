@@ -159,7 +159,9 @@ impl<S: StorageProvider> Engine<S> {
                 // never commit the merge + `Processed` write with a stale record.
                 let mut g = storage.get_group(&group_id)?;
                 g.epoch = EpochId(mls_group.epoch().as_u64());
-                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                if kind != crate::epoch_manager::PendingKind::Disband {
+                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                }
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
                 storage.put_group(&g)?;
@@ -277,6 +279,11 @@ impl<S: StorageProvider> Engine<S> {
                 from: EpochId(new_epoch.0.saturating_sub(1)),
                 to: new_epoch,
             },
+            crate::epoch_manager::PendingKind::Disband => GroupEvent::EpochChanged {
+                group_id,
+                from: EpochId(new_epoch.0.saturating_sub(1)),
+                to: new_epoch,
+            },
         };
         let replay_group_id = match &event {
             GroupEvent::GroupCreated { group_id } | GroupEvent::EpochChanged { group_id, .. } => {
@@ -285,6 +292,11 @@ impl<S: StorageProvider> Engine<S> {
             _ => unreachable!("confirm only emits create/evolution events"),
         };
         self.events_buf.push_back(event.clone());
+        if kind == crate::epoch_manager::PendingKind::Disband {
+            self.pending_state_changes.remove(&pending);
+            self.schedule_pending_convergence_group(&replay_group_id);
+            return Ok(event);
+        }
         if let Some(changes) = self.pending_state_changes.remove(&pending) {
             for pending_change in changes {
                 self.push_group_state_change(
@@ -432,6 +444,14 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.pending_state_changes.remove(&pending);
+        if kind == crate::epoch_manager::PendingKind::Disband {
+            self.storage.clear_disband_candidates(&group_id)?;
+            if let Some(mut request) = self.storage.disband_request(&group_id)? {
+                request.last_prepared_epoch = None;
+                self.storage.put_disband_request(&request)?;
+            }
+            self.schedule_pending_convergence_group(&group_id);
+        }
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
             self.schedule_pending_convergence_group(&queued_group_id);
         }

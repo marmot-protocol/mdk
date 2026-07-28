@@ -525,6 +525,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
+        self.epoch_manager.state(group_id).cloned()
+    }
+
     /// Persist a frozen transport fanout before or after one lifecycle edge.
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> Result<(), EngineError> {
         if let Some(group_id) = fanout.group_id() {
@@ -818,6 +822,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
+            SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => None,
             SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }
@@ -971,9 +976,16 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
-        for group_id in self.storage.list_groups()? {
+        let stored_groups = self.storage.list_groups()?;
+        let stored_group_ids = stored_groups.iter().cloned().collect::<HashSet<_>>();
+        for group_id in stored_groups {
             if let Err(reason) = self.hydrate_one_stored_group(&group_id) {
                 self.quarantine_stored_group_on_hydrate(&group_id, reason);
+            }
+        }
+        for (group_id, tombstone) in self.storage.list_disband_tombstones()? {
+            if !stored_group_ids.contains(&group_id) {
+                self.restore_disband_tombstone(group_id, tombstone);
             }
         }
         Ok(())
@@ -987,14 +999,50 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .list_groups()?
             .into_iter()
-            .filter(|group_id| self.epoch_manager.state(group_id).is_some())
+            .filter(|group_id| {
+                self.epoch_manager.state(group_id).is_some_and(|state| {
+                    !matches!(state, cgka_traits::engine_state::EpochState::Disbanded(_))
+                })
+            })
             .collect())
+    }
+
+    fn restore_disband_tombstone(
+        &mut self,
+        group_id: GroupId,
+        tombstone: cgka_traits::DisbandTombstone,
+    ) {
+        self.epoch_manager
+            .restore_disbanded(group_id.clone(), tombstone.epoch);
+        self.events_buf.push_back(GroupEvent::GroupStateChanged {
+            group_id,
+            epoch: tombstone.epoch,
+            actor: Some(tombstone.actor),
+            change: GroupStateChange::GroupDisbanded,
+            origin_commit_id: tombstone.origin_commit_id,
+        });
     }
 
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
+        let group = self
+            .storage
+            .get_group(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let tombstone = group
+            .disbanded
+            .clone()
+            .or_else(|| self.storage.disband_tombstone(group_id).ok().flatten());
+        if let Some(tombstone) = tombstone {
+            // Reconcile the single deterministic system row after a crash. The
+            // application projection canonicalizes this event, so replaying it
+            // on open is idempotent.
+            let epoch = tombstone.epoch;
+            self.restore_disband_tombstone(group_id.clone(), tombstone);
+            return Ok(epoch);
+        }
         // A retained-anchor convergence probe durably rewinds the group while
         // it explores historical candidates. Process termination cannot run
         // the in-process rollback guard, so restore its pre-probe live snapshot

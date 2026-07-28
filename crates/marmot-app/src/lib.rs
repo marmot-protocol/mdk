@@ -40,7 +40,10 @@ pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
-use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
+use cgka_traits::storage::{
+    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, KeyPackageBundleStorage,
+    MaintenanceStorage,
+};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
@@ -142,12 +145,13 @@ pub use drafts::{
 };
 pub use error::AppError;
 pub use groups::{
-    AppAgentTextStreamComponent, AppBlobEndpoint, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason,
-    AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
-    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupOpaqueComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppGroupSystemEvent, AppInitialGroupImage,
-    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
+    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
+    AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
+    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppGroupSystemEvent, AppInitialGroupImage, AppPriorNostrRoute,
+    AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1249,6 +1253,7 @@ impl MarmotApp {
             // reconciled group set when it registers subscriptions.
             client.app.save_state(&client.state)?;
         }
+        client.reconcile_disband_drafts();
         // This once-only projection migration is local SQL work and must land
         // before the host renders its first chat-list snapshot.
         client.backfill_self_membership_once()?;
@@ -2610,6 +2615,7 @@ impl MarmotApp {
         }
 
         let account = self.account_home().account(&state.label)?;
+        let account_storage = self.account_storage(&state.label)?;
         let relay_lists = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let mut group_routes = Vec::new();
         for group in &state.groups {
@@ -2623,6 +2629,9 @@ impl MarmotApp {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
+            if account_storage.disband_tombstone(&group_id)?.is_some() {
+                continue;
+            }
             match group.transport_subscriptions(&group_id) {
                 Ok(subscriptions) => group_routes.extend(subscriptions),
                 Err(_) => tracing::warn!(
@@ -3598,9 +3607,17 @@ impl MarmotApp {
         group_id_hex: &str,
     ) -> Result<bool, AppError> {
         self.ensure_account_state(label)?;
-        let deleted = self
-            .account_storage(label)?
-            .delete_local_group_data(group_id_hex)?;
+        let storage = self.account_storage(label)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        if matches!(
+            storage
+                .disband_request(&group_id)?
+                .map(|request| request.status),
+            Some(DisbandRequestStatus::Pending)
+        ) {
+            return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
+        }
+        let deleted = storage.delete_local_group_data(group_id_hex)?;
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

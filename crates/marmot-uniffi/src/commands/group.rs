@@ -11,7 +11,7 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
     GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
     GroupMutationResultFfi, KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
     PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
@@ -71,7 +71,18 @@ pub(crate) async fn group_details_for(
             .runtime
             .display_names_for_account_ids(&member_ids)
             .unwrap_or_default();
-        group_details_ffi(group, members, &account.account_id_hex, display_names)
+        let mls_state = kit
+            .runtime
+            .group_mls_state(account_ref, group_id)
+            .await?
+            .into();
+        group_details_ffi(
+            group,
+            members,
+            mls_state,
+            &account.account_id_hex,
+            display_names,
+        )
     }
     .await;
     kit.runtime
@@ -331,6 +342,49 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await
+    }
+
+    /// Install lifecycle-v1 and require it in one admin Commit.
+    pub async fn enable_group_disbanding(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .enable_group_disbanding(&account_ref, &group_id)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    /// Durably accept an irreversible disband request. Completion is observed
+    /// through normal group state updates after bounded convergence.
+    pub async fn disband_group(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<DisbandRequestFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let request = self.runtime.disband_group(&account_ref, &group_id).await?;
+        Ok(request.into())
+    }
+
+    pub async fn acknowledge_disband_failure(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .acknowledge_disband_failure(&account_ref, &group_id)
+            .await?)
     }
 
     pub async fn invite_members(
@@ -889,6 +943,12 @@ mod tests {
             requires_self_demote_before_leave: self_admin,
             leave_request_pending: false,
             leave_requested_at_ms: None,
+            lifecycle_state: crate::conversions::GroupLifecycleStateFfi::Stable,
+            disbanding_enabled: true,
+            can_enable_disbanding: false,
+            can_disband: self_admin,
+            disband_blockers: vec![],
+            disband_request: None,
             member_actions: vec![
                 GroupMemberActionStateFfi {
                     member_id_hex: self_id.into(),

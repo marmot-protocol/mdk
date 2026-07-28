@@ -838,6 +838,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::Peeler(_) => "peeler",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",

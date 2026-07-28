@@ -530,6 +530,7 @@ impl<S: StorageProvider> Engine<S> {
             protocol_profile: self.new_protocol_profile,
             removed: false,
             unrecoverable: false,
+            disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         if self.new_protocol_profile == ProtocolProfile::Legacy {
@@ -988,6 +989,9 @@ impl<S: StorageProvider> Engine<S> {
                         .as_slice()
                         .to_vec(),
                 );
+                if storage.disband_tombstone(&group_id)?.is_some() {
+                    return Err(EngineError::InvalidWelcome);
+                }
 
                 let (local_state_is_stale, repaired_unrecoverable) =
                     match storage.get_group(&group_id) {
@@ -1108,6 +1112,7 @@ impl<S: StorageProvider> Engine<S> {
                     protocol_profile,
                     removed: false,
                     unrecoverable: false,
+                    disbanded: None,
                     join_epoch: EpochId(mls_group.epoch().as_u64()),
                 };
                 mirror_app_components_into_record(&mls_group, &mut group_record);

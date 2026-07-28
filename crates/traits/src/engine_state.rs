@@ -21,6 +21,19 @@
 use crate::ingest::PeeledMessage;
 use crate::types::EpochId;
 use serde::{Deserialize, Serialize};
+
+/// Canonical application-facing group lifecycle classification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupLifecycleState {
+    #[default]
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
 use std::fmt;
 
 /// Opaque handle to a staged MLS commit. The engine serializes its
@@ -142,6 +155,17 @@ pub struct Unrecoverable {
     last_stable_epoch: EpochId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disbanded {
+    epoch: EpochId,
+}
+
+impl Disbanded {
+    pub fn epoch(&self) -> EpochId {
+        self.epoch
+    }
+}
+
 impl Unrecoverable {
     pub fn last_stable_epoch(&self) -> EpochId {
         self.last_stable_epoch
@@ -206,11 +230,18 @@ pub enum EpochState {
     /// applying and ingesting group-state changes until a verified repair path.
     /// See `spec/protocol-core/group-state.md:17,54-66`.
     Unrecoverable(Unrecoverable),
+    /// A selected authenticated disband Commit terminalized the group. Live MLS
+    /// state no longer exists and there is no legal transition out.
+    Disbanded(Disbanded),
 }
 
 impl EpochState {
     pub fn stable(epoch: EpochId) -> Self {
         EpochState::Stable { epoch }
+    }
+
+    pub fn disbanded(epoch: EpochId) -> Self {
+        EpochState::Disbanded(Disbanded { epoch })
     }
 
     /// Current epoch this state reflects. For `Recovering`, returns the last
@@ -222,6 +253,7 @@ impl EpochState {
             EpochState::Merging(m) => m.epoch(),
             EpochState::Recovering(r) => r.last_stable_epoch(),
             EpochState::Unrecoverable(u) => u.last_stable_epoch(),
+            EpochState::Disbanded(d) => d.epoch(),
         }
     }
 
@@ -238,6 +270,10 @@ impl EpochState {
     /// a repair path before it may apply or ingest more group traffic.
     pub fn is_unrecoverable(&self) -> bool {
         matches!(self, EpochState::Unrecoverable(_))
+    }
+
+    pub fn is_disbanded(&self) -> bool {
+        matches!(self, EpochState::Disbanded(_))
     }
 
     /// Whether this group is in the `Stable` state — the only state from which
@@ -257,6 +293,7 @@ impl EpochState {
             EpochState::Merging(_) => "Merging",
             EpochState::Recovering(_) => "Recovering",
             EpochState::Unrecoverable(_) => "Unrecoverable",
+            EpochState::Disbanded(_) => "Disbanded",
         }
     }
 
@@ -360,6 +397,32 @@ impl EpochState {
                 to: "Stable",
                 reason: "repair_to_stable requires Unrecoverable",
             }),
+        }
+    }
+
+    /// `Recovering → Disbanded`. Terminalization is legal only after the
+    /// mandatory bounded convergence pass selects a disband branch.
+    pub fn settle_to_disbanded(self, epoch: EpochId) -> Result<Self, InvalidTransition> {
+        match self {
+            EpochState::Recovering(_) => Ok(EpochState::disbanded(epoch)),
+            other => Err(InvalidTransition {
+                from: other.name(),
+                to: "Disbanded",
+                reason: "disband terminalization requires Recovering",
+            }),
+        }
+    }
+}
+
+impl From<&EpochState> for GroupLifecycleState {
+    fn from(value: &EpochState) -> Self {
+        match value {
+            EpochState::Stable { .. } => Self::Stable,
+            EpochState::PendingPublish(_) => Self::PendingPublish,
+            EpochState::Merging(_) => Self::Merging,
+            EpochState::Recovering(_) => Self::Recovering,
+            EpochState::Unrecoverable(_) => Self::Unrecoverable,
+            EpochState::Disbanded(_) => Self::Disbanded,
         }
     }
 }

@@ -749,6 +749,23 @@ impl AppClient {
                     )?;
                 }
             }
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            } = event
+            {
+                routes_dirty = true;
+                let group_id_hex = hex::encode(group_id.as_slice());
+                // Terminal groups never advertise notification destinations
+                // again. Queue the current registration's removal and discard
+                // every cached peer token immediately; publishing the removal
+                // rumor remains restart-safe in the normal outbox.
+                let _ = self.queue_current_push_registration_removal_for_group(group_id);
+                let _ =
+                    self.app
+                        .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
+            }
             // A (re-)join or create restores the local account's membership so a
             // re-add after removal un-suppresses the group's unread count. Same
             // source-of-truth write as the departure path above: propagate the

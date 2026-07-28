@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use marmot_app::{
-    AppBlobEndpoint, AppGroupAdminPolicyComponent, AppGroupEncryptedMediaComponent,
-    AppGroupHydrationQuarantineReason, AppGroupMemberRecord, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppProtocolProfile,
-    AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
+    AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
+    AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupLifecycleState,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupProfileComponent, AppGroupRecord, AppProtocolProfile, AppQuarantinedGroup,
+    GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
@@ -225,6 +226,7 @@ pub struct GroupMemberDetailsFfi {
 pub struct GroupDetailsFfi {
     pub group: AppGroupRecordFfi,
     pub members: Vec<GroupMemberDetailsFfi>,
+    pub mls_state: AppGroupMlsStateFfi,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -259,6 +261,12 @@ pub struct GroupManagementStateFfi {
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
     pub leave_requested_at_ms: Option<u64>,
+    pub lifecycle_state: GroupLifecycleStateFfi,
+    pub disbanding_enabled: bool,
+    pub can_enable_disbanding: bool,
+    pub can_disband: bool,
+    pub disband_blockers: Vec<String>,
+    pub disband_request: Option<DisbandRequestFfi>,
     pub member_actions: Vec<GroupMemberActionStateFfi>,
 }
 
@@ -319,6 +327,7 @@ fn canonical_member_ref_input(member_ref: &str) -> String {
 pub(crate) fn group_details_ffi(
     group: AppGroupRecordFfi,
     members: Vec<AppGroupMemberRecordFfi>,
+    mls_state: AppGroupMlsStateFfi,
     my_account_id_hex: &str,
     display_names: HashMap<String, String>,
 ) -> Result<GroupDetailsFfi, MarmotKitError> {
@@ -342,7 +351,11 @@ pub(crate) fn group_details_ffi(
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
-    Ok(GroupDetailsFfi { group, members })
+    Ok(GroupDetailsFfi {
+        group,
+        members,
+        mls_state,
+    })
 }
 
 pub(crate) fn group_management_state_ffi(
@@ -360,7 +373,16 @@ pub(crate) fn group_management_state_ffi(
         .find(|member| member.member_id_hex == my_account_id_hex);
     let is_self_admin = self_member.is_some_and(|member| member.is_admin);
     let is_last_admin = is_self_admin && admin_count == 1;
-    let can_invite = is_self_admin;
+    let request_pending = matches!(
+        details.mls_state.disband_request,
+        Some(DisbandRequestFfi::Pending { .. })
+    );
+    let lifecycle_terminal = matches!(
+        details.mls_state.lifecycle_state,
+        GroupLifecycleStateFfi::Disbanded
+    );
+    let ordinary_actions_enabled = !request_pending && !lifecycle_terminal;
+    let can_invite = is_self_admin && ordinary_actions_enabled;
     // A leave already in flight suppresses `can_leave` so hosts do not offer a
     // second Leave that the engine would reject: the durable request is not
     // epoch-bound, but the SelfRemove proposal backing it is, and re-requesting
@@ -369,8 +391,12 @@ pub(crate) fn group_management_state_ffi(
     // the affordance keeps that error off the happy path; it does not prevent it,
     // since this state is not read atomically with the leave it guards.
     let leave_request_pending = details.group.leave_request_pending;
-    let can_leave = self_member.is_some() && !is_self_admin && !leave_request_pending;
-    let requires_self_demote_before_leave = self_member.is_some() && is_self_admin;
+    let can_leave = self_member.is_some()
+        && !is_self_admin
+        && !leave_request_pending
+        && ordinary_actions_enabled;
+    let requires_self_demote_before_leave =
+        self_member.is_some() && is_self_admin && ordinary_actions_enabled;
     let member_actions = details
         .members
         .iter()
@@ -380,9 +406,13 @@ pub(crate) fn group_management_state_ffi(
                 member_id_hex: member.member_id_hex.clone(),
                 is_self: member.is_self,
                 is_admin: member.is_admin,
-                can_remove: is_self_admin && !member.is_self && !would_remove_last_admin,
-                can_promote: is_self_admin && !member.is_admin,
+                can_remove: is_self_admin
+                    && ordinary_actions_enabled
+                    && !member.is_self
+                    && !would_remove_last_admin,
+                can_promote: is_self_admin && ordinary_actions_enabled && !member.is_admin,
                 can_demote: is_self_admin
+                    && ordinary_actions_enabled
                     && member.is_admin
                     && !member.is_self
                     && !would_remove_last_admin,
@@ -398,7 +428,94 @@ pub(crate) fn group_management_state_ffi(
         requires_self_demote_before_leave,
         leave_request_pending,
         leave_requested_at_ms: details.group.leave_requested_at_ms,
+        lifecycle_state: details.mls_state.lifecycle_state,
+        disbanding_enabled: details.mls_state.disbanding_enabled,
+        can_enable_disbanding: is_self_admin
+            && ordinary_actions_enabled
+            && matches!(
+                details.mls_state.lifecycle_state,
+                GroupLifecycleStateFfi::Stable
+            )
+            && !details.mls_state.disbanding_enabled
+            && details.mls_state.disbanding_blockers.is_empty(),
+        can_disband: is_self_admin
+            && ordinary_actions_enabled
+            && matches!(
+                details.mls_state.lifecycle_state,
+                GroupLifecycleStateFfi::Stable
+            )
+            && details.mls_state.disbanding_enabled,
+        disband_blockers: details.mls_state.disbanding_blockers.clone(),
+        disband_request: details.mls_state.disband_request.clone(),
         member_actions,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupLifecycleStateFfi {
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
+
+impl From<AppGroupLifecycleState> for GroupLifecycleStateFfi {
+    fn from(value: AppGroupLifecycleState) -> Self {
+        match value {
+            AppGroupLifecycleState::Stable => Self::Stable,
+            AppGroupLifecycleState::PendingPublish => Self::PendingPublish,
+            AppGroupLifecycleState::Merging => Self::Merging,
+            AppGroupLifecycleState::Recovering => Self::Recovering,
+            AppGroupLifecycleState::Unrecoverable => Self::Unrecoverable,
+            AppGroupLifecycleState::Disbanded => Self::Disbanded,
+        }
+    }
+}
+
+impl From<cgka_traits::GroupLifecycleState> for GroupLifecycleStateFfi {
+    fn from(value: cgka_traits::GroupLifecycleState) -> Self {
+        AppGroupLifecycleState::from(value).into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DisbandFailureReasonFfi {
+    NoLongerAdmin,
+    NoLongerMember,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DisbandRequestFfi {
+    Pending {
+        requested_at_ms: u64,
+    },
+    Failed {
+        requested_at_ms: u64,
+        reason: DisbandFailureReasonFfi,
+    },
+}
+
+impl From<AppDisbandRequest> for DisbandRequestFfi {
+    fn from(value: AppDisbandRequest) -> Self {
+        match value {
+            AppDisbandRequest::Pending { requested_at_ms } => Self::Pending { requested_at_ms },
+            AppDisbandRequest::Failed {
+                requested_at_ms,
+                reason,
+            } => Self::Failed {
+                requested_at_ms,
+                reason: match reason {
+                    AppDisbandFailureReason::NoLongerAdmin => {
+                        DisbandFailureReasonFfi::NoLongerAdmin
+                    }
+                    AppDisbandFailureReason::NoLongerMember => {
+                        DisbandFailureReasonFfi::NoLongerMember
+                    }
+                },
+            },
+        }
     }
 }
 
@@ -408,10 +525,14 @@ pub(crate) fn group_management_state_ffi(
 pub struct AppGroupMlsStateFfi {
     pub group_id_hex: String,
     pub protocol_profile: AppProtocolProfileFfi,
+    pub lifecycle_state: GroupLifecycleStateFfi,
     pub epoch: u64,
     pub member_count: u32,
     pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
+    pub disbanding_enabled: bool,
+    pub disbanding_blockers: Vec<String>,
+    pub disband_request: Option<DisbandRequestFfi>,
 }
 
 impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
@@ -419,10 +540,14 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
         Self {
             group_id_hex: value.group_id_hex,
             protocol_profile: value.protocol_profile.into(),
+            lifecycle_state: value.lifecycle_state.into(),
             epoch: value.epoch,
             member_count: super::saturating_u32(value.member_count),
             unrecoverable: value.unrecoverable,
             required_app_components: value.required_app_components,
+            disbanding_enabled: value.disbanding_enabled,
+            disbanding_blockers: value.disbanding_blockers,
+            disband_request: value.disband_request.map(Into::into),
         }
     }
 }

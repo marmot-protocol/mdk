@@ -68,6 +68,14 @@ pub enum EngineError {
         had: Box<GroupCapabilities>,
     },
 
+    /// One or more current member leaves have not yet advertised lifecycle-v1
+    /// support, so the group cannot atomically require the component.
+    #[error("group disbanding is blocked by unsupported member leaves")]
+    DisbandingUnsupportedMembers {
+        group_id: GroupId,
+        members: Vec<MemberId>,
+    },
+
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an

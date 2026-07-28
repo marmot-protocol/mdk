@@ -81,6 +81,7 @@ pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
 /// Product-facing system row for the `marmot.group.message-retention.v1` app
 /// component changing (the app calls this the disappearing-message timer).
 pub const GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED: &str = "disappearing_timer_changed";
+pub const GROUP_SYSTEM_TYPE_GROUP_DISBANDED: &str = "group_disbanded";
 
 /// Human-readable fallback `text` for kind-1210 group system rows. These strings
 /// feed `content` → `id_preimage` → `canonical_event_id`, so they must stay in
@@ -93,6 +94,7 @@ pub const GROUP_SYSTEM_TEXT_ADMIN_REMOVED: &str = "Admin removed";
 pub const GROUP_SYSTEM_TEXT_GROUP_RENAMED: &str = "Group renamed";
 pub const GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED: &str = "Group avatar changed";
 pub const GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED: &str = "Disappearing timer changed";
+pub const GROUP_SYSTEM_TEXT_GROUP_DISBANDED: &str = "Group disbanded";
 
 /// Keys inside the kind-1210 `data` object. `actor`/`subject` are lowercase-hex
 /// pubkeys, `name` is UTF-8, and retention values are seconds where `0` means
@@ -404,6 +406,15 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             old_retention_seconds: Some(*old_seconds),
             new_retention_seconds: Some(*new_seconds),
             text: GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED,
+        },
+        GroupStateChange::GroupDisbanded => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_GROUP_DISBANDED,
+            subject: None,
+            name: None,
+            old_name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_GROUP_DISBANDED,
         },
     }
 }

@@ -39,7 +39,7 @@ use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, t
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
     AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
@@ -718,9 +718,39 @@ impl AppClient {
 
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
+        let lifecycle_state = self
+            .runtime
+            .epoch_state(group_id)
+            .as_ref()
+            .map(cgka_traits::GroupLifecycleState::from)
+            .map(Into::into)
+            .unwrap_or_else(|| {
+                if group.disbanded.is_some() {
+                    crate::AppGroupLifecycleState::Disbanded
+                } else if group.unrecoverable {
+                    crate::AppGroupLifecycleState::Unrecoverable
+                } else {
+                    crate::AppGroupLifecycleState::Stable
+                }
+            });
+        let disbanding_enabled = group
+            .required_capabilities
+            .app_components
+            .contains(cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID)
+            && group.disbanded.is_none();
+        let disbanding_blockers = if disbanding_enabled || group.disbanded.is_some() {
+            Vec::new()
+        } else {
+            self.runtime
+                .disbanding_support_blockers(group_id)?
+                .into_iter()
+                .map(|member| hex::encode(member.as_slice()))
+                .collect()
+        };
         Ok(AppGroupMlsState {
             group_id_hex: hex::encode(group_id.as_slice()),
             protocol_profile: group.protocol_profile.into(),
+            lifecycle_state,
             epoch: group.epoch.0,
             member_count: group.members.len(),
             unrecoverable: group.unrecoverable,
@@ -731,6 +761,9 @@ impl AppClient {
                 .iter()
                 .copied()
                 .collect(),
+            disbanding_enabled,
+            disbanding_blockers,
+            disband_request: self.runtime.disband_request(group_id)?.map(Into::into),
         })
     }
 
@@ -1024,6 +1057,94 @@ impl AppClient {
             .await
     }
 
+    /// Atomically install lifecycle-v1 and make it required for this group.
+    pub async fn enable_group_disbanding(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "enable_group_disbanding",
+            vec!["lifecycle"],
+            vec![
+                cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+            ],
+            None,
+        );
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::EnableDisbanding {
+                    group_id: group_id.clone(),
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    /// Persist the irreversible request and return without waiting for the
+    /// disband Commit or its mandatory convergence pass.
+    pub async fn disband_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        self.ensure_group(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "disband_group",
+            vec!["lifecycle", "membership", "admins"],
+            vec![
+                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+                cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ],
+            None,
+        );
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::Disband {
+                    group_id: group_id.clone(),
+                },
+                audit_context,
+            )
+            .await?;
+        self.remember_published_reports(&effects);
+        if let Err(error) = self
+            .app
+            .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
+        {
+            // The irreversible engine request is already durable. Treat draft
+            // cleanup like the other repairable post-canonical projections:
+            // report success for the request and reconcile local UI state on
+            // the next account mutation/open rather than inviting a retry.
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "disband_group",
+                error_kind = error.privacy_safe_kind(),
+                "durable disband request outpaced composer draft cleanup"
+            );
+        }
+        self.app.save_state(&self.state)?;
+        self.runtime
+            .disband_request(group_id)?
+            .map(Into::into)
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub fn acknowledge_disband_failure(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.acknowledge_disband_failure(group_id)?)
+    }
+
     /// Delete only this group's app-local data. This intentionally does not send
     /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
     /// future fresh group delivery can recreate the chat-list projection.
@@ -1031,6 +1152,13 @@ impl AppClient {
     /// The live transport route is removed and synced before the DB wipe so the
     /// account stops actively subscribing to the group before local rows vanish.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        if self
+            .runtime
+            .disband_request(group_id)?
+            .is_some_and(|request| request.status == cgka_traits::DisbandRequestStatus::Pending)
+        {
+            return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
+        }
         // A local wipe removes this group's transport route. Any already-durable
         // removal must publish first; retaining it after the route disappears
         // would preserve bytes on disk without preserving liveness.
@@ -2514,6 +2642,16 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
+            if self
+                .runtime
+                .group_record(&group_id)
+                .is_ok_and(|group| group.disbanded.is_some())
+            {
+                if self.routing.replace_group_routes(&group_id, Vec::new()) {
+                    changed = true;
+                }
+                continue;
+            }
             // Retention is epoch-derived, never process-uptime-derived. Do not
             // prune while convergence still has unresolved inputs: the
             // retained anchor is not settled yet, so conservatively keep every
