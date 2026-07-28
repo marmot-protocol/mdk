@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSummary,
+    KeychainSecretStore,
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
@@ -442,6 +443,36 @@ fn account_home_idempotent_import_recovers_orphaned_keychain_credential() {
     assert_eq!(
         home.load_signing_keys("agent").unwrap().public_key(),
         keys.public_key()
+    );
+}
+
+#[test]
+fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let requested_keys = nostr::Keys::generate();
+    let unrelated_keys = nostr::Keys::generate();
+    let account_id = requested_keys.public_key().to_hex();
+    let account = AccountSummary {
+        label: account_id.clone(),
+        account_id_hex: account_id.clone(),
+        local_signing: true,
+        external_signing: false,
+        signed_out: false,
+    };
+    let store =
+        KeychainSecretStore::new(format!("com.marmot.test.runtime-mismatch-{account_id}")).unwrap();
+    store.write_secret(&account, &unrelated_keys).unwrap();
+    let home = AccountHome::open_with_secret_store(dir.path(), Arc::new(store.clone()));
+
+    assert!(matches!(
+        home.import_nostr_account_idempotent(&requested_keys.secret_key().to_secret_hex()),
+        Err(AccountHomeError::AccountIdMismatch)
+    ));
+    assert!(home.accounts().unwrap().is_empty());
+    assert_eq!(
+        store.load_secret(&account).unwrap().public_key(),
+        unrelated_keys.public_key()
     );
 }
 

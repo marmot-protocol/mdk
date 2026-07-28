@@ -11,7 +11,7 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
-use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
+use marmot_account::{AccountHome, AccountHomeError, AccountSummary, NostrAccountImport};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -3518,9 +3518,9 @@ impl AccountManager {
         let imports_private_key = request.identity.as_deref().is_some_and(is_nostr_secret);
         let creates_new_private_key = request.identity.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        let mut account = match request.identity.as_deref() {
+        let (mut account, private_key_import) = match request.identity.as_deref() {
             Some(identity) => match self.signed_out_account_for_identity(identity)? {
-                Some(account) => account,
+                Some(account) => (account, None),
                 None => self.create_nostr_account(request.identity.clone())?,
             },
             None => self.create_nostr_account(None)?,
@@ -3559,7 +3559,11 @@ impl AccountManager {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
                 if rollback_on_setup_failure {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
+                    return self.rollback_import_after_setup_failure(
+                        &account,
+                        private_key_import.as_ref(),
+                        err,
+                    );
                 }
                 return Err(err);
             }
@@ -3574,7 +3578,11 @@ impl AccountManager {
                 Ok(profile) => Some(profile),
                 Err(err) => {
                     if rollback_on_setup_failure {
-                        return self.rollback_account_after_setup_failure(&account.label, err);
+                        return self.rollback_import_after_setup_failure(
+                            &account,
+                            private_key_import.as_ref(),
+                            err,
+                        );
                     }
                     return Err(err);
                 }
@@ -3589,7 +3597,11 @@ impl AccountManager {
                 Ok(bytes) => Some(bytes),
                 Err(err) => {
                     if rollback_on_setup_failure {
-                        return self.rollback_account_after_setup_failure(&account.label, err);
+                        return self.rollback_import_after_setup_failure(
+                            &account,
+                            private_key_import.as_ref(),
+                            err,
+                        );
                     }
                     return Err(err);
                 }
@@ -3967,14 +3979,18 @@ impl AccountManager {
         }
     }
 
-    fn create_nostr_account(&self, identity: Option<String>) -> Result<AccountSummary, AppError> {
+    fn create_nostr_account(
+        &self,
+        identity: Option<String>,
+    ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
         let account_home = self.app.account_home();
         match identity {
             Some(value) if is_nostr_secret(&value) => {
-                Ok(account_home.import_nostr_account(&value)?)
+                let imported = account_home.import_nostr_account_idempotent(&value)?;
+                Ok((imported.account().clone(), Some(imported)))
             }
-            Some(value) => Ok(account_home.add_public_account(&value)?),
-            None => Ok(account_home.create_nostr_account()?),
+            Some(value) => Ok((account_home.add_public_account(&value)?, None)),
+            None => Ok((account_home.create_nostr_account()?, None)),
         }
     }
 
@@ -4013,6 +4029,29 @@ impl AccountManager {
         // inode. See `drop_account_caches` and mdk#220.
         self.app.drop_account_caches(account);
         match self.app.account_home().remove_account(account) {
+            Ok(()) => Err(source),
+            Err(rollback) => Err(AppError::RelayDirectory(format!(
+                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
+            ))),
+        }
+    }
+
+    fn rollback_import_after_setup_failure<T>(
+        &self,
+        account: &AccountSummary,
+        private_key_import: Option<&NostrAccountImport>,
+        source: AppError,
+    ) -> Result<T, AppError> {
+        let Some(imported) = private_key_import else {
+            return self.rollback_account_after_setup_failure(&account.label, source);
+        };
+
+        self.app.drop_account_caches(&account.label);
+        match self
+            .app
+            .account_home()
+            .rollback_nostr_account_import(imported)
+        {
             Ok(()) => Err(source),
             Err(rollback) => Err(AppError::RelayDirectory(format!(
                 "failed to roll back account after setup failure: {source}; rollback error: {rollback}"

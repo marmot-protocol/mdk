@@ -3192,6 +3192,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "image",
+ "keyring-core",
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
@@ -12,9 +12,9 @@ use cgka_traits::app_event::{
     STREAM_TAG,
 };
 use cgka_traits::engine::KeyPackage;
-use marmot_account::AccountHome;
+use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
-    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditDataMode,
+    AccountRelayListBootstrap, AccountSetupRequest, AppError, AppMessageQuery, AuditDataMode,
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
     MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationWakeSource,
@@ -61,6 +61,16 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
             .with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
+}
+
+fn install_mock_keyring() {
+    static KEYRING_INIT: Once = Once::new();
+    KEYRING_INIT.call_once(|| {
+        if keyring_core::get_default_store().is_none() {
+            let store = keyring_core::mock::Store::new().expect("create mock keyring store");
+            keyring_core::set_default_store(store);
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -591,6 +601,185 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
+}
+
+#[tokio::test]
+async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() {
+    use nostr::prelude::ToBech32;
+
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let service_name = format!("com.marmot.test.runtime-orphan-{account_id}");
+    let setup = AccountSetupRequest {
+        identity: Some(secret),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        ..AccountSetupRequest::default()
+    };
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+
+    let first_home = AccountHome::open_with_keychain(dir.path(), service_name.clone()).unwrap();
+    let first_app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![url.clone()],
+        first_home,
+        config.clone(),
+    );
+    let first_runtime = MarmotAppRuntime::new(first_app.clone());
+    let first = first_runtime
+        .create_or_import_account(setup.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.account.account_id_hex, account_id);
+    assert!(matches!(
+        first_runtime
+            .create_or_import_account(setup.clone())
+            .await,
+        Err(AppError::AccountHome(AccountHomeError::AccountExists(
+            duplicate
+        ))) if duplicate == account_id
+    ));
+    first_runtime.shutdown().await;
+    drop(first_runtime);
+    drop(first_app);
+
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+
+    let recovered_home = AccountHome::open_with_keychain(dir.path(), service_name).unwrap();
+    let recovered_app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![url],
+        recovered_home.clone(),
+        config,
+    );
+    let recovered_runtime = MarmotAppRuntime::new(recovered_app.clone());
+    let recovered = recovered_runtime
+        .create_or_import_account(setup)
+        .await
+        .expect("runtime import should recover the matching orphaned Keychain credential");
+
+    assert_eq!(recovered.account.account_id_hex, account_id);
+    assert_eq!(
+        recovered_home.account(&account_id).unwrap(),
+        recovered.account
+    );
+    assert_eq!(
+        recovered_home
+            .load_signing_keys(&account_id)
+            .unwrap()
+            .public_key(),
+        keys.public_key()
+    );
+
+    recovered_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychain_secret() {
+    use nostr::prelude::ToBech32;
+
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let recovered_keys = Keys::generate();
+    let recovered_account_id = recovered_keys.public_key().to_hex();
+    let recovered_secret = recovered_keys.secret_key().to_bech32().unwrap();
+    let recovered_service =
+        format!("com.marmot.test.runtime-rollback-recovered-{recovered_account_id}");
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let successful_setup = AccountSetupRequest {
+        identity: Some(recovered_secret.clone()),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first_home =
+        AccountHome::open_with_keychain(dir.path(), recovered_service.clone()).unwrap();
+    let first_app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![url.clone()],
+        first_home,
+        config.clone(),
+    );
+    let first_runtime = MarmotAppRuntime::new(first_app.clone());
+    first_runtime
+        .create_or_import_account(successful_setup.clone())
+        .await
+        .unwrap();
+    first_runtime.shutdown().await;
+    drop(first_runtime);
+    drop(first_app);
+
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+
+    let recovered_home =
+        AccountHome::open_with_keychain(dir.path(), recovered_service.clone()).unwrap();
+    let recovered_app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec![url.clone()],
+        recovered_home.clone(),
+        config.clone(),
+    );
+    let recovered_runtime = MarmotAppRuntime::new(recovered_app);
+    assert!(matches!(
+        recovered_runtime
+            .create_or_import_account(AccountSetupRequest {
+                identity: Some(recovered_secret),
+                ..AccountSetupRequest::default()
+            })
+            .await,
+        Err(AppError::MissingDefaultRelays)
+    ));
+    assert!(recovered_home.accounts().unwrap().is_empty());
+    assert!(
+        KeychainSecretStore::new(recovered_service)
+            .unwrap()
+            .has_secret_for_account_id(&recovered_account_id)
+            .unwrap(),
+        "rollback must retain the exact Keychain credential that predated setup"
+    );
+
+    let new_keys = Keys::generate();
+    let new_account_id = new_keys.public_key().to_hex();
+    let new_service = format!("com.marmot.test.runtime-rollback-new-{new_account_id}");
+    let new_dir = tempfile::tempdir().unwrap();
+    let new_home = AccountHome::open_with_keychain(new_dir.path(), new_service.clone()).unwrap();
+    let new_app = MarmotApp::with_relays_and_account_home_and_config(
+        new_dir.path(),
+        vec![url],
+        new_home.clone(),
+        config,
+    );
+    let new_runtime = MarmotAppRuntime::new(new_app);
+    assert!(matches!(
+        new_runtime
+            .create_or_import_account(AccountSetupRequest {
+                identity: Some(new_keys.secret_key().to_bech32().unwrap()),
+                ..AccountSetupRequest::default()
+            })
+            .await,
+        Err(AppError::MissingDefaultRelays)
+    ));
+    assert!(new_home.accounts().unwrap().is_empty());
+    assert!(
+        !KeychainSecretStore::new(new_service)
+            .unwrap()
+            .has_secret_for_account_id(&new_account_id)
+            .unwrap(),
+        "rollback must still delete a signing credential created by failed setup"
+    );
+
+    recovered_runtime.shutdown().await;
+    new_runtime.shutdown().await;
 }
 
 #[tokio::test]
