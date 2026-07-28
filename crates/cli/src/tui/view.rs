@@ -1503,6 +1503,15 @@ pub(crate) fn relay_health_lines(data: &RelayHealthData) -> Vec<Line<'static>> {
             data.connection_attempts,
             data.connection_successes,
         )),
+        Line::from(format!(
+            "forwarder: running={} restarts={} lag_incidents={} lagged={} panics={} unexpected_exits={}",
+            data.notification_forwarder_running,
+            data.notification_forwarder_restarts,
+            data.notification_forwarder_lag_incidents,
+            data.notification_forwarder_lagged_notifications,
+            data.notification_forwarder_panics,
+            data.notification_forwarder_unexpected_exits,
+        )),
         Line::from(""),
         Line::from("counters"),
         Line::from(format!(

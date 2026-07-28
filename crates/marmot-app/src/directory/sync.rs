@@ -233,7 +233,7 @@ async fn run_directory_sync_worker(
     relay_plane: MarmotRelayPlane,
     mut commands: mpsc::Receiver<DirectorySyncCommand>,
     mut directory_events: tokio::sync::broadcast::Receiver<
-        crate::relay_plane::DirectoryRelayEventRecord,
+        crate::relay_plane::DirectoryRelayPlaneEvent,
     >,
     rebuild_queued: Arc<AtomicBool>,
 ) {
@@ -243,7 +243,8 @@ async fn run_directory_sync_worker(
                 match command {
                     Some(DirectorySyncCommand::Rebuild { respond }) => {
                         rebuild_queued.store(false, Ordering::SeqCst);
-                        let result = run_directory_sync_once(app.clone(), relay_plane.clone()).await;
+                        let result =
+                            run_directory_sync_once(app.clone(), relay_plane.clone(), false).await;
                         if let Some(respond) = respond {
                             let _ = respond.send(result.map_err(|err| err.to_string()));
                         }
@@ -253,11 +254,23 @@ async fn run_directory_sync_worker(
             }
             event = directory_events.recv() => {
                 match event {
-                    Ok(record) => {
+                    Ok(crate::relay_plane::DirectoryRelayPlaneEvent::Record(record)) => {
                         let app = app.clone();
                         let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if run_directory_sync_once(app.clone(), relay_plane.clone(), true)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                target: "marmot_app::directory",
+                                method = "run_directory_sync_worker",
+                                "directory subscription recovery rebuild failed",
+                            );
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -268,11 +281,12 @@ async fn run_directory_sync_worker(
 async fn run_directory_sync_once(
     app: MarmotApp,
     relay_plane: MarmotRelayPlane,
+    force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, AppError> {
     let plan = blocking_app_task(move || app.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
-        .sync_directory_user_subscriptions(plan)
+        .sync_directory_user_subscriptions(plan, force_rebuild)
         .await
         .map_err(AppError::RelayDirectory)?;
     Ok(DirectorySyncRunSummary {

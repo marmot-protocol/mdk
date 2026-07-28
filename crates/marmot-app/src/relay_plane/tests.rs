@@ -118,11 +118,280 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
     assert_eq!(account_deliveries_read(&deliveries).len(), 1);
 }
 
+#[tokio::test]
+async fn notification_consumer_reports_lag_without_silently_ending() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
+    let (notifications, receiver) = broadcast::channel(1);
+    let _ = notifications.send(RelayPoolNotification::Shutdown);
+    let _ = notifications.send(RelayPoolNotification::Shutdown);
+
+    let outcome = run_relay_notification_consumer(
+        receiver,
+        relay_plane.inner.transport.adapter.clone(),
+        relay_plane.inner.transport.directory_events.clone(),
+        relay_plane.inner.directory.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        outcome.exit,
+        RelayNotificationConsumerExit::Lagged(1),
+        "a broadcast overrun must be an explicit recovery trigger"
+    );
+
+    let resumed = run_relay_notification_consumer(
+        outcome.receiver,
+        relay_plane.inner.transport.adapter.clone(),
+        relay_plane.inner.transport.directory_events.clone(),
+        relay_plane.inner.directory.clone(),
+    )
+    .await;
+    assert_eq!(
+        resumed.exit,
+        RelayNotificationConsumerExit::Shutdown,
+        "the retained notification after the lag must still be consumed"
+    );
+}
+
+#[tokio::test]
+async fn notification_recovery_closes_account_delivery_and_signals_directory_rebuild() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let account_adapter = relay_plane.account_adapter(account, relay.clone());
+    let mut directory_events = relay_plane.subscribe_directory_events();
+
+    recover_relay_notification_forwarder(
+        &relay_plane.inner.transport,
+        RelayNotificationConsumerExit::Lagged(7),
+    );
+
+    assert!(
+        timeout(Duration::from_secs(1), account_adapter.receive())
+            .await
+            .expect("account receiver should close promptly")
+            .expect("closed account receiver is not an adapter error")
+            .is_none(),
+        "closing the producer must drive the account worker into its existing reconnect path"
+    );
+    assert!(matches!(
+        directory_events.recv().await,
+        Ok(DirectoryRelayPlaneEvent::RecoveryRequired)
+    ));
+
+    let health = relay_plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    assert_eq!(health.restarts, 1);
+    assert_eq!(health.lag_incidents, 1);
+    assert_eq!(health.lagged_notifications, 7);
+
+    let message = group_event("outbound-during-recovery", &[0xD4; 32])
+        .to_transport_message()
+        .unwrap();
+    account_adapter
+        .publish(TransportPublishRequest {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            message,
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            },
+            required_acks: 0,
+        })
+        .await
+        .expect("inbound recovery must not take the outbound publisher down");
+}
+
+#[tokio::test]
+async fn managed_account_worker_reopens_transport_after_notification_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(RecordingRelayClient::default());
+    let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let relay_plane = app.relay_plane.clone();
+    let runtime = crate::MarmotAppRuntime::new(app);
+
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let inbox_subscriptions = relay
+                .subscriptions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|subscription| {
+                    matches!(subscription, NostrSubscription::AccountInbox { .. })
+                })
+                .count();
+            if inbox_subscriptions >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the managed account worker should activate its initial inbox subscription");
+
+    recover_relay_notification_forwarder(
+        &relay_plane.inner.transport,
+        RelayNotificationConsumerExit::Lagged(3),
+    );
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let inbox_subscriptions = relay
+                .subscriptions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|subscription| {
+                    matches!(subscription, NostrSubscription::AccountInbox { .. })
+                })
+                .count();
+            if inbox_subscriptions >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("producer death should make the managed account worker reopen and resubscribe");
+
+    runtime.shutdown().await;
+}
+
 #[derive(Default)]
 struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
+}
+
+struct TestNotificationSource {
+    sender: broadcast::Sender<RelayPoolNotification>,
+    subscriptions: AtomicUsize,
+    preload_lag: bool,
+    panic_first: AtomicBool,
+}
+
+impl TestNotificationSource {
+    fn lag_once() -> Self {
+        Self {
+            sender: broadcast::channel(1).0,
+            subscriptions: AtomicUsize::new(0),
+            preload_lag: true,
+            panic_first: AtomicBool::new(false),
+        }
+    }
+
+    fn panic_once() -> Self {
+        Self {
+            sender: broadcast::channel(1).0,
+            subscriptions: AtomicUsize::new(0),
+            preload_lag: false,
+            panic_first: AtomicBool::new(true),
+        }
+    }
+
+    fn send(&self, notification: RelayPoolNotification) {
+        self.sender
+            .send(notification)
+            .expect("test supervisor should have an active notification receiver");
+    }
+}
+
+impl RelayNotificationSource for TestNotificationSource {
+    fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
+        if self.panic_first.swap(false, Ordering::SeqCst) {
+            panic!("injected notification consumer panic");
+        }
+        let receiver = self.sender.subscribe();
+        if self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 && self.preload_lag {
+            let relay_url = RelayUrl::parse("wss://relay.example").unwrap();
+            let notice = || RelayPoolNotification::Message {
+                relay_url: relay_url.clone(),
+                message: RelayMessage::Notice("preloaded notification".into()),
+            };
+            let _ = self.sender.send(notice());
+            let _ = self.sender.send(notice());
+        }
+        receiver
+    }
+
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn notification_supervisor_restarts_after_consumer_panic() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_adapter = relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay);
+    let source = Arc::new(TestNotificationSource::panic_once());
+    let supervisor = spawn_relay_notification_supervisor(
+        source.clone(),
+        relay_plane.inner.transport.clone(),
+        relay_plane.inner.directory.clone(),
+    );
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let health = relay_plane
+                .inner
+                .transport
+                .notification_forwarder_health
+                .snapshot();
+            if health.panics == 1 && source.subscriptions.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a panicked consumer should be observed and replaced");
+
+    assert!(
+        timeout(Duration::from_secs(1), account_adapter.receive())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none(),
+        "panic recovery must propagate producer death to the account receiver"
+    );
+    let recovered = relay_plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    assert!(recovered.running);
+    assert_eq!(recovered.restarts, 1);
+    assert_eq!(recovered.panics, 1);
+    assert_eq!(recovered.unexpected_exits, 1);
+
+    source.send(RelayPoolNotification::Shutdown);
+    timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("normal shutdown should stop the replacement consumer")
+        .unwrap();
+    let stopped = relay_plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    assert!(!stopped.running);
+    assert_eq!(
+        stopped.restarts, 1,
+        "normal shutdown must not be counted as another restart"
+    );
 }
 
 #[async_trait]
@@ -996,6 +1265,177 @@ fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEven
     };
     event.id = event.computed_id();
     event
+}
+
+fn relay_pool_group_notification(
+    id_prefix: &str,
+    transport_group_id: &[u8],
+) -> RelayPoolNotification {
+    use nostr_sdk::prelude::{Alphabet, EventBuilder, Keys, SingleLetterTag, Tag, TagKind};
+
+    let signed = EventBuilder::new(
+        Kind::MlsGroupMessage,
+        format!("encrypted recovery {id_prefix}"),
+    )
+    .tags([Tag::custom(
+        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+        [hex::encode(transport_group_id)],
+    )])
+    .custom_created_at(NostrTimestamp::from_secs(1_700_000_001))
+    .sign_with_keys(&Keys::generate())
+    .expect("sign test group event");
+    RelayPoolNotification::Event {
+        relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+        subscription_id: SubscriptionId::new("group-sub"),
+        event: Box::new(signed),
+    }
+}
+
+#[tokio::test]
+async fn supervised_notification_lag_recovers_later_inbound_exactly_once() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let group_id = GroupId::new(vec![0xC3; 32]);
+    let transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let old_adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    old_adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    let source = Arc::new(TestNotificationSource::lag_once());
+    let supervisor = spawn_relay_notification_supervisor(
+        source.clone(),
+        relay_plane.inner.transport.clone(),
+        relay_plane.inner.directory.clone(),
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while relay_plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .lag_incidents
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the deterministic overrun should trigger recovery");
+    assert!(
+        timeout(Duration::from_secs(1), old_adapter.receive())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none(),
+        "the old account delivery stream must terminate"
+    );
+
+    let outbound = group_event("outbound-still-available", &transport_group_id)
+        .to_transport_message()
+        .unwrap();
+    old_adapter
+        .publish(TransportPublishRequest {
+            account_id: account.clone(),
+            message: outbound,
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 0,
+        })
+        .await
+        .expect("outbound publishing remains available during inbound recovery");
+
+    let recovered_adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    recovered_adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint],
+            }],
+            since: Some(Timestamp(1_699_999_999)),
+        })
+        .await
+        .unwrap();
+    assert!(
+        relay
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|subscription| matches!(
+                subscription,
+                NostrSubscription::Group {
+                    account_id: subscribed_account,
+                    transport_group_id: subscribed_group,
+                    since: Some(Timestamp(1_699_999_999)),
+                    ..
+                } if subscribed_account == &account && subscribed_group == &transport_group_id
+            )),
+        "recovery must reinstall a cursor-bounded group subscription"
+    );
+
+    let replayed_backlog = relay_pool_group_notification("replayed-backlog", &transport_group_id);
+    let expected_message_id = match &replayed_backlog {
+        RelayPoolNotification::Event { event, .. } => {
+            NostrTransportEvent::from_nostr_event(event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap()
+                .id
+        }
+        _ => unreachable!(),
+    };
+    source.send(replayed_backlog);
+    let first_delivery = timeout(Duration::from_secs(1), recovered_adapter.receive())
+        .await
+        .expect("the restarted consumer should deliver later inbound")
+        .unwrap()
+        .unwrap();
+    let mut deliveries = vec![first_delivery];
+    loop {
+        match timeout(Duration::from_millis(50), recovered_adapter.receive()).await {
+            Err(_) => break,
+            Ok(Ok(Some(delivery))) => deliveries.push(delivery),
+            Ok(Ok(None)) => panic!("recovered account delivery stream closed unexpectedly"),
+            Ok(Err(error)) => panic!("recovered account delivery stream failed: {error}"),
+        }
+    }
+    let matching = deliveries
+        .iter()
+        .filter(|delivery| delivery.message.id == expected_message_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the recovered inbound event must be projected exactly once"
+    );
+    assert_eq!(matching[0].account_id, account);
+    assert_eq!(matching[0].group_id_hint, Some(group_id));
+
+    source.send(RelayPoolNotification::Shutdown);
+    timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("supervisor should stop on normal SDK shutdown")
+        .unwrap();
 }
 
 #[test]

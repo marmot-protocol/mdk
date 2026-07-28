@@ -1575,6 +1575,12 @@ pub(crate) struct RelayHealthData {
     pub(crate) disconnected: u64,
     pub(crate) connection_attempts: u64,
     pub(crate) connection_successes: u64,
+    pub(crate) notification_forwarder_running: bool,
+    pub(crate) notification_forwarder_restarts: u64,
+    pub(crate) notification_forwarder_lag_incidents: u64,
+    pub(crate) notification_forwarder_lagged_notifications: u64,
+    pub(crate) notification_forwarder_panics: u64,
+    pub(crate) notification_forwarder_unexpected_exits: u64,
     pub(crate) per_relay: Vec<RelayHealthRow>,
 }
 
@@ -1686,6 +1692,24 @@ pub(crate) fn parse_relay_health(result: &Value, daemon_running: bool) -> RelayH
         disconnected: u64_at(&health, "disconnected"),
         connection_attempts: u64_at(&health, "connection_attempts"),
         connection_successes: u64_at(&health, "connection_successes"),
+        notification_forwarder_running: health
+            .get("notification_forwarder_running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        notification_forwarder_restarts: u64_at(&health, "notification_forwarder_restarts"),
+        notification_forwarder_lag_incidents: u64_at(
+            &health,
+            "notification_forwarder_lag_incidents",
+        ),
+        notification_forwarder_lagged_notifications: u64_at(
+            &health,
+            "notification_forwarder_lagged_notifications",
+        ),
+        notification_forwarder_panics: u64_at(&health, "notification_forwarder_panics"),
+        notification_forwarder_unexpected_exits: u64_at(
+            &health,
+            "notification_forwarder_unexpected_exits",
+        ),
         per_relay,
     }
 }
