@@ -16,11 +16,14 @@ pub struct ChatListQuery {
     pub include_archived: bool,
 }
 
+/// Authoritative device-local order of every currently pinned chat.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatPinState {
+    /// Group ids in normalized zero-based display order.
     pub ordered_group_ids: Vec<String>,
 }
 
+/// Typed validation and persistence failures for local chat pin mutations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatPinError {
     #[error(transparent)]
@@ -154,6 +157,7 @@ pub struct ChatListMessagePreview {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListRow {
     pub group_id_hex: String,
+    /// Whether this row belongs to the device-local manually ordered section.
     pub pinned: bool,
     /// Normalized zero-based position in the pinned section. The stored
     /// ordinal is internal and may contain gaps after an archive-triggered
@@ -241,6 +245,11 @@ impl SqliteAccountStorage {
         chat_list_row_tx(&conn, group_id_hex)
     }
 
+    /// Pin or unpin one unarchived local chat and return the complete
+    /// authoritative pin order after the transaction.
+    ///
+    /// A newly pinned chat is inserted at the top. Repeating the current state
+    /// is idempotent and does not move an existing pin.
     pub fn set_chat_pinned(
         &self,
         group_id_hex: &str,
@@ -281,6 +290,13 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Replace the manual order of the complete current pinned set.
+    ///
+    /// `ordered_group_ids` must contain every currently pinned group exactly
+    /// once. This strict compare-and-set contract deliberately rejects stale
+    /// client orders with [`ChatPinError::InvalidOrder`] instead of silently
+    /// merging them. A client receiving that error should refresh its chat-list
+    /// snapshot and retry from the authoritative pinned set.
     pub fn set_pinned_chat_order(
         &self,
         ordered_group_ids: &[String],
@@ -1400,71 +1416,21 @@ fn read_state_tx(
 
 fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
     let sql = if query.include_archived {
-        "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
-                row.title, row.group_name, row.avatar_url,
-                row.avatar_image_hash_hex, row.avatar_image_key_hex,
-                row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
-                row.avatar_media_type, row.last_message_id_hex,
-                row.last_message_sender, row.last_message_preview,
-                row.last_message_kind, row.last_message_timeline_at,
-                row.last_message_deleted, row.last_message_media_json,
-                row.last_message_delivery_state, row.unread_count,
-                row.manually_marked_unread, row.unread_mention_count,
-                row.first_unread_message_id_hex, row.last_read_message_id_hex,
-                row.last_read_timeline_at, row.conversation_created_at,
-                row.activity_sort_at, row.updated_at, row.self_membership,
-                ag.member_count,
-                mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms,
-                pin.group_id_hex IS NOT NULL,
-                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
-                    SELECT COUNT(*)
-                    FROM chat_pin_positions AS earlier_pin
-                    WHERE earlier_pin.ordinal < pin.ordinal
-                ) END
-         FROM chat_list_rows AS row
-         LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_notification_settings AS mute
-            ON mute.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_pin_positions AS pin
-            ON pin.group_id_hex = row.group_id_hex
-         ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
-                  row.activity_sort_at DESC, row.group_id_hex"
+        format!(
+            "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+             ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                      row.activity_sort_at DESC, row.group_id_hex"
+        )
     } else {
-        "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
-                row.title, row.group_name, row.avatar_url,
-                row.avatar_image_hash_hex, row.avatar_image_key_hex,
-                row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
-                row.avatar_media_type, row.last_message_id_hex,
-                row.last_message_sender, row.last_message_preview,
-                row.last_message_kind, row.last_message_timeline_at,
-                row.last_message_deleted, row.last_message_media_json,
-                row.last_message_delivery_state, row.unread_count,
-                row.manually_marked_unread, row.unread_mention_count,
-                row.first_unread_message_id_hex, row.last_read_message_id_hex,
-                row.last_read_timeline_at, row.conversation_created_at,
-                row.activity_sort_at, row.updated_at, row.self_membership,
-                ag.member_count,
-                mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms,
-                pin.group_id_hex IS NOT NULL,
-                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
-                    SELECT COUNT(*)
-                    FROM chat_pin_positions AS earlier_pin
-                    WHERE earlier_pin.ordinal < pin.ordinal
-                ) END
-         FROM chat_list_rows AS row
-         LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_notification_settings AS mute
-            ON mute.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_pin_positions AS pin
-            ON pin.group_id_hex = row.group_id_hex
-         WHERE row.archived = 0
-         ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
-                  row.activity_sort_at DESC, row.group_id_hex"
+        format!(
+            "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+             WHERE row.archived = 0
+             ORDER BY pin.ordinal IS NULL, pin.ordinal ASC,
+                      row.activity_sort_at DESC, row.group_id_hex"
+        )
     };
     let now_ms = unix_now_ms();
-    let mut stmt = tx.prepare(sql).storage()?;
+    let mut stmt = tx.prepare(&sql).storage()?;
     let mut rows = stmt
         .query_map([], |row| chat_list_row_from_row(row, now_ms))
         .storage()?
@@ -1483,39 +1449,13 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
 
 fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
     let now_ms = unix_now_ms();
-    tx.query_row(
-        "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
-                row.title, row.group_name, row.avatar_url,
-                row.avatar_image_hash_hex, row.avatar_image_key_hex,
-                row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
-                row.avatar_media_type, row.last_message_id_hex,
-                row.last_message_sender, row.last_message_preview,
-                row.last_message_kind, row.last_message_timeline_at,
-                row.last_message_deleted, row.last_message_media_json,
-                row.last_message_delivery_state, row.unread_count,
-                row.manually_marked_unread, row.unread_mention_count,
-                row.first_unread_message_id_hex, row.last_read_message_id_hex,
-                row.last_read_timeline_at, row.conversation_created_at,
-                row.activity_sort_at, row.updated_at, row.self_membership,
-                ag.member_count,
-                mute.group_id_hex IS NOT NULL,
-                mute.muted_until_ms,
-                pin.group_id_hex IS NOT NULL,
-                CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
-                    SELECT COUNT(*)
-                    FROM chat_pin_positions AS earlier_pin
-                    WHERE earlier_pin.ordinal < pin.ordinal
-                ) END
-         FROM chat_list_rows AS row
-         LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_notification_settings AS mute
-            ON mute.group_id_hex = row.group_id_hex
-         LEFT JOIN chat_pin_positions AS pin
-            ON pin.group_id_hex = row.group_id_hex
-         WHERE row.group_id_hex = ?1",
-        params![group_id_hex],
-        |row| chat_list_row_from_row(row, now_ms),
-    )
+    let sql = format!(
+        "{CHAT_LIST_ROW_SELECT_AND_JOINS}
+         WHERE row.group_id_hex = ?1"
+    );
+    tx.query_row(&sql, params![group_id_hex], |row| {
+        chat_list_row_from_row(row, now_ms)
+    })
     .optional()
     .storage()?
     .map(|mut row| {
@@ -1527,6 +1467,38 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
     })
     .transpose()
 }
+
+// Keep this projection in one place: `chat_list_row_from_row` decodes it by
+// index, so list and single-row queries must never drift in column order.
+const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
+    "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
+            row.title, row.group_name, row.avatar_url,
+            row.avatar_image_hash_hex, row.avatar_image_key_hex,
+            row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
+            row.avatar_media_type, row.last_message_id_hex,
+            row.last_message_sender, row.last_message_preview,
+            row.last_message_kind, row.last_message_timeline_at,
+            row.last_message_deleted, row.last_message_media_json,
+            row.last_message_delivery_state, row.unread_count,
+            row.manually_marked_unread, row.unread_mention_count,
+            row.first_unread_message_id_hex, row.last_read_message_id_hex,
+            row.last_read_timeline_at, row.conversation_created_at,
+            row.activity_sort_at, row.updated_at, row.self_membership,
+            ag.member_count,
+            mute.group_id_hex IS NOT NULL,
+            mute.muted_until_ms,
+            pin.group_id_hex IS NOT NULL,
+            CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
+                SELECT COUNT(*)
+                FROM chat_pin_positions AS earlier_pin
+                WHERE earlier_pin.ordinal < pin.ordinal
+            ) END
+     FROM chat_list_rows AS row
+     LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+     LEFT JOIN chat_notification_settings AS mute
+        ON mute.group_id_hex = row.group_id_hex
+     LEFT JOIN chat_pin_positions AS pin
+        ON pin.group_id_hex = row.group_id_hex";
 
 fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Result<ChatListRow> {
     let group_name: String = row.get(4)?;

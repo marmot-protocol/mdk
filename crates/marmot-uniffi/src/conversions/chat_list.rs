@@ -240,8 +240,10 @@ impl From<ChatListRow> for ChatListRowFfi {
     }
 }
 
+/// Authoritative device-local order of every currently pinned chat.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct ChatPinStateFfi {
+    /// Group ids in normalized zero-based display order.
     pub ordered_group_ids: Vec<String>,
 }
 
@@ -289,6 +291,10 @@ pub enum ChatListSubscriptionUpdateFfi {
         trigger: ChatListUpdateTriggerFfi,
         group_id_hex: String,
     },
+    /// Full replacement for the subscribed visible chat list.
+    ///
+    /// Swift and Kotlin hosts must atomically replace their locally held rows
+    /// with `rows` and drop any prior row absent from this value.
     Snapshot {
         trigger: ChatListUpdateTriggerFfi,
         rows: Vec<ChatListRowFfi>,
