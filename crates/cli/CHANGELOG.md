@@ -9,6 +9,45 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-07-28
+
+### Added
+
+- MarmotKit now supports durable, device-local chat pinning. Chat-list rows
+  expose normalized pin state and position, new commands pin, unpin, and
+  transactionally replace the complete pinned order, and chat-list
+  subscriptions publish atomic snapshots when pin order changes.
+- MDK now implements lifecycle-v1 terminal group disbanding. Current-profile
+  groups can durably request and converge on an authenticated disband Commit,
+  transactionally erase live MLS state, retain a terminal tombstone and local
+  history, block later group activity, recover safely after restart, and expose
+  lifecycle, request, support, and management state through MarmotKit.
+- WN Agent inbound delivery now carries structured actor, message, media, reply,
+  edit, delete, and reaction context. Durable mutation events are normalized,
+  deduplicated, privacy-filtered, and delivered through the native OpenClaw and
+  Hermes context surfaces; OpenCode decodes the new schema while intentionally
+  ignoring ambient mutations.
+
+### Changed
+
+- The `marmot.agent-control.v2` inbound schema replaces the former flat message
+  shape. This is the final unversioned wire break: deploy the `0.9.9` WN Agent,
+  Hermes plugin, OpenClaw plugin, and OpenCode harness as one cohort. Future
+  breaking changes require a new protocol label or explicit negotiation.
+- Chat-list consumers must handle the new snapshot and pin-order subscription
+  cases and the required pin fields. Group consumers gain terminal lifecycle
+  and disband-request fields, typed disband errors, and disband commands.
+- The supported integration baselines are now Hermes Agent 0.19.0 and OpenClaw
+  2026.7.1. Release installers validate an existing host but never install or
+  upgrade Hermes or OpenClaw.
+
+### Fixed
+
+- WN Agent now preserves ambient edits, deletes, and reactions that arrive
+  while an agent turn is already in flight, so the bounded context is attached
+  to the next triggering message instead of being lost when the current turn
+  finishes.
+
 ## [0.9.8] - 2026-07-27
 
 ### Added
@@ -959,7 +998,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/marmot-protocol/mdk/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/marmot-protocol/mdk/compare/v0.9.5...v0.9.6

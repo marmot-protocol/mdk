@@ -56,7 +56,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 `0600`, then use a pinned release URL:
 
 ```sh
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.8/install-hermes-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.9/install-hermes-marmot.sh" | \
   bash -s -- \
     --yes \
     --existing-identity-file "$HOME/.config/example/hermes-agent.nsec" \
