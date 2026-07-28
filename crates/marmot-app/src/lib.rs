@@ -1704,6 +1704,8 @@ impl MarmotApp {
         Ok(row)
     }
 
+    /// Pin or unpin one unarchived local chat and return the complete
+    /// authoritative pin order after the transaction.
     pub fn set_chat_pinned(
         &self,
         label: &str,
@@ -1716,6 +1718,9 @@ impl MarmotApp {
             .map_err(chat_pin_error_from_storage)
     }
 
+    /// Atomically replace the order of the current pinned set.
+    ///
+    /// The input must contain every currently pinned group exactly once.
     pub fn set_pinned_chat_order(
         &self,
         label: &str,

@@ -525,6 +525,11 @@ pub enum RuntimeChatListUpdate {
         trigger: ChatListUpdateTrigger,
         group_id_hex: String,
     },
+    /// Full replacement for this subscription's visible chat list.
+    ///
+    /// Consumers must atomically replace their locally held rows with `rows`;
+    /// any previously held row absent from this value has left the subscribed
+    /// list and must be removed.
     Snapshot {
         trigger: ChatListUpdateTrigger,
         rows: Vec<ChatListRow>,

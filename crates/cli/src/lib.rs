@@ -1294,6 +1294,8 @@ mod tests {
         // agrees key-for-key.
         let row: marmot_app::ChatListRow = serde_json::from_value(json!({
             "group_id_hex": "abcd",
+            "pinned": false,
+            "pinned_position": null,
             "archived": false,
             "pending_confirmation": false,
             "title": "General",
@@ -1329,6 +1331,8 @@ mod tests {
             "muted_until_ms": null
         }))
         .expect("valid chat list row");
+        assert!(!row.pinned);
+        assert_eq!(row.pinned_position, None);
 
         let mut value = json!({ "group_id": "abcd" });
         insert_chat_projection(&mut value, Some(row));

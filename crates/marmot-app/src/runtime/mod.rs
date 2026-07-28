@@ -2668,6 +2668,10 @@ impl MarmotAppRuntime {
             .chat_list_row(&account.label, group_id_hex)
     }
 
+    /// Pin or unpin one unarchived chat in an account-device's local store.
+    ///
+    /// Returns the complete authoritative pin order after the transaction and
+    /// publishes an atomic chat-list snapshot to live subscribers.
     pub fn set_chat_pinned(
         &self,
         account_ref: &str,
@@ -2694,6 +2698,10 @@ impl MarmotAppRuntime {
         Ok(state)
     }
 
+    /// Atomically replace an account-device's complete pinned chat order.
+    ///
+    /// The input must contain every currently pinned group exactly once.
+    /// Successful mutations publish an atomic chat-list snapshot.
     pub fn set_pinned_chat_order(
         &self,
         account_ref: &str,

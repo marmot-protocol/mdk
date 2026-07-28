@@ -95,6 +95,16 @@ impl ChatListSubscription {
         take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
+    /// Legacy row-only update stream.
+    ///
+    /// Atomic replacement snapshots are flattened into every visible row in
+    /// authoritative order so existing clients can observe changed pin fields.
+    /// This can yield many rows for one pin or archive operation and cannot
+    /// express the replacement boundary or removals. New clients that need
+    /// correct manual ordering and archive removals should use `next_update`.
+    ///
+    /// `next` and `next_update` consume the same stream and must not be mixed
+    /// for the lifetime of one subscription.
     pub async fn next(&self) -> Option<ChatListRowFfi> {
         let mut state = self.state.lock().await;
         if let Some(row) = state.pending_rows.pop_front() {
@@ -114,6 +124,11 @@ impl ChatListSubscription {
         }
     }
 
+    /// Typed update stream, including atomic full-list replacement snapshots.
+    ///
+    /// Do not mix this with `next` on the same subscription: both consume the
+    /// same underlying stream, while `next` may also hold flattened snapshot
+    /// rows in its compatibility buffer.
     pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi> {
         let mut state = self.state.lock().await;
         state.inner.recv().await.map(Into::into)
