@@ -29,7 +29,7 @@ pub enum AppError {
     UnknownGroup(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
-    #[error("group disbanding is pending; local deletion is blocked")]
+    #[error("group is disbanding or disbanded; outbound work is blocked")]
     GroupDisbanding(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]

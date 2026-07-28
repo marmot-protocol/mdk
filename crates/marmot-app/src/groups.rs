@@ -129,6 +129,19 @@ pub struct AppGroupRecord {
     /// only way a cold launch can rediscover it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leave_requested_at_ms: Option<u64>,
+    /// Whether ordinary outbound work is gated by a local request or an
+    /// authenticated inbound disband candidate awaiting convergence.
+    #[serde(default)]
+    pub disbanding: bool,
+    /// Local disband request outcome, when this account initiated the action.
+    /// `disbanding` can be true with no request when another admin authored the
+    /// candidate being settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disband_request: Option<AppDisbandRequest>,
+    /// Durable terminal projection used by group-state subscribers after the
+    /// request row has been cleared.
+    #[serde(default)]
+    pub disbanded: bool,
     /// The engine has frozen this local group copy because it cannot safely
     /// select canonical state from retained material. Sending and applying
     /// group traffic remain blocked until a verified repair replaces it.
@@ -175,6 +188,10 @@ pub struct AppGroupMlsState {
     pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
     pub disbanding_enabled: bool,
+    /// True while all ordinary outbound group work, including application
+    /// messages, is blocked pending terminal convergence.
+    #[serde(default)]
+    pub disbanding: bool,
     #[serde(default)]
     pub disbanding_blockers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -541,6 +558,9 @@ impl AppGroupRecord {
             member_count: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
+            disbanding: false,
+            disband_request: None,
+            disbanded: false,
             unrecoverable: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
@@ -579,6 +599,7 @@ impl AppGroupRecord {
             record.nostr_routing_last_epoch = group.epoch.0;
             record.member_count = u64::try_from(group.members.len()).ok();
             record.unrecoverable = group.unrecoverable;
+            record.disbanded = group.disbanded.is_some();
         }
         record
     }
@@ -618,6 +639,7 @@ impl AppGroupRecord {
             self.protocol_profile = group.protocol_profile.into();
             self.member_count = u64::try_from(group.members.len()).ok();
             self.unrecoverable = group.unrecoverable;
+            self.disbanded = group.disbanded.is_some();
         }
     }
 

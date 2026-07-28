@@ -2438,6 +2438,19 @@ impl MarmotApp {
                 group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
             }
         }
+        let storage = self.account_storage(label)?;
+        let disbanding = storage.disbanding_group_ids_hex()?;
+        let requests = storage.disband_requests_by_group_hex()?;
+        let disbanded = storage
+            .list_disband_tombstones()?
+            .into_iter()
+            .map(|(group_id, _)| hex::encode(group_id.as_slice()))
+            .collect::<HashSet<_>>();
+        for group in &mut groups {
+            group.disbanding = disbanding.contains(&group.group_id_hex);
+            group.disband_request = requests.get(&group.group_id_hex).cloned().map(Into::into);
+            group.disbanded = disbanded.contains(&group.group_id_hex);
+        }
         Ok(groups)
     }
 

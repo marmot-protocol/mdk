@@ -1,4 +1,7 @@
 use crate::account_projection::chat_mute_is_effective;
+use crate::storage::disband_requests::{
+    disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
+};
 use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
     SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
@@ -170,6 +173,14 @@ pub struct ChatListRow {
     /// terminal Disbanded survives restarts and local history deletion.
     #[serde(default)]
     pub lifecycle_state: cgka_traits::GroupLifecycleState,
+    /// Ordinary outbound group work is gated while a local disband request or
+    /// authenticated inbound disband candidate awaits convergence.
+    #[serde(default)]
+    pub disbanding: bool,
+    /// Local request outcome, when this account initiated disbanding. An
+    /// inbound candidate can set `disbanding` without creating this request.
+    #[serde(default)]
+    pub disband_request: Option<cgka_traits::DisbandRequest>,
     pub title: String,
     pub group_name: String,
     pub avatar_url: Option<String>,
@@ -1453,6 +1464,12 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
             row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
         }
     }
+    let disbanding = disbanding_group_ids_hex_tx(tx)?;
+    let disband_requests = disband_requests_by_group_hex_tx(tx)?;
+    for row in &mut rows {
+        row.disbanding = disbanding.contains(&row.group_id_hex);
+        row.disband_request = disband_requests.get(&row.group_id_hex).cloned();
+    }
     Ok(rows)
 }
 
@@ -1472,6 +1489,10 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         row.leave_requested_at_ms = pending_leave_requests_by_group_hex_tx(tx)?
             .get(&row.group_id_hex)
             .copied();
+        row.disbanding = disbanding_group_ids_hex_tx(tx)?.contains(&row.group_id_hex);
+        row.disband_request = disband_requests_by_group_hex_tx(tx)?
+            .get(&row.group_id_hex)
+            .cloned();
         Ok(row)
     })
     .transpose()
@@ -1581,6 +1602,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
         lifecycle_state,
+        disbanding: false,
+        disband_request: None,
         title: row.get(3)?,
         group_name: group_name.clone(),
         avatar_url,

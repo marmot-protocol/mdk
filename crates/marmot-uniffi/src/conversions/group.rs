@@ -58,6 +58,15 @@ pub struct AppGroupRecordFfi {
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
     pub leave_requested_at_ms: Option<u64>,
+    /// Hide/disable the message composer while this is true. It includes both
+    /// this account's durable request and another admin's authenticated
+    /// terminal candidate awaiting convergence.
+    pub disbanding: bool,
+    /// This account's durable request outcome, if any. Another admin's pending
+    /// candidate can make `disbanding` true while this remains `null`.
+    pub disband_request: Option<DisbandRequestFfi>,
+    /// Hide the composer permanently for this group id when terminal.
+    pub disbanded: bool,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
 }
@@ -100,6 +109,9 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             self_membership: value.self_membership.into(),
             leave_request_pending: value.leave_requested_at_ms.is_some(),
             leave_requested_at_ms: value.leave_requested_at_ms,
+            disbanding: value.disbanding,
+            disband_request: value.disband_request.map(Into::into),
+            disbanded: value.disbanded,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
         }
@@ -263,6 +275,9 @@ pub struct GroupManagementStateFfi {
     pub leave_requested_at_ms: Option<u64>,
     pub lifecycle_state: GroupLifecycleStateFfi,
     pub disbanding_enabled: bool,
+    /// Whether terminal convergence currently blocks all ordinary outbound
+    /// group work. Hosts should hide the message composer while true.
+    pub disbanding: bool,
     pub can_enable_disbanding: bool,
     pub can_disband: bool,
     pub disband_blockers: Vec<String>,
@@ -373,15 +388,11 @@ pub(crate) fn group_management_state_ffi(
         .find(|member| member.member_id_hex == my_account_id_hex);
     let is_self_admin = self_member.is_some_and(|member| member.is_admin);
     let is_last_admin = is_self_admin && admin_count == 1;
-    let request_pending = matches!(
-        details.mls_state.disband_request,
-        Some(DisbandRequestFfi::Pending { .. })
-    );
     let lifecycle_terminal = matches!(
         details.mls_state.lifecycle_state,
         GroupLifecycleStateFfi::Disbanded
     );
-    let ordinary_actions_enabled = !request_pending && !lifecycle_terminal;
+    let ordinary_actions_enabled = !details.mls_state.disbanding && !lifecycle_terminal;
     let can_invite = is_self_admin && ordinary_actions_enabled;
     // A leave already in flight suppresses `can_leave` so hosts do not offer a
     // second Leave that the engine would reject: the durable request is not
@@ -430,6 +441,7 @@ pub(crate) fn group_management_state_ffi(
         leave_requested_at_ms: details.group.leave_requested_at_ms,
         lifecycle_state: details.mls_state.lifecycle_state,
         disbanding_enabled: details.mls_state.disbanding_enabled,
+        disbanding: details.mls_state.disbanding,
         can_enable_disbanding: is_self_admin
             && ordinary_actions_enabled
             && matches!(
@@ -531,6 +543,9 @@ pub struct AppGroupMlsStateFfi {
     pub unrecoverable: bool,
     pub required_app_components: Vec<u16>,
     pub disbanding_enabled: bool,
+    /// True while application messages and all other ordinary outbound group
+    /// work are gated pending terminal convergence.
+    pub disbanding: bool,
     pub disbanding_blockers: Vec<String>,
     pub disband_request: Option<DisbandRequestFfi>,
 }
@@ -546,6 +561,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             unrecoverable: value.unrecoverable,
             required_app_components: value.required_app_components,
             disbanding_enabled: value.disbanding_enabled,
+            disbanding: value.disbanding,
             disbanding_blockers: value.disbanding_blockers,
             disband_request: value.disband_request.map(Into::into),
         }

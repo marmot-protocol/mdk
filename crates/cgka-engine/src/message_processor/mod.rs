@@ -248,7 +248,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        if self.disband_request_pending(&group_id)? || self.disband_candidate_pending(&group_id)? {
+        if self.disbanding_in_progress(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanding",

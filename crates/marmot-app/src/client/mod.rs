@@ -762,6 +762,7 @@ impl AppClient {
                 .copied()
                 .collect(),
             disbanding_enabled,
+            disbanding: self.runtime.disbanding_in_progress(group_id)?,
             disbanding_blockers,
             disband_request: self.runtime.disband_request(group_id)?.map(Into::into),
         })
@@ -1642,7 +1643,7 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `Delete` below, so the audit log records the user's actual intent.
         let audit_context = Self::message_human_action_context(&intent);
@@ -1870,7 +1871,7 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         // Validate every outbound attachment against the group's exact,
         // profile-selected media version and locator policy.
@@ -1904,7 +1905,7 @@ impl AppClient {
         group_id: &GroupId,
         reference: &MediaAttachmentReference,
     ) -> Result<Vec<String>, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         reference.build_imeta_tag(
@@ -1919,7 +1920,7 @@ impl AppClient {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<MediaUploadResult, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // `upload_encrypted_media` always performs Blossom upload semantics and
@@ -2055,7 +2056,7 @@ impl AppClient {
         plaintext: Vec<u8>,
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
+        self.ensure_group_application_messages_allowed(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
             vec!["image"],
@@ -2382,6 +2383,27 @@ impl AppClient {
         } else {
             Err(AppError::UnknownGroup(group_id_hex))
         }
+    }
+
+    /// Fail before optimistic projection, media upload, or any other
+    /// application-message preparation once terminal convergence has gated the
+    /// group. The engine repeats this check at the authoritative mutation
+    /// boundary; this app-layer preflight keeps clients from briefly rendering
+    /// a message that can only be retracted.
+    fn ensure_group_application_messages_allowed(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        let terminal = self
+            .runtime
+            .group_record(group_id)
+            .map(|group| group.disbanded.is_some())
+            .unwrap_or(false);
+        if terminal || self.runtime.disbanding_in_progress(group_id)? {
+            return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
+        }
+        Ok(())
     }
 
     /// Flip a group's local `archived` flag on the worker-owned in-memory

@@ -60,7 +60,7 @@ pub enum MarmotKitError {
         group_id_hex: String,
         member_ids_hex: Vec<String>,
     },
-    #[error("group {group_id_hex} has a pending disband request")]
+    #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {

@@ -201,6 +201,73 @@ fn account_reconcile_returns_local_readiness_before_relay_subscription_registrat
     );
 }
 
+#[test]
+fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
+    run_composed_app_runtime_test(
+        "pending-disband-composer-gate",
+        pending_disband_composer_gate_body,
+    );
+}
+
+async fn pending_disband_composer_gate_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let request = client.disband_group(&group_id).await.unwrap();
+    assert!(matches!(
+        request,
+        AppDisbandRequest::Pending { requested_at_ms: _ }
+    ));
+
+    let mls = client.group_mls_state(&group_id).unwrap();
+    assert!(mls.disbanding);
+    assert!(matches!(
+        mls.disband_request,
+        Some(AppDisbandRequest::Pending { .. })
+    ));
+
+    let group = app.group("alice", &group_id_hex).unwrap().unwrap();
+    assert!(group.disbanding);
+    assert!(!group.disbanded);
+    assert!(matches!(
+        group.disband_request,
+        Some(AppDisbandRequest::Pending { .. })
+    ));
+
+    let row = app
+        .chat_list_row("alice", &group_id_hex)
+        .unwrap()
+        .expect("chat-list row");
+    assert!(row.disbanding);
+    assert!(matches!(
+        row.disband_request,
+        Some(cgka_traits::DisbandRequest {
+            status: cgka_traits::DisbandRequestStatus::Pending,
+            ..
+        })
+    ));
+
+    let mut optimistic_projection_count = 0usize;
+    let error = client
+        .send_with_local_projection(&group_id, b"must not appear", |_| {
+            optimistic_projection_count += 1;
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::GroupDisbanding(_)));
+    assert_eq!(
+        optimistic_projection_count, 0,
+        "composer sends must fail before optimistic timeline projection"
+    );
+}
+
 async fn account_local_ready_before_subscribe_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

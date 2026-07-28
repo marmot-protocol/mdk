@@ -945,6 +945,7 @@ mod tests {
             leave_requested_at_ms: None,
             lifecycle_state: crate::conversions::GroupLifecycleStateFfi::Stable,
             disbanding_enabled: true,
+            disbanding: false,
             can_enable_disbanding: false,
             can_disband: self_admin,
             disband_blockers: vec![],
