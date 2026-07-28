@@ -113,17 +113,19 @@ impl AgentConnector {
                                 group_id_hex.as_deref(),
                             ) {
                                 Ok(event) => event.map(|event| (event, replay_id)),
-                                Err(_err) => {
+                                Err(err) => {
                                     // Hydration reads are best-effort at this live boundary.
                                     // A transient storage failure must not tear down the
                                     // subscription and strand the client outside the adjacent
                                     // lag-recovery path. Signal one undelivered event so the
                                     // consumer reconnects and lets durable replay retry it.
+                                    let error_code =
+                                        ConnectorError::from(err).privacy_safe_code();
                                     tracing::warn!(
                                         target: "agent_connector",
                                         method = "stream_inbound_events",
                                         dropped_events = 1_u64,
-                                        error_code = "projection_failed",
+                                        error_code,
                                         "live inbound projection failed; emitting resync_required"
                                     );
                                     Some((

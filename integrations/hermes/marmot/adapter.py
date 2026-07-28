@@ -2727,6 +2727,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         )
 
     async def _dispatch_inbound_message(self, event: Dict[str, Any]) -> None:
+        detached_ambient: list[str] = []
+        group_id_hex = ""
         try:
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
@@ -2797,7 +2799,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # prepends channel_context to the trigger text as context without it
             # being a trigger itself, so the fact reaches the agent on this turn.
             # Hermes 0.19.0 exposes channel_context as stable user-role context.
-            ambient_context, ambient_count = self._peek_pending_ambient_context(group_id_hex)
+            detached_ambient = self._detach_pending_ambient_context(group_id_hex)
+            ambient_context = (
+                "\n".join(detached_ambient) if detached_ambient else None
+            )
             contexts = [
                 context
                 for context in (
@@ -2809,11 +2814,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if contexts:
                 hermes_event.channel_context = "\n".join(contexts)
             await self.handle_message(hermes_event)
-            if ambient_count:
-                self._consume_pending_ambient_context(group_id_hex, ambient_count)
         except asyncio.CancelledError:
+            self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             raise
         except Exception:
+            self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             # A failed turn in one group must not tear down the dispatcher or the queue; log
             # privacy-safely (no ids/payloads) and let other groups keep flowing.
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
@@ -2987,6 +2992,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._append_pending_ambient_context(group_id_hex, text)
 
     def _append_pending_ambient_context(self, group_id_hex: str, text: str) -> None:
+        self._ensure_pending_ambient_group_capacity(group_id_hex)
+        pending = self._pending_ambient_context.setdefault(group_id_hex, [])
+        if len(pending) >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP:
+            pending.pop(0)
+            logger.warning(
+                "Marmot ambient context limit reached; evicting oldest fact"
+            )
+        pending.append(text)
+
+    def _ensure_pending_ambient_group_capacity(self, group_id_hex: str) -> None:
         if (
             group_id_hex not in self._pending_ambient_context
             and len(self._pending_ambient_context) >= MAX_PENDING_AMBIENT_GROUPS
@@ -2996,36 +3011,29 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.warning(
                 "Marmot ambient context group limit reached; evicting oldest group"
             )
-        pending = self._pending_ambient_context.setdefault(group_id_hex, [])
-        if len(pending) >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP:
-            pending.pop(0)
+
+    def _detach_pending_ambient_context(self, group_id_hex: str) -> list[str]:
+        return self._pending_ambient_context.pop(group_id_hex, [])
+
+    def _restore_pending_ambient_context(
+        self, group_id_hex: str, detached: list[str]
+    ) -> None:
+        if not group_id_hex or not detached:
+            return
+        combined = detached + self._pending_ambient_context.get(group_id_hex, [])
+        overflow = max(0, len(combined) - MAX_PENDING_AMBIENT_EVENTS_PER_GROUP)
+        if overflow:
             logger.warning(
                 "Marmot ambient context limit reached; evicting oldest fact"
             )
-        pending.append(text)
-
-    def _peek_pending_ambient_context(
-        self, group_id_hex: str
-    ) -> Tuple[Optional[str], int]:
-        pending = self._pending_ambient_context.get(group_id_hex)
-        if not pending:
-            return None, 0
-        return "\n".join(pending), len(pending)
-
-    def _consume_pending_ambient_context(self, group_id_hex: str, count: int) -> None:
-        pending = self._pending_ambient_context.get(group_id_hex)
-        if not pending or count <= 0:
-            return
-        del pending[:count]
-        if not pending:
-            self._pending_ambient_context.pop(group_id_hex, None)
+        self._ensure_pending_ambient_group_capacity(group_id_hex)
+        self._pending_ambient_context[group_id_hex] = combined[overflow:]
 
     def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
         # Drain and join the buffered ambient sentences for a group. Returns None
         # when nothing is pending so callers can leave channel_context unset.
-        context, count = self._peek_pending_ambient_context(group_id_hex)
-        self._consume_pending_ambient_context(group_id_hex, count)
-        return context
+        pending = self._detach_pending_ambient_context(group_id_hex)
+        return "\n".join(pending) if pending else None
 
     async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
         await self._maybe_prompt_for_missing_profile(account_id_hex, group_id_hex)

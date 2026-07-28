@@ -242,14 +242,18 @@ export function startMarmotInbound(
     let readyLogged = false;
     const pendingAmbient = new Map<string, MarmotAmbientEvent[]>();
     const ambientKey = (account: string, group: string) => `${account}:${group}`;
-    const appendPendingAmbient = (key: string, event: MarmotAmbientEvent): void => {
-      if (!pendingAmbient.has(key) && pendingAmbient.size >= MAX_PENDING_AMBIENT_GROUPS) {
-        const oldestKey = pendingAmbient.keys().next().value;
-        if (oldestKey !== undefined) {
-          pendingAmbient.delete(oldestKey);
-          api.logger.warn("marmot: ambient context group limit reached; evicting oldest group");
-        }
+    const ensurePendingAmbientGroupCapacity = (key: string): void => {
+      if (pendingAmbient.has(key) || pendingAmbient.size < MAX_PENDING_AMBIENT_GROUPS) {
+        return;
       }
+      const oldestKey = pendingAmbient.keys().next().value;
+      if (oldestKey !== undefined) {
+        pendingAmbient.delete(oldestKey);
+        api.logger.warn("marmot: ambient context group limit reached; evicting oldest group");
+      }
+    };
+    const appendPendingAmbient = (key: string, event: MarmotAmbientEvent): void => {
+      ensurePendingAmbientGroupCapacity(key);
       const pending = pendingAmbient.get(key) ?? [];
       if (pending.length >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP) {
         pending.shift();
@@ -257,6 +261,23 @@ export function startMarmotInbound(
       }
       pending.push(event);
       pendingAmbient.set(key, pending);
+    };
+    const detachPendingAmbient = (key: string): MarmotAmbientEvent[] => {
+      const pending = pendingAmbient.get(key) ?? [];
+      pendingAmbient.delete(key);
+      return pending;
+    };
+    const restorePendingAmbient = (key: string, detached: MarmotAmbientEvent[]): void => {
+      if (detached.length === 0) {
+        return;
+      }
+      const combined = [...detached, ...(pendingAmbient.get(key) ?? [])];
+      const overflow = Math.max(0, combined.length - MAX_PENDING_AMBIENT_EVENTS_PER_GROUP);
+      if (overflow > 0) {
+        api.logger.warn("marmot: ambient context limit reached; evicting oldest fact");
+      }
+      ensurePendingAmbientGroupCapacity(key);
+      pendingAmbient.set(key, combined.slice(overflow));
     };
 
     // Per-group serialization: distinct groups dispatch concurrently while each
@@ -285,24 +306,20 @@ export function startMarmotInbound(
         }
       }
       const key = ambientKey(message.accountIdHex, message.groupIdHex);
-      const pending = pendingAmbient.get(key) ?? [];
-      const pendingCount = pending.length;
-      const ambientContext = [...(message.ambientContext ?? []), ...pending];
+      // Detach atomically before the turn. Ambient facts arriving while the
+      // turn runs now land in a fresh capped batch and cannot be consumed as
+      // part of this turn's older snapshot.
+      const attachedAmbient = detachPendingAmbient(key);
+      const ambientContext = [...(message.ambientContext ?? []), ...attachedAmbient];
       api.logger.info("marmot: inbound message received; dispatching agent turn");
-      const dispatched = await dispatch({ ...message, ambientContext });
-      if (dispatched === false || pendingCount === 0) {
-        return;
-      }
-      // Per-group dispatch is FIFO, but ambient events can still arrive while a
-      // turn is running. Consume only the prefix attached to this successful
-      // turn so newer facts remain for the following turn.
-      const current = pendingAmbient.get(key);
-      if (!current) {
-        return;
-      }
-      current.splice(0, pendingCount);
-      if (current.length === 0) {
-        pendingAmbient.delete(key);
+      try {
+        const dispatched = await dispatch({ ...message, ambientContext });
+        if (dispatched === false) {
+          restorePendingAmbient(key, attachedAmbient);
+        }
+      } catch (error) {
+        restorePendingAmbient(key, attachedAmbient);
+        throw error;
       }
     };
     const runQueued = (message: MarmotInboundMessage): void => {
