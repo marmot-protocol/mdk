@@ -299,6 +299,8 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::Ack => "ack",
         AgentControlResponse::Error { .. } => "error",
         AgentControlResponse::AccountList { .. } => "account_list",
+        AgentControlResponse::TimelineMessage { .. } => "timeline_message",
+        AgentControlResponse::TimelinePage { .. } => "timeline_page",
         AgentControlResponse::AccountCreated { .. } => "account_created",
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",

@@ -265,6 +265,60 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_timeline_reads_write_exact_message_and_cursor_requests(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            if request["type"] == "timeline_message_get":
+                response = {
+                    "type": "timeline_message",
+                    "account_id_hex": request["account_id_hex"],
+                    "group_id_hex": request["group_id_hex"],
+                    "message_id_hex": request["message_id_hex"],
+                    "message": None,
+                }
+            else:
+                response = {
+                    "type": "timeline_page",
+                    "account_id_hex": request["account_id_hex"],
+                    "group_id_hex": request["group_id_hex"],
+                    "messages": [],
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    **response,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        await client.timeline_message_get("11" * 32, "22" * 32, "33" * 32)
+        await client.timeline_list(
+            "11" * 32,
+            "22" * 32,
+            before={"recorded_at": 42, "message_id_hex": "44" * 32},
+            limit=500,
+        )
+
+        self.assertEqual(requests[0]["type"], "timeline_message_get")
+        self.assertEqual(requests[0]["message_id_hex"], "33" * 32)
+        self.assertEqual(requests[1]["type"], "timeline_list")
+        self.assertEqual(
+            requests[1]["before"],
+            {"recorded_at": 42, "message_id_hex": "44" * 32},
+        )
+        self.assertIsNone(requests[1]["after"])
+        self.assertFalse(requests[1]["before_inclusive"])
+        self.assertEqual(requests[1]["limit"], 50)
+
     async def test_stream_begin_includes_parent_message_id_only_when_supplied(self):
         requests = []
 
@@ -3202,6 +3256,34 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 yield wire_event(event)
 
+            async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
+                return {
+                    "type": "timeline_page",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "messages": [
+                        {
+                            "message_id_hex": "88" * 32,
+                            "sender": {
+                                "account_id_hex": "44" * 32,
+                                "display_name": "Alice",
+                                "is_self": False,
+                            },
+                            "direction": "received",
+                            "kind": 9,
+                            "recorded_at": 1_720_999_800,
+                            "observed_at": 1_720_999_801,
+                            "availability": "available",
+                            "text": "earlier question",
+                            "text_truncated": False,
+                            "attachments_truncated": False,
+                            "reactions_truncated": False,
+                        }
+                    ],
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
+
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
 
@@ -3220,6 +3302,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(delivered.reply_to_is_own_message)
         # The internal normalized shape retains the routing id as well.
         self.assertEqual(delivered.raw_message.get("reply_to_message_id_hex"), "99" * 32)
+        self.assertIn('"type":"chat_window"', delivered.channel_context)
+        self.assertIn('"message_id_hex":"' + ("88" * 32) + '"', delivered.channel_context)
+        self.assertIn('"type":"referenced_message"', delivered.channel_context)
+        self.assertIn('"text_excerpt":"earlier answer"', delivered.channel_context)
+        self.assertIn('"display_name":"Hermes Agent"', delivered.channel_context)
 
     async def test_inbound_falls_back_to_marmot_name_without_display_name(self):
         event = {
@@ -4384,6 +4471,82 @@ class ProfilePromptTests(unittest.TestCase):
         action, name, _ = self.adapter_module.parse_profile_name_reply("yes")
         self.assertEqual(action, "affirm")
         self.assertIsNone(name)
+
+
+class PluginRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+
+    def test_register_exposes_marmot_history_as_a_platform_tool(self):
+        class FakeContext:
+            def __init__(self):
+                self.platforms = []
+                self.tools = []
+
+            def register_platform(self, **kwargs):
+                self.platforms.append(kwargs)
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+
+        ctx = FakeContext()
+        self.adapter_module.register(ctx)
+
+        self.assertEqual([platform["name"] for platform in ctx.platforms], ["marmot"])
+        history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
+        self.assertEqual(history["toolset"], "platform")
+        self.assertEqual(history["schema"]["required"], ["group_id_hex"])
+        self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+
+    def test_marmot_history_fetches_one_exact_materialized_message(self):
+        calls = []
+
+        class FakeClient:
+            async def timeline_message_get(
+                self, account_id_hex, group_id_hex, message_id_hex
+            ):
+                calls.append((account_id_hex, group_id_hex, message_id_hex))
+                return {
+                    "type": "timeline_message",
+                    "message_id_hex": message_id_hex,
+                    "message": None,
+                }
+
+        class FakeAdapter:
+            client = FakeClient()
+
+            async def _ensure_account_id(self):
+                return "11" * 32
+
+        class AdapterMap:
+            def get(self, _platform):
+                return FakeAdapter()
+
+        gateway_run = types.ModuleType("gateway.run")
+        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
+            adapters=AdapterMap()
+        )
+        model_tools = types.ModuleType("model_tools")
+        model_tools._run_async = asyncio.run
+        sys.modules["gateway.run"] = gateway_run
+        sys.modules["model_tools"] = model_tools
+
+        try:
+            result = json.loads(
+                self.adapter_module._marmot_history_tool(
+                    {
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                    }
+                )
+            )
+        finally:
+            sys.modules.pop("gateway.run", None)
+            sys.modules.pop("model_tools", None)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["type"], "timeline_message")
+        self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
 
 
 class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):

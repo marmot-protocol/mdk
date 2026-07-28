@@ -42,8 +42,8 @@ use crate::{
     PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
     RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
+    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -93,9 +93,9 @@ pub(crate) use subscriptions::{
 // External items `runtime/tests.rs` reaches through `super::*` that the
 // orchestration core itself no longer references after the split.
 #[cfg(test)]
-use crate::messages::STREAM_ROUTE_QUIC;
+use crate::TimelineMessageChange;
 #[cfg(test)]
-use crate::{TimelineMessageChange, TimelineMessageRecord};
+use crate::messages::STREAM_ROUTE_QUIC;
 #[cfg(test)]
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_ROUTE_TAG, STREAM_TAG,
@@ -2692,6 +2692,18 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .timeline_messages_with_query(&account.label, query)
+    }
+
+    pub fn timeline_message(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<TimelineMessageRecord>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .timeline_message(&account.label, group_id_hex, message_id_hex)
     }
 
     pub fn chat_list(

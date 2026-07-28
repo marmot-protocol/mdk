@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- WN Agent now exposes exact-message and stable cursor-paginated materialized
+  timeline reads. OpenClaw and Hermes attach bounded recent history with durable
+  message ids to inbound turns and provide a `marmot_history` tool for older or
+  exact transcript lookup; complete referenced-message sender and text context
+  is preserved, including self-authored OpenClaw reply targets.
+
 ## [0.9.9] - 2026-07-28
 
 ### Added

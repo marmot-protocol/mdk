@@ -17,6 +17,7 @@ mod quic;
 mod socket;
 mod stream;
 mod stream_session;
+mod timeline;
 mod validation;
 
 #[cfg(test)]

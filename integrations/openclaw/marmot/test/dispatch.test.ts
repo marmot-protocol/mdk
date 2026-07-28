@@ -79,7 +79,7 @@ function emptyCalls(): Calls {
 
 function stubClient(
   calls: Calls,
-  opts: { isDirect?: boolean } = {},
+  opts: { isDirect?: boolean; history?: unknown[] } = {},
 ): MarmotDispatchClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
@@ -94,6 +94,16 @@ function stubClient(
         member_count: opts.isDirect ? 2 : 5,
         is_direct: opts.isDirect ?? false,
         subject: null,
+      };
+    },
+    async timelineList(accountIdHex: string, groupIdHex: string) {
+      return {
+        type: "timeline_page",
+        account_id_hex: accountIdHex,
+        group_id_hex: groupIdHex,
+        messages: opts.history ?? [],
+        has_more_before: false,
+        has_more_after: false,
       };
     },
   } as unknown as MarmotDispatchClient;
@@ -201,7 +211,30 @@ describe("createMarmotInboundDispatcher", () => {
     const dispatch = createMarmotInboundDispatcher({
       cfg: {},
       runtimeChannel,
-      client: stubClient(emptyCalls()) as unknown as MarmotDispatchClient,
+      client: stubClient(emptyCalls(), {
+        history: [
+          {
+            message_id_hex: HEX32("10"),
+            sender: {
+              account_id_hex: HEX32("bb"),
+              display_name: "Alice",
+              is_self: false,
+            },
+            direction: "received",
+            kind: 9,
+            recorded_at: 1_720_999_800,
+            observed_at: 1_720_999_801,
+            availability: "available",
+            text: "earlier question",
+            text_truncated: false,
+            reply_to_message_id_hex: null,
+            attachments: [],
+            attachments_truncated: false,
+            reactions: [],
+            reactions_truncated: false,
+          },
+        ],
+      }) as unknown as MarmotDispatchClient,
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
@@ -254,9 +287,10 @@ describe("createMarmotInboundDispatcher", () => {
       ],
     });
 
-    const context = buildCtxMock.mock.calls.at(-1)?.[0] as {
+    const context = buildCtxMock.mock.calls.at(-1)?.[0] as unknown as {
       timestamp: number;
       reply: { replyToId: string };
+      suppressSelfQuoteBody: boolean;
       supplemental: {
         quote: {
           id: string;
@@ -270,6 +304,7 @@ describe("createMarmotInboundDispatcher", () => {
     };
     expect(context.timestamp).toBe(1_721_000_000_000);
     expect(context.reply.replyToId).toBe(HEX32("11"));
+    expect(context.suppressSelfQuoteBody).toBe(false);
     expect(context.supplemental.quote).toEqual({
       id: HEX32("11"),
       body: "quoted body",
@@ -281,7 +316,23 @@ describe("createMarmotInboundDispatcher", () => {
       expect.objectContaining({
         type: "referenced_message",
         payload: expect.objectContaining({
+          message_id_hex: HEX32("11"),
+          sender: expect.objectContaining({ account_id_hex: HEX32("aa") }),
+          text_excerpt: "quoted body",
           attachments: [{ media_type: "image/png", file_name: "quote.png" }],
+        }),
+      }),
+      expect.objectContaining({
+        type: "chat_window",
+        payload: expect.objectContaining({
+          relation: "before_current_message",
+          messages: [
+            expect.objectContaining({
+              message_id_hex: HEX32("10"),
+              sender: expect.objectContaining({ display_name: "Alice" }),
+              text: "earlier question",
+            }),
+          ],
         }),
       }),
       expect.objectContaining({ type: "reaction_added" }),

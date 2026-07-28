@@ -176,6 +176,57 @@ export interface AgentControlReferencedMessage {
   attachments_truncated: boolean;
 }
 
+export interface AgentControlTimelineCursor {
+  recorded_at: number;
+  message_id_hex: string;
+}
+
+export type AgentControlTimelineMessageAvailability =
+  | "available"
+  | "deleted"
+  | "invalidated";
+
+export interface AgentControlTimelineReaction {
+  reaction_message_id_hex: string;
+  actor: AgentControlActor;
+  emoji: string;
+  reacted_at: number;
+}
+
+export interface AgentControlTimelineMessage {
+  message_id_hex: string;
+  sender: AgentControlActor;
+  direction: string;
+  kind: number;
+  recorded_at: number;
+  observed_at: number;
+  availability: AgentControlTimelineMessageAvailability;
+  text?: string | null;
+  text_truncated: boolean;
+  reply_to_message_id_hex?: string | null;
+  attachments?: AgentControlAttachmentSummary[];
+  attachments_truncated: boolean;
+  reactions?: AgentControlTimelineReaction[];
+  reactions_truncated: boolean;
+}
+
+export interface TimelineMessageResponse {
+  type: "timeline_message";
+  account_id_hex: string;
+  group_id_hex: string;
+  message_id_hex: string;
+  message?: AgentControlTimelineMessage | null;
+}
+
+export interface TimelinePageResponse {
+  type: "timeline_page";
+  account_id_hex: string;
+  group_id_hex: string;
+  messages: AgentControlTimelineMessage[];
+  has_more_before: boolean;
+  has_more_after: boolean;
+}
+
 export interface MediaDownloadedResponse {
   type: "media_downloaded";
   /** Host-local path on the `wn-agent` machine where the plaintext was written. */
@@ -445,6 +496,52 @@ export class MarmotAgentControlClient {
 
   async accountList(): Promise<AccountListResponse> {
     return (await this.request({ type: "account_list" })) as unknown as AccountListResponse;
+  }
+
+  async timelineMessageGet(
+    accountIdHex: string,
+    groupIdHex: string,
+    messageIdHex: string,
+  ): Promise<TimelineMessageResponse> {
+    return (await this.request({
+      type: "timeline_message_get",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      message_id_hex: normalizeHex(messageIdHex, "message_id_hex"),
+    })) as unknown as TimelineMessageResponse;
+  }
+
+  async timelineList(
+    accountIdHex: string,
+    groupIdHex: string,
+    options: {
+      before?: AgentControlTimelineCursor | null;
+      after?: AgentControlTimelineCursor | null;
+      beforeInclusive?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<TimelinePageResponse> {
+    const normalizeCursor = (
+      cursor: AgentControlTimelineCursor | null | undefined,
+    ): AgentControlTimelineCursor | undefined =>
+      cursor
+        ? {
+            recorded_at: Math.max(0, Math.trunc(cursor.recorded_at)),
+            message_id_hex: normalizeHex(cursor.message_id_hex, "timeline cursor message_id_hex"),
+          }
+        : undefined;
+    return (await this.request({
+      type: "timeline_list",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      before: normalizeCursor(options.before),
+      after: normalizeCursor(options.after),
+      before_inclusive: options.beforeInclusive === true,
+      limit:
+        options.limit === undefined
+          ? undefined
+          : Math.max(1, Math.min(50, Math.trunc(options.limit))),
+    })) as unknown as TimelinePageResponse;
   }
 
   async accountLookupProfile(accountIdHex: string): Promise<{

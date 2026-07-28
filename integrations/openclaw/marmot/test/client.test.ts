@@ -28,6 +28,39 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
       });
       break;
+    case "timeline_message_get":
+      send(socket, id, {
+        type: "timeline_message",
+        account_id_hex: req.account_id_hex,
+        group_id_hex: req.group_id_hex,
+        message_id_hex: req.message_id_hex,
+        message: {
+          message_id_hex: req.message_id_hex,
+          sender: { account_id_hex: HEX32("bb"), is_self: false },
+          direction: "received",
+          kind: 9,
+          recorded_at: 10,
+          observed_at: 11,
+          availability: "available",
+          text: "earlier",
+          text_truncated: false,
+          attachments_truncated: false,
+          reactions_truncated: false,
+        },
+      });
+      break;
+    case "timeline_list":
+      send(socket, id, {
+        type: "timeline_page",
+        account_id_hex: req.account_id_hex,
+        group_id_hex: req.group_id_hex,
+        messages: [],
+        has_more_before: true,
+        has_more_after: false,
+        echoed_before: req.before ?? null,
+        echoed_limit: req.limit,
+      });
+      break;
     case "account_profile_lookup":
       send(socket, id, {
         type: "profile_lookup",
@@ -189,6 +222,32 @@ describe("MarmotAgentControlClient", () => {
       status: "profile_found",
       retryable: false,
     });
+  });
+
+  it("fetches one durable timeline message and pages by stable cursor", async () => {
+    const one = await client.timelineMessageGet(
+      HEX32("aa"),
+      HEX32("cc"),
+      HEX32("dd"),
+    );
+    expect(one.message).toMatchObject({
+      message_id_hex: HEX32("dd"),
+      text: "earlier",
+      availability: "available",
+    });
+
+    const page = (await client.timelineList(HEX32("aa"), HEX32("cc"), {
+      before: { recorded_at: 10, message_id_hex: HEX32("dd") },
+      limit: 500,
+    })) as unknown as {
+      echoed_before: { recorded_at: number; message_id_hex: string };
+      echoed_limit: number;
+    };
+    expect(page.echoed_before).toEqual({
+      recorded_at: 10,
+      message_id_hex: HEX32("dd"),
+    });
+    expect(page.echoed_limit).toBe(50);
   });
 
   it("returns durable message ids from send_final", async () => {

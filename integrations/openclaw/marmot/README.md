@@ -11,6 +11,16 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies it to OpenClaw with durable message ids,
+senders, timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context is supplied through both OpenClaw's
+native quote fields and a complete structured referenced-message payload.
+The model-callable `marmot_history` tool can fetch one exact message id or page
+older messages using the returned `(recorded_at, message_id_hex)` cursor.
+History reads are best-effort for turn activation, so a temporary read failure
+does not suppress the new inbound message.
+
 - Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 

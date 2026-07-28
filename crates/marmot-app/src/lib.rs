@@ -1698,6 +1698,18 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.message_timeline(query)?)
     }
 
+    pub fn timeline_message(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<TimelineMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .timeline_message(group_id_hex, message_id_hex)?)
+    }
+
     pub fn chat_list(
         &self,
         label: &str,

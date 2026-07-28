@@ -1652,6 +1652,15 @@ fn timeline_message_target_resolves_single_row_and_reflects_state() {
     assert!(!found.deleted);
     assert!(!found.invalidated);
 
+    let full = store
+        .timeline_message(&"11".repeat(32), "target")
+        .unwrap()
+        .expect("complete target row");
+    assert_eq!(full.message_id_hex, "target");
+    assert_eq!(full.sender, "alice");
+    assert_eq!(full.plaintext, "hello");
+    assert_eq!(full.timeline_at, 1);
+
     // Absent id in the same group → None.
     assert!(
         store

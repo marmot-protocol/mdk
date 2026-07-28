@@ -4,6 +4,15 @@ This directory is a Hermes platform plugin for the local `wn-agent` connector.
 Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
 Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 
+For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
+materialized chat window and supplies Hermes with durable message ids, senders,
+timestamps, reply links, current reaction summaries, and
+delete/invalidation state. Reply context includes both Hermes's native reply
+fields and a complete structured referenced-message payload. The
+model-callable `marmot_history` tool can fetch one exact message id or page older
+messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
+lookup is best-effort and never drops the current inbound message if it fails.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
