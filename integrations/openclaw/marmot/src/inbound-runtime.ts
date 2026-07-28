@@ -51,6 +51,8 @@ export interface InboundPluginApi {
 }
 
 type ClientFactory = (resolved: ResolvedMarmotAccount) => MarmotAgentControlClient;
+const MAX_PENDING_AMBIENT_EVENTS_PER_GROUP = 16;
+const MAX_PENDING_AMBIENT_GROUPS = 256;
 
 function resolveAccount(
   api: InboundPluginApi,
@@ -111,7 +113,9 @@ function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMe
   };
 }
 
-export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
+export type InboundAgentDispatcher = (
+  message: MarmotInboundMessage,
+) => boolean | void | Promise<boolean | void>;
 
 /**
  * A passive ambient event surfaced to the agent as next-turn context (no reply
@@ -238,6 +242,22 @@ export function startMarmotInbound(
     let readyLogged = false;
     const pendingAmbient = new Map<string, MarmotAmbientEvent[]>();
     const ambientKey = (account: string, group: string) => `${account}:${group}`;
+    const appendPendingAmbient = (key: string, event: MarmotAmbientEvent): void => {
+      if (!pendingAmbient.has(key) && pendingAmbient.size >= MAX_PENDING_AMBIENT_GROUPS) {
+        const oldestKey = pendingAmbient.keys().next().value;
+        if (oldestKey !== undefined) {
+          pendingAmbient.delete(oldestKey);
+          api.logger.warn("marmot: ambient context group limit reached; evicting oldest group");
+        }
+      }
+      const pending = pendingAmbient.get(key) ?? [];
+      if (pending.length >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP) {
+        pending.shift();
+        api.logger.warn("marmot: ambient context limit reached; evicting oldest fact");
+      }
+      pending.push(event);
+      pendingAmbient.set(key, pending);
+    };
 
     // Per-group serialization: distinct groups dispatch concurrently while each
     // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
@@ -264,8 +284,26 @@ export function startMarmotInbound(
           return;
         }
       }
+      const key = ambientKey(message.accountIdHex, message.groupIdHex);
+      const pending = pendingAmbient.get(key) ?? [];
+      const pendingCount = pending.length;
+      const ambientContext = [...(message.ambientContext ?? []), ...pending];
       api.logger.info("marmot: inbound message received; dispatching agent turn");
-      await dispatch(message);
+      const dispatched = await dispatch({ ...message, ambientContext });
+      if (dispatched === false || pendingCount === 0) {
+        return;
+      }
+      // Per-group dispatch is FIFO, but ambient events can still arrive while a
+      // turn is running. Consume only the prefix attached to this successful
+      // turn so newer facts remain for the following turn.
+      const current = pendingAmbient.get(key);
+      if (!current) {
+        return;
+      }
+      current.splice(0, pendingCount);
+      if (current.length === 0) {
+        pendingAmbient.delete(key);
+      }
     };
     const runQueued = (message: MarmotInboundMessage): void => {
       dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
@@ -319,10 +357,7 @@ export function startMarmotInbound(
         // MarmotInboundBridge.handle() already ran synchronously before this.
         markMarmotInboundReceived(statusAccountId);
         options.statusSink?.({ lastInboundAt: Date.now() });
-        const key = ambientKey(message.accountIdHex, message.groupIdHex);
-        const ambientContext = pendingAmbient.get(key) ?? [];
-        pendingAmbient.delete(key);
-        submitInbound({ ...message, ambientContext });
+        submitInbound(message);
       },
       onAmbientEvent: (event) => {
         markMarmotInboundReceived(statusAccountId);
@@ -332,9 +367,7 @@ export function startMarmotInbound(
           options.invalidateGroupActivation?.(event.account_id_hex, event.group_id_hex);
         }
         const key = ambientKey(event.account_id_hex, event.group_id_hex);
-        const pending = pendingAmbient.get(key) ?? [];
-        pending.push(event);
-        pendingAmbient.set(key, pending);
+        appendPendingAmbient(key, event);
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {

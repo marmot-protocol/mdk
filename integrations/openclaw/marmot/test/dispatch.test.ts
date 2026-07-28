@@ -599,7 +599,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
 
   /** Dispatch a message and report whether an agent turn ran (the gate let it through). */
   async function runTurn(
-    dispatch: (message: MarmotInboundMessage) => Promise<void>,
+    dispatch: (message: MarmotInboundMessage) => Promise<boolean | void>,
     turns: { count: number },
     message: MarmotInboundMessage,
   ): Promise<boolean> {

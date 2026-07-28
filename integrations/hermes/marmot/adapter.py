@@ -63,6 +63,8 @@ DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
 DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
 DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32
 DEFAULT_AMBIENT_CONTEXT_WINDOW = 2048
+MAX_PENDING_AMBIENT_EVENTS_PER_GROUP = 16
+MAX_PENDING_AMBIENT_GROUPS = 256
 DEFAULT_SENT_TARGET_CACHE_SIZE = 2048
 DEFAULT_GROUP_ACTIVATION: Literal["mention", "always"] = "mention"
 MAX_PROFILE_NAME_CHARS = 80
@@ -335,7 +337,8 @@ def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
     - text: newline-joined, skipping empty parts;
     - ``mentions_self``: OR across the batch (true if ANY message mentions self);
     - ``media``: deduped by ``ciphertext_sha256`` across the batch;
-    - ``reply_to_message_id_hex``: newest non-null value in the batch.
+    - ``reply_to`` / ``reply_to_message_id_hex``: newest rich reply context in
+      the batch, falling back to the newest standalone routing id.
     """
     last = items[-1]
     if len(items) == 1:
@@ -363,14 +366,32 @@ def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
     if media:
         merged["media"] = media
     reply_to = None
+    reply_to_context = None
     for item in reversed(items):
+        candidate_context = item.get("reply_to")
+        if isinstance(candidate_context, dict):
+            reply_to_context = candidate_context
+            reply_to = candidate_context.get("message_id_hex")
+            break
         candidate = item.get("reply_to_message_id_hex")
         if candidate:
             reply_to = candidate
             break
+    if reply_to_context is not None:
+        merged["reply_to"] = reply_to_context
     if reply_to:
         merged["reply_to_message_id_hex"] = reply_to
     return merged
+
+
+def _required_string_field(value: Dict[str, Any], field: str, path: str) -> str:
+    result = value.get(field)
+    if not isinstance(result, str) or not result:
+        raise AgentControlError(
+            f"{path}.{field} must be a non-empty string",
+            code="wrong_protocol",
+        )
+    return result
 
 
 def _normalize_inbound_message_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -379,13 +400,29 @@ def _normalize_inbound_message_event(event: Dict[str, Any]) -> Dict[str, Any]:
     fields are not accepted as a compatibility alias."""
     message = event.get("message")
     if not isinstance(message, dict):
-        raise AgentControlError("inbound_message.message must be an object")
+        raise AgentControlError(
+            "inbound_message.message must be an object",
+            code="wrong_protocol",
+        )
     sender = message.get("sender")
     if not isinstance(sender, dict):
-        raise AgentControlError("inbound_message.message.sender must be an object")
+        raise AgentControlError(
+            "inbound_message.message.sender must be an object",
+            code="wrong_protocol",
+        )
     normalized = dict(event)
-    normalized["message_id_hex"] = message["message_id_hex"]
-    normalized["sender_account_id_hex"] = sender["account_id_hex"]
+    normalized["account_id_hex"] = _required_string_field(
+        event, "account_id_hex", "inbound_message"
+    )
+    normalized["group_id_hex"] = _required_string_field(
+        event, "group_id_hex", "inbound_message"
+    )
+    normalized["message_id_hex"] = _required_string_field(
+        message, "message_id_hex", "inbound_message.message"
+    )
+    normalized["sender_account_id_hex"] = _required_string_field(
+        sender, "account_id_hex", "inbound_message.message.sender"
+    )
     normalized["sender_display_name"] = sender.get("display_name")
     normalized["text"] = str(message.get("text") or "")
     normalized["recorded_at"] = int(message.get("recorded_at") or 0)
@@ -2760,10 +2797,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # prepends channel_context to the trigger text as context without it
             # being a trigger itself, so the fact reaches the agent on this turn.
             # Hermes 0.19.0 exposes channel_context as stable user-role context.
+            ambient_context, ambient_count = self._peek_pending_ambient_context(group_id_hex)
             contexts = [
                 context
                 for context in (
-                    self._take_pending_ambient_context(group_id_hex),
+                    ambient_context,
                     _referenced_channel_context(reply),
                 )
                 if context
@@ -2771,6 +2809,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if contexts:
                 hermes_event.channel_context = "\n".join(contexts)
             await self.handle_message(hermes_event)
+            if ambient_count:
+                self._consume_pending_ambient_context(group_id_hex, ambient_count)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2944,15 +2984,48 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # and prepending it to the NEXT real inbound message's channel_context.
         # If no message ever follows, the fact is only logged — matching
         # OpenClaw's "when omitted, those events are only logged" degraded mode.
-        self._pending_ambient_context.setdefault(group_id_hex, []).append(text)
+        self._append_pending_ambient_context(group_id_hex, text)
+
+    def _append_pending_ambient_context(self, group_id_hex: str, text: str) -> None:
+        if (
+            group_id_hex not in self._pending_ambient_context
+            and len(self._pending_ambient_context) >= MAX_PENDING_AMBIENT_GROUPS
+        ):
+            oldest_group = next(iter(self._pending_ambient_context))
+            self._pending_ambient_context.pop(oldest_group, None)
+            logger.warning(
+                "Marmot ambient context group limit reached; evicting oldest group"
+            )
+        pending = self._pending_ambient_context.setdefault(group_id_hex, [])
+        if len(pending) >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP:
+            pending.pop(0)
+            logger.warning(
+                "Marmot ambient context limit reached; evicting oldest fact"
+            )
+        pending.append(text)
+
+    def _peek_pending_ambient_context(
+        self, group_id_hex: str
+    ) -> Tuple[Optional[str], int]:
+        pending = self._pending_ambient_context.get(group_id_hex)
+        if not pending:
+            return None, 0
+        return "\n".join(pending), len(pending)
+
+    def _consume_pending_ambient_context(self, group_id_hex: str, count: int) -> None:
+        pending = self._pending_ambient_context.get(group_id_hex)
+        if not pending or count <= 0:
+            return
+        del pending[:count]
+        if not pending:
+            self._pending_ambient_context.pop(group_id_hex, None)
 
     def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
         # Drain and join the buffered ambient sentences for a group. Returns None
         # when nothing is pending so callers can leave channel_context unset.
-        pending = self._pending_ambient_context.pop(group_id_hex, None)
-        if not pending:
-            return None
-        return "\n".join(pending)
+        context, count = self._peek_pending_ambient_context(group_id_hex)
+        self._consume_pending_ambient_context(group_id_hex, count)
+        return context
 
     async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
         await self._maybe_prompt_for_missing_profile(account_id_hex, group_id_hex)

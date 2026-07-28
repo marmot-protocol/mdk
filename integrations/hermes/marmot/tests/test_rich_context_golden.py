@@ -20,6 +20,33 @@ class RichContextGoldenTests(unittest.TestCase):
         ]
         self.assertEqual(len(decoded_inbound), 4)
         self.assertTrue(all(event["message_id_hex"] for event in decoded_inbound))
+        available_reply = next(
+            event["reply_to"]
+            for event in events
+            if event["type"] == "inbound_message"
+            and event["reply_to"]["availability"] == "available"
+        )
+        quoted_context = adapter._referenced_channel_context(available_reply)
+        self.assertIn('"type":"quoted_attachments"', quoted_context)
+        self.assertIn('"file_name":"diagram.png"', quoted_context)
+
+        mutations = [
+            event
+            for event in events
+            if event["type"]
+            in {
+                "message_edited",
+                "message_deleted",
+                "reaction_added",
+                "reaction_removed",
+            }
+        ]
+        self.assertEqual(len(mutations), 4)
+        for event in mutations:
+            context = adapter._mutation_channel_context(event)
+            self.assertIn(f'"type":"{event["type"]}"', context)
+            self.assertIn(event["event_id_hex"], context)
+
         deleted = next(event for event in events if event["type"] == "message_deleted")
         self.assertEqual(deleted["target"]["availability"], "deleted")
         self.assertNotIn("text_excerpt", deleted["target"])

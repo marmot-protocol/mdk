@@ -3300,6 +3300,61 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
             {
+                "type": "message_edited",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e1" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "replacement_text": "edited",
+                "recorded_at": 1_721_000_001,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
+            },
+            {
+                "type": "reaction_added",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e2" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "emoji": "👍",
+                "recorded_at": 1_721_000_002,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
+            },
+            {
+                "type": "reaction_removed",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "e3" * 32,
+                "reaction_event_id_hex": "e2" * 32,
+                "target_message_id_hex": "33" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "emoji": "👍",
+                "recorded_at": 1_721_000_003,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "available",
+                },
+            },
+            {
                 "type": "group_state_changed",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
@@ -3326,7 +3381,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await adapter._consume_inbound_once(drain=True)
 
         # Only the real inbound message reached handle_message (one agent turn);
-        # the three ambient events did NOT trigger turns of their own.
+        # the ambient events did NOT trigger turns of their own.
         self.assertEqual(len(adapter.events), 1)
         triggered = adapter.events[0]
         self.assertEqual(triggered.text, "hello there")
@@ -3334,10 +3389,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # event is a normal inbound_message, never an ambient flag.
         self.assertEqual(triggered.raw_message.get("type"), "inbound_message")
         self.assertNotIn("marmot_ambient", triggered.raw_message)
-        # The two distinct ambient facts (deletion deduped to one, rename) are
+        # The distinct ambient facts (deletion deduped to one, mutations, rename) are
         # carried as quiet channel_context on the next inbound turn, in order.
         self.assertIn('"type":"message_deleted"', triggered.channel_context)
         self.assertEqual(triggered.channel_context.count('"type":"message_deleted"'), 1)
+        self.assertIn('"type":"message_edited"', triggered.channel_context)
+        self.assertIn('"type":"reaction_added"', triggered.channel_context)
+        self.assertIn('"type":"reaction_removed"', triggered.channel_context)
         self.assertTrue(
             triggered.channel_context.endswith('The group was renamed to "Crew".')
         )
@@ -3383,6 +3441,53 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         context = adapter._take_pending_ambient_context("22" * 32)
         self.assertIn('"type":"message_deleted"', context)
         self.assertNotIn("plaintext", context)
+
+    async def test_ambient_context_is_bounded_and_survives_failed_turn(self):
+        class FakeClient:
+            pass
+
+        adapter = self._adapter(FakeClient())
+        group_id = "22" * 32
+        for index in range(20):
+            adapter._append_pending_ambient_context(group_id, f"fact-{index}")
+
+        pending, count = adapter._peek_pending_ambient_context(group_id)
+        self.assertEqual(count, 16)
+        self.assertNotIn("fact-3\n", pending)
+        self.assertTrue(pending.startswith("fact-4\n"))
+        self.assertTrue(pending.endswith("fact-19"))
+
+        async def fail_turn(event):
+            raise RuntimeError("synthetic turn failure")
+
+        adapter.handle_message = fail_turn  # type: ignore[assignment]
+        await adapter._dispatch_inbound_message(
+            self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a1" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "hello",
+                        "mentions_self": True,
+                    }
+                )
+            )
+        )
+        retained, retained_count = adapter._peek_pending_ambient_context(group_id)
+        self.assertEqual(retained_count, 16)
+        self.assertEqual(retained, pending)
+
+        for index in range(257):
+            adapter._append_pending_ambient_context(
+                f"{index:064x}",
+                f"group-fact-{index}",
+            )
+        self.assertEqual(len(adapter._pending_ambient_context), 256)
+        self.assertNotIn(f"{0:064x}", adapter._pending_ambient_context)
+        self.assertIn(f"{256:064x}", adapter._pending_ambient_context)
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -4071,7 +4176,20 @@ class CoalesceInboundTests(unittest.TestCase):
                 {
                     "type": "inbound_message",
                     "message_id_hex": "22" * 32,
-                    "reply_to_message_id_hex": "bb" * 32,
+                    "reply_to": {
+                        "message_id_hex": "bb" * 32,
+                        "availability": "available",
+                        "sender": {
+                            "account_id_hex": "44" * 32,
+                            "display_name": "Alice",
+                            "is_self": False,
+                        },
+                        "recorded_at": 123,
+                        "text_excerpt": "rich quoted context",
+                        "text_truncated": False,
+                        "attachments": [],
+                        "attachments_truncated": False,
+                    },
                     "text": "two",
                     "media": [dict(ref)],
                 },
@@ -4079,8 +4197,34 @@ class CoalesceInboundTests(unittest.TestCase):
         )
         self.assertEqual(merged["message_id_hex"], "22" * 32)
         self.assertEqual(merged["reply_to_message_id_hex"], "bb" * 32)
+        self.assertEqual(
+            merged["reply_to"]["text_excerpt"],
+            "rich quoted context",
+        )
         self.assertEqual(merged["text"], "one\ntwo")
         self.assertEqual(len(merged["media"]), 1)
+
+    def test_normalization_rejects_missing_routing_ids_consistently(self):
+        with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+            self.adapter_module._normalize_inbound_message_event(
+                {
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "",
+                    "message": {
+                        "message_id_hex": "22" * 32,
+                        "sender": {
+                            "account_id_hex": "44" * 32,
+                            "is_self": False,
+                        },
+                        "text": "hello",
+                        "recorded_at": 1,
+                        "media": [],
+                    },
+                    "mentions_self": False,
+                }
+            )
+        self.assertEqual(raised.exception.code, "wrong_protocol")
 
 
 class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):

@@ -10,10 +10,10 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, STREAM_PARENT_TAG, STREAM_TAG,
+    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, STREAM_PARENT_TAG,
+    STREAM_TAG,
 };
 use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::{EpochId, GroupId, MessageId};
@@ -34,7 +34,8 @@ use tokio::time::{Duration, sleep, timeout};
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
-    control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
+    control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
+    media_refs_from_tags, message_mentions_account, reply_target_from_tags, resync_required_event,
     runtime_replay_dedup_key,
 };
 use crate::{
@@ -225,75 +226,39 @@ fn received_message(
     }
 }
 
-#[test]
-fn control_event_forwards_only_chat_inner_events_as_inbound_messages() {
+#[tokio::test]
+async fn control_event_requires_a_durable_row_for_received_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("agent")
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     let agent_account_id_hex = "aa".repeat(32);
-    let non_conversational = [
-        (MARMOT_APP_EVENT_KIND_DELETE, ""),
-        (MARMOT_APP_EVENT_KIND_REACTION, "+"),
-        (MARMOT_APP_EVENT_KIND_EDIT, "edited text"),
-        (MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, "thinking"),
-        (MARMOT_APP_EVENT_KIND_AGENT_OPERATION, "tool running"),
-        (MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, "member added"),
-    ];
-
-    for (kind, plaintext) in non_conversational {
+    for kind in [
+        MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_EDIT,
+    ] {
         let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
             account_id_hex: agent_account_id_hex.clone(),
             account_label: "agent".to_owned(),
-            message: received_message(kind, plaintext, Vec::new()),
+            message: received_message(kind, "untrusted live plaintext", Vec::new()),
         });
 
         assert_eq!(
-            control_event_from_runtime_event(event, None, None),
+            control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap(),
             None,
-            "kind {kind} must not be forwarded to Hermes as a prompt"
+            "kind {kind} without a durable row must not fall back to live plaintext"
         );
     }
-
-    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-        account_id_hex: agent_account_id_hex,
-        account_label: "agent".to_owned(),
-        message: received_message(
-            MARMOT_APP_EVENT_KIND_CHAT,
-            "hello agent",
-            vec![vec![
-                "imeta".to_owned(),
-                "url https://example.invalid/a.png".to_owned(),
-            ]],
-        ),
-    });
-
-    let Some(AgentControlEvent::InboundMessage { message, .. }) =
-        control_event_from_runtime_event(event, None, None)
-    else {
-        panic!("expected kind-9 chat event to become an inbound message");
-    };
-    assert_eq!(message.text, "hello agent");
+    runtime.shutdown().await;
 }
 
-#[test]
-fn control_event_does_not_project_unhydrated_kind5_deletion() {
-    let agent_account_id_hex = "aa".repeat(32);
-    let target = "99".repeat(32);
-    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-        account_id_hex: agent_account_id_hex.clone(),
-        account_label: "agent".to_owned(),
-        message: received_message(
-            MARMOT_APP_EVENT_KIND_DELETE,
-            "",
-            vec![vec!["e".to_owned(), target.clone()]],
-        ),
-    });
-
-    assert!(
-        control_event_from_runtime_event(event, None, None).is_none(),
-        "a delete must be classified against durable target state"
-    );
-}
-
-#[test]
-fn control_event_projects_group_rename_as_group_state_changed() {
+#[tokio::test]
+async fn control_event_projects_group_rename_as_group_state_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     // A GroupRenamed change projects to a coarse `group_renamed` control event
     // carrying the new group display name in `detail`. Privacy: member/admin
     // changes carry NO detail (the subject member's pubkey is never surfaced).
@@ -318,7 +283,7 @@ fn control_event_projects_group_rename_as_group_state_changed() {
         group_id_hex,
         change,
         detail,
-    }) = control_event_from_runtime_event(event, None, None)
+    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
     else {
         panic!("expected a group state change to project to GroupStateChanged");
     };
@@ -326,10 +291,13 @@ fn control_event_projects_group_rename_as_group_state_changed() {
     assert_eq!(group_id_hex, "22".repeat(32));
     assert_eq!(change, "group_renamed");
     assert_eq!(detail, Some("Team".to_owned()));
+    runtime.shutdown().await;
 }
 
-#[test]
-fn control_event_group_state_change_member_add_carries_no_member_detail() {
+#[tokio::test]
+async fn control_event_group_state_change_member_add_carries_no_member_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     // A member add must NOT surface the subject member's pubkey: the projection
     // collapses to a coarse change kind with `detail == None`.
     let agent_account_id_hex = "aa".repeat(32);
@@ -347,12 +315,13 @@ fn control_event_group_state_change_member_add_carries_no_member_detail() {
     });
 
     let Some(AgentControlEvent::GroupStateChanged { change, detail, .. }) =
-        control_event_from_runtime_event(event, None, None)
+        control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
     else {
         panic!("expected a member add to project to GroupStateChanged");
     };
     assert_eq!(change, "member_added");
     assert_eq!(detail, None, "member pubkey must never be surfaced");
+    runtime.shutdown().await;
 }
 
 #[test]
@@ -360,7 +329,6 @@ fn control_event_projects_imeta_tag_into_inbound_media_ref() {
     // A kind-9 chat carrying a structurally valid `imeta` tag must project a
     // single media reference onto the InboundMessage (the non-secret mirror: no
     // content key, just fetch + authentication metadata for download_media).
-    let agent_account_id_hex = "aa".repeat(32);
     // A blossom-v1 locator URL MUST carry the ciphertext hash so the fetched blob
     // matches the reference; the parser enforces this binding.
     let ciphertext_sha256 = "cd".repeat(32);
@@ -377,23 +345,9 @@ fn control_event_projects_imeta_tag_into_inbound_media_ref() {
         "m image/png".to_owned(),
         "filename a.png".to_owned(),
     ];
-    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-        account_id_hex: agent_account_id_hex,
-        account_label: "agent".to_owned(),
-        message: received_message(MARMOT_APP_EVENT_KIND_CHAT, "see this", vec![imeta]),
-    });
-
-    let Some(AgentControlEvent::InboundMessage { message, .. }) =
-        control_event_from_runtime_event(event, None, None)
-    else {
-        panic!("expected kind-9 chat event to become an inbound message");
-    };
-    assert_eq!(
-        message.media.len(),
-        1,
-        "one imeta tag should project one media ref"
-    );
-    let attachment = &message.media[0];
+    let media = media_refs_from_tags(&[imeta], 7);
+    assert_eq!(media.len(), 1, "one imeta tag should project one media ref");
+    let attachment = &media[0];
     assert_eq!(attachment.media_type, "image/png");
     assert_eq!(attachment.file_name, "a.png");
     assert_eq!(attachment.ciphertext_sha256, ciphertext_sha256);
@@ -403,8 +357,10 @@ fn control_event_projects_imeta_tag_into_inbound_media_ref() {
     assert_eq!(attachment.locators[0].value, locator_url);
 }
 
-#[test]
-fn control_event_emits_stream_update_for_agent_stream_started() {
+#[tokio::test]
+async fn control_event_emits_stream_update_for_agent_stream_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     let agent_account_id_hex = "aa".repeat(32);
     let stream_id_hex = "55".repeat(32);
     let event = MarmotAppEvent::AgentStreamStarted(RuntimeAgentStreamMessage {
@@ -422,7 +378,7 @@ fn control_event_emits_stream_update_for_agent_stream_started() {
         group_id_hex,
         stream_id_hex: event_stream_id_hex,
         status,
-    }) = control_event_from_runtime_event(event, None, None)
+    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
     else {
         panic!("expected agent stream start to become a stream update");
     };
@@ -431,6 +387,7 @@ fn control_event_emits_stream_update_for_agent_stream_started() {
     assert_eq!(group_id_hex, "22".repeat(32));
     assert_eq!(event_stream_id_hex, stream_id_hex);
     assert_eq!(status, AGENT_CONTROL_STREAM_STATUS_STARTED);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -3424,14 +3381,24 @@ fn received_chat_record(
     }
 }
 
-#[test]
-fn inbound_message_event_from_record_projects_received_chat() {
+#[tokio::test]
+async fn inbound_message_event_from_record_projects_received_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     // Regression for mdk#210: a missed inbound chat recovered from storage must
     // project into exactly the same InboundMessage event the live path emits, so the
     // consumer's existing handler delivers it to the agent.
     let record = received_chat_record("aa", "bb", "cc", "hello agent");
-    let event =
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let event = inbound_message_event_from_record_with_runtime(
+        &runtime,
+        "acct",
+        "acct",
+        record,
+        Some("acct"),
+        Some("bb"),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
         event,
         AgentControlEvent::InboundMessage {
@@ -3452,25 +3419,13 @@ fn inbound_message_event_from_record_projects_received_chat() {
             reply_to: None,
         }
     );
+    runtime.shutdown().await;
 }
 
-#[test]
-fn inbound_message_event_from_record_projects_received_delete() {
-    // Regression for mdk#505: storage replay must surface a missed inbound kind-5
-    // deletion the same way the live MessageReceived path does.
-    let target = "99".repeat(32);
-    let mut record = received_chat_record("dd", "bb", "cc", "");
-    record.kind = MARMOT_APP_EVENT_KIND_DELETE;
-    record.tags = vec![vec!["e".to_owned(), target.clone()]];
-
-    assert!(
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).is_none(),
-        "a replayed delete must be hydrated against durable target state"
-    );
-}
-
-#[test]
-fn inbound_message_event_from_record_projects_group_system_row() {
+#[tokio::test]
+async fn inbound_message_event_from_record_projects_group_system_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
     // Regression for mdk#505: durable kind-1210 group-system rows synthesized from
     // GroupStateChanged events must replay as group_state_changed control events after lag.
     let content = cgka_traits::app_event::GroupSystemEvent::new(
@@ -3488,8 +3443,16 @@ fn inbound_message_event_from_record_projects_group_system_row() {
     record.direction = "system".to_owned();
     record.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
 
-    let event =
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let event = inbound_message_event_from_record_with_runtime(
+        &runtime,
+        "acct",
+        "acct",
+        record,
+        Some("acct"),
+        Some("bb"),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
         event,
         AgentControlEvent::GroupStateChanged {
@@ -3499,6 +3462,7 @@ fn inbound_message_event_from_record_projects_group_system_row() {
             detail: Some("Team".to_owned()),
         }
     );
+    runtime.shutdown().await;
 }
 
 #[test]
@@ -3550,24 +3514,16 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
     let parent_msg_id = "bb".repeat(32);
-    let mut record = received_chat_record("aa", "bb", "cc", "hey there");
-    record.tags = vec![
+    let tags = vec![
         vec!["p".to_owned(), "acct".to_owned()],
         vec!["e".to_owned(), parent_msg_id.clone()],
     ];
-    let event =
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
-    let AgentControlEvent::InboundMessage {
-        mentions_self,
-        reply_to,
-        ..
-    } = event
-    else {
-        panic!("expected inbound message event");
-    };
-    assert!(mentions_self, "p-tag for the account should mark a mention");
+    assert!(
+        message_mentions_account(&tags, "hey there", "acct"),
+        "p-tag for the account should mark a mention"
+    );
     assert_eq!(
-        reply_to.as_ref().map(|reply| reply.message_id_hex.as_str()),
+        reply_target_from_tags(&tags).as_deref(),
         Some(parent_msg_id.as_str())
     );
 }
@@ -3576,13 +3532,10 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
 fn inbound_message_event_detects_inline_nostr_mention() {
     // Marmot clients address a member with an inline `nostr:<pubkey-hex>` token
     // (no p-tag), and the account id IS the pubkey hex.
-    let record = received_chat_record("aa", "bb", "cc", "hey nostr:acct can you help?");
-    let event =
-        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
-    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
-        panic!("expected inbound message event");
-    };
-    assert!(mentions_self, "inline nostr:<pubkey> should mark a mention");
+    assert!(
+        message_mentions_account(&[], "hey nostr:acct can you help?", "acct"),
+        "inline nostr:<pubkey> should mark a mention"
+    );
 }
 
 #[test]
@@ -3604,24 +3557,14 @@ fn inbound_message_event_detects_npub_bech32_mention() {
     let account = "aa".repeat(32);
     let npub = marmot_app::npub_for_account_id(&account).unwrap();
     let text = format!("hey nostr:{npub} can you help?");
-    let record = received_chat_record("11", "bb", "cc", &text);
-    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
-    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
-        panic!("expected inbound message event");
-    };
     assert!(
-        mentions_self,
+        message_mentions_account(&[], &text, &account),
         "inline nostr:<npub> bech32 mention should be detected"
     );
 }
 
 fn inbound_message_mentions_self_for_text(account: &str, text: &str) -> bool {
-    let record = received_chat_record("11", "bb", "cc", text);
-    let event = inbound_message_event_from_record(account, record, None, Some("bb")).unwrap();
-    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
-        panic!("expected inbound message event");
-    };
-    mentions_self
+    message_mentions_account(&[], text, account)
 }
 
 #[test]
@@ -3773,14 +3716,12 @@ fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     // The p-tag is authoritative: a mention with only the structured tag (no
     // inline nostr: reference in the body) is still detected.
     let account = "aa".repeat(32);
-    let mut record = received_chat_record("11", "bb", "cc", "please take a look");
-    record.tags = vec![vec!["p".to_owned(), account.clone()]];
-    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
-    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
-        panic!("expected inbound message event");
-    };
     assert!(
-        mentions_self,
+        message_mentions_account(
+            &[vec!["p".to_owned(), account.clone()]],
+            "please take a look",
+            &account,
+        ),
         "p-tag mention should be detected without inline text"
     );
 }
@@ -3811,33 +3752,45 @@ fn safe_media_filename_strips_path_traversal() {
     assert_eq!(safe_media_filename(""), "media");
 }
 
-#[test]
-fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
+#[tokio::test]
+async fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    let project = |record, account_filter, group_filter| {
+        inbound_message_event_from_record_with_runtime(
+            &runtime,
+            "acct",
+            "acct",
+            record,
+            account_filter,
+            group_filter,
+        )
+        .unwrap()
+    };
     // Outbound (own) messages are never re-delivered as inbound.
     let mut own = received_chat_record("aa", "bb", "acct", "mine");
     own.direction = "sent".to_owned();
-    assert!(inbound_message_event_from_record("acct", own, None, None).is_none());
+    assert!(project(own, None, None).is_none());
 
     // A received message authored by the subscribed account itself is skipped (mirrors live).
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
-    assert!(inbound_message_event_from_record("acct", self_authored, None, None).is_none());
+    assert!(project(self_authored, None, None).is_none());
 
     // Agent stream markers are not part of the inbound durable-event feed.
     let mut stream_start = received_chat_record("aa", "bb", "cc", "+1");
     stream_start.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
-    assert!(inbound_message_event_from_record("acct", stream_start, None, None).is_none());
+    assert!(project(stream_start, None, None).is_none());
 
     // A group-system row that was received as an app message, rather than synthesized locally,
     // is not treated as a durable GroupStateChanged replay event.
     let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
     received_system.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
-    assert!(inbound_message_event_from_record("acct", received_system, None, None).is_none());
+    assert!(project(received_system, None, None).is_none());
 
     // A mismatched group filter excludes the message.
     let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
-    assert!(
-        inbound_message_event_from_record("acct", other_group, Some("acct"), Some("zz")).is_none()
-    );
+    assert!(project(other_group, Some("acct"), Some("zz")).is_none());
+    runtime.shutdown().await;
 }
 
 #[test]
@@ -3908,7 +3861,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     // Deliver a real inbound message into storage via a normal send + catch-up.
     connector.runtime.catch_up_accounts().await.unwrap();
-    let _ = connector
+    let sent = connector
         .send_final_response(
             &human.account.account_id_hex,
             &group_id_hex,
@@ -3918,6 +3871,13 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .await
         .unwrap();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent
+    else {
+        panic!("expected final send");
+    };
+    let target_message_id_hex = message_ids_hex[0].clone();
     // Let the agent account observe the message so it lands in its storage projection.
     for _ in 0..40 {
         connector.runtime.catch_up_accounts().await.unwrap();
@@ -3963,7 +3923,108 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         "replay should recover the missed inbound message, got {recovered:?}"
     );
 
-    // Second replay must not re-deliver the same message (cursor dedup).
+    // Exercise every durable mutation through the same production projection
+    // used by live delivery and replay.
+    connector
+        .runtime
+        .edit_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "edited while lagging",
+        )
+        .await
+        .unwrap();
+    let reaction = connector
+        .runtime
+        .react_to_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "👍",
+        )
+        .await
+        .unwrap();
+    let expected_reaction_event_id_hex = reaction.message_ids[0].clone();
+    connector
+        .runtime
+        .unreact_from_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                &agent.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if stored.iter().any(|message| {
+            message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                && message
+                    .tags
+                    .iter()
+                    .any(|tag| tag.get(1) == Some(&expected_reaction_event_id_hex))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mutation_replay = connector
+        .replay_missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut delivered,
+        )
+        .unwrap();
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: target,
+                replacement_text,
+                ..
+            } if target == &target_message_id_hex && replacement_text == "edited while lagging"
+        )),
+        "accepted edit must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionAdded {
+                target_message_id_hex: target,
+                emoji,
+                ..
+            } if target == &target_message_id_hex && emoji == "👍"
+        )),
+        "accepted reaction must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionRemoved {
+                target_message_id_hex: target,
+                reaction_event_id_hex,
+                emoji,
+                ..
+            } if target == &target_message_id_hex
+                && reaction_event_id_hex == &expected_reaction_event_id_hex
+                && emoji == "👍"
+        )),
+        "accepted reaction removal must replay through the production projector: {mutation_replay:?}"
+    );
+
+    // A subsequent replay must not re-deliver either the message or mutations.
     let replayed_again = connector
         .replay_missed_inbound(
             Some(&agent.account.account_id_hex),
@@ -3972,11 +4033,109 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         )
         .unwrap();
     assert!(
-        !replayed_again.iter().any(|event| matches!(
+        replayed_again.is_empty(),
+        "subsequent replay must not duplicate delivered durable events: {replayed_again:?}"
+    );
+
+    // Raw modifiers that the materialized timeline rejects must also stay out
+    // of the agent feed. Send them as valid MLS application messages to bypass
+    // the local convenience APIs' authorship checks.
+    let forged_edit = MarmotInnerEvent::new(
+        agent.account.account_id_hex.clone(),
+        1_785_200_100,
+        MARMOT_APP_EVENT_KIND_EDIT,
+        vec![vec!["e".to_owned(), target_message_id_hex.clone()]],
+        "forged replacement",
+    )
+    .encode()
+    .unwrap();
+    connector
+        .runtime
+        .send_message(&agent.account.account_id_hex, &group_id, forged_edit)
+        .await
+        .unwrap();
+
+    let retained_reaction = connector
+        .runtime
+        .react_to_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "🔥",
+        )
+        .await
+        .unwrap();
+    let retained_reaction_id_hex = retained_reaction.message_ids[0].clone();
+    let forged_reaction_removal = MarmotInnerEvent::new(
+        agent.account.account_id_hex.clone(),
+        1_785_200_101,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".to_owned(), retained_reaction_id_hex.clone()]],
+        "",
+    )
+    .encode()
+    .unwrap();
+    connector
+        .runtime
+        .send_message(
+            &agent.account.account_id_hex,
+            &group_id,
+            forged_reaction_removal,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                &human.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if stored.iter().any(|message| {
+            message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                && message
+                    .tags
+                    .iter()
+                    .any(|tag| tag.get(1) == Some(&retained_reaction_id_hex))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+    let rejected = connector
+        .replay_missed_inbound(
+            Some(&human.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut human_delivered,
+        )
+        .unwrap();
+    assert!(
+        !rejected.iter().any(|event| matches!(
             event,
-            AgentControlEvent::InboundMessage { message, .. } if message.text == "missed while lagging"
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: projected_target,
+                ..
+            } if projected_target == &target_message_id_hex
         )),
-        "second replay must not duplicate an already-delivered message"
+        "wrong-author edit must not enter the agent feed: {rejected:?}"
+    );
+    assert!(
+        !rejected.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionRemoved {
+                reaction_event_id_hex,
+                ..
+            } if reaction_event_id_hex == &retained_reaction_id_hex
+        )),
+        "wrong-author reaction removal must not enter the agent feed: {rejected:?}"
     );
 }
 
