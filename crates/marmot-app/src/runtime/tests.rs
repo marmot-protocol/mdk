@@ -1098,6 +1098,8 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
             recorded_at: 0,
             received_at: 0,
             insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
         }],
         Some(&stream_id_hex.to_uppercase()),
     )
@@ -1156,6 +1158,8 @@ fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMes
         recorded_at: 11,
         received_at: 12,
         insert_order: 0,
+        invalidated: false,
+        moderation_grant: false,
     }
 }
 

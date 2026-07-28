@@ -5,15 +5,15 @@
 // MARMOT_* env), the durable message adapter, gateway-owned inbound lifecycle,
 // DM allowlist security, and reply threading.
 
-import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionContext,
 } from "openclaw/plugin-sdk/channel-contract";
 import {
   createChatChannelPlugin,
+  jsonResult,
   type OpenClawConfig,
-} from "openclaw/plugin-sdk/channel-core";
+} from "openclaw/plugin-sdk/core";
 import {
   buildBaseChannelStatusSummary,
   collectStatusIssuesFromLastError,

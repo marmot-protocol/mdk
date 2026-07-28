@@ -27,7 +27,8 @@ pre-releases.
 
 Prerequisites:
 
-- Hermes Agent installed and working locally
+- Hermes Agent **0.19.0 or newer** installed and working locally. The installer
+  validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
@@ -147,6 +148,11 @@ just hermes-dev-setup --print-env
 source /tmp/hermes-marmot-test/env.sh
 ```
 
+Development, CI, and the phone-test image default to the repo-owned
+[`hermes-agent.lock`](hermes-agent.lock): Hermes `0.19.0`, release tag
+`v2026.7.20`, commit `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`.
+Use `--hermes-ref` (or `HERMES_AGENT_REF`) only for deliberate upstream testing.
+
 The setup script creates these paths under that root:
 
 - `hermes-agent` for the isolated Hermes checkout.
@@ -194,12 +200,12 @@ with no inherited `MARMOT_*` environment (installer/configure + fresh subprocess
 probe):
 
 ```sh
-just hermes-dev-setup --hermes-ref c7b75a7849cb260e6f17a045473bfdd0ea21ca81 --install-uv --print-env
+just hermes-dev-setup --install-uv --print-env
 source /tmp/hermes-marmot-test/env.sh
 just hermes-verify-persisted-config
 ```
 
-This uses the real Hermes checkout pinned above, runs `configure_gateway.py` and
+This uses the real Hermes checkout pinned by `hermes-agent.lock`, runs `configure_gateway.py` and
 `hermes plugins enable marmot`, then launches a fresh Python process with all
 `MARMOT_*` variables removed. The probe exercises Hermes plugin discovery,
 `load_gateway_config()`, and `platform_registry.create_adapter()` only. It does

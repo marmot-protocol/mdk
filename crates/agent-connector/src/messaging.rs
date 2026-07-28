@@ -1,8 +1,9 @@
 //! Final-message sends, agent activity/operation/group-system events, and debug send recording.
 
 use agent_control::{
-    AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
-    AgentControlResponse, AgentControlSendMaintenanceDisposition,
+    AgentControlActor, AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef,
+    AgentControlMediaUpload, AgentControlMessage, AgentControlResponse,
+    AgentControlSendMaintenanceDisposition,
 };
 use cgka_traits::GroupId;
 use marmot_app::{
@@ -233,16 +234,24 @@ impl AgentConnector {
         text: String,
     ) -> Result<AgentControlResponse, ConnectorError> {
         self.ensure_debug_controls()?;
+        let account_id_hex = normalize_hex(account_id_hex)?;
+        let sender_account_id_hex = normalize_hex(sender_account_id_hex)?;
         let event = AgentControlEvent::InboundMessage {
-            account_id_hex: normalize_hex(account_id_hex)?,
+            account_id_hex: account_id_hex.clone(),
             group_id_hex: normalize_hex(group_id_hex)?,
-            message_id_hex: normalize_hex(message_id_hex)?,
-            sender_account_id_hex: normalize_hex(sender_account_id_hex)?,
-            text,
+            message: AgentControlMessage {
+                message_id_hex: normalize_hex(message_id_hex)?,
+                sender: AgentControlActor {
+                    is_self: sender_account_id_hex == account_id_hex,
+                    account_id_hex: sender_account_id_hex,
+                    display_name: None,
+                },
+                text,
+                recorded_at: 0,
+                media: Vec::new(),
+            },
             mentions_self: false,
-            reply_to_message_id_hex: None,
-            sender_display_name: None,
-            media: Vec::new(),
+            reply_to: None,
         };
         let _ = self.debug_events.send(event);
         Ok(AgentControlResponse::Ack)

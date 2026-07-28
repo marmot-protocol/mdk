@@ -11,7 +11,7 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
-- Pinned OpenClaw SDK: **`openclaw@2026.6.11`** (`openclaw/plugin-sdk/*`).
+- Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 
 ## Install (release)
@@ -21,7 +21,8 @@ GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH
 
 Prerequisites:
 
-- OpenClaw **2026.6.11** or compatible (this plugin pins `openclaw@2026.6.11`)
+- OpenClaw host **2026.7.1 or newer**. The installer validates the existing
+  host and never installs or upgrades OpenClaw.
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
@@ -277,14 +278,13 @@ for any plugin or tenant that is not in the same trust boundary.
   add/remove/leave, admin grant/revoke, rename/avatar) surface as a
   `group_state_changed` event carrying only a coarse `change` kind and, for a
   rename, the new group display name — never a member pubkey.
-- **Ambient context** (`index.ts` ambient surfacer): `message_deleted` and
-  `group_state_changed` are surfaced to the agent's session as quiet,
-  next-turn context via `api.runtime.system.enqueueSystemEvent(text, {
-  sessionKey, contextKey })` (sessionKey from `resolveAgentRoute`). It is
-  feature-detected (no-ops on a runtime without the system-event surface). The
-  agent sees the event as context without being forced to reply; confirmed on
-  the docker harness.
-- **Media**: inbound — an `inbound_message` carries non-secret `media` refs
+- **Native reply and ambient context**: reply hydration maps to
+  `supplemental.quote`; quoted attachment summaries and buffered
+  `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, and
+  group-state facts map to structured `supplemental.untrustedContext`. Ambient
+  facts are isolated per account/group and attached only to the next triggering
+  user turn; they never start a turn and never enter a system prompt.
+- **Media**: inbound — an `inbound_message.message` carries non-secret `media` refs
   (the `imeta` mirror); on dispatch the connector calls `download_media` to get
   a host-local decrypted path and passes it to the turn as an OpenClaw
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw

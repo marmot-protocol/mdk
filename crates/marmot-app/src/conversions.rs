@@ -306,6 +306,8 @@ pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> 
         recorded_at: record.recorded_at,
         received_at: record.received_at,
         insert_order: record.insert_order,
+        invalidated: record.invalidated,
+        moderation_grant: record.moderation_grant,
     }
 }
 

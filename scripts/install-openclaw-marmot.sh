@@ -34,6 +34,7 @@ MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-openclaw}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.openclaw}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 PLUGIN_PACKAGE="${PLUGIN_PACKAGE:-openclaw-marmot-plugin-${WN_AGENT_VERSION}.tgz}"
+MIN_OPENCLAW_VERSION="2026.7.1"
 
 ASSUME_YES=0
 CONFIGURE_OPENCLAW=1
@@ -123,6 +124,37 @@ run() {
     "$@"
 }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 1; }; }
+
+version_at_least() {
+    awk -v have="$1" -v need="$2" 'BEGIN {
+        split(have, h, "."); split(need, n, ".");
+        for (i = 1; i <= 3; i++) {
+            hv = (h[i] == "" ? 0 : h[i]) + 0;
+            nv = (n[i] == "" ? 0 : n[i]) + 0;
+            if (hv > nv) exit 0;
+            if (hv < nv) exit 1;
+        }
+        exit 0;
+    }'
+}
+
+require_openclaw_version() {
+    local output version
+    output="$(openclaw --version 2>&1)" || {
+        echo "error: could not determine OpenClaw version; OpenClaw $MIN_OPENCLAW_VERSION or newer is required" >&2
+        exit 1
+    }
+    version="$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')"
+    if [ -z "$version" ] || ! version_at_least "$version" "$MIN_OPENCLAW_VERSION"; then
+        echo "error: OpenClaw $MIN_OPENCLAW_VERSION or newer is required (found ${version:-unknown}); upgrade OpenClaw separately, then rerun this installer" >&2
+        exit 1
+    fi
+}
 
 append_csv() {
     local value="$1"
@@ -805,6 +837,7 @@ need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then
     need_cmd openclaw
+    require_openclaw_version
     need_cmd python3
     if [ "$CONFIGURE_OPENCLAW" -eq 1 ]; then need_cmd node; fi
 else

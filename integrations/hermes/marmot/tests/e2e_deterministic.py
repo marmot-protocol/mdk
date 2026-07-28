@@ -125,9 +125,18 @@ class FakeAgentControlServer:
                 "type": "inbound_message",
                 "account_id_hex": ACCOUNT_ID_HEX,
                 "group_id_hex": GROUP_ID_HEX,
-                "message_id_hex": MESSAGE_ID_HEX,
-                "sender_account_id_hex": SENDER_ACCOUNT_ID_HEX,
-                "text": INBOUND_TEXT,
+                "message": {
+                    "message_id_hex": MESSAGE_ID_HEX,
+                    "sender": {
+                        "account_id_hex": SENDER_ACCOUNT_ID_HEX,
+                        "display_name": "Deterministic Sender",
+                        "is_self": False,
+                    },
+                    "text": INBOUND_TEXT,
+                    "recorded_at": 1_721_000_000,
+                    "media": [],
+                },
+                "mentions_self": True,
             },
         )
         await asyncio.wait_for(self.final_sent.wait(), timeout=5.0)

@@ -147,6 +147,13 @@ pub struct StoredAppMessageRecord {
     pub retention: Option<cgka_traits::app_event::AppMessageRetentionDecision>,
     pub recorded_at: u64,
     pub received_at: u64,
+    /// True when convergence retained this raw row only as an invalidated
+    /// losing-branch tombstone. Invalidated modifiers must never be replayed as
+    /// effective agent events.
+    pub invalidated: bool,
+    /// Whether this delete carried an authenticated moderation grant when it
+    /// was recorded. False for every non-delete event.
+    pub moderation_grant: bool,
     /// Local `app_events` insert order (rowid). The final, LOCAL tiebreak of the
     /// raw-event replay ordering; see [`AppEventReplayCursor`]. Never used for
     /// cross-client display order (that is the materialized-timeline surface).
@@ -165,10 +172,12 @@ impl StoredAppMessageRecord {
 }
 
 /// Column list for [`SqliteAccountStorage::app_messages`], ending in
-/// `insert_order` (column index 12, read by `app_message_from_row`).
+/// `insert_order`, `moderation_grant`, and `invalidated` (column indexes
+/// 12-14, read by
+/// `app_message_from_row`).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
-     received_at, insert_order";
+     received_at, insert_order, moderation_grant, invalidated";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -861,6 +870,27 @@ impl SqliteAccountStorage {
             (None, None) => statement.query_map([], app_message_from_row).storage()?,
         };
         rows.collect::<Result<Vec<_>, _>>().storage()
+    }
+
+    /// Resolve one durable raw app event without scanning group history.
+    pub fn app_message(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<StoredAppMessageRecord>> {
+        let cols = APP_EVENT_REPLAY_COLUMNS;
+        self.lock()?
+            .query_row(
+                &format!(
+                    "SELECT {cols} FROM app_events
+                     WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                     LIMIT 1"
+                ),
+                params![group_id_hex, message_id_hex],
+                app_message_from_row,
+            )
+            .optional()
+            .storage()
     }
 
     pub fn app_message_count(&self) -> StorageResult<usize> {
@@ -2270,6 +2300,8 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         recorded_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
         insert_order: row.get::<_, i64>(12)?,
+        moderation_grant: row.get::<_, i64>(13)? != 0,
+        invalidated: row.get::<_, i64>(14)? != 0,
     })
 }
 

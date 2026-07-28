@@ -139,6 +139,43 @@ export interface AgentControlMediaUpload {
   thumbhash?: string | null;
 }
 
+export interface AgentControlActor {
+  account_id_hex: string;
+  display_name?: string | null;
+  is_self: boolean;
+}
+
+export interface AgentControlMessage {
+  message_id_hex: string;
+  sender: AgentControlActor;
+  text: string;
+  recorded_at: number;
+  media?: AgentControlMediaRef[];
+}
+
+export interface AgentControlAttachmentSummary {
+  media_type: string;
+  file_name: string;
+  dim?: string | null;
+}
+
+export type AgentControlReferencedMessageAvailability =
+  | "available"
+  | "missing"
+  | "deleted"
+  | "invalidated";
+
+export interface AgentControlReferencedMessage {
+  message_id_hex: string;
+  availability: AgentControlReferencedMessageAvailability;
+  sender?: AgentControlActor | null;
+  recorded_at?: number | null;
+  text_excerpt?: string | null;
+  text_truncated: boolean;
+  attachments?: AgentControlAttachmentSummary[];
+  attachments_truncated: boolean;
+}
+
 export interface MediaDownloadedResponse {
   type: "media_downloaded";
   /** Host-local path on the `wn-agent` machine where the plaintext was written. */
@@ -153,27 +190,57 @@ export type AgentControlEvent =
       type: "inbound_message";
       account_id_hex: string;
       group_id_hex: string;
-      message_id_hex: string;
-      sender_account_id_hex: string;
-      text: string;
+      message: AgentControlMessage;
       /**
        * True when the message addresses the agent via p-tag, nostr hex, or
        * visible npub mention.
        */
       mentions_self?: boolean;
-      /** The message id this message replies to (`e` tag), when present. */
-      reply_to_message_id_hex?: string | null;
-      /** Sender's directory display name, when resolvable. */
-      sender_display_name?: string | null;
-      /** Encrypted media references (`imeta` tags) on this message, if any. */
-      media?: AgentControlMediaRef[];
+      reply_to?: AgentControlReferencedMessage | null;
+    }
+  | {
+      type: "message_edited";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      replacement_text: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
     }
   | {
       type: "message_deleted";
       account_id_hex: string;
       group_id_hex: string;
+      event_id_hex: string;
       target_message_id_hex: string;
-      sender_account_id_hex: string;
+      actor: AgentControlActor;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
+    }
+  | {
+      type: "reaction_added";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      emoji: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
+    }
+  | {
+      type: "reaction_removed";
+      account_id_hex: string;
+      group_id_hex: string;
+      event_id_hex: string;
+      reaction_event_id_hex: string;
+      target_message_id_hex: string;
+      actor: AgentControlActor;
+      emoji: string;
+      recorded_at: number;
+      target: AgentControlReferencedMessage;
     }
   | {
       type: "group_state_changed";
@@ -233,6 +300,66 @@ interface SubscribeInboundHooks {
 }
 
 type Envelope = Record<string, unknown>;
+
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new AgentControlError(`${field} must be an object`, { code: "wrong_protocol" });
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireStringField(value: Record<string, unknown>, field: string): void {
+  if (typeof value[field] !== "string") {
+    throw new AgentControlError(`${field} must be a string`, { code: "wrong_protocol" });
+  }
+}
+
+/**
+ * Validate the intentionally breaking rich-context portion of the v2 event
+ * wire before exposing it to the channel bridge. This deliberately rejects the
+ * removed flat inbound shape instead of maintaining a compatibility alias.
+ */
+export function decodeAgentControlEvent(frame: Envelope): AgentControlEvent {
+  const type = frame.type;
+  if (type === "inbound_message") {
+    const message = requireRecord(frame.message, "inbound_message.message");
+    const sender = requireRecord(message.sender, "inbound_message.message.sender");
+    requireStringField(message, "message_id_hex");
+    requireStringField(message, "text");
+    requireStringField(sender, "account_id_hex");
+    if (typeof message.recorded_at !== "number" || typeof sender.is_self !== "boolean") {
+      throw new AgentControlError("inbound_message has invalid rich context fields", {
+        code: "wrong_protocol",
+      });
+    }
+  } else if (
+    type === "message_edited" ||
+    type === "message_deleted" ||
+    type === "reaction_added" ||
+    type === "reaction_removed"
+  ) {
+    const actor = requireRecord(frame.actor, `${type}.actor`);
+    requireRecord(frame.target, `${type}.target`);
+    requireStringField(frame, "event_id_hex");
+    requireStringField(frame, "target_message_id_hex");
+    requireStringField(actor, "account_id_hex");
+    if (typeof frame.recorded_at !== "number" || typeof actor.is_self !== "boolean") {
+      throw new AgentControlError(`${type} has invalid actor or timestamp`, {
+        code: "wrong_protocol",
+      });
+    }
+    if (type === "message_edited") {
+      requireStringField(frame, "replacement_text");
+    }
+    if (type === "reaction_added" || type === "reaction_removed") {
+      requireStringField(frame, "emoji");
+    }
+    if (type === "reaction_removed") {
+      requireStringField(frame, "reaction_event_id_hex");
+    }
+  }
+  return frame as unknown as AgentControlEvent;
+}
 
 /** Lowercase, strip an optional `0x`, and validate even-length hexadecimal. */
 export function normalizeHex(value: string | null | undefined, field = "hex"): string {
@@ -649,7 +776,7 @@ export class MarmotAgentControlClient {
           hooks.onReady?.();
           continue;
         }
-        yield frame as unknown as AgentControlEvent;
+        yield decodeAgentControlEvent(frame);
       }
     } catch (err) {
       throw wrapSocketError(err);

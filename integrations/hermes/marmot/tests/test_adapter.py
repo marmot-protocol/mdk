@@ -15,6 +15,32 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 
 
+def wire_event(event):
+    """Build the intentionally breaking structured v2 inbound shape for tests."""
+    if event.get("type") != "inbound_message" or "message" in event:
+        return event
+    flat = dict(event)
+    message = {
+        "message_id_hex": flat.pop("message_id_hex"),
+        "sender": {
+            "account_id_hex": flat.pop("sender_account_id_hex", "44" * 32),
+            "display_name": flat.pop("sender_display_name", None),
+            "is_self": False,
+        },
+        "text": flat.pop("text", ""),
+        "recorded_at": flat.pop("recorded_at", 0),
+        "media": flat.pop("media", []),
+    }
+    reply_to_message_id_hex = flat.pop("reply_to_message_id_hex", None)
+    flat["message"] = message
+    if reply_to_message_id_hex:
+        flat["reply_to"] = {
+            "message_id_hex": reply_to_message_id_hex,
+            "availability": "missing",
+        }
+    return flat
+
+
 def install_fake_hermes_modules():
     gateway = types.ModuleType("gateway")
     gateway_platforms = types.ModuleType("gateway.platforms")
@@ -51,8 +77,14 @@ def install_fake_hermes_modules():
         source: object = None
         raw_message: object = None
         message_id: str | None = None
+        timestamp: object = None
         media_urls: list = field(default_factory=list)
         media_types: list = field(default_factory=list)
+        reply_to_message_id: str | None = None
+        reply_to_text: str | None = None
+        reply_to_author_id: str | None = None
+        reply_to_author_name: str | None = None
+        reply_to_is_own_message: bool = False
         # Quiet next-turn context prepended to the trigger text by the runner;
         # never a trigger itself. Mirrors gateway.platforms.base.MessageEvent.
         channel_context: str | None = None
@@ -936,7 +968,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -975,7 +1007,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -1011,7 +1043,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "dropped_events": 3,
                     }
                 elif attempts["n"] == 2:
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": "22" * 32,
@@ -1019,7 +1051,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "recovered after resync",
                         "mentions_self": True,
-                    }
+                    })
                 else:
                     # No further events; idle so the loop parks instead of busy-spinning.
                     await asyncio.sleep(3600)
@@ -1079,7 +1111,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
                 # Keep the subscription open after yielding so the consume loop parks on the
                 # next event instead of draining the queue (which would serialize the turns).
                 await asyncio.sleep(3600)
@@ -1166,7 +1198,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
@@ -1218,7 +1250,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
             async def account_lookup_profile(self, account_id_hex):
                 return {"type": "profile_lookup", "status": "profile_not_found", "retryable": False}
@@ -1373,7 +1405,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
-                    yield event
+                    yield wire_event(event)
 
             async def account_publish_profile(self, account_id_hex, name, display_name=None):
                 self.published_profiles.append((account_id_hex, name, display_name))
@@ -1428,7 +1460,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
                     # First subscription: a slow/hung group-A turn, then a resync forces reconnect.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": group_a,
@@ -1436,7 +1468,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "slow group A",
                         "mentions_self": True,
-                    }
+                    })
                     yield {
                         "type": "resync_required",
                         "account_id_hex": "11" * 32,
@@ -1445,7 +1477,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 elif attempts["n"] == 2:
                     # Fresh subscription after resync delivers group B's message.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": group_b,
@@ -1453,7 +1485,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "fast group B",
                         "mentions_self": True,
-                    }
+                    })
                 else:
                     await asyncio.sleep(3600)
                     return
@@ -3052,7 +3084,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in (event, dict(event)):
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -3085,12 +3117,12 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await original(message)
 
         adapter.handle_message = slow_handle
-        first = asyncio.create_task(adapter._handle_control_event(dict(event)))
+        first = asyncio.create_task(adapter._handle_control_event(wire_event(event)))
         await asyncio.sleep(0)
         # Let the per-group queue start the first turn so it is in-flight.
         await asyncio.sleep(0)
         # Duplicate arrives while the first turn is still in-flight.
-        await adapter._handle_control_event(dict(event))
+        await adapter._handle_control_event(wire_event(event))
         gate.set()
         await first
         # Drain the per-group queue so the dispatched turn(s) complete before asserting.
@@ -3138,17 +3170,37 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "type": "inbound_message",
             "account_id_hex": "11" * 32,
             "group_id_hex": "22" * 32,
-            "message_id_hex": "33" * 32,
-            "sender_account_id_hex": "44" * 32,
-            "text": "ping",
+            "message": {
+                "message_id_hex": "33" * 32,
+                "sender": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "text": "ping",
+                "recorded_at": 1_721_000_000,
+                "media": [],
+            },
             "mentions_self": True,
-            "sender_display_name": "Alice",
-            "reply_to_message_id_hex": "99" * 32,
+            "reply_to": {
+                "message_id_hex": "99" * 32,
+                "availability": "available",
+                "sender": {
+                    "account_id_hex": "11" * 32,
+                    "display_name": "Hermes Agent",
+                    "is_self": True,
+                },
+                "recorded_at": 1_720_999_900,
+                "text_excerpt": "earlier answer",
+                "text_truncated": False,
+                "attachments": [],
+                "attachments_truncated": False,
+            },
         }
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
-                yield event
+                yield wire_event(event)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -3160,7 +3212,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # Reply threads to the inbound message id (source.message_id).
         self.assertEqual(delivered.source.message_id, "33" * 32)
         self.assertEqual(delivered.message_id, "33" * 32)
-        # Raw reply_to carried for downstream use.
+        self.assertEqual(delivered.timestamp.timestamp(), 1_721_000_000)
+        self.assertEqual(delivered.reply_to_message_id, "99" * 32)
+        self.assertEqual(delivered.reply_to_text, "earlier answer")
+        self.assertEqual(delivered.reply_to_author_id, "11" * 32)
+        self.assertEqual(delivered.reply_to_author_name, "Hermes Agent")
+        self.assertTrue(delivered.reply_to_is_own_message)
+        # The internal normalized shape retains the routing id as well.
         self.assertEqual(delivered.raw_message.get("reply_to_message_id_hex"), "99" * 32)
 
     async def test_inbound_falls_back_to_marmot_name_without_display_name(self):
@@ -3177,7 +3235,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
-                yield event
+                yield wire_event(event)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -3211,15 +3269,35 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "type": "message_deleted",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
+                "event_id_hex": "d1" * 32,
                 "target_message_id_hex": "33" * 32,
-                "sender_account_id_hex": "44" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "recorded_at": 1_721_000_000,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "deleted",
+                },
             },
             {
                 "type": "message_deleted",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
+                "event_id_hex": "d1" * 32,
                 "target_message_id_hex": "33" * 32,
-                "sender_account_id_hex": "44" * 32,
+                "actor": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "recorded_at": 1_721_000_000,
+                "target": {
+                    "message_id_hex": "33" * 32,
+                    "availability": "deleted",
+                },
             },
             {
                 "type": "group_state_changed",
@@ -3242,7 +3320,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())
         await adapter._consume_inbound_once(drain=True)
@@ -3258,9 +3336,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("marmot_ambient", triggered.raw_message)
         # The two distinct ambient facts (deletion deduped to one, rename) are
         # carried as quiet channel_context on the next inbound turn, in order.
-        self.assertEqual(
-            triggered.channel_context,
-            'A message was deleted.\nThe group was renamed to "Crew".',
+        self.assertIn('"type":"message_deleted"', triggered.channel_context)
+        self.assertEqual(triggered.channel_context.count('"type":"message_deleted"'), 1)
+        self.assertTrue(
+            triggered.channel_context.endswith('The group was renamed to "Crew".')
         )
         # Buffer was drained: a second message in the group carries no stale context.
         self.assertEqual(adapter._take_pending_ambient_context("22" * 32), None)
@@ -3277,8 +3356,18 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "type": "message_deleted",
                     "account_id_hex": "11" * 32,
                     "group_id_hex": "22" * 32,
+                    "event_id_hex": "d1" * 32,
                     "target_message_id_hex": "33" * 32,
-                    "sender_account_id_hex": "44" * 32,
+                    "actor": {
+                        "account_id_hex": "44" * 32,
+                        "display_name": None,
+                        "is_self": False,
+                    },
+                    "recorded_at": 1_721_000_000,
+                    "target": {
+                        "message_id_hex": "33" * 32,
+                        "availability": "deleted",
+                    },
                 }
 
         adapter = self._adapter(FakeClient())
@@ -3291,10 +3380,9 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handler_calls, [], "ambient event must not invoke handle_message")
         # The fact is buffered for a later real message rather than dropped.
-        self.assertEqual(
-            adapter._take_pending_ambient_context("22" * 32),
-            "A message was deleted.",
-        )
+        context = adapter._take_pending_ambient_context("22" * 32)
+        self.assertIn('"type":"message_deleted"', context)
+        self.assertNotIn("plaintext", context)
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -3333,7 +3421,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient(), {"debounce_ms": 5})
         await adapter._consume_inbound_once()
@@ -3384,7 +3472,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for value in events:
-                    yield value
+                    yield wire_event(value)
 
         adapter = self._adapter(FakeClient())  # debounce disabled by default
         await adapter._consume_inbound_once(drain=True)
@@ -3426,7 +3514,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
                     # Healthy: yields one message, then raises -> reconnect.
-                    yield {
+                    yield wire_event({
                         "type": "inbound_message",
                         "account_id_hex": "11" * 32,
                         "group_id_hex": "22" * 32,
@@ -3434,7 +3522,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                         "sender_account_id_hex": "44" * 32,
                         "text": "healthy",
                         "mentions_self": True,
-                    }
+                    })
                     raise RuntimeError("dropped after healthy")
                 else:
                     await asyncio.sleep(3600)

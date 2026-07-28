@@ -16,11 +16,12 @@ const pinnedLabel = `openclaw@${pinnedOpenClaw}`;
 
 describe("README OpenClaw SDK pin", () => {
   it("documents the pinned SDK version from package.json", () => {
-    expect(readme).toContain(`Pinned OpenClaw SDK: **\`${pinnedLabel}\`**`);
+    expect(readme).toContain(`Pinned OpenClaw development SDK: **\`${pinnedLabel}\`**`);
   });
 
   it("documents the OpenClaw prerequisite version from package.json", () => {
-    expect(readme).toContain(`OpenClaw **${pinnedOpenClaw}** or compatible`);
-    expect(readme).toContain(`this plugin pins \`${pinnedLabel}\``);
+    const hostVersion = pinnedOpenClaw.replace(/-\d+$/, "");
+    expect(readme).toContain(`OpenClaw host **${hostVersion} or newer**`);
+    expect(readme).toContain("never installs or upgrades OpenClaw");
   });
 });

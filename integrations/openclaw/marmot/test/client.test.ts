@@ -103,9 +103,18 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         type: "inbound_message",
         account_id_hex: req.account_id_hex ?? HEX32("aa"),
         group_id_hex: HEX32("cc"),
-        message_id_hex: HEX32("dd"),
-        sender_account_id_hex: HEX32("bb"),
-        text: "hello agent",
+        message: {
+          message_id_hex: HEX32("dd"),
+          sender: {
+            account_id_hex: HEX32("bb"),
+            display_name: "Alice",
+            is_self: false,
+          },
+          text: "hello agent",
+          recorded_at: 1_721_000_000,
+          media: [],
+        },
+        mentions_self: true,
       });
       send(socket, id, {
         type: "resync_required",
@@ -306,7 +315,10 @@ describe("MarmotAgentControlClient", () => {
       events.push(event);
     }
     expect(events.map((e) => e.type)).toEqual(["inbound_message", "resync_required"]);
-    expect(events[0]).toMatchObject({ text: "hello agent", group_id_hex: HEX32("cc") });
+    expect(events[0]).toMatchObject({
+      message: { text: "hello agent", recorded_at: 1_721_000_000 },
+      group_id_hex: HEX32("cc"),
+    });
   });
 
   it("surfaces a connection failure as a retryable error", async () => {

@@ -392,8 +392,7 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/hermes_marmot_dev_setup.sh \
-            --root "$RUNNER_TEMP/hermes-installer-auth" \
-            --hermes-ref af8d698b418ede7dc8b078a8116510699ec94eb7
+            --root "$RUNNER_TEMP/hermes-installer-auth"
 
       - name: Hermes installer unit and mock regressions
         run: |

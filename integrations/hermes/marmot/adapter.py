@@ -20,6 +20,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Literal, Optional, Tuple
 
@@ -370,6 +371,68 @@ def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
     if reply_to:
         merged["reply_to_message_id_hex"] = reply_to
     return merged
+
+
+def _normalize_inbound_message_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode the structured agent-control inbound DTO into the adapter's
+    internal turn shape. This is intentionally one-way: the removed flat wire
+    fields are not accepted as a compatibility alias."""
+    message = event.get("message")
+    if not isinstance(message, dict):
+        raise AgentControlError("inbound_message.message must be an object")
+    sender = message.get("sender")
+    if not isinstance(sender, dict):
+        raise AgentControlError("inbound_message.message.sender must be an object")
+    normalized = dict(event)
+    normalized["message_id_hex"] = message["message_id_hex"]
+    normalized["sender_account_id_hex"] = sender["account_id_hex"]
+    normalized["sender_display_name"] = sender.get("display_name")
+    normalized["text"] = str(message.get("text") or "")
+    normalized["recorded_at"] = int(message.get("recorded_at") or 0)
+    normalized["media"] = message.get("media") or []
+    reply = event.get("reply_to")
+    normalized["reply_to"] = reply if isinstance(reply, dict) else None
+    normalized["reply_to_message_id_hex"] = (
+        reply.get("message_id_hex") if isinstance(reply, dict) else None
+    )
+    return normalized
+
+
+def _referenced_channel_context(reply: Any) -> Optional[str]:
+    if not isinstance(reply, dict):
+        return None
+    attachments = reply.get("attachments")
+    if not isinstance(attachments, list) or not attachments:
+        return None
+    fact = {
+        "type": "quoted_attachments",
+        "message_id": reply.get("message_id_hex"),
+        "availability": reply.get("availability"),
+        "attachments": attachments,
+        "attachments_truncated": bool(reply.get("attachments_truncated")),
+    }
+    return f"Marmot quoted attachment context (untrusted): {json.dumps(fact, separators=(',', ':'))}"
+
+
+def _mutation_channel_context(event: Dict[str, Any]) -> str:
+    """Render one bounded mutation fact for Hermes' untrusted user-role
+    channel_context. The DTO has already redacted deleted/invalidated targets."""
+    event_type = str(event.get("type") or "conversation_event")
+    fact: Dict[str, Any] = {
+        "type": event_type,
+        "event_id": event.get("event_id_hex"),
+        "target_message_id": event.get("target_message_id_hex"),
+        "actor": event.get("actor"),
+        "recorded_at": event.get("recorded_at"),
+        "target": event.get("target"),
+    }
+    if event_type == "message_edited":
+        fact["replacement_text"] = str(event.get("replacement_text") or "")[:2000]
+    elif event_type in {"reaction_added", "reaction_removed"}:
+        fact["emoji"] = str(event.get("emoji") or "")
+        if event_type == "reaction_removed":
+            fact["reaction_event_id"] = event.get("reaction_event_id_hex")
+    return f"Marmot conversation event (untrusted): {json.dumps(fact, separators=(',', ':'))}"
 
 
 def reconnect_backoff_ms(
@@ -2570,8 +2633,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if event_type == "resync_required":
             await self._handle_resync_required(event)
             return
-        if event_type == "message_deleted":
-            await self._handle_message_deleted(event)
+        if event_type in {
+            "message_edited",
+            "message_deleted",
+            "reaction_added",
+            "reaction_removed",
+        }:
+            await self._handle_mutation(event)
             return
         if event_type == "group_state_changed":
             await self._handle_group_state_changed(event)
@@ -2583,6 +2651,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Ignoring Marmot control event type %s", event_type)
             return
 
+        event = _normalize_inbound_message_event(event)
         message_id_hex = event["message_id_hex"]
         # Client-side dedupe: the connector can re-emit the same inbound message
         # (rapid catch-up after subscribe, or across a reconnect). Drop a repeat
@@ -2655,7 +2724,33 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 source=source,
                 raw_message=event,
                 message_id=message_id_hex,
+                timestamp=datetime.fromtimestamp(
+                    int(event.get("recorded_at") or 0),
+                    tz=timezone.utc,
+                ),
             )
+            reply = event.get("reply_to")
+            if isinstance(reply, dict):
+                reply_sender = reply.get("sender")
+                if not isinstance(reply_sender, dict):
+                    reply_sender = {}
+                hermes_event.reply_to_message_id = str(
+                    reply.get("message_id_hex") or ""
+                ) or None
+                hermes_event.reply_to_text = (
+                    str(reply.get("text_excerpt"))
+                    if reply.get("text_excerpt") is not None
+                    else None
+                )
+                hermes_event.reply_to_author_id = (
+                    str(reply_sender.get("account_id_hex") or "") or None
+                )
+                hermes_event.reply_to_author_name = (
+                    str(reply_sender.get("display_name") or "") or None
+                )
+                hermes_event.reply_to_is_own_message = bool(
+                    reply_sender.get("is_self")
+                )
             media_urls, media_types = await self._download_inbound_media(event)
             if media_urls:
                 hermes_event.media_urls = media_urls
@@ -2664,11 +2759,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # change observed since the last turn) as channel_context. The runner
             # prepends channel_context to the trigger text as context without it
             # being a trigger itself, so the fact reaches the agent on this turn.
-            # Set via setattr so the adapter stays compatible with a MessageEvent
-            # build that predates the channel_context field.
-            ambient = self._take_pending_ambient_context(group_id_hex)
-            if ambient and hasattr(hermes_event, "channel_context"):
-                hermes_event.channel_context = ambient
+            # Hermes 0.19.0 exposes channel_context as stable user-role context.
+            contexts = [
+                context
+                for context in (
+                    self._take_pending_ambient_context(group_id_hex),
+                    _referenced_channel_context(reply),
+                )
+                if context
+            ]
+            if contexts:
+                hermes_event.channel_context = "\n".join(contexts)
             await self.handle_message(hermes_event)
         except asyncio.CancelledError:
             raise
@@ -2796,14 +2897,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             lambda evt=merged: self._dispatch_inbound_message(evt),
         )
 
-    async def _handle_message_deleted(self, event: Dict[str, Any]) -> None:
-        # A peer retracted a message. Surface it to the agent as quiet ambient
-        # (next-turn) context, never a triggered reply. Privacy-safe log: no ids.
-        logger.debug("Marmot inbound message deletion observed")
+    async def _handle_mutation(self, event: Dict[str, Any]) -> None:
+        # Mutations are quiet next-turn context and never trigger an agent turn.
+        # Privacy-safe log: no ids, actors, emoji, or plaintext.
+        logger.debug("Marmot inbound mutation observed")
         group_id_hex = str(event.get("group_id_hex") or "")
-        target_message_id_hex = str(event.get("target_message_id_hex") or "")
-        context_key = f"marmot:message_deleted:{group_id_hex}:{target_message_id_hex}"
-        await self._surface_ambient_context(event, "A message was deleted.", context_key)
+        event_id_hex = str(event.get("event_id_hex") or "")
+        context_key = f"marmot:mutation:{group_id_hex}:{event_id_hex}"
+        await self._surface_ambient_context(
+            event,
+            _mutation_channel_context(event),
+            context_key,
+        )
 
     async def _handle_group_state_changed(self, event: Dict[str, Any]) -> None:
         # A durable group-state change (membership/admin/rename/avatar). Surfaced
