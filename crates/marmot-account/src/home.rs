@@ -84,6 +84,23 @@ pub struct AccountSummary {
     pub signed_out: bool,
 }
 
+/// Provenance for a strict Nostr private-key import used by account setup.
+///
+/// A live account record is never treated as idempotent by this flow. The
+/// only reusable state is an exact account-id-keyed signing credential whose
+/// filesystem account record is absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrAccountImport {
+    account: AccountSummary,
+    reused_account_id_credential: bool,
+}
+
+impl NostrAccountImport {
+    pub fn account(&self) -> &AccountSummary {
+        &self.account
+    }
+}
+
 impl AccountSummary {
     pub fn can_sign(&self) -> bool {
         self.local_signing || self.external_signing
@@ -235,6 +252,65 @@ impl AccountHome {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
         self.write_signing_account(&keys)
+    }
+
+    /// Import a Nostr private key for runtime account setup, recovering only an
+    /// exact orphaned account-id-keyed credential.
+    ///
+    /// Existing account records remain duplicates and are rejected. This is
+    /// narrower than [`Self::import_account_idempotent`]: it exists for
+    /// uninstall/reinstall recovery where an app's filesystem home was removed
+    /// while its Keychain entry survived.
+    pub fn import_nostr_account_idempotent(
+        &self,
+        secret_key: &str,
+    ) -> AccountHomeResult<NostrAccountImport> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        let account_id_hex = keys.public_key().to_hex();
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_account_label(&account_id_hex)?;
+
+        if self.account_record_path(&account_id_hex).exists()
+            || self.secret_store.has_secret_for_label(&account_id_hex)?
+        {
+            return Err(AccountHomeError::AccountExists(account_id_hex));
+        }
+        if self
+            .accounts()?
+            .iter()
+            .any(|account| account.local_signing && account.account_id_hex == account_id_hex)
+        {
+            return Err(AccountHomeError::AccountIdInUse(account_id_hex));
+        }
+
+        let account = AccountSummary {
+            label: account_id_hex.clone(),
+            account_id_hex,
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+        };
+        let reused_account_id_credential = self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?;
+        if reused_account_id_credential {
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            self.write_account_record(&account)?;
+        } else {
+            self.write_new_signing_account(&account, &keys)?;
+        }
+
+        Ok(NostrAccountImport {
+            account,
+            reused_account_id_credential,
+        })
     }
 
     pub fn add_public_account(&self, public_key: &str) -> AccountHomeResult<AccountSummary> {
@@ -410,6 +486,32 @@ impl AccountHome {
     /// live account, so the call still reports success rather than a forbidden
     /// partial-live state.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
+        self.remove_account_inner(account_ref, None, false)
+    }
+
+    /// Roll back a runtime setup import using the provenance captured when the
+    /// account record was created.
+    ///
+    /// If the import recovered an account-id-keyed credential, the filesystem
+    /// account state is removed while that pre-existing credential is retained.
+    /// Newly created credentials are removed with the account as usual.
+    pub fn rollback_nostr_account_import(
+        &self,
+        imported: &NostrAccountImport,
+    ) -> AccountHomeResult<()> {
+        self.remove_account_inner(
+            &imported.account.label,
+            Some(&imported.account),
+            imported.reused_account_id_credential,
+        )
+    }
+
+    fn remove_account_inner(
+        &self,
+        account_ref: &str,
+        expected: Option<&AccountSummary>,
+        preserve_account_id_credential: bool,
+    ) -> AccountHomeResult<()> {
         // Hold the mutation lock across the shared-credential check and
         // the matching `remove_secret` call so two concurrent removals on
         // twin records cannot both observe the other as still present,
@@ -420,6 +522,23 @@ impl AccountHome {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = self.account(account_ref)?;
+        if expected.is_some_and(|expected| expected != &account) {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        if preserve_account_id_credential {
+            if !self
+                .secret_store
+                .has_secret_for_account_id(&account.account_id_hex)?
+            {
+                return Err(AccountHomeError::SecretNotFound(
+                    account.account_id_hex.clone(),
+                ));
+            }
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key().to_hex() != account.account_id_hex {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+        }
 
         // Commit point: atomically move the live account directory into the
         // tombstone namespace. After this returns Ok the account is no longer a
@@ -434,7 +553,7 @@ impl AccountHome {
         // a no-op (NotFound -> Ok); the tombstoned secret file is scrubbed below
         // before recursive directory deletion. For the keychain store the entry
         // is independent of the directory and is removed here.
-        if !self.secret_shared_with_other_record(&account)? {
+        if !preserve_account_id_credential && !self.secret_shared_with_other_record(&account)? {
             self.secret_store.remove_secret(&account)?;
         }
 
