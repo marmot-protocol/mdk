@@ -1255,6 +1255,10 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         cgka_traits::DisbandRequestStatus::Pending
     ));
     assert!(
+        alice.disbanding_in_progress(&group_id).unwrap(),
+        "the client-facing gate becomes visible with the durable request"
+    );
+    assert!(
         alice
             .send(cgka_traits::engine::SendIntent::AppMessage {
                 group_id: group_id.clone(),
@@ -1319,6 +1323,10 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         "historical pre-disband account roster is retained"
     );
     assert!(alice.disband_request(&group_id).unwrap().is_none());
+    assert!(
+        !alice.disbanding_in_progress(&group_id).unwrap(),
+        "terminal state is reported by the lifecycle, not as pending work"
+    );
     let state_changes = alice
         .drain_events()
         .into_iter()

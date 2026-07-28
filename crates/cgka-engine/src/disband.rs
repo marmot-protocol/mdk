@@ -246,6 +246,16 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.storage.disband_request(group_id)?)
     }
 
+    /// Whether outbound group work is gated while a terminal request or
+    /// authenticated terminal candidate awaits convergence.
+    ///
+    /// This deliberately differs from [`Self::disband_request`]: an inbound
+    /// disband Commit can make the group non-sendable before this account has a
+    /// local request of its own.
+    pub fn disbanding_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(self.disband_request_pending(group_id)? || self.disband_candidate_pending(group_id)?)
+    }
+
     /// Account identifiers for leaves that do not yet advertise lifecycle-v1.
     ///
     /// This is an advisory read. The enable commit repeats the same check under

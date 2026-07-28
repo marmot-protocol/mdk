@@ -1,9 +1,9 @@
 //! Chat-list avatar, row, message-preview, and subscription-update FFI conversions.
 
 use marmot_app::{
-    ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListRow, ChatNotificationSettings, ChatPinState,
-    RuntimeChatListUpdate,
+    AppDisbandRequest, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
+    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListRow, ChatNotificationSettings,
+    ChatPinState, RuntimeChatListUpdate,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
@@ -151,6 +151,11 @@ pub struct ChatListRowFfi {
     pub archived: bool,
     pub pending_confirmation: bool,
     pub lifecycle_state: GroupLifecycleStateFfi,
+    /// Hide/disable the message composer while terminal convergence is in
+    /// progress. This also covers another admin's inbound candidate.
+    pub disbanding: bool,
+    /// This account's durable request outcome, if any.
+    pub disband_request: Option<super::group::DisbandRequestFfi>,
     pub title: String,
     pub group_name: String,
     pub avatar_url: Option<String>,
@@ -217,6 +222,11 @@ impl From<ChatListRow> for ChatListRowFfi {
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             lifecycle_state: value.lifecycle_state.into(),
+            disbanding: value.disbanding,
+            disband_request: value
+                .disband_request
+                .map(AppDisbandRequest::from)
+                .map(Into::into),
             title: value.title,
             group_name: value.group_name,
             avatar_url: value.avatar_url,
@@ -383,6 +393,8 @@ mod tests {
             archived: false,
             pending_confirmation: false,
             lifecycle_state: cgka_traits::GroupLifecycleState::Stable,
+            disbanding: false,
+            disband_request: None,
             title: "Marmot Lab".to_owned(),
             group_name: "Marmot Lab".to_owned(),
             avatar_url: None,
@@ -480,6 +492,29 @@ mod tests {
         let ffi = ChatListRowFfi::from(sample_row());
         assert!(!ffi.leave_request_pending);
         assert_eq!(ffi.leave_requested_at_ms, None);
+    }
+
+    #[test]
+    fn chat_list_row_exports_pending_disband_for_composer_gating() {
+        let request = cgka_traits::DisbandRequest {
+            group_id: cgka_traits::GroupId::new(vec![0x11]),
+            requested_at_ms: 1_700_000_000_456,
+            status: cgka_traits::DisbandRequestStatus::Pending,
+            last_prepared_epoch: None,
+        };
+        let ffi = ChatListRowFfi::from(ChatListRow {
+            disbanding: true,
+            disband_request: Some(request),
+            ..sample_row()
+        });
+
+        assert!(ffi.disbanding);
+        assert!(matches!(
+            ffi.disband_request,
+            Some(super::super::group::DisbandRequestFfi::Pending {
+                requested_at_ms: 1_700_000_000_456
+            })
+        ));
     }
 
     #[test]

@@ -134,6 +134,10 @@ where
         Ok(self.session.disband_request(group_id)?)
     }
 
+    pub fn disbanding_in_progress(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.disbanding_in_progress(group_id)?)
+    }
+
     pub fn disbanding_support_blockers(&self, group_id: &GroupId) -> AccountResult<Vec<MemberId>> {
         Ok(self.session.disbanding_support_blockers(group_id)?)
     }

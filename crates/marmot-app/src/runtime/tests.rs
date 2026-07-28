@@ -1059,6 +1059,13 @@ fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
         chat_list_row_fingerprint(&base),
         chat_list_row_fingerprint(&pinned)
     );
+    let mut disbanding = base.clone();
+    disbanding.disbanding = true;
+    assert_ne!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&disbanding),
+        "pending disband must wake chat-list subscribers so hosts can hide the composer"
+    );
 
     let mut timed = base.clone();
     timed.muted = true;
@@ -1108,6 +1115,8 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         pinned_position: None,
         archived: false,
         pending_confirmation: false,
+        disbanding: false,
+        disband_request: None,
         title: title.to_owned(),
         group_name: title.to_owned(),
         avatar_url: None,

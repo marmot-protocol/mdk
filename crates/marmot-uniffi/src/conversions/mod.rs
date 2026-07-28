@@ -98,6 +98,9 @@ mod tests {
             self_membership: SelfMembershipFfi::Member,
             leave_request_pending: false,
             leave_requested_at_ms: None,
+            disbanding: false,
+            disband_request: None,
+            disbanded: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
@@ -160,6 +163,7 @@ mod tests {
             unrecoverable: false,
             required_app_components: vec![],
             disbanding_enabled: true,
+            disbanding: false,
             disbanding_blockers: vec![],
             disband_request: None,
         }
@@ -246,6 +250,7 @@ mod tests {
             if terminal {
                 mls.lifecycle_state = GroupLifecycleStateFfi::Disbanded;
             } else {
+                mls.disbanding = true;
                 mls.disband_request = Some(DisbandRequestFfi::Pending {
                     requested_at_ms: 1_700_000_000_123,
                 });
@@ -264,6 +269,7 @@ mod tests {
             assert!(!state.requires_self_demote_before_leave);
             assert!(!state.can_enable_disbanding);
             assert!(!state.can_disband);
+            assert_eq!(state.disbanding, !terminal);
             assert!(
                 state.member_actions.iter().all(|action| {
                     !action.can_remove && !action.can_promote && !action.can_demote

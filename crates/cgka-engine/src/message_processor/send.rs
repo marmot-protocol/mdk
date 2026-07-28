@@ -65,6 +65,18 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        // Queued-intent drains call this method directly. A disband request or
+        // inbound terminal candidate can arrive after an ordinary intent was
+        // queued, so the durable gate must be repeated here before dispatch.
+        if self.disbanding_in_progress(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanding",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "disband requested or awaiting convergence",
+                },
+            ));
+        }
         match intent {
             SendIntent::AppMessage { group_id, payload } => {
                 self.do_send_app_message(group_id, payload).await

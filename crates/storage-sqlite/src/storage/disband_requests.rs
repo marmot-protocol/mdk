@@ -1,11 +1,68 @@
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::DisbandTombstone;
 use cgka_traits::storage::{
-    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
-    DisbandTombstoneStorage, StorageResult,
+    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStatus,
+    DisbandRequestStorage, DisbandTombstoneStorage, StorageResult,
 };
 use cgka_traits::types::{GroupId, MessageId};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{HashMap, HashSet};
+
+/// Every durable disband request keyed by lowercase hex MLS group id.
+///
+/// Requests are read through rather than denormalized into app projections:
+/// the engine can replace or clear them during convergence without an
+/// intervening app-layer write.
+pub(crate) fn disband_requests_by_group_hex_tx(
+    tx: &Connection,
+) -> StorageResult<HashMap<String, DisbandRequest>> {
+    let mut statement = tx
+        .prepare("SELECT group_id, record FROM cgka_disband_requests")
+        .storage()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .storage()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .storage()?;
+    rows.into_iter()
+        .map(|(group_id, record)| Ok((hex::encode(group_id), deserialize(&record)?)))
+        .collect()
+}
+
+/// Groups whose ordinary outbound work is currently gated by either a local
+/// request or an authenticated terminal candidate awaiting convergence.
+pub(crate) fn disbanding_group_ids_hex_tx(tx: &Connection) -> StorageResult<HashSet<String>> {
+    let mut group_ids = disband_requests_by_group_hex_tx(tx)?
+        .into_iter()
+        .filter_map(|(group_id, request)| {
+            (request.status == DisbandRequestStatus::Pending).then_some(group_id)
+        })
+        .collect::<HashSet<_>>();
+    let mut statement = tx
+        .prepare("SELECT DISTINCT group_id FROM cgka_disband_candidates")
+        .storage()?;
+    let candidate_group_ids = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .storage()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .storage()?;
+    group_ids.extend(candidate_group_ids.into_iter().map(hex::encode));
+    Ok(group_ids)
+}
+
+impl SqliteAccountStorage {
+    pub fn disband_requests_by_group_hex(&self) -> StorageResult<HashMap<String, DisbandRequest>> {
+        let conn = self.lock()?;
+        disband_requests_by_group_hex_tx(&conn)
+    }
+
+    pub fn disbanding_group_ids_hex(&self) -> StorageResult<HashSet<String>> {
+        let conn = self.lock()?;
+        disbanding_group_ids_hex_tx(&conn)
+    }
+}
 
 impl DisbandRequestStorage for SqliteAccountStorage {
     fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
@@ -178,7 +235,23 @@ mod tests {
             last_prepared_epoch: Some(EpochId(3)),
         };
         store.put_disband_request(&request).unwrap();
-        assert_eq!(store.disband_request(&group.id).unwrap(), Some(request));
+        assert_eq!(
+            store.disband_request(&group.id).unwrap(),
+            Some(request.clone())
+        );
+        assert_eq!(
+            store
+                .disband_requests_by_group_hex()
+                .unwrap()
+                .get(&hex::encode(group.id.as_slice())),
+            Some(&request)
+        );
+        assert!(
+            store
+                .disbanding_group_ids_hex()
+                .unwrap()
+                .contains(&hex::encode(group.id.as_slice()))
+        );
         store.delete_group(&group.id).unwrap();
         assert_eq!(store.disband_request(&group.id).unwrap(), None);
     }
@@ -208,6 +281,13 @@ mod tests {
         assert_eq!(
             store.list_disband_candidates(&group.id).unwrap(),
             vec![candidate.clone()]
+        );
+        assert!(
+            store
+                .disbanding_group_ids_hex()
+                .unwrap()
+                .contains(&hex::encode(group.id.as_slice())),
+            "an inbound candidate gates sending without a local request"
         );
 
         let tombstone = DisbandTombstone {
