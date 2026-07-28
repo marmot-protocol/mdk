@@ -525,6 +525,10 @@ pub enum RuntimeChatListUpdate {
         trigger: ChatListUpdateTrigger,
         group_id_hex: String,
     },
+    Snapshot {
+        trigger: ChatListUpdateTrigger,
+        rows: Vec<ChatListRow>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +544,7 @@ pub enum ChatListUpdateTrigger {
     MuteChanged,
     ConversationKindChanged,
     LatestMessageDeliveryChanged,
+    PinOrderChanged,
     #[default]
     SnapshotRefresh,
     Removed,
@@ -1195,6 +1200,34 @@ impl MarmotAppRuntime {
                 if let Some(update) = projection_update_from_event(&event)
                     && update.account_id_hex == account_id_hex
                 {
+                    if matches!(
+                        update.update.chat_list_trigger,
+                        ChatListUpdateTrigger::PinOrderChanged
+                            | ChatListUpdateTrigger::ArchiveChanged
+                    ) {
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let rows = match blocking_app_task(move || {
+                            app_for_lookup.chat_list(&account_label_for_lookup, include_archived)
+                        })
+                        .await
+                        {
+                            Ok(rows) => rows,
+                            Err(_) => continue,
+                        };
+                        mute_expiries = chat_list_mute_expiries(&rows);
+                        if !send_atomic_chat_list_snapshot(
+                            &updates_tx,
+                            &mut row_fingerprints,
+                            update.update.chat_list_trigger,
+                            rows,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let Some(row) = update.update.chat_list_row.clone() else {
                         mute_expiries.remove(&update.update.group_id_hex);
                         if !send_chat_list_remove_update(
@@ -1644,4 +1677,21 @@ pub(crate) async fn reconcile_chat_list_snapshot(
         }
     }
     true
+}
+
+pub(crate) async fn send_atomic_chat_list_snapshot(
+    updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
+    row_fingerprints: &mut HashMap<String, String>,
+    trigger: ChatListUpdateTrigger,
+    rows: Vec<ChatListRow>,
+) -> bool {
+    row_fingerprints.clear();
+    row_fingerprints.extend(
+        rows.iter()
+            .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row))),
+    );
+    updates_tx
+        .send(RuntimeChatListUpdate::Snapshot { trigger, rows })
+        .await
+        .is_ok()
 }

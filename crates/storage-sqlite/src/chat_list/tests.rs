@@ -1,8 +1,8 @@
 use super::*;
 use crate::storage::test_support::sample_group;
 use crate::{
-    SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent,
+    SelfMembership, SqlCipherKey, StoredAccountGroup, StoredAccountGroupComponent,
+    StoredAccountState, StoredAppEvent,
 };
 use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GroupAvatarUrlV1,
@@ -1742,5 +1742,294 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
             .unwrap()
             .leave_requested_at_ms,
         None
+    );
+}
+
+fn three_groups() -> Vec<StoredAccountGroup> {
+    vec![
+        group(),
+        StoredAccountGroup {
+            group_id_hex: "22".to_owned(),
+            profile_name: "Second".to_owned(),
+            ..group()
+        },
+        StoredAccountGroup {
+            group_id_hex: "33".to_owned(),
+            profile_name: "Third".to_owned(),
+            ..group()
+        },
+    ]
+}
+
+#[test]
+fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: three_groups(),
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups
+             SET conversation_created_at = CASE group_id_hex
+                 WHEN '11' THEN 100
+                 WHEN '22' THEN 300
+                 WHEN '33' THEN 200
+             END",
+            [],
+        )
+        .unwrap();
+    }
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let initial = store
+        .chat_list_rows(ChatListQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.group_id_hex)
+        .collect::<Vec<_>>();
+    assert_eq!(initial, vec!["22", "33", "11"]);
+
+    assert_eq!(
+        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        vec!["11"]
+    );
+    assert_eq!(
+        store.set_chat_pinned("33", true).unwrap().ordered_group_ids,
+        vec!["33", "11"]
+    );
+    // Re-pinning is idempotent and does not move an existing pin.
+    assert_eq!(
+        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        vec!["33", "11"]
+    );
+    assert_eq!(
+        store
+            .set_chat_pinned("11", false)
+            .unwrap()
+            .ordered_group_ids,
+        vec!["33"]
+    );
+    // Re-unpinning is also idempotent.
+    assert_eq!(
+        store
+            .set_chat_pinned("11", false)
+            .unwrap()
+            .ordered_group_ids,
+        vec!["33"]
+    );
+    assert_eq!(
+        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        vec!["11", "33"]
+    );
+
+    let rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["11", "33", "22"]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.pinned, row.pinned_position))
+            .collect::<Vec<_>>(),
+        vec![(true, Some(0)), (true, Some(1)), (false, None)]
+    );
+
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .chat_list_rows(ChatListQuery::default())
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.pinned)
+            .map(|row| row.group_id_hex)
+            .collect::<Vec<_>>(),
+        vec!["11", "33"]
+    );
+
+    assert_eq!(
+        store
+            .set_pinned_chat_order(&["33".to_owned(), "11".to_owned()])
+            .unwrap()
+            .ordered_group_ids,
+        vec!["33", "11"]
+    );
+    store
+        .record_app_event(&chat("newest", REMOTE, 1_000, "new activity"))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_rows(ChatListQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.group_id_hex)
+            .collect::<Vec<_>>(),
+        vec!["33", "11", "22"]
+    );
+}
+
+#[test]
+fn pin_validation_and_unarchived_eligibility_are_explicit() {
+    let mut groups = three_groups();
+    groups[0].self_membership = SelfMembership::Left;
+    groups[1].pending_confirmation = true;
+    groups[2].self_membership = SelfMembership::Removed;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups,
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    store.set_chat_pinned("11", true).unwrap();
+    store.set_chat_pinned("22", true).unwrap();
+    store.set_chat_pinned("33", true).unwrap();
+    assert!(matches!(
+        store.set_chat_pinned("missing", true),
+        Err(ChatPinError::UnknownGroup(_))
+    ));
+    assert!(matches!(
+        store.set_pinned_chat_order(&["33".to_owned(), "33".to_owned()]),
+        Err(ChatPinError::InvalidOrder(_))
+    ));
+    assert!(matches!(
+        store.set_pinned_chat_order(&["33".to_owned()]),
+        Err(ChatPinError::InvalidOrder(_))
+    ));
+
+    let mut archived_groups = three_groups();
+    archived_groups[0].archived = true;
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: archived_groups,
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.set_chat_pinned("11", true),
+        Err(ChatPinError::ArchivedChat)
+    ));
+}
+
+#[test]
+fn archiving_and_deleting_clear_pins_without_restoring_them() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: three_groups(),
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    store.set_chat_pinned("11", true).unwrap();
+    store.set_chat_pinned("33", true).unwrap();
+
+    let mut archived_groups = three_groups();
+    archived_groups[2].archived = true;
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: archived_groups,
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let remaining = store.chat_list_row("11").unwrap().unwrap();
+    assert!(remaining.pinned);
+    assert_eq!(remaining.pinned_position, Some(0));
+    let archived = store.chat_list_row("33").unwrap().unwrap();
+    assert!(!archived.pinned);
+
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: three_groups(),
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert!(!store.chat_list_row("33").unwrap().unwrap().pinned);
+
+    assert!(store.delete_local_group_data("11").unwrap());
+    let pin_count = {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM chat_pin_positions WHERE group_id_hex = '11'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(pin_count, 0);
+}
+
+#[test]
+fn pinned_order_survives_encrypted_database_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chat-pins.sqlite3");
+    let key = SqlCipherKey::new("chat pin persistence key").unwrap();
+    {
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    groups: three_groups(),
+                    ..StoredAccountState::default()
+                },
+                256,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        store.set_chat_pinned("11", true).unwrap();
+        store.set_chat_pinned("33", true).unwrap();
+    }
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let pinned = reopened
+        .chat_list_rows(ChatListQuery::default())
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.pinned)
+        .map(|row| (row.group_id_hex, row.pinned_position))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pinned,
+        vec![("33".to_owned(), Some(0)), ("11".to_owned(), Some(1))]
     );
 }

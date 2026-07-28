@@ -2,7 +2,8 @@
 
 use marmot_app::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListRow, ChatNotificationSettings, RuntimeChatListUpdate,
+    ChatListMessagePreview, ChatListRow, ChatNotificationSettings, ChatPinState,
+    RuntimeChatListUpdate,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
@@ -144,6 +145,8 @@ impl From<ChatConversationKind> for ChatConversationKindFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct ChatListRowFfi {
     pub group_id_hex: String,
+    pub pinned: bool,
+    pub pinned_position: Option<u32>,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub title: String,
@@ -207,6 +210,8 @@ impl From<ChatListRow> for ChatListRowFfi {
     fn from(value: ChatListRow) -> Self {
         Self {
             group_id_hex: value.group_id_hex,
+            pinned: value.pinned,
+            pinned_position: value.pinned_position,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             title: value.title,
@@ -231,6 +236,19 @@ impl From<ChatListRow> for ChatListRowFfi {
             muted_until_ms: value.muted_until_ms,
             leave_request_pending: value.leave_requested_at_ms.is_some(),
             leave_requested_at_ms: value.leave_requested_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatPinStateFfi {
+    pub ordered_group_ids: Vec<String>,
+}
+
+impl From<ChatPinState> for ChatPinStateFfi {
+    fn from(value: ChatPinState) -> Self {
+        Self {
+            ordered_group_ids: value.ordered_group_ids,
         }
     }
 }
@@ -271,6 +289,10 @@ pub enum ChatListSubscriptionUpdateFfi {
         trigger: ChatListUpdateTriggerFfi,
         group_id_hex: String,
     },
+    Snapshot {
+        trigger: ChatListUpdateTriggerFfi,
+        rows: Vec<ChatListRowFfi>,
+    },
 }
 
 impl From<RuntimeChatListUpdate> for ChatListSubscriptionUpdateFfi {
@@ -286,6 +308,10 @@ impl From<RuntimeChatListUpdate> for ChatListSubscriptionUpdateFfi {
             } => Self::RemoveRow {
                 trigger: trigger.into(),
                 group_id_hex,
+            },
+            RuntimeChatListUpdate::Snapshot { trigger, rows } => Self::Snapshot {
+                trigger: trigger.into(),
+                rows: rows.into_iter().map(Into::into).collect(),
             },
         }
     }
@@ -304,6 +330,7 @@ pub enum ChatListUpdateTriggerFfi {
     MuteChanged,
     ConversationKindChanged,
     LatestMessageDeliveryChanged,
+    PinOrderChanged,
     SnapshotRefresh,
     Removed,
 }
@@ -328,6 +355,7 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
             marmot_app::ChatListUpdateTrigger::LatestMessageDeliveryChanged => {
                 Self::LatestMessageDeliveryChanged
             }
+            marmot_app::ChatListUpdateTrigger::PinOrderChanged => Self::PinOrderChanged,
             marmot_app::ChatListUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,
             marmot_app::ChatListUpdateTrigger::Removed => Self::Removed,
         }
@@ -341,6 +369,8 @@ mod tests {
     fn sample_row() -> ChatListRow {
         ChatListRow {
             group_id_hex: "11".to_owned(),
+            pinned: false,
+            pinned_position: None,
             archived: false,
             pending_confirmation: false,
             title: "Marmot Lab".to_owned(),

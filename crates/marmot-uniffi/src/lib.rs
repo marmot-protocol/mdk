@@ -50,7 +50,7 @@ pub use conversions::{
     BackgroundNotificationCollectionFfi, ChatConversationKindFfi, ChatListAttachmentKindFfi,
     ChatListAvatarFfi, ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
-    CursorPersistenceFfi, EncryptedMediaVersionFfi, GroupEvolutionStatusFfi,
+    ChatPinStateFfi, CursorPersistenceFfi, EncryptedMediaVersionFfi, GroupEvolutionStatusFfi,
     GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
     GroupSystemEventFfi, HostPerformanceOperationFfi, HostPerformanceOutcomeFfi,
     KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi, MaintenanceObligationFfi,
