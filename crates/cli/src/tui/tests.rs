@@ -7587,6 +7587,39 @@ fn group_detail_frame_shows_members_with_badges_and_relays() {
 }
 
 #[test]
+fn group_detail_pane_scrolls_the_selected_member_into_view() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    // A member list far taller than the pane, with the selection at the bottom.
+    let mut members: Vec<GroupMemberRow> = (0..40)
+        .map(|index| GroupMemberRow {
+            member_id: format!("id{index:02}"),
+            npub: format!("npubmember{index:02}"),
+            is_admin: false,
+            is_self: false,
+        })
+        .collect();
+    members[39].npub = "npubLASTMEMBER".to_owned();
+    let selected = members.len() - 1;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: "the ops".to_owned(),
+        members,
+        relays: vec!["wss://relay.example".to_owned()],
+        account_is_admin: true,
+        admin_count: 1,
+        selected,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("npubLASTMEMBER"),
+        "the selected member renders inside the pane"
+    );
+}
+
+#[test]
 fn daemon_start_args_forward_first_run_relays() {
     assert_eq!(
         daemon_start_args(&[], &[]),
@@ -7939,6 +7972,32 @@ fn start_opens_the_account_picker_with_several_accounts() {
     assert!(
         !app.entered_main,
         "the startup picker has no active main yet"
+    );
+}
+
+#[test]
+fn account_picker_scrolls_the_selected_account_into_view() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    // More accounts than the picker card can show, with the selection last.
+    app.accounts = (0..40)
+        .map(|index| AccountRow {
+            account_id: format!("{index:064}"),
+            npub: format!("npubaccount{index:02}"),
+            display_name: Some(if index == 39 {
+                "LASTACCOUNT".to_owned()
+            } else {
+                format!("account{index:02}")
+            }),
+            local_signing: true,
+        })
+        .collect();
+    app.picker_selection = app.accounts.len() - 1;
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("LASTACCOUNT"),
+        "the highlighted account renders inside the picker card"
     );
 }
 
@@ -8677,6 +8736,37 @@ fn popup_rect_clamps_to_a_small_area() {
 }
 
 #[test]
+fn picker_popup_scrolls_the_selected_row_into_view() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    // More rows than the screen can hold, so the popup clamps to the area and
+    // the highlighted row falls outside the drawn body without a scroll offset.
+    let items: Vec<PickerItem> = (0..40)
+        .map(|index| PickerItem {
+            id: format!("id{index:02}"),
+            label: if index == 39 {
+                "LASTCHOICE".to_owned()
+            } else {
+                format!("choice{index:02}")
+            },
+        })
+        .collect();
+    let selected = items.len() - 1;
+    app.popup = Some(Popup::Picker {
+        purpose: PickerPurpose::Invites,
+        title: "Pending Invites".to_owned(),
+        items,
+        selected,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("LASTCHOICE"),
+        "the selected picker row renders inside the popup"
+    );
+}
+
+#[test]
 fn popup_body_lines_color_confirm_yellow_and_logout_red() {
     let confirm = Popup::Confirm {
         purpose: ConfirmPurpose::LeaveGroup {
@@ -8685,7 +8775,7 @@ fn popup_body_lines_color_confirm_yellow_and_logout_red() {
         title: "Leave Group".to_owned(),
         body: vec!["Leave ops-room?".to_owned()],
     };
-    let lines = popup_body_lines(&confirm);
+    let lines = popup_body_lines(&confirm).lines;
     assert_eq!(
         lines[0].spans[0].style.fg,
         Some(Color::Yellow),
@@ -8701,7 +8791,7 @@ fn popup_body_lines_color_confirm_yellow_and_logout_red() {
         body: vec!["This permanently destroys the signing key.".to_owned()],
         input: Input::default(),
     };
-    let lines = popup_body_lines(&logout);
+    let lines = popup_body_lines(&logout).lines;
     assert_eq!(
         lines[0].spans[0].style.fg,
         Some(Color::Red),
@@ -10276,6 +10366,7 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
     );
 
     let rendered = user_search_lines(view, false)
+        .lines
         .iter()
         .map(|line| {
             line.spans
@@ -10293,6 +10384,46 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
         rendered.matches("[following]").count(),
         1,
         "only the followed row is badged; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn user_search_pane_scrolls_the_whole_selected_row_into_view() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::UserSearch;
+    // Two lines per result, so a result list far taller than the pane needs the
+    // attribution line visible too — not just the label the marker sits on.
+    let results: Vec<UserSearchResultRow> = (0..30)
+        .map(|index| UserSearchResultRow {
+            pubkey: format!("{index:064}"),
+            npub: format!("npubresult{index:02}"),
+            display_name: Some(if index == 29 {
+                "LASTRESULT".to_owned()
+            } else {
+                format!("result{index:02}")
+            }),
+            matched_field: "name".to_owned(),
+            match_quality: "prefix".to_owned(),
+            radius: 2,
+            following: false,
+        })
+        .collect();
+    let selected = results.len() - 1;
+    app.user_search = Some(UserSearchView {
+        query: Input::default(),
+        results,
+        selected,
+        focus: UserSearchFocus::Results,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("LASTRESULT"),
+        "the selected result renders inside the pane"
+    );
+    assert!(
+        rendered.contains("name · prefix · radius 2"),
+        "the selected result's attribution line renders with it"
     );
 }
 
@@ -10771,6 +10902,30 @@ fn profile_frame_shows_fields_and_follows() {
     assert!(rendered.contains("Follows"), "follows section present");
     assert!(rendered.contains("npubBOB"), "follow present");
     assert!(rendered.contains("(unset)"), "unset field rendered");
+}
+
+#[test]
+fn profile_pane_scrolls_the_selected_follow_into_view() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Profile;
+    // A follow list far taller than the pane, with the selection at the bottom.
+    let mut follows: Vec<String> = (0..60)
+        .map(|index| format!("npubfollow{index:02}"))
+        .collect();
+    follows[59] = "npubLASTFOLLOW".to_owned();
+    let mut view = ProfileView {
+        npub: "npubSELF".to_owned(),
+        follows,
+        ..ProfileView::default()
+    };
+    view.selected = view.row_count() - 1;
+    app.profile_view = Some(view);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("npubLASTFOLLOW"),
+        "the selected follow renders inside the pane"
+    );
 }
 
 #[test]

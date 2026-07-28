@@ -94,6 +94,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The Nostr SDK failed-signature regression test now observes EOSE under one
   bounded CI-safe window, avoiding sharded CI flakes without weakening
   failed-event non-emission and non-caching assertions.
+- `wn tui` now scrolls the highlighted row into view on the account picker, the
+  profile, group-detail, and user-search panes, and the picker popup. Past
+  roughly a screenful of rows the highlight fell outside the drawn area, which
+  made the selection invisible rather than merely awkward — the marker and the
+  highlight are drawn inside each row.
 
 ## [0.9.11] - 2026-08-09
 
