@@ -51,6 +51,12 @@ use tls_codec::{Deserialize as _, Serialize as _};
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+#[derive(Clone, Copy)]
+enum SendAcceptance {
+    Prepare,
+    QueueAppMessage,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct SystemWallClock;
 
@@ -680,6 +686,30 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
+        self.accept_send_with_audit_context(intent, context, SendAcceptance::Prepare)
+            .await
+    }
+
+    pub async fn queue_app_message_with_audit_context(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+        context: Option<AuditEventContext>,
+    ) -> Result<SendResult, EngineError> {
+        self.accept_send_with_audit_context(
+            SendIntent::AppMessage { group_id, payload },
+            context,
+            SendAcceptance::QueueAppMessage,
+        )
+        .await
+    }
+
+    async fn accept_send_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: Option<AuditEventContext>,
+        acceptance: SendAcceptance,
+    ) -> Result<SendResult, EngineError> {
         let operation_id = self.next_audit_operation_id();
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
         let group_ref = crate::audit_helpers::send_intent_group_ref(&intent);
@@ -694,7 +724,15 @@ impl<S: StorageProvider> Engine<S> {
             },
         });
         self.current_audit_context = Some(context.clone());
-        let result = self.do_send(intent).await;
+        let result = match acceptance {
+            SendAcceptance::Prepare => self.do_send(intent).await,
+            SendAcceptance::QueueAppMessage => {
+                let SendIntent::AppMessage { group_id, payload } = intent else {
+                    unreachable!("queue app-message acceptance constructs an AppMessage intent")
+                };
+                self.do_queue_app_message(group_id, payload)
+            }
+        };
         self.current_audit_context = None;
         match &result {
             Ok(send_result) => {
@@ -2355,6 +2393,15 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         self.send_with_audit_context(intent, None).await
+    }
+
+    async fn queue_app_message(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        self.queue_app_message_with_audit_context(group_id, payload, None)
+            .await
     }
 
     async fn advance_convergence(

@@ -1675,20 +1675,31 @@ impl AppClient {
         }
 
         let effects = match async {
-            self.sync_runtime_groups().await?;
-            let send_intent = SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload,
-            };
-            // Thread the human-action context through the engine so the send's
-            // audit rows carry `human_action`, matching create_group/invite/etc.
-            let effects = match &audit_context {
-                Some(context) => {
+            let effects = match self.sync_runtime_groups().await {
+                Ok(()) => {
+                    let send_intent = SendIntent::AppMessage {
+                        group_id: group_id.clone(),
+                        payload,
+                    };
+                    // Thread the human-action context through the engine so the
+                    // send's audit rows carry `human_action`, matching
+                    // create_group/invite/etc.
+                    match &audit_context {
+                        Some(context) => {
+                            self.runtime
+                                .send_with_audit_context(send_intent, context.clone())
+                                .await?
+                        }
+                        None => self.runtime.send(send_intent).await?,
+                    }
+                }
+                Err(error) if error.is_account_not_active() => {
+                    let context = audit_context.clone().unwrap_or_default();
                     self.runtime
-                        .send_with_audit_context(send_intent, context.clone())
+                        .queue_app_message_with_audit_context(group_id.clone(), payload, context)
                         .await?
                 }
-                None => self.runtime.send(send_intent).await?,
+                Err(error) => return Err(error),
             };
             fail_if_publish_failed(&effects)?;
             Ok::<_, AppError>(effects)
@@ -1747,7 +1758,7 @@ impl AppClient {
         }
         self.app.save_state(&self.state)?;
         self.queue_own_group_system_projection_updates(&effects);
-        if notification_trigger_for_intent(&intent).is_some() {
+        if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,

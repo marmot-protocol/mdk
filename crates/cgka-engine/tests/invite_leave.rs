@@ -1306,6 +1306,26 @@ async fn applying_removal_commit_purges_queued_outbound_intents() {
             .is_empty(),
         "marking the copy removed must discard queued outbound intents"
     );
+    let payload = app_payload_for(&bob, b"must not queue after removal");
+    let error = bob
+        .queue_app_message(group_id.clone(), payload)
+        .await
+        .expect_err("authoritative removal must reject forced local queueing");
+    assert!(
+        matches!(
+            error,
+            EngineError::InvalidTransition(ref transition)
+                if transition.from == "Removed"
+        ),
+        "removed copy should fail through the authoritative gate, got {error:?}"
+    );
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "a rejected post-removal send must not recreate queued plaintext"
+    );
 }
 
 /// #376 review follow-up: realization itself purges queued intents, and the

@@ -561,6 +561,28 @@ async fn run_app_runtime_account_worker(
                 &account_label,
                 message.clone(),
             );
+            // Hydration may already have scheduled durable queued intents from
+            // a prior process. Initial transport activation failed before the
+            // normal sync path could drain those engine effects, so transfer
+            // their scheduling edge into the app client now. Queued intents do
+            // not require transport merely to drain; any incidental fanout
+            // failure remains retryable and is reported separately.
+            match client.drain_pending_session_events().await {
+                Ok(summary) => {
+                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                }
+                Err(drain_error) => {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message(
+                            "runtime startup queued-work wake failed",
+                            &drain_error,
+                        ),
+                    );
+                }
+            }
             Err(message)
         }
     };
@@ -650,6 +672,7 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                     Err(err) => {
+                        let account_inactive = err.is_account_not_active();
                         scheduled_convergence.schedule_retry_groups(groups);
                         publish_app_runtime_account_error(
                             &events,
@@ -657,6 +680,19 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("scheduled convergence sync failed", &err),
                         );
+                        if account_inactive
+                            && let Err(activation_error) = client.prepare_transport().await
+                        {
+                            publish_app_runtime_account_error(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                account_error_message(
+                                    "scheduled convergence transport reactivation failed",
+                                    &activation_error,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -770,11 +806,36 @@ async fn run_app_runtime_account_worker(
                                 }
                                 app.finish_client_open_network_maintenance(&mut reopened)
                                     .await;
+                                match reopened.drain_pending_session_events().await {
+                                    Ok(summary) => {
+                                        publish_app_runtime_summary(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &summary,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message(
+                                                "runtime restart queued-work wake failed",
+                                                &error,
+                                            ),
+                                        );
+                                    }
+                                }
                                 let pending = reopened
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;
                                 scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
                                 client = reopened;
+                                schedule_pending_convergence_groups(
+                                    &mut scheduled_convergence,
+                                    &mut client,
+                                );
                             }
                             Err(setup_err) => {
                                 publish_app_runtime_account_error(
