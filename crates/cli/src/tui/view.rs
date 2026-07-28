@@ -831,9 +831,18 @@ impl TuiApp {
                 })
                 .collect()
         };
-        frame.render_widget(
+        // Drive the list with a ListState synced to the selection so the
+        // highlighted account always scrolls into view, exactly as the chats
+        // sidebar does. A plain `render_widget` pins the offset at 0, which
+        // hides the marker once the account list outgrows the card.
+        let mut state = ListState::default();
+        if !self.accounts.is_empty() {
+            state.select(Some(self.picker_selection.min(self.accounts.len() - 1)));
+        }
+        frame.render_stateful_widget(
             List::new(items).block(panel_block("Select Account", true)),
             area,
+            &mut state,
         );
     }
 
