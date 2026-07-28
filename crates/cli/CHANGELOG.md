@@ -60,6 +60,65 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `users search` now counts people you share a group with as socially close
+  (radius 1) when a daemon is running, which includes every search from
+  `wn tui`. Previously `users` was the one account-touching command the daemon
+  did not answer with its app runtime, so it never saw group membership even
+  with `wnd` alive. A standalone `wn` with no daemon is unchanged: it searches
+  the follow graph, which is all it can know without a live MLS session, and
+  starts no session to find out. Watch-only and signed-out accounts are
+  unaffected — they have no MLS sessions, so they are never asked.
+- MarmotKit user search now treats people you share a group with as radius 1,
+  alongside the accounts you follow: sharing a group is social proximity even
+  when neither of you has followed the other. Only groups you are currently a
+  member of contribute — an invite you have not accepted, a group you left or
+  were removed from, and a group the engine froze all bring nobody. Archived
+  groups do contribute, since archival is a presentation choice rather than a
+  change in who you know. No host API change. `wn users search` is unaffected:
+  it runs without an app runtime and so has no live MLS session to read
+  membership from.
+- User search can fall back to configured seed accounts when the searcher's own
+  web of trust is empty, so a brand-new account that follows nobody and shares
+  no group gets results instead of nothing. Seeds are consulted only when the
+  searcher's own graph yields nothing at all — anyone with follows or a shared
+  group never has a stranger's network folded into their results. Matches found
+  this way report `radius` 255, meaning off-graph: they are one hop from the
+  seed, not from the searcher, and presenting them as follows would make the
+  provenance every surface renders a lie. They sort last. Off by default; whose
+  network to fall back to is a deployment decision.
+- User search now follows the outbox model: an account whose `kind:0` profile
+  is not on any relay you read is resolved from the write relays its own NIP-65
+  list advertises, so following someone is enough to find them. Relay URLs
+  discovered this way are checked against the same host-safety rule configured
+  relays face, but one unusable entry drops itself instead of the whole list —
+  nobody can make themselves unresolvable, or take the path down for others, by
+  publishing a single bad URL. Bounded on both axes: at most four write relays
+  are honoured per account and at most eight distinct relays are queried per
+  batch, widest coverage first, and each relay is asked only about accounts
+  that named it.
+- `users search --json` now reports whether the traversal actually finished:
+  `complete` is `false` and `incomplete_reason` names the cause
+  (`radius_timeout` or `radius_truncated`) when a radius ran out of time or a
+  layer hit the candidate cap. The matches are still returned — they are valid,
+  just not all of them — and the human-readable output gains a
+  `(partial results: …)` line. Previously both cases returned a short list
+  indistinguishable from a complete one.
+- `users search --radius` now reaches radius 2 (follows-of-follows). The
+  default stays `0..1`: radius 2 reads a contact list for every account you
+  follow, so it is opt-in rather than a silent slowdown on every search. Each
+  layer is bounded — at most 25,000 candidates, contact lists read from the
+  device first and otherwise fetched in batches — and a layer that hits the cap
+  reports a new `radius_truncated` update rather than passing a short result
+  list off as complete.
+- MarmotKit now exposes streaming web-of-trust user search: `search_users`
+  returns a `UserSearchSubscription` whose `next_update` yields matches as each
+  social-distance radius resolves, ending with a `SearchCompleted` trigger and
+  then `null`. Dropping the subscription cancels the traversal. Results carry
+  the searcher-relative `radius` plus typed `MatchedField`/`MatchQuality`
+  attribution rather than strings, so hosts branch on checked cases. People
+  found by search are deliberately not added to the local directory — a search
+  result is not a relationship, and `user_profile` still answers only for
+  accounts the user has actually interacted with.
 - MarmotKit now exposes an engine-owned, per-account disappearing-message
   retention sweep with a caller-supplied Unix-millisecond clock. The sweep
   preserves the Android background policy's current-timer gating, five-second
@@ -146,6 +205,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   leaves cannot race past a caller-side precheck and lose the reason. Forensic
   audit records and conformance observations for this case change from
   `invalid_transition` to `leave_already_requested`.
+- `users search` now searches your live follow graph instead of only the locally cached directory, so it finds people
+  whose profile has never been cached on this device. Results still stream out of the app runtime ranked by social
+  distance, and the command's JSON shape is unchanged (`users[]` rows keep `account_id_hex`, `npub`, `radius`,
+  `matched_field`, `match_quality`, and `profile`). Two consequences worth knowing: `--radius` defaults to `0..1`
+  (you, then who you follow), and a traversal that *fails* reports `user_search_failed` rather than returning a short
+  list that looks complete. Discovered strangers are
+  never written into the local directory, so `users show` still only knows accounts you have actually interacted with.
 - TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
   after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders
   when that pane holds focus or while an interaction is armed — arming `/react`/`/reply`/`/delete` moves focus to the

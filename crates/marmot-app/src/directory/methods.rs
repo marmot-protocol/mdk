@@ -22,13 +22,14 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::directory::records::{
     DirectoryKeyPackage, FetchedFollowList, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    field_rank, follow_list_from_record, latest_follow_list_from_records,
-    latest_fresh_profiles_from_records, match_quality_rank, profile_content_json,
-    profile_from_record, public_directory_user_record, select_newer_directory_entry,
-    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
-    user_record_match,
+    follow_list_from_record, latest_follow_list_from_records, latest_fresh_profiles_from_records,
+    profile_content_json, profile_from_record, public_directory_user_record,
+    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
+    user_directory_record_from_public, user_record_match,
 };
-use crate::directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
+use crate::directory::{
+    DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
+};
 use crate::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
@@ -425,15 +426,7 @@ impl MarmotApp {
                 profile: record.profile.clone(),
             });
         }
-        results.sort_by(|a, b| {
-            a.radius
-                .cmp(&b.radius)
-                .then_with(|| {
-                    match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
-                })
-                .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
-                .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
-        });
+        sort_user_search_results(&mut results);
         if let Some(limit) = search.limit {
             results.truncate(limit);
         }
@@ -489,7 +482,7 @@ impl MarmotApp {
             .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
 
-    async fn fetch_follow_list_for_account_id(
+    pub(crate) async fn fetch_follow_list_for_account_id(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
@@ -574,7 +567,7 @@ impl MarmotApp {
         Ok(())
     }
 
-    async fn fetch_events_for_account_ids(
+    pub(crate) async fn fetch_events_for_account_ids(
         &self,
         account_ids: &[String],
         kind: u64,
@@ -597,6 +590,26 @@ impl MarmotApp {
 
     pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
+    }
+
+    /// Accounts to fall back to when a searcher's own web of trust is empty.
+    /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
+    pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
+        &self.config.directory_search_fallback_seeds
+    }
+
+    /// Narrow relay endpoints discovered from another account's published
+    /// relay list to the ones this device is willing to dial.
+    ///
+    /// Routes to the same host-safety rule configured endpoints face; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
+    /// filters rather than fails.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
+            .retain_safe_discovered_endpoints(endpoints, "directory write-relay discovery")
     }
 
     pub(crate) fn directory_source_relays(
@@ -657,6 +670,9 @@ impl MarmotApp {
         let mut seen = HashSet::new();
         let mut frontier = vec![parse_account_id_hex(searcher_account_id_hex)?];
         let caches = self.directory_caches()?;
+        // One instant for the whole traversal: a layer must not disagree with
+        // itself about whether a cached profile has expired.
+        let now = crate::unix_now_seconds() as i64;
 
         for radius in 0..=radius_end {
             let mut next = Vec::new();
@@ -671,7 +687,8 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) = Self::directory_search_record_from_caches(&caches, &account_id)?
+                let Some(record) =
+                    Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
@@ -725,9 +742,10 @@ impl MarmotApp {
     fn directory_search_record_from_caches(
         caches: &[DirectoryCache],
         account_id_hex: &str,
+        now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         for cache in caches {
-            if let Some(entry) = cache.search_record(account_id_hex)? {
+            if let Some(entry) = cache.search_record(account_id_hex, now)? {
                 return Ok(Some(entry));
             }
         }
@@ -1167,7 +1185,7 @@ impl MarmotApp {
         self.clean_future_dated_directory_caches_once(&accounts)
     }
 
-    fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
             npub: npub_for_account_id_lossy(account_id_hex),

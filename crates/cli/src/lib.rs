@@ -531,7 +531,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
         }
         Command::Settings { command } => commands::settings::settings_command(&home, command),
         Command::Users { command } => {
-            commands::users::users_command(&account_home, &app, command, account_flag)
+            commands::users::users_command(&account_home, &app, command, account_flag).await
         }
         Command::Notifications { command } => {
             commands::notifications::notifications_command(command)

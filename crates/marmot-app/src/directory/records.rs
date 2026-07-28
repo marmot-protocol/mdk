@@ -88,8 +88,8 @@ pub struct UserDirectorySearchResult {
     pub account_id_hex: String,
     pub npub: String,
     pub radius: u8,
-    pub matched_field: String,
-    pub match_quality: String,
+    pub matched_field: MatchedField,
+    pub match_quality: MatchQuality,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<UserProfileMetadata>,
 }
@@ -324,10 +324,50 @@ pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String
     relays
 }
 
-#[derive(Clone, Debug)]
+/// How closely a record's field matched the query, best first.
+///
+/// The declaration order *is* the ranking order — [`Ord`] is derived, so a
+/// new variant slots into the ranking by where it is written.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchQuality {
+    /// The whole field equals the query.
+    Exact,
+    /// The field starts with the query.
+    Prefix,
+    /// The query appears somewhere in the field.
+    Contains,
+}
+
+/// Which field of a record the query matched, most identifying first.
+///
+/// The declaration order *is* the ranking order (see [`MatchQuality`]): a
+/// name match outranks an `about` match of the same quality, and the two
+/// pubkey spellings rank last because matching them is incidental rather
+/// than a search for a person by that name.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchedField {
+    Name,
+    Nip05,
+    DisplayName,
+    About,
+    Npub,
+    Pubkey,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct UserRecordMatch {
-    pub(crate) field: String,
-    pub(crate) quality: String,
+    pub(crate) field: MatchedField,
+    pub(crate) quality: MatchQuality,
+}
+
+impl UserRecordMatch {
+    /// Ranking key: quality first, then which field matched. Sorting by this
+    /// orders best match first.
+    pub(crate) fn rank(&self) -> (MatchQuality, MatchedField) {
+        (self.quality, self.field)
+    }
 }
 
 pub(crate) fn user_record_match(
@@ -335,21 +375,21 @@ pub(crate) fn user_record_match(
     query: &str,
 ) -> Option<UserRecordMatch> {
     let mut candidates = vec![
-        ("npub", record.npub.as_str()),
-        ("pubkey", record.account_id_hex.as_str()),
+        (MatchedField::Npub, record.npub.as_str()),
+        (MatchedField::Pubkey, record.account_id_hex.as_str()),
     ];
     if let Some(profile) = &record.profile {
         if let Some(name) = profile.name.as_deref() {
-            candidates.push(("name", name));
+            candidates.push((MatchedField::Name, name));
         }
         if let Some(nip05) = profile.nip05.as_deref() {
-            candidates.push(("nip05", nip05));
+            candidates.push((MatchedField::Nip05, nip05));
         }
         if let Some(display_name) = profile.display_name.as_deref() {
-            candidates.push(("display_name", display_name));
+            candidates.push((MatchedField::DisplayName, display_name));
         }
         if let Some(about) = profile.about.as_deref() {
-            candidates.push(("about", about));
+            candidates.push((MatchedField::About, about));
         }
     }
 
@@ -358,45 +398,17 @@ pub(crate) fn user_record_match(
         .filter_map(|(field, value)| {
             let value = value.to_lowercase();
             let quality = if value == query {
-                "exact"
+                MatchQuality::Exact
             } else if value.starts_with(query) {
-                "prefix"
+                MatchQuality::Prefix
             } else if value.contains(query) {
-                "contains"
+                MatchQuality::Contains
             } else {
                 return None;
             };
-            Some(UserRecordMatch {
-                field: field.to_owned(),
-                quality: quality.to_owned(),
-            })
+            Some(UserRecordMatch { field, quality })
         })
-        .min_by(|a, b| {
-            match_quality_rank(&a.quality)
-                .cmp(&match_quality_rank(&b.quality))
-                .then_with(|| field_rank(&a.field).cmp(&field_rank(&b.field)))
-        })
-}
-
-pub(crate) fn match_quality_rank(quality: &str) -> u8 {
-    match quality {
-        "exact" => 0,
-        "prefix" => 1,
-        "contains" => 2,
-        _ => 3,
-    }
-}
-
-pub(crate) fn field_rank(field: &str) -> u8 {
-    match field {
-        "name" => 0,
-        "nip05" => 1,
-        "display_name" => 2,
-        "about" => 3,
-        "npub" => 4,
-        "pubkey" => 5,
-        _ => 6,
-    }
+        .min_by_key(UserRecordMatch::rank)
 }
 
 pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
@@ -540,6 +552,64 @@ mod tests {
     use transport_nostr_peeler::NostrTransportEvent;
 
     use super::*;
+
+    /// The `matched_field` / `match_quality` wire strings are a published
+    /// contract: `wn users search --json` emits them and the TUI parses them
+    /// back (`cli/src/tui/model.rs`). They must survive any change to how the
+    /// two are modelled in Rust, so pin the serialized form rather than the
+    /// in-memory type.
+    #[test]
+    fn search_result_serializes_match_attribution_as_snake_case_strings() {
+        let result = UserDirectorySearchResult {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1example".to_owned(),
+            radius: 1,
+            matched_field: MatchedField::DisplayName,
+            match_quality: MatchQuality::Exact,
+            profile: None,
+        };
+
+        let json = serde_json::to_value(&result).expect("search result serializes");
+
+        assert_eq!(json["matched_field"], "display_name");
+        assert_eq!(json["match_quality"], "exact");
+        assert_eq!(
+            serde_json::from_value::<UserDirectorySearchResult>(json).expect("round-trips"),
+            result
+        );
+    }
+
+    /// Every wire spelling the CLI has ever emitted must still parse, in both
+    /// directions — a rename here would silently break an installed TUI.
+    #[test]
+    fn every_match_attribution_spelling_round_trips() {
+        for (field, wire) in [
+            (MatchedField::Name, "name"),
+            (MatchedField::Nip05, "nip05"),
+            (MatchedField::DisplayName, "display_name"),
+            (MatchedField::About, "about"),
+            (MatchedField::Npub, "npub"),
+            (MatchedField::Pubkey, "pubkey"),
+        ] {
+            assert_eq!(serde_json::to_value(field).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MatchedField>(serde_json::json!(wire)).unwrap(),
+                field
+            );
+        }
+
+        for (quality, wire) in [
+            (MatchQuality::Exact, "exact"),
+            (MatchQuality::Prefix, "prefix"),
+            (MatchQuality::Contains, "contains"),
+        ] {
+            assert_eq!(serde_json::to_value(quality).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MatchQuality>(serde_json::json!(wire)).unwrap(),
+                quality
+            );
+        }
+    }
 
     #[test]
     fn profile_string_fields_strip_control_characters() {

@@ -912,15 +912,15 @@ pub(crate) enum UsersCommand {
         #[arg(value_name = "NPUB_OR_HEX", help = "User to show")]
         pubkey: String,
     },
-    #[command(about = "Search known users in the local directory")]
+    #[command(about = "Search users across your follow graph")]
     Search {
         #[arg(help = "Search query")]
         query: String,
         #[arg(
             long,
-            default_value = "0..2",
+            default_value = "0..1",
             value_parser = parse_radius,
-            help = "Directory graph radius as START..END"
+            help = "Follow-graph radius as START..END (0 is you, 1 who you follow, 2 follows-of-follows)"
         )]
         radius: (u8, u8),
     },

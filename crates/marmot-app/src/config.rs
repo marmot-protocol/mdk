@@ -77,6 +77,20 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides` feature is enabled; normal debug and release
     /// builds ignore it so hosts cannot fork the pinned v1 baseline (mdk#970).
     pub dev_settlement_quiescence_ms: Option<u64>,
+    /// Accounts to search outward from when the searcher's own web of trust is
+    /// empty, as pubkey hex.
+    ///
+    /// A brand-new account follows nobody and shares no group, so a
+    /// personalized search over it can only ever answer "nothing". Seeding a
+    /// well-connected account gives the traversal somewhere to start. Those
+    /// people are not close to the searcher in any measurable sense, so their
+    /// matches are reported at `OFF_GRAPH_SEARCH_RADIUS` rather than presented
+    /// as follows -- see that constant for why the distinction is load-bearing.
+    ///
+    /// Empty by default: whose network to fall back to is a deployment
+    /// decision, not protocol behaviour, and it is only consulted when the
+    /// searcher has no graph of their own.
+    pub directory_search_fallback_seeds: Vec<String>,
 }
 
 /// Compiled or app-level default service URLs for production telemetry export
@@ -107,6 +121,7 @@ impl Default for MarmotAppConfig {
             allow_loopback_blob_endpoints: false,
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
+            directory_search_fallback_seeds: Vec::new(),
         }
     }
 }
@@ -145,6 +160,13 @@ impl MarmotAppConfig {
     /// must leave this unset.
     pub fn with_allow_loopback_relay_endpoints(mut self, allow: bool) -> Self {
         self.allow_loopback_relay_endpoints = allow;
+        self
+    }
+
+    /// Set the accounts to fall back to when a searcher's own graph is empty.
+    /// See [`Self::directory_search_fallback_seeds`].
+    pub fn with_directory_search_fallback_seeds(mut self, seeds: Vec<String>) -> Self {
+        self.directory_search_fallback_seeds = seeds;
         self
     }
 

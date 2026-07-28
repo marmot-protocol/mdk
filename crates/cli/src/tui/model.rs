@@ -2865,8 +2865,8 @@ mod timeline {
             self.statuses.and_then(|statuses| statuses.get(hash))
         }
 
-        /// Decide how an attachment lays out. The placeholder ladder mirrors
-        /// `tui.md`: `[img name]` before download and when the terminal has no
+        /// Decide how an attachment lays out. The placeholder ladder is
+        /// `[img name]` before download and when the terminal has no
         /// image protocol, `[downloading name...]`, `[loading name...]` while
         /// decoding, `[name failed: err]` on error, and a reserved image block
         /// once `Ready`.

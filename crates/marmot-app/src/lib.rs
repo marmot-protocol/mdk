@@ -134,8 +134,10 @@ pub use config::{
     RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
-    DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
-    UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
+    DirectoryKeyPackage, MatchQuality, MatchedField, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
+    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
+    UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
     MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
@@ -4191,7 +4193,7 @@ impl MarmotApp {
         self.root.join(SHARED_DB_FILE)
     }
 
-    fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
+    pub(crate) fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
         if let Some(storage) = self
             .shared_storage
             .lock()

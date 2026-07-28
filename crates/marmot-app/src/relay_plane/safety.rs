@@ -74,6 +74,54 @@ impl RelaySafetyPolicy {
         Ok(request)
     }
 
+    /// Keep the endpoints that pass the host-safety rule and drop the rest.
+    ///
+    /// The counterpart to [`Self::sanitize_endpoints`] for endpoints that were
+    /// *discovered* rather than configured — a relay list published by another
+    /// account, say. Sanitizing is fail-closed because a configured relay set
+    /// is the operator's stated intent, and one bad entry there is a mistake
+    /// worth surfacing. A published list is untrusted input: rejecting all of
+    /// it over one bad entry would let anyone make themselves unresolvable by
+    /// appending a single loopback URL. Every endpoint is checked against the
+    /// same rule; only the response to a rejection differs.
+    ///
+    /// The result still passes through [`Self::sanitize_endpoints`] at the
+    /// dial chokepoint, so this narrows what is offered rather than replacing
+    /// the check.
+    pub(crate) fn retain_safe_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        let offered = endpoints.len();
+        let mut kept: Vec<TransportEndpoint> = Vec::new();
+        for endpoint in endpoints {
+            let Ok(relay_url) = RelayUrl::parse(endpoint.as_str().trim()) else {
+                continue;
+            };
+            if reject_unsafe_relay_host(&relay_url, self.allow_loopback).is_err() {
+                continue;
+            }
+            let endpoint = TransportEndpoint(relay_url.to_string());
+            if !kept.contains(&endpoint) {
+                kept.push(endpoint);
+            }
+        }
+        if kept.len() != offered {
+            // Aggregate counts only: a rejected relay URL is somebody's
+            // published data and never reaches a log line.
+            tracing::debug!(
+                target: "marmot_app::relay_plane",
+                method = "retain_safe_endpoints",
+                context = context,
+                offered = offered,
+                kept = kept.len(),
+                "dropped discovered relay endpoints that failed the host-safety rule"
+            );
+        }
+        kept
+    }
+
     pub(crate) fn sanitize_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -148,6 +196,58 @@ mod tests {
         urls.iter()
             .map(|url| TransportEndpoint((*url).to_owned()))
             .collect()
+    }
+
+    /// Relay lists published by other accounts are input, not configuration.
+    /// One hostile or malformed entry in somebody's NIP-65 list must not deny
+    /// every other relay they publish -- otherwise anyone could make themselves
+    /// unresolvable, or take the outbox path down for everyone, by adding a
+    /// single bad URL. The host rule applied to each entry is the same one
+    /// `sanitize_endpoints` enforces; only the answer to a rejection differs.
+    #[test]
+    fn discovered_endpoints_drop_the_unsafe_and_keep_the_rest() {
+        let policy = RelaySafetyPolicy::default();
+
+        let kept = policy.retain_safe_endpoints(
+            endpoints(&[
+                "wss://good.example",
+                "ws://127.0.0.1:8080",
+                "not a url",
+                "wss://also-good.example",
+                "ws://169.254.169.254",
+            ]),
+            "test",
+        );
+
+        assert_eq!(
+            kept,
+            endpoints(&["wss://good.example", "wss://also-good.example"])
+        );
+    }
+
+    #[test]
+    fn discovered_endpoints_are_deduplicated() {
+        let policy = RelaySafetyPolicy::default();
+
+        let kept = policy.retain_safe_endpoints(
+            endpoints(&["wss://relay.example", "wss://relay.example"]),
+            "test",
+        );
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// A published list of only unsafe hosts yields nothing, rather than
+    /// falling back to anything the caller did not ask for.
+    #[test]
+    fn discovered_endpoints_can_all_be_dropped() {
+        let policy = RelaySafetyPolicy::default();
+
+        assert!(
+            policy
+                .retain_safe_endpoints(endpoints(&["ws://127.0.0.1", "ws://10.0.0.1"]), "test")
+                .is_empty()
+        );
     }
 
     #[test]
