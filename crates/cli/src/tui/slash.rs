@@ -77,6 +77,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "users" => Ok(SlashCommand::UsersSearch {
             query: (!rest.is_empty()).then(|| rest.join(" ")),
         }),
+        "search" => Ok(SlashCommand::MessageSearch {
+            query: (!rest.is_empty()).then(|| rest.join(" ")),
+        }),
         "stream" => parse_stream_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),

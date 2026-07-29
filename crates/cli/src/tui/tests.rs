@@ -2400,6 +2400,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         pending_mark_read: false,
         loading_chat: None,
         searching_users: None,
+        searching_messages: None,
         loading_group_detail: None,
         loading_invites: false,
         flick_countdown: None,
@@ -2416,6 +2417,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         pending_full_repaint: false,
         group_detail: None,
         user_search: None,
+        message_search: None,
         profile_view: None,
         relay_health: None,
         media: MediaState::new(),
@@ -10007,6 +10009,312 @@ fn user_search_runs_query_and_navigates_results() {
     assert_eq!(
         app.user_search.as_ref().unwrap().focus,
         UserSearchFocus::Query
+    );
+}
+
+/// A timeline-row JSON object in the shape `messages timeline search` returns,
+/// which is the same page shape `messages timeline list` returns.
+fn timeline_hit_json(message_id: &str, from: &str, text: &str, timeline_at: u64) -> String {
+    format!(
+        r#"{{"message_id":"{message_id}","direction":"received","from":"{from}","from_display_name":"{from}","plaintext":"{text}","timeline_at":{timeline_at},"received_at":{timeline_at},"deleted":false}}"#
+    )
+}
+
+/// An app with one chat open and its timeline loaded, ready to search.
+fn app_with_open_chat(client: WnClient, rows: &[(&str, &str)]) -> TuiApp {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(client, &account_id);
+    app.chats = vec![ChatRow {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        ..ChatRow::default()
+    }];
+    app.selected_chat = 0;
+    app.messages_account_id = Some(account_id);
+    app.messages_group_id = Some("g1".to_owned());
+    app.timeline = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (message_id, text))| {
+            parse_timeline_row(
+                &serde_json::from_str::<serde_json::Value>(&timeline_hit_json(
+                    message_id,
+                    "bob",
+                    text,
+                    1_700_000_000 + index as u64,
+                ))
+                .expect("row json"),
+            )
+            .expect("row parses")
+        })
+        .collect();
+    app
+}
+
+#[test]
+fn slash_search_runs_a_message_search_over_the_open_chat() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}],"has_more_before":false,"has_more_after":false,"query":"deploy"}}}}"#,
+        timeline_hit_json("m2", "bob", "the deploy is green", 1_700_000_001)
+    ));
+    let mut app = app_with_open_chat(client, &[("m1", "morning"), ("m2", "the deploy is green")]);
+
+    app.run_slash_command(parse_slash_command("/search deploy").expect("parses"))
+        .expect("slash search");
+    app.settle_effects(1);
+
+    assert_eq!(app.screen, Screen::MessageSearch);
+    let view = app.message_search.as_ref().expect("search view");
+    assert_eq!(view.query.value(), "deploy");
+    assert_eq!(view.results.len(), 1, "the hit folds in as a timeline row");
+    assert_eq!(view.results[0].message_id, "m2");
+    assert_eq!(view.results[0].plaintext, "the deploy is green");
+}
+
+#[test]
+fn message_search_navigates_hits_and_returns_to_the_query() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{},{}]}}}}"#,
+        timeline_hit_json("m1", "bob", "deploy one", 1_700_000_000),
+        timeline_hit_json("m2", "bob", "deploy two", 1_700_000_001)
+    ));
+    let mut app = app_with_open_chat(client, &[("m1", "deploy one"), ("m2", "deploy two")]);
+    app.open_message_search(None).expect("open search");
+    // Query focus: typed characters edit the query, so j/k are literal text here.
+    for character in "dej".chars() {
+        app.handle_key(char_key(character)).expect("type query");
+    }
+    assert_eq!(app.message_search.as_ref().unwrap().query.value(), "dej");
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .expect("fix the query");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("run search");
+    app.settle_effects(1);
+
+    // Newest first, so the later message leads.
+    {
+        let view = app.message_search.as_ref().expect("view");
+        assert_eq!(view.results.len(), 2);
+        assert_eq!(view.results[0].message_id, "m2");
+        assert_eq!(view.selected, 0);
+    }
+    app.handle_key(char_key('j')).expect("j down");
+    assert_eq!(app.message_search.as_ref().unwrap().selected, 1);
+    app.handle_key(char_key('k')).expect("k up");
+    assert_eq!(app.message_search.as_ref().unwrap().selected, 0);
+    app.handle_key(char_key('k')).expect("k to query");
+    assert_eq!(
+        app.message_search.as_ref().unwrap().focus,
+        MessageSearchFocus::Query,
+        "k at the top returns to the query"
+    );
+}
+
+#[test]
+fn a_stale_message_search_result_for_a_superseded_query_is_dropped() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}]}}}}"#,
+        timeline_hit_json("m1", "bob", "stale hit", 1_700_000_000)
+    ));
+    let mut app = app_with_open_chat(client, &[("m1", "stale hit")]);
+    app.open_message_search(Some("first".to_owned()))
+        .expect("open search");
+    // A second query supersedes the first before its page lands.
+    app.searching_messages = Some("second".to_owned());
+    app.settle_effects(1);
+
+    assert!(
+        app.message_search
+            .as_ref()
+            .expect("view")
+            .results
+            .is_empty(),
+        "the superseded query's page does not repopulate the list"
+    );
+    assert_eq!(
+        app.searching_messages.as_deref(),
+        Some("second"),
+        "and the outstanding query is left alone"
+    );
+}
+
+#[test]
+fn message_search_targets_the_loaded_chat_not_the_highlighted_row() {
+    let (_dir, client) = test_json_client(r#"{"ok":true,"result":{"messages":[]}}"#);
+    let mut app = app_with_open_chat(client, &[("m1", "morning")]);
+    // Flicking the chat list moves the highlight ahead of the pane, which keeps
+    // showing `g1` until the debounced preview lands. A search keyed on the
+    // highlight would return `g2` hits the jump could only refuse.
+    app.chats.push(ChatRow {
+        group_id: "g2".to_owned(),
+        name: "Other Room".to_owned(),
+        ..ChatRow::default()
+    });
+    app.selected_chat = 1;
+
+    app.open_message_search(None).expect("open search");
+
+    assert_eq!(
+        app.message_search.as_ref().expect("view").group_id,
+        "g1",
+        "the search follows the pane, not the highlight"
+    );
+}
+
+#[test]
+fn message_search_without_a_loaded_chat_reports_instead_of_opening() {
+    let (_dir, client) = test_json_client(r#"{"ok":true,"result":{"messages":[]}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+
+    let error = app
+        .open_message_search(Some("deploy".to_owned()))
+        .expect_err("no chat is loaded");
+
+    assert!(
+        error.to_string().contains("open a chat first"),
+        "says what to do; got: {error}"
+    );
+    assert!(app.message_search.is_none(), "no empty screen is opened");
+    assert_eq!(app.screen, Screen::Main, "and the screen does not change");
+}
+
+#[test]
+fn message_search_frame_shows_matches_and_strips_control_sequences() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}],"has_more_before":false,"has_more_after":false}}}}"#,
+        // An escape sequence in the message body and in the sender's display name:
+        // both are relay-supplied text rendering into a pane.
+        "{\"message_id\":\"m9\",\"direction\":\"received\",\"from\":\"bob\",\"from_display_name\":\"ev\\u001b[31mil\",\"plaintext\":\"deploy is \\u001b[2Jgreen\",\"timeline_at\":1700000000,\"received_at\":1700000000,\"deleted\":false}"
+    ));
+    let mut app = app_with_open_chat(client, &[("m9", "deploy is green")]);
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Message Search"), "screen title present");
+    assert!(
+        rendered.contains("Ops Room"),
+        "names the chat being searched"
+    );
+    assert!(rendered.contains("Matches (1)"), "match count present");
+    assert!(rendered.contains("deploy is"), "hit text rendered");
+
+    // Assert the escape stripping on the built lines, not on the rendered buffer:
+    // ratatui drops a zero-width ESC while writing cells whatever we hand it, so a
+    // buffer-level assertion passes even with the sanitizer removed and would be
+    // no guard at all for invariant 7.
+    let view = app.message_search.as_ref().expect("search view");
+    let body = message_search_lines(view, app.selected_account_row(), false)
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect::<String>();
+    assert!(
+        !body.contains('\u{1b}'),
+        "no escape reaches a rendered span; got: {body:?}"
+    );
+    assert!(
+        body.contains("deploy is [2Jgreen") && body.contains("ev[31mil"),
+        "the surrounding text survives the strip; got: {body:?}"
+    );
+}
+
+#[test]
+fn the_message_search_key_is_named_in_the_palette_hints_and_help() {
+    let palette = SLASH_COMMAND_SUGGESTIONS
+        .iter()
+        .map(|entry| entry.usage)
+        .collect::<Vec<_>>();
+    assert!(
+        palette.contains(&"/search [query]"),
+        "the command palette offers the message search; got: {palette:?}"
+    );
+    assert!(
+        message_search_hint(MessageSearchFocus::Results).contains("Enter jump to message"),
+        "the results hint names what Enter does"
+    );
+    let help = help_card_lines().join("\n");
+    assert!(
+        help.contains("/search"),
+        "the help card names the message search; got:\n{help}"
+    );
+}
+
+#[test]
+fn enter_on_a_hit_jumps_the_messages_pane_to_that_message() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}],"has_more_before":false,"has_more_after":false}}}}"#,
+        timeline_hit_json("m1", "bob", "the deploy is green", 1_700_000_000)
+    ));
+    // Four loaded rows with the hit oldest, so a jump has to move the selection
+    // and the offset off the newest row it defaults to.
+    let mut app = app_with_open_chat(
+        client,
+        &[
+            ("m1", "the deploy is green"),
+            ("m2", "second"),
+            ("m3", "third"),
+            ("m4", "fourth"),
+        ],
+    );
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+    assert_eq!(
+        app.message_search.as_ref().expect("view").focus,
+        MessageSearchFocus::Results,
+        "landing hits move focus into them"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("jump to the hit");
+
+    assert_eq!(app.screen, Screen::Main, "returns to the conversation");
+    assert_eq!(app.focus, Focus::Messages, "with the messages pane focused");
+    assert!(app.message_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.timeline_scroll.resolved_selection(app.timeline.len()),
+        Some(0),
+        "the hit is the selected message"
+    );
+    assert_eq!(
+        app.timeline_scroll.offset, 3,
+        "and the viewport is anchored on it, not on the newest row"
+    );
+}
+
+#[test]
+fn enter_on_a_hit_outside_the_loaded_history_explains_instead_of_moving() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}],"has_more_before":true,"has_more_after":false}}}}"#,
+        timeline_hit_json("ancient", "bob", "the deploy is green", 1_600_000_000)
+    ));
+    // The hit is not among the loaded rows: the timeline is one contiguous run
+    // ending at the newest message and cannot represent a hole, so the jump must
+    // decline rather than move the viewport somewhere misleading.
+    let mut app = app_with_open_chat(client, &[("m1", "morning"), ("m2", "second")]);
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+    let offset_before = app.timeline_scroll.offset;
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("attempt the jump");
+
+    assert_eq!(
+        app.screen,
+        Screen::MessageSearch,
+        "the search screen stays open so the reader keeps the result list"
+    );
+    assert_eq!(
+        app.timeline_scroll.offset, offset_before,
+        "the viewport does not move"
+    );
+    assert!(
+        app.status.contains("older than the loaded history"),
+        "the status says why, and what to do about it; got: {}",
+        app.status
     );
 }
 

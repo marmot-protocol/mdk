@@ -711,6 +711,7 @@ impl TuiApp {
             Screen::Main => self.render_main(frame),
             Screen::GroupDetail => self.render_group_detail(frame),
             Screen::UserSearch => self.render_user_search(frame),
+            Screen::MessageSearch => self.render_message_search(frame),
             Screen::Profile => self.render_profile(frame),
             Screen::RelayHealth => self.render_relay_health(frame),
         }
@@ -981,6 +982,11 @@ impl TuiApp {
             (Screen::UserSearch, Some(view)) => {
                 keymap_hint_spans(&user_search_hint(view.focus, &view.purpose))
             }
+            (Screen::MessageSearch, _) => keymap_hint_spans(message_search_hint(
+                self.message_search
+                    .as_ref()
+                    .map_or(MessageSearchFocus::Query, |view| view.focus),
+            )),
             (Screen::Main, _) => {
                 match armed_interaction_hint(self.input.value(), self.selected_timeline_row()) {
                     Some(armed) => armed_hint_spans(&armed),
@@ -1310,6 +1316,30 @@ impl TuiApp {
         self.render_status_bar(frame, root[2]);
     }
 
+    fn render_message_search(&self, frame: &mut Frame) {
+        let root = screen_body_layout(frame.area());
+        match self.message_search.as_ref() {
+            Some(view) => render_selection_pane(
+                frame,
+                root[0],
+                panel_block("Message Search", true),
+                message_search_lines(
+                    view,
+                    self.selected_account_row(),
+                    self.searching_messages.is_some(),
+                ),
+            ),
+            None => render_loading_screen(
+                frame,
+                root[0],
+                "Message Search",
+                "loading message search...",
+            ),
+        }
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+
     fn render_user_search(&self, frame: &mut Frame) {
         let root = screen_body_layout(frame.area());
         match self.user_search.as_ref() {
@@ -1563,6 +1593,85 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> PaneB
                 terminal_safe_text(&result.matched_field),
                 terminal_safe_text(&result.match_quality),
             ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    body
+}
+
+/// The message-search screen body: the chat being searched, the query field (with
+/// the cursor cell in query focus), then two lines per hit — `[HH:MM] author` and
+/// the message text below it. Timestamp and author styling match the messages
+/// pane (dark-gray time, cyan author, green when it is yours) so a hit reads as
+/// the same message it will jump to. Every author name and message body passes
+/// through `terminal_safe_text`.
+pub(crate) fn message_search_lines(
+    view: &MessageSearchView,
+    selected_account: Option<&AccountRow>,
+    searching: bool,
+) -> PaneBody {
+    let query_focused = view.focus == MessageSearchFocus::Query;
+    let mut body = PaneBody {
+        lines: vec![Line::from(vec![
+            Span::styled("Search in ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                shorten(&terminal_safe_text(&view.group_name), 32),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])],
+        anchor: None,
+    };
+    body.extend(input_field_lines(
+        &view.query.display(),
+        view.query.cursor(),
+        query_focused,
+        Some(Span::styled("find ", Style::default().fg(FOCUS_ACCENT))),
+    ));
+    body.push(Line::from(""));
+    if view.results.is_empty() {
+        // An in-flight search (yellow) reads differently from a settled empty
+        // result (dark gray), keyed off the async search flag.
+        let (text, color) = if searching {
+            ("searching...", Color::Yellow)
+        } else {
+            ("no matches — type a query and press Enter", Color::DarkGray)
+        };
+        body.push(Line::from(Span::styled(text, Style::default().fg(color))));
+        return body;
+    }
+    body.push(Line::from(format!("Matches ({})", view.results.len())));
+    let results_focused = view.focus == MessageSearchFocus::Results;
+    for (index, hit) in view.results.iter().enumerate() {
+        let is_selected = results_focused && index == view.selected;
+        let marker = if is_selected { ">" } else { " " };
+        let author_color = if timeline_row_is_self(hit, selected_account) {
+            Color::Green
+        } else {
+            Color::Cyan
+        };
+        body.push(Line::from(vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                format!("[{}] ", local_hhmm(hit.timeline_at)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                shorten(&terminal_safe_text(&timeline_author_label(hit)), 24),
+                row_label_style(is_selected, author_color),
+            ),
+        ]));
+        // Anchor on the text line rather than the header above it, so scrolling to
+        // the last hit brings the whole two-line row into view.
+        if is_selected {
+            body.anchor_next();
+        }
+        let text = if hit.deleted {
+            "message deleted".to_owned()
+        } else {
+            terminal_safe_text(&hit.display_text)
+        };
+        body.push(Line::from(Span::styled(
+            format!("    {}", shorten(&text, 76)),
             Style::default().fg(Color::DarkGray),
         )));
     }

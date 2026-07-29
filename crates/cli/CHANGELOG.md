@@ -61,6 +61,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   repair.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
 
+- `wn tui` can now search messages in the open chat with `/search [query]`
+  (`messages timeline search`), the one thing the CLI could do that the TUI could
+  not reach at all. Matches list newest first with sender, time, and text; `Enter`
+  jumps the messages pane to the highlighted match and focuses it. Matches older
+  than the loaded history say so instead of moving the view, because the pane
+  holds one contiguous run of messages and cannot represent a gap — page back with
+  `g` and search again to reach them.
+
 ### Changed
 
 - Account databases upgrade through storage migrations 47–50. Migration 47
@@ -144,6 +152,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   at all, leaving timelines and chat lists showing pending until some unrelated
   event woke them.
   ([#1426](https://github.com/marmot-protocol/mdk/pull/1426))
+
+- `wn tui` group detail can now reach its relay hints. They sit below the member
+  list, so a group with more members than the pane is tall left them permanently
+  off-screen; moving the selection to the last member now scrolls to the end of
+  the pane and brings them into view with it.
 
 ## [0.9.12] - 2026-08-13
 
@@ -312,10 +325,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   roughly a screenful of rows the highlight fell outside the drawn area, which
   made the selection invisible rather than merely awkward — the marker and the
   highlight are drawn inside each row.
-- `wn tui` group detail can now reach its relay hints. They sit below the member
-  list, so a group with more members than the pane is tall left them permanently
-  off-screen; moving the selection to the last member now scrolls to the end of
-  the pane and brings them into view with it.
 
 ## [0.9.11] - 2026-08-09
 

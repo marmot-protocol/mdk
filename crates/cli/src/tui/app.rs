@@ -69,6 +69,9 @@ pub(crate) struct TuiApp {
     /// search is outstanding. A `UserSearch` result is folded only while its
     /// query still matches (the same stale guard as `loading_chat`).
     pub(crate) searching_users: Option<String>,
+    /// The query of the most recently requested message search, or `None`. A
+    /// `MessageSearch` result folds only while its query still matches.
+    pub(crate) searching_messages: Option<String>,
     /// The group id of the group-detail load in flight, or `None`. A
     /// `LoadGroupDetail` result is folded only while it still matches.
     pub(crate) loading_group_detail: Option<String>,
@@ -106,6 +109,9 @@ pub(crate) struct TuiApp {
     /// User-search screen state (Phase 5b). Present only while
     /// `screen == Screen::UserSearch`; a one-shot load, no per-view subscription.
     pub(crate) user_search: Option<UserSearchView>,
+    /// Message-search screen state. Present only while
+    /// `screen == Screen::MessageSearch`; a one-shot load, no subscription.
+    pub(crate) message_search: Option<MessageSearchView>,
     /// Own-profile screen state (Phase 5b). Present only while
     /// `screen == Screen::Profile`.
     pub(crate) profile_view: Option<ProfileView>,
@@ -177,6 +183,7 @@ impl TuiApp {
             pending_mark_read: false,
             loading_chat: None,
             searching_users: None,
+            searching_messages: None,
             loading_group_detail: None,
             loading_invites: false,
             flick_countdown: None,
@@ -190,6 +197,7 @@ impl TuiApp {
             pending_full_repaint: false,
             group_detail: None,
             user_search: None,
+            message_search: None,
             profile_view: None,
             relay_health: None,
             media: MediaState::new(),
@@ -563,6 +571,7 @@ impl TuiApp {
             Screen::Login(mode) => return self.handle_login_key(mode, key),
             Screen::GroupDetail => return self.handle_group_detail_key(key),
             Screen::UserSearch => return self.handle_user_search_key(key),
+            Screen::MessageSearch => return self.handle_message_search_key(key),
             Screen::Profile => return self.handle_profile_key(key),
             Screen::RelayHealth => return self.handle_relay_health_key(key),
             Screen::Main => {}
@@ -1227,6 +1236,7 @@ impl TuiApp {
                 self.open_user_search(query);
                 Ok(())
             }
+            SlashCommand::MessageSearch { query } => self.open_message_search(query),
             SlashCommand::StreamCompose {
                 stream_id,
                 quic_candidates,
@@ -1695,23 +1705,151 @@ impl TuiApp {
         }
     }
 
-    /// Drop any Phase 5b full-view state and return to the main view. Shared by
-    /// the search/profile/relay-health `Esc` handlers (their data is a one-shot
-    /// load with no per-view subscription to tear down).
+    /// Drop any secondary full-view state and return to the main view. Shared by
+    /// the user-search, message-search, profile, and relay-health `Esc` handlers
+    /// (their data is a one-shot load with no per-view subscription to tear down).
+    /// Clearing all of them unconditionally is what keeps each view's "present only
+    /// while its screen is showing" invariant true from one exit path.
     pub(crate) fn leave_screen(&mut self) {
-        // A user search may still be in flight. Clearing its anchor drops the
+        // Either search may still be in flight. Clearing its anchor drops the
         // stale result at fold time (mirroring `leave_group_detail`'s
         // `loading_group_detail` clear), so reopening the search screen never
         // inherits the abandoned query's results, and resets the "searching..."
         // status the abandoned load would otherwise strand on the status line.
-        if self.searching_users.take().is_some() {
+        if self.searching_users.take().is_some() || self.searching_messages.take().is_some() {
             self.status = String::new();
         }
         self.user_search = None;
+        self.message_search = None;
         self.profile_view = None;
         self.relay_health = None;
         self.screen = Screen::Main;
         self.focus = Focus::Chats;
+    }
+
+    /// Message-search keys. `Esc` leaves the screen from either focus; otherwise
+    /// the query field or the hit list handles the key per the screen's focus.
+    pub(crate) fn handle_message_search_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        if key.code == KeyCode::Esc {
+            self.leave_screen();
+            return Ok(());
+        }
+        match self.message_search.as_ref().map(|view| view.focus) {
+            Some(MessageSearchFocus::Query) => self.handle_message_search_query_key(key),
+            Some(MessageSearchFocus::Results) => self.handle_message_search_results_key(key),
+            None => Ok(()),
+        }
+    }
+
+    /// Query-focus keys: typing edits the query (so `j`/`k` are literal text),
+    /// `Enter` runs the search, and `Down` steps into the hits.
+    fn handle_message_search_query_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        match key.code {
+            KeyCode::Enter => {
+                if let Err(err) = self.run_message_search() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Down => {
+                if let Some(view) = self.message_search.as_mut()
+                    && !view.results.is_empty()
+                {
+                    view.focus = MessageSearchFocus::Results;
+                }
+            }
+            KeyCode::Left => self.with_message_search_query(Input::left),
+            KeyCode::Right => self.with_message_search_query(Input::right),
+            KeyCode::Home => self.with_message_search_query(Input::home),
+            KeyCode::End => self.with_message_search_query(Input::end),
+            KeyCode::Delete => self.with_message_search_query(Input::delete),
+            KeyCode::Backspace => self.with_message_search_query(Input::backspace),
+            KeyCode::Char(character) => {
+                if let Some(view) = self.message_search.as_mut() {
+                    view.query.insert(character);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn with_message_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Some(view) = self.message_search.as_mut() {
+            edit(&mut view.query);
+        }
+    }
+
+    /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
+    /// query), `Enter` jumps the messages pane to the highlighted hit, and `i`/`/`
+    /// return to the query.
+    fn handle_message_search_results_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = self.message_search.as_mut() {
+                    if view.selected == 0 {
+                        view.focus = MessageSearchFocus::Query;
+                    } else {
+                        view.select_up();
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = self.message_search.as_mut() {
+                    view.select_down();
+                }
+            }
+            KeyCode::Enter => self.jump_to_selected_hit(),
+            KeyCode::Char('i') | KeyCode::Char('/') => {
+                if let Some(view) = self.message_search.as_mut() {
+                    view.focus = MessageSearchFocus::Query;
+                }
+            }
+            KeyCode::Char('?') => self.popup = Some(Popup::help()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Jump the messages pane to the highlighted hit and return to it.
+    ///
+    /// Only hits inside the loaded timeline can be jumped to. The timeline is one
+    /// flat, contiguous run of rows ending at the newest message, extended
+    /// backwards a page at a time; it has no way to represent a hole. Splicing in a
+    /// window around an older hit would leave the pane rendering as continuous
+    /// while silently skipping everything between, and there is no forward paging
+    /// to walk back out of the past with — so an out-of-window hit reports what it
+    /// would take instead of moving the viewport somewhere misleading.
+    fn jump_to_selected_hit(&mut self) {
+        let Some(view) = self.message_search.as_ref() else {
+            return;
+        };
+        let Some(hit) = view.selected_hit() else {
+            return;
+        };
+        // The pane must still be showing the chat the search ran against; the
+        // search screen captures every key, but the loaded target is app state and
+        // this check is what makes the jump unable to act on the wrong chat.
+        if self.messages_group_id.as_deref() != Some(view.group_id.as_str()) {
+            self.status = "the messages pane is no longer on the searched chat".to_owned();
+            return;
+        }
+        let Some(index) = self
+            .timeline
+            .iter()
+            .position(|row| row.message_id == hit.message_id)
+        else {
+            self.status =
+                "that message is older than the loaded history; press g to page back first"
+                    .to_owned();
+            return;
+        };
+        self.timeline_scroll
+            .jump_to_index(index, self.timeline.len());
+        self.message_search = None;
+        self.searching_messages = None;
+        self.screen = Screen::Main;
+        self.focus = Focus::Messages;
+        self.status = "jumped to message".to_owned();
     }
 
     /// User-search keys. `Esc` leaves the screen from either focus; otherwise the

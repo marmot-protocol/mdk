@@ -85,6 +85,14 @@ pub(crate) enum Effect {
     /// left screen) are dropped at fold time by comparing `query` to the pending
     /// search.
     UserSearch { account: String, query: String },
+    /// Search one group's materialized timeline. Stale results (a newer query, or
+    /// a left screen) are dropped at fold time by comparing `query` to the
+    /// pending search, exactly as `UserSearch` does.
+    MessageSearch {
+        account: String,
+        group: String,
+        query: String,
+    },
     /// Load the group-detail view: members, admins, relays, and profile (four
     /// `wn` calls run in that order on the worker thread).
     LoadGroupDetail { account: String, group: String },
@@ -222,6 +230,26 @@ impl Effect {
                     args: vec!["follows".to_owned(), "list".to_owned()],
                 },
             ],
+            // `messages timeline search` rather than `messages search`: it answers
+            // in timeline-page shape, so the hits parse with the timeline parser
+            // and share message ids with the rows in the messages pane.
+            Effect::MessageSearch {
+                account,
+                group,
+                query,
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: vec![
+                    "messages".to_owned(),
+                    "timeline".to_owned(),
+                    "search".to_owned(),
+                    query.clone(),
+                    "--group".to_owned(),
+                    group.clone(),
+                    "--limit".to_owned(),
+                    TUI_MESSAGE_SEARCH_LIMIT.to_string(),
+                ],
+            }],
             Effect::LoadGroupDetail { account, group } => vec![
                 WnCall {
                     account: Some(account.clone()),
@@ -562,6 +590,7 @@ pub(crate) enum Screen {
     Main,
     GroupDetail,
     UserSearch,
+    MessageSearch,
     Profile,
     RelayHealth,
 }
@@ -1082,6 +1111,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; a search for a member to add; A add by pubkey; x remove; P promote; R rename; L leave.",
         "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat; f follow; x unfollow.",
+        "Message search: /search [query] searches the open chat; Enter jumps the pane to the highlighted match.",
         "A search opened by group-detail a adds to that group and Esc returns to it.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
@@ -1334,6 +1364,52 @@ pub(crate) enum UserSearchPurpose {
         /// view still being loaded.
         group_name: String,
     },
+}
+
+/// Which region of the message-search screen has focus. Mirrors
+/// [`UserSearchFocus`]: typing edits the query until the results take over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MessageSearchFocus {
+    Query,
+    Results,
+}
+
+/// The message-search screen state: the chat being searched, a reusable query
+/// [`Input`], the hits, the selection, and which region has focus.
+///
+/// Hits are [`TimelineRow`]s, not a bespoke row type: `messages timeline search`
+/// returns the same page shape as `messages timeline list`, so the existing
+/// timeline parser reads them and a hit carries the real message id, sender,
+/// text, and timestamp. That shared identity is what lets a hit be located in
+/// the loaded timeline.
+///
+/// `group_id` is captured when the screen opens and checked before any jump, so a
+/// hit can never be applied to a timeline that has since been retargeted at a
+/// different chat.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MessageSearchView {
+    pub(crate) group_id: String,
+    pub(crate) group_name: String,
+    pub(crate) query: Input,
+    pub(crate) results: Vec<TimelineRow>,
+    pub(crate) selected: usize,
+    pub(crate) focus: MessageSearchFocus,
+}
+
+impl MessageSearchView {
+    pub(crate) fn select_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        if self.selected + 1 < self.results.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub(crate) fn selected_hit(&self) -> Option<&TimelineRow> {
+        self.results.get(self.selected)
+    }
 }
 
 /// The user-search screen state: a reusable query [`Input`], the one-shot
@@ -1822,6 +1898,19 @@ pub(crate) fn user_search_hint(focus: UserSearchFocus, purpose: &UserSearchPurpo
 /// `user_search_hint` cannot drift apart.
 const USER_SEARCH_QUERY_HINT: &str = "type query  Enter search  Down results  Esc back";
 
+/// The message-search query-focus hint, shared with `hints_line`'s fallback arm
+/// for the same reason.
+const MESSAGE_SEARCH_QUERY_HINT: &str = "type query  Enter search  Down results  Esc back";
+
+/// The message-search hints line, keyed by the screen's internal focus. `Enter`
+/// on a hit is named for what it does — jump the messages pane to that message.
+pub(crate) fn message_search_hint(focus: MessageSearchFocus) -> &'static str {
+    match focus {
+        MessageSearchFocus::Query => MESSAGE_SEARCH_QUERY_HINT,
+        MessageSearchFocus::Results => "j/k move  Enter jump to message  i query  Esc back",
+    }
+}
+
 /// A name made safe to interpolate into a keymap hint: terminal-safe, collapsed
 /// to single spaces, and shortened. The collapse matters as much as the
 /// filtering — `keymap_hint_spans` splits segments on a double space and boxes a
@@ -2102,10 +2191,12 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
         Screen::GroupDetail => {
             "j/k move  a search+add  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
         }
-        // The search screen has an internal focus the shared signature cannot
-        // carry; `render_hints` calls `user_search_hint` instead. This arm keeps
-        // `hints_line` total and returns the query-focus hint as the fallback.
+        // Both search screens have an internal focus the shared signature cannot
+        // carry; `render_hints` calls `user_search_hint` / `message_search_hint`
+        // instead. These arms keep `hints_line` total and return the query-focus
+        // hint as the fallback.
         Screen::UserSearch => USER_SEARCH_QUERY_HINT,
+        Screen::MessageSearch => MESSAGE_SEARCH_QUERY_HINT,
         Screen::Profile => "j/k move  Enter edit  f follow  x unfollow  Esc back",
         Screen::RelayHealth => "r refresh  j/k scroll  Esc back",
         Screen::Main => match focus {
@@ -2383,6 +2474,11 @@ pub(crate) enum SlashCommand {
     UsersSearch {
         query: Option<String>,
     },
+    /// Open the message-search screen for the open chat, optionally pre-running a
+    /// query.
+    MessageSearch {
+        query: Option<String>,
+    },
     StreamCompose {
         stream_id: Option<String>,
         quic_candidates: Vec<String>,
@@ -2536,6 +2632,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/users [query]",
         description: "open user search (optionally run a query)",
+    },
+    SlashCommandSuggestion {
+        usage: "/search [query]",
+        description: "search messages in the open chat",
     },
     SlashCommandSuggestion {
         usage: "/name <display-name>",
@@ -3496,6 +3596,22 @@ mod timeline {
             self.offset = len - 1;
         }
 
+        /// Select the row at `index` and scroll it to the anchor, for landing on a
+        /// message chosen somewhere other than the pane (a search hit). The offset
+        /// convention is the one `jump_oldest` uses — `jump_oldest` is this with
+        /// `index == 0` — kept here so the arithmetic that relates an absolute
+        /// index to a bottom-anchored offset lives in one place. An out-of-range
+        /// index is ignored rather than clamped: the caller resolved it from a
+        /// message id, so a stale index means the caller's row is gone and moving
+        /// the viewport somewhere arbitrary would be worse than not moving.
+        pub(crate) fn jump_to_index(&mut self, index: usize, len: usize) {
+            if index >= len {
+                return;
+            }
+            self.selection = Some(index);
+            self.offset = len - 1 - index;
+        }
+
         fn move_selection(&mut self, len: usize, step: impl FnOnce(usize) -> usize) {
             let Some(sel) = self.resolved_selection(len) else {
                 return;
@@ -3807,7 +3923,7 @@ mod timeline {
 
     /// The author label shown before a timeline message: the sender's display name,
     /// falling back to a shortened id. Color (not "me") signals ownership.
-    fn timeline_author_label(row: &TimelineRow) -> String {
+    pub(crate) fn timeline_author_label(row: &TimelineRow) -> String {
         row.from_display_name
             .clone()
             .unwrap_or_else(|| shorten(&row.from, 18))
@@ -3837,7 +3953,7 @@ mod timeline {
     /// the `[HH:MM]` shape (fixed 8-column prefix) rather than the value and cover
     /// the arithmetic through the pure `format_hhmm_with_offset` below. Falls back
     /// to UTC when the timestamp is out of `DateTime`'s range.
-    fn local_hhmm(timeline_at: u64) -> String {
+    pub(crate) fn local_hhmm(timeline_at: u64) -> String {
         chrono::DateTime::from_timestamp(timeline_at as i64, 0)
             .map(|instant| {
                 instant

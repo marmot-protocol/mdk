@@ -54,6 +54,10 @@ const SLASH_SUGGESTION_LIMIT: usize = 8;
 const TUI_MESSAGE_SCROLLBACK_LIMIT: usize = 1_000;
 /// Materialized-timeline page size for the snapshot load and each history page.
 const TUI_TIMELINE_PAGE_SIZE: usize = 100;
+/// Hits requested per message search. Bounded because the results screen is a
+/// scan-and-pick list, not a second timeline: a query matching thousands of
+/// messages is a query to refine, not a page to walk.
+const TUI_MESSAGE_SEARCH_LIMIT: usize = 100;
 /// Blank rows rendered below each timeline message as a separator; counted in a
 /// row's rendered height so the visibility walk and the renderer agree.
 const TIMELINE_MESSAGE_SEPARATOR_ROWS: u16 = 1;

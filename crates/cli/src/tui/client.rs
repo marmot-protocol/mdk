@@ -406,6 +406,9 @@ impl TuiApp {
             Effect::UserSearch { query, .. } => {
                 self.fold_user_search(query, result);
             }
+            Effect::MessageSearch { query, .. } => {
+                self.fold_message_search(query, result);
+            }
             Effect::LoadGroupDetail { account, group } => {
                 self.fold_group_detail(account, group, result);
             }
@@ -1343,6 +1346,107 @@ impl TuiApp {
         if run_now && let Err(err) = self.run_user_search() {
             self.status = format!("error: {err}");
         }
+    }
+
+    /// Enter the message-search screen for the chat loaded in the messages pane.
+    ///
+    /// Keyed on the loaded pane target rather than the highlighted chat row,
+    /// because a hit is only useful if it can be jumped to in the pane, and the
+    /// two can differ — flicking through the chat list retargets the pane on a
+    /// delay, so the highlight can sit on a chat the pane is not showing. Keying on
+    /// the highlight would let a search return hits the jump then has to refuse.
+    /// With nothing loaded there is no timeline to search or jump into, so this
+    /// reports instead of opening an empty screen.
+    pub(crate) fn open_message_search(&mut self, query: Option<String>) -> TuiResult<()> {
+        let group_id = self
+            .messages_group_id
+            .clone()
+            .ok_or_else(|| TuiError::Cli("open a chat first, then /search it".to_owned()))?;
+        let group_name = self
+            .chats
+            .iter()
+            .find(|chat| chat.group_id == group_id)
+            .map(|chat| chat.name.clone())
+            .unwrap_or_default();
+        let mut view = MessageSearchView {
+            group_id,
+            group_name,
+            query: Input::default(),
+            results: Vec::new(),
+            selected: 0,
+            focus: MessageSearchFocus::Query,
+        };
+        if let Some(query) = query
+            .map(|query| query.trim().to_owned())
+            .filter(|query| !query.is_empty())
+        {
+            view.query.set_value(query);
+        }
+        let run_now = !view.query.is_empty();
+        self.message_search = Some(view);
+        self.screen = Screen::MessageSearch;
+        self.status = "message search".to_owned();
+        if run_now {
+            self.run_message_search()?;
+        }
+        Ok(())
+    }
+
+    /// Run the one-shot `messages timeline search` for the open search screen off
+    /// the event loop; the hits fold in when they land. An empty query is a no-op
+    /// with a hint, mirroring `run_user_search`.
+    pub(crate) fn run_message_search(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let Some(view) = self.message_search.as_ref() else {
+            return Ok(());
+        };
+        let group = view.group_id.clone();
+        let query = view.query.value().trim().to_owned();
+        if query.is_empty() {
+            self.status = "type a query, then Enter to search".to_owned();
+            return Ok(());
+        }
+        self.searching_messages = Some(query.clone());
+        self.status = "searching...".to_owned();
+        self.effects.enqueue(Effect::MessageSearch {
+            account: account_id,
+            group,
+            query,
+        });
+        Ok(())
+    }
+
+    /// Fold a message-search page into the view. Dropped unless its query is still
+    /// the outstanding one, so a superseded query or a left screen cannot
+    /// repopulate the list. Landing hits moves focus into them, as user search
+    /// does; an empty page leaves focus on the query so it can be edited.
+    fn fold_message_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
+        if self.searching_messages.as_deref() != Some(query.as_str()) {
+            return;
+        }
+        self.searching_messages = None;
+        let values = match result {
+            Ok(values) => values,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
+        let page = values.first().cloned().unwrap_or(Value::Null);
+        let Some(view) = self.message_search.as_mut() else {
+            return;
+        };
+        // Newest first: a search is read top-down and the recent hit is usually the
+        // wanted one. The timeline parser sorts oldest-first for the pane.
+        let mut hits = parse_timeline_page(&page);
+        hits.reverse();
+        let count = hits.len();
+        view.results = hits;
+        view.selected = 0;
+        if count > 0 {
+            view.focus = MessageSearchFocus::Results;
+        }
+        self.status = format!("{count} match(es)");
     }
 
     /// Run the one-shot `users search <query>` off the event loop; the results
