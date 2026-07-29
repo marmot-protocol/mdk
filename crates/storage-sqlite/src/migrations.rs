@@ -1391,7 +1391,7 @@ mod tests {
             conn.query_row(
                 "SELECT COUNT(*) FROM pending_push_registration_removals",
                 [],
-                |row| row.get::<_, usize>(0),
+                |row| row.get::<_, i64>(0),
             )
             .unwrap(),
             0

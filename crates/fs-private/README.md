@@ -1,6 +1,7 @@
 # fs-private
 
-Restrictive-by-construction helpers for local files, directories, and Unix domain sockets.
+Restrictive-by-construction helpers for local files, directories, advisory
+lock files, and Unix domain sockets.
 
 This crate owns the shared "secure local artifact" creation path: files and directories are created already at their
 target owner-only mode, and Unix sockets are bound inside a fresh private staging directory and hard-linked into place.
@@ -10,6 +11,7 @@ Callers supply policy (which paths, which modes); this crate supplies the mechan
 
 - Creates files with `O_CREAT` at the target mode (no post-create chmod on reachable paths).
 - Creates directories atomically at mode `0700` via `DirBuilder`.
+- Acquires nonblocking, kernel-released exclusive leases on private lock files.
 - Binds Unix sockets through a private staging directory and hard-links them into the final path.
 - Exposes the workspace's single octal permission-mode parser (`parse_octal_mode`).
 

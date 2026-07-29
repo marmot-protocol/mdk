@@ -1,7 +1,7 @@
 use crate::{
     SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy,
-    encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, tags_from_json,
-    unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, i64_to_usize,
+    tags_from_json, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
@@ -1375,9 +1375,10 @@ impl SqliteAccountStorage {
                      WHERE token_fingerprint = ?1
                        AND registration_updated_at_ms = ?2",
                     params![token_fingerprint, registration_updated_at_ms],
-                    |row| row.get::<_, usize>(0),
+                    |row| row.get::<_, i64>(0),
                 )
                 .storage()?;
+            let count = i64_to_usize(count)?;
             if count > 0 {
                 conn.execute("UPDATE push_registration SET last_shared_at_ms = NULL", [])
                     .storage()?;
@@ -2049,19 +2050,21 @@ fn queue_push_registration_removals_with_conn(
         ],
     )
     .storage()?;
-    conn.query_row(
-        "SELECT COUNT(*) FROM pending_push_registration_removals
-         WHERE platform = ?1 AND server_pubkey_hex = ?2
-           AND token_fingerprint = ?3 AND registration_updated_at_ms = ?4",
-        params![
-            i64::from(registration.platform),
-            &registration.server_pubkey_hex,
-            &registration.token_fingerprint,
-            registration.updated_at_ms,
-        ],
-        |row| row.get(0),
-    )
-    .storage()
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_push_registration_removals
+             WHERE platform = ?1 AND server_pubkey_hex = ?2
+               AND token_fingerprint = ?3 AND registration_updated_at_ms = ?4",
+            params![
+                i64::from(registration.platform),
+                &registration.server_pubkey_hex,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .storage()?;
+    i64_to_usize(count)
 }
 
 fn insert_push_registration_removal_with_conn(
