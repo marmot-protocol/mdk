@@ -33,7 +33,7 @@ use super::records::{
 };
 use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
-use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
+use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::runtime::blocking_app_task;
 use crate::{
     KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
@@ -75,14 +75,26 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The one NIP-50 relay currently used to widen a user-directory search.
+///
+/// This is a best-effort discovery source, not a directory sync relay: its
+/// results stay in the current search only and never create subscriptions or
+/// directory records.
+const VERTEX_NIP50_RELAY: &str = "wss://relay.vertexlab.io";
+
+/// Keep NIP-50 work bounded independently from graph traversal.
+const NIP50_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const NIP50_RESULT_LIMIT: usize = 20;
+const NIP50_MIN_QUERY_CHARS: usize = 3;
+
 /// Reported distance for matches that are not on the searcher's graph at all.
 ///
 /// Every consumer renders `radius` as provenance -- "via someone you follow".
-/// When a search falls back to a configured seed because the searcher follows
-/// nobody, the people it finds are one hop from *the seed*, not from the
-/// searcher, and labelling them radius 1 would make that provenance a lie.
-/// They are not a measurable distance away, so they are reported as off-graph.
-/// `u8::MAX` also sorts last, which is where an off-graph match belongs.
+/// When a search falls back to a configured seed, or a search relay discovers
+/// someone outside the graph, that person is not a measurable distance from
+/// the searcher. Labelling them radius 1 would make that provenance a lie, so
+/// they are reported as off-graph. `u8::MAX` also sorts last, which is where an
+/// off-graph match belongs.
 pub const OFF_GRAPH_SEARCH_RADIUS: u8 = u8::MAX;
 
 /// How far a layer has walked, and how that distance is reported.
@@ -245,24 +257,122 @@ async fn run_search(
     // An empty query would match every candidate through `contains`, so it
     // finds nobody by definition rather than everybody.
     let query = params.query.trim().to_lowercase();
-    if !query.is_empty()
-        && let Err(error) = traverse_graph(
-            &app,
-            &searcher_account_id_hex,
-            &query,
-            &params,
-            &mut emitter,
-        )
-        .await
-    {
-        emitter
-            .emit(SearchUpdateTrigger::Error {
-                message: error.to_string(),
-            })
-            .await;
+    if !query.is_empty() {
+        // Start the independent discovery request with the graph walk, but
+        // merge its results afterwards. That gives a graph result precedence
+        // when both sources return the same identity, without holding a
+        // mutable emitter across concurrent tasks.
+        let nip50_updates_tx = emitter.updates_tx.clone();
+        let (graph_result, nip50_records) = tokio::join!(
+            traverse_graph(
+                &app,
+                &searcher_account_id_hex,
+                &query,
+                &params,
+                &mut emitter,
+            ),
+            fetch_vertex_nip50_profiles(&app, &query, nip50_updates_tx),
+        );
+        if let Err(error) = graph_result {
+            emitter
+                .emit(SearchUpdateTrigger::Error {
+                    message: error.to_string(),
+                })
+                .await;
+        }
+        if let Some(records) = nip50_records {
+            emitter.tally.resolved_from_nip50(records.len());
+            emitter
+                .emit_matches(OFF_GRAPH_SEARCH_RADIUS, records, &query)
+                .await;
+        }
     }
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
     emitter.report_tally(&params);
+}
+
+/// Fetch profile candidates from Vertex's NIP-50 endpoint.
+///
+/// A relay search is only a discovery hint: signatures and kind are validated
+/// by the common directory fetcher, profiles are freshly checked here, and no
+/// event or relationship is persisted. The local matcher remains authoritative
+/// for whether the returned profile actually matches the user's query.
+async fn fetch_vertex_nip50_profiles(
+    app: &MarmotApp,
+    query: &str,
+    updates_tx: mpsc::Sender<UserSearchUpdate>,
+) -> Option<Vec<UserDirectoryRecord>> {
+    if query.chars().count() < NIP50_MIN_QUERY_CHARS {
+        return None;
+    }
+
+    let fetch = app.relay_plane.fetch_directory_events(
+        vec![TransportEndpoint(VERTEX_NIP50_RELAY.to_owned())],
+        vec![DirectoryEventQuery::search(
+            KIND_NOSTR_METADATA,
+            query,
+            NIP50_RESULT_LIMIT,
+        )],
+    );
+    let result = tokio::select! {
+        _ = updates_tx.closed() => return None,
+        result = timeout(NIP50_SEARCH_TIMEOUT, fetch) => result,
+    };
+    let records = match result {
+        Ok(Ok(records)) => records,
+        Ok(Err(_)) => {
+            tracing::debug!(
+                target: "marmot_app::directory",
+                method = "search_users_nip50",
+                outcome = "fetch_failed",
+                "NIP-50 user discovery unavailable"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: "marmot_app::directory",
+                method = "search_users_nip50",
+                outcome = "timed_out",
+                "NIP-50 user discovery unavailable"
+            );
+            return None;
+        }
+    };
+    Some(vertex_nip50_profile_records(app, records))
+}
+
+/// Convert fresh NIP-50 metadata events into transient directory records.
+fn vertex_nip50_profile_records(
+    app: &MarmotApp,
+    records: Vec<RelayEventRecord>,
+) -> Vec<UserDirectoryRecord> {
+    let freshness = app.directory_freshness();
+    let mut profiles = HashMap::new();
+    for record in records {
+        if !freshness.accepts(&record) {
+            continue;
+        }
+        let Some((account_id_hex, profile)) = profile_from_record(record) else {
+            continue;
+        };
+        if profiles
+            .get(&account_id_hex)
+            .is_none_or(|current: &crate::UserProfileMetadata| {
+                profile.created_at > current.created_at
+            })
+        {
+            profiles.insert(account_id_hex, profile);
+        }
+    }
+    profiles
+        .into_iter()
+        .map(|(account_id_hex, profile)| {
+            let mut record = app.empty_directory_record(&account_id_hex);
+            record.profile = Some(profile);
+            record
+        })
+        .collect()
 }
 
 /// Walk outward from the searcher, emitting each radius as it resolves.
@@ -731,6 +841,8 @@ struct SearchTally {
     from_relays: usize,
     /// Reachable only through the author's advertised write relays.
     from_write_relays: usize,
+    /// Found by the bounded, ephemeral NIP-50 discovery request.
+    from_nip50: usize,
     /// No tier produced a profile. Still matchable by npub or pubkey.
     unresolved: usize,
 }
@@ -746,6 +858,10 @@ impl SearchTally {
 
     fn resolved_from_write_relays(&mut self, count: usize) {
         self.from_write_relays += count;
+    }
+
+    fn resolved_from_nip50(&mut self, count: usize) {
+        self.from_nip50 += count;
     }
 
     fn unresolved(&mut self, count: usize) {
@@ -876,6 +992,7 @@ async fn cache_resolved_follows(
 struct SearchEmitter {
     updates_tx: mpsc::Sender<UserSearchUpdate>,
     total_result_count: usize,
+    emitted_account_ids: HashSet<String>,
     tally: SearchTally,
 }
 
@@ -884,6 +1001,7 @@ impl SearchEmitter {
         Self {
             updates_tx,
             total_result_count: 0,
+            emitted_account_ids: HashSet::new(),
             tally: SearchTally::default(),
         }
     }
@@ -910,6 +1028,10 @@ impl SearchEmitter {
                 })
             })
             .collect::<Vec<_>>();
+        results.retain(|result| {
+            self.emitted_account_ids
+                .insert(result.account_id_hex.clone())
+        });
         if results.is_empty() {
             return;
         }
@@ -933,6 +1055,7 @@ impl SearchEmitter {
             from_cache = self.tally.from_cache,
             from_relays = self.tally.from_relays,
             from_write_relays = self.tally.from_write_relays,
+            from_nip50 = self.tally.from_nip50,
             unresolved = self.tally.unresolved,
             matches = self.total_result_count,
             "user search finished"
@@ -1375,6 +1498,7 @@ mod tests {
         tally.resolved_from_cache(3);
         tally.resolved_from_relays(2);
         tally.resolved_from_write_relays(1);
+        tally.resolved_from_nip50(5);
         tally.unresolved(4);
         // A second layer accumulates rather than replacing.
         tally.resolved_from_cache(1);
@@ -1382,7 +1506,70 @@ mod tests {
         assert_eq!(tally.from_cache, 4);
         assert_eq!(tally.from_relays, 2);
         assert_eq!(tally.from_write_relays, 1);
+        assert_eq!(tally.from_nip50, 5);
         assert_eq!(tally.unresolved, 4);
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_repeat_a_graph_result() {
+        let (updates_tx, mut updates_rx) = mpsc::channel(2);
+        let mut emitter = SearchEmitter::new(updates_tx);
+        let account_id_hex = format!("{:064x}", 97);
+        let record = record_named(&account_id_hex, "needle");
+
+        emitter
+            .emit_matches(1, vec![record.clone()], "needle")
+            .await;
+        emitter
+            .emit_matches(OFF_GRAPH_SEARCH_RADIUS, vec![record], "needle")
+            .await;
+        drop(emitter);
+
+        let update = updates_rx
+            .recv()
+            .await
+            .expect("the graph result should be emitted");
+        assert_eq!(update.new_results.len(), 1);
+        assert_eq!(update.new_results[0].radius, 1);
+        assert!(
+            updates_rx.recv().await.is_none(),
+            "discovery must not emit the identity already found in the graph"
+        );
+    }
+
+    #[test]
+    fn nip50_profiles_stay_out_of_the_persistent_directory() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
+        use transport_nostr_peeler::NostrTransportEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Metadata, r#"{"name":"needle"}"#)
+            .sign_with_keys(&author)
+            .unwrap();
+        let records = vertex_nip50_profile_records(
+            &app,
+            vec![RelayEventRecord {
+                endpoints: Vec::new(),
+                event: NostrTransportEvent::from_nostr_event(&event).unwrap(),
+            }],
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.name.as_deref()),
+            Some("needle")
+        );
+        assert!(
+            app.directory_entries().unwrap().is_empty(),
+            "a NIP-50 result must remain an ephemeral search candidate"
+        );
     }
 
     /// A layer that overflows the candidate cap is a prefix of the real one.
