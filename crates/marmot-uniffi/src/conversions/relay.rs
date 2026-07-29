@@ -1,8 +1,9 @@
 //! Relay telemetry, relay-list, and relay-health FFI conversions.
 
 use marmot_app::{
-    AccountRelayListState, AccountRelayListStatus, MissingRelayListKind, RelayPlaneHealth,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AccountRelayListState, AccountRelayListStatus, MissingRelayListKind,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -147,6 +148,44 @@ impl From<AccountRelayListStatus> for AccountRelayListsFfi {
     }
 }
 
+/// Stable relay-policy result for settings and remediation UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayEndpointPolicyFfi {
+    Allowed,
+    Retired,
+    Invalid,
+    Unsafe,
+}
+
+impl From<RelayEndpointPolicy> for RelayEndpointPolicyFfi {
+    fn from(value: RelayEndpointPolicy) -> Self {
+        match value {
+            RelayEndpointPolicy::Allowed => Self::Allowed,
+            RelayEndpointPolicy::Retired => Self::Retired,
+            RelayEndpointPolicy::Invalid => Self::Invalid,
+            RelayEndpointPolicy::Unsafe => Self::Unsafe,
+        }
+    }
+}
+
+/// Policy classification for one caller-supplied relay endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RelayEndpointClassificationFfi {
+    pub endpoint: String,
+    pub normalized_endpoint: Option<String>,
+    pub policy: RelayEndpointPolicyFfi,
+}
+
+impl From<RelayEndpointClassification> for RelayEndpointClassificationFfi {
+    fn from(value: RelayEndpointClassification) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            normalized_endpoint: value.normalized_endpoint,
+            policy: value.policy.into(),
+        }
+    }
+}
+
 /// Live relay-plane connection health for the diagnostics view.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RelayHealthFfi {
@@ -211,5 +250,21 @@ mod tests {
         assert!(!rendered.contains("super-secret-otlp-token"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("otlp.example"), "{rendered}");
+    }
+
+    #[test]
+    fn relay_endpoint_classification_preserves_typed_policy() {
+        let ffi = RelayEndpointClassificationFfi::from(RelayEndpointClassification {
+            endpoint: "wss://relay.example".to_owned(),
+            normalized_endpoint: Some("wss://relay.example/".to_owned()),
+            policy: RelayEndpointPolicy::Retired,
+        });
+
+        assert_eq!(ffi.endpoint, "wss://relay.example");
+        assert_eq!(
+            ffi.normalized_endpoint.as_deref(),
+            Some("wss://relay.example/")
+        );
+        assert_eq!(ffi.policy, RelayEndpointPolicyFfi::Retired);
     }
 }

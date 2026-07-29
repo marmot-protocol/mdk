@@ -178,8 +178,9 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{
-    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
-    RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
+    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
 };
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
