@@ -1711,10 +1711,16 @@ impl TuiApp {
     pub(crate) fn handle_user_search_key(&mut self, key: KeyEvent) -> TuiResult<()> {
         if key.code == KeyCode::Esc {
             // A search opened from group detail goes back there rather than to the
-            // main view, so `Esc` undoes the step that opened it.
+            // main view, so `Esc` undoes the step that opened it. The refresh that
+            // return schedules can fail its account precondition, and a key handler
+            // reports rather than propagates: a `?` here would leave `run()` and end
+            // the session over a status-line error. One assignment covers both
+            // outcomes so the report cannot be overwritten by the settled status.
             if let Some(group_id) = self.search_add_target().map(str::to_owned) {
-                self.return_to_group_detail(&group_id)?;
-                self.status = "group detail".to_owned();
+                self.status = match self.return_to_group_detail(&group_id) {
+                    Ok(()) => "group detail".to_owned(),
+                    Err(err) => format!("error: {err}"),
+                };
                 return Ok(());
             }
             self.leave_screen();
