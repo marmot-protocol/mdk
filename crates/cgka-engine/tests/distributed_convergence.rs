@@ -5574,26 +5574,66 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
     );
 }
 
-#[tokio::test]
-async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
-    // A durable pass whose base epoch disagrees with the tip is stale local
-    // scheduling state, not corruption: convergence must discard it, reopen at
-    // the tip, and keep converging. The disagreement is inherited rather than
-    // reachable live — a base epoch stamped from the durable group record while
-    // the tip was read from the epoch manager, two stores that can split across a
-    // restart — so the test installs that shape on the durable record directly.
-    // The live engine cannot produce it: an open pass gates outbound work and
-    // re-routes inbound commits back through convergence. Halting on it durably
-    // wedged a field device six epochs behind, and every later send failed
-    // against the halt.
-    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+/// One buffered inbound commit on `carol`, so she holds an active convergence
+/// pass opened at her current tip, with a forensic recorder attached.
+///
+/// The base-epoch discard tests differ only in the shape they then stamp onto
+/// that durable pass, so they share the arrival path.
+struct BufferedPassFixture {
+    carol: Engine<SqliteAccountStorage>,
+    storage: SqliteAccountStorage,
+    group_id: GroupId,
+    commit: TransportMessage,
+    tip: EpochId,
+    audit_path: std::path::PathBuf,
+    /// Owns the audit file for the lifetime of the fixture.
+    _audit_dir: tempfile::TempDir,
+}
+
+impl BufferedPassFixture {
+    /// The durable pass as convergence last persisted it.
+    fn pass(&self) -> cgka_traits::convergence_pass::DurableConvergencePass {
+        self.storage
+            .convergence_pass(&self.group_id)
+            .unwrap()
+            .expect("a buffered commit leaves a durable pass")
+    }
+
+    fn put_pass(&self, pass: &cgka_traits::convergence_pass::DurableConvergencePass) {
+        self.storage.put_convergence_pass(pass).unwrap();
+    }
+
+    /// Every `convergence_pass_discarded` row the recorder wrote. Consumes the
+    /// engine so the recorder flushes first.
+    fn discard_audit_rows(self) -> Vec<(u64, u64, u64)> {
+        use marmot_forensics::{AuditEvent, AuditEventKind};
+
+        drop(self.carol);
+        std::fs::read_to_string(&self.audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+            .filter_map(|event| match event.kind {
+                AuditEventKind::ConvergencePassDiscarded {
+                    stale_base_epoch,
+                    current_tip_epoch,
+                    generation,
+                } => Some((stale_base_epoch, current_tip_epoch, generation)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+async fn buffered_convergence_pass_fixture(group_name: &str) -> BufferedPassFixture {
+    use marmot_forensics::JsonlRecorder;
 
     let audit_dir = tempfile::tempdir().unwrap();
     let audit_path = audit_dir.path().join("audit.jsonl");
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut david, _david_storage) = build_client(b"david");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
-    let mut carol = EngineBuilder::new(carol_storage.clone())
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut carol = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
@@ -5608,7 +5648,7 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let (group_id, create) = alice
         .create_group(CreateGroupRequest {
-            name: "engine-convergence-stale-pass-base".into(),
+            name: group_name.into(),
             description: "".into(),
             members: vec![carol_kp],
             required_features: vec![],
@@ -5641,16 +5681,47 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
         .unwrap();
 
     let tip = carol.epoch(&group_id).unwrap();
+    let fixture = BufferedPassFixture {
+        carol,
+        storage,
+        group_id,
+        commit,
+        tip,
+        audit_path,
+        _audit_dir: audit_dir,
+    };
+    assert_eq!(
+        fixture.pass().base_epoch,
+        tip,
+        "pass opens at the current tip"
+    );
+    fixture
+}
+
+#[tokio::test]
+async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
+    // A durable pass whose base epoch disagrees with the tip is stale local
+    // scheduling state, not corruption: convergence must discard it, reopen at
+    // the tip, and keep converging. The disagreement is inherited rather than
+    // reachable live — a base epoch stamped from the durable group record while
+    // the tip was read from the epoch manager, two stores that can split across a
+    // restart — so the test installs that shape on the durable record directly.
+    // The live engine cannot produce it: an open pass gates outbound work and
+    // re-routes inbound commits back through convergence. Halting on it durably
+    // wedged a field device six epochs behind, and every later send failed
+    // against the halt.
+    let mut fixture = buffered_convergence_pass_fixture("engine-convergence-stale-pass-base").await;
+    let tip = fixture.tip;
     let stale_base = EpochId(tip.0.checked_sub(1).expect("the tip is past epoch zero"));
-    let mut stale = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
-    assert_eq!(stale.base_epoch, tip, "pass opens at the current tip");
+    let mut stale = fixture.pass();
     // Install the inherited shape: a durable pass whose base epoch trails the
     // tip the rest of convergence reads.
     stale.base_epoch = stale_base;
-    carol_storage.put_convergence_pass(&stale).unwrap();
+    fixture.put_pass(&stale);
 
-    let compensated = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+    let compensated = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
         .expect("a stale pass base is compensated, not fatal");
     assert_ne!(
         compensated.convergence_status,
@@ -5658,48 +5729,180 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
         "a stale pass base must not block the run"
     );
     assert!(
-        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        !fixture
+            .storage
+            .get_group(&fixture.group_id)
+            .unwrap()
+            .unrecoverable,
         "a stale pass base must not durably wedge the group"
     );
     assert!(
-        !carol
+        !fixture
+            .carol
             .drain_events()
             .iter()
             .any(|event| matches!(event, GroupEvent::GroupUnrecoverable { .. }))
     );
 
-    let reopened = carol_storage
-        .convergence_pass(&group_id)
-        .unwrap()
-        .expect("the discarded pass is replaced by one at the current tip");
+    let reopened = fixture.pass();
     assert_eq!(reopened.base_epoch, tip);
     assert_eq!(reopened.generation, stale.generation + 1);
 
-    let settled = carol
-        .converge_stored_openmls_messages(&group_id, 3_000)
+    let settled = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
         .expect("the reopened pass converges at the current tip");
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(tip.0 + 1));
-    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+    assert_eq!(
+        fixture.carol.epoch(&fixture.group_id).unwrap(),
+        EpochId(tip.0 + 1)
+    );
+    assert_message_state(&fixture.storage, &fixture.commit, MessageState::Processed);
 
-    drop(carol);
-    let events: Vec<AuditEvent> = std::fs::read_to_string(&audit_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    assert_eq!(
+        fixture.discard_audit_rows(),
+        vec![(stale_base.0, tip.0, stale.generation)],
+        "the compensation is diagnosable from a forensic export, exactly once"
+    );
+}
+
+#[tokio::test]
+async fn frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
+    // Frozen passes are deliberately inside the discard, not carved out of it. A
+    // frozen batch has fixed its membership, but it is still scheduling state for
+    // one base epoch, and an inherited base epoch is no more trustworthy frozen
+    // than collecting. The frozen-member integrity check remains the only thing
+    // that halts, and it only ever runs against a pass convergence keeps — never
+    // against one it is about to drop.
+    let mut fixture =
+        buffered_convergence_pass_fixture("engine-convergence-frozen-stale-pass-base").await;
+    let tip = fixture.tip;
+    let stale_base = EpochId(tip.0.checked_sub(1).expect("the tip is past epoch zero"));
+    let mut stale = fixture.pass();
+    stale.base_epoch = stale_base;
+    stale.phase = cgka_traits::ConvergencePassPhase::Frozen;
+    stale.frozen_at_wall_ms = Some(1_500);
+    stale.cutoff_cause = Some(cgka_traits::ConvergenceCutoffCause::Quiescence);
+    assert!(stale.is_active(), "a frozen pass is still an active pass");
+    fixture.put_pass(&stale);
+
+    let compensated = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
+        .expect("a frozen stale pass base is compensated, not fatal");
+    assert_ne!(
+        compensated.convergence_status,
+        ConvergenceStatus::Blocked,
+        "a frozen stale pass base must not block the run"
+    );
     assert!(
-        events.iter().any(|event| matches!(
-            &event.kind,
-            AuditEventKind::ConvergencePassDiscarded {
-                stale_base_epoch,
-                current_tip_epoch,
-                generation,
-            } if *stale_base_epoch == stale_base.0
-                && *current_tip_epoch == tip.0
-                && *generation == stale.generation
-        )),
-        "the compensation is diagnosable from a forensic export"
+        !fixture
+            .storage
+            .get_group(&fixture.group_id)
+            .unwrap()
+            .unrecoverable,
+        "a frozen stale pass base must not durably wedge the group"
+    );
+    assert!(
+        !fixture
+            .carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupUnrecoverable { .. })),
+        "the frozen phase must not route the discard into the integrity halt"
+    );
+
+    let reopened = fixture.pass();
+    assert_eq!(reopened.base_epoch, tip);
+    assert_eq!(reopened.generation, stale.generation + 1);
+    assert_eq!(
+        reopened.phase,
+        cgka_traits::ConvergencePassPhase::Collecting,
+        "the replacement pass collects afresh rather than inheriting the frozen batch"
+    );
+
+    let settled = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
+        .expect("the reopened pass converges at the current tip");
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        fixture.carol.epoch(&fixture.group_id).unwrap(),
+        EpochId(tip.0 + 1)
+    );
+    assert_message_state(&fixture.storage, &fixture.commit, MessageState::Processed);
+
+    assert_eq!(
+        fixture.discard_audit_rows(),
+        vec![(stale_base.0, tip.0, stale.generation)],
+        "one discard row, reporting the frozen pass that was dropped"
+    );
+}
+
+#[tokio::test]
+async fn future_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
+    // The other direction of the same inherited split: a base epoch *ahead* of
+    // the tip. Fork rollback reaches this shape on shipped code, because
+    // recovering to a pre-commit snapshot moves the in-memory tip backwards while
+    // the durable pass keeps the base it was stamped with. It is exactly as
+    // benign as a trailing base — the pass still holds no canonical state — so
+    // discarding on `!=` rather than `<` is load-bearing. A directional guard
+    // would leave this direction halting the group.
+    let mut fixture =
+        buffered_convergence_pass_fixture("engine-convergence-future-pass-base").await;
+    let tip = fixture.tip;
+    let future_base = EpochId(tip.0 + 1);
+    let mut stale = fixture.pass();
+    stale.base_epoch = future_base;
+    fixture.put_pass(&stale);
+
+    let compensated = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
+        .expect("a future pass base is compensated, not fatal");
+    assert_ne!(
+        compensated.convergence_status,
+        ConvergenceStatus::Blocked,
+        "a future pass base must not block the run"
+    );
+    assert!(
+        !fixture
+            .storage
+            .get_group(&fixture.group_id)
+            .unwrap()
+            .unrecoverable,
+        "a future pass base must not durably wedge the group"
+    );
+    assert!(
+        !fixture
+            .carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupUnrecoverable { .. }))
+    );
+
+    let reopened = fixture.pass();
+    assert_eq!(
+        reopened.base_epoch, tip,
+        "the replacement pass is scheduled at the tip, not at the base it inherited"
+    );
+    assert_eq!(reopened.generation, stale.generation + 1);
+
+    let settled = fixture
+        .carol
+        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
+        .expect("the reopened pass converges at the current tip");
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        fixture.carol.epoch(&fixture.group_id).unwrap(),
+        EpochId(tip.0 + 1)
+    );
+    assert_message_state(&fixture.storage, &fixture.commit, MessageState::Processed);
+
+    assert_eq!(
+        fixture.discard_audit_rows(),
+        vec![(future_base.0, tip.0, stale.generation)],
+        "one discard row, reporting a base epoch ahead of the tip"
     );
 }
 
