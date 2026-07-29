@@ -21,6 +21,59 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Highest meaningful permission value (`suid|sgid|sticky` + `rwxrwxrwx`).
 const MAX_MODE: u32 = 0o7777;
 
+/// An exclusive advisory lease held for as long as its private file descriptor
+/// remains open.
+///
+/// The kernel releases the lease when this value is dropped or the process
+/// exits, including abrupt termination. Callers must keep the lock file at a
+/// stable path for its full lifetime: unlinking or replacing the file would
+/// allow a second process to lock a different inode under the same pathname.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PrivateExclusiveFileLease {
+    _file: std::fs::File,
+}
+
+/// Try to acquire an exclusive, nonblocking advisory lease on `path`.
+///
+/// The lock file is created at 0600 without following a final symlink and an
+/// existing file is tightened to 0600 before locking. Returns
+/// [`io::ErrorKind::WouldBlock`] when another process or separately opened
+/// descriptor owns the lease. The function never waits for that owner.
+///
+/// This Unix-only helper uses `flock(LOCK_EX | LOCK_NB)`, which is available to
+/// Apple App Group containers as well as the workspace's other Unix targets.
+#[cfg(unix)]
+pub fn try_acquire_private_exclusive_file_lease(
+    path: &Path,
+) -> io::Result<PrivateExclusiveFileLease> {
+    use std::os::fd::AsRawFd;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    set_private_file_mode(&mut options);
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private lease target must be a regular file",
+        ));
+    }
+    set_handle_private(&file)?;
+
+    loop {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(PrivateExclusiveFileLease { _file: file });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
 /// How [`prepare_directory_path`] handles a leaf directory that already
 /// exists.
 #[cfg(unix)]
@@ -544,6 +597,78 @@ mod unix_tests {
         let path = dir.path().join("log.jsonl");
         drop(open_private_append(&path).unwrap());
         assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn private_exclusive_file_lease_is_nonblocking_and_drop_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lock");
+        let first = try_acquire_private_exclusive_file_lease(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+
+        let blocked = try_acquire_private_exclusive_file_lease(&path).unwrap_err();
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        drop(try_acquire_private_exclusive_file_lease(&path).unwrap());
+    }
+
+    #[test]
+    fn private_exclusive_file_lease_child_process() {
+        let Some(path) = std::env::var_os("FS_PRIVATE_LEASE_CHILD_PATH") else {
+            return;
+        };
+        let expect_blocked = std::env::var_os("FS_PRIVATE_LEASE_EXPECT_BLOCKED").is_some();
+        let result = try_acquire_private_exclusive_file_lease(Path::new(&path));
+        if std::env::var_os("FS_PRIVATE_LEASE_EXIT_WITHOUT_DROP").is_some() {
+            let _lease = result.expect("child should acquire lease before abrupt exit");
+            // Simulate process termination without running Rust destructors.
+            // The kernel must still close the descriptor and release the lock.
+            unsafe { libc::_exit(0) }
+        }
+        if expect_blocked {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        } else {
+            drop(result.expect("child should acquire released lease"));
+        }
+    }
+
+    #[test]
+    fn private_exclusive_file_lease_coordinates_processes() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lock");
+        let first = try_acquire_private_exclusive_file_lease(&path).unwrap();
+        let current_exe = std::env::current_exe().unwrap();
+        let run_child = |expect_blocked: bool| {
+            let mut command = Command::new(&current_exe);
+            command
+                .arg("--exact")
+                .arg("unix_tests::private_exclusive_file_lease_child_process")
+                .arg("--nocapture")
+                .env("FS_PRIVATE_LEASE_CHILD_PATH", &path);
+            if expect_blocked {
+                command.env("FS_PRIVATE_LEASE_EXPECT_BLOCKED", "1");
+            }
+            let status = command.status().expect("run lease child test process");
+            assert!(status.success(), "lease child process failed");
+        };
+
+        run_child(true);
+        drop(first);
+        run_child(false);
+
+        let status = Command::new(&current_exe)
+            .arg("--exact")
+            .arg("unix_tests::private_exclusive_file_lease_child_process")
+            .arg("--nocapture")
+            .env("FS_PRIVATE_LEASE_CHILD_PATH", &path)
+            .env("FS_PRIVATE_LEASE_EXIT_WITHOUT_DROP", "1")
+            .status()
+            .expect("run abrupt-exit lease child test process");
+        assert!(status.success(), "abrupt-exit lease child process failed");
+        drop(try_acquire_private_exclusive_file_lease(&path).unwrap());
     }
 
     #[test]

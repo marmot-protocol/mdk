@@ -90,12 +90,14 @@ mod projection;
 mod publisher_sequences;
 mod relay_plane;
 mod relay_telemetry_export;
+mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
 
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
+pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
@@ -428,6 +430,10 @@ type AppRuntime = AccountDeviceRuntime<
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
+    /// Present for exclusive-root entry points. Every clone shares this lease
+    /// so the root remains exclusively owned until all database-capable app and
+    /// runtime handles have been released.
+    _root_runtime_lease: Option<Arc<MarmotRootRuntimeLease>>,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
@@ -1055,10 +1061,11 @@ impl MarmotApp {
     }
 
     /// Dev/test-only convenience constructor. **Not a production entry point**
-    /// and hidden from the public API docs: production opens through
-    /// `with_relays_and_account_home*`, which default the relay-safety gate to
-    /// production posture (loopback rejected). This helper backs the crate's own
-    /// tests, which drive in-process `MockRelay`s at loopback, so it opts the
+    /// and hidden from the public API docs: exclusive-root hosts open through
+    /// [`MarmotApp::try_with_relays_and_account_home_and_config`], which owns
+    /// the root exclusively and defaults the relay-safety gate to production
+    /// posture (loopback rejected). This helper backs the crate's own tests,
+    /// which drive in-process `MockRelay`s at loopback, so it opts the
     /// relay-safety gate into admitting loopback endpoints. It cannot be
     /// `#[cfg(test)]`-gated because the crate's integration tests
     /// (`crates/marmot-app/tests/*`) consume it through the public API. Callers
@@ -1096,6 +1103,7 @@ impl MarmotApp {
         Self {
             account_home: AccountHome::open(&root),
             root,
+            _root_runtime_lease: None,
             relay_urls,
             relay_plane,
             config,
@@ -1116,6 +1124,12 @@ impl MarmotApp {
         }
     }
 
+    /// Constructor for tests and embeddings that coordinate root ownership
+    /// externally.
+    ///
+    /// Independently scheduled processes must use
+    /// [`Self::try_with_relays_and_account_home_and_config`].
+    #[doc(hidden)]
     pub fn with_relays_and_account_home(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
@@ -1129,6 +1143,13 @@ impl MarmotApp {
         )
     }
 
+    /// Constructor for tests and embeddings that coordinate ownership
+    /// externally.
+    ///
+    /// Independently scheduled processes sharing a root must use
+    /// [`Self::try_with_relays_and_account_home_and_config`] so independently
+    /// hydrated runtimes cannot write the same root concurrently.
+    #[doc(hidden)]
     pub fn with_relays_and_account_home_and_config(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
@@ -1141,6 +1162,7 @@ impl MarmotApp {
         );
         Self {
             root: root.as_ref().to_path_buf(),
+            _root_runtime_lease: None,
             relay_urls,
             account_home,
             relay_plane,
@@ -1160,6 +1182,27 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Constructor that exclusively owns the Marmot root across processes for
+    /// the full lifetime of every resulting app/runtime clone.
+    ///
+    /// Acquisition is nonblocking. [`AppError::RuntimeBusy`] means a different
+    /// process or independently constructed runtime currently owns the root.
+    /// Hosts should retry later or take a bounded fallback path; they must not
+    /// construct an unleased runtime against the same root.
+    pub fn try_with_relays_and_account_home_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        config: MarmotAppConfig,
+    ) -> Result<Self, AppError> {
+        let root = root.as_ref().to_path_buf();
+        let lease = Arc::new(MarmotRootRuntimeLease::try_acquire(&root)?);
+        let mut app =
+            Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
+        app._root_runtime_lease = Some(lease);
+        Ok(app)
     }
 
     pub fn runtime(&self) -> MarmotAppRuntime {
