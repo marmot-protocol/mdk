@@ -98,7 +98,8 @@ impl Marmot {
     }
 
     /// Create a brand-new Nostr identity, store its secret in the platform
-    /// keychain, and publish initial relay lists + key package.
+    /// keychain, and publish initial relay lists, an empty follow list, and a
+    /// key package.
     pub async fn create_identity(
         &self,
         default_relays: Vec<String>,

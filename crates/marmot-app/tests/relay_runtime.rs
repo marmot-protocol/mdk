@@ -836,6 +836,16 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         fetched.key_package.bytes().len(),
         created.key_package_bytes.unwrap()
     );
+    assert_eq!(
+        app.fetch_current_follow_list_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap(),
+        Some(Vec::new()),
+        "a new identity should publish a kind-3 event with no p tags"
+    );
 
     runtime.shutdown().await;
 }

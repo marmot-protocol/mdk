@@ -172,7 +172,8 @@ The first slice now proves the architecture without filling in every product sur
 
 1. `MarmotAppRuntime::open`, `start`, and `shutdown` exist.
 2. Local signing accounts are restored into an `AccountManager`.
-3. Identity creation publishes relay lists, a profile, and a fresh KeyPackage through runtime-backed setup.
+3. Identity creation publishes relay lists, an empty follow list, a profile, and a fresh KeyPackage through
+   runtime-backed setup.
 4. Runtime events cover group joins, group-state changes, messages, and typed agent stream start/final messages.
 5. Live Nostr receive and ingest run inside `marmot-app` account workers.
 6. `wnd` hosts one runtime and forwards command intents into it.
