@@ -4,7 +4,12 @@ mod common;
 use common::{paragraph, parse_blocks};
 
 fn item(checked: Option<bool>, blocks: Vec<Block>) -> ListItem {
-    ListItem { blocks, checked }
+    let blank_lines_before = vec![0; blocks.len()];
+    ListItem {
+        blocks,
+        blank_lines_before,
+        checked,
+    }
 }
 
 fn bullet_list(marker: u8, tight: bool, items: Vec<ListItem>) -> Block {
@@ -33,7 +38,8 @@ fn blockquote_simple() {
     assert_eq!(
         parse_blocks("> foo"),
         vec![Block::BlockQuote {
-            blocks: vec![paragraph("foo")]
+            blocks: vec![paragraph("foo")],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -44,7 +50,8 @@ fn blockquote_multiline_continuation() {
     assert_eq!(
         parse_blocks(input),
         vec![Block::BlockQuote {
-            blocks: vec![paragraph("foo\nbar")]
+            blocks: vec![paragraph("foo\nbar")],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -55,7 +62,8 @@ fn blockquote_lazy_continuation() {
     assert_eq!(
         parse_blocks(input),
         vec![Block::BlockQuote {
-            blocks: vec![paragraph("foo\nbar")]
+            blocks: vec![paragraph("foo\nbar")],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -67,7 +75,8 @@ fn blockquote_blank_line_ends() {
         parse_blocks(input),
         vec![
             Block::BlockQuote {
-                blocks: vec![paragraph("foo")]
+                blocks: vec![paragraph("foo")],
+                blank_lines_before: vec![0],
             },
             paragraph("bar"),
         ]
@@ -81,8 +90,10 @@ fn blockquote_nested() {
         parse_blocks(input),
         vec![Block::BlockQuote {
             blocks: vec![Block::BlockQuote {
-                blocks: vec![paragraph("foo")]
-            }]
+                blocks: vec![paragraph("foo")],
+                blank_lines_before: vec![0],
+            }],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -108,7 +119,7 @@ fn nested_blockquote_list_then_trailing_paragraph() {
     let parsed = parse_blocks(input);
     assert_eq!(parsed.len(), 1, "exactly one outer block expected");
     let outer = match &parsed[0] {
-        Block::BlockQuote { blocks } => blocks,
+        Block::BlockQuote { blocks, .. } => blocks,
         other => panic!("expected outer BlockQuote, got {other:?}"),
     };
     assert_eq!(outer.len(), 3, "outer should contain 3 children");
@@ -119,7 +130,7 @@ fn nested_blockquote_list_then_trailing_paragraph() {
     // Outer[1]: inner BlockQuote with 3 children (intro paragraph, list,
     // trailing paragraph).
     let inner = match &outer[1] {
-        Block::BlockQuote { blocks } => blocks,
+        Block::BlockQuote { blocks, .. } => blocks,
         other => panic!("expected inner BlockQuote, got {other:?}"),
     };
     assert_eq!(inner.len(), 3, "inner should contain 3 children");
@@ -176,7 +187,8 @@ fn blockquote_with_atx_inside() {
             blocks: vec![Block::Heading {
                 level: 1,
                 inlines: vec![Inline::Text("foo".into())]
-            }]
+            }],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -186,7 +198,8 @@ fn blockquote_indent_three_ok() {
     assert_eq!(
         parse_blocks("   > foo"),
         vec![Block::BlockQuote {
-            blocks: vec![paragraph("foo")]
+            blocks: vec![paragraph("foo")],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -442,7 +455,8 @@ fn list_inside_blockquote() {
                     item(None, vec![paragraph("foo")]),
                     item(None, vec![paragraph("bar")]),
                 ]
-            )]
+            )],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -533,6 +547,7 @@ fn nested_sibling_lists_do_not_lazy_continue_deeper_paragraphs() {
                                         paragraph("Another inner"),
                                         Block::BlockQuote {
                                             blocks: vec![paragraph("Quote inside a list item.")],
+                                            blank_lines_before: vec![0],
                                         },
                                     ],
                                 ),
@@ -556,6 +571,7 @@ fn lazy_continuation_strips_matched_blockquote_marker() {
                 true,
                 vec![item(None, vec![paragraph("item\nstill item")])],
             )],
+            blank_lines_before: vec![0],
         }]
     );
 }
@@ -649,7 +665,7 @@ fn max_container_depth(blocks: &[Block]) -> usize {
 
 fn max_single_block_container_depth(block: &Block) -> usize {
     match block {
-        Block::BlockQuote { blocks } => 1 + max_container_depth(blocks),
+        Block::BlockQuote { blocks, .. } => 1 + max_container_depth(blocks),
         Block::List { items, .. } => {
             1 + items
                 .iter()

@@ -48,7 +48,7 @@ fn render_block(b: &Block, out: &mut String) {
             out.push_str(&escape(content));
             out.push_str("</code></pre>\n");
         }
-        Block::BlockQuote { blocks } => {
+        Block::BlockQuote { blocks, .. } => {
             out.push_str("<blockquote>\n");
             render_blocks(blocks, out);
             out.push_str("</blockquote>\n");

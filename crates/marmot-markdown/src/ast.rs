@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    /// Number of consecutive blank source lines immediately before each
+    /// corresponding entry in `blocks`.
+    #[serde(default)]
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +31,9 @@ pub enum Block {
     },
     BlockQuote {
         blocks: Vec<Block>,
+        /// Blank source lines before each corresponding child block.
+        #[serde(default)]
+        blank_lines_before: Vec<u8>,
     },
     List {
         kind: ListKind,
@@ -58,6 +65,9 @@ pub enum ListKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItem {
     pub blocks: Vec<Block>,
+    /// Blank source lines before each corresponding child block.
+    #[serde(default)]
+    pub blank_lines_before: Vec<u8>,
     pub checked: Option<bool>,
 }
 

@@ -77,7 +77,7 @@ fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<Str
         Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
             collect_inline_mention_hexes(inlines, out);
         }
-        Block::BlockQuote { blocks } => {
+        Block::BlockQuote { blocks, .. } => {
             for block in blocks {
                 collect_block_mention_hexes(block, out);
             }

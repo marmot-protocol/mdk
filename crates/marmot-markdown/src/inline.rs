@@ -97,9 +97,14 @@ fn inline_children(item: &Inline) -> Option<&[Inline]> {
     }
 }
 
-pub(crate) fn parse_inlines(blocks: Vec<Block>, refs: &HashMap<String, LinkRef>) -> Document {
+pub(crate) fn parse_inlines(
+    blocks: Vec<Block>,
+    blank_lines_before: Vec<u8>,
+    refs: &HashMap<String, LinkRef>,
+) -> Document {
     Document {
         blocks: walk_blocks(blocks, refs),
+        blank_lines_before,
     }
 }
 
@@ -118,8 +123,12 @@ fn walk(block: Block, refs: &HashMap<String, LinkRef>) -> Block {
             level,
             inlines: tokenize(&extract_raw(inlines), refs),
         },
-        Block::BlockQuote { blocks } => Block::BlockQuote {
+        Block::BlockQuote {
+            blocks,
+            blank_lines_before,
+        } => Block::BlockQuote {
             blocks: walk_blocks(blocks, refs),
+            blank_lines_before,
         },
         Block::List { kind, tight, items } => Block::List {
             kind,
@@ -128,6 +137,7 @@ fn walk(block: Block, refs: &HashMap<String, LinkRef>) -> Block {
                 .into_iter()
                 .map(|item| ListItem {
                     blocks: walk_blocks(item.blocks, refs),
+                    blank_lines_before: item.blank_lines_before,
                     checked: item.checked,
                 })
                 .collect(),
