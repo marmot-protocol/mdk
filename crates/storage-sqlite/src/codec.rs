@@ -92,6 +92,13 @@ pub(crate) fn i64_to_u64(value: i64) -> StorageResult<u64> {
         .map_err(|_| StorageError::Serialization(format!("value does not fit in u64: {value}")))
 }
 
+/// Convert SQLite's signed `INTEGER` to `usize`, rejecting negative or
+/// platform-oversized values.
+pub(crate) fn i64_to_usize(value: i64) -> StorageResult<usize> {
+    usize::try_from(value)
+        .map_err(|_| StorageError::Serialization(format!("value does not fit in usize: {value}")))
+}
+
 /// Convert an optional `u64` to SQLite's signed `INTEGER`, preserving `None`.
 pub(crate) fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
     value.map(u64_to_i64).transpose()

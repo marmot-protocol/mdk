@@ -155,8 +155,11 @@ impl Marmot {
     /// platform keyring (Keychain on Apple platforms, Android's native
     /// keyring on Android) via the default keychain-backed account home —
     /// not in a plaintext file. Fallible because initializing the platform
-    /// secret store can fail. Call [`Marmot::start`] before subscribing to
-    /// events.
+    /// secret store can fail or another process may own the same root
+    /// ([`MarmotKitError::RuntimeBusy`]). Root ownership is nonblocking and
+    /// remains held until the final `Marmot`/runtime handle is dropped, even
+    /// after [`Marmot::shutdown`]. Call [`Marmot::start`] before subscribing
+    /// to events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
         Self::open(root_path, relay_urls, MarmotAppConfig::default())
@@ -229,12 +232,12 @@ impl Marmot {
     ) -> Result<Arc<Self>, MarmotKitError> {
         let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
             .map_err(marmot_app::AppError::from)?;
-        let app = MarmotApp::with_relays_and_account_home_and_config(
+        let app = MarmotApp::try_with_relays_and_account_home_and_config(
             &root_path,
             relay_urls,
             account_home,
             config,
-        );
+        )?;
         let runtime = app.runtime();
         Ok(Arc::new(Self { app, runtime }))
     }

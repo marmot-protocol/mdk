@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-connector"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "agent-control",
  "agent-stream-compose",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agent-control"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agent-stream-compose"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -91,18 +91,6 @@ dependencies = [
  "tokio",
  "transport-quic-broker",
  "transport-quic-stream",
-]
-
-[[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
 ]
 
 [[package]]
@@ -853,7 +841,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgka-conformance-simulator"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -883,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-engine"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -912,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-session"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -934,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-traits"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "hex",
@@ -1846,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "fs-private"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "libc",
  "tempfile",
@@ -2072,15 +2060,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -2112,11 +2091,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -2575,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "incident-replay"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-conformance-simulator",
  "serde",
@@ -3059,9 +3038,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.30.1"
+version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
 dependencies = [
  "cc",
  "openssl-sys",
@@ -3150,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-account"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -3181,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-app"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -3224,7 +3203,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-forensics"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "fs-private",
  "serde",
@@ -3234,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-markdown"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -3242,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-engine",
  "cgka-traits",
@@ -4814,9 +4793,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.32.1"
+version = "0.40.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+checksum = "11438310b19e3109b6446c33d1ed5e889428cf2e278407bc7896bc4aaea43323"
 dependencies = [
  "bitflags 2.13.0",
  "fallible-iterator",
@@ -5442,7 +5421,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-sqlite"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-traits",
  "fs-private",
@@ -6036,7 +6015,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-adapter"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6055,7 +6034,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-peeler"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6072,7 +6051,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-broker"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-traits",
  "clap",
@@ -6092,7 +6071,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-stream"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "cgka-traits",
  "chacha20poly1305",
@@ -7147,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "wn-cli"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "agent-stream-compose",
  "cgka-session",
@@ -7180,7 +7159,7 @@ dependencies = [
 
 [[package]]
 name = "wn-opencode"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "agent-control",
  "clap",

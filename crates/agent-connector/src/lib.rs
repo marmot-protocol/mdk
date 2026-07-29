@@ -219,13 +219,13 @@ impl AgentConnector {
             media_roots::MediaAllowedRoots::prepare(&config.media_allowed_roots)?;
         let account_home = AccountHome::open(&config.home);
         let relays = config.relays;
-        let app = MarmotApp::with_relays_and_account_home_and_config(
+        let app = MarmotApp::try_with_relays_and_account_home_and_config(
             &config.home,
             relays.clone(),
             account_home.clone(),
             MarmotAppConfig::default()
                 .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
-        );
+        )?;
         let runtime = MarmotAppRuntime::new(app.clone());
         let inbound_catch_up = InboundCatchUpDriver::new(runtime.clone());
         let allowlists = AllowlistStore::new(&config.home);

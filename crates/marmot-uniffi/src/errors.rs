@@ -39,6 +39,11 @@ pub enum MarmotKitError {
     FollowListUnavailable,
     #[error("transport closed")]
     TransportClosed,
+    /// Another process or runtime owns the shared Marmot root. This is a typed,
+    /// retryable/fallback signal for the iOS foreground app and NSE; neither
+    /// host should open an unleased runtime after receiving it.
+    #[error("marmot runtime root is already in use")]
+    RuntimeBusy,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -203,6 +208,7 @@ impl From<AppError> for MarmotKitError {
             AppError::Publish(details) => Self::Publish { details },
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::TransportClosed => Self::TransportClosed,
+            AppError::RuntimeBusy => Self::RuntimeBusy,
             AppError::RuntimeStopping => Self::RuntimeStopping,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
             // #484: a transient storage busy error can also surface directly at
@@ -305,6 +311,15 @@ mod tests {
             }
             other => panic!("expected AccountCatchUp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_busy_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError = AppError::RuntimeBusy.into();
+        assert!(
+            matches!(ffi, MarmotKitError::RuntimeBusy),
+            "exclusive-root contention must remain distinguishable at the host boundary"
+        );
     }
 
     // The `leave_group` precheck on `leave_request_pending` is not atomic with
