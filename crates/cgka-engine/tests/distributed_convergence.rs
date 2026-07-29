@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DroppedMessageReason,
-    InvalidatedAppMessageReason, MessageKind,
+    InvalidatedAppMessageReason, MessageKind, V1_MAX_CONVERGENCE_PASS_MS,
+    V1_SETTLEMENT_QUIESCENCE_MS,
 };
 use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -2540,15 +2541,18 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
         commits.push(alice_rename_commit(&mut alice, &group_id, &format!("flood-{index}")).await);
     }
 
-    // One commit every 800ms: each admission restarts the 1000ms quiescence
-    // window, so only the absolute 5000ms deadline can freeze the pass.
+    // Admissions arrive faster than the quiescence window so each one
+    // restarts it; only the absolute deadline can freeze the pass. Derive the
+    // cadence from the pinned v1 constants so a policy change re-derives the
+    // flood shape instead of silently invalidating it.
+    let flood_interval_ms = V1_SETTLEMENT_QUIESCENCE_MS * 4 / 5;
     let opened_at = 10_000u64;
     for (index, commit) in commits.iter().take(6).enumerate() {
         carol
             .buffer_openmls_convergence_message(
                 &group_id,
                 commit.clone(),
-                opened_at + 800 * index as u64,
+                opened_at + flood_interval_ms * index as u64,
             )
             .unwrap();
     }
@@ -2565,7 +2569,7 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
     );
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, opened_at + 5_050)
+        .converge_stored_openmls_messages(&group_id, opened_at + V1_MAX_CONVERGENCE_PASS_MS + 50)
         .unwrap();
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(7));
@@ -2581,7 +2585,11 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
 
     // The flood continues, but the boundary now belongs to the admin intent.
     carol
-        .buffer_openmls_convergence_message(&group_id, commits[6].clone(), opened_at + 5_100)
+        .buffer_openmls_convergence_message(
+            &group_id,
+            commits[6].clone(),
+            opened_at + V1_MAX_CONVERGENCE_PASS_MS + 100,
+        )
         .unwrap();
     let parked = carol_storage
         .convergence_pass(&group_id)
@@ -2591,7 +2599,10 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
     assert!(parked.fairness_slot_available);
 
     let drained = carol
-        .converge_and_drain_queued_outbound_intents(&group_id, opened_at + 5_200)
+        .converge_and_drain_queued_outbound_intents(
+            &group_id,
+            opened_at + V1_MAX_CONVERGENCE_PASS_MS + 200,
+        )
         .await
         .unwrap();
     assert_eq!(drained.len(), 1);

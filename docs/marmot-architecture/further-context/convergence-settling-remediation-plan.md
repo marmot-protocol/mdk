@@ -349,7 +349,7 @@ Not scheduled until PR A has shipped and its telemetry confirms settling is fixe
 
 ## 6. Sequencing, rollout, revert levers
 
-- PR A ships first and alone; it is the user-facing fix. PR B after, trivially revertable.
+- PR A ships first and alone; it is the user-facing fix. PR B after, trivially reversible.
   PR C is gated on a design review.
 - Post-release, watch (a) the new §3.4 latency metrics — pass-open → apply should sit at
   ~quiescence + margin, generation gaps near zero; (b) post-settle reorg rate (existing
