@@ -11,6 +11,18 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+/// The epoch-machine state an engine enters when its group is blocked pending a
+/// verified repair. Goggles derives its error-severity `epoch_state_transition`
+/// projection row from exactly this state, so the classifier reads the primary
+/// audit event rather than that derived label: the event is present in both wire
+/// formats and does not depend on Goggles' severity derivation.
+const UNRECOVERABLE_STATE: &str = "unrecoverable";
+
+/// Stand-in reason for a halt whose row carried none. Every emitting surface
+/// populates a reason today; this keeps the lenient model from dropping a halt
+/// on the floor should one ever not.
+const UNSPECIFIED_HALT_REASON: &str = "unspecified";
+
 /// A parsed export, reduced to the classifier's inputs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentStateExport {
@@ -125,9 +137,35 @@ pub enum EventKind {
         epoch: Option<u64>,
     },
     /// The engine's epoch machine moved (commit confirmed, group hydrated, …).
+    /// `new_state` is the state it moved *into*; the classifier reads it for the
+    /// terminal [`UNRECOVERABLE_STATE`] halt, with `reason` naming the trigger
+    /// (e.g. `hydrate_unrecoverable_group`).
     EpochStateChanged {
         #[serde(default)]
         epoch: Option<u64>,
+        #[serde(default)]
+        new_state: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// A distributed-convergence run changed lifecycle phase. The classifier
+    /// reads only the terminal [`ConvergencePhase::Unrecoverable`] halt (mdk
+    /// #1110): the pass stopped and the group stays blocked until a verified
+    /// repair clears the marker. `reason` names the halt
+    /// (`convergence_pass_base_changed` / `frozen_pass_integrity_failure`) and
+    /// `error_kind` its underlying cause (e.g. `frozen_member_integrity`).
+    ConvergenceRunState {
+        #[serde(default)]
+        phase: Option<ConvergencePhase>,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        error_kind: Option<String>,
+        /// The tip the run started from — an epoch the engine has locally
+        /// materialized, so it feeds the epoch high-water mark exactly as
+        /// `convergence_decision.current_tip_epoch` does.
+        #[serde(default)]
+        current_tip_epoch: Option<u64>,
     },
     /// A snapshot of the group as the engine sees it; its epoch is the
     /// engine's own current epoch.
@@ -190,6 +228,20 @@ pub struct ConvergenceRule {
     pub decisive: Option<bool>,
 }
 
+/// The lifecycle phase of a convergence run. Only the terminal halt is
+/// modelled — every other phase (`started`, `applied`, `waiting`, …) is routine
+/// and carries no verdict signal, so it maps to [`ConvergencePhase::Other`]
+/// exactly as unknown [`EventKind`]s map to [`EventKind::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvergencePhase {
+    /// The run halted and cannot continue: convergence and ingest stay blocked
+    /// for this group until a verified repair path clears the marker.
+    Unrecoverable,
+    #[serde(other)]
+    Other,
+}
+
 /// The role that won a fork resolution. `MissingSnapshot` means the winner's
 /// pre-commit snapshot was unavailable, so the incident is unreproducible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -228,6 +280,36 @@ impl EventKind {
         matches!(self, EventKind::ForkResolution { .. })
     }
 
+    /// Why the engine recorded halting unrecoverably, or `None` when this event
+    /// is not such a halt.
+    ///
+    /// A halt is the engine's own statement that it stopped and will stay
+    /// stopped until repaired, so — unlike the inferential liveness gate — it
+    /// needs no corroborating timestamps to be believed.
+    pub fn unrecoverable_halt_reason(&self) -> Option<&str> {
+        match self {
+            EventKind::ConvergenceRunState {
+                phase: Some(ConvergencePhase::Unrecoverable),
+                reason,
+                error_kind,
+                ..
+            } => Some(
+                reason
+                    .as_deref()
+                    .or(error_kind.as_deref())
+                    .unwrap_or(UNSPECIFIED_HALT_REASON),
+            ),
+            EventKind::EpochStateChanged {
+                new_state: Some(new_state),
+                reason,
+                ..
+            } if new_state == UNRECOVERABLE_STATE => {
+                Some(reason.as_deref().unwrap_or(UNSPECIFIED_HALT_REASON))
+            }
+            _ => None,
+        }
+    }
+
     /// The group epoch this event reports the engine itself to be at, if it
     /// reports one. The liveness gates fold these into a per-engine epoch
     /// high-water mark, so only kinds that reflect the engine's *own* state
@@ -236,7 +318,7 @@ impl EventKind {
         match self {
             EventKind::GroupStateChanged { epoch, .. }
             | EventKind::MessageStateChanged { epoch }
-            | EventKind::EpochStateChanged { epoch } => *epoch,
+            | EventKind::EpochStateChanged { epoch, .. } => *epoch,
             EventKind::GroupContext { context } => context.epoch,
             EventKind::HumanAction { to_epoch } => *to_epoch,
             EventKind::ConvergenceDecision {
@@ -244,6 +326,9 @@ impl EventKind {
                 selected_tip_epoch,
                 ..
             } => (*current_tip_epoch).max(*selected_tip_epoch),
+            EventKind::ConvergenceRunState {
+                current_tip_epoch, ..
+            } => *current_tip_epoch,
             _ => None,
         }
     }

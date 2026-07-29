@@ -47,7 +47,8 @@ pub use artifact::{
     UnavailableEvidenceV1, accept_attested_history, archetype_artifact, import_attested_history,
 };
 pub use classify::{
-    BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory,
+    BehindEngine, BehindMode, HaltedEngine, QuarantineReason, Verdict, classify, halt_advisory,
+    liveness_advisory,
 };
 pub use convergence::{
     ConvergenceDecisionKind, ConvergenceRecoveryError, RecoveredConvergence, recover_convergence,

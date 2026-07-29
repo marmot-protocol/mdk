@@ -2,7 +2,8 @@
 //! against synthetic, non-sensitive fixtures.
 
 use incident_replay::{
-    BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory, parse,
+    BehindEngine, BehindMode, HaltedEngine, QuarantineReason, Verdict, classify, halt_advisory,
+    liveness_advisory, parse,
 };
 
 fn load(name: &str) -> incident_replay::AgentStateExport {
@@ -228,4 +229,123 @@ fn truncated_projection_quarantines_even_when_contested() {
             reason: QuarantineReason::TruncatedProjections
         }
     );
+}
+
+#[test]
+fn a_convergence_pass_that_halted_unrecoverably_quarantines() {
+    // PR #1110 made a convergence pass able to halt: it emits
+    // `convergence_run_state` with `phase: unrecoverable`, and the group stays
+    // blocked until a verified repair clears the marker. The engine is stating
+    // outright that it stopped, so — unlike the epoch-divergence gate's
+    // inferential lag — no timestamps are needed to believe it.
+    let export = load("quarantine-convergence-pass-halt.json");
+    assert_eq!(
+        classify(&export),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["convergence_pass_base_changed".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_group_hydrated_into_the_unrecoverable_state_quarantines() {
+    // The other halt surface (mdk #1106): the engine's epoch machine re-entered
+    // `unrecoverable` on hydrate, so a durable halt survived a process restart.
+    // This is the shape the real 26a9f546 export carried — the row Goggles
+    // derives its error-severity `epoch_state_transition` projection from — and
+    // the classifier previously read nothing but the row's epoch, so a hard
+    // client failure surfaced only as the misleading label `went dark`.
+    let export = load("quarantine-hydrate-unrecoverable.json");
+    assert_eq!(
+        classify(&export),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-b".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn both_halt_surfaces_on_one_engine_report_one_entry_per_reason() {
+    // An engine that halts mid-pass and then hydrates back into the halt records
+    // both surfaces, repeatedly. The report is per engine, with each distinct
+    // reason once: a halt is a state, not a count, so repetition is not severity.
+    let export = load("quarantine-repeated-halt.json");
+    assert_eq!(
+        classify(&export),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec![
+                        "frozen_pass_integrity_failure".into(),
+                        "hydrate_unrecoverable_group".into(),
+                    ],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_convergence_run_at_the_tip_proves_the_engine_is_not_behind() {
+    // engine-b's group-state evidence stops at epoch 4, but it went on to run a
+    // convergence pass whose canonical tip was 6 — an epoch it can only have
+    // started from by having materialized it locally. Reading only the older
+    // signal would report a healthy engine as two epochs behind. This is the same
+    // reasoning `convergence_decision.current_tip_epoch` already carries, applied
+    // to the denser of the two surfaces (a real export logs roughly twice as many
+    // run-state rows as decisions). A non-terminal phase must also leave the halt
+    // gate unarmed.
+    assert_eq!(
+        classify(&load("healthy-convergence-run-at-tip.json")),
+        Verdict::Healthy
+    );
+}
+
+#[test]
+fn halt_advisory_surfaces_behind_an_incident_verdict() {
+    // A halt is a client failure, not a branch contest, so it must not preempt a
+    // replayable incident — the fork still routes. But it must not be lost to
+    // that single verdict either, so `halt_advisory` exposes it the way
+    // `liveness_advisory` exposes rule 6.
+    let export = load("fork-with-halted-engine.json");
+    assert_eq!(classify(&export), Verdict::ForkRecovery);
+    assert_eq!(
+        halt_advisory(&export),
+        Some(QuarantineReason::UnrecoverableHalt {
+            engines: vec![HaltedEngine {
+                engine_id: "engine-b".into(),
+                reasons: vec!["hydrate_unrecoverable_group".into()],
+            }],
+        })
+    );
+}
+
+#[test]
+fn a_halt_outranks_the_epoch_divergence_it_explains() {
+    // engine-b is both halted and two epochs behind — the real 26a9f546 pairing,
+    // where the halt is *why* the engine stopped advancing. The diagnosis is the
+    // verdict; the inference stays available as the secondary advisory rather than
+    // sending the operator to re-pull for a confirmation they already have.
+    let export = load("quarantine-halt-and-divergence.json");
+    assert!(matches!(
+        classify(&export),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt { .. }
+        }
+    ));
+    assert!(matches!(
+        liveness_advisory(&export),
+        Some(QuarantineReason::EpochDivergence { .. })
+    ));
 }

@@ -28,11 +28,12 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
   - **Role:** The `classify` gate → `Verdict`: `Healthy | ForkRecovery |
     ConvergenceSelected | Quarantine { reason }`. Everything downstream is gated
     behind this, so a healthy export yields zero vectors and a clean exit. Also
-    home of the liveness gate (rule 5 below), which keeps a silently split
-    group from reading as healthy. `liveness_advisory` exposes that same rule-5
-    computation independent of the verdict, so a co-occurring liveness incident
-    that loses the single verdict to a higher-precedence incident (fork or
-    convergence) is still surfaced — the CLI prints it as a secondary advisory.
+    home of the two liveness gates (rules 5 and 6 below), which keep a halted or
+    silently split group from reading as healthy. `halt_advisory` and
+    `liveness_advisory` expose those same computations independent of the verdict,
+    so a co-occurring incident that loses the single verdict to a
+    higher-precedence one is still surfaced — the CLI prints each as a secondary
+    advisory.
 - **Module:** `src/fork.rs`
   - **Role:** `recover_fork` turns a fork-recovery export into a `RecoveredFork`
     (source epoch + commit kind), or a `ForkRecoveryError` when it cannot be
@@ -113,7 +114,25 @@ Precedence, highest first:
    `missing_snapshot` (the winning snapshot was unavailable, so it can't be
    replayed) on the fork-recovery route.
 4. **`ForkRecovery`** — any other `fork_resolution`.
-5. **Quarantine `epoch_divergence`** — an engine trails the group's epoch
+5. **Quarantine `unrecoverable_halt`** — an engine recorded halting
+   unrecoverably, so its group stays blocked until a verified repair clears the
+   marker. Two audit surfaces arm it, and the reason string from whichever fired
+   is reported per engine: `convergence_run_state` with `phase: unrecoverable`
+   (mdk#1110 — reasons `convergence_pass_base_changed` and
+   `frozen_pass_integrity_failure`, the latter from `error_kind:
+   frozen_member_integrity`), and `epoch_state_changed` with `new_state:
+   unrecoverable` (mdk#1106 — reason `hydrate_unrecoverable_group`, a durable
+   halt that survived a restart). Unlike rule 6 this is not an inference from
+   lag: the engine *stated* that it stopped, so the gate needs no timestamps to
+   order evidence and no threshold to clear noise — only an `engine_id` to
+   attribute the halt to. It therefore outranks rule 6, which it usually
+   explains: on the real 26a9f546 export the halted engine is exactly the one
+   rule 6 labelled `went dark`, and reporting the inference over the diagnosis
+   would send the operator to re-pull for a confirmation they already have.
+   A halt is a client failure, not a branch contest, so there is still nothing
+   to replay. `halt_advisory` exposes the same computation verdict-independently,
+   as `liveness_advisory` does for rule 6.
+6. **Quarantine `epoch_divergence`** — an engine trails the group's epoch
    high-water mark by ≥ 2 epochs (one epoch is routine commit propagation).
    The reason names every engine left behind with its epoch and a per-engine
    mode: **`went_dark`** (its events end before — or within one hour of — the
@@ -124,9 +143,9 @@ Precedence, highest first:
    catching up: commits are not reaching it while its other traffic flows).
    A real liveness incident, but not a branch contest, so there is nothing to
    replay — the named engines are the triage starting point.
-6. **`Healthy`** — none of the above.
+7. **`Healthy`** — none of the above.
 
-Rule 5 ranks *below* the incident routes on purpose: a reproducible contest is
+Rules 5 and 6 rank *below* the incident routes on purpose: a reproducible contest is
 worth replaying even when another engine's data is stale (recovery fail-closes
 downstream if the data it needs is missing). It fires only on positive
 evidence — no engine ids or timestamps means the gate stays unarmed — so
@@ -163,6 +182,28 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   activity): a device that is merely offline while no commits land misses
   nothing and converges on return; epoch-anchored lag subsumes the cases that
   matter.
+- *Reading Goggles' `epoch_state_transition` projection* for the rule-5 halt.
+  That NDJSON section is where a halt carries `severity: error`, so it looks like
+  the obvious input, but it is a *derived* row: its `evidence_ref.event_type` is
+  `epoch_state_changed`, and on the real 26a9f546 export its 12 error rows are a
+  1:1 projection of 12 audit events that state `new_state: unrecoverable`
+  outright. Reading the audit event instead keeps the gate on primary evidence,
+  keeps it working for the `agent-state.json` shape (whose projection layout is
+  not verified here — no real document export was on hand), and keeps this model
+  decoupled from Goggles' derivation rather than only from the engine's enum.
+  No evidence is lost: every error-severity transition on that export is an
+  unrecoverable one, and every unrecoverable one is error-severity.
+- *A separate gate per halt surface.* `convergence_run_state{phase:
+  unrecoverable}` and `epoch_state_changed{new_state: unrecoverable}` are two
+  views of one incident — on the real export the same engine recorded both — so
+  they fold into one per-engine report rather than two rules that would both fire
+  and disagree about precedence. Each distinct reason is listed once: a halt is a
+  state, not a count, so repetition is not severity.
+- *Recognizing `convergence_pass_reopened`* (the non-terminal kind open PR #1182
+  adds) ahead of its merge. Its wire shape can still change; it is non-terminal,
+  so no rule would read it and the variant would be dead on arrival; and the
+  parser is already lenient — an unmodelled kind maps to `EventKind::Other`
+  harmlessly — so waiting costs nothing. Add it with the rule that needs it.
 - *Softer arming* (two variants, both refuted by the same backtest): arming only
   on `active_while_behind` would have missed the incident's genuinely-stuck
   device entirely — its uploads had stopped, so it read as dark in the export,
