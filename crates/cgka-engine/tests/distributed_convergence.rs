@@ -5686,7 +5686,7 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
     assert!(
         events.iter().any(|event| matches!(
             &event.kind,
-            AuditEventKind::ConvergencePassReopened {
+            AuditEventKind::ConvergencePassDiscarded {
                 stale_base_epoch,
                 current_tip_epoch,
                 generation,

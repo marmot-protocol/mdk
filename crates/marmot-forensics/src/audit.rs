@@ -1032,7 +1032,7 @@ pub enum AuditEventKind {
     /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
     /// epochs/counters only, so nothing here needs scrubbing in either
     /// [`AuditDataMode`].
-    ConvergencePassReopened {
+    ConvergencePassDiscarded {
         stale_base_epoch: u64,
         current_tip_epoch: u64,
         generation: u64,
@@ -1088,7 +1088,7 @@ impl AuditEventKind {
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
             AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
-            AuditEventKind::ConvergencePassReopened { .. } => "convergence_pass_reopened",
+            AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }
     }
 }

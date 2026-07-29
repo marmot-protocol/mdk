@@ -492,7 +492,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(storage_projection_error)?;
         self.audit_group(
             &pass.group_id,
-            marmot_forensics::AuditEventKind::ConvergencePassReopened {
+            marmot_forensics::AuditEventKind::ConvergencePassDiscarded {
                 stale_base_epoch: pass.base_epoch.0,
                 current_tip_epoch: tip.0,
                 generation: pass.generation,

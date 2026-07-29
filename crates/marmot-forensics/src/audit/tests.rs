@@ -835,7 +835,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             stalled_epoch: 19,
             threshold: 8,
         },
-        AuditEventKind::ConvergencePassReopened {
+        AuditEventKind::ConvergencePassDiscarded {
             stale_base_epoch: 7,
             current_tip_epoch: 13,
             generation: 4,

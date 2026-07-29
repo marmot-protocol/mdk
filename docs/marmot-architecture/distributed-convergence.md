@@ -140,7 +140,7 @@ re-enumerating storage.
 
 A pass is scheduling state for one base epoch. When the group's tip has moved past that epoch — a device catching up
 applies commits while a pass is open — the stale pass is discarded and the next generation opens at the current tip
-(`convergence_pass_reopened`). The pass holds no canonical state of its own, so its members reseed from retained
+(`convergence_pass_discarded`). The pass holds no canonical state of its own, so its members reseed from retained
 storage. `stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` pins that rule. Only a frozen member
 that no longer matches the record it was admitted from is an integrity failure, and that alone halts the group
 `Unrecoverable`.

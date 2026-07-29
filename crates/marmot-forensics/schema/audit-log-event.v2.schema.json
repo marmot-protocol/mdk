@@ -1675,7 +1675,7 @@
           ],
           "properties": {
             "type": {
-              "const": "convergence_pass_reopened"
+              "const": "convergence_pass_discarded"
             },
             "stale_base_epoch": {
               "$ref": "#/$defs/u64"
