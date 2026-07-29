@@ -35,9 +35,17 @@ impl MarmotRootRuntimeLease {
     /// [`AppError::RuntimeBusy`] means another process/runtime owns the root and
     /// the caller should either retry later (foreground app) or take its
     /// bounded fallback path (notification extension). Other failures retain
-    /// their I/O classification.
+    /// their I/O classification. A missing root is created owner-only; the mode
+    /// of an existing externally managed root is preserved.
     pub fn try_acquire(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref();
+        #[cfg(unix)]
+        fs_private::prepare_directory_path(
+            root,
+            fs_private::PRIVATE_DIR_MODE,
+            fs_private::ExistingDirectoryMode::Preserve,
+        )?;
+        #[cfg(not(unix))]
         fs_private::create_dir_all_private(root)?;
 
         #[cfg(unix)]
@@ -67,6 +75,7 @@ mod tests {
     use super::*;
     use crate::{MarmotApp, MarmotAppConfig};
     use marmot_account::AccountHome;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn second_root_lease_is_busy_until_every_owner_drops() {
@@ -86,6 +95,24 @@ mod tests {
 
         drop(clone);
         drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
+    }
+
+    #[test]
+    fn root_lease_preserves_an_existing_shared_root_mode() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let lease = MarmotRootRuntimeLease::try_acquire(root.path()).unwrap();
+
+        let root_mode = std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(root_mode, 0o750);
+        let lock_mode = std::fs::metadata(root.path().join(MARMOT_ROOT_RUNTIME_LOCK_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(lock_mode, fs_private::PRIVATE_FILE_MODE);
+        drop(lease);
     }
 
     #[test]

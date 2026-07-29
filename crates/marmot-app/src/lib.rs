@@ -1123,6 +1123,12 @@ impl MarmotApp {
         }
     }
 
+    /// Constructor for tests and embeddings that coordinate root ownership
+    /// externally.
+    ///
+    /// Independently scheduled processes must use
+    /// [`Self::try_with_relays_and_account_home_and_config`].
+    #[doc(hidden)]
     pub fn with_relays_and_account_home(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
@@ -1142,6 +1148,7 @@ impl MarmotApp {
     /// Independently scheduled processes sharing a root must use
     /// [`Self::try_with_relays_and_account_home_and_config`] so independently
     /// hydrated runtimes cannot write the same root concurrently.
+    #[doc(hidden)]
     pub fn with_relays_and_account_home_and_config(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,

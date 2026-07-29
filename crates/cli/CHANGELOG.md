@@ -9,8 +9,6 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
-## [0.9.11] - 2026-07-29
-
 ### Added
 
 - MarmotKit and the agent connector now acquire a nonblocking, kernel-released
