@@ -7331,6 +7331,31 @@ fn esc_from_a_group_aimed_search_returns_to_the_group_not_the_main_view() {
 }
 
 #[test]
+fn a_failing_return_from_a_group_aimed_search_reports_and_keeps_the_session_up() {
+    // The return schedules a group-detail refresh, whose account precondition can
+    // fail. A key handler reports such a failure on the status line; propagating it
+    // would exit `run()` and end the whole session over a recoverable error.
+    let mut app = app_on_group_detail(test_unused_client());
+    app.handle_key(char_key('a')).expect("a on group detail");
+    // A public-only account cannot sign, so `require_selected_local_account` — the
+    // refresh's precondition — fails.
+    app.accounts[0].local_signing = false;
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc reports the failure instead of tearing down the session");
+
+    assert!(
+        app.status.starts_with("error:"),
+        "the failure reaches the status line; got: {:?}",
+        app.status
+    );
+    // The navigation the user asked for still applied: only the refresh failed, and
+    // the cached group-detail view is what renders.
+    assert_eq!(app.screen, Screen::GroupDetail);
+    assert!(app.user_search.is_none(), "the search view is cleared");
+}
+
+#[test]
 fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::GroupDetail;
