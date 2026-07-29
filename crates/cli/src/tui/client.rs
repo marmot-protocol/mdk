@@ -999,6 +999,30 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Return from a search opened by group-detail `a` to that group's detail,
+    /// refreshing it so a membership change made from the search is visible. The
+    /// cached view renders at once, so the refresh only shows if it changed
+    /// something. The status is left as the caller set it, because it carries the
+    /// outcome of whatever the search just did.
+    ///
+    /// Falls back to the main view when the group-detail view is gone: a disband
+    /// or a leave can clear it while the search is open, and returning to a
+    /// screen with nothing to show would strand the reader on a loading notice.
+    pub(crate) fn return_to_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
+        // Dropping the in-flight anchor makes a late search result a no-op at fold
+        // time, so the screen we return to cannot be repopulated by the abandoned
+        // query — the same guard `leave_screen` applies on `Esc`.
+        self.searching_users = None;
+        self.user_search = None;
+        if self.group_detail.is_none() {
+            self.screen = Screen::Main;
+            self.focus = Focus::Chats;
+            return Ok(());
+        }
+        self.screen = Screen::GroupDetail;
+        self.load_group_detail(group_id)
+    }
+
     /// Load (or reload) the group-detail view off the event loop: members with
     /// admin badges (`groups members` + `groups admins`), relay hints
     /// (`groups relays`), and name/description (`groups show`). The member
@@ -1285,10 +1309,27 @@ impl TuiApp {
 
     // ---- Phase 5b: user search, profile, and relay health ----
 
-    /// Enter the user-search screen. A query (from `/users <query>`) runs
-    /// immediately; an empty open lands on the query field awaiting input.
+    /// Enter the user-search screen to browse. A query (from `/users <query>`)
+    /// runs immediately; an empty open lands on the query field awaiting input.
     pub(crate) fn open_user_search(&mut self, query: Option<String>) {
-        let mut view = UserSearchView::default();
+        self.open_user_search_with(query, UserSearchPurpose::Browse);
+    }
+
+    /// Enter the user-search screen for a specific purpose. The purpose travels
+    /// on the view, so it is dropped with the screen and cannot outlive it.
+    pub(crate) fn open_user_search_with(
+        &mut self,
+        query: Option<String>,
+        purpose: UserSearchPurpose,
+    ) {
+        let status = match &purpose {
+            UserSearchPurpose::Browse => "user search",
+            UserSearchPurpose::AddToGroup { .. } => "search a user to add",
+        };
+        let mut view = UserSearchView {
+            purpose,
+            ..UserSearchView::default()
+        };
         if let Some(query) = query
             .map(|query| query.trim().to_owned())
             .filter(|q| !q.is_empty())
@@ -1298,7 +1339,7 @@ impl TuiApp {
         let run_now = !view.query.is_empty();
         self.user_search = Some(view);
         self.screen = Screen::UserSearch;
-        self.status = "user search".to_owned();
+        self.status = status.to_owned();
         if run_now && let Err(err) = self.run_user_search() {
             self.status = format!("error: {err}");
         }

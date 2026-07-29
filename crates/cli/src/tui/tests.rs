@@ -6796,13 +6796,14 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
         hints_line(Screen::RelayHealth, Focus::Chats, true),
         "r refresh  j/k scroll  Esc back"
     );
-    // The user-search screen's hint is focus-aware (rendered via `user_search_hint`).
+    // The user-search screen's hint is focus- and purpose-aware (rendered via
+    // `user_search_hint`).
     assert_eq!(
-        user_search_hint(UserSearchFocus::Query),
+        user_search_hint(UserSearchFocus::Query, &UserSearchPurpose::Browse),
         "type query  Enter search  Down results  Esc back"
     );
     assert_eq!(
-        user_search_hint(UserSearchFocus::Results),
+        user_search_hint(UserSearchFocus::Results, &UserSearchPurpose::Browse),
         "j/k move  Enter profile  f follow  x unfollow  c chat  a add  i query  Esc back"
     );
     assert_eq!(
@@ -6811,7 +6812,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         hints_line(Screen::GroupDetail, Focus::Chats, true),
-        "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
+        "j/k move  a search+add  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
@@ -7230,6 +7231,146 @@ fn group_detail_leave_guard_blocks_admins_and_confirms_non_admins() {
             ..
         })
     ));
+}
+
+/// A group-detail view with two members, for the search-and-add flow.
+fn app_on_group_detail(client: WnClient) -> TuiApp {
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: vec![GroupMemberRow {
+            member_id: "aa".to_owned(),
+            npub: "npubself".to_owned(),
+            is_admin: true,
+            is_self: true,
+        }],
+        relays: Vec::new(),
+        account_is_admin: true,
+        admin_count: 1,
+        selected: 0,
+    });
+    app
+}
+
+#[test]
+fn a_on_group_detail_opens_a_user_search_aimed_at_that_group() {
+    let mut app = app_on_group_detail(test_unused_client());
+
+    app.handle_key(char_key('a')).expect("a on group detail");
+
+    assert_eq!(app.screen, Screen::UserSearch);
+    assert_eq!(
+        app.user_search.as_ref().map(|view| view.purpose.clone()),
+        Some(UserSearchPurpose::AddToGroup {
+            group_id: "g1".to_owned(),
+            group_name: "Ops Room".to_owned(),
+        }),
+        "the search knows the group it was opened to add to"
+    );
+}
+
+/// A result row for the search-and-add flow.
+fn search_result_row(npub: &str, label: &str) -> UserSearchResultRow {
+    UserSearchResultRow {
+        pubkey: "bb".repeat(32),
+        npub: npub.to_owned(),
+        display_name: Some(label.to_owned()),
+        matched_field: "name".to_owned(),
+        match_quality: "exact".to_owned(),
+        radius: 1,
+        following: false,
+    }
+}
+
+#[test]
+fn a_on_a_result_confirms_against_the_group_the_search_was_opened_for() {
+    let mut app = app_on_group_detail(test_unused_client());
+    app.handle_key(char_key('a')).expect("a on group detail");
+    app.user_search.as_mut().expect("search view").results =
+        vec![search_result_row("npubbob", "Bob")];
+    app.user_search.as_mut().expect("search view").focus = UserSearchFocus::Results;
+
+    app.handle_key(char_key('a')).expect("a on the result");
+
+    // Straight to the confirm: the target group is already known, so the chat
+    // picker that the browse flow needs would be a dead step here.
+    match &app.popup {
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
+            body,
+            ..
+        }) => {
+            assert_eq!(group_id, "g1");
+            assert_eq!(pubkey, &"bb".repeat(32));
+            assert!(
+                body[0].contains("Bob") && body[0].contains("Ops Room"),
+                "the confirm names the user and the group; got: {body:?}"
+            );
+        }
+        other => panic!("expected the add-to-group confirm, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_group_aimed_search_hint_names_the_group_and_the_help_card_names_the_key() {
+    let purpose = UserSearchPurpose::AddToGroup {
+        group_id: "g1".to_owned(),
+        group_name: "Ops Room".to_owned(),
+    };
+    let hint = user_search_hint(UserSearchFocus::Results, &purpose);
+    assert!(
+        hint.contains("a add to Ops Room"),
+        "the aimed search names its target, since `a` no longer asks; got: {hint}"
+    );
+    let help = help_card_lines().join("\n");
+    assert!(
+        help.contains("a search for a member to add"),
+        "the help card names the group-detail search key; got:\n{help}"
+    );
+}
+
+#[test]
+fn a_group_name_cannot_fabricate_a_keycap_in_the_search_hint() {
+    // `keymap_hint_spans` splits hint segments on a double space and boxes a
+    // leading key-shaped token, so an unsanitized name could paint a convincing
+    // fake `Esc` keycap into the hint line.
+    let purpose = UserSearchPurpose::AddToGroup {
+        group_id: "g1".to_owned(),
+        group_name: "Ops  Esc quit".to_owned(),
+    };
+    let hint = user_search_hint(UserSearchFocus::Results, &purpose);
+    assert!(
+        hint.contains("a add to Ops Esc quit"),
+        "the name stays one segment; got: {hint}"
+    );
+    let keycaps = keymap_hint_spans(&hint)
+        .into_iter()
+        .filter(|span| span.content.as_ref() == " Esc ")
+        .count();
+    assert_eq!(keycaps, 1, "only the real `Esc back` renders as a keycap");
+}
+
+#[test]
+fn esc_from_a_group_aimed_search_returns_to_the_group_not_the_main_view() {
+    let mut app = app_on_group_detail(test_unused_client());
+    app.handle_key(char_key('a')).expect("a on group detail");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc from the search");
+
+    assert_eq!(
+        app.screen,
+        Screen::GroupDetail,
+        "back where `a` was pressed"
+    );
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert!(
+        app.group_detail.is_some(),
+        "the group-detail view was kept, so the return needs no reload to render"
+    );
 }
 
 #[test]
@@ -10410,10 +10551,10 @@ fn user_search_pane_scrolls_the_whole_selected_row_into_view() {
         .collect();
     let selected = results.len() - 1;
     app.user_search = Some(UserSearchView {
-        query: Input::default(),
         results,
         selected,
         focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
     });
 
     let rendered = rendered_buffer(&mut app);
@@ -11172,6 +11313,48 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
         app.selected_chat_row().map(|chat| chat.group_id.as_str()),
         Some("g1"),
         "the affected chat is selected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adding_a_found_user_from_group_detail_adds_them_and_returns_to_the_group() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = app_on_group_detail(client);
+    app.handle_key(char_key('a')).expect("a on group detail");
+    app.user_search.as_mut().expect("search view").results =
+        vec![search_result_row("npubbob", "Bob")];
+    app.user_search.as_mut().expect("search view").focus = UserSearchFocus::Results;
+    app.handle_key(char_key('a')).expect("a on the result");
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("confirm the add");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded.contains(&format!("groups add-members g1 {}", "bb".repeat(32))),
+        "the member is added to the group the search was opened for; got:\n{recorded}"
+    );
+    // Back where the flow started, not on the main view: the point of adding
+    // from group detail is to see the member land in that list.
+    assert_eq!(app.screen, Screen::GroupDetail);
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.loading_group_detail.as_deref(),
+        Some("g1"),
+        "the group detail reloads so the new member shows"
     );
 }
 
@@ -12239,7 +12422,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
 
 #[test]
 fn the_search_results_hints_and_help_card_name_the_follow_keys() {
-    let hint = user_search_hint(UserSearchFocus::Results);
+    let hint = user_search_hint(UserSearchFocus::Results, &UserSearchPurpose::Browse);
     assert!(
         hint.contains("f follow  x unfollow"),
         "the results-focus hints name the follow keys; got: {hint}"

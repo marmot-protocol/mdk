@@ -639,8 +639,12 @@ Main view controls:
 - `?`: open the help popup.
 - `Esc`: clear an armed message-interaction prefill (`/react`, `/reply`, or `/delete`, whether untouched or after you
   have typed into it); a hand-typed draft is left intact so `Esc` never destroys text you wrote — use `Ctrl-U` to
-  clear a hand-typed draft. With a popup open, `Esc` closes it.
+  clear a hand-typed draft. With no armed prefill, `Esc` is spatial back: composer → messages → chats, and a no-op
+  from the chat list. Leaving the composer this way keeps the draft for when focus returns. With a popup open, `Esc`
+  closes it.
 - `Ctrl-U`: clear the whole composer (readline kill-line), whatever it holds. Also clears the masked nsec-entry field.
+- `q`: quit, from the chat list or the messages pane and only while the composer is empty. In the composer it is a
+  literal `q`, and with a draft already typed it does nothing at all — so quitting can never discard text you wrote.
 - `Ctrl-C`: quit.
 
 Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
@@ -650,7 +654,9 @@ key. Because the help card is a popup, `q` under it closes the card instead of q
 
 Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
 its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
-selection; `A` adds a member by npub/hex (text popup → `groups add-members`); `x` removes the selected member
+selection (the pane scrolls to keep the highlighted member on screen); `a` searches for someone to add (see user
+search below) for when you do not have their pubkey to hand; `A` adds a member by npub/hex (text popup →
+`groups add-members`); `x` removes the selected member
 (confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
 renames the group (text popup prefilled with the current name → `groups rename`); `L` leaves the group. An admin
 cannot leave: `L` shows a "Cannot Leave Group" info card (sole admins are told to promote another member first,
@@ -677,13 +683,19 @@ worker with in-flight feedback and fold into a per-row
 `[following]` badge; rows you already follow are badged up front from a `follows list` snapshot taken with each
 search. `i` returns to the query, and
 `Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
-attribution the search returns.
+attribution the search returns, and the list scrolls to keep the highlighted result (both of its lines) on screen.
+
+Opened from group detail with `a`, the same screen is aimed at that group: the hints line names it, `a` on a result
+skips the chat picker and confirms straight against that group, and `Esc` returns to the group detail rather than the
+main view. After the add lands, the group detail reopens and reloads, so the new member shows in the list you started
+from.
 
 Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
 avatar is fetched), nip05, lud16, and npub — from `profile show`, plus your follows from `follows list`. `j`/`k` move a
 single cursor over the six fields then the follows; `Enter` on a field opens a text popup prefilled with the current
 value and, on submit, publishes only that one field (`profile update --<field>`, which merges over the current profile
-so the other fields survive); `f` follows a user by npub/hex (`follows add`), and `x` unfollows the selected follow
+so the other fields survive); the pane scrolls to keep the highlighted field or follow on screen. `f` follows a user
+by npub/hex (`follows add`), and `x` unfollows the selected follow
 (confirm → `follows remove`). There is no nsec export anywhere. `Esc` returns to the main view.
 
 Relay health (`h` from the chat list) is a redacted, device-local telemetry dashboard from `relay-stats` (which reads
