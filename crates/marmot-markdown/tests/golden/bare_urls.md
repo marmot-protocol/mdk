@@ -12,6 +12,10 @@ All seven recognized schemes, bare (no `<>`):
 
 Mid-sentence: see https://example.com for details.
 
+Bare www: www.example.com/path
+
+Sentence www: See www.example.com/path.
+
 Trailing-punct stripping: visit https://example.com.
 
 Trailing-punct cluster: really?! https://example.com?!

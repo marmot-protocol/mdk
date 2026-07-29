@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot-markdown` now recognizes bare `www.example.com/path` text as web
+  autolinks. The AST preserves the displayed `www.` source while exposing an
+  explicit `Www` autolink kind so renderers can synthesize `https://`
+  destinations without a second client-side URL parser.
+
 ## [0.9.10] - 2026-07-29
 
 ### Added

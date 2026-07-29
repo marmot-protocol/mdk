@@ -156,6 +156,8 @@ pub enum MarkdownInlineFfi {
 pub enum MarkdownAutolinkKindFfi {
     Uri,
     Email,
+    /// Bare `www.` host/path text. Hosts synthesize `https://` for navigation.
+    Www,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -454,6 +456,7 @@ impl From<MdAutolinkKind> for MarkdownAutolinkKindFfi {
         match value {
             MdAutolinkKind::Uri => Self::Uri,
             MdAutolinkKind::Email => Self::Email,
+            MdAutolinkKind::Www => Self::Www,
         }
     }
 }
@@ -621,6 +624,30 @@ mod tests {
                 classification: MarkdownLinkDestinationKindFfi::App,
                 ..
             } if url == "marmot://profile/npub1abc"
+        ));
+    }
+
+    #[test]
+    fn bridges_www_autolink_kind() {
+        let document = parse_markdown_document("See www.example.com/path.");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Text { ref content } if content == "See "
+        ));
+        assert!(matches!(
+            inlines[1],
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                kind: MarkdownAutolinkKindFfi::Www,
+                classification: MarkdownLinkDestinationKindFfi::Web,
+            } if url == "www.example.com/path"
+        ));
+        assert!(matches!(
+            inlines[2],
+            MarkdownInlineFfi::Text { ref content } if content == "."
         ));
     }
 

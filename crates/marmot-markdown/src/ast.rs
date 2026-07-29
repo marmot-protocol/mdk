@@ -125,6 +125,9 @@ pub enum Inline {
 pub enum AutolinkKind {
     Uri,
     Email,
+    /// Bare `www.` host/path text. Renderers synthesize an `https://` launch
+    /// destination while displaying the original source text.
+    Www,
 }
 
 /// Security-relevant classification of an untrusted Markdown destination.

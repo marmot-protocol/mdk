@@ -199,6 +199,7 @@ fn render_inline(i: &Inline, out: &mut String) {
             let href = match kind {
                 AutolinkKind::Uri => url.clone(),
                 AutolinkKind::Email => format!("mailto:{url}"),
+                AutolinkKind::Www => format!("https://{url}"),
             };
             out.push_str(&format!("<a href=\"{}\">", escape_attr(&href)));
             out.push_str(&escape(url));
