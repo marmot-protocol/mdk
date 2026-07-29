@@ -142,14 +142,20 @@ fn routed_outcome(
     verdict: &Verdict,
     advisories: &mut Vec<Advisory>,
 ) -> Outcome {
-    if matches!(verdict, Verdict::ForkRecovery | Verdict::ConvergenceSelected)
-        && let Some(outcome) = attested_outcome(export, source_format)
+    if matches!(
+        verdict,
+        Verdict::ForkRecovery | Verdict::ConvergenceSelected
+    ) && let Some(outcome) = attested_outcome(export, source_format)
     {
         return outcome;
     }
     match verdict {
         Verdict::Healthy => Outcome::Healthy,
-        Verdict::ForkRecovery => accepted_or_quarantine(fork_route(export, source_format)),
+        // The lowest incident route: nothing below it to fall through to.
+        Verdict::ForkRecovery => match fork_route(export, source_format) {
+            Ok(artifact) => Outcome::Accepted(artifact),
+            Err(reason) => Outcome::Quarantine { reason },
+        },
         // The only route with somewhere to fall through to: fork recovery sits
         // below it (rules 3 and 4), and `fork_route` applies both.
         Verdict::ConvergenceSelected => match convergence_route(export, source_format) {
@@ -308,11 +314,4 @@ fn is_primary(verdict: &Verdict, finding: &QuarantineReason) -> bool {
         Verdict::Quarantine { reason }
             if std::mem::discriminant(reason) == std::mem::discriminant(finding)
     )
-}
-
-fn accepted_or_quarantine(result: Result<Box<IncidentScenarioArtifactV1>, String>) -> Outcome {
-    match result {
-        Ok(artifact) => Outcome::Accepted(artifact),
-        Err(reason) => Outcome::Quarantine { reason },
-    }
 }
