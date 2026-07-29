@@ -1,17 +1,17 @@
-//! Auto-commit staging atomicity (mdk#333).
+//! Group-record write atomicity under an injected storage fault (mdk#333).
 //!
-//! `stage_auto_commit_for_queued_proposal` projects the post-merge group
-//! record (epoch N+1, leaver dropped) as part of staging. If any fallible
-//! staging step fails after durable state has advanced, the record must not
-//! be left torn — epoch/membership disagreeing with the MLS group and the
-//! epoch state machine strands auto-commit replay (which bails on any epoch
-//! mismatch) and forks the rendered member list from reality.
+//! Every seam that advances durable group state projects the Marmot record as
+//! part of the same logical step. If the record write fails after other durable
+//! state has advanced, the record must not be left torn — an epoch or roster
+//! disagreeing with the MLS group and the epoch state machine strands replay
+//! (which bails on any epoch mismatch), forks the rendered member list from
+//! reality, and survives into the next session because hydration reads the
+//! record.
 //!
-//! The staging path orders the record write after `begin_pending` and
-//! compensates a failed `put_group` by rewinding the state machine, with the
-//! armed `PendingCommitCleanupGuard` clearing the staged OpenMLS commit on
-//! the early return. This test injects a one-shot `put_group` failure at
-//! exactly that point and asserts nothing is torn and the group stays usable.
+//! Each test here arms a one-shot `put_group` failure at exactly one seam's
+//! projection — auto-commit staging, Welcome join, group-profile staging,
+//! inbound commit apply — and asserts nothing is torn and the group stays
+//! usable.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -20,7 +20,10 @@ use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, SendIntent,
+    SendResult,
+};
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -677,6 +680,134 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     assert_eq!(record.epoch, EpochId(2));
     assert_eq!(record.members.len(), 2);
     assert!(!record.members.iter().any(|m| m.id == bob_member_id));
+}
+
+/// Fork recovery rolls the losing side back to its pre-commit snapshot and
+/// re-applies the winning commit through the inbound apply seam, which mirrors
+/// the recovered epoch into the durable group record. A storage fault at that
+/// mirror must not leave the engine reporting the recovered epoch while the
+/// record still holds the pre-fork one: hydration seeds the in-memory epoch
+/// FROM that record, so an in-process split becomes a wrong epoch on the next
+/// session open.
+#[tokio::test]
+async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
+    let alice_fault = PutGroupFault::default();
+    let bob_fault = PutGroupFault::default();
+    let (mut alice, alice_handle) =
+        build_fault_selfremove_client(b"alice-mirror", alice_fault.clone());
+    let (mut bob, bob_handle) = build_fault_selfremove_client(b"bob-mirror", bob_fault.clone());
+    let mut david = build_selfremove_client(b"david-mirror");
+    let mut eve = build_selfremove_client(b"eve-mirror");
+
+    // Alice and bob are co-admins at epoch 1, so both can publish a privileged
+    // invite commit from the same epoch.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mirror".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Concurrent invites at epoch 1: neither admin has seen the other's commit.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let alice_commit = match alice_invite {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let bob_commit = match bob_invite {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+
+    // The authenticated ordering key decides which side rolls back; both sides
+    // are fault-injectable so the test never depends on which one that is.
+    let ordering_key = |committer: MemberId, commit: &TransportMessage| {
+        CommitOrderingKey::from_commit_bytes(
+            EpochId(1),
+            CommitOrderingPriority::Privileged,
+            committer,
+            &commit.payload,
+        )
+    };
+    let bob_wins =
+        ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
+    let (loser, loser_handle, loser_fault, winning_commit) = if bob_wins {
+        (&mut alice, &alice_handle, &alice_fault, bob_commit)
+    } else {
+        (&mut bob, &bob_handle, &bob_fault, alice_commit)
+    };
+    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
+
+    // Fail exactly the epoch mirror's record write on the fork-recovery apply
+    // (no other `put_group` runs on this ingest path).
+    loser_fault.arm(1);
+    let routed_winner = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..winning_commit
+    };
+    let ingested = loser.ingest(routed_winner).await;
+
+    let record = loser_handle.get_group(&group_id).unwrap();
+    assert_eq!(
+        loser.epoch(&group_id).unwrap(),
+        record.epoch,
+        "the engine's epoch and the durable record must never split"
+    );
+    assert_eq!(
+        record.epoch,
+        EpochId(1),
+        "a failed mirror must undo the apply, not half-commit it"
+    );
+    assert!(
+        matches!(ingested, Err(EngineError::Storage(StorageError::Busy(_)))),
+        "the storage fault must surface as a retryable error, got {ingested:?}"
+    );
+
+    // Both stores are consistent at the rolled-back epoch, roster included:
+    // neither forked invitee is present, and the group stays live.
+    let members = loser.members(&group_id).expect("group must stay live");
+    assert_eq!(members.len(), 2, "both forked invites are rolled back");
+    assert_eq!(record.members.len(), 2);
 }
 
 /// A profile projection failure occurs after the MLS commit is staged. It must

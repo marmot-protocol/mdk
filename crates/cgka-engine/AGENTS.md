@@ -360,6 +360,12 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
+- **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
+  Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
+  MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the
+  transaction that merges the commit (`publish::do_confirm_published`, the inbound apply in `message_processor/ingest.rs`)
+  or compensate the in-memory transition explicitly (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error
+  splits the two stores silently and the split resurfaces as a wrong epoch on the next session open.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

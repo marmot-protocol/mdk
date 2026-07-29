@@ -55,6 +55,17 @@ struct RetainedSelfRemoveProposal {
     queued: QueuedProposal,
 }
 
+/// What an applied inbound commit changed, derived from the merged group state.
+///
+/// Produced inside the apply transaction because the durable record mirror is
+/// written from the same values the post-apply events are synthesized from.
+struct AppliedCommitProjection {
+    epoch: EpochId,
+    remaining_member_ids: std::collections::HashSet<MemberId>,
+    removed_member_ids: Vec<MemberId>,
+    message_retention_seconds: Option<u64>,
+}
+
 enum ScheduledAutoCommitReplay {
     Staged,
     NotApplicable,
@@ -1272,34 +1283,84 @@ impl<S: StorageProvider> Engine<S> {
                         &group_id,
                         &staged,
                     )?;
-                    self.storage.with_transaction(|storage| {
-                        let tx_provider =
-                            EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                        mls_group
-                            .merge_staged_commit(&tx_provider, *staged)
-                            .map_err(|e| {
-                                EngineError::Backend(format!("merge_staged_commit: {e:?}"))
-                            })?;
-                        crate::app_components::validate_current_profile_group_invariants(&mls_group)
-                    })?;
-                    let after = EpochId(mls_group.epoch().as_u64());
-                    let after_members = group_lifecycle::marmot_members(&mls_group);
+                    // Merge and mirror the Marmot record in one durable unit, the
+                    // same rule `do_confirm_published` applies to its own merge.
+                    // Session open seeds the epoch state machine FROM that
+                    // record, so a failed mirror must undo the merge instead of
+                    // leaving the two stores at different epochs. Nothing between
+                    // this transaction and `set_stable` below is fallible, so the
+                    // in-memory epoch authority can only advance over a committed
+                    // mirror.
+                    let AppliedCommitProjection {
+                        epoch: after,
+                        remaining_member_ids: after_ids,
+                        removed_member_ids: removed,
+                        message_retention_seconds: after_message_retention,
+                    } = self.storage.with_transaction(
+                        |storage| -> Result<AppliedCommitProjection, EngineError> {
+                            let tx_provider = EngineOpenMlsProvider::<S>::new(
+                                &self.crypto,
+                                storage.mls_storage(),
+                            );
+                            mls_group
+                                .merge_staged_commit(&tx_provider, *staged)
+                                .map_err(|e| {
+                                    EngineError::Backend(format!("merge_staged_commit: {e:?}"))
+                                })?;
+                            crate::app_components::validate_current_profile_group_invariants(
+                                &mls_group,
+                            )?;
+                            let after = EpochId(mls_group.epoch().as_u64());
+                            let after_members = group_lifecycle::marmot_members(&mls_group);
+                            let after_ids: std::collections::HashSet<MemberId> =
+                                after_members.iter().map(|m| m.id.clone()).collect();
+                            let removed: Vec<MemberId> = before_members
+                                .into_iter()
+                                .filter_map(|m| (!after_ids.contains(&m.id)).then_some(m.id))
+                                .collect();
+                            let mut g = storage.get_group(&group_id)?;
+                            g.epoch = after;
+                            g.members = after_members;
+                            g.required_capabilities =
+                                crate::capability_manager::required_capabilities_from_group(
+                                    &mls_group,
+                                );
+                            crate::group_lifecycle::mirror_app_components_into_record(
+                                &mls_group, &mut g,
+                            );
+                            // This commit removed our own leaf: mark the local
+                            // copy removed (member-departure.md, "Realizing
+                            // removal") in the same record write. The departure
+                            // notification for self is emitted with the roster
+                            // diff below, so the marker and the notification stay
+                            // coupled and later `SelfEvicted` input does not
+                            // re-emit it.
+                            if removed
+                                .iter()
+                                .any(|member| member == self.identity.self_id())
+                            {
+                                g.removed = true;
+                            }
+                            storage.put_group(&g)?;
+                            Ok(AppliedCommitProjection {
+                                epoch: after,
+                                remaining_member_ids: after_ids,
+                                removed_member_ids: removed,
+                                message_retention_seconds:
+                                    crate::app_components::message_retention_seconds_of_group(
+                                        &mls_group,
+                                    )?,
+                            })
+                        },
+                    )?;
                     let after_admins =
                         crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
                     let after_profile = crate::app_components::group_profile_of_group(&mls_group)
                         .ok()
                         .flatten();
                     let after_avatar = avatar_component_snapshot(&mls_group);
-                    let after_message_retention =
-                        crate::app_components::message_retention_seconds_of_group(&mls_group)?;
-                    let after_ids: std::collections::HashSet<MemberId> =
-                        after_members.iter().map(|m| m.id.clone()).collect();
-                    let removed: Vec<MemberId> = before_members
-                        .into_iter()
-                        .filter_map(|m| (!after_ids.contains(&m.id)).then_some(m.id))
-                        .collect();
 
-                    // Update our per-group state machine + storage mirror.
+                    // Update our per-group state machine.
                     self.epoch_manager.set_stable(group_id.clone(), after);
                     self.drop_self_remove_auto_commit_schedules_for_group(&group_id);
                     // Proposal-arrival schedule signals are source-epoch
@@ -1318,29 +1379,6 @@ impl<S: StorageProvider> Engine<S> {
                         ),
                         recovery_snapshot,
                     );
-                    if let Ok(mut g) = self.storage.get_group(&group_id) {
-                        g.epoch = after;
-                        g.members = after_members;
-                        g.required_capabilities =
-                            crate::capability_manager::required_capabilities_from_group(&mls_group);
-                        crate::group_lifecycle::mirror_app_components_into_record(
-                            &mls_group, &mut g,
-                        );
-                        // This commit removed our own leaf: mark the local
-                        // copy removed (member-departure.md, "Realizing
-                        // removal") in the same record write. The departure
-                        // notification for self is emitted with the roster
-                        // diff below, so the marker and the notification stay
-                        // coupled and later `SelfEvicted` input does not
-                        // re-emit it.
-                        if removed
-                            .iter()
-                            .any(|member| member == self.identity.self_id())
-                        {
-                            g.removed = true;
-                        }
-                        self.storage.put_group(&g)?;
-                    }
                     // #740 rotation: a peer's applied commit may have changed the
                     // Nostr routing component; additively refresh the transport-id
                     // index so the new nostr_group_id resolves (prior id retained
