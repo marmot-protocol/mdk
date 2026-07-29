@@ -238,10 +238,7 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
-        // SQLCipher lifecycle state is authoritative. On first rollout the
-        // publisher imports only the legacy JSON `d` slot, then performs the
-        // recorded upgrade replacement under that same slot.
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        Ok(self.runtime.republish_key_package().await?)
     }
 
     pub fn maintenance_status(
@@ -492,7 +489,15 @@ impl AppClient {
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        self.publish_key_package().await
+        self.app
+            .ensure_local_account_relay_lists(&self.state.label)
+            .await?;
+        self.refresh_routing()?;
+        self.runtime.activate_transport(None).await?;
+        // SQLCipher lifecycle state is authoritative. On first rollout the
+        // publisher imports only the legacy JSON `d` slot, then performs the
+        // recorded upgrade replacement under that same slot.
+        Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
     /// Create a locally canonical group and attempt each founding Welcome.

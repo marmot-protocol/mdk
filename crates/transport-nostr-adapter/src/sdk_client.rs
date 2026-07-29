@@ -482,7 +482,12 @@ impl NostrSdkRelayClient {
             )
             .await
             {
-                Ok(Ok(output)) if output.success.contains(&endpoint) => {
+                Ok(Ok(output))
+                    if relay_endpoint_publish_accepted(
+                        output.success.contains(&endpoint),
+                        output.failed.get(&endpoint).map(String::as_str),
+                    ) =>
+                {
                     return Ok(TransportEndpointReceipt {
                         endpoint: transport_endpoint,
                         accepted_at: None,
@@ -1146,6 +1151,19 @@ fn merge_registration_log(
     }
 }
 
+/// A relay `OK:false` with the NIP-01 `duplicate:` machine prefix proves the
+/// exact event is already stored and counts as idempotent publication success.
+fn relay_duplicate_acknowledgement(relay_failure: &str) -> bool {
+    matches!(
+        nostr::message::MachineReadablePrefix::parse(relay_failure),
+        Some(nostr::message::MachineReadablePrefix::Duplicate)
+    )
+}
+
+fn relay_endpoint_publish_accepted(success: bool, failure_reason: Option<&str>) -> bool {
+    success || failure_reason.is_some_and(relay_duplicate_acknowledgement)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,7 +1171,7 @@ mod tests {
     use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
     use nostr_relay_builder::MockRelay;
-    use nostr_sdk::prelude::Keys;
+    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
@@ -1172,6 +1190,33 @@ mod tests {
             .sign_with_keys(&ephemeral)
             .expect("sign ephemeral 445");
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
+    }
+
+    #[test]
+    fn relay_duplicate_acknowledgement_accepts_only_duplicate_prefix() {
+        assert!(relay_duplicate_acknowledgement(
+            "duplicate: already have this event"
+        ));
+        assert!(!relay_duplicate_acknowledgement("blocked: policy"));
+        assert!(!relay_duplicate_acknowledgement("relay rejected event"));
+        assert!(!relay_duplicate_acknowledgement(""));
+    }
+
+    #[test]
+    fn relay_endpoint_publish_accepted_treats_duplicate_failure_as_success() {
+        assert!(relay_endpoint_publish_accepted(
+            false,
+            Some("duplicate: already have this event")
+        ));
+        assert!(!relay_endpoint_publish_accepted(
+            false,
+            Some("blocked: policy")
+        ));
+        assert!(!relay_endpoint_publish_accepted(
+            false,
+            Some("error: unknown")
+        ));
+        assert!(relay_endpoint_publish_accepted(true, None));
     }
 
     #[test]
@@ -1713,6 +1758,47 @@ mod tests {
 
         assert!(err.to_string().contains("publish timed out"));
         assert_eq!(sdk.relay_health().await.total_relays, 1);
+    }
+
+    #[tokio::test]
+    async fn publish_event_accepts_duplicate_relay_ack_for_same_signed_event() {
+        let relay = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys.clone()).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = NostrKeyPackagePublication {
+            account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+            key_package: KeyPackage::new(vec![1, 2, 3, 4]),
+            key_package_slot_id: "slot-1".into(),
+            key_package_ref: "bb".repeat(32),
+            mls_ciphersuite: "0x0001".into(),
+            mls_extensions: vec!["0x0006".into(), "0xf2f1".into(), "0x000a".into()],
+            mls_proposals: vec!["0x0008".into(), "0x000a".into()],
+            app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
+            publish_endpoints: vec![endpoint.clone()],
+        }
+        .to_event()
+        .expect("key package event");
+
+        timeout(
+            Duration::from_secs(2),
+            sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1),
+        )
+        .await
+        .expect("first publish should complete")
+        .expect("first publish should succeed");
+
+        let republish = timeout(
+            Duration::from_secs(2),
+            sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1),
+        )
+        .await
+        .expect("adapter republish should complete")
+        .expect("republishing the exact signed key package must be accepted");
+
+        assert_eq!(republish.accepted.len(), 1);
+        assert_eq!(republish.accepted[0].endpoint, endpoint);
     }
 
     #[tokio::test]

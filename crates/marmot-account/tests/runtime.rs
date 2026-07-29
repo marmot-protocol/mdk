@@ -1220,6 +1220,538 @@ async fn key_package_first_ack_promotes_then_paused_maintenance_finishes_exact_f
 }
 
 #[tokio::test]
+async fn republish_key_package_resends_exact_authored_event_and_finishes_partial_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp republish key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let publisher = PartialFanoutKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(70_000));
+    let routing = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+        TransportEndpoint("wss://keys-a.example".into()),
+        TransportEndpoint("wss://keys-b.example".into()),
+    ]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        routing.clone(),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("initial rotation promotes a current package");
+    let promoted = runtime.key_package_maintenance_status().unwrap().unwrap();
+    let authored_event = promoted.authored_signed_event.clone().unwrap();
+    let current_ref = promoted.current_key_package_ref.clone().unwrap();
+    let durable_bundle_count = runtime.durably_owned_key_packages().unwrap().len();
+    wall.set(promoted.current_not_before.unwrap().0);
+
+    runtime
+        .republish_key_package()
+        .await
+        .expect("explicit republish must reuse the current authored event");
+    let after_republish = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(after_republish.stable_slot_id, promoted.stable_slot_id);
+    assert_eq!(
+        after_republish.authored_signed_event,
+        Some(authored_event.clone())
+    );
+    assert_eq!(
+        after_republish.authored_event_id,
+        promoted.authored_event_id
+    );
+    assert_eq!(
+        after_republish.authored_event_created_at,
+        promoted.authored_event_created_at
+    );
+    assert_eq!(
+        after_republish.current_key_package_ref,
+        Some(current_ref.clone())
+    );
+    assert!(after_republish.pending_replacement.is_none());
+    assert_eq!(
+        after_republish.retained_private_material,
+        promoted.retained_private_material
+    );
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap().len(),
+        durable_bundle_count,
+        "republish must not mint or prune durable private bundles"
+    );
+
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert_eq!(calls[0].0.slot_id, calls[1].0.slot_id);
+    assert_eq!(calls[0].0.created_at, calls[1].0.created_at);
+    assert_eq!(
+        calls[1].0.endpoints,
+        vec![
+            TransportEndpoint("wss://keys-a.example".into()),
+            TransportEndpoint("wss://keys-b.example".into()),
+        ]
+    );
+    let completed = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(completed.phase, cgka_traits::MaintenancePhase::Complete);
+    assert!(
+        completed
+            .publication_targets
+            .iter()
+            .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+    );
+
+    drop(runtime);
+    let mut restarted = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        routing,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    restarted
+        .republish_key_package()
+        .await
+        .expect("restart republish must reuse the durable authored event");
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].1, authored_event);
+    assert_eq!(
+        calls[2].0.endpoints,
+        vec![
+            TransportEndpoint("wss://keys-a.example".into()),
+            TransportEndpoint("wss://keys-b.example".into()),
+        ]
+    );
+    let after_restart = restarted.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(after_restart.stable_slot_id, promoted.stable_slot_id);
+    assert_eq!(after_restart.authored_signed_event, Some(authored_event));
+    assert_eq!(after_restart.authored_event_id, promoted.authored_event_id);
+    assert_eq!(
+        after_restart.authored_event_created_at,
+        promoted.authored_event_created_at
+    );
+    assert_eq!(after_restart.current_key_package_ref, Some(current_ref));
+    assert_eq!(
+        after_restart.retained_private_material,
+        promoted.retained_private_material
+    );
+    assert_eq!(
+        restarted.durably_owned_key_packages().unwrap().len(),
+        durable_bundle_count,
+        "restart republish must not mint or prune durable private bundles"
+    );
+}
+
+#[tokio::test]
+async fn republish_key_package_rejects_pending_replacement_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot kp pending republish key").unwrap();
+    let policy = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let initial_publisher = RecordingKeyPackages::default();
+    let mut initial = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy.clone(),
+        initial_publisher,
+    );
+    initial.publish_fresh_key_package().await.unwrap();
+    drop(initial);
+
+    let flaky = FlakyKeyPackages::new(1);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        flaky.clone(),
+    );
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("replacement attempt must fail before acknowledgement");
+    let before = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(before.pending_replacement.is_some());
+    let durable_before = runtime.durably_owned_key_packages().unwrap();
+
+    let error = runtime
+        .republish_key_package()
+        .await
+        .expect_err("republish must not advance a pending replacement");
+    assert!(matches!(error, AccountError::KeyPackageRotationInProgress));
+    assert_eq!(
+        flaky.publications().len(),
+        1,
+        "only the failed rotation attempt may publish"
+    );
+    let after = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        durable_before
+    );
+}
+
+#[tokio::test]
+async fn republish_key_package_falls_back_when_no_current_artifact_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot kp no artifact republish key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let policy = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let session = session(database, &key, b"alice");
+    let slot = publisher
+        .legacy_slot_id(&session.self_id())
+        .unwrap()
+        .unwrap();
+    session
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(slot))
+        .unwrap();
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        RecordingAdapter::default(),
+        policy,
+        publisher.clone(),
+    );
+
+    let key_package = runtime
+        .republish_key_package()
+        .await
+        .expect("republish must fall back to fresh publication");
+    assert!(!key_package.bytes().is_empty());
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 1);
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(
+        lifecycle.current_key_package_ref,
+        Some(
+            hex::decode(
+                cgka_engine::key_package::key_package_metadata(&key_package)
+                    .unwrap()
+                    .key_package_ref_hex
+            )
+            .unwrap()
+        )
+    );
+    assert!(lifecycle.pending_replacement.is_none());
+    assert!(lifecycle.authored_signed_event.is_some());
+}
+
+#[tokio::test]
+async fn republish_key_package_falls_back_when_refresh_is_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp refresh due republish key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(90_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(17)),
+    );
+
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let refresh_at = runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .refresh_at
+        .unwrap();
+    wall.set(refresh_at.0);
+
+    let second = runtime.republish_key_package().await.unwrap();
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 2);
+    assert_ne!(first, second);
+    assert_ne!(
+        publications[0].created_at, publications[1].created_at,
+        "refresh-due fallback must rotate via a new authored event"
+    );
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(lifecycle.retained_private_material.len(), 1);
+    assert_eq!(
+        lifecycle.retained_private_material[0].key_package,
+        publications[0].key_package
+    );
+}
+
+#[tokio::test]
+async fn republish_key_package_falls_back_when_current_ref_is_consumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp consumed republish key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(90_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(17)),
+    );
+
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let mut lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    let consumed_ref = lifecycle.current_key_package_ref.clone().unwrap();
+    lifecycle.last_consumed_key_package_ref = Some(consumed_ref.clone());
+    lifecycle.last_consumed_at = Some(Timestamp(42));
+    runtime
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    wall.set(lifecycle.current_not_before.unwrap().0);
+
+    let second = runtime.republish_key_package().await.unwrap();
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 2);
+    assert_ne!(first, second);
+    let after = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_ne!(after.current_key_package_ref, Some(consumed_ref));
+    assert!(after.last_consumed_key_package_ref.is_none());
+    assert_eq!(after.retained_private_material.len(), 0);
+}
+
+#[tokio::test]
+async fn republish_key_package_reconciles_authoritative_targets_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp routing reconcile key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let publisher = PartialFanoutKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(70_000));
+    let initial_routing = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+        TransportEndpoint("wss://keys-a.example".into()),
+        TransportEndpoint("wss://keys-b.example".into()),
+    ]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        initial_routing,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+
+    runtime.publish_fresh_key_package().await.unwrap();
+    let promoted = runtime.key_package_maintenance_status().unwrap().unwrap();
+    wall.set(promoted.current_not_before.unwrap().0);
+    let authored_event = promoted.authored_signed_event.clone().unwrap();
+    drop(runtime);
+
+    let updated_routing = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+        TransportEndpoint("wss://keys-a.example".into()),
+        TransportEndpoint("wss://keys-c.example".into()),
+    ]);
+    let mut restarted = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        updated_routing,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    restarted.republish_key_package().await.unwrap();
+
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1, authored_event);
+    assert_eq!(
+        calls[1].0.endpoints,
+        vec![
+            TransportEndpoint("wss://keys-a.example".into()),
+            TransportEndpoint("wss://keys-c.example".into()),
+        ]
+    );
+    let completed = restarted.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(completed.phase, cgka_traits::MaintenancePhase::Complete);
+    let removed = completed
+        .publication_targets
+        .iter()
+        .find(|target| target.endpoint == TransportEndpoint("wss://keys-b.example".into()))
+        .expect("removed endpoint history must be retained");
+    assert_eq!(
+        removed.state,
+        cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+    );
+    let reauthorized = completed
+        .publication_targets
+        .iter()
+        .find(|target| target.endpoint == TransportEndpoint("wss://keys-c.example".into()))
+        .expect("new authoritative endpoint must be tracked");
+    assert_eq!(
+        reauthorized.state,
+        cgka_traits::TransportFanoutAttemptState::Accepted
+    );
+}
+
+#[tokio::test]
+async fn republish_key_package_reauthorizes_previously_removed_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp routing reauthorize key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(70_000));
+    let two_targets = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+        TransportEndpoint("wss://keys-a.example".into()),
+        TransportEndpoint("wss://keys-b.example".into()),
+    ]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        two_targets,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    runtime.publish_fresh_key_package().await.unwrap();
+    let promoted = runtime.key_package_maintenance_status().unwrap().unwrap();
+    wall.set(promoted.current_not_before.unwrap().0);
+    drop(runtime);
+
+    let one_target = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys-a.example".into())]);
+    let mut removed = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        one_target,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    removed.republish_key_package().await.unwrap();
+    let prohibited = removed
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .publication_targets
+        .iter()
+        .find(|target| target.endpoint == TransportEndpoint("wss://keys-b.example".into()))
+        .expect("removed endpoint must remain durable")
+        .state;
+    assert_eq!(
+        prohibited,
+        cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+    );
+    drop(removed);
+
+    let mut restored = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+            TransportEndpoint("wss://keys-a.example".into()),
+            TransportEndpoint("wss://keys-b.example".into()),
+        ]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    restored.republish_key_package().await.unwrap();
+    let restored_lifecycle = restored.key_package_maintenance_status().unwrap().unwrap();
+    let reauthorized = restored_lifecycle
+        .publication_targets
+        .iter()
+        .find(|target| target.endpoint == TransportEndpoint("wss://keys-b.example".into()))
+        .expect("reauthorized endpoint must be retained");
+    assert_eq!(
+        reauthorized.state,
+        cgka_traits::TransportFanoutAttemptState::Accepted
+    );
+    assert_eq!(reauthorized.attempt_count, 1);
+    assert!(reauthorized.failure_code.is_none());
+}
+
+#[tokio::test]
+async fn republish_key_package_persists_policy_removal_when_no_targets_remain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp empty routing republish key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(70_000));
+    let initial_routing = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        initial_routing,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    runtime.publish_fresh_key_package().await.unwrap();
+    let promoted = runtime.key_package_maintenance_status().unwrap().unwrap();
+    wall.set(promoted.current_not_before.unwrap().0);
+    drop(runtime);
+
+    let mut no_targets = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]).key_package_endpoints(vec![]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+
+    no_targets
+        .republish_key_package()
+        .await
+        .expect_err("republish without authoritative targets must fail");
+    assert_eq!(
+        publisher.publications().len(),
+        1,
+        "empty policy must not trigger a publication"
+    );
+    let lifecycle = no_targets
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle.publication_targets.iter().all(|target| {
+        target.state == cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+            && target.failure_code.as_deref() == Some("endpoint_removed_from_policy")
+    }));
+}
+
+#[tokio::test]
 async fn key_package_expiry_sweep_deletes_private_material_while_network_maintenance_is_paused() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot kp paused expiry key").unwrap();
