@@ -53,6 +53,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -73,6 +76,9 @@
                   ]
                 }
               }
+            ],
+            "blank_lines_before": [
+              0
             ],
             "checked": null
           },
@@ -95,6 +101,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -115,6 +124,9 @@
                   ]
                 }
               }
+            ],
+            "blank_lines_before": [
+              0
             ],
             "checked": null
           },
@@ -137,6 +149,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -158,6 +173,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -178,6 +196,9 @@
                   ]
                 }
               }
+            ],
+            "blank_lines_before": [
+              0
             ],
             "checked": null
           }
@@ -336,6 +357,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           }
         ]
@@ -418,6 +442,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -439,6 +466,9 @@
                 }
               }
             ],
+            "blank_lines_before": [
+              0
+            ],
             "checked": null
           },
           {
@@ -459,6 +489,9 @@
                   ]
                 }
               }
+            ],
+            "blank_lines_before": [
+              0
             ],
             "checked": null
           }
@@ -496,6 +529,9 @@
               ]
             }
           }
+        ],
+        "blank_lines_before": [
+          0
         ]
       }
     },
@@ -518,5 +554,25 @@
         ]
       }
     }
+  ],
+  "blank_lines_before": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
   ]
 }

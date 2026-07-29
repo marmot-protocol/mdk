@@ -2701,7 +2701,7 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
 }
 
 #[test]
-fn keys_publish_replaces_create_identity_key_package_under_stable_slot() {
+fn keys_publish_republishes_create_identity_key_package_under_stable_slot() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
 
@@ -2721,7 +2721,11 @@ fn keys_publish_replaces_create_identity_key_package_under_stable_slot() {
     assert_eq!(republished["key_package_bytes"], first["key_package_bytes"]);
     assert_eq!(second["key_package_bytes"], first["key_package_bytes"]);
     assert_eq!(second["key_package_id"], first["key_package_id"]);
-    assert_ne!(second["key_package_ref"], first["key_package_ref"]);
+    assert_eq!(second["key_package_ref"], first["key_package_ref"]);
+    assert_eq!(
+        second["key_package_event_id"],
+        first["key_package_event_id"]
+    );
     assert!(
         first["key_package_id"]
             .as_str()
@@ -2735,7 +2739,7 @@ fn keys_publish_replaces_create_identity_key_package_under_stable_slot() {
 }
 
 #[test]
-fn keys_rotate_and_publish_each_replace_under_the_stable_slot() {
+fn keys_rotate_changes_ref_and_publish_republishes_current_ref() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
 
@@ -2760,10 +2764,18 @@ fn keys_rotate_and_publish_each_replace_under_the_stable_slot() {
 
     assert_eq!(second["key_package_id"], first["key_package_id"]);
     assert_ne!(second["key_package_ref"], first["key_package_ref"]);
+    assert_ne!(
+        second["key_package_event_id"],
+        first["key_package_event_id"]
+    );
     assert_eq!(second["key_package_bytes"], rotated["key_package_bytes"]);
     assert_eq!(third["key_package_bytes"], second["key_package_bytes"]);
     assert_eq!(third["key_package_id"], second["key_package_id"]);
-    assert_ne!(third["key_package_ref"], second["key_package_ref"]);
+    assert_eq!(third["key_package_ref"], second["key_package_ref"]);
+    assert_eq!(
+        third["key_package_event_id"],
+        second["key_package_event_id"]
+    );
     assert!(
         third["key_package_id"]
             .as_str()
@@ -2845,25 +2857,17 @@ fn keys_list_reports_published_key_package() {
     run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
 
     // With a published KeyPackage on the reachable relay, `keys list` must
-    // surface it rather than returning an empty list.
+    // surface the merged local+relay row for the current package rather than
+    // returning an empty list or a separate retained duplicate.
     let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
     assert_eq!(listed["account_id"], account_id);
     let keys = listed["keys"].as_array().expect("keys array");
     assert_eq!(
         keys.len(),
-        2,
-        "expected the current relay-visible package and retained local package, got {keys:?}"
-    );
-    let relay_keys = keys
-        .iter()
-        .filter(|key| key["relay"] == true)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        relay_keys.len(),
         1,
-        "expected the published key package, got {keys:?}"
+        "expected one merged current key package inventory row, got {keys:?}"
     );
-    let published = relay_keys[0];
+    let published = &keys[0];
     assert_eq!(published["account_id"], account_id);
     assert!(
         published["key_package_event_id"]
@@ -2905,7 +2909,9 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
             .is_some_and(|count| count > 0)
     );
 
-    run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
+    // NIP-09 prevents republishing the deleted authored event. Mint the
+    // explicit replacement before exercising delete-all.
+    run_json(home.path(), &["--account", &account_id, "keys", "rotate"]);
     let delete_all = run_json(
         home.path(),
         &["--account", &account_id, "keys", "delete-all", "--confirm"],

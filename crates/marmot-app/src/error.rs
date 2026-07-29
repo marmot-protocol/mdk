@@ -50,6 +50,12 @@ pub enum AppError {
     MissingDefaultRelays,
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<MissingRelayListKind>),
+    /// The selected relay set returned no current kind-3 contact-list event.
+    ///
+    /// Follow updates replace the entire list, so treating an absent event as
+    /// an empty list could silently erase follows published elsewhere.
+    #[error("current account follow list is unavailable")]
+    FollowListUnavailable,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -157,6 +163,7 @@ impl AppError {
             Self::Publish(_) => "publish",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
+            Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
             Self::InvalidPublicKey => "invalid_public_key",
@@ -208,6 +215,7 @@ fn account_error_kind(error: &AccountError) -> &'static str {
         AccountError::TransportRouting(_) => "account_transport_routing",
         AccountError::KeyPackage(_) => "account_key_package",
         AccountError::ClockSkewBlocked => "account_clock_skew_blocked",
+        AccountError::KeyPackageRotationInProgress => "account_key_package_rotation_in_progress",
         AccountError::WrongAccountDelivery => "account_wrong_delivery",
         _ => "account_unknown",
     }

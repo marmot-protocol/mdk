@@ -31,6 +31,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   preserves input order, and returns a normalized endpoint when parsing
   succeeds, allowing NIP-65 and inbox relay screens to flag entries that users
   should remove without exposing transient connection state.
+- MarmotKit Markdown documents now preserve a bounded count of authored blank
+  lines before blocks across document, block-quote, and list-item containers,
+  including through serialization and UniFFI, so clients can render source
+  spacing without reparsing message plaintext.
 - WN Agent now exposes exact-message and stable cursor-paginated materialized
   timeline reads. OpenClaw and Hermes attach bounded recent history with durable
   message ids to inbound turns and provide a `marmot_history` tool for older or
