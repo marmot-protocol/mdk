@@ -128,6 +128,7 @@ pub use audit_log::{
     AuditLogUploadResult,
 };
 pub use client::AppClient;
+pub(crate) use client::ConvergenceScheduleState;
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
     MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,

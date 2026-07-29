@@ -561,6 +561,14 @@ If convergence invalidates a branch containing a previously confirmed self-updat
 
 ### 10.4 Local-intent fairness
 
+> **Amended 2026-07-29** (convergence settling remediation, see
+> `convergence-settling-remediation-plan.md`): the reservation's *activation* is scoped to
+> the spec's actual rule — only a queued **admin-authorized group-state** intent may hold
+> the completed-pass boundary open. The initial implementation parked admission whenever
+> *any* outbound intent was queued; once ordinary app messages became durably queueable
+> (PR #1158), that over-broad park delayed inbound convergence by multiple scheduler
+> cycles. Queued application messages never delay opening the next pass.
+
 After convergence settlement, the adopted fairness rule gives one already-queued, admin-authorized user group-state
 intent an opportunity before an inbound-only next pass.
 

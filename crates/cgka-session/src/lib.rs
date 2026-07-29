@@ -823,6 +823,10 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
+    pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.has_queued_outbound_intents(group_id)?)
+    }
+
     pub fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,

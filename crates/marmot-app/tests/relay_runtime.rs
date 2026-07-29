@@ -6666,3 +6666,84 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
         "the winning leave leaves exactly one durable request behind"
     );
 }
+
+/// Convergence remediation-plan liveness guard: successive inbound commits,
+/// each with a member send fired while the commit is still converging, must
+/// keep settling promptly through the real worker scheduling path.
+///
+/// Under the pre-fix behavior a queued app message parked the completed-pass
+/// boundary, so the next rename slipped extra scheduler cycles (and, after
+/// enough unsettled re-arms, into error backoff); the 5-second deadlines
+/// inside `wait_for_group_state_update` / `wait_for_event` fail in that
+/// world. A send that occasionally lands after bob already settled simply
+/// publishes directly — the assertions hold either way, and across rounds
+/// the mid-window queued path is exercised.
+#[tokio::test]
+async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "settling liveness",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut bob_group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .unwrap();
+
+    for round in 0..3u32 {
+        let renamed = format!("settling-round-{round}");
+        runtime
+            .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+            .await
+            .unwrap();
+        // Fire bob's send immediately so it often lands inside bob's
+        // collection window for the rename commit (the queued-intent path).
+        let text = format!("bob mid-window {round}");
+        runtime
+            .send_message(&bob_id, &group_id, text.clone().into_bytes())
+            .await
+            .unwrap();
+
+        wait_for_group_state_update(&mut bob_group_state, |group| group.profile.name == renamed)
+            .await;
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == alice_id
+                        && message.message.group_id == group_id
+                        && message.message.plaintext == text
+            )
+        })
+        .await;
+    }
+
+    runtime.shutdown().await;
+}

@@ -481,11 +481,19 @@ impl<S: StorageProvider> Engine<S> {
             && pass.phase == ConvergencePassPhase::Completed
             && pass.fairness_slot_available
         {
+            // The one-attempt reservation (convergence.md, marmot#375) is
+            // scoped to admin-authorized group-state intents. Only such an
+            // intent may hold the boundary open; queued application messages
+            // must never park pass admission — over-broad parking here is the
+            // settling regression fixed by the convergence remediation plan.
             let queued = self
                 .storage
                 .list_queued_outbound_intents(group_id)
                 .map_err(storage_projection_error)?;
-            if !queued.is_empty() {
+            if queued
+                .iter()
+                .any(|record| crate::message_processor::is_admin_group_state_intent(&record.intent))
+            {
                 return Ok(Some(pass.clone()));
             }
             let mut consumed = pass.clone();
@@ -939,6 +947,10 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(waiting_result(previous_tip.0));
             }
             self.freeze_collecting_convergence_pass(&mut pass)?;
+            // Diagnostic only: scheduler lag between the cutoff elapsing and
+            // this freeze actually running (remediation-plan telemetry).
+            self.engine_metrics
+                .note_pass_frozen_overdue(now_ms.saturating_sub(cutoff));
             let freeze_result = self.storage.with_transaction(|storage| {
                 Self::verify_frozen_pass_members_in(storage, &pass)?;
                 storage.put_convergence_pass(&pass)?;
@@ -1170,6 +1182,11 @@ impl<S: StorageProvider> Engine<S> {
             storage.put_convergence_pass(&completed_pass)?;
             Ok::<_, OpenMlsProjectionError>(observations)
         })?;
+        // Diagnostic only: settling-latency telemetry for the remediation
+        // plan — pass open → apply, and the gap since the previous completed
+        // generation. Never feeds convergence or branch selection.
+        self.engine_metrics
+            .note_pass_applied(group_id, completed_pass.opened_monotonic_ms, now_ms);
         // #740 rotation: a routing-component update commit applied through
         // convergence may have changed this group's nostr_group_id; additively
         // refresh the transport-id index so it resolves on the inbound path

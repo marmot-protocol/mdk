@@ -193,6 +193,27 @@ pub struct EngineMetrics {
     reorg_lateness_ms: BucketHistogram,
     /// Per-group last-applied branch, in-memory only (never snapshotted).
     last_applied: HashMap<GroupId, LastAppliedBranch>,
+    /// Pass open → apply, in milliseconds. The direct settling-latency signal
+    /// for the convergence remediation plan: healthy passes sit near
+    /// `settlement_quiescence_ms` plus scheduler margin.
+    pass_apply_latency_ms: BucketHistogram,
+    /// Previous generation completed → this generation opened, in
+    /// milliseconds. Near-zero gaps mean retained input flows into the next
+    /// pass without losing scheduler cycles at the boundary.
+    generation_gap_ms: BucketHistogram,
+    /// How far past its due cutoff a pass was frozen, in milliseconds —
+    /// scheduler lag between a cutoff elapsing and the freeze running.
+    freeze_overdue_ms: BucketHistogram,
+    /// Times the completed-pass boundary was held for a queued
+    /// admin-authorized group-state intent while retained inbound waited.
+    admin_reservation_holds: u64,
+    /// One-attempt reservations that prepared their admin intent.
+    admin_reservation_prepared: u64,
+    /// One-attempt reservations consumed by a failed preparation.
+    admin_reservation_failed: u64,
+    /// Per-group completion time of the last applied pass, in-memory only
+    /// (never snapshotted); feeds `generation_gap_ms`.
+    last_pass_completed_at_ms: HashMap<GroupId, u64>,
 }
 
 impl Default for EngineMetrics {
@@ -203,6 +224,13 @@ impl Default for EngineMetrics {
             reorg_rewind_depth: BucketHistogram::new(&REWIND_DEPTH_BUCKET_BOUNDS),
             reorg_lateness_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             last_applied: HashMap::new(),
+            pass_apply_latency_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            generation_gap_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            freeze_overdue_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
+            admin_reservation_holds: 0,
+            admin_reservation_prepared: 0,
+            admin_reservation_failed: 0,
+            last_pass_completed_at_ms: HashMap::new(),
         }
     }
 }
@@ -268,6 +296,42 @@ impl EngineMetrics {
         );
     }
 
+    /// Record a convergence pass that applied (or completed with nothing to
+    /// apply after freezing): open → apply latency plus the gap since the
+    /// group's previous completed generation. `opened_monotonic_ms` is the
+    /// pass's (possibly restart-rebased) open time; `now_ms` is the apply
+    /// time. Both local-monotonic.
+    pub fn note_pass_applied(&mut self, group_id: &GroupId, opened_monotonic_ms: u64, now_ms: u64) {
+        self.pass_apply_latency_ms
+            .record(now_ms.saturating_sub(opened_monotonic_ms));
+        if let Some(previous_completed) = self.last_pass_completed_at_ms.get(group_id) {
+            self.generation_gap_ms
+                .record(opened_monotonic_ms.saturating_sub(*previous_completed));
+        }
+        self.last_pass_completed_at_ms
+            .insert(group_id.clone(), now_ms);
+    }
+
+    /// Record how far past its due cutoff a pass was frozen (scheduler lag).
+    pub fn note_pass_frozen_overdue(&mut self, overdue_ms: u64) {
+        self.freeze_overdue_ms.record(overdue_ms);
+    }
+
+    /// Record that the completed-pass boundary is being held for a queued
+    /// admin-authorized group-state intent while retained inbound waits.
+    pub fn note_admin_reservation_hold(&mut self) {
+        self.admin_reservation_holds += 1;
+    }
+
+    /// Record the outcome of the one-attempt admin reservation.
+    pub fn note_admin_reservation_attempt(&mut self, prepared: bool) {
+        if prepared {
+            self.admin_reservation_prepared += 1;
+        } else {
+            self.admin_reservation_failed += 1;
+        }
+    }
+
     /// Aggregate, privacy-safe snapshot for diagnostics and quiescence tuning.
     pub fn snapshot(&self) -> EngineMetricsSnapshot {
         EngineMetricsSnapshot {
@@ -275,6 +339,12 @@ impl EngineMetrics {
             post_settle_reorgs: self.post_settle_reorgs,
             reorg_rewind_depth: self.reorg_rewind_depth.snapshot(),
             reorg_lateness_ms: self.reorg_lateness_ms.snapshot(),
+            pass_apply_latency_ms: self.pass_apply_latency_ms.snapshot(),
+            generation_gap_ms: self.generation_gap_ms.snapshot(),
+            freeze_overdue_ms: self.freeze_overdue_ms.snapshot(),
+            admin_reservation_holds: self.admin_reservation_holds,
+            admin_reservation_prepared: self.admin_reservation_prepared,
+            admin_reservation_failed: self.admin_reservation_failed,
         }
     }
 }
@@ -293,6 +363,19 @@ pub struct EngineMetricsSnapshot {
     pub reorg_rewind_depth: HistogramSnapshot,
     /// Lateness per reorg, in local-monotonic milliseconds.
     pub reorg_lateness_ms: HistogramSnapshot,
+    /// Pass open → apply latency, in local-monotonic milliseconds.
+    pub pass_apply_latency_ms: HistogramSnapshot,
+    /// Previous generation completed → next generation opened, in
+    /// local-monotonic milliseconds.
+    pub generation_gap_ms: HistogramSnapshot,
+    /// Freeze lag past the due cutoff, in local-monotonic milliseconds.
+    pub freeze_overdue_ms: HistogramSnapshot,
+    /// Completed-pass boundary holds for a queued admin group-state intent.
+    pub admin_reservation_holds: u64,
+    /// One-attempt admin reservations that prepared their intent.
+    pub admin_reservation_prepared: u64,
+    /// One-attempt admin reservations consumed by a failed preparation.
+    pub admin_reservation_failed: u64,
 }
 
 impl EngineMetricsSnapshot {

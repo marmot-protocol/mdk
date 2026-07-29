@@ -21,25 +21,58 @@ use crate::{
 use super::AppClient;
 use crate::config::CursorPersistence;
 
+/// What the convergence scheduler should do next for a group, derived from
+/// the engine's durable pass state. Expected collection time is not an error;
+/// storage and projection failures are, and they surface as `Err` from
+/// [`AppClient::convergence_schedule_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConvergenceScheduleState {
+    /// No active pass and no pending inputs: cancel scheduled wakeups.
+    Idle,
+    /// A pass is collecting; wake when its cutoff elapses.
+    Collecting { remaining_ms: u64 },
+    /// A pass is frozen/resolving or its cutoff already elapsed: run now.
+    Ready,
+    /// Pending inputs exist but no pass can open yet (epoch not `Stable`, an
+    /// admin reservation holds the boundary, or the retained input has no
+    /// trigger). Re-check on the fallback delay; only this state counts
+    /// toward the unsettled re-arm cap.
+    PendingUnopenable,
+}
+
 impl AppClient {
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
 
-    pub(crate) fn has_pending_convergence_inputs(&self, group_id: &cgka_traits::GroupId) -> bool {
-        self.runtime
-            .has_pending_convergence_inputs(group_id)
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn prepare_convergence_cutoff_delay_ms(
+    /// Engine-derived convergence scheduling state for one group.
+    ///
+    /// Errors propagate: a storage or engine failure must schedule a retry at
+    /// the caller, never read as "no pending work" (the previous
+    /// `unwrap_or(false)` wrapper let an error cancel future wakeups).
+    /// `prepare_convergence_cutoff_delay_ms` is a command, not a query — it
+    /// may open a pass or persist deadline rebasing before reporting.
+    pub(crate) fn convergence_schedule_state(
         &mut self,
         group_id: &cgka_traits::GroupId,
-    ) -> Option<u64> {
-        self.runtime
-            .prepare_convergence_cutoff_delay_ms(group_id)
-            .ok()
-            .flatten()
+    ) -> Result<ConvergenceScheduleState, AppError> {
+        match self.runtime.prepare_convergence_cutoff_delay_ms(group_id)? {
+            Some(0) => Ok(ConvergenceScheduleState::Ready),
+            Some(remaining_ms) => Ok(ConvergenceScheduleState::Collecting { remaining_ms }),
+            None => {
+                if self.runtime.has_pending_convergence_inputs(group_id)?
+                    || self.runtime.has_queued_outbound_intents(group_id)?
+                {
+                    // Queued outbound intents keep the wakeup armed even with
+                    // no convergence work: the scheduled drain is what
+                    // regenerates and publishes them, and a failed sync on
+                    // that tick is what triggers transport reactivation.
+                    Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else {
+                    Ok(ConvergenceScheduleState::Idle)
+                }
+            }
+        }
     }
 
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {

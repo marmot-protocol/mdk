@@ -365,6 +365,15 @@ impl<S: StorageProvider> Engine<S> {
             self.consume_convergence_fairness_slot(group_id)?;
             fairness_slot_available = false;
         }
+        if fairness_slot_available
+            && queued
+                .iter()
+                .any(|record| is_admin_group_state_intent(&record.intent))
+        {
+            // Diagnostic only: the completed-pass boundary is being held for a
+            // queued admin group-state intent while retained inbound waits.
+            self.engine_metrics.note_admin_reservation_hold();
+        }
         // A persisted fairness slot orders one already-queued administrative
         // evolution before automatic SelfRemove or leave-maintenance mutation.
         if !fairness_slot_available {
@@ -380,7 +389,7 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         for record in queued {
-            if fairness_slot_available && !is_admin_group_state_fairness_intent(&record.intent) {
+            if fairness_slot_available && !is_admin_group_state_intent(&record.intent) {
                 continue;
             }
             if !fairness_slot_available
@@ -408,6 +417,7 @@ impl<S: StorageProvider> Engine<S> {
                     // The protocol grants one preparation attempt, not an
                     // indefinite reservation. Keep the durable intent queued,
                     // consume the slot, and let retained inbound work proceed.
+                    self.engine_metrics.note_admin_reservation_attempt(false);
                     self.consume_convergence_fairness_slot(group_id)?;
                     fairness_slot_available = false;
                     break;
@@ -432,6 +442,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             drained.push(result);
             if fairness_slot_available {
+                self.engine_metrics.note_admin_reservation_attempt(true);
                 self.consume_convergence_fairness_slot(group_id)?;
                 fairness_slot_available = false;
                 if self.has_unresolved_convergence_inputs(group_id)? {
@@ -458,11 +469,15 @@ impl<S: StorageProvider> Engine<S> {
         Ok(drained)
     }
 
-    fn consume_convergence_fairness_slot(&self, group_id: &GroupId) -> Result<(), EngineError> {
+    fn consume_convergence_fairness_slot(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
         if let Some(mut pass) = self.storage.convergence_pass(group_id)? {
             pass.fairness_slot_available = false;
             self.storage.put_convergence_pass(&pass)?;
         }
+        // The reservation attempt is over (spec: "the scheduler proceeds").
+        // Schedule the group so the next retained inbound generation opens on
+        // the next runtime drain instead of one full scheduler cycle later.
+        self.schedule_pending_convergence_group(group_id);
         Ok(())
     }
 
@@ -760,6 +775,17 @@ impl<S: StorageProvider> Engine<S> {
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.has_unresolved_convergence_inputs(group_id)
+    }
+
+    /// Whether durable queued outbound intents exist for this group. Runtime
+    /// schedulers must keep a wakeup armed while any remain: the scheduled
+    /// drain is what regenerates and publishes them (and, on an inactive
+    /// transport, what triggers reactivation).
+    pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(!self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .is_empty())
     }
 
     /// Re-attempt retained `PeelDeferred` rows under the deferred-peel
@@ -1345,7 +1371,11 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     }
 }
 
-fn is_admin_group_state_fairness_intent(intent: &SendIntent) -> bool {
+/// Single classification chokepoint for the convergence.md one-attempt
+/// reservation: only an admin-authorized local group-state evolution may hold
+/// the completed-pass boundary open (marmot#375). Queued application messages
+/// must never park pass admission.
+pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }

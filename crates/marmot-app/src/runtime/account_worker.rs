@@ -27,11 +27,12 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppDisbandRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppInitialGroupImage,
-    AppProjectionUpdate, AppQuarantinedGroup, GroupInviteDeclineResult, MaintenanceRunSummary,
-    MarmotApp, MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
-    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    AppProjectionUpdate, AppQuarantinedGroup, ConvergenceScheduleState, GroupInviteDeclineResult,
+    MaintenanceRunSummary, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
+    SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -645,10 +646,23 @@ async fn run_app_runtime_account_worker(
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                                    scheduled_convergence.schedule_after_pass(
-                                        &group_id,
-                                        client.has_pending_convergence_inputs(&group_id),
-                                    );
+                                    match client.convergence_schedule_state(&group_id) {
+                                        Ok(state) => scheduled_convergence
+                                            .schedule_after_pass(&group_id, state),
+                                        Err(err) => {
+                                            scheduled_convergence
+                                                .schedule_retry_groups([group_id.clone()]);
+                                            publish_app_runtime_account_error(
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                account_error_message(
+                                                    "convergence schedule state failed",
+                                                    &err,
+                                                ),
+                                            );
+                                        }
+                                    }
                                     schedule_pending_convergence_groups(
                                         &mut scheduled_convergence,
                                         &mut client,
@@ -1881,11 +1895,36 @@ impl ScheduledConvergence {
         }
     }
 
-    fn schedule_after_pass(&mut self, group_id: &GroupId, has_pending_inputs: bool) {
-        if has_pending_inputs {
-            self.schedule_unsettled_groups([group_id.clone()]);
-        } else {
-            self.note_success(group_id);
+    /// Arm the timer for a group from the engine's structured scheduling
+    /// state. An in-window wake (`Collecting`) is on time, not a failure: it
+    /// arms at the pass's actual remaining cutoff and never touches the
+    /// unsettled re-arm counter. Only `PendingUnopenable` — pending inputs
+    /// with no pass able to open — counts toward the re-arm cap and its
+    /// eventual error-style backoff.
+    fn schedule_after_pass(&mut self, group_id: &GroupId, state: ConvergenceScheduleState) {
+        match state {
+            ConvergenceScheduleState::Idle => self.note_success(group_id),
+            ConvergenceScheduleState::Collecting { remaining_ms } => {
+                self.retry_attempts.remove(group_id);
+                self.unsettled_rearm_attempts.remove(group_id);
+                let delay = Duration::from_millis(
+                    remaining_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+                );
+                self.arm_no_later(group_id.clone(), TokioInstant::now() + delay);
+                self.reset_timer_to_earliest();
+            }
+            ConvergenceScheduleState::Ready => {
+                self.retry_attempts.remove(group_id);
+                self.unsettled_rearm_attempts.remove(group_id);
+                self.arm_no_later(
+                    group_id.clone(),
+                    TokioInstant::now() + MIN_CONVERGENCE_SETTLEMENT_DELAY,
+                );
+                self.reset_timer_to_earliest();
+            }
+            ConvergenceScheduleState::PendingUnopenable => {
+                self.schedule_unsettled_groups([group_id.clone()]);
+            }
         }
     }
 
@@ -1895,6 +1934,7 @@ impl ScheduledConvergence {
         self.schedule_groups_with_delays(groups.into_iter().map(|group_id| (group_id, delay)));
     }
 
+    #[cfg(test)]
     fn schedule_groups_with_delays(
         &mut self,
         groups: impl IntoIterator<Item = (GroupId, Duration)>,
@@ -2004,23 +2044,23 @@ fn schedule_pending_convergence_groups(
     scheduled: &mut ScheduledConvergence,
     client: &mut AppClient,
 ) {
-    let fallback = scheduled.normal_delay();
-    let groups = client
-        .take_pending_convergence_groups()
-        .into_iter()
-        .map(|group_id| {
-            let delay = client
-                .prepare_convergence_cutoff_delay_ms(&group_id)
-                .map(|delay_ms| {
-                    Duration::from_millis(
-                        delay_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
-                    )
-                })
-                .unwrap_or(fallback);
-            (group_id, delay)
-        })
-        .collect::<Vec<_>>();
-    scheduled.schedule_groups_with_delays(groups);
+    for group_id in client.take_pending_convergence_groups() {
+        match client.convergence_schedule_state(&group_id) {
+            Ok(state) => scheduled.schedule_after_pass(&group_id, state),
+            Err(_) => {
+                // A schedule-state failure must keep a future wakeup armed:
+                // swallowing it as "no work" would cancel the group's timer
+                // and strand pending inputs (liveness). Privacy-safe signal
+                // only — no group id.
+                tracing::warn!(
+                    target: "marmot_app::runtime::account_worker",
+                    method = "schedule_pending_convergence_groups",
+                    "convergence schedule-state read failed; arming retry backoff"
+                );
+                scheduled.schedule_retry_groups([group_id]);
+            }
+        }
+    }
 }
 
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
@@ -2344,11 +2384,12 @@ mod tests {
         let group_id = test_group_id(10);
         let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
 
-        scheduled.schedule_after_pass(&group_id, true);
+        scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingUnopenable);
 
         let ready = scheduled.take_ready();
         assert_eq!(ready, vec![group_id.clone()]);
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
+        assert_eq!(scheduled.unsettled_rearm_attempts.get(&group_id), Some(&1));
     }
 
     #[tokio::test]
@@ -2359,11 +2400,56 @@ mod tests {
         assert_eq!(scheduled.unsettled_rearm_attempts.get(&group_id), Some(&1));
         scheduled.take_ready();
 
-        scheduled.schedule_after_pass(&group_id, false);
+        scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::Idle);
 
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
         assert!(scheduled.deadlines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collecting_tick_does_not_increment_rearm_counter() {
+        let group_id = test_group_id(13);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        // Simulate a prior demotion pressure, then an in-window wake: the
+        // engine reports Collecting, which is on time — the counter resets
+        // and the group is never pushed toward error backoff.
+        scheduled.schedule_unsettled_groups([group_id.clone()]);
+        assert_eq!(scheduled.unsettled_rearm_attempts.get(&group_id), Some(&1));
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::Collecting { remaining_ms: 400 },
+        );
+
+        assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
+        assert!(scheduled.deadlines.contains_key(&group_id));
+    }
+
+    #[tokio::test]
+    async fn post_cutoff_retained_input_arms_from_remaining_cutoff() {
+        let group_id = test_group_id(14);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let before = TokioInstant::now();
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::Collecting { remaining_ms: 200 },
+        );
+
+        let deadline = scheduled.deadlines[&group_id];
+        let margin = Duration::from_millis(200 + CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS);
+        // Armed at the engine-reported remaining cutoff plus margin — not the
+        // full settlement delay the old scheduler always used.
+        assert!(deadline >= before + margin);
+        assert!(deadline < before + margin + Duration::from_millis(500));
+
+        scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::Ready);
+        assert!(
+            scheduled.deadlines[&group_id] <= before + margin,
+            "Ready must never postpone an armed deadline"
+        );
     }
 
     #[tokio::test]
