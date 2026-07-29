@@ -9,6 +9,7 @@ use nostr_sdk::prelude::RelayUrl;
 use url::{Host, Url};
 
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
+const RETIRED_RELAY_HOSTS: &[&str] = &["relay.damus.io", "relay.nostr.band"];
 
 #[derive(Clone, Debug)]
 pub(crate) struct RelaySafetyPolicy {
@@ -167,6 +168,9 @@ fn reject_unsafe_relay_host(url: &RelayUrl, allow_loopback: bool) -> Result<(), 
     let host = parsed
         .host()
         .ok_or_else(|| "relay endpoint is missing a host".to_owned())?;
+    if is_retired_relay_host(&host) {
+        return Err("relay endpoint host is retired".to_owned());
+    }
     if parsed.scheme() == "ws" {
         return if allow_loopback && is_loopback_host(host) {
             Ok(())
@@ -185,6 +189,18 @@ fn reject_unsafe_relay_host(url: &RelayUrl, allow_loopback: bool) -> Result<(), 
             }
             Ok(())
         }
+    }
+}
+
+fn is_retired_relay_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            RETIRED_RELAY_HOSTS
+                .iter()
+                .any(|retired| domain.eq_ignore_ascii_case(retired))
+        }
+        Host::Ipv4(_) | Host::Ipv6(_) => false,
     }
 }
 
@@ -235,6 +251,27 @@ mod tests {
         );
 
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn retired_relay_hosts_are_rejected_at_the_relay_plane_boundary() {
+        let policy = RelaySafetyPolicy::default();
+        for endpoint in [
+            "wss://relay.damus.io",
+            "wss://relay.nostr.band",
+            "wss://RELAY.DAMUS.IO./path",
+        ] {
+            let offered = endpoints(&[endpoint, "wss://good.example"]);
+            assert!(
+                policy.sanitize_endpoints(offered.clone(), "test").is_err(),
+                "configured routes must fail closed when they contain a retired relay"
+            );
+            assert_eq!(
+                policy.retain_safe_endpoints(offered, "test"),
+                endpoints(&["wss://good.example"]),
+                "discovered routes must drop retired relays and keep safe siblings"
+            );
+        }
     }
 
     /// A published list of only unsafe hosts yields nothing, rather than

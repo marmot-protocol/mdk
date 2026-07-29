@@ -34,7 +34,7 @@ use super::records::{
 use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
-use crate::runtime::blocking_app_task;
+use crate::runtime::{VERTEX_DIRECTORY_RELAY, blocking_app_task};
 use crate::{
     KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
     relay_list_state_from_event,
@@ -75,14 +75,9 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The one NIP-50 relay currently used to widen a user-directory search.
-///
-/// This is a best-effort discovery source, not a directory sync relay: its
-/// results stay in the current search only and never create subscriptions or
-/// directory records.
-const VERTEX_NIP50_RELAY: &str = "wss://relay.vertexlab.io";
-
-/// Keep NIP-50 work bounded independently from graph traversal.
+/// Keep best-effort NIP-50 work against the shared Vertex directory relay
+/// bounded independently from graph traversal. Results stay in the current
+/// search only and never create subscriptions or directory records.
 const NIP50_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const NIP50_RESULT_LIMIT: usize = 20;
 const NIP50_MIN_QUERY_CHARS: usize = 3;
@@ -307,7 +302,7 @@ async fn fetch_vertex_nip50_profiles(
     }
 
     let fetch = app.relay_plane.fetch_directory_events(
-        vec![TransportEndpoint(VERTEX_NIP50_RELAY.to_owned())],
+        vec![TransportEndpoint(VERTEX_DIRECTORY_RELAY.to_owned())],
         vec![DirectoryEventQuery::search(
             KIND_NOSTR_METADATA,
             query,

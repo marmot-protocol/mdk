@@ -1044,6 +1044,27 @@ async fn directory_fetches_reject_invalid_relay_endpoints_before_fetching() {
 }
 
 #[tokio::test]
+async fn directory_fetches_reject_retired_relays_before_fetching() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let directory_fetcher = Arc::new(RecordingDirectoryFetcher::default());
+    let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+    let query = DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12);
+
+    for endpoint in ["wss://relay.damus.io", "wss://relay.nostr.band"] {
+        let err = relay_plane
+            .fetch_directory_events(
+                vec![TransportEndpoint(endpoint.into())],
+                vec![query.clone()],
+            )
+            .await
+            .expect_err("retired relay endpoint should be rejected");
+        assert!(err.contains("retired"));
+    }
+
+    assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());

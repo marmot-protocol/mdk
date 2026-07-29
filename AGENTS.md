@@ -77,6 +77,9 @@ The canonical protocol specification lives in
   `cgka_traits::app_components::reject_non_public_ip`, pin the validated address, choose TLS trust from config (never a
   resolved IP), apply a connect timeout, and gate loopback behind an explicit dev flag. See
   `docs/marmot-architecture/overview/dial-safety.md`.
+- Never dial or adopt `wss://relay.nostr.band` or `wss://relay.damus.io`: both are retired. They may appear only in
+  the centralized retired-relay denylist and regression tests proving rejection; do not use them for discovery,
+  bootstrap, examples, or runtime traffic.
 - Keep multi-step state changes torn-write-free: validate before mutating, compensate every applied step on the error
   path, record intent before external side effects, and never confirm work that reached no one. See
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
