@@ -38,6 +38,12 @@ pub(crate) enum ConvergenceScheduleState {
     /// trigger). Re-check on the fallback delay; only this state counts
     /// toward the unsettled re-arm cap.
     PendingUnopenable,
+    /// No convergence work, but durable queued outbound intents remain. The
+    /// scheduled drain regenerates and publishes them (and a failed sync on
+    /// that tick triggers transport reactivation), so the wakeup stays armed
+    /// on the fallback delay — but a healthy waiting queue is not unsettled
+    /// convergence and never counts toward the re-arm cap.
+    PendingOutbound,
 }
 
 impl AppClient {
@@ -60,14 +66,10 @@ impl AppClient {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => Ok(ConvergenceScheduleState::Collecting { remaining_ms }),
             None => {
-                if self.runtime.has_pending_convergence_inputs(group_id)?
-                    || self.runtime.has_queued_outbound_intents(group_id)?
-                {
-                    // Queued outbound intents keep the wakeup armed even with
-                    // no convergence work: the scheduled drain is what
-                    // regenerates and publishes them, and a failed sync on
-                    // that tick is what triggers transport reactivation.
+                if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound)
                 } else {
                     Ok(ConvergenceScheduleState::Idle)
                 }

@@ -204,9 +204,13 @@ pub struct EngineMetrics {
     /// How far past its due cutoff a pass was frozen, in milliseconds —
     /// scheduler lag between a cutoff elapsing and the freeze running.
     freeze_overdue_ms: BucketHistogram,
-    /// Times the completed-pass boundary was held for a queued
+    /// Drain-loop observations of a boundary held for a queued
     /// admin-authorized group-state intent while retained inbound waited.
-    admin_reservation_holds: u64,
+    /// Counted once per drain pass, not once per park entry: repeated wakes
+    /// during a single park each count, so compare against
+    /// `admin_reservation_prepared`/`failed` as an observation rate, not a
+    /// park count.
+    admin_reservation_hold_observations: u64,
     /// One-attempt reservations that prepared their admin intent.
     admin_reservation_prepared: u64,
     /// One-attempt reservations consumed by a failed preparation.
@@ -227,7 +231,7 @@ impl Default for EngineMetrics {
             pass_apply_latency_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             generation_gap_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             freeze_overdue_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
-            admin_reservation_holds: 0,
+            admin_reservation_hold_observations: 0,
             admin_reservation_prepared: 0,
             admin_reservation_failed: 0,
             last_pass_completed_at_ms: HashMap::new(),
@@ -320,7 +324,7 @@ impl EngineMetrics {
     /// Record that the completed-pass boundary is being held for a queued
     /// admin-authorized group-state intent while retained inbound waits.
     pub fn note_admin_reservation_hold(&mut self) {
-        self.admin_reservation_holds += 1;
+        self.admin_reservation_hold_observations += 1;
     }
 
     /// Record the outcome of the one-attempt admin reservation.
@@ -342,7 +346,7 @@ impl EngineMetrics {
             pass_apply_latency_ms: self.pass_apply_latency_ms.snapshot(),
             generation_gap_ms: self.generation_gap_ms.snapshot(),
             freeze_overdue_ms: self.freeze_overdue_ms.snapshot(),
-            admin_reservation_holds: self.admin_reservation_holds,
+            admin_reservation_hold_observations: self.admin_reservation_hold_observations,
             admin_reservation_prepared: self.admin_reservation_prepared,
             admin_reservation_failed: self.admin_reservation_failed,
         }
@@ -370,8 +374,9 @@ pub struct EngineMetricsSnapshot {
     pub generation_gap_ms: HistogramSnapshot,
     /// Freeze lag past the due cutoff, in local-monotonic milliseconds.
     pub freeze_overdue_ms: HistogramSnapshot,
-    /// Completed-pass boundary holds for a queued admin group-state intent.
-    pub admin_reservation_holds: u64,
+    /// Drain-loop observations (not park entries) of a boundary held for a
+    /// queued admin group-state intent.
+    pub admin_reservation_hold_observations: u64,
     /// One-attempt admin reservations that prepared their intent.
     pub admin_reservation_prepared: u64,
     /// One-attempt admin reservations consumed by a failed preparation.

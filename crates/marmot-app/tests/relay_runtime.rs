@@ -6671,13 +6671,24 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
 /// each with a member send fired while the commit is still converging, must
 /// keep settling promptly through the real worker scheduling path.
 ///
-/// Under the pre-fix behavior a queued app message parked the completed-pass
-/// boundary, so the next rename slipped extra scheduler cycles (and, after
-/// enough unsettled re-arms, into error backoff); the 5-second deadlines
-/// inside `wait_for_group_state_update` / `wait_for_event` fail in that
-/// world. A send that occasionally lands after bob already settled simply
-/// publishes directly — the assertions hold either way, and across rounds
-/// the mid-window queued path is exercised.
+/// The queued mid-window path is observed deterministically: a send accepted
+/// while bob's pass is collecting reports `published == 0` (durably queued,
+/// nothing on transport yet), and the loop repeats rounds until one such
+/// acceptance is witnessed. For that round the message must reach alice
+/// within one settlement cycle plus drain (bounded below), because the
+/// post-fix drain publishes the queued intent at the same tick that applies
+/// the pass; the pre-fix drain skipped the app intent under the dormant
+/// reservation whenever retained inbound was present, costing at least one
+/// extra full settlement cycle.
+///
+/// The stronger parking discriminator — a *new* inbound commit arriving
+/// while the queue is non-empty and the reservation is set — cannot be
+/// forced through public runtime APIs on a healthy in-proc relay (the
+/// pass-apply and queue-drain happen inside one worker tick, so the window
+/// is sub-millisecond). That contract is pinned deterministically by the
+/// engine tests in `cgka-engine/tests/distributed_convergence.rs`
+/// (`pass_opens_while_app_message_intents_are_queued` and the reservation
+/// suite), which fail outright against the pre-fix engine.
 #[tokio::test]
 async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
     let dir = tempfile::tempdir().unwrap();
@@ -6717,19 +6728,25 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
         .subscribe_group_state(&bob_id, &group_id_hex)
         .unwrap();
 
-    for round in 0..3u32 {
+    const MAX_ROUNDS: u32 = 8;
+    let mut queued_round = None;
+    for round in 0..MAX_ROUNDS {
         let renamed = format!("settling-round-{round}");
         runtime
             .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
             .await
             .unwrap();
-        // Fire bob's send immediately so it often lands inside bob's
-        // collection window for the rename commit (the queued-intent path).
+        // Fire bob's send immediately so it lands inside bob's collection
+        // window for the rename commit; `published == 0` on the summary is
+        // the deterministic witness that this send took the durable queued
+        // path instead of publishing directly.
         let text = format!("bob mid-window {round}");
-        runtime
+        let send_accepted_at = Instant::now();
+        let summary = runtime
             .send_message(&bob_id, &group_id, text.clone().into_bytes())
             .await
             .unwrap();
+        let send_was_queued = summary.published == 0;
 
         wait_for_group_state_update(&mut bob_group_state, |group| group.profile.name == renamed)
             .await;
@@ -6743,7 +6760,28 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             )
         })
         .await;
+
+        if send_was_queued {
+            let queued_send_latency = send_accepted_at.elapsed();
+            // One settlement cycle plus drain: nominally ~1.1-1.4s (1000ms
+            // quiescence + 100ms schedule margin + worker slack). The pre-fix
+            // drain deferred a queued app intent past the apply tick whenever
+            // retained inbound was present, adding at least one more full
+            // settlement cycle (>= ~2.2s). 2s separates the classes while
+            // leaving headroom over the nominal fixed path.
+            assert!(
+                queued_send_latency < Duration::from_millis(2_000),
+                "queued mid-window send must publish within one settlement \
+                 cycle plus drain; took {queued_send_latency:?}"
+            );
+            queued_round = Some(round);
+            break;
+        }
     }
+    assert!(
+        queued_round.is_some(),
+        "no round exercised the queued mid-window send path in {MAX_ROUNDS} attempts"
+    );
 
     runtime.shutdown().await;
 }

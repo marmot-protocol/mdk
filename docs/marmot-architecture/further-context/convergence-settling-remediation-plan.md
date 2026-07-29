@@ -264,8 +264,8 @@ unchanged.
 Post-settle reorg rate does not observe scheduling latency. Add to
 `crates/cgka-engine/src/engine_metrics.rs` (aggregate values only — no group ids, per the
 observability invariant): pass-open → apply latency, completed-generation → next-generation-open
-gap, cutoff-overdue duration at freeze, and admin-reservation attempt outcome counters
-(granted / prepared / failed-consumed). These four directly validate this fix in production.
+gap, cutoff-overdue duration at freeze, and admin-reservation counters (per-drain hold
+observations / prepared / failed-consumed). These four directly validate this fix in production.
 Queue-age-by-category and backoff-transition metrics are optional follow-ups.
 
 ### 3.5 Docs / changelog

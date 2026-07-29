@@ -1925,6 +1925,16 @@ impl ScheduledConvergence {
             ConvergenceScheduleState::PendingUnopenable => {
                 self.schedule_unsettled_groups([group_id.clone()]);
             }
+            ConvergenceScheduleState::PendingOutbound => {
+                // A waiting outbound queue keeps the wakeup armed on the
+                // normal delay but is not unsettled convergence: it never
+                // feeds the re-arm cap, so a healthy queue cannot be demoted
+                // to error backoff (transport failures reach backoff through
+                // the sync/drain error paths instead).
+                self.retry_attempts.remove(group_id);
+                self.arm_no_later(group_id.clone(), TokioInstant::now() + self.normal_delay());
+                self.reset_timer_to_earliest();
+            }
         }
     }
 
@@ -2405,6 +2415,22 @@ mod tests {
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
         assert!(scheduled.deadlines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_outbound_rearms_without_counting_toward_backoff() {
+        let group_id = test_group_id(15);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+
+        for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
+            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.take_ready();
+        }
+
+        // A healthy waiting queue re-arms on the normal delay indefinitely
+        // without ever being demoted to error backoff.
+        assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
     }
 
     #[tokio::test]
