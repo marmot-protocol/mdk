@@ -5689,8 +5689,10 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
             AuditEventKind::ConvergencePassReopened {
                 stale_base_epoch,
                 current_tip_epoch,
-                ..
-            } if *stale_base_epoch == stale_base.0 && *current_tip_epoch == tip.0
+                generation,
+            } if *stale_base_epoch == stale_base.0
+                && *current_tip_epoch == tip.0
+                && *generation == stale.generation
         )),
         "the compensation is diagnosable from a forensic export"
     );
