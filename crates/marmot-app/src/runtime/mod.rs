@@ -2085,6 +2085,13 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn durably_owned_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<cgka_traits::engine::KeyPackage>, AppError> {
+        self.accounts.durably_owned_key_packages(account_ref).await
+    }
+
     pub async fn publish_new_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.rotate_key_package(account_ref).await
     }

@@ -926,7 +926,7 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
 }
 
 #[tokio::test]
-async fn app_runtime_routine_key_package_publish_replaces_under_stable_slot() {
+async fn app_runtime_republish_key_package_resends_exact_current_event() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -947,12 +947,27 @@ async fn app_runtime_routine_key_package_publish_replaces_under_stable_slot() {
         )
         .await
         .unwrap();
+    let before = runtime
+        .key_package_maintenance_status(&created.account.account_id_hex)
+        .await
+        .unwrap()
+        .expect("initial publication must promote lifecycle state");
+    let durable_before = runtime
+        .durably_owned_key_packages(&created.account.account_id_hex)
+        .await
+        .unwrap()
+        .len();
 
     let republished_bytes = runtime
         .publish_key_package(&created.account.account_id_hex)
         .await
         .unwrap();
-    let second = app
+    let after_republish = runtime
+        .key_package_maintenance_status(&created.account.account_id_hex)
+        .await
+        .unwrap()
+        .expect("republish must keep lifecycle state");
+    let relay_after_republish = app
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -961,17 +976,157 @@ async fn app_runtime_routine_key_package_publish_replaces_under_stable_slot() {
         .unwrap();
 
     assert_eq!(republished_bytes, first.key_package.bytes().len());
-    assert_ne!(second.key_package.bytes(), first.key_package.bytes());
-    assert_eq!(second.key_package_id, first.key_package_id);
-    assert_ne!(second.key_package_ref_hex, first.key_package_ref_hex);
-    assert!(!first.key_package_id.is_empty());
-    assert!(!second.key_package_id.is_empty());
-    assert!(!first.key_package_ref_hex.is_empty());
-    assert!(!second.key_package_ref_hex.is_empty());
-    assert!(!first.key_package_event_id.is_empty());
-    assert!(!second.key_package_event_id.is_empty());
+    assert_eq!(
+        relay_after_republish.key_package.bytes(),
+        first.key_package.bytes()
+    );
+    assert_eq!(
+        relay_after_republish.key_package_ref_hex,
+        first.key_package_ref_hex
+    );
+    assert_eq!(
+        relay_after_republish.key_package_event_id,
+        first.key_package_event_id
+    );
+    assert_eq!(after_republish.stable_slot_id, before.stable_slot_id);
+    assert_eq!(
+        after_republish.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_eq!(after_republish.authored_event_id, before.authored_event_id);
+    assert_eq!(
+        after_republish.authored_event_created_at,
+        before.authored_event_created_at
+    );
+    assert_eq!(
+        after_republish.authored_signed_event,
+        before.authored_signed_event
+    );
+    assert_eq!(after_republish.phase, before.phase);
+    assert_eq!(
+        after_republish.retained_private_material.len(),
+        before.retained_private_material.len()
+    );
+    assert!(after_republish.pending_replacement.is_none());
+    assert_eq!(
+        runtime
+            .durably_owned_key_packages(&created.account.account_id_hex)
+            .await
+            .unwrap()
+            .len(),
+        durable_before,
+        "republish must not mint or prune durable private bundles"
+    );
 
     runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let restarted_app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true),
+    );
+    let restarted = MarmotAppRuntime::new(restarted_app.clone());
+    restarted.reconcile_accounts().await.unwrap();
+
+    let republished_after_restart_bytes = restarted
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let after_restart = restarted
+        .key_package_maintenance_status(&created.account.account_id_hex)
+        .await
+        .unwrap()
+        .expect("restart must retain lifecycle state");
+    let relay_after_restart = restarted_app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        republished_after_restart_bytes,
+        first.key_package.bytes().len()
+    );
+    assert_eq!(
+        relay_after_restart.key_package.bytes(),
+        first.key_package.bytes()
+    );
+    assert_eq!(
+        relay_after_restart.key_package_ref_hex,
+        first.key_package_ref_hex
+    );
+    assert_eq!(
+        relay_after_restart.key_package_event_id,
+        first.key_package_event_id
+    );
+    assert_eq!(after_restart.stable_slot_id, before.stable_slot_id);
+    assert_eq!(
+        after_restart.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_eq!(after_restart.authored_event_id, before.authored_event_id);
+    assert_eq!(
+        after_restart.authored_signed_event,
+        before.authored_signed_event
+    );
+    assert_eq!(
+        after_restart.retained_private_material.len(),
+        before.retained_private_material.len()
+    );
+    assert_eq!(
+        restarted
+            .durably_owned_key_packages(&created.account.account_id_hex)
+            .await
+            .unwrap()
+            .len(),
+        durable_before,
+        "restart republish must not mint or prune durable private bundles"
+    );
+
+    let rotated_bytes = restarted
+        .rotate_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let after_rotation = restarted
+        .key_package_maintenance_status(&created.account.account_id_hex)
+        .await
+        .unwrap()
+        .expect("rotation must promote lifecycle state");
+    let relay_after_rotation = restarted_app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rotated_bytes,
+        relay_after_rotation.key_package.bytes().len()
+    );
+    assert_eq!(after_rotation.stable_slot_id, before.stable_slot_id);
+    assert_ne!(
+        after_rotation.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_ne!(after_rotation.authored_event_id, before.authored_event_id);
+    assert_ne!(
+        relay_after_rotation.key_package.bytes(),
+        first.key_package.bytes()
+    );
+    assert_eq!(
+        after_rotation.retained_private_material.len(),
+        before.retained_private_material.len() + 1,
+        "explicit rotation must retain the prior unconsumed private bundle"
+    );
+
+    restarted.shutdown().await;
 }
 
 #[tokio::test]
@@ -1076,9 +1231,9 @@ async fn app_runtime_can_rotate_key_package_on_request() {
     assert_eq!(rotated_bytes, rotated.key_package.bytes().len());
     assert_eq!(rotated.key_package_id, first.key_package_id);
     assert_ne!(rotated.key_package_ref_hex, first.key_package_ref_hex);
-    assert_ne!(republished.key_package.bytes(), rotated.key_package.bytes());
+    assert_eq!(republished.key_package.bytes(), rotated.key_package.bytes());
     assert_eq!(republished.key_package_id, rotated.key_package_id);
-    assert_ne!(republished.key_package_ref_hex, rotated.key_package_ref_hex);
+    assert_eq!(republished.key_package_ref_hex, rotated.key_package_ref_hex);
     assert!(!rotated.key_package_id.is_empty());
     assert!(!republished.key_package_id.is_empty());
     assert!(!rotated.key_package_ref_hex.is_empty());
