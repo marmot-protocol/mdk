@@ -967,7 +967,9 @@ impl TuiApp {
         // static keymap with a persistent "what Enter does, Esc clears" hint,
         // recomputed here each frame so it survives later status events.
         let spans = match (self.screen, self.user_search.as_ref()) {
-            (Screen::UserSearch, Some(view)) => keymap_hint_spans(user_search_hint(view.focus)),
+            (Screen::UserSearch, Some(view)) => {
+                keymap_hint_spans(&user_search_hint(view.focus, &view.purpose))
+            }
             (Screen::Main, _) => {
                 match armed_interaction_hint(self.input.value(), self.selected_timeline_row()) {
                     Some(armed) => armed_hint_spans(&armed),

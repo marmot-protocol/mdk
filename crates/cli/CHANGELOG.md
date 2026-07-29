@@ -21,7 +21,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   typed `RuntimeBusy` contention so foreground apps can retry and notification
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
-  
+
+- `wn tui` group detail now has a lowercase `a` that searches for a member to
+  add, for when you do not have the pubkey to hand (`A` remains the paste-a-pubkey
+  path). The search it opens is aimed at that group: `a` on a result confirms
+  against it directly instead of asking which chat, `Esc` returns to the group
+  detail, and a completed add reopens and reloads it.
+
 ### Fixed
 
 - `MarmotApp` now permits only one live in-memory engine session per account
