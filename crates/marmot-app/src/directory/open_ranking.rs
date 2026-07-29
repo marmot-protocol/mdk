@@ -17,10 +17,11 @@ use url::{Host, Url};
 
 use crate::ids::parse_account_id_hex;
 
-const VERTEX_OPEN_RANKING_SEARCH_URL: &str = "https://ranking.vertexlab.io/search/pubkeys";
 const OPEN_RANKING_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_RANKING_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const OPEN_RANKING_MAX_QUERY_CHARS: usize = 512;
+const OPEN_RANKING_MAX_ACCEPTED_RETRIES: usize = 3;
+const OPEN_RANKING_MIN_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub(crate) const OPEN_RANKING_RESULT_LIMIT: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,12 +49,15 @@ struct SearchResult {
     rank: f64,
 }
 
-/// Ask Vertex's Open Ranking provider for ranked pubkeys.
+/// Ask a configured Open Ranking provider for ranked pubkeys.
 ///
 /// The entire operation, including DNS and any protocol-mandated `202` retry,
 /// is bounded to five seconds. Results are normalized, deduplicated, and sorted
 /// locally before they cross into directory search.
-pub(crate) async fn search_vertex_pubkeys(query: &str) -> Result<Vec<RankedPubkey>, String> {
+pub(crate) async fn search_ranked_pubkeys(
+    endpoint: &str,
+    query: &str,
+) -> Result<Vec<RankedPubkey>, String> {
     let query = query.trim();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -62,20 +66,27 @@ pub(crate) async fn search_vertex_pubkeys(query: &str) -> Result<Vec<RankedPubke
         return Err("Open Ranking query exceeds the protocol limit".to_owned());
     }
 
-    timeout(OPEN_RANKING_TIMEOUT, search_vertex_pubkeys_inner(query))
-        .await
-        .map_err(|_| "Open Ranking request timed out".to_owned())?
+    timeout(
+        OPEN_RANKING_TIMEOUT,
+        search_ranked_pubkeys_inner(endpoint, query),
+    )
+    .await
+    .map_err(|_| "Open Ranking request timed out".to_owned())?
 }
 
-async fn search_vertex_pubkeys_inner(query: &str) -> Result<Vec<RankedPubkey>, String> {
-    let url = Url::parse(VERTEX_OPEN_RANKING_SEARCH_URL)
-        .map_err(|_| "Open Ranking provider URL is invalid".to_owned())?;
+async fn search_ranked_pubkeys_inner(
+    endpoint: &str,
+    query: &str,
+) -> Result<Vec<RankedPubkey>, String> {
+    let url =
+        Url::parse(endpoint).map_err(|_| "Open Ranking provider URL is invalid".to_owned())?;
     let client = open_ranking_http_client(&url).await?;
     let request = SearchRequest {
         query,
         limit: OPEN_RANKING_RESULT_LIMIT,
     };
 
+    let mut accepted_retries = 0usize;
     loop {
         let mut response = client
             .post(url.clone())
@@ -90,11 +101,8 @@ async fn search_vertex_pubkeys_inner(query: &str) -> Result<Vec<RankedPubkey>, S
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or_else(|| "Open Ranking 202 response omitted Retry-After".to_owned())?;
-            if retry_after == 0 {
-                tokio::task::yield_now().await;
-            } else {
-                sleep(Duration::from_secs(retry_after)).await;
-            }
+            let retry_delay = accepted_retry_delay(&mut accepted_retries, retry_after)?;
+            sleep(retry_delay).await;
             continue;
         }
         if !response.status().is_success() {
@@ -110,6 +118,17 @@ async fn search_vertex_pubkeys_inner(query: &str) -> Result<Vec<RankedPubkey>, S
         let _cache_hint_seconds = response.ttl;
         return validate_ranked_pubkeys(response.results);
     }
+}
+
+fn accepted_retry_delay(
+    accepted_retries: &mut usize,
+    retry_after_seconds: u64,
+) -> Result<Duration, String> {
+    if *accepted_retries >= OPEN_RANKING_MAX_ACCEPTED_RETRIES {
+        return Err("Open Ranking request was never ready".to_owned());
+    }
+    *accepted_retries += 1;
+    Ok(Duration::from_secs(retry_after_seconds).max(OPEN_RANKING_MIN_RETRY_DELAY))
 }
 
 fn validate_ranked_pubkeys(results: Vec<SearchResult>) -> Result<Vec<RankedPubkey>, String> {
@@ -291,5 +310,26 @@ mod tests {
         }])
         .unwrap_err();
         assert_eq!(error, "Open Ranking response contained an invalid pubkey");
+    }
+
+    #[test]
+    fn accepted_retries_are_bounded_and_back_off() {
+        let mut retries = 0;
+        assert_eq!(
+            accepted_retry_delay(&mut retries, 0).unwrap(),
+            OPEN_RANKING_MIN_RETRY_DELAY
+        );
+        assert_eq!(
+            accepted_retry_delay(&mut retries, 1).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            accepted_retry_delay(&mut retries, 2).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            accepted_retry_delay(&mut retries, 0).unwrap_err(),
+            "Open Ranking request was never ready"
+        );
     }
 }

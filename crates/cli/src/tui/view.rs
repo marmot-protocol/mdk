@@ -1,6 +1,7 @@
 //! TUI rendering: `TuiApp` draw methods and Ratatui line/style helpers.
 
 use super::*;
+use marmot_app::OFF_GRAPH_SEARCH_RADIUS;
 
 pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
@@ -1419,7 +1420,7 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
             ));
         }
         lines.push(Line::from(spans));
-        let provenance = if result.radius == u8::MAX {
+        let provenance = if result.radius == OFF_GRAPH_SEARCH_RADIUS {
             "discovery".to_owned()
         } else {
             format!("radius {}", result.radius)

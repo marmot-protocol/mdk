@@ -22,7 +22,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - User discovery now supplements the personal graph with up to 20 ranked
   pubkeys from Vertex's Open Ranking HTTP endpoint, bounded by a five-second
   timeout. Existing graph members are deduplicated before the remaining
-  candidates are hydrated through the relay plane.
+  candidates are hydrated through configured relay endpoints. Hosts can
+  override or disable the provider at construction time, and discovery batches
+  use a dedicated stream trigger rather than reopening completed graph radii.
 - MarmotKit clients can retrieve the canonical retired-relay host list and
   batch-classify arbitrary relay endpoints as `allowed`, `retired`, `invalid`,
   or `unsafe`. Classification uses the relay plane's dial-safety policy,

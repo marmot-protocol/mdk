@@ -98,6 +98,9 @@ pub enum SearchUpdateTriggerFfi {
     ResultsFound {
         radius: u8,
     },
+    /// Results from the optional off-graph discovery tier. Each result still
+    /// carries its own graph or discovery provenance.
+    DiscoveryResultsFound,
     RadiusCompleted {
         radius: u8,
     },
@@ -125,6 +128,7 @@ impl From<SearchUpdateTrigger> for SearchUpdateTriggerFfi {
         match value {
             SearchUpdateTrigger::RadiusStarted { radius } => Self::RadiusStarted { radius },
             SearchUpdateTrigger::ResultsFound { radius } => Self::ResultsFound { radius },
+            SearchUpdateTrigger::DiscoveryResultsFound => Self::DiscoveryResultsFound,
             SearchUpdateTrigger::RadiusCompleted { radius } => Self::RadiusCompleted { radius },
             SearchUpdateTrigger::RadiusTimeout { radius } => Self::RadiusTimeout { radius },
             SearchUpdateTrigger::RadiusTruncated { radius } => Self::RadiusTruncated { radius },
@@ -139,8 +143,9 @@ impl From<SearchUpdateTrigger> for SearchUpdateTriggerFfi {
 pub struct UserSearchUpdateFfi {
     pub trigger: SearchUpdateTriggerFfi,
     /// Matches found by this step, pre-sorted within the batch. Ordering
-    /// *across* updates is the radius order they arrive in, so a host that
-    /// renders one flat list should re-sort the aggregate.
+    /// *across* graph updates is radius order; an optional discovery batch
+    /// follows graph traversal and may contain results retaining graph
+    /// provenance. A host rendering one flat list should re-sort the aggregate.
     pub new_results: Vec<UserDirectorySearchResultFfi>,
     /// Running total this search has emitted so far, including `new_results`.
     pub total_result_count: u32,
@@ -212,5 +217,13 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert_eq!(ffi.total_result_count, 3);
+    }
+
+    #[test]
+    fn discovery_results_keep_a_distinct_trigger() {
+        assert!(matches!(
+            SearchUpdateTriggerFfi::from(SearchUpdateTrigger::DiscoveryResultsFound),
+            SearchUpdateTriggerFfi::DiscoveryResultsFound
+        ));
     }
 }

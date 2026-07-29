@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::cache::{DirectoryCache, DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
-use super::open_ranking::{RankedPubkey, search_vertex_pubkeys};
+use super::open_ranking::{RankedPubkey, search_ranked_pubkeys};
 use super::records::{
     UserDirectoryRecord, UserDirectorySearchResult, latest_follow_list_from_records,
     latest_fresh_profiles_from_records, profile_from_record, user_record_match,
@@ -35,7 +35,7 @@ use super::records::{
 use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
-use crate::runtime::{VERTEX_DIRECTORY_RELAY, blocking_app_task};
+use crate::runtime::blocking_app_task;
 use crate::{
     KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
     relay_list_state_from_event,
@@ -172,6 +172,10 @@ pub enum SearchUpdateTrigger {
     RadiusStarted { radius: u8 },
     /// A batch of matches resolved at this radius.
     ResultsFound { radius: u8 },
+    /// A batch produced by the optional off-graph discovery tier after graph
+    /// traversal. Individual results retain any graph radius already observed,
+    /// but this trigger never reopens a completed radius bucket.
+    DiscoveryResultsFound,
     /// This radius finished resolving.
     RadiusCompleted { radius: u8 },
     /// This radius ran out of time; traversal stops here.
@@ -191,7 +195,9 @@ pub enum SearchUpdateTrigger {
 pub struct UserSearchUpdate {
     pub trigger: SearchUpdateTrigger,
     /// Matches discovered by this step, pre-sorted within the batch. Ordering
-    /// *across* updates is the radius order they arrive in.
+    /// *across* graph updates is radius order; an optional discovery batch
+    /// follows graph traversal and may contain results retaining graph
+    /// provenance. Flat-list consumers should re-sort the aggregate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_results: Vec<UserDirectorySearchResult>,
     /// Running total emitted by this search so far, including `new_results`.
@@ -247,6 +253,17 @@ async fn run_search(
     // finds nobody by definition rather than everybody.
     let query = params.query.trim().to_lowercase();
     if !query.is_empty() {
+        let open_ranking_search_endpoint =
+            app.service_endpoints().open_ranking_search_endpoint.clone();
+        let open_ranking_profile_relays = app
+            .service_endpoints()
+            .open_ranking_profile_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let open_ranking_search_endpoint =
+            open_ranking_search_endpoint.filter(|_| !open_ranking_profile_relays.is_empty());
         // Start the independent discovery request with the graph walk, but
         // merge its results afterwards. That gives a graph result precedence
         // when both sources return the same identity, without holding a
@@ -260,7 +277,11 @@ async fn run_search(
                 &params,
                 &mut emitter,
             ),
-            fetch_open_ranking_pubkeys(&query, discovery_updates_tx),
+            fetch_open_ranking_pubkeys(
+                &query,
+                open_ranking_search_endpoint.as_deref(),
+                discovery_updates_tx,
+            ),
         );
         if let Err(error) = graph_result {
             emitter
@@ -274,7 +295,11 @@ async fn run_search(
             let hydration_updates_tx = emitter.updates_tx.clone();
             let hydration = tokio::select! {
                 _ = hydration_updates_tx.closed() => None,
-                result = hydrate_open_ranking_profiles(&app, remaining) => Some(result),
+                result = hydrate_open_ranking_profiles(
+                    &app,
+                    remaining,
+                    &open_ranking_profile_relays,
+                ) => Some(result),
             };
             match hydration {
                 None => {}
@@ -301,11 +326,15 @@ async fn run_search(
 /// traversal or logging the query.
 async fn fetch_open_ranking_pubkeys(
     query: &str,
+    endpoint: Option<&str>,
     updates_tx: mpsc::Sender<UserSearchUpdate>,
 ) -> Vec<RankedPubkey> {
+    let Some(endpoint) = endpoint else {
+        return Vec::new();
+    };
     let result = tokio::select! {
         _ = updates_tx.closed() => return Vec::new(),
-        result = search_vertex_pubkeys(query) => result,
+        result = search_ranked_pubkeys(endpoint, query) => result,
     };
     match result {
         Ok(ranked_pubkeys) => ranked_pubkeys,
@@ -330,17 +359,14 @@ async fn fetch_open_ranking_pubkeys(
 async fn hydrate_open_ranking_profiles(
     app: &MarmotApp,
     ranked_pubkeys: Vec<RankedPubkey>,
+    profile_relays: &[TransportEndpoint],
 ) -> Result<Vec<RankedDirectoryRecord>, AppError> {
     let account_ids = ranked_pubkeys
         .iter()
         .map(|ranked| ranked.account_id_hex.clone())
         .collect::<Vec<_>>();
     let records = app
-        .fetch_events_for_account_ids(
-            &account_ids,
-            KIND_NOSTR_METADATA,
-            &[TransportEndpoint(VERTEX_DIRECTORY_RELAY.to_owned())],
-        )
+        .fetch_events_for_account_ids(&account_ids, KIND_NOSTR_METADATA, profile_relays)
         .await?;
     let mut profiles = latest_fresh_profiles_from_records(records, app.directory_freshness()).value;
     Ok(ranked_pubkeys
@@ -1057,7 +1083,7 @@ impl SearchEmitter {
     /// Emit hydrated Open Ranking matches, retaining graph provenance for any
     /// ranked identity already encountered during traversal.
     async fn emit_ranked_matches(&mut self, records: Vec<RankedDirectoryRecord>, query: &str) {
-        let mut by_radius = BTreeMap::<u8, Vec<UserDirectorySearchResult>>::new();
+        let mut results = Vec::new();
         for ranked in records {
             let Some(search_match) = user_record_match(&ranked.record, query) else {
                 continue;
@@ -1081,12 +1107,12 @@ impl SearchEmitter {
                 .emitted_account_ids
                 .insert(result.account_id_hex.clone())
             {
-                by_radius.entry(radius).or_default().push(result);
+                results.push(result);
             }
         }
-        for (radius, mut results) in by_radius {
+        if !results.is_empty() {
             sort_user_search_results(&mut results);
-            self.emit_results(SearchUpdateTrigger::ResultsFound { radius }, results)
+            self.emit_results(SearchUpdateTrigger::DiscoveryResultsFound, results)
                 .await;
         }
     }
@@ -1273,6 +1299,12 @@ mod tests {
         let home = AccountHome::open(dir.path());
         let account = home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        assert!(
+            app.service_endpoints()
+                .open_ranking_search_endpoint
+                .is_none(),
+            "dev/test convenience constructors must never call a live provider"
+        );
         let cache = app.directory_cache_for_account(&account).unwrap();
         cache
             .put(&record_named(&account.account_id_hex, "needle"))
@@ -1644,6 +1676,7 @@ mod tests {
             .await;
 
         let update = updates_rx.recv().await.expect("ranked result");
+        assert_eq!(update.trigger, SearchUpdateTrigger::DiscoveryResultsFound);
         assert_eq!(update.new_results[0].radius, 1);
         assert_eq!(
             update.new_results[0].provider_rank, None,
@@ -1854,7 +1887,8 @@ mod tests {
             dir.path(),
             "wss://relay.invalid",
             crate::MarmotAppConfig::default()
-                .with_directory_search_fallback_seeds(vec![seed.clone()]),
+                .with_directory_search_fallback_seeds(vec![seed.clone()])
+                .with_open_ranking_provider(None, Vec::new()),
         );
         let cache = app.directory_cache_for_account(&account).unwrap();
         let now = crate::unix_now_seconds() as i64;
@@ -1915,7 +1949,8 @@ mod tests {
             dir.path(),
             "wss://relay.invalid",
             crate::MarmotAppConfig::default()
-                .with_directory_search_fallback_seeds(vec![seed.clone()]),
+                .with_directory_search_fallback_seeds(vec![seed.clone()])
+                .with_open_ranking_provider(None, Vec::new()),
         );
         let cache = app.directory_cache_for_account(&account).unwrap();
         let now = crate::unix_now_seconds() as i64;

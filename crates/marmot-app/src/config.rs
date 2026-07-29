@@ -9,6 +9,9 @@ const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
     option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
+pub(crate) const DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT: &str =
+    "https://ranking.vertexlab.io/search/pubkeys";
+pub(crate) const DEFAULT_OPEN_RANKING_PROFILE_RELAY: &str = "wss://relay.vertexlab.io";
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -93,8 +96,8 @@ pub struct MarmotAppConfig {
     pub directory_search_fallback_seeds: Vec<String>,
 }
 
-/// Compiled or app-level default service URLs for production telemetry export
-/// and forensic audit-log tracker uploads.
+/// Compiled or app-level default service URLs for production telemetry export,
+/// forensic audit-log tracker uploads, media, and optional user discovery.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
 /// credentials at runtime, while the MDK/Marmot build owns stable
@@ -110,6 +113,12 @@ pub struct MarmotServiceEndpoints {
     /// published in kind:0 metadata, so hosts with different privacy or
     /// availability requirements should override the built-in service.
     pub profile_image_blob_endpoint: Option<String>,
+    /// Optional ORE-05 pubkey search endpoint. `None` disables off-graph
+    /// provider discovery without affecting the personal graph search.
+    pub open_ranking_search_endpoint: Option<String>,
+    /// Relays used only to hydrate provider-returned pubkeys into signed kind-0
+    /// profiles. An empty list disables provider discovery.
+    pub open_ranking_profile_relays: Vec<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -170,6 +179,22 @@ impl MarmotAppConfig {
         self
     }
 
+    /// Configure or disable the optional Open Ranking discovery tier.
+    ///
+    /// Passing `None` or an empty relay list disables the tier. This is a
+    /// construction-time privacy/availability choice; personal graph search
+    /// remains available either way.
+    pub fn with_open_ranking_provider(
+        mut self,
+        search_endpoint: Option<String>,
+        profile_relays: Vec<String>,
+    ) -> Self {
+        self.service_endpoints.open_ranking_search_endpoint = search_endpoint;
+        self.service_endpoints.open_ranking_profile_relays = profile_relays;
+        self.service_endpoints = self.service_endpoints.normalize();
+        self
+    }
+
     /// Dev/test override for the convergence settlement quiescence window (ms).
     /// Off by default (the protocol-pinned `1000` ms is used). Normal builds
     /// ignore this field; explicit test harnesses set `0` for instant settlement.
@@ -191,6 +216,8 @@ impl MarmotServiceEndpoints {
             profile_image_blob_endpoint: Some(
                 crate::media::DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL.to_owned(),
             ),
+            open_ranking_search_endpoint: Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT.to_owned()),
+            open_ranking_profile_relays: vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY.to_owned()],
         }
         .normalize()
     }
@@ -201,6 +228,9 @@ impl MarmotServiceEndpoints {
         self.encrypted_media_blob_endpoints =
             normalize_endpoint_list(self.encrypted_media_blob_endpoints);
         self.profile_image_blob_endpoint = trim_optional(self.profile_image_blob_endpoint);
+        self.open_ranking_search_endpoint = trim_optional(self.open_ranking_search_endpoint);
+        self.open_ranking_profile_relays =
+            normalize_endpoint_list(self.open_ranking_profile_relays);
         self
     }
 }
@@ -623,6 +653,34 @@ mod tests {
             MarmotAppConfig::default()
                 .with_allow_loopback_blob_endpoints(true)
                 .allow_loopback_blob_endpoints
+        );
+    }
+
+    #[test]
+    fn open_ranking_provider_is_configurable_and_can_be_disabled() {
+        let default = MarmotAppConfig::default();
+        assert_eq!(
+            default
+                .service_endpoints
+                .open_ranking_search_endpoint
+                .as_deref(),
+            Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT)
+        );
+        assert_eq!(
+            default.service_endpoints.open_ranking_profile_relays,
+            vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY]
+        );
+
+        let disabled = default.with_open_ranking_provider(None, Vec::new());
+        assert_eq!(
+            disabled.service_endpoints.open_ranking_search_endpoint,
+            None
+        );
+        assert!(
+            disabled
+                .service_endpoints
+                .open_ranking_profile_relays
+                .is_empty()
         );
     }
 
