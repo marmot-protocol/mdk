@@ -68,6 +68,9 @@ mod scanner;
 /// Maximum nested block-container depth emitted by the parser.
 pub const MAX_CONTAINER_DEPTH: usize = block::MAX_CONTAINER_DEPTH;
 
+/// Maximum blank-line source gap retained before a block.
+pub const MAX_SOURCE_BLANK_LINES: u8 = block::MAX_SOURCE_BLANK_LINES;
+
 pub use ast::{
     Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, LinkDestinationKind, ListItem,
     ListKind, NostrEntity, NostrHrp, TableCell,
@@ -102,6 +105,6 @@ pub use destination::classify_link_destination;
 ///
 /// Bech32 strings are validated for *shape* only (no checksum).
 pub fn parse(input: &str) -> Document {
-    let (blocks, refs) = block::parse_blocks(input);
-    inline::parse_inlines(blocks, &refs)
+    let (blocks, blank_lines_before, refs) = block::parse_blocks(input);
+    inline::parse_inlines(blocks, blank_lines_before, &refs)
 }

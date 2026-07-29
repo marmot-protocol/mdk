@@ -24,6 +24,9 @@ pub struct MarkdownDocumentFfi {
     /// True when the input exceeded the FFI Markdown safety cap and `blocks`
     /// were parsed from a UTF-8-boundary prefix.
     pub truncated: bool,
+    /// Blank source lines before each corresponding block, clamped by
+    /// `marmot-markdown` to its documented maximum.
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -44,6 +47,8 @@ pub enum MarkdownBlockFfi {
     },
     BlockQuote {
         blocks: Vec<MarkdownBlockFfi>,
+        /// Blank source lines before each corresponding child block.
+        blank_lines_before: Vec<u8>,
     },
     /// Named `ListBlock` (not `List`) to match the sibling `*Block` variants and
     /// to avoid shadowing `kotlin.collections.List` in generated Kotlin bindings.
@@ -82,6 +87,8 @@ pub struct MarkdownListItemFfi {
     /// `None` for plain bullets/ordered items, `Some(false)` for `[ ]`,
     /// `Some(true)` for `[x]`.
     pub checked: Option<bool>,
+    /// Blank source lines before each corresponding child block.
+    pub blank_lines_before: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -218,6 +225,7 @@ impl From<&MdDocument> for MarkdownDocumentFfi {
                 .map(|block| markdown_block_from_md(block, 0))
                 .collect(),
             truncated: false,
+            blank_lines_before: value.blank_lines_before.clone(),
         }
     }
 }
@@ -258,11 +266,15 @@ fn markdown_block_from_md(value: &MdBlock, depth: usize) -> MarkdownBlockFfi {
             info: info.clone(),
             content: content.clone(),
         },
-        MdBlock::BlockQuote { blocks } => MarkdownBlockFfi::BlockQuote {
+        MdBlock::BlockQuote {
+            blocks,
+            blank_lines_before,
+        } => MarkdownBlockFfi::BlockQuote {
             blocks: blocks
                 .iter()
                 .map(|block| markdown_block_from_md(block, depth + 1))
                 .collect(),
+            blank_lines_before: blank_lines_before.clone(),
         },
         MdBlock::List { kind, tight, items } => MarkdownBlockFfi::ListBlock {
             kind: kind.into(),
@@ -330,6 +342,7 @@ fn markdown_list_item_from_md(value: &MdListItem, depth: usize) -> MarkdownListI
             .map(|block| markdown_block_from_md(block, depth))
             .collect(),
         checked: value.checked,
+        blank_lines_before: value.blank_lines_before.clone(),
     }
 }
 
@@ -656,6 +669,25 @@ mod tests {
     }
 
     #[test]
+    fn bridges_blank_line_counts_for_every_block_owner() {
+        let document =
+            parse_markdown_document("first\n\n> quoted\n>\n> again\n\n- item\n\n  continuation");
+
+        assert_eq!(document.blank_lines_before, [0, 1, 1]);
+        let MarkdownBlockFfi::BlockQuote {
+            blank_lines_before, ..
+        } = &document.blocks[1]
+        else {
+            panic!("expected block quote");
+        };
+        assert_eq!(blank_lines_before, &[0, 1]);
+        let MarkdownBlockFfi::ListBlock { items, .. } = &document.blocks[2] else {
+            panic!("expected list");
+        };
+        assert_eq!(items[0].blank_lines_before, [0, 1]);
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
@@ -667,7 +699,7 @@ mod tests {
 
     fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
         match block {
-            MarkdownBlockFfi::BlockQuote { blocks } => 1 + max_block_depth(blocks),
+            MarkdownBlockFfi::BlockQuote { blocks, .. } => 1 + max_block_depth(blocks),
             MarkdownBlockFfi::ListBlock { items, .. } => {
                 1 + items
                     .iter()

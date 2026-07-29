@@ -65,6 +65,9 @@
                             }
                           }
                         ],
+                        "blank_lines_before": [
+                          0
+                        ],
                         "checked": null
                       },
                       {
@@ -99,11 +102,18 @@
                                       }
                                     }
                                   ],
+                                  "blank_lines_before": [
+                                    0
+                                  ],
                                   "checked": null
                                 }
                               ]
                             }
                           }
+                        ],
+                        "blank_lines_before": [
+                          0,
+                          0
                         ],
                         "checked": null
                       }
@@ -119,6 +129,11 @@
                     ]
                   }
                 }
+              ],
+              "blank_lines_before": [
+                0,
+                1,
+                1
               ]
             }
           },
@@ -131,6 +146,11 @@
               ]
             }
           }
+        ],
+        "blank_lines_before": [
+          0,
+          1,
+          1
         ]
       }
     },
@@ -197,6 +217,9 @@
                                     }
                                   }
                                 ],
+                                "blank_lines_before": [
+                                  0
+                                ],
                                 "checked": null
                               },
                               {
@@ -211,11 +234,18 @@
                                     }
                                   }
                                 ],
+                                "blank_lines_before": [
+                                  0
+                                ],
                                 "checked": false
                               }
                             ]
                           }
                         }
+                      ],
+                      "blank_lines_before": [
+                        0,
+                        0
                       ],
                       "checked": null
                     },
@@ -242,15 +272,26 @@
                                   ]
                                 }
                               }
+                            ],
+                            "blank_lines_before": [
+                              0
                             ]
                           }
                         }
+                      ],
+                      "blank_lines_before": [
+                        0,
+                        0
                       ],
                       "checked": null
                     }
                   ]
                 }
               }
+            ],
+            "blank_lines_before": [
+              0,
+              0
             ],
             "checked": null
           },
@@ -272,6 +313,10 @@
                   "content": "code block inside list item\n"
                 }
               }
+            ],
+            "blank_lines_before": [
+              0,
+              0
             ],
             "checked": null
           }
@@ -350,9 +395,16 @@
                                             ]
                                           }
                                         }
+                                      ],
+                                      "blank_lines_before": [
+                                        0
                                       ]
                                     }
                                   }
+                                ],
+                                "blank_lines_before": [
+                                  0,
+                                  0
                                 ],
                                 "checked": null
                               }
@@ -360,16 +412,30 @@
                           }
                         }
                       ],
+                      "blank_lines_before": [
+                        0,
+                        0
+                      ],
                       "checked": null
                     }
                   ]
                 }
               }
             ],
+            "blank_lines_before": [
+              0,
+              0
+            ],
             "checked": null
           }
         ]
       }
     }
+  ],
+  "blank_lines_before": [
+    0,
+    1,
+    1,
+    1
   ]
 }
