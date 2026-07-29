@@ -5576,11 +5576,16 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
 
 #[tokio::test]
 async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
-    // A device catching up advances its tip while a durable pass stays open at
-    // the epoch it was scheduled from. That is stale local scheduling state, not
-    // corruption: convergence must discard the pass, reopen at the tip, and keep
-    // converging. Halting here durably wedged a field device that was six epochs
-    // behind, and every later send failed against the halt.
+    // A durable pass whose base epoch disagrees with the tip is stale local
+    // scheduling state, not corruption: convergence must discard it, reopen at
+    // the tip, and keep converging. The disagreement is inherited rather than
+    // reachable live — a base epoch stamped from the durable group record while
+    // the tip was read from the epoch manager, two stores that can split across a
+    // restart — so the test installs that shape on the durable record directly.
+    // The live engine cannot produce it: an open pass gates outbound work and
+    // re-routes inbound commits back through convergence. Halting on it durably
+    // wedged a field device six epochs behind, and every later send failed
+    // against the halt.
     use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
 
     let audit_dir = tempfile::tempdir().unwrap();
@@ -5639,8 +5644,8 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
     let stale_base = EpochId(tip.0.checked_sub(1).expect("the tip is past epoch zero"));
     let mut stale = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
     assert_eq!(stale.base_epoch, tip, "pass opens at the current tip");
-    // The durable pass outlives the tip it was scheduled from, so its base epoch
-    // falls behind as the device catches up.
+    // Install the inherited shape: a durable pass whose base epoch trails the
+    // tip the rest of convergence reads.
     stale.base_epoch = stale_base;
     carol_storage.put_convergence_pass(&stale).unwrap();
 

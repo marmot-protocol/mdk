@@ -138,11 +138,18 @@ millisecond wall deadlines. An elapsed deadline becomes immediately due, and a b
 fails closed to an immediate cutoff. Frozen and resolving passes resume their exact persisted membership without
 re-enumerating storage.
 
-A pass is scheduling state for one base epoch. When the group's tip has moved past that epoch — a device catching up
-applies commits while a pass is open — the stale pass is discarded and the next generation opens at the current tip
-(`convergence_pass_discarded`). The pass holds no canonical state of its own, so its members reseed from retained
-storage. `stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` pins that rule. Only a frozen member
-that no longer matches the record it was admitted from is an integrity failure, and that alone halts the group
+A pass is scheduling state for one base epoch. A pass whose base epoch disagrees with the current tip is discarded, and
+the next generation opens at the tip (`convergence_pass_discarded`). This is a repair path, not a steady-state
+transition: the tip does not move forward underneath an open pass, because an active pass gates outbound work and an
+inbound commit inside the rewind horizon re-enters convergence instead of applying directly. What it repairs is
+inherited scheduling state — a base epoch stamped from the durable group record while the tip was read from the epoch
+manager, two authorities for one epoch that can split across a restart — so an inherited base can sit either behind or
+ahead of the tip, and both directions are discarded regardless of pass phase. The pass holds no canonical state of its
+own, so its members reseed from retained storage.
+`stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting`,
+`frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting`, and
+`future_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` pin that rule. Only a frozen member that no
+longer matches the record it was admitted from is an integrity failure, and that alone halts the group
 `Unrecoverable`.
 
 The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier

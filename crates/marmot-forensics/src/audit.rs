@@ -1021,13 +1021,15 @@ pub enum AuditEventKind {
     /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
     /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
     EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
-    /// A durable convergence pass was scheduled against an epoch the device has
-    /// since left behind — it caught up while the pass stayed open — so the pass
-    /// was discarded and convergence reopened at the current tip. Non-terminal by
-    /// construction: it records the compensation that keeps a catching-up device
-    /// converging. `stale_base_epoch` is the epoch the discarded pass was
-    /// scheduled from and `generation` is its pass generation, so an export shows
-    /// how far behind the discarded scheduling state was.
+    /// A durable convergence pass whose base epoch disagreed with the device's
+    /// current tip was discarded, freeing convergence to reopen at the tip.
+    /// Non-terminal by construction: it records a repair, not a fault. The
+    /// disagreement is inherited scheduling state — an older binary stamped a
+    /// pass's base epoch from the durable group record while convergence compared
+    /// the epoch manager, and those two stores can split across a restart — so
+    /// `stale_base_epoch` may sit either behind or ahead of `current_tip_epoch`.
+    /// `generation` is the discarded pass's generation, so an export shows which
+    /// scheduling state was dropped.
     ///
     /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
     /// epochs/counters only, so nothing here needs scrubbing in either

@@ -473,15 +473,24 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Discard a pass whose base epoch the device has already left behind, so the
-    /// caller reopens one at the current tip.
+    /// Discard a pass whose base epoch disagrees with the current tip, so the
+    /// caller reopens one at the tip.
     ///
-    /// A pass is local scheduling state for a single base epoch; the tip
-    /// legitimately moves while one is open (a device catching up applies
-    /// commits). The stale batch is therefore benign, not evidence of corruption,
-    /// and it carries no canonical state of its own — its members are retained
-    /// stored messages that reseed into the next pass. Same rule as the discarded
-    /// local copy in `do_join_welcome`.
+    /// This is a repair path, not a steady-state transition. The tip does not
+    /// move forward underneath an open pass: an active pass gates outbound work
+    /// (every trigger that opens one admits at least one `CommitEdge` member, and
+    /// a `CommitEdge` member gates unconditionally), and an inbound commit inside
+    /// the rewind horizon re-enters convergence instead of applying directly.
+    /// What this repairs is inherited scheduling state — before
+    /// [`Self::convergence_tip_epoch`] there were two authorities for one epoch,
+    /// because `base_epoch` was stamped from the durable group record while the
+    /// halt compared the epoch manager, and those two stores can split across a
+    /// restart. A base inherited from an older binary can therefore sit behind or
+    /// ahead of the tip, so both directions are discarded.
+    ///
+    /// The stale batch is benign either way: a pass carries no canonical state of
+    /// its own, and its members are retained stored messages that reseed into the
+    /// next pass. Same rule as the discarded local copy in `do_join_welcome`.
     fn discard_stale_convergence_pass(
         &self,
         pass: &DurableConvergencePass,
