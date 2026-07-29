@@ -83,13 +83,17 @@ pub struct UserDirectorySearch {
     pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UserDirectorySearchResult {
     pub account_id_hex: String,
     pub npub: String,
     pub radius: u8,
     pub matched_field: MatchedField,
     pub match_quality: MatchQuality,
+    /// Rank assigned by an off-graph discovery provider. `None` for results
+    /// found only through the local social graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rank: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<UserProfileMetadata>,
 }
@@ -566,6 +570,7 @@ mod tests {
             radius: 1,
             matched_field: MatchedField::DisplayName,
             match_quality: MatchQuality::Exact,
+            provider_rank: None,
             profile: None,
         };
 
@@ -573,6 +578,10 @@ mod tests {
 
         assert_eq!(json["matched_field"], "display_name");
         assert_eq!(json["match_quality"], "exact");
+        assert!(
+            json.get("provider_rank").is_none(),
+            "graph-only results must not gain discovery metadata"
+        );
         assert_eq!(
             serde_json::from_value::<UserDirectorySearchResult>(json).expect("round-trips"),
             result

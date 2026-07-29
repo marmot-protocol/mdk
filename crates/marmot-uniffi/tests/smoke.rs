@@ -15,8 +15,8 @@ use marmot_uniffi::{
     AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
     CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
-    MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi,
-    TimelineMessageQueryFfi, parse_media_imeta_tag,
+    MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
+    RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -565,6 +565,29 @@ async fn relay_list_binding_methods_are_public() {
         kit.set_account_inbox_relays("missing".into(), relays.clone(), relays)
             .await
             .is_err()
+    );
+
+    assert_eq!(
+        kit.retired_relay_hosts(),
+        vec!["relay.damus.io", "relay.nostr.band"]
+    );
+    let classifications = kit.classify_relay_endpoints(vec![
+        "wss://relay.example".into(),
+        "wss://relay.damus.io".into(),
+        "not a relay".into(),
+        "ws://relay.example".into(),
+    ]);
+    assert_eq!(
+        classifications
+            .iter()
+            .map(|result| result.policy)
+            .collect::<Vec<_>>(),
+        vec![
+            RelayEndpointPolicyFfi::Allowed,
+            RelayEndpointPolicyFfi::Retired,
+            RelayEndpointPolicyFfi::Invalid,
+            RelayEndpointPolicyFfi::Unsafe,
+        ]
     );
 }
 

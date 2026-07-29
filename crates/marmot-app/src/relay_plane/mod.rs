@@ -35,6 +35,7 @@ mod directory;
 mod safety;
 mod telemetry;
 
+pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
@@ -277,6 +278,15 @@ impl MarmotRelayPlane {
         self.inner
             .relay_safety
             .sanitize_endpoints(endpoints, context)
+    }
+
+    /// Classify caller-owned relay URLs under the exact policy used at every
+    /// relay-plane dial boundary. Results preserve input order and cardinality.
+    pub fn classify_relay_endpoints(
+        &self,
+        endpoints: Vec<String>,
+    ) -> Vec<RelayEndpointClassification> {
+        self.inner.relay_safety.classify_endpoints(endpoints)
     }
 
     pub fn subscription_rebuild_since(

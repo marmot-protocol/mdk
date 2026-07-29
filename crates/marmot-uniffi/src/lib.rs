@@ -63,13 +63,14 @@ pub use conversions::{
     NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
     PeriodicMaintenancePolicyFfi, PushPlatformFfi, PushRegistrationFfi,
     PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
-    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
-    RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
-    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
-    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
-    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
-    TimelineUserReactionFfi, TransportFanoutStatusFfi,
+    RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
+    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
+    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
+    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
+    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    TransportFanoutStatusFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

@@ -4272,10 +4272,11 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
 /// the directory preflight a discovery set distinct from the operational
 /// messaging relays. They are used only to read the outbox list and profile,
 /// they are never adopted as the account's messaging relays.
+pub(crate) const VERTEX_DIRECTORY_RELAY: &str = "wss://relay.vertexlab.io";
+
 const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
     "wss://purplepag.es",
-    "wss://relay.nostr.band",
-    "wss://relay.damus.io",
+    VERTEX_DIRECTORY_RELAY,
     "wss://nos.lol",
 ];
 

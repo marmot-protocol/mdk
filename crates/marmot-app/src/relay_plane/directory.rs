@@ -369,14 +369,14 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
 
         let mut records = Vec::new();
         for query in request.queries {
+            let kind = u16::try_from(query.kind)
+                .map(Kind::from)
+                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
             let public_keys = query
                 .authors
                 .iter()
                 .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
                 .collect::<Result<Vec<_>, _>>()?;
-            let kind = u16::try_from(query.kind)
-                .map(Kind::from)
-                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
             let filter = Filter::new()
                 .authors(public_keys)
                 .kind(kind)

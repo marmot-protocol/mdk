@@ -1,6 +1,7 @@
 //! TUI rendering: `TuiApp` draw methods and Ratatui line/style helpers.
 
 use super::*;
+use marmot_app::OFF_GRAPH_SEARCH_RADIUS;
 
 pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
@@ -1372,7 +1373,7 @@ pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> Vec<Line<'st
 
 /// The user-search screen body: the query field (with the cursor cell in query
 /// focus) then the result rows, each showing the display label, a shortened
-/// npub, and the `matched_field · match_quality · radius` attribution. Every
+/// npub, and the `matched_field · match_quality · provenance` attribution. Every
 /// name and npub passes through `terminal_safe_text`.
 pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<Line<'static>> {
     let query_focused = view.focus == UserSearchFocus::Query;
@@ -1419,12 +1420,16 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
             ));
         }
         lines.push(Line::from(spans));
+        let provenance = if result.radius == OFF_GRAPH_SEARCH_RADIUS {
+            "discovery".to_owned()
+        } else {
+            format!("radius {}", result.radius)
+        };
         lines.push(Line::from(Span::styled(
             format!(
-                "    {} · {} · radius {}",
+                "    {} · {} · {provenance}",
                 terminal_safe_text(&result.matched_field),
                 terminal_safe_text(&result.match_quality),
-                result.radius
             ),
             Style::default().fg(Color::DarkGray),
         )));

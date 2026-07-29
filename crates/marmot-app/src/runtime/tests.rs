@@ -2,6 +2,23 @@ use super::subscriptions::chat_list_mute_expiries;
 use super::*;
 
 #[test]
+fn default_directory_discovery_relays_use_live_indexers() {
+    let relays = default_directory_discovery_relays();
+
+    assert!(
+        relays.iter().any(|relay| relay.0 == VERTEX_DIRECTORY_RELAY),
+        "Vertex must remain available for directory bootstrap"
+    );
+    assert!(
+        relays
+            .iter()
+            .all(|relay| !["wss://relay.nostr.band", "wss://relay.damus.io",]
+                .contains(&relay.0.as_str())),
+        "retired relays must never return to discovery defaults"
+    );
+}
+
+#[test]
 fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
     let mut seen =
         MessageSubscriptionSeenIds::from_ids((0..5).map(|index| format!("message-{index}")), 3);

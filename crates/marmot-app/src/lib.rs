@@ -178,8 +178,9 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{
-    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
-    RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
+    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
 };
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
@@ -1067,7 +1068,9 @@ impl MarmotApp {
         Self::with_relays_and_config(
             root,
             relay_urls,
-            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            MarmotAppConfig::default()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_open_ranking_provider(None, Vec::new()),
         )
     }
 
