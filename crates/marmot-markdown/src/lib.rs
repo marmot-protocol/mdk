@@ -87,10 +87,12 @@ pub use destination::classify_link_destination;
 /// - GFM task-list items (`- [ ]`, `- [x]`).
 /// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
 ///   `https://`, `mailto:`, `tel:`, `marmot://`, `whitenoise://`, and
-///   `whitenoise-staging://`. Recognized at word boundaries; trailing
-///   punctuation (`.,;:!?*_~` and unbalanced `)`) is excluded from the
-///   matched URL. Opaque app-scheme forms like `marmot:foo` and
-///   `whitenoise:foo` (no `//`) stay literal.
+///   `whitenoise-staging://`, plus bare `www.` host/path forms. `www.`
+///   autolinks preserve their source text; renderers synthesize an `https://`
+///   launch destination. Recognized at word boundaries; trailing punctuation
+///   (`.,;:!?*_~` and unbalanced `)`) is excluded from the matched URL. Opaque
+///   app-scheme forms like `marmot:foo` and `whitenoise:foo` (no `//`) stay
+///   literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
