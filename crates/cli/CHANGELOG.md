@@ -312,6 +312,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   roughly a screenful of rows the highlight fell outside the drawn area, which
   made the selection invisible rather than merely awkward — the marker and the
   highlight are drawn inside each row.
+- `wn tui` group detail can now reach its relay hints. They sit below the member
+  list, so a group with more members than the pane is tall left them permanently
+  off-screen; moving the selection to the last member now scrolls to the end of
+  the pane and brings them into view with it.
 
 ## [0.9.11] - 2026-08-09
 

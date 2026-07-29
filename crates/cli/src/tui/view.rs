@@ -383,6 +383,18 @@ impl PaneBody {
         self.anchor = Some(self.lines.len());
     }
 
+    /// Move an existing anchor to the last line of the body, for a body that ends
+    /// in content no selection can reach (group detail's relay hints). Called once
+    /// the body is complete and the anchored row was the last selectable one, so
+    /// that tail scrolls into view with it instead of sitting below the viewport
+    /// forever. Never *creates* an anchor: with nothing selected there is nothing
+    /// the viewport has to follow.
+    fn anchor_body_end(&mut self) {
+        if self.anchor.is_some() {
+            self.anchor = Some(self.lines.len().saturating_sub(1));
+        }
+    }
+
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
     }
@@ -1446,8 +1458,10 @@ pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> PaneBody {
     }
     body.push(Line::from(""));
     body.push(Line::from(format!("Members ({})", view.members.len())));
+    let mut selection_ends_the_list = false;
     for (index, member) in view.members.iter().enumerate() {
         let is_selected = index == view.selected;
+        selection_ends_the_list |= is_selected && index + 1 == view.members.len();
         let marker = if is_selected { ">" } else { " " };
         let mut spans = vec![
             Span::raw(format!("{marker} ")),
@@ -1471,6 +1485,12 @@ pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> PaneBody {
     body.push(Line::from(format!("Relays ({})", view.relays.len())));
     for relay in &view.relays {
         body.push(Line::from(format!("  {}", terminal_safe_text(relay))));
+    }
+    // The relay hints are the one stretch of this screen no selection can land
+    // on, so they are only reachable by riding along with the end of the member
+    // list. Moving to the last member scrolls to the end of the body.
+    if selection_ends_the_list {
+        body.anchor_body_end();
     }
     body
 }

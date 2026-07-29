@@ -7791,6 +7791,49 @@ fn group_detail_pane_scrolls_the_selected_member_into_view() {
 }
 
 #[test]
+fn group_detail_reveals_the_relay_section_at_the_end_of_a_long_member_list() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    // The relay hints sit *after* the member list, so with more members than the
+    // pane can hold they scroll off the bottom. Nothing scrolls the pane
+    // independently of the selection, so reaching the end of the list has to be
+    // what brings the tail into view.
+    let members: Vec<GroupMemberRow> = (0..40)
+        .map(|index| GroupMemberRow {
+            member_id: format!("id{index:02}"),
+            npub: format!("npubmember{index:02}"),
+            is_admin: false,
+            is_self: false,
+        })
+        .collect();
+    let selected = members.len() - 1;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: "the ops".to_owned(),
+        members,
+        relays: vec![
+            "wss://first.example".to_owned(),
+            "wss://middle.example".to_owned(),
+            "wss://last.example".to_owned(),
+        ],
+        account_is_admin: true,
+        admin_count: 1,
+        selected,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("first.example") && rendered.contains("last.example"),
+        "the whole relay section is reachable once the selection reaches the last member"
+    );
+    assert!(
+        rendered.contains("npubmember39"),
+        "and the selected member is still on screen with it"
+    );
+}
+
+#[test]
 fn daemon_start_args_forward_first_run_relays() {
     assert_eq!(
         daemon_start_args(&[], &[]),

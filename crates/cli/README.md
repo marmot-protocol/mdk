@@ -658,7 +658,8 @@ key. Because the help card is a popup, `q` under it closes the card instead of q
 
 Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
 its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
-selection (the pane scrolls to keep the highlighted member on screen); `a` searches for someone to add (see user
+selection (the pane scrolls to keep the highlighted member on screen, and moving to the last member scrolls to the
+end of the pane so the relay hints below the list come into view); `a` searches for someone to add (see user
 search below) for when you do not have their pubkey to hand; `A` adds a member by npub/hex (text popup →
 `groups add-members`); `x` removes the selected member
 (confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
