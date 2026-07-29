@@ -3740,6 +3740,31 @@ impl AccountManager {
             }
         };
 
+        if creates_new_private_key && account.local_signing {
+            self.shared.lifecycle().ensure_running()?;
+            if let Err(err) = self
+                .app
+                .publish_account_follow_list(
+                    &account.label,
+                    &[],
+                    AccountRelayListBootstrap::new(
+                        request.default_relays.clone(),
+                        request.bootstrap_relays.clone(),
+                    ),
+                )
+                .await
+            {
+                if rollback_on_setup_failure {
+                    return self.rollback_import_after_setup_failure(
+                        &account,
+                        private_key_import.as_ref(),
+                        err,
+                    );
+                }
+                return Err(err);
+            }
+        }
+
         let profile = if creates_new_private_key && account.local_signing {
             self.shared.lifecycle().ensure_running()?;
             match self
