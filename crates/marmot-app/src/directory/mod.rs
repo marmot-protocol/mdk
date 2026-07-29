@@ -1,5 +1,6 @@
 mod cache;
 mod methods;
+mod open_ranking;
 pub(crate) mod records;
 mod search;
 mod sync;

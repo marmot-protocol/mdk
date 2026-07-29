@@ -2,9 +2,9 @@
 //!
 //! [`MarmotApp::search_users`] answers "who do I know called *foo*" by walking
 //! the searcher's own social graph outward and streaming matches as each layer
-//! resolves, so on-device hits appear immediately instead of after the slowest
-//! relay. Results are ranked by social distance (`radius`): radius 0 is the
-//! searcher, radius 1 their direct follows.
+//! resolves, while a bounded Open Ranking request supplies off-graph discovery.
+//! Graph results retain priority and social provenance; only remaining ranked
+//! pubkeys are hydrated from signed Nostr profile events.
 //!
 //! Traversal is bounded by construction, as `AGENTS.md` requires: the radius is
 //! capped, relay work per radius is batched author-scoped fetches under a
@@ -27,13 +27,14 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::cache::{DirectoryCache, DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
+use super::open_ranking::{RankedPubkey, search_vertex_pubkeys};
 use super::records::{
     UserDirectoryRecord, UserDirectorySearchResult, latest_follow_list_from_records,
-    profile_from_record, user_record_match,
+    latest_fresh_profiles_from_records, profile_from_record, user_record_match,
 };
 use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
-use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
+use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 use crate::runtime::{VERTEX_DIRECTORY_RELAY, blocking_app_task};
 use crate::{
     KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
@@ -75,17 +76,10 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Keep best-effort NIP-50 work against the shared Vertex directory relay
-/// bounded independently from graph traversal. Results stay in the current
-/// search only and never create subscriptions or directory records.
-const NIP50_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const NIP50_RESULT_LIMIT: usize = 20;
-const NIP50_MIN_QUERY_CHARS: usize = 3;
-
 /// Reported distance for matches that are not on the searcher's graph at all.
 ///
 /// Every consumer renders `radius` as provenance -- "via someone you follow".
-/// When a search falls back to a configured seed, or a search relay discovers
+/// When a search falls back to a configured seed, or a discovery provider finds
 /// someone outside the graph, that person is not a measurable distance from
 /// the searcher. Labelling them radius 1 would make that provenance a lie, so
 /// they are reported as off-graph. `u8::MAX` also sorts last, which is where an
@@ -193,7 +187,7 @@ pub enum SearchUpdateTrigger {
 }
 
 /// One incremental step of a running search.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UserSearchUpdate {
     pub trigger: SearchUpdateTrigger,
     /// Matches discovered by this step, pre-sorted within the batch. Ordering
@@ -257,8 +251,8 @@ async fn run_search(
         // merge its results afterwards. That gives a graph result precedence
         // when both sources return the same identity, without holding a
         // mutable emitter across concurrent tasks.
-        let nip50_updates_tx = emitter.updates_tx.clone();
-        let (graph_result, nip50_records) = tokio::join!(
+        let discovery_updates_tx = emitter.updates_tx.clone();
+        let (graph_result, ranked_pubkeys) = tokio::join!(
             traverse_graph(
                 &app,
                 &searcher_account_id_hex,
@@ -266,7 +260,7 @@ async fn run_search(
                 &params,
                 &mut emitter,
             ),
-            fetch_vertex_nip50_profiles(&app, &query, nip50_updates_tx),
+            fetch_open_ranking_pubkeys(&query, discovery_updates_tx),
         );
         if let Err(error) = graph_result {
             emitter
@@ -275,99 +269,97 @@ async fn run_search(
                 })
                 .await;
         }
-        if let Some(records) = nip50_records {
-            emitter.tally.resolved_from_nip50(records.len());
-            emitter
-                .emit_matches(OFF_GRAPH_SEARCH_RADIUS, records, &query)
-                .await;
+        let remaining = emitter.remaining_ranked_pubkeys(ranked_pubkeys, params.radius_start);
+        if !remaining.is_empty() && !emitter.is_cancelled() {
+            let hydration_updates_tx = emitter.updates_tx.clone();
+            let hydration = tokio::select! {
+                _ = hydration_updates_tx.closed() => None,
+                result = hydrate_open_ranking_profiles(&app, remaining) => Some(result),
+            };
+            match hydration {
+                None => {}
+                Some(Ok(records)) => {
+                    emitter.tally.resolved_from_open_ranking(records.len());
+                    emitter.emit_ranked_matches(records, &query).await;
+                }
+                Some(Err(_)) => {
+                    tracing::debug!(
+                        target: "marmot_app::directory",
+                        method = "search_users_open_ranking_hydrate",
+                        outcome = "fetch_failed",
+                        "Open Ranking profile hydration unavailable"
+                    );
+                }
+            }
         }
     }
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
     emitter.report_tally(&params);
 }
 
-/// Fetch profile candidates from Vertex's NIP-50 endpoint.
-///
-/// A relay search is only a discovery hint: signatures and kind are validated
-/// by the common directory fetcher, profiles are freshly checked here, and no
-/// event or relationship is persisted. The local matcher remains authoritative
-/// for whether the returned profile actually matches the user's query.
-async fn fetch_vertex_nip50_profiles(
-    app: &MarmotApp,
+/// Fetch ranked identities from Vertex without exposing failures to the graph
+/// traversal or logging the query.
+async fn fetch_open_ranking_pubkeys(
     query: &str,
     updates_tx: mpsc::Sender<UserSearchUpdate>,
-) -> Option<Vec<UserDirectoryRecord>> {
-    if query.chars().count() < NIP50_MIN_QUERY_CHARS {
-        return None;
-    }
-
-    let fetch = app.relay_plane.fetch_directory_events(
-        vec![TransportEndpoint(VERTEX_DIRECTORY_RELAY.to_owned())],
-        vec![DirectoryEventQuery::search(
-            KIND_NOSTR_METADATA,
-            query,
-            NIP50_RESULT_LIMIT,
-        )],
-    );
+) -> Vec<RankedPubkey> {
     let result = tokio::select! {
-        _ = updates_tx.closed() => return None,
-        result = timeout(NIP50_SEARCH_TIMEOUT, fetch) => result,
+        _ = updates_tx.closed() => return Vec::new(),
+        result = search_vertex_pubkeys(query) => result,
     };
-    let records = match result {
-        Ok(Ok(records)) => records,
-        Ok(Err(_)) => {
-            tracing::debug!(
-                target: "marmot_app::directory",
-                method = "search_users_nip50",
-                outcome = "fetch_failed",
-                "NIP-50 user discovery unavailable"
-            );
-            return None;
-        }
+    match result {
+        Ok(ranked_pubkeys) => ranked_pubkeys,
         Err(_) => {
             tracing::debug!(
                 target: "marmot_app::directory",
-                method = "search_users_nip50",
-                outcome = "timed_out",
-                "NIP-50 user discovery unavailable"
+                method = "search_users_open_ranking",
+                outcome = "fetch_failed",
+                "Open Ranking user discovery unavailable"
             );
-            return None;
-        }
-    };
-    Some(vertex_nip50_profile_records(app, records))
-}
-
-/// Convert fresh NIP-50 metadata events into transient directory records.
-fn vertex_nip50_profile_records(
-    app: &MarmotApp,
-    records: Vec<RelayEventRecord>,
-) -> Vec<UserDirectoryRecord> {
-    let freshness = app.directory_freshness();
-    let mut profiles = HashMap::new();
-    for record in records {
-        if !freshness.accepts(&record) {
-            continue;
-        }
-        let Some((account_id_hex, profile)) = profile_from_record(record) else {
-            continue;
-        };
-        if profiles
-            .get(&account_id_hex)
-            .is_none_or(|current: &crate::UserProfileMetadata| {
-                profile.created_at > current.created_at
-            })
-        {
-            profiles.insert(account_id_hex, profile);
+            Vec::new()
         }
     }
-    profiles
+}
+
+/// Hydrate ranked pubkeys in one bounded, author-scoped kind-0 query against
+/// Vertex's directory relay.
+///
+/// The ranked response itself is derived data. Profiles still come from signed
+/// Nostr events and pass through the relay-plane safety, signature, kind, and
+/// freshness checks. Nothing in this path is persisted.
+async fn hydrate_open_ranking_profiles(
+    app: &MarmotApp,
+    ranked_pubkeys: Vec<RankedPubkey>,
+) -> Result<Vec<RankedDirectoryRecord>, AppError> {
+    let account_ids = ranked_pubkeys
+        .iter()
+        .map(|ranked| ranked.account_id_hex.clone())
+        .collect::<Vec<_>>();
+    let records = app
+        .fetch_events_for_account_ids(
+            &account_ids,
+            KIND_NOSTR_METADATA,
+            &[TransportEndpoint(VERTEX_DIRECTORY_RELAY.to_owned())],
+        )
+        .await?;
+    let mut profiles = latest_fresh_profiles_from_records(records, app.directory_freshness()).value;
+    Ok(ranked_pubkeys
         .into_iter()
-        .map(|(account_id_hex, profile)| {
-            let mut record = app.empty_directory_record(&account_id_hex);
+        .filter_map(|ranked| {
+            let profile = profiles.remove(&ranked.account_id_hex)?;
+            let mut record = app.empty_directory_record(&ranked.account_id_hex);
             record.profile = Some(profile);
-            record
+            Some(RankedDirectoryRecord {
+                record,
+                rank: ranked.rank,
+            })
         })
-        .collect()
+        .collect())
+}
+
+struct RankedDirectoryRecord {
+    record: UserDirectoryRecord,
+    rank: f64,
 }
 
 /// Walk outward from the searcher, emitting each radius as it resolves.
@@ -403,6 +395,7 @@ async fn traverse_graph(
                 radius: depth.reported,
             })
             .await;
+        emitter.remember_graph_accounts(depth.reported, &frontier);
 
         // One timeout per radius, covering every relay round trip the radius
         // makes: resolving its profiles and reading the follow lists that
@@ -836,8 +829,8 @@ struct SearchTally {
     from_relays: usize,
     /// Reachable only through the author's advertised write relays.
     from_write_relays: usize,
-    /// Found by the bounded, ephemeral NIP-50 discovery request.
-    from_nip50: usize,
+    /// Hydrated from the bounded, ephemeral Open Ranking discovery request.
+    from_open_ranking: usize,
     /// No tier produced a profile. Still matchable by npub or pubkey.
     unresolved: usize,
 }
@@ -855,8 +848,8 @@ impl SearchTally {
         self.from_write_relays += count;
     }
 
-    fn resolved_from_nip50(&mut self, count: usize) {
-        self.from_nip50 += count;
+    fn resolved_from_open_ranking(&mut self, count: usize) {
+        self.from_open_ranking += count;
     }
 
     fn unresolved(&mut self, count: usize) {
@@ -988,6 +981,7 @@ struct SearchEmitter {
     updates_tx: mpsc::Sender<UserSearchUpdate>,
     total_result_count: usize,
     emitted_account_ids: HashSet<String>,
+    graph_radii: HashMap<String, u8>,
     tally: SearchTally,
 }
 
@@ -997,6 +991,7 @@ impl SearchEmitter {
             updates_tx,
             total_result_count: 0,
             emitted_account_ids: HashSet::new(),
+            graph_radii: HashMap::new(),
             tally: SearchTally::default(),
         }
     }
@@ -1005,6 +1000,29 @@ impl SearchEmitter {
     /// search is cancelled.
     fn is_cancelled(&self) -> bool {
         self.updates_tx.is_closed()
+    }
+
+    fn remember_graph_accounts(&mut self, radius: u8, account_ids: &[String]) {
+        for account_id in account_ids {
+            self.graph_radii.entry(account_id.clone()).or_insert(radius);
+        }
+    }
+
+    fn remaining_ranked_pubkeys(
+        &self,
+        ranked_pubkeys: Vec<RankedPubkey>,
+        radius_start: u8,
+    ) -> Vec<RankedPubkey> {
+        ranked_pubkeys
+            .into_iter()
+            .filter(|ranked| {
+                !self.emitted_account_ids.contains(&ranked.account_id_hex)
+                    && self
+                        .graph_radii
+                        .get(&ranked.account_id_hex)
+                        .is_none_or(|radius| *radius >= radius_start)
+            })
+            .collect()
     }
 
     /// Match a resolved layer against the query and emit whatever hit.
@@ -1019,6 +1037,7 @@ impl SearchEmitter {
                     radius,
                     matched_field: search_match.field,
                     match_quality: search_match.quality,
+                    provider_rank: None,
                     profile: record.profile,
                 })
             })
@@ -1033,6 +1052,43 @@ impl SearchEmitter {
         sort_user_search_results(&mut results);
         self.emit_results(SearchUpdateTrigger::ResultsFound { radius }, results)
             .await;
+    }
+
+    /// Emit hydrated Open Ranking matches, retaining graph provenance for any
+    /// ranked identity already encountered during traversal.
+    async fn emit_ranked_matches(&mut self, records: Vec<RankedDirectoryRecord>, query: &str) {
+        let mut by_radius = BTreeMap::<u8, Vec<UserDirectorySearchResult>>::new();
+        for ranked in records {
+            let Some(search_match) = user_record_match(&ranked.record, query) else {
+                continue;
+            };
+            let radius = self
+                .graph_radii
+                .get(&ranked.record.account_id_hex)
+                .copied()
+                .unwrap_or(OFF_GRAPH_SEARCH_RADIUS);
+            let provider_rank = (radius == OFF_GRAPH_SEARCH_RADIUS).then_some(ranked.rank);
+            let result = UserDirectorySearchResult {
+                account_id_hex: ranked.record.account_id_hex,
+                npub: ranked.record.npub,
+                radius,
+                matched_field: search_match.field,
+                match_quality: search_match.quality,
+                provider_rank,
+                profile: ranked.record.profile,
+            };
+            if self
+                .emitted_account_ids
+                .insert(result.account_id_hex.clone())
+            {
+                by_radius.entry(radius).or_default().push(result);
+            }
+        }
+        for (radius, mut results) in by_radius {
+            sort_user_search_results(&mut results);
+            self.emit_results(SearchUpdateTrigger::ResultsFound { radius }, results)
+                .await;
+        }
     }
 
     /// Report where this search's profiles came from, once, at the end.
@@ -1050,7 +1106,7 @@ impl SearchEmitter {
             from_cache = self.tally.from_cache,
             from_relays = self.tally.from_relays,
             from_write_relays = self.tally.from_write_relays,
-            from_nip50 = self.tally.from_nip50,
+            from_open_ranking = self.tally.from_open_ranking,
             unresolved = self.tally.unresolved,
             matches = self.total_result_count,
             "user search finished"
@@ -1082,8 +1138,8 @@ impl SearchEmitter {
     }
 }
 
-/// Rank results best-first: nearest radius, then match strength, then which
-/// field matched, then pubkey so equally good matches keep a stable order.
+/// Rank results best-first: nearest radius, then provider rank for discovery
+/// results, then local match strength, matched field, and pubkey for stability.
 ///
 /// Public because a streaming consumer has to re-rank for itself. Updates
 /// arrive pre-sorted *within* a batch, but a search emits several batches per
@@ -1093,6 +1149,12 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
     results.sort_by(|a, b| {
         a.radius
             .cmp(&b.radius)
+            .then_with(|| match (a.provider_rank, b.provider_rank) {
+                (Some(left), Some(right)) => right.total_cmp(&left),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
             .then_with(|| a.match_quality.cmp(&b.match_quality))
             .then_with(|| a.matched_field.cmp(&b.matched_field))
             .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
@@ -1493,7 +1555,7 @@ mod tests {
         tally.resolved_from_cache(3);
         tally.resolved_from_relays(2);
         tally.resolved_from_write_relays(1);
-        tally.resolved_from_nip50(5);
+        tally.resolved_from_open_ranking(5);
         tally.unresolved(4);
         // A second layer accumulates rather than replacing.
         tally.resolved_from_cache(1);
@@ -1501,7 +1563,7 @@ mod tests {
         assert_eq!(tally.from_cache, 4);
         assert_eq!(tally.from_relays, 2);
         assert_eq!(tally.from_write_relays, 1);
-        assert_eq!(tally.from_nip50, 5);
+        assert_eq!(tally.from_open_ranking, 5);
         assert_eq!(tally.unresolved, 4);
     }
 
@@ -1515,9 +1577,17 @@ mod tests {
         emitter
             .emit_matches(1, vec![record.clone()], "needle")
             .await;
-        emitter
-            .emit_matches(OFF_GRAPH_SEARCH_RADIUS, vec![record], "needle")
-            .await;
+        let remaining = emitter.remaining_ranked_pubkeys(
+            vec![RankedPubkey {
+                account_id_hex,
+                rank: 1.0,
+            }],
+            0,
+        );
+        assert!(
+            remaining.is_empty(),
+            "an emitted graph identity must be removed before hydration"
+        );
         drop(emitter);
 
         let update = updates_rx
@@ -1533,37 +1603,55 @@ mod tests {
     }
 
     #[test]
-    fn nip50_profiles_stay_out_of_the_persistent_directory() {
-        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
-        use transport_nostr_peeler::NostrTransportEvent;
+    fn discovery_does_not_reintroduce_a_graph_radius_below_the_requested_window() {
+        let (updates_tx, _updates_rx) = mpsc::channel(1);
+        let mut emitter = SearchEmitter::new(updates_tx);
+        let searcher = format!("{:064x}", 96);
+        emitter.remember_graph_accounts(0, std::slice::from_ref(&searcher));
 
+        let remaining = emitter.remaining_ranked_pubkeys(
+            vec![RankedPubkey {
+                account_id_hex: searcher,
+                rank: 1.0,
+            }],
+            1,
+        );
+
+        assert!(
+            remaining.is_empty(),
+            "discovery must preserve the requested graph radius window"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_ranking_profiles_keep_graph_provenance_and_stay_ephemeral() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
-        let author = Keys::generate();
-        let event = EventBuilder::new(Kind::Metadata, r#"{"name":"needle"}"#)
-            .sign_with_keys(&author)
-            .unwrap();
-        let records = vertex_nip50_profile_records(
-            &app,
-            vec![RelayEventRecord {
-                endpoints: Vec::new(),
-                event: NostrTransportEvent::from_nostr_event(&event).unwrap(),
-            }],
-        );
+        let account_id_hex = format!("{:064x}", 98);
+        let (updates_tx, mut updates_rx) = mpsc::channel(2);
+        let mut emitter = SearchEmitter::new(updates_tx);
+        emitter.remember_graph_accounts(1, std::slice::from_ref(&account_id_hex));
+        emitter
+            .emit_ranked_matches(
+                vec![RankedDirectoryRecord {
+                    record: record_named(&account_id_hex, "needle"),
+                    rank: 0.75,
+                }],
+                "needle",
+            )
+            .await;
 
-        assert_eq!(records.len(), 1);
+        let update = updates_rx.recv().await.expect("ranked result");
+        assert_eq!(update.new_results[0].radius, 1);
         assert_eq!(
-            records[0]
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.name.as_deref()),
-            Some("needle")
+            update.new_results[0].provider_rank, None,
+            "graph provenance wins over provider ranking metadata"
         );
         assert!(
             app.directory_entries().unwrap().is_empty(),
-            "a NIP-50 result must remain an ephemeral search candidate"
+            "an Open Ranking result must remain an ephemeral search candidate"
         );
     }
 
@@ -2074,6 +2162,7 @@ mod tests {
                 radius: 1,
                 matched_field: MatchedField::Name,
                 match_quality: MatchQuality::Contains,
+                provider_rank: None,
                 profile: None,
             },
             UserDirectorySearchResult {
@@ -2082,6 +2171,7 @@ mod tests {
                 radius: 1,
                 matched_field: MatchedField::About,
                 match_quality: MatchQuality::Exact,
+                provider_rank: None,
                 profile: None,
             },
             UserDirectorySearchResult {
@@ -2090,6 +2180,7 @@ mod tests {
                 radius: 1,
                 matched_field: MatchedField::Name,
                 match_quality: MatchQuality::Exact,
+                provider_rank: None,
                 profile: None,
             },
         ];
@@ -2103,5 +2194,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["npub-exact-name", "npub-exact-about", "npub-contains-name"]
         );
+    }
+
+    #[test]
+    fn discovery_results_preserve_provider_rank() {
+        let mut results = vec![
+            UserDirectorySearchResult {
+                account_id_hex: format!("{:064x}", 4),
+                npub: "npub-lower-provider-rank".into(),
+                radius: OFF_GRAPH_SEARCH_RADIUS,
+                matched_field: MatchedField::Name,
+                match_quality: MatchQuality::Exact,
+                provider_rank: Some(0.25),
+                profile: None,
+            },
+            UserDirectorySearchResult {
+                account_id_hex: format!("{:064x}", 5),
+                npub: "npub-higher-provider-rank".into(),
+                radius: OFF_GRAPH_SEARCH_RADIUS,
+                matched_field: MatchedField::About,
+                match_quality: MatchQuality::Contains,
+                provider_rank: Some(0.75),
+                profile: None,
+            },
+        ];
+
+        sort_user_search_results(&mut results);
+
+        assert_eq!(results[0].npub, "npub-higher-provider-rank");
     }
 }

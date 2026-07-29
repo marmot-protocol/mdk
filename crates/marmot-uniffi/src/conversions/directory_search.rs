@@ -59,7 +59,7 @@ impl From<MatchedField> for MatchedFieldFfi {
 /// direct follow. Render it as provenance ("via someone you follow").
 ///
 /// `255` is the exception and means *off-graph*: this person came from a
-/// configured fallback or a search relay rather than through anyone the user
+/// configured fallback or a discovery provider rather than through anyone the user
 /// knows. Present those as discovery, never as a connection -- they are not a
 /// distance from the user at all.
 #[derive(Clone, Debug, uniffi::Record)]
@@ -69,6 +69,8 @@ pub struct UserDirectorySearchResultFfi {
     pub radius: u8,
     pub matched_field: MatchedFieldFfi,
     pub match_quality: MatchQualityFfi,
+    /// Rank supplied by an off-graph discovery provider.
+    pub provider_rank: Option<f64>,
     pub profile: Option<UserProfileMetadataFfi>,
 }
 
@@ -80,6 +82,7 @@ impl From<UserDirectorySearchResult> for UserDirectorySearchResultFfi {
             radius: value.radius,
             matched_field: value.matched_field.into(),
             match_quality: value.match_quality.into(),
+            provider_rank: value.provider_rank,
             profile: value.profile.map(Into::into),
         }
     }
@@ -171,6 +174,7 @@ mod tests {
                 radius: 1,
                 matched_field: MatchedField::DisplayName,
                 match_quality: MatchQuality::Prefix,
+                provider_rank: Some(0.75),
                 profile: None,
             }],
             total_result_count: 1,
@@ -184,6 +188,7 @@ mod tests {
         ));
         assert_eq!(ffi.total_result_count, 1);
         assert_eq!(ffi.new_results.len(), 1);
+        assert_eq!(ffi.new_results[0].provider_rank, Some(0.75));
         assert!(matches!(
             ffi.new_results[0].matched_field,
             MatchedFieldFfi::DisplayName

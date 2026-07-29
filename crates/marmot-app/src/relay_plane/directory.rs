@@ -18,7 +18,6 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 pub(crate) struct DirectoryEventQuery {
     pub(crate) kind: u64,
     pub(crate) authors: Vec<String>,
-    pub(crate) search: Option<String>,
     pub(crate) limit: usize,
 }
 
@@ -127,20 +126,6 @@ impl DirectoryEventQuery {
         Self {
             kind,
             authors,
-            search: None,
-            limit,
-        }
-    }
-
-    /// Build a bounded NIP-50 query for events of one kind.
-    ///
-    /// Search relays select the authors, so unlike the directory's normal
-    /// author-scoped queries this deliberately carries no author constraint.
-    pub(crate) fn search(kind: u64, query: impl Into<String>, limit: usize) -> Self {
-        Self {
-            kind,
-            authors: Vec::new(),
-            search: Some(query.into()),
             limit,
         }
     }
@@ -162,13 +147,8 @@ impl DirectoryFetchRequest {
             return Err("directory fetch: no queries".to_owned());
         }
         for query in &queries {
-            if query.authors.is_empty()
-                && query
-                    .search
-                    .as_deref()
-                    .is_none_or(|search| search.trim().is_empty())
-            {
-                return Err("directory fetch: query needs authors or search".to_owned());
+            if query.authors.is_empty() {
+                return Err("directory fetch: no query authors".to_owned());
             }
             if query.limit == 0 {
                 return Err("directory fetch: query limit must be greater than zero".to_owned());
@@ -350,11 +330,10 @@ fn validated_directory_event(
 ) -> Option<NostrTransportEvent> {
     if event.verify().is_err()
         || u64::from(event.kind.as_u16()) != query.kind
-        || (!query.authors.is_empty()
-            && !query
-                .authors
-                .iter()
-                .any(|author| author == &event.pubkey.to_hex()))
+        || !query
+            .authors
+            .iter()
+            .any(|author| author == &event.pubkey.to_hex())
     {
         return None;
     }
@@ -393,18 +372,15 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             let kind = u16::try_from(query.kind)
                 .map(Kind::from)
                 .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
-            let mut filter = Filter::new().kind(kind).limit(query.limit);
-            if !query.authors.is_empty() {
-                let public_keys = query
-                    .authors
-                    .iter()
-                    .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                filter = filter.authors(public_keys);
-            }
-            if let Some(search) = &query.search {
-                filter = filter.search(search.clone());
-            }
+            let public_keys = query
+                .authors
+                .iter()
+                .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let filter = Filter::new()
+                .authors(public_keys)
+                .kind(kind)
+                .limit(query.limit);
             let events = self
                 .client
                 .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
@@ -450,42 +426,6 @@ mod tests {
         let tampered = Event::from_json(tampered.to_string()).unwrap();
         assert!(tampered.verify().is_err());
         assert!(validated_directory_event(&tampered, &query).is_none());
-    }
-
-    #[test]
-    fn nip50_queries_accept_signed_metadata_from_any_author() {
-        use nostr_sdk::prelude::{EventBuilder, Keys};
-
-        let query = DirectoryEventQuery::search(0, "agent", 10);
-        let author = Keys::generate();
-        let metadata = EventBuilder::new(Kind::Metadata, r#"{"name":"agent"}"#)
-            .sign_with_keys(&author)
-            .unwrap();
-        assert!(validated_directory_event(&metadata, &query).is_some());
-
-        let wrong_kind = EventBuilder::new(Kind::TextNote, "agent")
-            .sign_with_keys(&author)
-            .unwrap();
-        assert!(validated_directory_event(&wrong_kind, &query).is_none());
-    }
-
-    #[test]
-    fn directory_search_query_requires_nonblank_search_text() {
-        let endpoint = TransportEndpoint("wss://relay.example".to_owned());
-        assert!(
-            DirectoryFetchRequest::new(
-                vec![endpoint.clone()],
-                vec![DirectoryEventQuery::search(0, "agent", 10)],
-            )
-            .is_ok()
-        );
-
-        let error = DirectoryFetchRequest::new(
-            vec![endpoint],
-            vec![DirectoryEventQuery::search(0, "   ", 10)],
-        )
-        .unwrap_err();
-        assert_eq!(error, "directory fetch: query needs authors or search");
     }
 
     #[tokio::test]

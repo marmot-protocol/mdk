@@ -423,6 +423,7 @@ impl MarmotApp {
                 radius,
                 matched_field: search_match.field,
                 match_quality: search_match.quality,
+                provider_rank: None,
                 profile: record.profile.clone(),
             });
         }
