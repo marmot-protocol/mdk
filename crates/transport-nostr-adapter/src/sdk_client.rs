@@ -1216,6 +1216,7 @@ mod tests {
             false,
             Some("error: unknown")
         ));
+        assert!(!relay_endpoint_publish_accepted(false, None));
         assert!(relay_endpoint_publish_accepted(true, None));
     }
 
@@ -1761,7 +1762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_event_accepts_duplicate_relay_ack_for_same_signed_event() {
+    async fn publish_event_accepts_republishing_same_signed_replaceable_event() {
         let relay = MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let keys = Keys::generate();

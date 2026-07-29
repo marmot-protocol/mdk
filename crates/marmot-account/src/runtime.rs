@@ -289,11 +289,11 @@ where
             .into());
         }
         let now = self.wall_clock.now();
-        if !current_key_package_republishable(&lifecycle, now) {
+        if let Some(fallback_reason) = current_key_package_republish_blocker(&lifecycle, now) {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "republish_key_package",
-                fallback_reason = current_key_package_republish_fallback_reason(&lifecycle, now),
+                fallback_reason,
                 "no republishable current key package artifact; falling back to fresh publication"
             );
             return self.publish_fresh_key_package().await;
@@ -3109,52 +3109,36 @@ fn apply_report_to_fanout(
     }
 }
 
-fn current_key_package_republishable(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
-    lifecycle.current_key_package.is_some()
-        && lifecycle.current_key_package_ref.is_some()
-        && lifecycle
-            .current_not_before
-            .is_some_and(|not_before| not_before <= now)
-        && lifecycle
-            .current_not_after
-            .is_some_and(|not_after| not_after > now)
-        && lifecycle.authored_event_id.is_some()
-        && lifecycle.authored_event_created_at.is_some()
-        && lifecycle.authored_signed_event.is_some()
-        && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
-        && lifecycle.upgrade_rotation_recorded
-}
-
-fn current_key_package_republish_fallback_reason(
+fn current_key_package_republish_blocker(
     lifecycle: &KeyPackageLifecycleState,
     now: Timestamp,
-) -> &'static str {
+) -> Option<&'static str> {
     if lifecycle.current_key_package.is_none() {
-        "missing_current_key_package"
+        Some("missing_current_key_package")
     } else if lifecycle.current_key_package_ref.is_none() {
-        "missing_current_key_package_ref"
+        Some("missing_current_key_package_ref")
     } else if lifecycle
         .current_not_before
         .is_none_or(|not_before| not_before > now)
     {
-        "current_not_before_unreached"
+        Some("current_not_before_unreached")
     } else if lifecycle
         .current_not_after
         .is_none_or(|not_after| not_after <= now)
     {
-        "current_not_after_expired"
+        Some("current_not_after_expired")
     } else if lifecycle.authored_event_id.is_none() {
-        "missing_authored_event_id"
+        Some("missing_authored_event_id")
     } else if lifecycle.authored_event_created_at.is_none() {
-        "missing_authored_event_created_at"
+        Some("missing_authored_event_created_at")
     } else if lifecycle.authored_signed_event.is_none() {
-        "missing_authored_signed_event"
+        Some("missing_authored_signed_event")
     } else if lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref {
-        "current_key_package_ref_consumed"
+        Some("current_key_package_ref_consumed")
     } else if !lifecycle.upgrade_rotation_recorded {
-        "upgrade_rotation_required"
+        Some("upgrade_rotation_required")
     } else {
-        "republishable"
+        None
     }
 }
 
