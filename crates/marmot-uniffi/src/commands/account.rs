@@ -3,7 +3,7 @@
 use cgka_traits::TransportEndpoint;
 use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
 
-use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi};
+use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi, normalize_member_ref_ffi};
 use crate::errors::MarmotKitError;
 use crate::external_signer::{ExternalAccountSignerAdapter, ExternalAccountSignerFfi};
 use crate::{Marmot, conversions, endpoints};
@@ -326,6 +326,67 @@ impl Marmot {
         Ok(status.into())
     }
 
+    // -----------------------------------------------------------------------
+    // Follows
+    // -----------------------------------------------------------------------
+
+    /// Return the complete locally cached kind-3 follow list for `account_ref`
+    /// as canonical lowercase public-key hex strings.
+    ///
+    /// This is a synchronous, network-free read intended for profile screens
+    /// and bulk membership checks. Follow/unfollow and directory refreshes
+    /// update the cache before returning.
+    pub fn account_follows(&self, account_ref: String) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self.runtime.account_follows(&account_ref)?)
+    }
+
+    /// Return whether `account_ref` currently follows `user_ref`, using the
+    /// same local cache as [`Self::account_follows`]. `user_ref` accepts npub,
+    /// hex, `nostr:npub…`, and Marmot profile links.
+    pub fn is_following(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<bool, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .is_following(&account_ref, &user.account_id_hex)?)
+    }
+
+    /// Follow `user_ref` while preserving every other entry in the account's
+    /// current kind-3 contact list. Returns the complete updated list.
+    ///
+    /// This fetches the current replaceable event from the account's known
+    /// outbox/default relays before publishing. If no current event can be
+    /// established, it returns `FollowListUnavailable` rather than risking a
+    /// destructive replacement.
+    pub async fn follow_user(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .follow_user(&account_ref, &user.account_id_hex)
+            .await?)
+    }
+
+    /// Unfollow `user_ref` while preserving every other entry in the account's
+    /// current kind-3 contact list. Returns the complete updated list.
+    pub async fn unfollow_user(
+        &self,
+        account_ref: String,
+        user_ref: String,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let user = normalize_member_ref_ffi(&user_ref)?;
+        Ok(self
+            .runtime
+            .unfollow_user(&account_ref, &user.account_id_hex)
+            .await?)
+    }
+
     /// Export the active account's raw private key in canonical `nsec1...`
     /// bech32 form for an in-app key-backup display (mdk#543).
     ///
@@ -411,4 +472,100 @@ fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
         }
     }
     relays
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use marmot_account::AccountHome;
+    use marmot_app::{AccountRelayListBootstrap, MarmotApp, npub_for_account_id};
+    use nostr_relay_builder::MockRelay;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_bindings_preserve_the_list_and_refresh_fast_reads() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = AccountHome::open(root.path());
+        let alice = home.create_account("alice").expect("create alice");
+        let bob = home.create_account("bob").expect("create bob");
+        let carol = home.create_account("carol").expect("create carol");
+        let app = MarmotApp::with_relay(root.path(), relay_url.clone());
+        let endpoint = TransportEndpoint(relay_url);
+        let bootstrap =
+            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]);
+        app.publish_account_follow_list(&alice.label, &[bob.account_id_hex.as_str()], bootstrap)
+            .await
+            .expect("seed follow list");
+
+        // Kind-3 is replaceable at second granularity. Keep each update in a
+        // distinct timestamp so this test exercises deterministic relay state
+        // rather than the event-id tie-breaker.
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let bob_npub = npub_for_account_id(&bob.account_id_hex).expect("bob npub");
+        let carol_npub = npub_for_account_id(&carol.account_id_hex).expect("carol npub");
+
+        let followed = kit
+            .follow_user(alice.label.clone(), carol_npub)
+            .await
+            .expect("follow carol");
+        let mut expected_follows = vec![bob.account_id_hex.clone(), carol.account_id_hex.clone()];
+        expected_follows.sort();
+        assert_eq!(followed, expected_follows);
+        assert_eq!(
+            kit.account_follows(alice.label.clone())
+                .expect("cached follows"),
+            followed
+        );
+        assert!(
+            kit.is_following(alice.label.clone(), bob_npub.clone())
+                .expect("bob membership")
+        );
+        assert!(
+            kit.is_following(alice.label.clone(), carol.account_id_hex.clone())
+                .expect("carol membership")
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let remaining = kit
+            .unfollow_user(alice.label.clone(), bob_npub)
+            .await
+            .expect("unfollow bob");
+        assert_eq!(remaining, vec![carol.account_id_hex.clone()]);
+        assert_eq!(
+            kit.account_follows(alice.label.clone())
+                .expect("updated cached follows"),
+            remaining
+        );
+        assert!(
+            !kit.is_following(alice.label, bob.account_id_hex)
+                .expect("removed membership")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_binding_refuses_to_replace_an_unknown_list() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = AccountHome::open(root.path());
+        let alice = home.create_account("alice").expect("create alice");
+        let bob = home.create_account("bob").expect("create bob");
+        let app = MarmotApp::with_relay(root.path(), relay_url);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+
+        let error = kit
+            .follow_user(alice.label, bob.account_id_hex)
+            .await
+            .expect_err("missing current kind-3 must not be treated as empty");
+        assert!(matches!(error, MarmotKitError::FollowListUnavailable));
+    }
 }
