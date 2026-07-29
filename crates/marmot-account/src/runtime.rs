@@ -3122,9 +3122,6 @@ fn current_key_package_republishable(lifecycle: &KeyPackageLifecycleState, now: 
         && lifecycle.authored_event_created_at.is_some()
         && lifecycle.authored_signed_event.is_some()
         && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
-        && lifecycle
-            .refresh_at
-            .is_some_and(|refresh_at| refresh_at > now)
         && lifecycle.upgrade_rotation_recorded
 }
 
@@ -3154,11 +3151,6 @@ fn current_key_package_republish_fallback_reason(
         "missing_authored_signed_event"
     } else if lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref {
         "current_key_package_ref_consumed"
-    } else if lifecycle
-        .refresh_at
-        .is_none_or(|refresh_at| refresh_at <= now)
-    {
-        "refresh_due"
     } else if !lifecycle.upgrade_rotation_recorded {
         "upgrade_rotation_required"
     } else {

@@ -1449,7 +1449,7 @@ async fn republish_key_package_falls_back_when_no_current_artifact_exists() {
 }
 
 #[tokio::test]
-async fn republish_key_package_falls_back_when_refresh_is_due() {
+async fn republish_key_package_reuses_current_artifact_when_refresh_is_due() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot kp refresh due republish key").unwrap();
     let publisher = RecordingKeyPackages::default();
@@ -1468,27 +1468,35 @@ async fn republish_key_package_falls_back_when_refresh_is_due() {
     );
 
     let first = runtime.publish_fresh_key_package().await.unwrap();
-    let refresh_at = runtime
-        .key_package_maintenance_status()
-        .unwrap()
-        .unwrap()
-        .refresh_at
-        .unwrap();
+    let before = runtime.key_package_maintenance_status().unwrap().unwrap();
+    let durable_before = runtime.durably_owned_key_packages().unwrap();
+    let refresh_at = before.refresh_at.unwrap();
     wall.set(refresh_at.0);
 
     let second = runtime.republish_key_package().await.unwrap();
     let publications = publisher.publications();
     assert_eq!(publications.len(), 2);
-    assert_ne!(first, second);
-    assert_ne!(
-        publications[0].created_at, publications[1].created_at,
-        "refresh-due fallback must rotate via a new authored event"
-    );
-    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
-    assert_eq!(lifecycle.retained_private_material.len(), 1);
+    assert_eq!(first, second);
+    assert_eq!(publications[0], publications[1]);
+    let after = runtime.key_package_maintenance_status().unwrap().unwrap();
     assert_eq!(
-        lifecycle.retained_private_material[0].key_package,
-        publications[0].key_package
+        after.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_eq!(after.authored_event_id, before.authored_event_id);
+    assert_eq!(
+        after.authored_event_created_at,
+        before.authored_event_created_at
+    );
+    assert_eq!(after.authored_signed_event, before.authored_signed_event);
+    assert_eq!(
+        after.retained_private_material,
+        before.retained_private_material
+    );
+    assert_eq!(
+        runtime.durably_owned_key_packages().unwrap(),
+        durable_before,
+        "refresh-due republish must not mint or prune durable private bundles"
     );
 }
 
