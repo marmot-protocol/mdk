@@ -1639,7 +1639,10 @@ pub(crate) fn message_search_lines(
         body.push(Line::from(Span::styled(text, Style::default().fg(color))));
         return body;
     }
-    body.push(Line::from(format!("Matches ({})", view.results.len())));
+    body.push(Line::from(format!(
+        "Matches ({})",
+        view.match_count_label()
+    )));
     let results_focused = view.focus == MessageSearchFocus::Results;
     for (index, hit) in view.results.iter().enumerate() {
         let is_selected = results_focused && index == view.selected;

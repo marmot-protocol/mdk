@@ -1737,13 +1737,14 @@ impl TuiApp {
         match self.message_search.as_ref().map(|view| view.focus) {
             Some(MessageSearchFocus::Query) => self.handle_message_search_query_key(key),
             Some(MessageSearchFocus::Results) => self.handle_message_search_results_key(key),
-            None => Ok(()),
+            None => {}
         }
+        Ok(())
     }
 
     /// Query-focus keys: typing edits the query (so `j`/`k` are literal text),
     /// `Enter` runs the search, and `Down` steps into the hits.
-    fn handle_message_search_query_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+    fn handle_message_search_query_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
                 if let Err(err) = self.run_message_search() {
@@ -1770,7 +1771,6 @@ impl TuiApp {
             }
             _ => {}
         }
-        Ok(())
     }
 
     fn with_message_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
@@ -1782,7 +1782,7 @@ impl TuiApp {
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
     /// query), `Enter` jumps the messages pane to the highlighted hit, and `i`/`/`
     /// return to the query.
-    fn handle_message_search_results_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+    fn handle_message_search_results_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(view) = self.message_search.as_mut() {
@@ -1807,7 +1807,6 @@ impl TuiApp {
             KeyCode::Char('?') => self.popup = Some(Popup::help()),
             _ => {}
         }
-        Ok(())
     }
 
     /// Jump the messages pane to the highlighted hit and return to it.

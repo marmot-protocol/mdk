@@ -1375,6 +1375,7 @@ impl TuiApp {
             results: Vec::new(),
             selected: 0,
             focus: MessageSearchFocus::Query,
+            truncated: false,
         };
         if let Some(query) = query
             .map(|query| query.trim().to_owned())
@@ -1441,12 +1442,20 @@ impl TuiApp {
         let mut hits = parse_timeline_page(&page);
         hits.reverse();
         let count = hits.len();
+        view.truncated = count >= TUI_MESSAGE_SEARCH_LIMIT;
         view.results = hits;
         view.selected = 0;
         if count > 0 {
             view.focus = MessageSearchFocus::Results;
         }
-        self.status = format!("{count} match(es)");
+        // A filled page points at refining the query, which is the only thing that
+        // helps: this screen is a scan-and-pick list and does not page.
+        let refine = if view.truncated {
+            " — refine the query"
+        } else {
+            ""
+        };
+        self.status = format!("{} match(es){refine}", view.match_count_label());
     }
 
     /// Run the one-shot `users search <query>` off the event loop; the results

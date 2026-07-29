@@ -10111,6 +10111,75 @@ fn message_search_navigates_hits_and_returns_to_the_query() {
 }
 
 #[test]
+fn a_message_search_that_fills_its_limit_reports_the_count_as_partial() {
+    // A full page means hits were almost certainly dropped, and the screen is a
+    // scan-and-pick list with no paging. Reporting the cap as an exact count would
+    // read as "these are all of them" and hide the need to refine the query.
+    let hits = (0..TUI_MESSAGE_SEARCH_LIMIT)
+        .map(|index| {
+            timeline_hit_json(
+                &format!("m{index}"),
+                "bob",
+                "deploy",
+                1_700_000_000 + index as u64,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{hits}]}}}}"#
+    ));
+    let mut app = app_with_open_chat(client, &[("m0", "deploy")]);
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+
+    let view = app.message_search.as_ref().expect("view");
+    assert_eq!(view.results.len(), TUI_MESSAGE_SEARCH_LIMIT);
+    assert_eq!(
+        view.match_count_label(),
+        format!("{TUI_MESSAGE_SEARCH_LIMIT}+"),
+        "a filled page is labelled as a lower bound, not an exact count"
+    );
+    assert!(
+        app.status.contains(&format!("{TUI_MESSAGE_SEARCH_LIMIT}+")),
+        "the status says the count is partial; got: {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("refine"),
+        "the status points at the action that fixes it; got: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn a_short_message_search_page_reports_an_exact_count() {
+    let (_dir, client) = test_json_client(&format!(
+        r#"{{"ok":true,"result":{{"messages":[{}]}}}}"#,
+        timeline_hit_json("m1", "bob", "deploy one", 1_700_000_000)
+    ));
+    let mut app = app_with_open_chat(client, &[("m1", "deploy one")]);
+    app.open_message_search(Some("deploy".to_owned()))
+        .expect("open search");
+    app.settle_effects(1);
+
+    assert_eq!(
+        app.message_search
+            .as_ref()
+            .expect("view")
+            .match_count_label(),
+        "1",
+        "an unfilled page is an exact count"
+    );
+    assert!(
+        !app.status.contains('+'),
+        "no partial marker on an exact count; got: {:?}",
+        app.status
+    );
+}
+
+#[test]
 fn a_stale_message_search_result_for_a_superseded_query_is_dropped() {
     let (_dir, client) = test_json_client(&format!(
         r#"{{"ok":true,"result":{{"messages":[{}]}}}}"#,

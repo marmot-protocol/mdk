@@ -696,7 +696,8 @@ main view. After the add lands, the group detail reopens and reloads, so the new
 from.
 
 Message search (`/search [query]`) searches the chat loaded in the messages pane
-(`messages timeline search --group <group>`, capped at 100 hits). It follows the loaded pane rather than the
+(`messages timeline search --group <group>`, capped at 100 hits — a full page reports its count as `100+` and
+says to refine the query, since the screen is a scan-and-pick list with no paging). It follows the loaded pane rather than the
 highlighted chat row, because the two can differ while a flick-through preview is pending and a hit is only useful
 if it can be jumped to. The screen has the same two regions and two-state focus as user search: type the query
 (`j`/`k` are literal text) and `Enter` runs it; once there are matches, focus moves to the list where `j`/`k` (or
