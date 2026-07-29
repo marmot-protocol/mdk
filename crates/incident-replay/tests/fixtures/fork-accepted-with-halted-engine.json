@@ -1,0 +1,51 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "_comment": "Synthetic. A cleanly reproducible membership fork alongside an engine that recorded an unrecoverable halt. All engines sit at epoch 31, so the epoch-divergence gate stays unarmed and the halt is the only co-occurring finding.",
+  "events": [
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000000000,
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 30,
+        "invalidated_msg_id": "inv-1",
+        "winner": "candidate"
+      }
+    },
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000060000,
+      "account_ref": "alpha",
+      "kind": {
+        "type": "group_state_changed",
+        "epoch": 31,
+        "change_kind": "admin_added",
+        "actor_member_ref": "member-alpha"
+      }
+    },
+    {
+      "engine_id": "engine-b",
+      "wall_time_ms": 1000000120000,
+      "account_ref": "beta",
+      "kind": {
+        "type": "group_state_changed",
+        "epoch": 31,
+        "change_kind": "member_added",
+        "actor_member_ref": "member-beta"
+      }
+    },
+    {
+      "engine_id": "engine-b",
+      "wall_time_ms": 1000000180000,
+      "kind": {
+        "type": "epoch_state_changed",
+        "epoch": 31,
+        "new_state": "unrecoverable",
+        "reason": "hydrate_unrecoverable_group"
+      }
+    }
+  ],
+  "derived_projections": {
+    "pagination": {}
+  }
+}

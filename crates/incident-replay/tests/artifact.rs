@@ -1,8 +1,8 @@
 use incident_replay::{
     EvidenceConfidenceV1, ForkCommitKind, IncidentArtifactSensitivityV1, IncidentReplayFidelityV1,
     IncidentReproductionStatusV1, IncidentSourceFormatV1, NormalizedActionEvidenceV1,
-    NormalizedHistoryImportError, NormalizedScenarioHistoryV1, RecoveredFork,
-    accept_attested_history, archetype_artifact, import_attested_history, parse, synthesize,
+    NormalizedHistoryImportError, NormalizedScenarioHistoryV1, Outcome, RecoveredFork,
+    accept_attested_history, archetype_artifact, import_attested_history, parse, route, synthesize,
 };
 use std::collections::BTreeSet;
 
@@ -205,6 +205,54 @@ fn legacy_export_is_an_explicitly_inexact_archetype() {
             .unavailable_fields
             .iter()
             .any(|field| { field.field == "exact_scenario_action_history" })
+    );
+}
+
+#[test]
+fn the_attested_history_decides_the_incident_route() {
+    // The export classifies as a fork recovery, so the archetype route could
+    // synthesize a vector for it — but the producer attested its own history, and
+    // nothing derived can improve on the export's own account of the incident.
+    // `route` therefore reads the attested history before recovering anything.
+    let routing = route(
+        &export_with_history(),
+        IncidentSourceFormatV1::AgentStateDocument,
+    );
+
+    let Outcome::Accepted(artifact) = &routing.outcome else {
+        panic!("expected the attested history to be accepted, got {routing:?}");
+    };
+    assert_eq!(
+        artifact.replay_fidelity,
+        IncidentReplayFidelityV1::ProducerAttestedNormalizedHistory
+    );
+    assert_eq!(
+        artifact.reproduction_status,
+        IncidentReproductionStatusV1::Reproduced
+    );
+}
+
+#[test]
+fn a_rejected_attested_history_does_not_fall_back_to_an_archetype() {
+    // Fall-through rescues a *different*, lower-precedence incident; it does not
+    // re-tell the same incident at a lower fidelity. Silently downgrading a
+    // rejected attestation to an archetype would publish derived evidence under
+    // the producer's failed claim.
+    let mut export = export_with_history();
+    export
+        .normalized_scenario_history
+        .as_mut()
+        .expect("history present")
+        .complete = false;
+
+    let routing = route(&export, IncidentSourceFormatV1::AgentStateDocument);
+
+    let Outcome::Quarantine { reason } = &routing.outcome else {
+        panic!("expected the incomplete history to fail closed, got {routing:?}");
+    };
+    assert!(
+        reason.contains("incomplete"),
+        "quarantine must name the rejected attestation, got {reason:?}"
     );
 }
 

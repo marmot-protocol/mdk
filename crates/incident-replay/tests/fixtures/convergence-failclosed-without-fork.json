@@ -1,0 +1,41 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "_comment": "Synthetic. A contested convergence that fails closed with no fork anywhere in the export: there is no lower route to fall through to, so the quarantine stands alone with no advisory.",
+  "events": [
+    {
+      "kind": {
+        "type": "convergence_decision",
+        "current_tip_epoch": 30,
+        "candidates": [
+          {
+            "branch_id": "path:branch-kept",
+            "score": {
+              "witness_quorum_met": true,
+              "valid_commit_depth": 3
+            }
+          },
+          {
+            "branch_id": "path:branch-dropped",
+            "score": {
+              "witness_quorum_met": false,
+              "valid_commit_depth": 1
+            }
+          }
+        ],
+        "rule_trace": [
+          {
+            "rule_name": "effective_commit_depth",
+            "decisive": true
+          }
+        ],
+        "selected_branch_id": "path:branch-kept",
+        "losing_branch_ids": [
+          "path:branch-dropped"
+        ]
+      }
+    }
+  ],
+  "derived_projections": {
+    "pagination": {}
+  }
+}

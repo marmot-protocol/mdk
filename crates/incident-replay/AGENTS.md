@@ -88,17 +88,43 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     reproduction. It does not independently prove action-to-event correspondence and marks unredacted imported
     Scenario IR confidential. Raw MLS bytes and the engine checkpoint remain unavailable; byte replay requires the
     separate local sensitive capsule path.
+- **Module:** `src/route.rs`
+  - **Role:** `route` composes classify → import/recover → accept into one
+    `Routing`: the primary `Outcome` (`Healthy | Accepted | Quarantine |
+    InfrastructureFailure`) plus an `Advisory` per co-occurring finding. An
+    incident verdict reads the producer's attested normalized history first
+    (`src/artifact.rs`) and only synthesizes an archetype when the export carries
+    none — the gate reads the export rather than the verdict, so it runs once,
+    ahead of route dispatch, and both incident routes ask it the same question.
+    An attested history that is rejected is fail-closed like any other route,
+    *except* when the simulator could not be run at all: that decided nothing, so
+    it is an `InfrastructureFailure` (the CLI's only non-classification exit-2)
+    rather than a quarantine nobody reached. `route` also owns the
+    **fall-through**: when the route the verdict selected fails its recovery
+    closed, the remaining lower-precedence routes are tried rather than
+    discarding a reproducible incident that shares the export (the real 26a9f546 export fail-closed on convergence
+    `WitnessBoostNotDecisive` while carrying a cleanly acceptable membership fork
+    at the same epoch). Classification precedence is untouched — fall-through runs
+    only *after* a failure — and one rule keeps it honest: a lower route may
+    override a higher route's quarantine only by producing an accepted vector. A
+    second quarantine never displaces the higher-precedence one; it becomes an
+    `advisory (fallback route):` instead. Vector names live here too: they are
+    pipeline facts, not CLI ones.
 - **Module:** `src/main.rs`
-  - **Role:** CLI — classify one export file; for a fork-recovery or convergence
-    incident, run the recover → accept → write pipeline. Exits 0 for any
+  - **Role:** CLI — read one export file, detect its format, print the `Routing`.
+    Reading and formatting only; route policy is `src/route.rs`. Exits 0 for any
     classification (healthy, quarantine, and accepted are all valid), 2 on
-    usage/IO/parse/write failure. Also prints a secondary `advisory (liveness):`
-    line whenever `liveness_advisory` fires and the primary verdict is not
-    already the epoch-divergence quarantine, so an accepted or quarantined
-    incident never masks a co-occurring engine left behind (the real e1a04e82
-    export carried both an accepted membership fork and a lag-12 stuck device). When an output directory is supplied,
-    writes both the portable vector and `incident-scenario-artifact.v1` evidence envelope owner-only; it never copies
-    the source export, transport ciphertext, or an MLS checkpoint.
+    usage/IO/parse/write failure and on an `InfrastructureFailure`. Output is one
+    primary line plus an `advisory (<label>):` line per finding that line does not
+    report: `superseded route` / `fallback route` (the fall-through above), `halt`
+    (rule 5), and `liveness` (rule 6) — the last two suppressed only when the
+    finding *is* the primary. So an accepted or quarantined incident never masks
+    a co-occurring halted or stranded engine (the real e1a04e82 export carried
+    both an accepted membership fork and a lag-12 stuck device). When an output
+    directory is supplied, writes both the portable vector and the
+    `incident-scenario-artifact.v1` evidence envelope owner-only, and refuses to
+    persist an unreproduced attested artifact; it never copies the source export,
+    transport ciphertext, or an MLS checkpoint.
 
 ## Classification rules (verified against real Goggles exports)
 
