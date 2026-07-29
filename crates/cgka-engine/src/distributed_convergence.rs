@@ -118,8 +118,9 @@ impl<S: StorageProvider> Engine<S> {
     /// remaining process-local cutoff delay.
     ///
     /// This is intentionally a command, not a diagnostic query: when eligible
-    /// retained input exists it may open a pass, consume a dormant fairness
-    /// slot, or persist restart deadline rebasing before returning the delay.
+    /// retained input exists it may open a pass, discard one left behind by an
+    /// advanced tip, consume a dormant fairness slot, or persist restart deadline
+    /// rebasing before returning the delay.
     pub fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,
@@ -127,13 +128,10 @@ impl<S: StorageProvider> Engine<S> {
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
-        let group = self
-            .storage
-            .get_group(group_id)
-            .map_err(storage_projection_error)?;
+        let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let now_ms = self.convergence_now_ms();
-        let pass = self.load_or_open_convergence_pass(group_id, group.epoch, &policy, now_ms)?;
+        let pass = self.load_or_open_convergence_pass(group_id, tip, &policy, now_ms)?;
         Ok(match pass {
             Some(pass) if pass.phase == ConvergencePassPhase::Collecting => {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now_ms))
@@ -352,11 +350,7 @@ impl<S: StorageProvider> Engine<S> {
                 .get_group(group_id)
                 .map_err(storage_projection_error)?
                 .epoch;
-            self.realize_group_unrecoverable_for_convergence_pass(
-                group_id,
-                epoch,
-                "frozen_member_integrity",
-            );
+            self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
         }
         Ok(())
     }
@@ -375,13 +369,9 @@ impl<S: StorageProvider> Engine<S> {
             // first stable scheduler run opens a pass and seeds retained work.
             return Ok(ConvergenceAdmissionOutcome::Retained);
         }
-        let group = self
-            .storage
-            .get_group(group_id)
-            .map_err(storage_projection_error)?;
+        let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
-        let Some(mut pass) =
-            self.load_or_open_convergence_pass(group_id, group.epoch, &policy, now_ms)?
+        let Some(mut pass) = self.load_or_open_convergence_pass(group_id, tip, &policy, now_ms)?
         else {
             return Ok(ConvergenceAdmissionOutcome::Retained);
         };
@@ -466,6 +456,51 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// The epoch a convergence pass is scheduled against.
+    ///
+    /// One authority for the tip: the epoch manager owns it, and the durable
+    /// group record is only the pre-hydration fallback. Reading the two stores at
+    /// different call sites let a pass be stamped against an epoch the rest of
+    /// convergence disagreed with.
+    fn convergence_tip_epoch(&self, group_id: &GroupId) -> Result<EpochId, OpenMlsProjectionError> {
+        match self.epoch_manager.epoch(group_id) {
+            Some(epoch) => Ok(epoch),
+            None => Ok(self
+                .storage
+                .get_group(group_id)
+                .map_err(storage_projection_error)?
+                .epoch),
+        }
+    }
+
+    /// Discard a pass whose base epoch the device has already left behind, so the
+    /// caller reopens one at the current tip.
+    ///
+    /// A pass is local scheduling state for a single base epoch; the tip
+    /// legitimately moves while one is open (a device catching up applies
+    /// commits). The stale batch is therefore benign, not evidence of corruption,
+    /// and it carries no canonical state of its own — its members are retained
+    /// stored messages that reseed into the next pass. Same rule as the discarded
+    /// local copy in `do_join_welcome`.
+    fn discard_stale_convergence_pass(
+        &self,
+        pass: &DurableConvergencePass,
+        tip: EpochId,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.storage
+            .delete_convergence_pass(&pass.group_id)
+            .map_err(storage_projection_error)?;
+        self.audit_group(
+            &pass.group_id,
+            marmot_forensics::AuditEventKind::ConvergencePassReopened {
+                stale_base_epoch: pass.base_epoch.0,
+                current_tip_epoch: tip.0,
+                generation: pass.generation,
+            },
+        );
+        Ok(())
+    }
+
     fn load_or_open_convergence_pass(
         &self,
         group_id: &GroupId,
@@ -502,7 +537,13 @@ impl<S: StorageProvider> Engine<S> {
                 .put_convergence_pass(&consumed)
                 .map_err(storage_projection_error)?;
         }
-        if let Some(mut pass) = previous.clone()
+        if let Some(stale) = previous.as_ref()
+            && stale.is_active()
+            && stale.base_epoch != base_epoch
+        {
+            // Reopen below, at the tip this call asks for.
+            self.discard_stale_convergence_pass(stale, base_epoch)?;
+        } else if let Some(mut pass) = previous.clone()
             && pass.is_active()
         {
             #[cfg(feature = "test-policy-overrides")]
@@ -766,19 +807,6 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), OpenMlsProjectionError> {
-        self.mark_group_unrecoverable_for_convergence_pass(
-            group_id,
-            epoch,
-            "frozen_member_integrity",
-        )
-    }
-
-    fn mark_group_unrecoverable_for_convergence_pass(
-        &mut self,
-        group_id: &GroupId,
-        epoch: EpochId,
-        error_kind: &'static str,
-    ) -> Result<(), OpenMlsProjectionError> {
         let mut group = self
             .storage
             .get_group(group_id)
@@ -789,16 +817,14 @@ impl<S: StorageProvider> Engine<S> {
                 .put_group(&group)
                 .map_err(storage_projection_error)?;
         }
-        self.realize_group_unrecoverable_for_convergence_pass(group_id, epoch, error_kind);
+        self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
         Ok(())
     }
 
-    fn realize_group_unrecoverable_for_convergence_pass(
-        &mut self,
-        group_id: &GroupId,
-        epoch: EpochId,
-        error_kind: &'static str,
-    ) {
+    /// A frozen pass member that no longer matches the record it was admitted
+    /// from is a real integrity failure: the batch this group already committed
+    /// to resolving cannot be reconstructed, so the group halts.
+    fn realize_group_unrecoverable_for_frozen_pass(&mut self, group_id: &GroupId, epoch: EpochId) {
         self.epoch_manager.mark_unrecoverable(group_id);
         self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
             group_id: group_id.clone(),
@@ -809,15 +835,8 @@ impl<S: StorageProvider> Engine<S> {
                 phase: ConvergencePhase::Unrecoverable,
                 current_tip_epoch: Some(epoch.0),
                 retained_anchor_horizon: None,
-                reason: Some(
-                    if error_kind == "base_epoch_mismatch" {
-                        "convergence_pass_base_changed"
-                    } else {
-                        "frozen_pass_integrity_failure"
-                    }
-                    .to_string(),
-                ),
-                error_kind: Some(error_kind.to_string()),
+                reason: Some("frozen_pass_integrity_failure".to_string()),
+                error_kind: Some("frozen_member_integrity".to_string()),
             },
         );
     }
@@ -893,10 +912,7 @@ impl<S: StorageProvider> Engine<S> {
         // MLS state isn't loadable just skips those diffs.
         let previous_components = self.reorg_component_snapshot(group_id);
         let previous_name = previous_group.name.clone();
-        let previous_tip = self
-            .epoch_manager
-            .epoch(group_id)
-            .unwrap_or(previous_group.epoch);
+        let previous_tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let Some(mut pass) =
             self.load_or_open_convergence_pass(group_id, previous_tip, &policy, now_ms)?
@@ -932,14 +948,6 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(settled_empty_result(previous_tip.0));
         };
-        if pass.is_active() && pass.base_epoch != previous_tip {
-            self.mark_group_unrecoverable_for_convergence_pass(
-                group_id,
-                previous_tip,
-                "base_epoch_mismatch",
-            )?;
-            return Ok(unrecoverable_result(previous_tip.0));
-        }
         let mut just_frozen = false;
         if pass.phase == ConvergencePassPhase::Collecting {
             let cutoff = pass.cutoff_monotonic_ms();

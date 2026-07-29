@@ -5575,6 +5575,128 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
 }
 
 #[tokio::test]
+async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
+    // A device catching up advances its tip while a durable pass stays open at
+    // the epoch it was scheduled from. That is stale local scheduling state, not
+    // corruption: convergence must discard the pass, reopen at the tip, and keep
+    // converging. Halting here durably wedged a field device that was six epochs
+    // behind, and every later send failed against the halt.
+    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut david, _david_storage) = build_client(b"david");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut carol = EngineBuilder::new(carol_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(
+            JsonlRecorder::open(&audit_path, "carol-engine".to_string()).unwrap(),
+        ))
+        .build()
+        .unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-stale-pass-base".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _) = evolution(invite);
+    let commit = route(commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .unwrap();
+
+    let tip = carol.epoch(&group_id).unwrap();
+    let stale_base = EpochId(tip.0.checked_sub(1).expect("the tip is past epoch zero"));
+    let mut stale = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(stale.base_epoch, tip, "pass opens at the current tip");
+    // The durable pass outlives the tip it was scheduled from, so its base epoch
+    // falls behind as the device catches up.
+    stale.base_epoch = stale_base;
+    carol_storage.put_convergence_pass(&stale).unwrap();
+
+    let compensated = carol
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("a stale pass base is compensated, not fatal");
+    assert_ne!(
+        compensated.convergence_status,
+        ConvergenceStatus::Blocked,
+        "a stale pass base must not block the run"
+    );
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "a stale pass base must not durably wedge the group"
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupUnrecoverable { .. }))
+    );
+
+    let reopened = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("the discarded pass is replaced by one at the current tip");
+    assert_eq!(reopened.base_epoch, tip);
+    assert_eq!(reopened.generation, stale.generation + 1);
+
+    let settled = carol
+        .converge_stored_openmls_messages(&group_id, 3_000)
+        .expect("the reopened pass converges at the current tip");
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(tip.0 + 1));
+    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+
+    drop(carol);
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            AuditEventKind::ConvergencePassReopened {
+                stale_base_epoch,
+                current_tip_epoch,
+                ..
+            } if *stale_base_epoch == stale_base.0 && *current_tip_epoch == tip.0
+        )),
+        "the compensation is diagnosable from a forensic export"
+    );
+}
+
+#[tokio::test]
 async fn frozen_pass_member_tampering_fails_closed_to_unrecoverable() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");

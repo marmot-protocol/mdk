@@ -1663,6 +1663,30 @@
               "$ref": "#/$defs/u64"
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "stale_base_epoch",
+            "current_tip_epoch",
+            "generation"
+          ],
+          "properties": {
+            "type": {
+              "const": "convergence_pass_reopened"
+            },
+            "stale_base_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "current_tip_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "generation": {
+              "$ref": "#/$defs/u64"
+            }
+          }
         }
       ]
     }

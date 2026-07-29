@@ -1021,6 +1021,22 @@ pub enum AuditEventKind {
     /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
     /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
     EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
+    /// A durable convergence pass was scheduled against an epoch the device has
+    /// since left behind — it caught up while the pass stayed open — so the pass
+    /// was discarded and convergence reopened at the current tip. Non-terminal by
+    /// construction: it records the compensation that keeps a catching-up device
+    /// converging. `stale_base_epoch` is the epoch the discarded pass was
+    /// scheduled from and `generation` is its pass generation, so an export shows
+    /// how far behind the discarded scheduling state was.
+    ///
+    /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
+    /// epochs/counters only, so nothing here needs scrubbing in either
+    /// [`AuditDataMode`].
+    ConvergencePassReopened {
+        stale_base_epoch: u64,
+        current_tip_epoch: u64,
+        generation: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1072,6 +1088,7 @@ impl AuditEventKind {
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
             AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
+            AuditEventKind::ConvergencePassReopened { .. } => "convergence_pass_reopened",
         }
     }
 }
