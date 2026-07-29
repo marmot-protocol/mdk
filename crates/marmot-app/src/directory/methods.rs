@@ -379,14 +379,14 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        let tags = follows
+        let cached_follows =
+            normalize_account_ids(follows.iter().map(|follow| (*follow).to_owned()).collect())?;
+        let tags = cached_follows
             .iter()
-            .map(|follow| {
-                parse_account_id_hex(follow).map(|account_id| vec!["p".to_owned(), account_id])
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|account_id| vec!["p".to_owned(), account_id.clone()])
+            .collect();
         let event = NostrTransportEvent::new_unsigned(
-            account.account_id_hex,
+            account.account_id_hex.clone(),
             KIND_NOSTR_CONTACT_LIST,
             tags,
             String::new(),
@@ -394,6 +394,19 @@ impl MarmotApp {
         self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
             .publish_event(&endpoints, &event, 1)
             .await?;
+        // Publishing a local kind-3 list must make its own cached edge set
+        // immediately available to the bindings, without admitting every
+        // followed account as a watched directory entry.
+        self.remember_directory_follow_edges_for_search(
+            &account.account_id_hex,
+            &FetchedFollowList {
+                follows: cached_follows,
+                source_relays: endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+            },
+        )?;
         Ok(())
     }
 

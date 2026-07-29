@@ -106,6 +106,7 @@ pub struct MarmotAppRuntime {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     accounts: AccountManager,
+    follow_list_updates: Arc<Mutex<()>>,
     directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -820,6 +821,7 @@ impl MarmotAppRuntime {
             events,
             shared,
             accounts,
+            follow_list_updates: Arc::new(Mutex::new(())),
             directory_sync: Arc::new(Mutex::new(None)),
             initial_directory_sync: Arc::new(Mutex::new(None)),
         }
@@ -2585,6 +2587,118 @@ impl MarmotAppRuntime {
             .app
             .publish_account_follow_list(&account.label, &follow_refs, bootstrap)
             .await
+    }
+
+    /// Return the locally cached kind-3 follow list for a local account.
+    ///
+    /// This is intentionally network-free for profile/search-row rendering.
+    /// Successful directory refreshes and follow-list publishes update the
+    /// cache before returning.
+    pub fn account_follows(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let mut follows = self
+            .accounts
+            .app
+            .directory_entry_for_account_id(&account.account_id_hex)?
+            .map(|entry| entry.follows)
+            .unwrap_or_default();
+        follows.sort();
+        follows.dedup();
+        Ok(follows)
+    }
+
+    /// Fast, network-free membership check against [`Self::account_follows`].
+    pub fn is_following(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        Ok(self
+            .account_follows(account_ref)?
+            .binary_search_by(|follow| follow.as_str().cmp(user_account_id_hex))
+            .is_ok())
+    }
+
+    /// Add one account to the current kind-3 list without replacing unrelated
+    /// follows.
+    pub async fn follow_user(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+    ) -> Result<Vec<String>, AppError> {
+        self.set_following(account_ref, user_account_id_hex, true)
+            .await
+    }
+
+    /// Remove one account from the current kind-3 list without replacing
+    /// unrelated follows.
+    pub async fn unfollow_user(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+    ) -> Result<Vec<String>, AppError> {
+        self.set_following(account_ref, user_account_id_hex, false)
+            .await
+    }
+
+    async fn set_following(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+        following: bool,
+    ) -> Result<Vec<String>, AppError> {
+        // Kind-3 is a whole-list replaceable event. Serialize updates made
+        // through this runtime so two local UI actions cannot both fetch the
+        // same snapshot and then overwrite one another.
+        let _update_guard = self.follow_list_updates.lock().await;
+        let account = self.accounts.resolve(account_ref)?;
+        let status = self
+            .accounts
+            .app
+            .account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        let mut source_relays = status
+            .nip65
+            .relays
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        for endpoint in self.accounts.app.directory_source_relays(&[]) {
+            if !source_relays.contains(&endpoint) {
+                source_relays.push(endpoint);
+            }
+        }
+        let mut follows = self
+            .accounts
+            .app
+            .fetch_current_follow_list_for_account_id(&account.account_id_hex, source_relays)
+            .await?
+            .ok_or(AppError::FollowListUnavailable)?;
+
+        let changed = if following {
+            if follows.iter().any(|follow| follow == user_account_id_hex) {
+                false
+            } else {
+                follows.push(user_account_id_hex.to_owned());
+                true
+            }
+        } else {
+            let previous_len = follows.len();
+            follows.retain(|follow| follow != user_account_id_hex);
+            follows.len() != previous_len
+        };
+        follows.sort();
+        follows.dedup();
+
+        if changed {
+            let fallback = self.accounts.app.directory_source_relays(&[]);
+            self.publish_account_follow_list(
+                &account.label,
+                &follows,
+                AccountRelayListBootstrap::new(fallback.clone(), fallback),
+            )
+            .await?;
+        }
+        Ok(follows)
     }
 
     pub async fn refresh_user_directory_for_account_id(

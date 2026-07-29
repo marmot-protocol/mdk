@@ -32,6 +32,11 @@ pub enum MarmotKitError {
     MissingKeyPackage { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
+    /// No current kind-3 event was found on the account's known outbox/default
+    /// relays. Retrying after directory/relay recovery is safe; publishing from
+    /// an assumed empty list is not.
+    #[error("current account follow list is unavailable")]
+    FollowListUnavailable,
     #[error("transport closed")]
     TransportClosed,
     #[error("marmot runtime is shutting down")]
@@ -196,6 +201,7 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent { details },
             AppError::Publish(details) => Self::Publish { details },
+            AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeStopping => Self::RuntimeStopping,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
