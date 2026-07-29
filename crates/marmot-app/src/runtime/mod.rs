@@ -106,7 +106,7 @@ pub struct MarmotAppRuntime {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     accounts: AccountManager,
-    follow_list_updates: Arc<Mutex<()>>,
+    follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -821,7 +821,7 @@ impl MarmotAppRuntime {
             events,
             shared,
             accounts,
-            follow_list_updates: Arc::new(Mutex::new(())),
+            follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
             directory_sync: Arc::new(Mutex::new(None)),
             initial_directory_sync: Arc::new(Mutex::new(None)),
         }
@@ -2582,6 +2582,18 @@ impl MarmotAppRuntime {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        let update_lock = self.follow_list_update_lock(&account.account_id_hex).await;
+        let _update_guard = update_lock.lock().await;
+        self.publish_account_follow_list_unlocked(&account, follows, bootstrap)
+            .await
+    }
+
+    async fn publish_account_follow_list_unlocked(
+        &self,
+        account: &AccountSummary,
+        follows: &[String],
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<(), AppError> {
         let follow_refs = follows.iter().map(String::as_str).collect::<Vec<_>>();
         self.accounts
             .app
@@ -2647,11 +2659,12 @@ impl MarmotAppRuntime {
         user_account_id_hex: &str,
         following: bool,
     ) -> Result<Vec<String>, AppError> {
-        // Kind-3 is a whole-list replaceable event. Serialize updates made
-        // through this runtime so two local UI actions cannot both fetch the
-        // same snapshot and then overwrite one another.
-        let _update_guard = self.follow_list_updates.lock().await;
         let account = self.accounts.resolve(account_ref)?;
+        // Kind-3 is a whole-list replaceable event. Serialize updates for
+        // this account so two local actions cannot both fetch the same
+        // snapshot and then overwrite one another.
+        let update_lock = self.follow_list_update_lock(&account.account_id_hex).await;
+        let _update_guard = update_lock.lock().await;
         let status = self
             .accounts
             .app
@@ -2691,14 +2704,22 @@ impl MarmotAppRuntime {
 
         if changed {
             let fallback = self.accounts.app.directory_source_relays(&[]);
-            self.publish_account_follow_list(
-                &account.label,
+            self.publish_account_follow_list_unlocked(
+                &account,
                 &follows,
                 AccountRelayListBootstrap::new(fallback.clone(), fallback),
             )
             .await?;
         }
         Ok(follows)
+    }
+
+    async fn follow_list_update_lock(&self, account_id_hex: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.follow_list_updates.lock().await;
+        locks
+            .entry(account_id_hex.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn refresh_user_directory_for_account_id(

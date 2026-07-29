@@ -397,7 +397,7 @@ impl MarmotApp {
         // Publishing a local kind-3 list must make its own cached edge set
         // immediately available to the bindings, without admitting every
         // followed account as a watched directory entry.
-        self.remember_directory_follow_edges_for_search(
+        if let Err(error) = self.remember_directory_follow_edges_for_search(
             &account.account_id_hex,
             &FetchedFollowList {
                 follows: cached_follows,
@@ -406,7 +406,14 @@ impl MarmotApp {
                     .map(|endpoint| endpoint.0.clone())
                     .collect(),
             },
-        )?;
+        ) {
+            tracing::warn!(
+                target: "marmot_app::directory",
+                method = "publish_account_follow_list",
+                error_kind = error.privacy_safe_kind(),
+                "follow list published but local cache update failed"
+            );
+        }
         Ok(())
     }
 
