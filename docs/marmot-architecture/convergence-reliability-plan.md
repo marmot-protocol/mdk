@@ -31,8 +31,9 @@ The program is successful when the following statement is justified by specifica
 bounded models, and repeatable campaign evidence:
 
 > Under explicit delivery, input-closure, policy-version, participant, and resource assumptions, every nonfaulty client
-> either reaches exactly equivalent cryptographic and application state within a measured bound or reaches the same
-> explicit, deterministic, diagnosable, and replayable terminal outcome.
+> either reaches exactly equivalent cryptographic and application state within the scenario's declared observation
+> budget, with convergence latency characterized separately, or reaches the same explicit, deterministic, diagnosable,
+> replayable, and durably recoverable non-progress outcome.
 
 This statement deliberately does not promise prompt convergence under permanent message suppression, an unbounded
 stream of valid competing commits, or exhausted resources. Those cases require an explicit availability or fairness
@@ -102,13 +103,18 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 10. **Privacy-safe evidence.** Committed fixtures are synthetic. Reports and telemetry follow the repository
     observability rules and never emit identifiers, relay URLs, payloads, ciphertext, plaintext, or key material into
     production tracing.
+11. **Clocks are dependencies.** Engine campaigns inject advancing monotonic and wall clocks. Process adapters define
+    their own observable quiescence contract rather than pretending an in-process progress snapshot is universal.
+12. **Equivalence is layered.** Shared protocol state, scenario-input/application-output dispositions, and local
+    operational/resource diagnostics are compared separately. Local diagnostic differences cannot silently weaken
+    shared-state or output equality.
 
 ## Milestone Summary
 
 | Milestone | Outcome | Status | Exit gate |
 | --- | --- | --- | --- |
 | 0. Assurance foundation | Guarantees, assumptions, constants, and formal gate are explicit | complete | Every constant is classified; formal warnings fail CI; protocol decisions are named |
-| 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | not-started | Known semantic mutations fail and captured failures replay |
+| 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | in-progress | Known semantic mutations fail and captured failures replay |
 | 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | not-started | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | not-started | Headline workload families produce bounded, diagnosable results |
 | 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | not-started | Model and tests detect seeded policy/lifecycle defects |
@@ -127,17 +133,19 @@ The initial assurance matrix is below. “Required verification” names the min
 | ID | Claim | Required assumptions | Required verification | Status |
 | --- | --- | --- | --- | --- |
 | S1 | Same retained anchor, authenticated input closure, policy version, and engine version produce the same canonical branch and exact state | Finite relevant input set; every compared client possesses the same validated dependency closure | Independent reference comparison; schedule/restart metamorphic tests; bounded model | specified |
-| S2 | Application output after settlement is exactly the payload/state-change projection of the selected branch | MLS and Marmot payload authentication succeeds; invalidations reach projection | Exact logical ledger; losing-branch and superseded-state scenarios; Tamarin output lemmas | partially-covered |
+| S2 | Application output after settlement is exactly the payload/state-change projection of the selected branch | MLS and Marmot payload authentication succeeds; invalidations reach projection | Exact scenario-input/output ledger; losing-branch and superseded-state scenarios; Tamarin output lemmas | partially-covered |
 | S3 | Missing retained state, invalid policy, corrupt frozen input, and exhausted replay budget never apply a partial candidate result | Storage reports failures accurately; fail-closed errors are durable or retryable by contract | Engine tests, crash matrix, resource campaigns, seeded mutations | partially-covered |
 | S4 | Publish-before-apply and convergence lifecycle changes are torn-write-free | Storage transaction contract holds; external publication results are accurately reported | Storage/engine lifecycle tests; kill/restart at each durable transition | partially-covered |
-| S5 | Operational scheduler timing does not change the eventual canonical result after authenticated input closure | All pending passes are eventually revisited; required retained state remains available | Virtual-time metamorphic tests across scheduler margin, retry, and re-arm values | unverified |
-| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named terminal failure | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios | unverified |
+| S5 | For one retained authenticated input set and fixed horizon eligibility, changing delivery partitioning across convergence passes or scheduler timing does not change the eventual canonical result | All pending passes are eventually revisited; required retained state remains available; no compared run crosses a semantic retention/eligibility boundary | Controlled pass-partition and virtual-time metamorphic tests; separately classified horizon-assumption violations | unverified |
+| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named durable fail-closed/non-progress state with an explicit repair path | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios; repair-path tests | unverified |
 | L2 | Outbound work blocked by convergence is eventually released, regenerated, or terminated with an explicit outcome | L1 assumptions; publication path eventually returns a result | Scheduler/outbound ledger assertions; crash/restart scenarios | partially-covered |
 | L3 | Marmot does not guarantee that a privileged administrative transition becomes canonical while valid selection-relevant input, including ordinary self-updates, continues without bound | The bounded post-settlement preparation opportunity remains enforced; stronger progress requires eventual relevant-input closure | Adversarial model and sustained simulator family; bounded preparation-opportunity tests | specified |
 | S6 | Clients are exactly equivalent only when the canonical conformance projection, including its domain-separated exporter commitment, matches | Synthetic/local conformance execution; raw exporter secret never leaves the test process | M1.1 exact snapshot comparison; mismatched-member, component, disposition, output, and commitment sentinels | specified |
+| S7 | Shared protocol state, exact scenario-input/application-output dispositions, and local operational diagnostics remain distinct comparison layers | Every scenario input has a stable action id; adapters declare observable capabilities | M1.1 disposition ledger; M2 adapter schema; M5 projection comparison | partially-covered |
 | R1 | Crash/reopen from any durable convergence phase is equivalent to uninterrupted execution | Database and required WAL/sidecars remain intact; no storage corruption unless scenario declares it | File-backed crash matrix and process-kill replay | partially-covered |
 | R2 | Clients with unequal relay histories converge after the histories reconcile | Relevant events remain retained and are eventually fetched; same policy/version | Retained multi-relay scenarios with EOSE, backfill, and set equality | unverified |
-| D1 | Every failure is attributable to a stable action, policy, state transition, or resource bound and can be replayed | Failure artifact completes successfully; sensitive evidence remains local | Failure-capsule self-replay and schema tests | unverified |
+| R3 | A runtime can determine the completeness claim it is making for acquired relay history and can invoke a stronger reconciliation path when incremental cursors are insufficient | Relay EOSE and query completion are observable; at least one full-history/set-reconciliation mechanism is available | Since-floor/EOSE matrix; full-history backstop tests; retained-relay adapter | unverified |
+| D1 | Every observed failure is attributable to a stable action, policy, state transition, or resource bound and can be replayed; silent input absence requires the separate R3 completeness signal | Failure manifests in an observable layer; failure artifact completes successfully; sensitive evidence remains local | Failure-capsule self-replay and schema tests; R3 absence detection | unverified |
 
 #### Assurance verification ownership
 
@@ -147,17 +155,19 @@ test is evidence for only the behavior in its name; it does not establish the la
 | ID | Normative/architecture source | Current evidence | Missing evidence owner |
 | --- | --- | --- | --- |
 | S1 | Protocol `convergence.md` branch selection; local canonicalization contract “Determinism and convergence” | Tamarin `same_input_set_converges`; `prop_candidate_graph_selection_is_order_invariant`; `prop_stored_convergence_restart_equivalence` | M1.1 exact-state oracle; M4.1 independent reference model; M4.2 arbitrary schedule/lifecycle model |
-| S2 | Protocol `convergence.md` “Applying the selected branch”; local canonicalization output contract | Tamarin application-output/invalidation lemmas; `engine_emits_only_canonical_branch_app_messages_after_convergence`; `rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence` | M1.1 exact logical ledger and projection equivalence; M5.1 app projection adapter |
+| S2 | Protocol `convergence.md` “Applying the selected branch”; local canonicalization output contract | Tamarin application-output/invalidation lemmas; `engine_emits_only_canonical_branch_app_messages_after_convergence`; `rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence` | M1.1 exact scenario-input/output ledger; M5.1 app projection adapter |
 | S3 | Protocol retained-anchor error rules; local canonicalization errors and fail-closed replay contract | Tamarin missing/beyond-anchor lemmas; `frozen_pass_member_tampering_fails_closed_to_unrecoverable`; `missing_frozen_pass_member_fails_closed_to_unrecoverable`; replay-budget unit tests | M3.1 end-to-end resource exhaustion; M4.3 mutations |
 | S4 | Protocol publish lifecycle and bounded-pass persistence; local multi-step-state-change rules | `convergence_pass_round_trips_updates_and_cascades`; `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `reopen_after_crash_during_publish_recovers_stranded_pending_commit`; crash-recovery SQLite tests | M3.1 complete durable-transition kill matrix; M5.1 runtime crash matrix |
-| S5 | Protocol bounded collection window; relay telemetry claim that quiescence is not a correctness boundary | `prop_quiescence_gate_controls_settlement`; cutoff and scheduler unit tests | M3.2 cross-value metamorphic campaign; M4.2 scheduler model |
-| L1 | Protocol pass freeze and completion rules; group convergence status | Individual settle/fail-closed integration tests | M4.2 TLA+/TLC liveness specification; M2.3 retained-relay scenarios |
+| S5 | Protocol pass-partition invariance and bounded collection window; relay telemetry claim that quiescence is not a correctness boundary | `prop_quiescence_gate_controls_settlement`; cutoff and scheduler unit tests | M1.3 controlled partition metamorphic test; M3.2 cross-value campaign; M4.2 scheduler model |
+| L1 | Protocol pass freeze and completion rules; group convergence status | Individual settle/fail-closed integration tests | M4.2 TLA+/TLC liveness specification; M2.3 retained-relay scenarios; named repair tests for every durable non-progress state |
 | L2 | Protocol outbound gating; local queued-intent lifecycle | Tamarin queued-outbound lemmas; `engine_queues_app_send_until_convergence_is_settled`; `trait_advance_convergence_drains_queued_outbound_intent`; scheduler tests | M1.3 complete quiescence; M3.1 crash/failure workload |
 | L3 | Protocol same-epoch priority and depth rules; no sustained-progress guarantee currently stated | `convergence_privileged_remove_beats_grinding_ordinary_self_update`; `continuous_inbound_cannot_starve_admin_attempt` | M3.1 sustained self-update family; M4.2 fairness model; protocol decision PDR-2 below |
 | S6 | Protocol `foundation/conformance.md`, adopted by [marmot#410](https://github.com/marmot-protocol/marmot/pull/410) | Domain separation and 33-byte commitment prefix checked in the protocol PR | M1.1 public snapshot API and exact-equivalence sentinels |
+| S7 | Protocol conformance projection and input-disposition requirements | M1.1 exact canonical snapshot plus commit/proposal/application disposition ledger | M2.2 common adapter observation schema; M5.1 app projection layer |
 | R1 | Protocol durable pass wall/monotonic deadline rules; local storage/restart contract | `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `h5_kill_before_historical_apply_commit_preserves_live_inputs`; `h6_kill_after_retained_anchor_rewind_recovers_live_snapshot` | M3.1 every-phase crash matrix; M5.3 process kill/reopen |
 | R2 | Relay telemetry EOSE/backfill/reconciliation architecture; protocol requires equalized relevant history for equivalent selection | `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed`; `next_event_returns_when_a_live_delivery_arms_the_epoch_backfill` | M2.3 retained multi-relay model; M3.1 unequal-history family |
-| D1 | Local forensic audit/report contracts and privacy rules | Generated reports, oracle coverage, conservative minimizer, incident archetype synthesis | M1.4 failure capsule and self-replay; M3.3 exact incident import |
+| R3 | Relay sync/backfill architecture; incremental cursors do not establish full offline history | Existing since-floor regressions expose the blind spot; epoch-stall backfill is armed only after qualifying live evidence | M2.3 EOSE/completeness policy and full-history/set-reconciliation backstop; M5.1 production runtime adapter |
+| D1 | Local forensic audit/report contracts and privacy rules | Generated reports, oracle coverage, conservative minimizer, incident archetype synthesis | M1.4 failure capsule and self-replay; M3.3 exact incident import; R3 silent-absence detection |
 
 Milestone 0 work:
 
@@ -184,6 +194,9 @@ protocol guarantees:
 | PDR-3 | State the interoperable outcome when local resource policy drops, defers, or refuses otherwise valid input; distinguish fail-closed local availability from canonical branch selection | adopted-protocol-pr-410; MDK-aligned | M3.1 resource campaigns |
 | PDR-4 | Define the portable notion of exact cryptographic/application state equivalence without exposing secrets | adopted-protocol-pr-410 | M1.1 exporter commitment and cross-implementation vectors |
 | PDR-5 | Keep quiescence/pass cutoffs explicitly outside final-state correctness after input closure, or revise the guarantee if metamorphic tests find a counterexample | adopted-protocol-pr-410; evidence-required | S5 and P4/P5 verification |
+| PDR-6 | Distinguish deterministic processing of one frozen batch from invariance under different pass partitions of the same retained input; classify runs that cross anchor/app-retention eligibility as assumption violations, not scheduler counterexamples | test-method-required | M1.3 controlled metamorphic harness; M3.2 witness-expiry/deferred-commit/anchor-pruning matrix; M4.2 model |
+| PDR-7 | Define the supported repair outcome for a joiner/invite/device-add that lands only on a losing branch | protocol-decision-required | M3.1 workload; M4.2 lifecycle model; M5.1 user-visible repair projection |
+| PDR-8 | Define what relay-history completeness claim implementations make after EOSE, cursor rebuild, and long offline intervals, including the full-history or set-reconciliation backstop | architecture/protocol-decision-required | R2/R3; M2.3 retained relay; M5.1 runtime |
 
 This MDK branch records and tests the implementation implications. The implementation-neutral wording is adopted in
 `marmot-protocol/marmot` through [marmot#410](https://github.com/marmot-protocol/marmot/pull/410).
@@ -210,8 +223,8 @@ Categories:
 | P1 | `V1_MAX_REWIND_COMMITS` | 5 commits | semantic, security-retention | Bounds eligible fork depth and retained anchors | Too low rejects recoverable late history; too high increases reorg, storage, replay, and secret-retention exposure | yes, by policy version | Eligibility boundaries, delayed-history sweep, retention/security review |
 | P2 | `V1_APP_MESSAGE_PAST_EPOCH_LIMIT` | 5 epochs | semantic, security-retention | Bounds delayed app delivery and witness eligibility | Too low expires realistic offline traffic; too high retains old message secrets and increases work | yes, by policy version | Multi-commit offline flood, exact app ledger, six-advance boundary |
 | P3 | `DEFAULT_MAX_PAST_EPOCHS` | 5 epochs | security-retention | Configures OpenMLS decryptable history; must equal P2 | Drift causes messages to be policy-eligible but cryptographically undecryptable, or retains unusable secrets | must be identical to P2 | Pin/alignment tests and delayed decryption sweep |
-| P4 | `V1_SETTLEMENT_QUIESCENCE_MS` | 1,000 ms | semantic scheduling policy | Closes a live-input window after delivery jitter | Too low raises post-settle reorgs; too high stalls outbound work | intended no after input closure; may change intermediate passes | Virtual-time sweep, post-settle reorg metrics, retained-relay spread |
-| P5 | `V1_MAX_CONVERGENCE_PASS_MS` | 5,000 ms | semantic scheduling policy | Guarantees a collecting pass freezes under sustained relevant input | Too low fragments ordinary bursts; too high lets a flood hold the group collecting | intended no after all follow-up passes; may change pass membership | Sustained-flood test, cutoff restart matrix, eventual fixed-point comparison |
+| P4 | `V1_SETTLEMENT_QUIESCENCE_MS` | 1,000 ms | semantic, scheduler | Closes a live-input window after delivery jitter | Too low raises post-settle reorgs; too high stalls outbound work | intended no after input closure; may change intermediate passes | Virtual-time sweep, post-settle reorg metrics, retained-relay spread |
+| P5 | `V1_MAX_CONVERGENCE_PASS_MS` | 5,000 ms | semantic, scheduler | Guarantees a collecting pass freezes under sustained relevant input | Too low fragments ordinary bursts; too high lets a flood hold the group collecting | intended no after all follow-up passes; may change pass membership | Sustained-flood test, cutoff restart matrix, controlled pass-partition fixed-point comparison |
 | P6 | `V1_WITNESS_QUORUM_SENDERS_PER_EPOCH` | 2 senders | semantic | Defines per-epoch corroboration | Too low lets one identity dominate; too high makes evidence unavailable in small/offline groups | yes, by policy version | Group-size/device-topology sweep and Sybil/account dedupe model |
 | P7 | `V1_WITNESS_QUORUM_EPOCHS` | 1 epoch | semantic | Defines how many branch epochs require quorum | Too low gives brief activity more weight; too high suppresses witnesses on short branches | yes, by policy version | Branch-length and traffic-duration sweep |
 | P8 | `V1_MAX_WITNESS_OVERRIDE_DEPTH` | 1 commit | semantic | Caps witness-derived effective-depth boost | Too low makes witnesses irrelevant; too high lets traffic outrank much longer commit history | yes, by policy version | Bound proof, depth-difference matrix, adversarial witness flood |
@@ -226,7 +239,7 @@ Categories:
 | E4 | `MAX_DEFERRED_ROWS_PER_SWEEP` | 64 rows | resource, scheduler | Prevents old deferred history monopolizing a pass | Fair cursor progress eventually visits every row | intended no | Backlog fairness and restart tests |
 | E5 | `CANDIDATE_REPLAY_BUDGET_SLACK` | 4× | resource | Scales replay budget over linear commit/rewind estimate | `ReplayBudgetExceeded` fails closed without partial selection | intended no | Branch-explosion campaign and recovery policy test |
 | E6 | `CANDIDATE_REPLAY_BUDGET_FLOOR` | 32 probes | resource | Gives small passes minimum replay headroom | Same as E5 | intended no | Small/large boundary matrix |
-| E7 | self-remove auto-commit jitter | 10 ms + [0, 40) ms | scheduler | Reduces synchronized automatic self-remove commits | Jitter changes ordering only, not admissible final behavior after closure | intended no | Seeded schedule invariance and collision tests |
+| E7 | self-remove auto-commit jitter | 10 ms + [0, 40] ms (10–50 ms inclusive) | scheduler | Reduces synchronized automatic self-remove commits | Jitter changes ordering only, not admissible final behavior after closure | intended no | Seeded schedule invariance and collision tests |
 
 #### App scheduler and input-recovery bounds
 
@@ -251,7 +264,9 @@ because they can delay a process.
 The machine-readable
 [`convergence-constant-inventory.txt`](./convergence-constant-inventory.txt) maps every ledger ID to its current Rust
 declaration. `just convergence-ledger-gate` verifies those declarations, requires every P/E/A ID below, and scans the
-named source families for newly introduced constants that have not been reviewed into this ledger.
+named source families for newly introduced constants that have not been reviewed into this ledger. It currently checks
+declaration presence and coverage, not literal values; production-value drift remains guarded by policy pin tests, and a
+future inventory revision should encode machine-checked expected values where the Rust expression is stable enough.
 
 | IDs | Current source/test owner | Remaining verification owner |
 | --- | --- | --- |
@@ -331,7 +346,7 @@ row without terminal deduplication, while E3 returns typed `ResourceRefused`; ex
 remain eligible, and the app runtime immediately arms history backfill for resource refusal. The normative availability
 and liveness wording is adopted through
 [marmot#410](https://github.com/marmot-protocol/marmot/pull/410). With that dependency merged, Milestone 0 is complete;
-the exact state/message oracle is the first Milestone 1 slice.
+the exact state/scenario-input oracle is the first Milestone 1 slice.
 
 Milestone 0 verification:
 
@@ -352,22 +367,64 @@ git diff --check
 
 ## Milestone 1: Trustworthy Engine Black Box
 
-### 1.1 Exact state and logical-message oracle
+### 1.1 Exact state and scenario-input oracle
 
-- [ ] Add exact sorted member identities to portable observations.
-- [ ] Include epoch, selected branch, admin policy, application profile, required capabilities, and group state.
-- [ ] Record a logical message ledger: sent, accepted, delivered, deduplicated, expired, invalidated, and pending.
-- [ ] Add a test-only privacy-safe cryptographic state commitment based on MLS exporter state.
-- [ ] Prove bidirectional decryptability after apparent convergence.
-- [ ] Add `ClientsExactlyEquivalent`, `LogicalMessageLedger`, and `NoPendingWork` expectations.
-- [ ] Make strict oracle behavior the default for reliability campaigns.
+- [x] Add exact sorted member identities to strict observations, while also preserving nonblank leaves in MLS leaf-index
+  order.
+- [x] Include epoch, selected branch commitment, admin policy, application profile, required capabilities, exact
+  app-component state, and group lifecycle/convergence state.
+- [x] Record a generalized scenario-input disposition ledger for commits, proposals, and application messages, keyed by
+  stable scenario action id and distinguishing sent, accepted, delivered, deduplicated, expired, invalidated, rejected,
+  resource-refused, rolled-back, and pending outcomes.
+- [x] Add a test-only privacy-safe cryptographic state commitment based on MLS exporter state.
+- [x] Prove bidirectional decryptability after apparent convergence.
+- [x] Add strict expectations for `ClientsExactlyEquivalent`, `ScenarioInputLedger`, `NoPendingWork`, and
+  `ClientsBidirectionallyDecryptable`.
+- [x] Project terminal disband tombstones into exact canonical state without device-local authorship metadata.
+- [x] Make strict oracle behavior the default for reliability campaigns, with an explicit exploratory opt-out.
 
 Verification:
 
 - same member count but different member identities fails;
 - same public metadata but different exporter commitment fails;
-- duplicate delivery appears once in the logical ledger;
-- losing-branch payload/state output is absent or explicitly invalidated.
+- duplicate application delivery appears once in the scenario-input ledger;
+- commit, proposal, and application actions retain stable scenario ids and exact current dispositions;
+- losing-branch payload/state output is absent or explicitly invalidated;
+- queued, delayed, unread, unconfirmed-publish, and retained transport-deferred work fail `NoPendingWork`;
+- every directed application-message edge succeeds after settled convergence; a deliberately missed commit produces a
+  visible one-way decryptability failure while the reverse past-epoch edge succeeds;
+- terminal disband state survives restart and compares independently of device-local committer-leaf metadata;
+- generated reliability cases finish with a global drain, exact observation, and `NoPendingWork`; report runs fail on
+  weak-oracle coverage unless explicitly invoked with `--allow-weak-oracle`.
+
+The exact-state interface is feature-gated to the simulator. Legacy observations remain unchanged for existing vectors;
+strict scenarios opt in with `observe_client_exact` / `observe_exact`, `ClientsExactlyEquivalent`, and
+`ScenarioInputLedger`. The ledger names every commit, proposal, and application action independently of randomized
+transport/MLS ids, correlates aliases through the feature-gated durable conformance view, and uses the deterministic
+inner application event only for delivery correlation. It preserves the protocol distinction between authenticated
+acceptance and pre-admission `TransportDeferred`. `NoPendingWork` adds an instantaneous aggregate progress snapshot
+across engine, bus, and scenario-input ledger state; it deliberately does not replace Milestone 1.3's repeated
+virtual-time quiescence test. The active
+decryptability probe sends one exact logical event per client, correlates every directed delivery by logical event id,
+and retains the recipient ledger disposition for failed edges. Exact canonical state is a tagged live-or-disbanded
+projection; the terminal form is derived from the durable authenticated tombstone and excludes
+`local_was_committer_leaf`, which is device-local rather than a shared protocol fact.
+
+The strict campaign migration deliberately exposed three pre-existing reliability failures that the legacy observation
+point hid:
+
+1. a locally rolled-back but already transported group-data commit can later advance another member, splitting exact
+   state after the final mailbox drain;
+2. a member invited after an old application event can retain that pre-join object as transport/scenario-input pending
+   work;
+3. after self-remove convergence, selected remaining members can retain a created proposal row and valid-proposal
+   schedule signal.
+
+These remain red strict-campaign evidence, not relaxed oracle rules. The ordinary generated-family regression tests keep
+checking their original semantic observation windows and explicitly retain the leave pending-work sentinel; report
+campaigns run the complete strict expectations by default. Strict coverage also flags the mixed large storm because its
+application phase is cleared before any delivery-or-invalidation expectation accounts for it; that is an oracle coverage
+gap, distinct from the three engine-state failures.
 
 ### 1.2 Public subject boundary
 
@@ -376,20 +433,26 @@ Verification:
   observation.
 - [ ] Split normal black-box execution from explicitly named white-box storage/fault capabilities.
 - [ ] Reject scenarios that require unsupported subject capabilities before execution.
+- [ ] Refresh the local canonicalization contract against the adopted protocol before freezing the public observation
+  schema; keep normative behavior in the protocol repo and implementation/diagnostic detail here.
 
 ### 1.3 Full-system quiescence
 
 - [ ] Include deliverable input, inbox, delayed messages, pass phase, deferred replay, outbound publication, retry
   timers, and durable transitions in a progress snapshot.
+- [ ] Inject an advancing monotonic clock plus a controlled wall clock; do not infer time progress from repeated calls
+  at one synthetic timestamp.
 - [ ] Require two stable virtual-time observations with no state or ledger progress.
 - [ ] Report which subsystem prevents quiescence.
 - [ ] Bound quiescence waiting by scenario policy and emit a terminal timeout artifact.
+- [ ] Add controlled metamorphic runs that preserve retained input and horizon eligibility while varying delivery across
+  one frozen batch versus multiple convergence passes; report retention/anchor assumption violations separately.
 
 ### 1.4 Deterministic failure capsules
 
 - [ ] Define a versioned capsule schema.
 - [ ] Save original scenario, canonical IR, seeds, expanded schedule, policy/constant snapshot, adapter/binary versions,
-  captured wire bytes, virtual time, logical ledger, state commitments, and resource measurements.
+  captured wire bytes, virtual time, scenario-input/output ledger, state commitments, and resource measurements.
 - [ ] Replay a capsule without regenerating MLS bytes.
 - [ ] Keep real incident artifacts local and restrictive-by-construction.
 - [ ] Promote minimized synthetic failures into portable vectors when they define durable behavior.
@@ -401,15 +464,20 @@ Verification:
 - [ ] Hidden pending work prevents quiescence.
 - [ ] A captured byte-level failure replays with the same outcome.
 - [ ] Targeted semantic mutations are detected.
+- [ ] Every durable fail-closed/non-progress state names a tested repair or terminal user-visible outcome.
 
 ## Milestone 2: Scenario IR And Retained Relays
 
 ### 2.1 Scenario IR v2 and authoring DSL
 
-- [ ] Define adapter-neutral, versioned JSON IR and JSON Schema.
-- [ ] Add human YAML authoring that compiles to canonical JSON; execute only canonical JSON.
+- [ ] Land a minimal vertical slice first: versioned action/assertion IR, deterministic executor, stable action ids, and
+  one engine-adapter scenario that round-trips through JSON.
+- [ ] Define the complete adapter-neutral JSON IR and JSON Schema.
+- [ ] Specify deterministic expansion and rate semantics (`repeat`, `parallel`, `rate`, `burst`, barriers, and virtual
+  time) before adding authoring sugar.
+- [ ] Add human YAML authoring only after the canonical JSON IR/executor is stable; execute only canonical JSON.
 - [ ] Model accounts, devices, processes, roles, groups, relays, and policy/binary versions explicitly.
-- [ ] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time.
+- [ ] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time with a recorded expanded schedule.
 - [ ] Add create, invite, remove, leave, self-update, group/admin state update, and application send.
 - [ ] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
 - [ ] Replace queue indices with semantic action/message selectors.
@@ -427,8 +495,14 @@ Verification:
 
 - [ ] Maintain a durable event history per relay.
 - [ ] Model publish fanout, subscriptions, query filters, EOSE, reconnect, since floors, and full backfill.
+- [ ] Make query completion explicit: distinguish relay EOSE from proven relevant-history completeness and record the
+  completeness claim in every run.
 - [ ] Model relay-specific duplicate/order/visibility/omission behavior.
 - [ ] Model unequal client relay sets and later history reconciliation.
+- [ ] Add a set/full-history reconciliation backstop for the case where no qualifying live event arms the existing
+  epoch-stall recovery path; evaluate NIP-77-like set reconciliation without making it a prerequisite.
+- [ ] Make quiet-group diagnosis explicit: a lack of new traffic must not be mistaken for complete history or healthy
+  convergence, and reports must identify which reconciliation path was or was not attempted.
 - [ ] Keep the existing in-memory packet bus as a fast unit-test adapter, not offline-sync evidence.
 
 ### Milestone 2 Exit Gate
@@ -445,12 +519,17 @@ Verification:
 - [ ] Offline retained-history flood with application traffic spanning many membership/state commits.
 - [ ] Sustained application traffic interspersed with proposals and commits.
 - [ ] Sequential self-update adversary racing privileged administrative changes.
+- [ ] Losing-branch joiner/invite/device-add, including an explicit successful repair, re-invite, or named unrecoverable
+  user-visible outcome.
 - [ ] Unequal relay histories followed by reconciliation.
 - [ ] Crash/restart at every durable convergence transition.
 - [ ] Multi-group noisy-neighbor and per-group fairness.
 - [ ] Candidate graph/replay budget/resource exhaustion.
 - [ ] Multi-device account identity and witness deduplication.
-- [ ] Mixed binary and policy versions.
+- [ ] App-message witness value: compare selection with/without witnesses, include proposal expiry and multi-parent
+  commit cases, and decide whether the speculative mechanism earns its complexity.
+- [ ] Mixed binary and policy versions as controlled negative/compatibility tests. Do not require a production policy
+  stamp before Scenario IR v2 can carry explicit policy versions.
 - [ ] Clock movement, scheduler delay, and timestamp/cursor attacks.
 
 Each family varies schedule, storage mode, participant count, rates, restart placement, relay topology, and applicable
@@ -460,9 +539,11 @@ test-only constants while preserving a stable semantic oracle.
 
 - [ ] Record convergence latency and blocked-send duration.
 - [ ] Record pass count, reorg count/depth/lateness, and unresolved outcomes.
-- [ ] Record logical delivery/expiry/invalidation results.
+- [ ] Record commit/proposal/application dispositions and logical delivery/expiry/invalidation results.
 - [ ] Record CPU time, peak memory, database size/writes, queue depth, and replay probes.
 - [ ] Sweep constants around the pinned value in explicit test-policy builds.
+- [ ] For P4/P5, preserve one retained input set and fixed eligibility horizons while varying pass partitioning; keep
+  witness expiry, deferred commits, and anchor pruning as explicit boundary cases rather than accidental confounders.
 - [ ] Produce curves and boundary failures; never auto-tune production policy from simulator output.
 
 ### 3.3 Incident replay
@@ -475,7 +556,7 @@ test-only constants while preserving a stable semantic oracle.
 ### Milestone 3 Exit Gate
 
 - [ ] The three headline workloads run both as small regressions and sustained campaigns.
-- [ ] Every resource exhaustion reaches a named fail-closed or retryable outcome.
+- [ ] Every resource exhaustion reaches a named fail-closed or retryable outcome with a tested repair path.
 - [ ] Campaign reports identify the first failing action and limiting resource.
 - [ ] Selected incident histories reproduce or clearly state why exact replay is impossible.
 
@@ -485,6 +566,8 @@ test-only constants while preserving a stable semantic oracle.
 
 - [ ] Implement symbolic authenticated candidates, authorization, dependency closure, witness scoring, selection, and
   dispositions without calling production selector/canonicalization code.
+- [ ] Include proposal expiry and multi-parent commit sentinels, and keep an app-message-witness-free reference variant
+  so the witness mechanism's marginal effect is measurable.
 - [ ] Differentially compare reference model, production selector, and full engine.
 - [ ] Keep model inputs small and shrinkable.
 
@@ -492,6 +575,8 @@ test-only constants while preserving a stable semantic oracle.
 
 - [ ] Prototype the self-update/admin-progress case in TLA+/TLC and Stateright, then record the tool decision.
 - [ ] Model unequal histories, eventual input closure, pass freeze/settle, crash/restart, fairness, and resource failure.
+- [ ] Model joiner/invite/device-add state that becomes stranded on a losing branch and its permitted repair transitions.
+- [ ] Emit model traces that preserve enough action identity to compile into Scenario IR regression cases.
 - [ ] Produce minimal counterexample traces consumable by Scenario IR where practical.
 - [ ] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
 
@@ -499,6 +584,7 @@ test-only constants while preserving a stable semantic oracle.
 
 - [ ] Mutate selector comparison order.
 - [ ] Mutate witness sender/epoch deduplication.
+- [ ] Mutate app-message witness admission/removal to determine which scenarios actually depend on it.
 - [ ] Mutate cutoff admission and frozen-member persistence.
 - [ ] Mutate scheduler deadlines and re-arm classification.
 - [ ] Mutate output invalidation and publication acknowledgement.
@@ -527,7 +613,11 @@ test-only constants while preserving a stable semantic oracle.
 - [ ] Drive only public app-runtime operations.
 - [ ] Exercise real account/device lifecycle, projections, outbound publication, relay sync/backfill, and retries.
 - [ ] Compare engine state commitments and user-visible chat/member/admin/message projections.
+- [ ] Compare the three equivalence layers independently: shared protocol state, scenario-input/application projection,
+  and local operational diagnostics.
 - [ ] Crash/reopen the complete runtime.
+- [ ] Exercise long-offline sync where no live message arms epoch-stall backfill, and prove the selected EOSE/full-history
+  completeness policy closes the gap.
 
 ### 5.2 Simulator node process
 
@@ -535,6 +625,8 @@ test-only constants while preserving a stable semantic oracle.
 - [ ] Define a versioned JSONL control and observation protocol.
 - [ ] Keep engine/storage internals unavailable through the process protocol.
 - [ ] Emit privacy-safe structured diagnostics and failure capsules.
+- [ ] Define process-adapter quiescence from observable inbox/outbox, relay-query completion, retry timers, projection
+  checkpoints, and stable state commitments; do not reuse engine-private counters as the contract.
 
 ### 5.3 Process orchestrator
 
@@ -612,7 +704,7 @@ adapter capabilities and versions
 policy and constant snapshot
 captured transport artifacts
 virtual and wall-clock timeline
-logical input/output/disposition ledger
+scenario-input/application-output disposition ledger
 exact state commitments
 resource observations
 assertion failures
@@ -629,7 +721,7 @@ The first implementation series is deliberately ordered:
 
 1. strict Tamarin warning/derivation gate;
 2. assurance contract and constant-ledger review against the canonical protocol;
-3. exact state/message oracle;
+3. exact state/scenario-input oracle;
 4. public subject boundary and complete quiescence;
 5. failure capsule;
 6. Scenario IR v2;
@@ -657,3 +749,9 @@ incorrect result.
 | 2026-07-30 | 0.1 typed deferred/resource outcomes | Replaced ambiguous `Stale(PeelFailed)` results with typed transport availability, protocol rejection, and stale-disposition categories; retry-budget release no longer terminally deduplicates exact-ID redelivery | `cargo test -p cgka-engine --features test-policy-overrides --test deferred_peel_lifecycle`; `--test ingest`; `--test fork_detection` |
 | 2026-07-30 | 0.1 resource-refusal recovery signal | Resource refusal immediately arms one account-wide history backfill per group epoch; ordinary transport deferral retains the existing evidence threshold | `cargo test -p marmot-app client::epoch_stall --lib` |
 | 2026-07-30 | Milestone 0 completion verification | Rebased onto MDK `master` at `1b949655`; fast CI, the full feature-enabled engine suite, full simulator suite, session suite, focused app deferral/backfill coverage, and all 76 strict Tamarin lemmas passed | `just fast-ci`; `cargo test -p cgka-engine --features test-policy-overrides`; `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-session --features test-policy-overrides`; focused `marmot-app` tests; `just tamarin` |
+| 2026-07-30 | 1.1 exact live-group state oracle | Added a conformance-only canonical snapshot and strict equivalence expectation; exact member and exporter semantic mutations now fail while two independently joined clients match | `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-engine --features "test-conformance-snapshot test-policy-overrides"` |
+| 2026-07-30 | 1.1 generalized scenario-input disposition ledger | Added strict per-client commit, proposal, and application dispositions keyed by stable scenario action ids and joined to outer transport/content aliases; duplicate application delivery is one delivery plus one dedup, and unpeeled input remains visibly transport-pending | `cargo test -p cgka-conformance-simulator exact_observation_ledgers_commit_proposal_and_application_dispositions`; full simulator suite |
+| 2026-07-30 | 1.1 instantaneous pending-work oracle | Added `NoPendingWork` over aggregate engine, bus, and scenario-input-ledger progress; queued, delayed, unread, unconfirmed-publish, and transport-deferred sentinels fail while a drained joined group passes | `cargo test -p cgka-conformance-simulator` |
+| 2026-07-30 | 1.1 bidirectional decryptability probe | Added an active exact-ID application-message matrix; settled members pass every directed edge, a missed commit exposes future-epoch deferral in only one direction, and a named nonmember cannot pass | `cargo test -p cgka-conformance-simulator bidirectional_decryptability` |
+| 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
+| 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |
