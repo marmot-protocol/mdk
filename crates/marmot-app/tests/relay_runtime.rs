@@ -2020,9 +2020,8 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
         .unwrap();
     runtime.start().await.unwrap();
 
-    let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice
-        .create_group("runtime inbound audit", &["bob"])
+    let group_id = runtime
+        .create_group("alice", "runtime inbound audit", &["bob".to_owned()], None)
         .await
         .unwrap();
     wait_for_event(&mut events, |event| {
@@ -2096,9 +2095,13 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
 
     // bob's managed worker joins the group so it holds a live subscription on
     // which the undecryptable probes below are delivered.
-    let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice
-        .create_group("runtime epoch backfill arm", &["bob"])
+    let group_id = runtime
+        .create_group(
+            "alice",
+            "runtime epoch backfill arm",
+            &["bob".to_owned()],
+            None,
+        )
         .await
         .unwrap();
     wait_for_event(&mut events, |event| {
@@ -3075,8 +3078,10 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     let mut events = runtime.subscribe();
     runtime.start().await.unwrap();
 
-    let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("live", &["bob"]).await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "live", &["bob".to_owned()], None)
+        .await
+        .unwrap();
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -3086,8 +3091,12 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     })
     .await;
 
-    alice
-        .send(&group_id, b"hello through the app runtime")
+    runtime
+        .send_message(
+            "alice",
+            &group_id,
+            b"hello through the app runtime".to_vec(),
+        )
         .await
         .unwrap();
     let received = wait_for_event(&mut events, |event| {

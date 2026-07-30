@@ -473,11 +473,12 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     let account = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
 
-    let _client = app.client(&account.label).await.unwrap();
+    let client = app.client(&account.label).await.unwrap();
     assert!(
         app.audit_log_files().unwrap().is_empty(),
         "audit logs should be off by default"
     );
+    drop(client);
 
     app.set_audit_log_settings(AuditLogSettings {
         enabled: true,

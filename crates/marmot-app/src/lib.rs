@@ -440,6 +440,7 @@ pub struct MarmotApp {
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
@@ -975,10 +976,25 @@ struct KeyPackageRecord {
 
 struct OpenAppAccount {
     runtime: AppRuntime,
+    session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
     signer: Arc<dyn nostr::NostrSigner>,
+}
+
+struct AppAccountSessionGuard {
+    label: String,
+    owners: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for AppAccountSessionGuard {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.label);
+    }
 }
 
 impl MarmotApp {
@@ -1113,6 +1129,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
@@ -1173,6 +1190,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
@@ -1221,6 +1239,12 @@ impl MarmotApp {
             .contains_key(label)
     }
 
+    /// Open the account's exclusive in-memory engine session.
+    ///
+    /// Only one [`AppClient`] for an account may exist within a [`MarmotApp`]
+    /// (including its clones and managed runtime workers). A concurrent open
+    /// returns [`AppError::AccountSessionBusy`]. Drop the owning client before
+    /// retrying.
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
         #[cfg(test)]
         let relay_plane = self
@@ -1275,7 +1299,9 @@ impl MarmotApp {
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
         let app = self.clone();
-        let label = label.to_owned();
+        // Resolve every supported account ref before touching label-keyed
+        // caches or the session-owner registry.
+        let label = self.account_home().account(label)?.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
@@ -1293,6 +1319,7 @@ impl MarmotApp {
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
+            _session_guard: open.session_guard,
             adapter: open.adapter,
             routing: open.routing,
             relay_plane: relay_plane.clone(),
@@ -2595,8 +2622,12 @@ impl MarmotApp {
         label: &str,
         relay_plane: &MarmotRelayPlane,
     ) -> Result<OpenAppAccount, AppError> {
-        let state = self.load_state(label)?;
         let account = self.account_home().account(label)?;
+        // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
+        // by the canonical stored label so aliases cannot open a second engine.
+        let label = account.label.as_str();
+        let session_guard = self.acquire_account_session(label)?;
+        let state = self.load_state(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
@@ -2676,10 +2707,25 @@ impl MarmotApp {
             AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
         Ok(OpenAppAccount {
             runtime,
+            session_guard,
             adapter,
             routing,
             state,
             signer: nostr_signer,
+        })
+    }
+
+    fn acquire_account_session(&self, label: &str) -> Result<AppAccountSessionGuard, AppError> {
+        let mut owners = self
+            .account_session_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !owners.insert(label.to_owned()) {
+            return Err(AppError::AccountSessionBusy);
+        }
+        Ok(AppAccountSessionGuard {
+            label: label.to_owned(),
+            owners: self.account_session_owners.clone(),
         })
     }
 

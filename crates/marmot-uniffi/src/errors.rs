@@ -44,6 +44,10 @@ pub enum MarmotKitError {
     /// host should open an unleased runtime after receiving it.
     #[error("marmot runtime root is already in use")]
     RuntimeBusy,
+    /// Another client or managed worker in this runtime currently owns the
+    /// account's in-memory engine session. Retry only after that owner closes.
+    #[error("marmot account session is already in use")]
+    AccountSessionBusy,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -209,6 +213,7 @@ impl From<AppError> for MarmotKitError {
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeBusy => Self::RuntimeBusy,
+            AppError::AccountSessionBusy => Self::AccountSessionBusy,
             AppError::RuntimeStopping => Self::RuntimeStopping,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
             // #484: a transient storage busy error can also surface directly at
@@ -319,6 +324,15 @@ mod tests {
         assert!(
             matches!(ffi, MarmotKitError::RuntimeBusy),
             "exclusive-root contention must remain distinguishable at the host boundary"
+        );
+    }
+
+    #[test]
+    fn account_session_busy_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError = AppError::AccountSessionBusy.into();
+        assert!(
+            matches!(ffi, MarmotKitError::AccountSessionBusy),
+            "in-process account-session contention must remain distinguishable at the host boundary"
         );
     }
 

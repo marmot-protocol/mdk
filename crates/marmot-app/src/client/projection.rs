@@ -590,6 +590,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::SqlcipherKeyDerivation(_) => "read_marker_failed:sqlcipher_key_derivation",
         AppError::BlockingTask(_) => "read_marker_failed:blocking_task",
         AppError::RuntimeBusy => "read_marker_failed:runtime_busy",
+        AppError::AccountSessionBusy => "read_marker_failed:account_session_busy",
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
         AppError::TransportClosed => "read_marker_failed:transport_closed",
