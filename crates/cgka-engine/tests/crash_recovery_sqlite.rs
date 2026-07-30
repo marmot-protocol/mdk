@@ -379,10 +379,10 @@ async fn run_child_case(database: &Path) {
             .expect("alice invite"),
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, route(alice_commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(alice_commit, &group_id), 1_000)
         .expect("buffer incumbent commit");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("settle incumbent branch");
     assert_eq!(carol.epoch(&group_id).expect("live epoch"), EpochId(2));
     assert_eq!(
@@ -403,7 +403,7 @@ async fn run_child_case(database: &Path) {
         .expect("bob invite"),
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, route(bob_commit, &group_id), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(bob_commit, &group_id), 2_000)
         .expect("buffer late winning commit");
     carol_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
@@ -444,7 +444,7 @@ async fn run_child_case(database: &Path) {
         .expect("historical apply reaches selected crash point");
     } else {
         carol
-            .converge_stored_openmls_messages(&group_id, 3_000_000)
+            .converge_stored_openmls_messages_at(&group_id, 3_000_000)
             .expect("late branch convergence reaches selected crash point");
     }
 }

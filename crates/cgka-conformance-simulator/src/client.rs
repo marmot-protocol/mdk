@@ -14,7 +14,7 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationResult};
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
 use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
     default_group_components, encode_nostr_routing_v1,
@@ -56,6 +56,7 @@ pub struct HarnessClient {
     signer: nostr::Keys,
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
+    convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
     /// automatically after the first create/join.
@@ -79,6 +80,7 @@ pub struct ClientBuilder {
     storage_mode: HarnessStorageMode,
     storage_options: SqliteStorageOptions,
     explicit_file_storage: Option<ExplicitFileStorage>,
+    convergence_clock: Option<Arc<dyn ConvergenceClock>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +194,7 @@ impl ClientBuilder {
             storage_mode: HarnessStorageMode::from_env(),
             storage_options: SqliteStorageOptions::default(),
             explicit_file_storage: None,
+            convergence_clock: None,
         }
     }
 
@@ -231,6 +234,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn convergence_clock(mut self, clock: Arc<dyn ConvergenceClock>) -> Self {
+        self.convergence_clock = Some(clock);
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -246,6 +254,7 @@ impl ClientBuilder {
             &self.registry,
             self.protocol_profile,
             &audit_capture,
+            self.convergence_clock.as_ref(),
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         HarnessClient {
@@ -258,6 +267,7 @@ impl ClientBuilder {
             signer: self.signer,
             registry: self.registry,
             protocol_profile: self.protocol_profile,
+            convergence_clock: self.convergence_clock,
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
@@ -282,6 +292,7 @@ fn build_harness_engine(
     registry: &FeatureRegistry,
     protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
+    convergence_clock: Option<&Arc<dyn ConvergenceClock>>,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
@@ -296,6 +307,9 @@ fn build_harness_engine(
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
+    }
+    if let Some(clock) = convergence_clock {
+        builder = builder.convergence_clock(clock.clone());
     }
     builder.build().expect("engine builds")
 }
@@ -446,6 +460,7 @@ impl HarnessClient {
             &self.registry,
             self.protocol_profile,
             &self.audit_capture,
+            self.convergence_clock.as_ref(),
         );
         engine
             .hydrate_stable_groups_from_storage()
@@ -511,7 +526,7 @@ impl HarnessClient {
         now_ms: u64,
     ) -> CanonicalizationResult {
         self.engine_mut()
-            .converge_stored_openmls_messages(group_id, now_ms)
+            .converge_stored_openmls_messages_at(group_id, now_ms)
             .expect("stored convergence succeeds")
     }
 

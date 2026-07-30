@@ -14,6 +14,7 @@ use cgka_conformance_simulator::{
     run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
     run_vector_fixture_report,
 };
+use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -171,8 +172,10 @@ async fn exact_oracle_matches_full_canonical_state_after_join() {
 #[tokio::test]
 async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
     let bus = TransportBus::ordered();
+    let clock = ManualConvergenceClock::new(0, 10_000);
     let mut alice = ClientBuilder::new(pad32(b"alice"))
         .protocol_profile(ProtocolProfile::Current)
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
         .attach(&bus);
     let (_group_id, pending) = alice
         .create_group_with_admins_maybe_pending("terminal", vec![], vec![], vec![])
@@ -184,28 +187,25 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
     alice.drain_events();
 
     alice.request_disband().await.expect("request disband");
-    // Milestone 1.3 replaces this production-clock wait with the simulator's
-    // injected monotonic/wall clocks. Until that subject boundary exists, run
-    // the real pinned-v1 quiescence policy rather than weakening its constants
-    // just for this terminal-projection test.
-    let mut reached_terminal = false;
-    for _ in 0..24 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        alice
-            .advance_convergence()
-            .await
-            .expect("advance disband convergence");
-        if matches!(
+    alice
+        .advance_convergence()
+        .await
+        .expect("prepare and confirm disband commit");
+    alice
+        .advance_convergence()
+        .await
+        .expect("open disband collecting pass");
+    clock.advance_ms(1_000);
+    alice
+        .advance_convergence()
+        .await
+        .expect("settle disband convergence at quiescence");
+    assert!(
+        matches!(
             alice.canonical_state_snapshot(),
             ConformanceCanonicalStateSnapshot::Disbanded(_)
-        ) {
-            reached_terminal = true;
-            break;
-        }
-    }
-    assert!(
-        reached_terminal,
-        "disband did not reach terminal state within the 6-second pinned-v1 test budget"
+        ),
+        "disband must reach terminal state at the pinned quiescence boundary"
     );
     bus.deliver_all();
 

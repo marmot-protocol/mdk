@@ -554,7 +554,7 @@ fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<SqliteAccountStorag
 
 fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
     let result = engine
-        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(group_id, 1_000_000)
         .expect("buffered commit converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
@@ -746,7 +746,7 @@ async fn strict_cutover_rejects_inbound_adds_to_legacy_groups_during_convergence
     assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
 
     let convergence = bob
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("strict cutover should reject the branch without failing convergence");
     assert_eq!(convergence.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(

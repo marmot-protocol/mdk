@@ -12,7 +12,7 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata};
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
@@ -49,6 +49,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
+use std::sync::Arc;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
 
@@ -1224,8 +1225,15 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
 async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let identity = b"alice-current-solo-disband";
-    let mut alice =
-        build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build current-profile engine");
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
             name: "terminal solo".into(),
@@ -1290,22 +1298,22 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         "publish confirmation alone must not terminalize before convergence"
     );
 
-    for _ in 0..24 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            alice
-                .advance_convergence(&group_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        if matches!(
-            alice.epoch_state(&group_id),
-            Some(cgka_traits::EpochState::Disbanded(_))
-        ) {
-            break;
-        }
-    }
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the post-confirmation tick opens the collecting pass"
+    );
+    clock.advance_ms(1_000);
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         matches!(
             alice.epoch_state(&group_id),

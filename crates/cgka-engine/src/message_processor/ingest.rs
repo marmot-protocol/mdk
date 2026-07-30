@@ -767,11 +767,15 @@ impl<S: StorageProvider> Engine<S> {
                 false
             };
             if pending_recovery.is_none() && commit_should_enter_convergence {
-                let now_ms = self.convergence_now_ms();
-                self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
-                    .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+                let now = self.convergence_now();
+                self.buffer_openmls_convergence_message_with_time(
+                    &group_id,
+                    openmls_msg.clone(),
+                    now,
+                )
+                .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
-                    .converge_stored_openmls_messages(&group_id, now_ms)
+                    .converge_stored_openmls_messages_with_time(&group_id, now)
                     .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
                 return Ok(convergence_ingest_outcome(
                     &result,
@@ -781,11 +785,15 @@ impl<S: StorageProvider> Engine<S> {
                 ));
             }
             if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
-                let now_ms = self.convergence_now_ms();
-                self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
-                    .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+                let now = self.convergence_now();
+                self.buffer_openmls_convergence_message_with_time(
+                    &group_id,
+                    openmls_msg.clone(),
+                    now,
+                )
+                .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
-                    .converge_stored_openmls_messages(&group_id, now_ms)
+                    .converge_stored_openmls_messages_with_time(&group_id, now)
                     .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
                 return Ok(convergence_ingest_outcome(
                     &result,
@@ -967,9 +975,8 @@ impl<S: StorageProvider> Engine<S> {
                         // Sender and membership-tag authentication can depend
                         // on a retained same-epoch parent. Try every retained
                         // branch before classifying the proposal as terminal.
-                        let now_ms = self.convergence_now_ms();
                         let result = self
-                            .converge_stored_openmls_messages(&group_id, now_ms)
+                            .converge_stored_openmls_messages(&group_id)
                             .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
                         return Ok(convergence_ingest_outcome(
                             &result,
@@ -1216,9 +1223,8 @@ impl<S: StorageProvider> Engine<S> {
                             commit_committer,
                             committer_index == mls_group.own_leaf_index(),
                         )?;
-                        let now_ms = self.convergence_now_ms();
                         let result = self
-                            .converge_stored_openmls_messages(&group_id, now_ms)
+                            .converge_stored_openmls_messages(&group_id)
                             .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
                         return Ok(convergence_ingest_outcome(
                             &result,
