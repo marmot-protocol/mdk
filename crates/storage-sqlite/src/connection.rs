@@ -45,13 +45,14 @@ impl TransientError for StorageError {
     }
 }
 
-/// Run a whole storage operation, retrying with capped exponential backoff while
-/// it fails with transient lock contention. `op` MUST be a complete, idempotent
-/// unit of work (a single autocommit statement or an entire `BEGIN..COMMIT`
-/// transaction) — never a single statement inside a larger transaction, since a
-/// retry re-runs the closure from the top. On `SQLITE_BUSY`/`SQLITE_LOCKED`
-/// SQLite has already rolled back the failed transaction, so re-running is safe.
-/// After [`BUSY_MAX_ATTEMPTS`] the last transient error is returned unchanged so
+/// Retry an operation with capped exponential backoff while it fails with
+/// transient lock contention. `op` MUST be safe to invoke again. Most callers
+/// pass a complete, idempotent storage operation (a single autocommit statement
+/// or an entire transaction), never one statement from the middle of a larger
+/// transaction. Transaction-boundary callers are the deliberate exception:
+/// they retry only `COMMIT` or `ROLLBACK` in place while retaining transaction
+/// ownership, without re-running the transaction closure. After
+/// [`BUSY_MAX_ATTEMPTS`] the last transient error is returned unchanged so
 /// callers still see a `Busy` (transient) classification.
 pub(crate) fn retry_on_busy<T, E, F>(mut op: F) -> Result<T, E>
 where
@@ -189,12 +190,12 @@ impl SharedConnection {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         match result {
-            Ok(Ok(value)) => match self.execute_transaction_boundary("COMMIT") {
+            Ok(Ok(value)) => match self.execute_transaction_boundary_with_retry("COMMIT") {
                 Ok(()) => {
                     self.clear_transaction_owner();
                     Ok(value)
                 }
-                Err(commit_err) => match self.execute_transaction_boundary("ROLLBACK") {
+                Err(commit_err) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
                     Ok(()) => {
                         self.clear_transaction_owner();
                         Err(E::from(commit_err))
@@ -204,7 +205,7 @@ impl SharedConnection {
                     )))),
                 },
             },
-            Ok(Err(err)) => match self.execute_transaction_boundary("ROLLBACK") {
+            Ok(Err(err)) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
                 Ok(()) => {
                     self.clear_transaction_owner();
                     Err(err)
@@ -213,7 +214,7 @@ impl SharedConnection {
                     "sqlite transaction ROLLBACK failed after callback error ({rollback_err}); connection marked unusable",
                 )))),
             },
-            Err(payload) => match self.execute_transaction_boundary("ROLLBACK") {
+            Err(payload) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
                 Ok(()) => {
                     self.clear_transaction_owner();
                     std::panic::resume_unwind(payload);
@@ -249,14 +250,23 @@ impl SharedConnection {
         }
     }
 
-    fn execute_transaction_boundary(&self, sql: &str) -> StorageResult<()> {
-        let conn = self
-            .inner
-            .connection
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        conn.execute_batch(sql)
-            .map_err(|e| StorageError::Backend(format!("sqlite transaction {sql}: {e}")))
+    /// Finish the active transaction without releasing its in-process owner.
+    ///
+    /// SQLite leaves a transaction active when `COMMIT` returns
+    /// `SQLITE_BUSY`, so retrying that boundary in place is safe and avoids
+    /// re-running the arbitrary transaction closure. `ROLLBACK` uses the same
+    /// bounded policy so a transient boundary failure cannot strand a usable
+    /// connection. Ownership is cleared only by the caller after a boundary
+    /// succeeds; an exhausted rollback instead marks the connection unusable.
+    fn execute_transaction_boundary_with_retry(&self, sql: &str) -> StorageResult<()> {
+        retry_transaction_boundary(sql, || {
+            let conn = self
+                .inner
+                .connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            conn.execute_batch(sql)
+        })
     }
 
     /// Run `BEGIN IMMEDIATE`, retrying with capped exponential backoff on
@@ -321,6 +331,23 @@ impl SharedConnection {
         self.inner.transaction_released.notify_all();
         StorageError::Backend(reason)
     }
+}
+
+fn retry_transaction_boundary<F>(sql: &str, mut execute: F) -> StorageResult<()>
+where
+    F: FnMut() -> rusqlite::Result<()>,
+{
+    retry_on_busy(|| {
+        execute().map_err(|error| match crate::codec::map_sqlite_error(error) {
+            StorageError::Busy(detail) => {
+                StorageError::Busy(format!("sqlite transaction {sql}: {detail}"))
+            }
+            StorageError::Backend(detail) => {
+                StorageError::Backend(format!("sqlite transaction {sql}: {detail}"))
+            }
+            other => StorageError::Backend(format!("sqlite transaction {sql}: {other}")),
+        })
+    })
 }
 
 pub struct SqlCipherKey(Zeroizing<String>);
@@ -663,10 +690,38 @@ impl KeyPackageBundleStorage for SqliteAccountStorage {
 mod tests {
     use super::*;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    };
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TRACED_SQLCIPHER_SETUP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    fn delete_journal_options() -> SqliteStorageOptions {
+        SqliteStorageOptions {
+            busy_timeout_ms: 0,
+            journal_mode: SqliteJournalMode::Delete,
+            ..SqliteStorageOptions::default()
+        }
+    }
+
+    fn open_delete_journal_store(path: &Path) -> SqliteAccountStorage {
+        SqliteAccountStorage::open_encrypted_with_options(
+            path,
+            &SqlCipherKey::new("delete journal transaction boundary key").unwrap(),
+            delete_journal_options(),
+        )
+        .unwrap()
+    }
+
+    fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(primary),
+            Some("database is locked".to_string()),
+        )
+    }
 
     fn trace_sqlcipher_setup(sql: &str) {
         let sql = sql.to_ascii_lowercase();
@@ -854,8 +909,153 @@ mod tests {
     }
 
     #[test]
-    fn transaction_rolls_back_after_failed_commit_before_releasing_owner() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+    fn delete_journal_transient_commit_contention_retries_boundary_not_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transient-commit.sqlite");
+        let writer = open_delete_journal_store(&path);
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+                .unwrap();
+        }
+        let reader = open_delete_journal_store(&path);
+        let reader_conn = reader.lock().unwrap();
+        reader_conn.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader_conn
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+
+        let closure_calls = Arc::new(AtomicU32::new(0));
+        let worker_calls = closure_calls.clone();
+        let worker_store = writer.clone();
+        let (closure_done_tx, closure_done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_store.with_transaction(|storage| {
+                worker_calls.fetch_add(1, Ordering::SeqCst);
+                storage
+                    .lock()?
+                    .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
+                    .storage()?;
+                closure_done_tx.send(()).unwrap();
+                Ok::<_, StorageError>(())
+            })
+        });
+
+        closure_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer closure should reach the contended COMMIT");
+
+        let waiting_store = writer.clone();
+        let (lock_acquired_tx, lock_acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _guard = waiting_store.lock().unwrap();
+            lock_acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            lock_acquired_rx
+                .recv_timeout(Duration::from_millis(60))
+                .is_err(),
+            "transaction ownership must remain held while COMMIT is retrying",
+        );
+
+        reader_conn.execute_batch("COMMIT").unwrap();
+        drop(reader_conn);
+        worker
+            .join()
+            .unwrap()
+            .expect("COMMIT should succeed after reader contention clears");
+        lock_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connection waiter should proceed after COMMIT finishes");
+        waiter.join().unwrap();
+
+        assert_eq!(
+            closure_calls.load(Ordering::SeqCst),
+            1,
+            "busy COMMIT retries must not rerun the transaction closure",
+        );
+        let persisted: i64 = writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn delete_journal_persistent_commit_contention_returns_busy_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persistent-commit.sqlite");
+        let writer = open_delete_journal_store(&path);
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+                .unwrap();
+        }
+        let reader = open_delete_journal_store(&path);
+        let reader_conn = reader.lock().unwrap();
+        reader_conn.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader_conn
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+
+        let mut closure_calls = 0;
+        let result: StorageResult<()> = writer.with_transaction(|storage| {
+            closure_calls += 1;
+            storage
+                .lock()?
+                .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
+                .storage()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "exhausted COMMIT contention must remain retryable Busy, got {result:?}",
+        );
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite transaction COMMIT"),
+            "busy classification should retain transaction-boundary context",
+        );
+        assert_eq!(
+            closure_calls, 1,
+            "persistent COMMIT contention must not rerun the closure",
+        );
+        assert!(
+            writer.lock().unwrap().is_autocommit(),
+            "failed COMMIT must be rolled back before ownership is released",
+        );
+
+        reader_conn.execute_batch("COMMIT").unwrap();
+        drop(reader_conn);
+        writer
+            .with_transaction(|storage| {
+                storage
+                    .lock()?
+                    .execute("INSERT INTO boundary_probe (value) VALUES (2)", [])
+                    .storage()?;
+                Ok::<_, StorageError>(())
+            })
+            .expect("connection must remain usable after contended COMMIT rollback");
+        let values: i64 = writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT SUM(value) FROM boundary_probe", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(values, 2, "the rolled-back value must not persist");
+    }
+
+    #[test]
+    fn delete_journal_fatal_commit_failure_rolls_back_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fatal-commit.sqlite");
+        let store = open_delete_journal_store(&path);
         {
             let conn = store.lock().unwrap();
             conn.execute_batch(
@@ -868,14 +1068,20 @@ mod tests {
             .unwrap();
         }
 
+        let mut closure_calls = 0;
         let result: StorageResult<()> = store.with_transaction(|storage| {
+            closure_calls += 1;
             let conn = storage.lock()?;
             conn.execute("INSERT INTO deferred_child (parent_id) VALUES (7)", [])
                 .storage()?;
             Ok(())
         });
 
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "deferred constraint failure must remain fatal Backend, got {result:?}",
+        );
+        assert_eq!(closure_calls, 1, "fatal COMMIT must not rerun the closure");
         let conn = store.lock().unwrap();
         assert!(
             conn.is_autocommit(),
@@ -886,6 +1092,58 @@ mod tests {
             .storage()
             .unwrap();
         assert_eq!(child_count, 0);
+        drop(conn);
+        store
+            .with_transaction(|storage| {
+                storage
+                    .lock()?
+                    .execute("INSERT INTO deferred_parent (id) VALUES (7)", [])
+                    .storage()?;
+                Ok::<_, StorageError>(())
+            })
+            .expect("connection must remain usable after fatal COMMIT rollback");
+    }
+
+    #[test]
+    fn delete_journal_rollback_boundary_retries_busy_and_locked_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback-classification.sqlite");
+        let store = open_delete_journal_store(&path);
+        assert_eq!(
+            pragma_string(&store.lock().unwrap(), "journal_mode"),
+            "delete"
+        );
+
+        let mut calls = 0;
+        retry_transaction_boundary("ROLLBACK", || {
+            calls += 1;
+            match calls {
+                1 => Err(sqlite_failure(rusqlite::ffi::SQLITE_BUSY)),
+                2 => Err(sqlite_failure(rusqlite::ffi::SQLITE_LOCKED)),
+                _ => Ok(()),
+            }
+        })
+        .expect("transient rollback boundary failures should be retried");
+        assert_eq!(calls, 3);
+
+        let mut persistent_calls = 0;
+        let result = retry_transaction_boundary("ROLLBACK", || {
+            persistent_calls += 1;
+            Err(sqlite_failure(rusqlite::ffi::SQLITE_LOCKED))
+        });
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "exhausted ROLLBACK lock contention must remain Busy, got {result:?}",
+        );
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite transaction ROLLBACK"),
+            "busy classification should retain transaction-boundary context",
+        );
+        assert_eq!(persistent_calls, BUSY_MAX_ATTEMPTS);
     }
 
     #[test]
