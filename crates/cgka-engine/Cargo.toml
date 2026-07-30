@@ -14,6 +14,10 @@ test-policy-overrides = []
 # Debug-only subprocess crash points used by the SQLCipher durability tests.
 # Production/app consumers must not enable this feature.
 test-crash-hooks = []
+# Synthetic conformance-only state projection. This exposes commitments and
+# public protocol state, never raw exporter material, and must not be enabled by
+# production/app consumers.
+test-conformance-snapshot = []
 
 [dependencies]
 cgka-traits.workspace = true

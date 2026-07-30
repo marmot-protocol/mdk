@@ -142,6 +142,11 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** role-aware convergence scheduling classification that distinguishes commit edges, proposal
     dependencies, and potential application-message witnesses for pass opening, quiescence, and outbound gating
 
+- **Module:** `conformance_snapshot.rs` (feature `test-conformance-snapshot`)
+  - **Owns:** privacy-safe exact canonical-state (live MLS state or authenticated terminal disband tombstone) and
+    aggregate pending-work projections consumed only by the conformance simulator. Terminal equality excludes
+    device-local authorship metadata. These diagnostics never feed protocol selection or production telemetry.
+
 - **Module:** `distributed_convergence.rs`
   - **Owns:** the engine entry point for stored-message distributed convergence
 

@@ -538,6 +538,109 @@ impl<S: StorageProvider> Engine<S> {
         self.epoch_manager.state(group_id).cloned()
     }
 
+    /// Capture the adopted Marmot conformance projection for one live group.
+    ///
+    /// This synthetic-test interface is deliberately feature-gated. It returns
+    /// public protocol state and a domain-separated exporter commitment, never
+    /// the raw exporter secret. Production telemetry and app surfaces must not
+    /// enable `test-conformance-snapshot`.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_group_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceGroupSnapshot, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let epoch_state = self
+            .epoch_manager
+            .state(group_id)
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        crate::conformance_snapshot::capture_group_snapshot(
+            &self.storage,
+            &self.crypto,
+            group_id,
+            epoch_state,
+        )
+    }
+
+    /// Capture exact canonical state for either a live group or an
+    /// authenticated terminal disband tombstone.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_canonical_state_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError> {
+        if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
+            return Ok(
+                crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Disbanded(
+                    crate::conformance_snapshot::capture_disbanded_group_snapshot(
+                        group_id, &tombstone,
+                    ),
+                ),
+            );
+        }
+        self.conformance_group_snapshot(group_id)
+            .map(Box::new)
+            .map(crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Live)
+    }
+
+    /// Capture aggregate outstanding work for the synthetic conformance
+    /// simulator. This is an oracle diagnostic only and never affects engine
+    /// scheduling or protocol decisions.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_pending_work_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformancePendingWorkSnapshot, EngineError> {
+        crate::conformance_snapshot::capture_pending_work_snapshot(self, group_id)
+    }
+
+    /// Read the durable state of one synthetic scenario input under either its
+    /// transport or content-derived id.
+    ///
+    /// The simulator supplies both aliases because outbound and inbound copies
+    /// of the same MLS bytes can use different storage keys. This observation is
+    /// feature-gated, exposes no payload bytes, and never affects processing.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_message_state(
+        &self,
+        aliases: &[MessageId],
+    ) -> Result<Option<cgka_traits::MessageState>, EngineError> {
+        for alias in aliases {
+            match self.storage.get_message(alias) {
+                Ok(record) => return Ok(Some(record.state)),
+                Err(cgka_traits::storage::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return the transport and content-derived ids for a durable synthetic
+    /// scenario input without exposing its wire bytes.
+    ///
+    /// Locally produced OpenMLS messages are retained under the exact
+    /// transport id and a content marker. The simulator needs both aliases to
+    /// correlate a re-wrapped inbound copy and later invalidation events, but
+    /// must not re-peel a commit after the sender has already advanced state.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_message_aliases(
+        &self,
+        transport_id: &MessageId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        let record = self.storage.get_message(transport_id)?;
+        let mut aliases = vec![transport_id.clone()];
+        if let Ok(payload) = StoredMessagePayload::decode(&record.payload)
+            && let Some(openmls_message) = payload.as_openmls_wire()
+        {
+            let content_id =
+                MessageId::new(Sha256::digest(openmls_message.payload.as_slice()).to_vec());
+            if content_id != *transport_id {
+                aliases.push(content_id);
+            }
+        }
+        Ok(aliases)
+    }
+
     /// Persist a frozen transport fanout before or after one lifecycle edge.
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> Result<(), EngineError> {
         if let Some(group_id) = fanout.group_id() {
