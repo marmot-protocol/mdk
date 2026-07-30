@@ -365,7 +365,12 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the
   transaction that merges the commit (`publish::do_confirm_published`, the inbound apply in `message_processor/ingest.rs`)
   or compensate the in-memory transition explicitly (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error
-  splits the two stores silently and the split resurfaces as a wrong epoch on the next session open.
+  splits the two stores silently and the split resurfaces as a wrong epoch on the next session open. Undoing the apply
+  is only half the obligation: where the failing seam sits behind fork resolution — whose side effects (released
+  incumbent snapshot, `EpochInvalidated` incumbent commit) cannot be compensated — it must also release the recovery
+  snapshot it created and hand the still-retained winning commit back to stored convergence via
+  `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable winner nothing
+  will ever apply.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

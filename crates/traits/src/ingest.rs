@@ -17,6 +17,13 @@ pub enum IngestOutcome {
     /// the group is temporarily not ingestible, usually during a local
     /// publish-before-apply transition. The engine replays buffered messages
     /// when the group returns to `Stable`.
+    ///
+    /// That replay is owned by the application's convergence drain
+    /// (`drain_pending_convergence_groups` →
+    /// `converge_stored_openmls_messages`), not by `replay_buffered_messages`,
+    /// which only re-ingests retained raw transport rows. So an engine seam that
+    /// leaves a retained content row unapplied MUST schedule the group for
+    /// convergence; otherwise this outcome promises a replay that never happens.
     Buffered { group_id: GroupId, epoch: EpochId },
     /// Rejected before convergence admission because routing or deduplication
     /// proved the input cannot affect this account-device's canonical state.

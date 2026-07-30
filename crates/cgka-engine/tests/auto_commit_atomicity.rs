@@ -27,7 +27,7 @@ use cgka_traits::engine::{
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -66,6 +66,14 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         }
         counter += 1;
     }
+}
+
+/// Hex form of a group message's content-derived dedup id, for comparing
+/// against canonicalization-result message ids. Under the pass-through
+/// `MockPeeler` the recovered MLS bytes are exactly `msg.payload`.
+fn content_hex(msg: &TransportMessage) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(&msg.payload))
 }
 
 fn hash_id(bytes: &[u8]) -> MessageId {
@@ -689,6 +697,15 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
 /// record still holds the pre-fork one: hydration seeds the in-memory epoch
 /// FROM that record, so an in-process split becomes a wrong epoch on the next
 /// session open.
+///
+/// Undoing the apply is only half the obligation. Fork resolution already
+/// consumed side effects this seam cannot compensate (the incumbent snapshot is
+/// released, the incumbent commit is `EpochInvalidated`), and the winning commit
+/// stays durably retained. So the failure must also release the recovery
+/// snapshot it created for the apply it abandoned and hand the retained winner
+/// back to stored convergence — otherwise the group is parked one epoch behind
+/// with a durable winner nothing will ever apply, and redelivery answers
+/// `Buffered` forever.
 #[tokio::test]
 async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     let alice_fault = PutGroupFault::default();
@@ -775,6 +792,11 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         (&mut bob, &bob_handle, &bob_fault, alice_commit)
     };
     assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
+    let snapshots_before: std::collections::HashSet<String> = loser_handle
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .collect();
 
     // Fail exactly the epoch mirror's record write on the fork-recovery apply
     // (no other `put_group` runs on this ingest path).
@@ -785,7 +807,7 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         },
         ..winning_commit
     };
-    let ingested = loser.ingest(routed_winner).await;
+    let ingested = loser.ingest(routed_winner.clone()).await;
 
     let record = loser_handle.get_group(&group_id).unwrap();
     assert_eq!(
@@ -808,6 +830,78 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     let members = loser.members(&group_id).expect("group must stay live");
     assert_eq!(members.len(), 2, "both forked invites are rolled back");
     assert_eq!(record.members.len(), 2);
+
+    // Fork resolution legitimately releases the incumbent's snapshot, so the
+    // retained set may shrink — but the abandoned apply must not add its own
+    // recovery snapshot to it.
+    let snapshots_after: std::collections::HashSet<String> = loser_handle
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert!(
+        snapshots_after.is_subset(&snapshots_before),
+        "the failed apply leaked its recovery snapshot: {:?}",
+        snapshots_after
+            .difference(&snapshots_before)
+            .collect::<Vec<_>>()
+    );
+
+    // The winning commit is durably retained but unapplied, and the consumed
+    // fork-resolution side effects cannot be undone. The only repair left is
+    // stored convergence, so the failure must schedule it.
+    let scheduled = loser.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&group_id),
+        "a failed apply must reschedule the retained winner for convergence"
+    );
+
+    // Drive recovery only through what the drain scheduled: the first pass
+    // opens on the retained commit edge, the second settles it past quiescence.
+    let mut recovered = None;
+    for g in &scheduled {
+        loser.converge_stored_openmls_messages_at(g, 0).unwrap();
+        let settled = loser
+            .converge_stored_openmls_messages_at(g, 60_000)
+            .unwrap();
+        if g == &group_id {
+            recovered = Some(settled);
+        }
+    }
+    let recovered = recovered.expect("the faulted group is scheduled");
+    assert!(
+        recovered
+            .accepted_commits
+            .contains(&content_hex(&routed_winner)),
+        "convergence must accept the retained winning commit, got {:?}",
+        recovered.accepted_commits
+    );
+    assert_eq!(
+        loser.epoch(&group_id).unwrap(),
+        EpochId(2),
+        "the scheduled convergence pass must eventually apply the winner"
+    );
+    let record = loser_handle.get_group(&group_id).unwrap();
+    assert_eq!(record.epoch, EpochId(2));
+    assert_eq!(
+        loser.members(&group_id).expect("group stays live").len(),
+        3,
+        "the winner's invitee joins the roster"
+    );
+    assert_eq!(record.members.len(), 3);
+
+    // With the winner applied, redelivery is a plain duplicate — not a
+    // `Buffered` promise of a replay that would never come.
+    let redelivered = loser.ingest(routed_winner).await;
+    assert!(
+        matches!(
+            redelivered,
+            Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
+            })
+        ),
+        "redelivery after recovery must be a duplicate, got {redelivered:?}"
+    );
 }
 
 /// A profile projection failure occurs after the MLS commit is staged. It must

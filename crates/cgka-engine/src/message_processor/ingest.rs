@@ -1296,7 +1296,7 @@ impl<S: StorageProvider> Engine<S> {
                         remaining_member_ids: after_ids,
                         removed_member_ids: removed,
                         message_retention_seconds: after_message_retention,
-                    } = self.storage.with_transaction(
+                    } = match self.storage.with_transaction(
                         |storage| -> Result<AppliedCommitProjection, EngineError> {
                             let tx_provider = EngineOpenMlsProvider::<S>::new(
                                 &self.crypto,
@@ -1352,7 +1352,36 @@ impl<S: StorageProvider> Engine<S> {
                                     )?,
                             })
                         },
-                    )?;
+                    ) {
+                        Ok(projection) => projection,
+                        Err(error) => {
+                            // The snapshot above guards an apply that is now
+                            // abandoned; only `record_applied_commit_for_recovery`
+                            // below takes ownership of it. Release it here, and
+                            // do not let a release failure mask the original
+                            // error.
+                            match self
+                                .storage
+                                .release_group_snapshot(&group_id, &recovery_snapshot)
+                            {
+                                Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                                Err(_) => tracing::warn!(
+                                    target: "cgka_engine::message_processor",
+                                    method = "ingest_group_message",
+                                    "failed to release the recovery snapshot of an abandoned inbound apply"
+                                ),
+                            }
+                            // Fork resolution already consumed side effects this
+                            // seam cannot compensate: the incumbent's snapshot is
+                            // released and its commit is `EpochInvalidated`. The
+                            // winning commit is durably retained as a `Created`
+                            // wire row, so hand the group back to stored
+                            // convergence — that pass is the repair path, and
+                            // without the schedule nothing would ever apply it.
+                            self.schedule_pending_convergence_group(&group_id);
+                            return Err(error);
+                        }
+                    };
                     let after_admins =
                         crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
                     let after_profile = crate::app_components::group_profile_of_group(&mls_group)

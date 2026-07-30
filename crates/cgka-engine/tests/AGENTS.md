@@ -70,7 +70,8 @@ backend on the same rail.
   - **Owns:** Group-record write atomicity under an injected `put_group` failure (mdk#333), one test per seam that
     projects the record: auto-commit staging, Welcome join, group-profile staging, and inbound commit apply. No torn
     record, no orphaned pending publish, no leaked snapshot, no stale stored proposal, no epoch split between the
-    record and the epoch manager; the group stays usable
+    record and the epoch manager; the group stays usable, and an apply the fault abandoned hands its still-retained
+    winning commit back to stored convergence so it is eventually applied
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
