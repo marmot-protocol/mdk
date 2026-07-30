@@ -79,6 +79,33 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
     Ok(())
 }
 
+/// Replay-side self-cache refresh when the caller has only the materialized
+/// OpenMLS group, not the engine's declared identity.
+///
+/// The own leaf still carries the authenticated Marmot credential identity;
+/// derive that identity and route through [`cache_self_capabilities`] so replay
+/// performs the same proof/profile validation and durable write as direct
+/// ingest.
+pub(crate) fn cache_own_capabilities_from_group<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    mls_group: &MlsGroup,
+) -> Result<(), EngineError> {
+    let Some(leaf) = mls_group.own_leaf_node() else {
+        return Ok(());
+    };
+    let credential = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+    let self_id = MemberId::new(credential.identity().to_vec());
+    cache_self_capabilities(
+        storage,
+        group_id,
+        mls_group,
+        &self_id,
+        mls_group.ciphersuite(),
+    )
+}
+
 /// Cache capabilities extracted from a validated invitee's KeyPackage.
 /// Called from create_group / invite paths after capability-check passes.
 pub(crate) fn cache_from_key_packages<S: StorageProvider>(
