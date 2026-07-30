@@ -133,8 +133,10 @@ unexposed. Welcome outcomes remain independent after a live commit is accepted, 
 retired or re-armed from the same acknowledgement. A state transition with no transport artifacts is confirmed as a
 no-op publication rather than inventing a synthetic artifact. The built-in ScenarioSpec v1 runners use a legacy-compatibility
 constructor so existing fixtures retain their explicit `confirm_pending` / `fail_pending` behavior until Scenario IR v2
-adds portable outbound actions. The simulator does not yet wait for quiescence: structural progress tokens, a fixed-point
-driver, timeout policy, and retry-timer coverage remain in Milestone 1.3.
+adds portable outbound actions. That compatibility subject does not advertise `outbound_publication`; removal of the
+dual lifecycle after the v2 migration is tracked in
+[MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207). The simulator does not yet wait for quiescence:
+structural progress tokens, a fixed-point driver, timeout policy, and retry-timer coverage remain in Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting

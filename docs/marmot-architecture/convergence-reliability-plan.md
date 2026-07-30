@@ -443,6 +443,11 @@ delivery-or-invalidation expectation accounts for it; that is an oracle coverage
 
 Status: `complete`
 
+Completion here means the explicit engine-subject contract and its capability boundary are implemented. Portable
+Scenario IR adoption is still owned by Milestone 2.1 and
+[MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207); until then, v1 runners use a compatibility constructor
+that deliberately does not advertise outbound-publication support.
+
 - [x] Define a simulator-owned `ConvergenceSubject` interface that keeps scenario semantics in the runner and exposes
   semantic engine operations through declared adapter capabilities.
 - [x] Implement the first engine-adapter vertical slice: create/mutate, publication confirmation/failure, application
@@ -515,6 +520,9 @@ Status: `not-started`
 - [ ] Replace queue indices with semantic action/message selectors.
 - [ ] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
 - [ ] Compile `ScenarioSpec` v1 into v2 so existing vectors retain meaning.
+- [ ] Add portable outbound poll/acknowledgement operations, migrate built-in runners to the explicit lifecycle, and
+  remove the legacy-compatible constructor and dual client lifecycle
+  ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)).
 
 ### 2.2 Adapter contract
 
@@ -815,4 +823,4 @@ incorrect result.
 | 2026-07-30 | M5 projection-maintenance prerequisite | Made large-set projection pruning bounded, preserved draft-owning groups, and made secure-delete checkpoint completion durable and explicitly observable as `erasure_pending` | [MDK #1201](https://github.com/marmot-protocol/mdk/pull/1201), merge `eec70bd9`; 307 storage tests; focused app/UniFFI retention tests; `just fast-ci` |
 | 2026-07-30 | M5 account-device modeling input | Documented a non-normative multi-device design space while deliberately leaving admission, synchronization, and repair choices unresolved; future scenarios must model account-device instances without assuming those candidate semantics | [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199), merge `aac777f3`; documentation-only |
 | 2026-07-30 | 1.2c / 1.3b subject virtual time | Added a capability-gated `advance_time` scenario operation backed by one shared paired clock across the engine subject; time advancement is a separate failure-free operation and `Tick` selects which participant runtimes observe it, while standalone clients without an injected clock preserve the legacy far-future shortcut | [MDK #1202](https://github.com/marmot-protocol/mdk/pull/1202), merge `1ccc4065`; focused serialization/preflight/dispatch test; two real disband passes remain live at a 999 ms tick, Alice alone settles at 1,000 ms, and Bob settles on a later tick without another time advance; full simulator suite |
-| 2026-07-30 | 1.2d public outbound lifecycle | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues | Focused subject contract tests; full simulator suite; `just fast-ci` |
+| 2026-07-30 | 1.2d public outbound lifecycle | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues; v1 lifecycle removal is tracked in [MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207) | Focused subject contract tests; full simulator suite; `just fast-ci` |

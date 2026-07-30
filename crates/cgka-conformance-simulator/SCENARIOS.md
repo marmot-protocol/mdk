@@ -454,14 +454,20 @@ These tests keep the simulator machinery honest.
 - `outbound_poll_is_non_destructive_and_acknowledgement_is_idempotent` checks exact application artifacts, repeatable
   polling, same-outcome acknowledgement replay, transport delivery, and disappearance after resolution;
   `outbound_poll_preserves_emission_order_past_single_digit_handles` guards deterministic ordering under a burst.
+- `pending_publication_identity_is_scoped_by_client` forces equal per-engine pending counters on two participants and
+  proves one client's acceptance or rollback cannot resolve, suppress, or remove the other's publication.
 - `evolution_commit_acknowledgement_and_welcome_outcome_are_independent` and
   `no_endpoint_commit_outcome_rolls_back_the_complete_unexposed_publication` check that accepted commits advance local
   state independently of Welcome delivery, while definite unexposed commit failure atomically retracts and rolls back
   the complete publication.
+- `accepted_welcome_blocks_later_definite_commit_failure` treats transport acceptance as exposure evidence: it preserves
+  the accepted Welcome outcome and leaves the state-bearing commit acknowledgeable instead of partially rolling back.
 - `legacy_create_confirms_on_first_welcome_acceptance_and_keeps_other_welcomes_independent` checks the temporary legacy
   creation rule, `empty_legacy_creation_confirms_without_synthetic_outbound_work` covers creation with nothing to
   publish, and `scheduled_group_evolution_waits_for_public_outbound_acknowledgement` proves timer-produced evolution
   work stays pending until the public acknowledgement arrives.
+- `legacy_compatible_subject_does_not_advertise_outbound_publication` keeps capability preflight honest while v1 runners
+  remain on their temporary manual publication lifecycle.
 - `regenerated_queued_intent_retries_then_retires_through_outbound_acknowledgement` proves a queued application is
   re-armed after definite failure, regenerated with a fresh artifact, and retired only after transport acceptance.
 - `no_endpoint_outcome_is_rejected_after_recipient_exposure` prevents a caller from claiming definite non-publication

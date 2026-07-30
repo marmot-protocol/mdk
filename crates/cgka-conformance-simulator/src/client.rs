@@ -89,6 +89,30 @@ pub struct ClientBuilder {
     external_publication_lifecycle: bool,
 }
 
+pub(crate) enum HarnessPublicationError {
+    AlreadyExposed { recipient_exposures: usize },
+    Engine(EngineError),
+}
+
+impl From<EngineError> for HarnessPublicationError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl HarnessPublicationError {
+    fn into_engine_error(self) -> EngineError {
+        match self {
+            Self::AlreadyExposed {
+                recipient_exposures,
+            } => EngineError::Other(format!(
+                "cannot report definite publication failure after {recipient_exposures} matching artifact(s) reached a recipient mailbox"
+            )),
+            Self::Engine(error) => error,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessStorageMode {
     InMemorySqlite,
@@ -779,6 +803,15 @@ impl HarnessClient {
     }
 
     pub async fn try_fail(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
+        self.try_fail_publication(pending)
+            .await
+            .map_err(HarnessPublicationError::into_engine_error)
+    }
+
+    pub(crate) async fn try_fail_publication(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<(), HarnessPublicationError> {
         let message_ids = self
             .pending_publication_artifacts
             .get(&pending)
@@ -786,11 +819,11 @@ impl HarnessClient {
             .unwrap_or_default();
         self.bus
             .retract_undelivered_publication(self.bus_id, &message_ids)
-            .map_err(|delivered| {
-                EngineError::Other(format!(
-                    "cannot report definite publication failure after {delivered} matching artifact(s) reached a recipient mailbox"
-                ))
-            })?;
+            .map_err(
+                |recipient_exposures| HarnessPublicationError::AlreadyExposed {
+                    recipient_exposures,
+                },
+            )?;
         self.engine_mut().publish_failed(pending).await?;
         self.pending_publication_artifacts.remove(&pending);
         self.pending_confirmation_artifacts.remove(&pending);
