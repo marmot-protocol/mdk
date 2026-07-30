@@ -336,6 +336,15 @@ impl EngineMetrics {
         }
     }
 
+    /// Drop the per-group in-memory records for a group that reached a
+    /// terminal state (disband/removal). Both maps grow one entry per live
+    /// group and are never snapshotted; without this hook a long-lived
+    /// process accretes entries for dead groups.
+    pub fn forget_group(&mut self, group_id: &GroupId) {
+        self.last_applied.remove(group_id);
+        self.last_pass_completed_at_ms.remove(group_id);
+    }
+
     /// Aggregate, privacy-safe snapshot for diagnostics and quiescence tuning.
     pub fn snapshot(&self) -> EngineMetricsSnapshot {
         EngineMetricsSnapshot {

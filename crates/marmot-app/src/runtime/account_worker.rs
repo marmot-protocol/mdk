@@ -1930,8 +1930,11 @@ impl ScheduledConvergence {
                 // normal delay but is not unsettled convergence: it never
                 // feeds the re-arm cap, so a healthy queue cannot be demoted
                 // to error backoff (transport failures reach backoff through
-                // the sync/drain error paths instead).
+                // the sync/drain error paths instead). It also clears the
+                // counter: this state means pending inputs are gone, so any
+                // prior unopenable streak genuinely ended.
                 self.retry_attempts.remove(group_id);
+                self.unsettled_rearm_attempts.remove(group_id);
                 self.arm_no_later(group_id.clone(), TokioInstant::now() + self.normal_delay());
                 self.reset_timer_to_earliest();
             }
@@ -2429,6 +2432,18 @@ mod tests {
 
         // A healthy waiting queue re-arms on the normal delay indefinitely
         // without ever being demoted to error backoff.
+        assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
+
+        // Alternating unopenable/outbound states must not accrue the cap
+        // either: an outbound tick means pending inputs cleared, ending any
+        // unopenable streak.
+        for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
+            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingUnopenable);
+            scheduled.take_ready();
+            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.take_ready();
+        }
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
     }
