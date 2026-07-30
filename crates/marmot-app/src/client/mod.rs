@@ -1738,7 +1738,8 @@ impl AppClient {
             // folded are durably applied — broadcast them before surfacing the
             // publish failure, best-effort so a projection error cannot mask
             // the primary error.
-            self.observe_send_applied_effects_best_effort(&effects).await;
+            self.observe_send_applied_effects_best_effort(&effects)
+                .await;
             if let Err(_save_err) = self.app.save_state(&self.state) {
                 tracing::warn!(
                     target: "marmot_app::messages",
@@ -1788,7 +1789,8 @@ impl AppClient {
         // for the account worker to broadcast; dropping the events here leaves
         // storage renamed while chat-list/group-state subscribers never wake.
         // Best-effort: a projection failure must not fail a completed publish.
-        self.observe_send_applied_effects_best_effort(&effects).await;
+        self.observe_send_applied_effects_best_effort(&effects)
+            .await;
         self.app.save_state(&self.state)?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
