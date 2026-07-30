@@ -1699,11 +1699,6 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
             "rolled-back transported commit",
         ),
         (
-            3usize,
-            "pending_work_remaining",
-            "self-remove proposal work",
-        ),
-        (
             4usize,
             "pending_work_remaining",
             "pre-join deferred application object",
@@ -1723,6 +1718,15 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
             report.expectation_failures
         );
     }
+
+    let self_remove_report = run_generated_case_report(&cases[3], None)
+        .await
+        .expect("strict self-remove case reports");
+    assert!(
+        self_remove_report.expectation_failures.is_empty(),
+        "strict self-remove case must retire consumed proposal work: {:?}",
+        self_remove_report.expectation_failures
+    );
 }
 
 #[tokio::test]
