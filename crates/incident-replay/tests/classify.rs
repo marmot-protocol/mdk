@@ -324,6 +324,88 @@ fn both_halt_surfaces_on_one_engine_report_one_entry_per_reason() {
 }
 
 #[test]
+fn a_verified_repair_after_a_halt_clears_the_halt() {
+    // The halt is a state, not a permanent record: rule 5 says the group stays
+    // blocked "until a verified repair clears the marker", and there is exactly
+    // one legal exit from `Unrecoverable` — `repair_to_stable`, driven by an
+    // authenticated Welcome, which emits `epoch_state_changed { new_state:
+    // "stable", reason: "join_welcome_repair" }` right after the transition. An
+    // engine that halted and then completed that repair is repaired, so
+    // quarantining it would send the operator after a device that already
+    // healed. Only this engine appears, at the post-repair epoch, so rule 6
+    // stays unarmed and `Healthy` is the whole verdict.
+    let export = load("healthy-halt-cleared-by-repair.json");
+    assert_eq!(classify(&export), Verdict::Healthy);
+    // The advisory is verdict-independent, so a cleared halt must vanish from it
+    // too — otherwise the CLI would still print the halt beneath a healthy line.
+    assert_eq!(halt_advisory(&export), None);
+}
+
+#[test]
+fn a_halt_after_a_verified_repair_still_quarantines() {
+    // A repaired group can halt again. Both rows are present here exactly as in
+    // the cleared case — only their order differs — so this is the shape a
+    // presence-only "halted, but also repaired ⇒ downgrade" rule gets wrong, and
+    // it gets it wrong on the dangerous side: a device that is halted *right now*
+    // would read as healthy. Ordering the two by their own clock is what
+    // distinguishes them.
+    assert_eq!(
+        classify(&load("quarantine-halt-after-repair.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_verified_repair_in_another_group_does_not_clear_a_halt() {
+    // `Unrecoverable` is per-group state, and one engine serves many groups. Here
+    // the engine re-joined group b — a real repair, for a group that was never
+    // halted — while group a stays blocked. Clearing per engine rather than per
+    // (engine, group) would report this device healthy on the strength of a
+    // repair that never touched the halted group. Both real exports on hand carry
+    // `group_ref` on every event line, so this scoping is live, not latent.
+    assert_eq!(
+        classify(&load("quarantine-halt-with-repair-in-another-group.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn an_untimed_repair_does_not_clear_a_halt() {
+    // Same group, same engine, both rows present — but neither carries a wall
+    // clock, so nothing says which came last, and the two orders have opposite
+    // meanings (see `a_halt_after_a_verified_repair_still_quarantines`). The halt
+    // stands. Note the asymmetry this preserves: *arming* rule 5 needs no
+    // timestamps, because a halt is self-reported and repetition-proof, while
+    // *clearing* it is an ordering claim that untimed rows cannot support. Fail
+    // closed — a missed repair costs a re-pull, a missed halt costs the incident.
+    assert_eq!(
+        classify(&load("quarantine-untimed-halt-with-repair.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
 fn a_convergence_run_at_the_tip_proves_the_engine_is_not_behind() {
     // engine-b's group-state evidence stops at epoch 4, but it went on to run a
     // convergence pass whose canonical tip was 6 — an epoch it can only have

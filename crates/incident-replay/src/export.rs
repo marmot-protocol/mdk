@@ -18,6 +18,27 @@ use serde::Deserialize;
 /// formats and does not depend on Goggles' severity derivation.
 const UNRECOVERABLE_STATE: &str = "unrecoverable";
 
+/// The healthy epoch-machine state. A halt clears only through a transition into
+/// it, but this state alone is *not* the clearing signal — it is by far the
+/// engine's most ordinary state, entered from `publish_confirmed`,
+/// `publish_failed`, `join_welcome`, `founding_create`,
+/// `auto_commit_stage_failed`, and `update_group_data_stage_failed`, none of
+/// which repairs anything. `publish_confirmed` alone is one of the commonest rows
+/// in a healthy export, so matching the bare state would clear every halt on the
+/// engine's next successful publish. Hence the pairing with
+/// [`VERIFIED_REPAIR_REASON`]: the reason is what identifies the repair.
+const STABLE_STATE: &str = "stable";
+
+/// The `reason` the engine stamps on the one legal exit from
+/// [`UNRECOVERABLE_STATE`]. `Engine::join_welcome` routes a halted group's
+/// re-join through `EpochManager::repair_to_stable` — the only caller, and the
+/// only transition the state machine accepts out of `Unrecoverable` — then emits
+/// this `epoch_state_changed { new_state: "stable" }` row unconditionally right
+/// after it succeeds (`cgka-engine/src/group_lifecycle.rs`). So the row is
+/// present exactly when a verified repair completed: an authenticated Welcome
+/// rebuilt the group's state and the durable `unrecoverable` marker is gone.
+const VERIFIED_REPAIR_REASON: &str = "join_welcome_repair";
+
 /// Stand-in reason for a halt whose row carried none. Every emitting surface
 /// populates a reason today; this keeps the lenient model from dropping a halt
 /// on the floor should one ever not.
@@ -54,14 +75,22 @@ pub struct Pagination {
 }
 
 /// One forensic audit event. The classifier reads `kind` plus the envelope's
-/// `engine_id` and `wall_time_ms` (the liveness gates aggregate per-engine
-/// activity from them).
+/// `engine_id`, `group_ref`, and `wall_time_ms` (the liveness gates aggregate
+/// per-engine activity from them).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
     #[serde(default)]
     pub account_ref: Option<String>,
     #[serde(default)]
     pub engine_id: Option<String>,
+    /// The group this row belongs to, when it is group-scoped. The halt
+    /// lifecycle keys on it: `Unrecoverable` is per-group state, so a repair in
+    /// one group says nothing about a halt in another. `None` is therefore its
+    /// own bucket and never a wildcard — an unattributed repair must not clear an
+    /// attributed halt (nor the reverse), which keeps a partially-attributed
+    /// export failing closed the way an untimed one does.
+    #[serde(default)]
+    pub group_ref: Option<String>,
     #[serde(default)]
     pub wall_time_ms: Option<u64>,
     pub kind: EventKind,
@@ -332,6 +361,25 @@ impl EventKind {
             }
             _ => None,
         }
+    }
+
+    /// The engine recorded completing the verified repair that exits
+    /// [`UNRECOVERABLE_STATE`] — the counterpart to
+    /// [`EventKind::unrecoverable_halt_reason`], and the only thing that clears a
+    /// halt.
+    ///
+    /// Both halves of the match are load-bearing: [`STABLE_STATE`] alone is the
+    /// ordinary healthy state and [`VERIFIED_REPAIR_REASON`] is what marks this
+    /// particular transition as the repair.
+    pub fn is_verified_repair(&self) -> bool {
+        matches!(
+            self,
+            EventKind::EpochStateChanged {
+                new_state: Some(new_state),
+                reason: Some(reason),
+                ..
+            } if new_state == STABLE_STATE && reason == VERIFIED_REPAIR_REASON
+        )
     }
 
     /// The group epoch this event reports the engine itself to be at, if it

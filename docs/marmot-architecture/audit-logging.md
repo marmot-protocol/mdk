@@ -605,7 +605,9 @@ Metadata notes:
 - `new_state = "unrecoverable"` is a terminal halt: convergence and ingest stay blocked for that group until a verified
   repair path clears the marker, and `reason = "hydrate_unrecoverable_group"` means the halt was durable and survived a
   process restart. `crates/incident-replay` treats these rows as one of its two halt surfaces (the other being
-  `convergence_run_state` with `phase = "unrecoverable"`) and quarantines the export naming the affected engines.
+  `convergence_run_state` with `phase = "unrecoverable"`) and quarantines the export naming the affected engines —
+  unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
+  `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
   Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
 
 ### `group_state_changed`

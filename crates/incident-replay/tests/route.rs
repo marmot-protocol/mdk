@@ -106,6 +106,18 @@ fn an_accepted_vector_does_not_mask_a_halted_engine() {
 }
 
 #[test]
+fn a_repaired_halt_is_not_reported_as_an_advisory() {
+    // The halt advisory is verdict-independent, so a cleared halt has to vanish
+    // from the advisory path too — suppressing it only from the verdict would
+    // leave the CLI printing `advisory (halt)` under a healthy primary line,
+    // sending the operator after a device that already repaired itself.
+    let routing = routed("healthy-halt-cleared-by-repair.json");
+
+    assert!(matches!(routing.outcome, Outcome::Healthy));
+    assert_eq!(routing.advisories, []);
+}
+
+#[test]
 fn a_halt_verdict_is_not_also_reported_as_its_own_advisory() {
     // When the halt *is* the primary outcome, printing it again as an advisory
     // would just duplicate the line.

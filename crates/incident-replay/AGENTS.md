@@ -155,9 +155,28 @@ Precedence, highest first:
    arm), and `epoch_state_changed` with `new_state:
    unrecoverable` (mdk#1106 — reason `hydrate_unrecoverable_group`, a durable
    halt that survived a restart). Unlike rule 6 this is not an inference from
-   lag: the engine *stated* that it stopped, so the gate needs no timestamps to
-   order evidence and no threshold to clear noise — only an `engine_id` to
-   attribute the halt to. It therefore outranks rule 6, which it usually
+   lag: the engine *stated* that it stopped, so *arming* the gate needs no
+   timestamps to order evidence and no threshold to clear noise — only an
+   `engine_id` to attribute the halt to. **Clearing** it needs more, because
+   "until a verified repair clears the marker" is part of the rule, not a
+   footnote: an engine that halted and then completed the repair is repaired, and
+   reporting it would send the operator after a healed device. The clearing signal
+   is `epoch_state_changed` with `new_state: stable` **and** `reason:
+   join_welcome_repair` — `Engine::join_welcome` routes a halted group's re-join
+   through `EpochManager::repair_to_stable` (its only caller, and the state
+   machine's only accepted exit from `Unrecoverable`) and emits that row
+   unconditionally right after. The `reason` is the whole signal; `new_state:
+   stable` alone is the engine's ordinary healthy state (see the rejected designs
+   below). Clearing is decided per **`(engine_id, group_ref)`** — `Unrecoverable`
+   is per-group state, so a repair in one group must not clear another group's
+   halt — by **newest halt vs. newest repair**, with surviving halts folded back
+   per engine so an engine halted in two groups is still one halted engine with
+   the union of its reasons. Newest-wins needs no global event ordering because a
+   live halt is continuously re-asserted (every session open re-emits
+   `hydrate_unrecoverable_group`; every convergence attempt emits
+   `already_unrecoverable`), so a halt that outlived its repair leaves rows after
+   it. Both rows come from one engine — one clock, one recorder file — so rule 6's
+   cross-device grace does not apply here. It therefore outranks rule 6, which it usually
    explains: on the real 26a9f546 export the halted engine is exactly the one
    rule 6 labelled `went dark`, and reporting the inference over the diagnosis
    would send the operator to re-pull for a confirmation they already have.
@@ -184,7 +203,14 @@ evidence, with its own arming requirement: rule 5 arms on an attributable
 self-reported halt — an `engine_id` plus a halt reason, no timestamps needed —
 while rule 6 needs both an `engine_id` and `wall_time_ms` activity evidence.
 Events missing those fields leave the respective rule unarmed, so synthetic
-fixtures and older exports classify as before. Rule 6 measures lag in
+fixtures and older exports classify as before. Rule 5's asymmetry is deliberate:
+*arming* needs no timestamps, because a halt is self-reported and repetition
+carries no extra meaning, but *clearing* is an ordering claim about two rows and
+absent timestamps therefore fail closed — the halt stands. The same applies to a
+missing `group_ref`: `None` is its own scope, never a wildcard, so an
+unattributed repair cannot clear an attributed halt. The asymmetry is the
+fail-closed direction on purpose — a missed repair costs a re-pull, a missed halt
+costs the incident. Rule 6 measures lag in
 epochs, not wall-clock silence: a device that is offline while nothing is
 committed misses nothing, and an idle group never reads as stale. The ≥ 2
 threshold is derived, not tuned — lag 1 is the propagation noise floor, so 2 is
@@ -234,6 +260,30 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   they fold into one per-engine report rather than two rules that would both fire
   and disagree about precedence. Each distinct reason is listed once: a halt is a
   state, not a count, so repetition is not severity.
+- *Clearing a halt on any `new_state: stable` row.* The obvious reading of "the
+  group returns to stable" is wrong: `stable` is the engine's ordinary state and
+  is entered from `publish_confirmed`, `publish_failed`, `join_welcome`,
+  `founding_create`, `auto_commit_stage_failed`, and
+  `update_group_data_stage_failed` — none of which repairs anything.
+  `publish_confirmed` alone is among the commonest rows in a healthy export, so
+  this rule would clear every halt on the halted engine's next successful publish
+  and delete the gate in practice. Only `reason: join_welcome_repair` marks the
+  transition that actually exited `Unrecoverable`.
+- *A presence-only downgrade* ("the engine halted but a repair row also exists ⇒
+  not halted"). It cannot tell a repaired halt from a re-halt: halt→repair and
+  repair→halt carry identical row sets and opposite meanings, and the rule gets
+  the second one wrong on the worse side, reporting a currently-halted device as
+  healthy. Ordering the newest of each is what separates them, which is why the
+  fixture set carries both orders.
+- *Ordering the two rows by `seq` or by line order.* `seq` is recorder-local and
+  restarts at `0` on every recorder open *within the same file*
+  (`docs/marmot-architecture/audit-logging.md`), so it cannot order rows across a
+  restart — precisely the boundary a durable halt survives, making it wrong exactly
+  where it matters. Line order would be an unverified server guarantee: Goggles
+  does not document the export as clock-ordered, and depending on it would put a
+  correctness claim on someone else's undocumented behaviour. `wall_time_ms` is
+  the engine's own clock, and both rows compared come from one engine, so no
+  cross-device skew enters.
 - *Recognizing `convergence_pass_reopened`* (the non-terminal kind open PR #1182
   adds) ahead of its merge. Its wire shape can still change; it is non-terminal,
   so no rule would read it and the variant would be dead on arrival; and the
