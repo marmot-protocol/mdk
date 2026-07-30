@@ -360,7 +360,7 @@ pub fn parse_report_command(
     let mut cases = 1usize;
     let mut vectors = Vec::new();
     let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
-    let mut strict_oracle = false;
+    let mut strict_oracle = true;
     let mut storage_mode = None;
 
     let mut args = args.into_iter();
@@ -378,6 +378,7 @@ pub fn parse_report_command(
                 )?)?)
             }
             "--strict-oracle" => strict_oracle = true,
+            "--allow-weak-oracle" => strict_oracle = false,
             "--help" | "-h" => return Ok(ReportCommand::Help),
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -410,7 +411,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle]"
+    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle]"
 }
 
 #[cfg(test)]

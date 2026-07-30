@@ -4,6 +4,11 @@
 
 use crate::audit_capture::{AuditCapture, CapturingRecorder};
 use crate::bus::{ClientId, TransportBus};
+use crate::decryptability::DecryptabilityProbeSendStatus;
+use crate::pending_work::PendingWorkObservation;
+use crate::scenario_input_ledger::{
+    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioInputMetadata, ScenarioInputTracker,
+};
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
@@ -56,6 +61,10 @@ pub struct HarnessClient {
     /// automatically after the first create/join.
     default_group: Option<GroupId>,
     app_event_counter: u64,
+    scenario_input_counter: u64,
+    next_scenario_input_id: Option<String>,
+    scenario_input_tracker: ScenarioInputTracker,
+    pending_scenario_inputs: HashMap<PendingStateRef, String>,
     /// Shared in-memory capture of the engine's forensic audit events, used to
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
@@ -252,6 +261,10 @@ impl ClientBuilder {
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
+            scenario_input_counter: 0,
+            next_scenario_input_id: None,
+            scenario_input_tracker: ScenarioInputTracker::default(),
+            pending_scenario_inputs: HashMap::new(),
             audit_capture,
             convergence_checkpoints: HashMap::new(),
         }
@@ -524,6 +537,16 @@ impl HarnessClient {
         self.engine().self_id()
     }
 
+    /// Assign the stable synthetic id consumed by the next commit, proposal, or
+    /// application input this client produces.
+    pub fn name_next_scenario_input(&mut self, scenario_id: impl Into<String>) {
+        assert!(
+            self.next_scenario_input_id.is_none(),
+            "previous scenario input id was not consumed"
+        );
+        self.next_scenario_input_id = Some(scenario_id.into());
+    }
+
     pub async fn fresh_key_package(&mut self) -> KeyPackage {
         let key_package = self.engine_mut().fresh_key_package().await.expect("kp");
         key_package_with_harness_source(key_package)
@@ -634,10 +657,15 @@ impl HarnessClient {
     /// action (create, invite, upgrade) when the simulated transport
     /// "succeeds."
     pub async fn confirm(&mut self, pending: PendingStateRef) {
-        self.engine_mut()
-            .confirm_published(pending)
-            .await
-            .expect("confirm_published");
+        self.try_confirm(pending).await.expect("confirm_published");
+    }
+
+    async fn try_confirm(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
+        self.engine_mut().confirm_published(pending).await?;
+        if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
+            self.scenario_input_tracker.record_confirmed(&scenario_id);
+        }
+        Ok(())
     }
 
     /// Report a publish failure for a pending operation. The engine
@@ -648,6 +676,9 @@ impl HarnessClient {
             .publish_failed(pending)
             .await
             .expect("publish_failed");
+        if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
+            self.scenario_input_tracker.record_rolled_back(&scenario_id);
+        }
     }
 
     /// Issue a `SendIntent::UpgradeCapabilities` for the default group
@@ -666,10 +697,21 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
-                self.bus.send(self.bus_id, route(msg, &gid));
+                let routed = route(msg, &gid);
+                let scenario_input = self
+                    .register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.bus.send(self.bus_id, routed);
                 pending
             }
             other => panic!("expected GroupEvolution from upgrade, got {other:?}"),
@@ -697,7 +739,18 @@ impl HarnessClient {
                     welcomes.is_empty(),
                     "group-data update should not create welcomes"
                 );
-                self.bus.send(self.bus_id, route(msg, &gid));
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                let routed = route(msg, &gid);
+                let scenario_input = self
+                    .register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.bus.send(self.bus_id, routed);
                 pending
             }
             other => panic!("expected GroupEvolution from update_group_data, got {other:?}"),
@@ -730,7 +783,18 @@ impl HarnessClient {
                     welcomes.is_empty(),
                     "admin policy update should not create welcomes"
                 );
-                self.bus.send(self.bus_id, route(msg, &gid));
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                let routed = route(msg, &gid);
+                let scenario_input = self
+                    .register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.bus.send(self.bus_id, routed);
                 Ok(pending)
             }
             other => Err(EngineError::Backend(format!(
@@ -758,6 +822,14 @@ impl HarnessClient {
             .clone()
             .expect("must create or join a group first");
         let payload = self.next_app_payload(payload.into());
+        let (logical_id, logical_payload) = logical_message_fields(&payload);
+        let scenario_input = self.next_scenario_input_metadata(
+            ScenarioInputKind::Application,
+            Some(logical_id),
+            Some(logical_payload),
+        );
+        self.scenario_input_tracker
+            .record_send_attempt(&scenario_input);
         let res = self
             .engine_mut()
             .send(SendIntent::AppMessage {
@@ -768,7 +840,11 @@ impl HarnessClient {
             .expect("send app");
         match res {
             SendResult::ApplicationMessage { msg, .. } => {
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
                 let routed = route(msg, &gid);
+                self.register_published_scenario_input(&routed, scenario_input)
+                    .await;
                 self.bus.send(self.bus_id, routed.clone());
                 routed
             }
@@ -778,23 +854,68 @@ impl HarnessClient {
 
     /// Send an application message to the default group.
     pub async fn send_app(&mut self, payload: impl Into<Vec<u8>>) {
+        let _ = self
+            .try_send_app(payload)
+            .await
+            .expect("send app message through harness");
+    }
+
+    pub async fn request_disband(&mut self) -> Result<(), EngineError> {
+        let group_id = self.default_group.clone().expect("group");
+        match self
+            .engine_mut()
+            .send(SendIntent::Disband { group_id })
+            .await?
+        {
+            SendResult::DisbandRequested { .. } => Ok(()),
+            other => Err(EngineError::Backend(format!(
+                "expected DisbandRequested, got {other:?}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn try_send_app(
+        &mut self,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<(DecryptabilityProbeSendStatus, String), EngineError> {
         let gid = self
             .default_group
             .clone()
-            .expect("must create or join a group first");
+            .ok_or_else(|| EngineError::Other("must create or join a group first".into()))?;
         let payload = self.next_app_payload(payload.into());
+        let (logical_id, logical_payload) = logical_message_fields(&payload);
+        let scenario_input = self.next_scenario_input_metadata(
+            ScenarioInputKind::Application,
+            Some(logical_id.clone()),
+            Some(logical_payload),
+        );
+        self.scenario_input_tracker
+            .record_send_attempt(&scenario_input);
         let res = self
             .engine_mut()
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
             })
-            .await
-            .expect("send app");
-        if let SendResult::ApplicationMessage { msg, .. } = res {
-            self.bus.send(self.bus_id, route(msg, &gid));
-        } else {
-            panic!("expected ApplicationMessage");
+            .await?;
+        match res {
+            SendResult::ApplicationMessage { msg, .. } => {
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                let routed = route(msg, &gid);
+                self.register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.bus.send(self.bus_id, routed);
+                Ok((DecryptabilityProbeSendStatus::Published, logical_id))
+            }
+            SendResult::Queued { .. } => {
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, true);
+                Ok((DecryptabilityProbeSendStatus::Queued, logical_id))
+            }
+            other => Err(EngineError::Backend(format!(
+                "expected ApplicationMessage or Queued, got {other:?}"
+            ))),
         }
     }
 
@@ -831,7 +952,18 @@ impl HarnessClient {
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
-                self.bus.send(self.bus_id, route(msg, &gid));
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                let routed = route(msg, &gid);
+                let scenario_input = self
+                    .register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.bus.send(self.bus_id, routed);
                 Ok(pending)
             }
             other => Err(EngineError::Other(format!(
@@ -856,7 +988,15 @@ impl HarnessClient {
             .await
             .expect("send leave");
         if let SendResult::Proposal { msg } = res {
+            let scenario_input =
+                self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
+            self.scenario_input_tracker
+                .record_send_attempt(&scenario_input);
+            self.scenario_input_tracker
+                .record_send_accepted(&scenario_input, false);
             let routed = route(msg, &gid);
+            self.register_published_scenario_input(&routed, scenario_input)
+                .await;
             self.bus.send(self.bus_id, routed.clone());
             routed
         } else {
@@ -897,7 +1037,12 @@ impl HarnessClient {
         let inbound = self.bus.mailbox(self.bus_id);
         let mut outcomes = Vec::with_capacity(inbound.len());
         for msg in inbound {
+            let scenario_input = self.bus.scenario_input_for_transport(&msg.id);
             let result = self.engine_mut().ingest(msg).await;
+            if let Some(scenario_input) = scenario_input {
+                self.scenario_input_tracker
+                    .record_ingest(&scenario_input, result.as_ref().map_err(|_| ()));
+            }
             if result.is_ok() {
                 self.capture_engine_events();
             }
@@ -1013,12 +1158,40 @@ impl HarnessClient {
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {
         let gid = self.default_group.clone();
         match result {
-            SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
+            SendResult::ApplicationMessage {
+                msg, app_event_id, ..
+            } => {
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
                     msg
                 };
+                let scenario_input = self
+                    .scenario_input_tracker
+                    .metadata_for_logical(&app_event_id)
+                    .ok_or_else(|| {
+                        EngineError::Backend(format!(
+                            "missing scenario-input metadata for regenerated app event {app_event_id}"
+                        ))
+                    })?;
+                self.register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.bus.send(self.bus_id, routed);
+            }
+            SendResult::Proposal { msg } => {
+                let routed = if let Some(gid) = &gid {
+                    route(msg, gid)
+                } else {
+                    msg
+                };
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                self.register_published_scenario_input(&routed, scenario_input)
+                    .await;
                 self.bus.send(self.bus_id, routed);
             }
             SendResult::GroupEvolution {
@@ -1034,8 +1207,18 @@ impl HarnessClient {
                 } else {
                     msg
                 };
+                let scenario_input =
+                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+                self.scenario_input_tracker
+                    .record_send_attempt(&scenario_input);
+                self.scenario_input_tracker
+                    .record_send_accepted(&scenario_input, false);
+                let scenario_input = self
+                    .register_published_scenario_input(&routed, scenario_input)
+                    .await;
+                self.remember_pending_scenario_input(pending, &scenario_input);
                 self.bus.send(self.bus_id, routed);
-                self.engine_mut().confirm_published(pending).await?;
+                self.try_confirm(pending).await?;
                 self.capture_engine_events();
             }
             SendResult::GroupCreated { welcomes, pending } => {
@@ -1068,8 +1251,18 @@ impl HarnessClient {
             } else {
                 auto.msg
             };
+            let scenario_input =
+                self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+            self.scenario_input_tracker
+                .record_send_attempt(&scenario_input);
+            self.scenario_input_tracker
+                .record_send_accepted(&scenario_input, false);
+            let scenario_input = self
+                .register_published_scenario_input(&routed, scenario_input)
+                .await;
+            self.remember_pending_scenario_input(auto.pending, &scenario_input);
             self.bus.send(self.bus_id, routed);
-            if let Err(e) = self.engine_mut().confirm_published(auto.pending).await {
+            if let Err(e) = self.try_confirm(auto.pending).await {
                 outcomes.push(Err(e));
                 continue;
             }
@@ -1082,6 +1275,14 @@ impl HarnessClient {
             } else {
                 msg
             };
+            let scenario_input =
+                self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
+            self.scenario_input_tracker
+                .record_send_attempt(&scenario_input);
+            self.scenario_input_tracker
+                .record_send_accepted(&scenario_input, false);
+            self.register_published_scenario_input(&routed, scenario_input)
+                .await;
             self.bus.send(self.bus_id, routed);
         }
         outcomes
@@ -1099,7 +1300,19 @@ impl HarnessClient {
 
     pub fn members(&self) -> Vec<cgka_traits::group::Member> {
         let gid = self.default_group.clone().expect("group");
-        self.engine().members(&gid).expect("members")
+        match self.engine().members(&gid) {
+            Ok(members) => members,
+            Err(error) => {
+                let record = self.engine().group_record(&gid).unwrap_or_else(|_| {
+                    panic!("members unavailable without terminal group record: {error}")
+                });
+                assert!(
+                    record.disbanded.is_some(),
+                    "members unavailable for non-disbanded group: {error}"
+                );
+                record.members
+            }
+        }
     }
 
     /// Current app-facing group name mirrored from signed group-profile state.
@@ -1119,6 +1332,64 @@ impl HarnessClient {
         self.default_group.clone().expect("group")
     }
 
+    /// Capture the conformance-only canonical state projection for the default
+    /// group without exposing the wrapped engine to scenario code.
+    pub fn canonical_group_snapshot(
+        &self,
+    ) -> cgka_engine::conformance_snapshot::ConformanceGroupSnapshot {
+        let group_id = self.default_group.clone().expect("group");
+        self.engine()
+            .conformance_group_snapshot(&group_id)
+            .expect("capture canonical group snapshot")
+    }
+
+    pub fn canonical_state_snapshot(
+        &self,
+    ) -> cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot {
+        let group_id = self.default_group.clone().expect("group");
+        self.engine()
+            .conformance_canonical_state_snapshot(&group_id)
+            .expect("capture canonical state snapshot")
+    }
+
+    pub fn scenario_input_ledger(&mut self) -> Vec<ScenarioInputLedgerEntry> {
+        let observed_states = self
+            .scenario_input_tracker
+            .state_queries()
+            .into_iter()
+            .map(|(scenario_id, kind, aliases)| {
+                let state = self
+                    .engine()
+                    .conformance_message_state(&aliases)
+                    .expect("capture conformance message state");
+                (scenario_id, kind, state)
+            })
+            .collect::<Vec<_>>();
+        for (scenario_id, kind, state) in observed_states {
+            if let Some(state) = state {
+                self.scenario_input_tracker
+                    .record_storage_state(&scenario_id, kind, state);
+            }
+        }
+        self.scenario_input_tracker.snapshot()
+    }
+
+    pub fn pending_work_observation(&self) -> PendingWorkObservation {
+        let group_id = self.default_group.clone().expect("group");
+        let engine = self
+            .engine()
+            .conformance_pending_work_snapshot(&group_id)
+            .expect("capture conformance pending work");
+        let bus = self.bus.pending_work_snapshot();
+        PendingWorkObservation {
+            engine,
+            bus_queued_messages: bus.queued_messages,
+            bus_delayed_messages: bus.delayed_messages,
+            bus_mailbox_messages: bus.mailbox_messages,
+            scenario_inputs_pending: self.scenario_input_tracker.pending_count(),
+        }
+    }
+
     fn next_app_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {
         let seq = self.app_event_counter;
         self.app_event_counter = self
@@ -1126,6 +1397,63 @@ impl HarnessClient {
             .checked_add(1)
             .expect("app event counter exhausted");
         encode_harness_app_payload(&self.engine().self_id(), seq, payload)
+    }
+
+    async fn register_published_scenario_input(
+        &mut self,
+        message: &TransportMessage,
+        mut metadata: ScenarioInputMetadata,
+    ) -> ScenarioInputMetadata {
+        metadata.aliases = self
+            .engine()
+            .conformance_message_aliases(&message.id)
+            .expect("sender exposes durable scenario-input aliases");
+        let content_id = metadata
+            .aliases
+            .iter()
+            .find(|alias| **alias != message.id)
+            .cloned()
+            .unwrap_or_else(|| message.id.clone());
+        self.bus
+            .register_scenario_input(message.id.clone(), content_id, metadata.clone());
+        self.scenario_input_tracker.record_published(&metadata);
+        metadata
+    }
+
+    fn next_scenario_input_metadata(
+        &mut self,
+        kind: ScenarioInputKind,
+        logical_id: Option<String>,
+        payload: Option<String>,
+    ) -> ScenarioInputMetadata {
+        let sequence = self.scenario_input_counter;
+        self.scenario_input_counter = self
+            .scenario_input_counter
+            .checked_add(1)
+            .expect("scenario input counter exhausted");
+        let sender = logical_label_for_member_id(&self.identity)
+            .unwrap_or_else(|| hex::encode(&self.identity));
+        let scenario_id = self
+            .next_scenario_input_id
+            .take()
+            .unwrap_or_else(|| format!("{sender}/{}-{sequence}", kind.label()));
+        ScenarioInputMetadata {
+            scenario_id,
+            kind,
+            sender,
+            logical_id,
+            payload,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn remember_pending_scenario_input(
+        &mut self,
+        pending: PendingStateRef,
+        metadata: &ScenarioInputMetadata,
+    ) {
+        self.pending_scenario_inputs
+            .insert(pending, metadata.scenario_id.clone());
     }
 
     /// Return a clone of `msg` whose payload is the peeled MLS wire bytes.
@@ -1170,15 +1498,61 @@ impl HarnessClient {
 
 impl HarnessClient {
     fn capture_engine_events(&mut self) {
-        for event in self.engine_mut().drain_events() {
+        let events = self.engine_mut().drain_events();
+        for event in events {
             if let GroupEvent::GroupJoined { group_id, .. } = &event
                 && self.default_group.is_none()
             {
                 self.default_group = Some(group_id.clone());
             }
+            match &event {
+                GroupEvent::MessageReceived { payload, .. } => {
+                    let (logical_id, _) = logical_message_fields(payload);
+                    self.scenario_input_tracker
+                        .record_delivered_logical(&logical_id);
+                }
+                GroupEvent::AppMessageInvalidated {
+                    message_id, reason, ..
+                } => {
+                    if let Some(scenario_input) = self.bus.scenario_input_for_content(message_id) {
+                        self.scenario_input_tracker
+                            .record_app_invalidated(&scenario_input, *reason);
+                    }
+                }
+                GroupEvent::ForkRecovered {
+                    invalidated_commit_id,
+                    ..
+                }
+                | GroupEvent::CommitRolledBack {
+                    invalidated_commit_id,
+                    ..
+                }
+                | GroupEvent::GroupStateInvalidated {
+                    invalidated_commit_id,
+                    ..
+                } => {
+                    if let Some(scenario_input) = self
+                        .bus
+                        .scenario_input_for_transport(invalidated_commit_id)
+                        .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
+                    {
+                        self.scenario_input_tracker
+                            .record_commit_invalidated(&scenario_input, "superseded");
+                    }
+                }
+                _ => {}
+            }
             self.pending_events.push(event);
         }
     }
+}
+
+fn logical_message_fields(payload: &[u8]) -> (String, String) {
+    let event = MarmotAppEvent::decode(payload).expect("harness application payload decodes");
+    (
+        event.id,
+        String::from_utf8_lossy(&decode_harness_app_payload(payload)).into_owned(),
+    )
 }
 
 pub fn encode_harness_app_payload(sender: &MemberId, sequence: u64, payload: Vec<u8>) -> Vec<u8> {

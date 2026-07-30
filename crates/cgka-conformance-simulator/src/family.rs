@@ -47,13 +47,15 @@ pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScena
     let mut out = Vec::with_capacity(cases);
     for case_index in 0..cases {
         let mut rng = StdRng::seed_from_u64(seed ^ ((case_index as u64) << 32));
+        let (mut scenario, mut expected_outcomes) = send_leave_case(&mut rng, case_index as u64);
+        add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
         out.push(GeneratedScenarioCase {
             family_name: "send-leave/v1".into(),
-            generator_version: "1".into(),
+            generator_version: "2".into(),
             seed,
             case_index: case_index as u64,
-            scenario: send_leave_case(&mut rng, case_index as u64),
-            expected_outcomes: vec![],
+            scenario,
+            expected_outcomes,
         });
     }
     out
@@ -82,10 +84,12 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
     let mut out = Vec::with_capacity(cases);
     for case_index in 0..cases {
         let mut rng = StdRng::seed_from_u64(seed ^ 0xC0A7_1CE5 ^ ((case_index as u64) << 32));
-        let (scenario, expected_outcomes) = convergence_chaos_case(&mut rng, case_index as u64);
+        let (mut scenario, mut expected_outcomes) =
+            convergence_chaos_case(&mut rng, case_index as u64);
+        add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-chaos/v1".into(),
-            generator_version: "3".into(),
+            generator_version: "4".into(),
             seed,
             case_index: case_index as u64,
             scenario,
@@ -1198,7 +1202,7 @@ fn shuffled_order(rng: &mut StdRng, len: usize) -> Vec<usize> {
     order
 }
 
-fn send_leave_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
+fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = vec!["alice".to_string(), "bob".to_string(), "carol".to_string()];
     let mut steps = vec![
         ScenarioStep::CreateGroup {
@@ -1220,19 +1224,23 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
     ];
 
     let send_count = 2 + rng.gen_range(0..=2);
+    let mut sends = Vec::with_capacity(send_count);
     for send_index in 0..send_count {
         let sender = clients[rng.gen_range(0..clients.len())].clone();
         let marker: u16 = rng.r#gen();
+        let payload = format!("case-{case_index}:send-{send_index}:{sender}:{marker}");
         steps.push(ScenarioStep::SendAppMessage {
             sender: sender.clone(),
-            payload: format!("case-{case_index}:send-{send_index}:{sender}:{marker}"),
+            payload: payload.clone(),
         });
+        sends.push((sender, payload));
     }
 
     if send_count > 1 && rng.gen_bool(0.5) {
         steps.push(ScenarioStep::ReorderQueued {
             order: (0..send_count).rev().collect(),
         });
+        sends.reverse();
     }
     steps.push(ScenarioStep::DeliverAll);
     steps.push(ScenarioStep::Tick {
@@ -1267,13 +1275,94 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
     };
 
     steps.push(ScenarioStep::Observe {
-        clients: observe_clients,
+        clients: observe_clients.clone(),
     });
 
-    ScenarioSpec {
-        name: format!("send-leave/v1/case-{case_index}"),
-        spec_version: "1".into(),
-        clients,
-        steps,
+    let epoch = u64::from(leaver.is_some()) + 1;
+    let member_count = clients.len() - usize::from(leaver.is_some());
+    let mut expected = vec![confirmed(1, "alice", "create")];
+    for client in &observe_clients {
+        expected.push(client_state(
+            client,
+            epoch,
+            member_count,
+            sends
+                .iter()
+                .filter(|(sender, _)| sender != client)
+                .map(|(_, payload)| payload.clone())
+                .collect(),
+        ));
     }
+
+    (
+        ScenarioSpec {
+            name: format!("send-leave/v1/case-{case_index}"),
+            spec_version: "1".into(),
+            clients,
+            steps,
+        },
+        expected,
+    )
+}
+
+/// Turn a generated reliability scenario's claimed settled state into a
+/// strict black-box assertion. The extra drain is deliberate: exact state and
+/// quiescence are sampled only after every attached client has had a final
+/// chance to consume retained transport.
+fn add_strict_reliability_oracle(
+    scenario: &mut ScenarioSpec,
+    expected: &mut Vec<TraceExpectation>,
+) {
+    let exact_clients = expected
+        .iter()
+        .find_map(|expectation| match expectation {
+            TraceExpectation::ClientsConverged { clients, .. } => Some(clients.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            expected.iter().find_map(|expectation| match expectation {
+                TraceExpectation::ClientState { member_count, .. }
+                    if *member_count == scenario.clients.len() =>
+                {
+                    Some(scenario.clients.clone())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| {
+            expected
+                .iter()
+                .filter_map(|expectation| match expectation {
+                    TraceExpectation::ClientState { client, .. } => Some(client.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        });
+
+    if exact_clients.is_empty() {
+        return;
+    }
+
+    scenario.steps.push(ScenarioStep::DeliverAll);
+    scenario.steps.push(ScenarioStep::Tick {
+        clients: scenario.clients.clone(),
+    });
+    scenario.steps.push(ScenarioStep::DeliverAll);
+    scenario.steps.push(ScenarioStep::Tick {
+        clients: scenario.clients.clone(),
+    });
+    scenario.steps.push(ScenarioStep::ObserveExact {
+        clients: exact_clients.clone(),
+    });
+
+    if exact_clients.len() >= 2 {
+        expected.push(TraceExpectation::ClientsExactlyEquivalent {
+            clients: exact_clients.clone(),
+        });
+    }
+    expected.push(TraceExpectation::NoPendingWork {
+        clients: exact_clients,
+    });
 }

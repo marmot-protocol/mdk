@@ -18,7 +18,7 @@ fn parse_defaults_to_send_leave_family() {
                 cases: 1,
             },
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
-            strict_oracle: false,
+            strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
@@ -47,7 +47,7 @@ fn parse_custom_report_args() {
                 cases: 3,
             },
             out: PathBuf::from("target/custom"),
-            strict_oracle: false,
+            strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
@@ -80,7 +80,7 @@ fn parse_vector_fixture_report_args() {
                 paths: vec![PathBuf::from("crates/cgka-conformance-simulator/vectors")],
             },
             out: PathBuf::from("target/vector-reports"),
-            strict_oracle: false,
+            strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
@@ -108,6 +108,21 @@ fn parse_strict_oracle_report_args() {
             storage_mode: HarnessStorageMode::InMemorySqlite,
         })
     );
+}
+
+#[test]
+fn parse_allow_weak_oracle_report_args() {
+    let command = parse_report_command([
+        "--family".into(),
+        "send-leave/v1".into(),
+        "--allow-weak-oracle".into(),
+    ])
+    .expect("weak oracle opt-out args parse");
+
+    let ReportCommand::Run(args) = command else {
+        panic!("expected run command");
+    };
+    assert!(!args.strict_oracle);
 }
 
 #[test]
@@ -186,7 +201,14 @@ async fn report_runner_writes_send_leave_json_reports() {
     .await
     .expect("runner writes reports");
     assert_eq!(summary.total(), 2);
-    assert_eq!(summary.failed(), 0);
+    assert_eq!(summary.failed(), 1);
+    assert!(summary.scenarios[0].failures.is_empty());
+    assert!(
+        summary.scenarios[1]
+            .failures
+            .iter()
+            .any(|failure| failure.kind == "pending_work_remaining")
+    );
 
     let case0 = out_dir.join("send-leave-v1-seed-42-case-0.json");
     let case1 = out_dir.join("send-leave-v1-seed-42-case-1.json");
@@ -224,7 +246,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
 
     let summary = run_report(&ReportArgs {
         input: ReportInput::GeneratedFamily {
-            family: "send-leave/v1".into(),
+            family: "convergence-e2e-delivery/v1".into(),
             seed: 42,
             cases: 1,
         },

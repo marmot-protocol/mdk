@@ -22,6 +22,22 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
     `GroupEvolution`.
 
+- **Module:** `src/scenario_input_ledger.rs`
+  - **Role:** Simulator-owned per-client application-message accounting. Joins the inner Marmot event id to outer
+    transport and peeled MLS content ids, then records send/queue/publication, ingest/defer/resource outcomes,
+    delivery/deduplication/expiry/invalidation, and pending state without adding production engine hooks.
+
+- **Module:** `src/pending_work.rs`
+  - **Role:** Instantaneous strict progress observation combining the conformance engine snapshot, global bus
+    queue/delay/mailbox counts, and per-client logical pending entries. It reports blockers for `NoPendingWork`; it does
+    not implement virtual-time quiescence waiting.
+
+- **Module:** `src/decryptability.rs`
+  - **Role:** Serializable active application-message probe results. A
+    `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
+    client, and records each directed sender-to-recipient edge by exact logical event id and recipient ledger
+    disposition. This is a mutating probe, not a passive observation.
+
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for
     tests. These tests pin selector policy independently from OpenMLS replay.
@@ -30,7 +46,9 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
   - **Role:** Deterministic generated scenario families. `generate_send_leave_family`,
     `generate_convergence_e2e_delivery_family`, and `generate_convergence_chaos_family` record family name, generator
     version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
-    adds generated metadata to report artifacts.
+    adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
+    observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
+    observation passed.
 
 - **Module:** `src/oracle.rs`
   - **Role:** Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed
@@ -51,11 +69,14 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
   - **Role:** Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report` /
     `run_vector_fixture_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a
     `ScenarioTrace` or a serializable report with the executed scenario, metadata, step log, flattened epoch changes,
-    app invalidations, recoveries, expectation failures, and invariant failures.
+    app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
+    into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
+    `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
 
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
-    facts plus member additions/removals, client convergence, epoch changes, app invalidations, and
+    facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
+    commit/proposal/application input dispositions, pending-work blockers, active decryptability matrices, and
     `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`.
 
 - **Module:** `src/policy_cases.rs`
@@ -171,7 +192,8 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 ```
 
 Generated-family runs write both `*-case-N.json` reports and `*-case-N-fixture.v1.json` candidates that can be promoted
-into `vectors/` after review.
+into `vectors/` after review. Oracle coverage is strict by default; use `--allow-weak-oracle` only for an explicitly
+exploratory run.
 
 Run portable vector fixtures:
 

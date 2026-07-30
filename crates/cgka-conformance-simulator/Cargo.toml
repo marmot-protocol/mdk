@@ -13,7 +13,7 @@ conformance-slow = []
 
 [dependencies]
 cgka-traits.workspace = true
-cgka-engine.workspace = true
+cgka-engine = { workspace = true, features = ["test-conformance-snapshot"] }
 marmot-forensics.workspace = true
 storage-sqlite.workspace = true
 transport-nostr-peeler.workspace = true

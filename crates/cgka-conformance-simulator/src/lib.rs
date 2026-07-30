@@ -9,6 +9,8 @@
 //!   partition support, broadcast / addressed delivery for welcomes.
 //! - [`client`] - [`client::HarnessClient`] wrapping `Engine<SqliteAccountStorage>`
 //!   plus the real Nostr transport peeler over the in-memory bus.
+//! - active bidirectional decryptability probes that exercise the complete
+//!   application-message path and retain per-edge ledger evidence.
 //! - [`canonicalization`] - executable model of the CGKA canonicalization
 //!   contract above the branch selector, re-exported from `cgka-engine`.
 //! - [`convergence`] - candidate-state graph scoring rules, re-exported
@@ -21,17 +23,29 @@
 mod audit_capture;
 pub mod bus;
 pub mod client;
+mod decryptability;
 pub mod family;
 pub mod oracle;
+mod pending_work;
 pub mod policy_cases;
 pub mod proptest_support;
 pub mod report;
 pub mod scenario;
+mod scenario_input_ledger;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
+pub use cgka_engine::conformance_snapshot::{
+    ConformanceAppComponent, ConformanceCanonicalStateSnapshot, ConformanceDisbandedGroupSnapshot,
+    ConformanceGroupSnapshot, ConformanceLeafCapabilities, ConformanceLeafSnapshot,
+    ConformancePendingWorkSnapshot, ConformanceRequiredCapabilities,
+};
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
+pub use decryptability::{
+    BidirectionalDecryptabilityObservation, DecryptabilityProbeSendStatus,
+    DirectionalDecryptabilityProbe,
+};
 pub use family::{
     GeneratedScenarioCase, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
@@ -43,6 +57,7 @@ pub use oracle::{
     coverage_matrix_entry, expected_behaviors, property_test_coverage_entries, scenario_stimuli,
     trace_behaviors,
 };
+pub use pending_work::PendingWorkObservation;
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,
@@ -55,10 +70,14 @@ pub use scenario::{
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_storage_mode,
     run_scenario_spec, run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
 };
+pub use scenario_input_ledger::{
+    ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+};
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,
     ConvergenceDecisionObservation, EpochChangeObservation, ExpectationFailure,
     ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioTrace, TraceExpectation,
     VectorFixture, VectorMismatch, compare_trace_expectations, observe_client,
+    observe_client_exact,
 };
