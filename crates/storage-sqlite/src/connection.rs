@@ -338,17 +338,14 @@ where
     F: FnMut() -> rusqlite::Result<()>,
 {
     retry_on_busy(|| {
-        execute().map_err(|error| {
-            let detail = error.to_string();
-            match crate::codec::map_sqlite_error(error) {
-                StorageError::Busy(_) => {
-                    StorageError::Busy(format!("sqlite transaction {sql}: {detail}"))
-                }
-                StorageError::Backend(_) => {
-                    StorageError::Backend(format!("sqlite transaction {sql}: {detail}"))
-                }
-                _ => unreachable!("SQLite errors map only to Busy or Backend"),
+        execute().map_err(|error| match crate::codec::map_sqlite_error(error) {
+            StorageError::Busy(detail) => {
+                StorageError::Busy(format!("sqlite transaction {sql}: {detail}"))
             }
+            StorageError::Backend(detail) => {
+                StorageError::Backend(format!("sqlite transaction {sql}: {detail}"))
+            }
+            other => StorageError::Backend(format!("sqlite transaction {sql}: {other}")),
         })
     })
 }
