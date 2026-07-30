@@ -1608,6 +1608,10 @@ where
         Ok(self.session.has_pending_convergence_inputs(group_id)?)
     }
 
+    pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
     pub fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,

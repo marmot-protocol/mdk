@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Group state changes settle promptly again when messages are queued for
+  sending: a queued ordinary message no longer delays the next convergence
+  pass (only an admin group-state change may briefly hold that boundary, as
+  the protocol requires), and busy groups are no longer demoted to retry
+  backoff while convergence is legitimately still collecting.
+  
 ### Added
 
 - MarmotKit and the agent connector now acquire a nonblocking, kernel-released

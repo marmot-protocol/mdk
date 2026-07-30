@@ -60,6 +60,7 @@ use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
+pub(crate) use sync::ConvergenceScheduleState;
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
 
