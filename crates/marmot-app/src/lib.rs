@@ -3715,7 +3715,7 @@ impl MarmotApp {
         {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
-        let deleted = storage.delete_local_group_data(group_id_hex)?;
+        let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4095,9 +4095,16 @@ impl MarmotApp {
         group_id_hex: &str,
         now: u64,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         Ok(self
-            .account_storage(label)?
-            .secure_prune_expired_app_events(group_id_hex, now)?
+            .account_storage(&account.label)?
+            .secure_prune_expired_app_events(
+                group_id_hex,
+                now,
+                &account.account_id_hex,
+                &classifier,
+            )?
             .into())
     }
 

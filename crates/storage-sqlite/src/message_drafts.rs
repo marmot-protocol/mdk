@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn message_draft_round_trips_and_deletes_with_group() {
+    fn message_draft_round_trips_and_survives_projection_pruning() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let group_id_hex = "11".repeat(16);
         storage
@@ -647,7 +647,12 @@ mod tests {
         assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
 
         storage
-            .save_message_draft(&group_id_hex, "cascade", None, &[])
+            .save_message_draft(
+                &group_id_hex,
+                "protected",
+                None,
+                std::slice::from_ref(&attachment),
+            )
             .unwrap();
         storage
             .save_account_projection_state(
@@ -661,7 +666,40 @@ mod tests {
                 MAX_FUTURE_SKEW_SECS,
             )
             .unwrap();
-        assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
+        let protected = storage.message_draft(&group_id_hex).unwrap().unwrap();
+        assert_eq!(protected.content, "protected");
+        assert_eq!(protected.media_attachments, vec![attachment]);
+        assert_eq!(
+            storage
+                .load_account_projection_state("alice", 100)
+                .unwrap()
+                .groups
+                .len(),
+            1,
+            "the draft-owning projection row must remain for the foreign key"
+        );
+
+        storage.delete_message_draft(&group_id_hex).unwrap();
+        storage
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![],
+                },
+                100,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        assert!(
+            storage
+                .load_account_projection_state("alice", 100)
+                .unwrap()
+                .groups
+                .is_empty(),
+            "the formerly protected row must become stale after draft deletion"
+        );
     }
 
     #[test]

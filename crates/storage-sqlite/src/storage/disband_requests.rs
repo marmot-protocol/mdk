@@ -311,6 +311,7 @@ mod tests {
             store
                 .delete_local_group_data(&hex::encode(group.id.as_slice()))
                 .unwrap()
+                .did_delete()
         );
 
         assert!(store.list_disband_candidates(&group.id).unwrap().is_empty());

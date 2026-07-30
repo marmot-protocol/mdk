@@ -78,6 +78,8 @@ mod migration_0038_chat_list_interaction_state;
 mod migration_0039_chat_pin_positions;
 #[path = "migrations/0040_disband_requests.rs"]
 mod migration_0040_disband_requests;
+#[path = "migrations/0041_secure_delete_checkpoint_intents.rs"]
+mod migration_0041_secure_delete_checkpoint_intents;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -289,6 +291,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 40,
         name: "0040_disband_requests",
         apply: migration_0040_disband_requests::apply,
+    },
+    Migration {
+        version: 41,
+        name: "0041_secure_delete_checkpoint_intents",
+        apply: migration_0041_secure_delete_checkpoint_intents::apply,
     },
 ];
 
@@ -849,6 +856,37 @@ mod tests {
             "message_draft_attachments",
             "plaintext"
         ));
+    }
+
+    #[test]
+    fn secure_delete_checkpoint_intents_table_is_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'secure_delete_checkpoint_intents'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        let columns = conn
+            .prepare("PRAGMA table_info(secure_delete_checkpoint_intents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "intent_nonce"));
+        assert!(!columns.iter().any(|column| column == "generation"));
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "checkpoint_completed")
+        );
     }
 
     #[test]

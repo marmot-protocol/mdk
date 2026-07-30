@@ -1267,6 +1267,37 @@ fn unread_summary_tx(
     })
 }
 
+pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<()> {
+    let read_state = read_state_tx(tx, group_id_hex)?;
+    let unread = unread_summary_tx(
+        tx,
+        local_account_id_hex,
+        group_id_hex,
+        read_state.as_ref(),
+        mention_classifier,
+    )?;
+    tx.execute(
+        "UPDATE chat_list_rows
+         SET unread_count = ?2,
+             unread_mention_count = ?3,
+             first_unread_message_id_hex = ?4
+         WHERE group_id_hex = ?1",
+        params![
+            group_id_hex,
+            u64_to_i64(unread.count)?,
+            u64_to_i64(unread.mention_count)?,
+            unread.first_message_id
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
 fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
     let mut stmt = tx
         .prepare(

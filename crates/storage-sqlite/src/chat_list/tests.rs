@@ -554,10 +554,14 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
         assert_eq!(row.conversation_created_at, 5);
         assert_eq!(row.activity_sort_at, 100);
 
-        store.secure_prune_app_events_before(GROUP, 101).unwrap();
+        store
+            .secure_prune_app_events_before(GROUP, 101, LOCAL, &no_mentions)
+            .unwrap();
         row = store.chat_list_row(GROUP).unwrap().expect("chat row");
         assert_eq!(row.last_message, None);
-        assert_eq!(row.unread_count, u64::from(!mark_read));
+        assert_eq!(row.unread_count, 0);
+        assert_eq!(row.unread_mention_count, 0);
+        assert_eq!(row.first_unread_message_id_hex, None);
         assert_eq!(row.activity_sort_at, 100);
 
         if mark_read {
@@ -973,6 +977,43 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
         .expect("chat row");
     assert_eq!(row.unread_count, 0);
     assert_eq!(row.last_read_message_id_hex.as_deref(), Some("new"));
+}
+
+#[test]
+fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
+    let store = setup_store();
+    let mentions = |plaintext: &str, _tags: &[Vec<String>]| plaintext.contains("@local");
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("pruned-unread", REMOTE, 10, "hello @local"))
+        .unwrap();
+    store
+        .record_app_event(&chat("surviving-unread", REMOTE, 20, "hello"))
+        .unwrap();
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(before.unread_count, 2);
+    assert_eq!(before.unread_mention_count, 1);
+    assert_eq!(
+        before.first_unread_message_id_hex.as_deref(),
+        Some("pruned-unread")
+    );
+
+    store
+        .secure_prune_app_events_before(GROUP, 15, LOCAL, &mentions)
+        .unwrap();
+
+    let after = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(after.unread_count, 1);
+    assert_eq!(after.unread_mention_count, 0);
+    assert_eq!(
+        after.first_unread_message_id_hex.as_deref(),
+        Some("surviving-unread")
+    );
 }
 
 #[test]
@@ -1984,7 +2025,7 @@ fn archiving_and_deleting_clear_pins_without_restoring_them() {
         .unwrap();
     assert!(!store.chat_list_row("33").unwrap().unwrap().pinned);
 
-    assert!(store.delete_local_group_data("11").unwrap());
+    assert!(store.delete_local_group_data("11").unwrap().did_delete());
     let pin_count = {
         let conn = store.lock().unwrap();
         conn.query_row(

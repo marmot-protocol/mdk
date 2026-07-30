@@ -1,5 +1,9 @@
 use super::*;
 
+fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+    false
+}
+
 fn chat(id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -2005,7 +2009,9 @@ fn pruning_modifier_event_cascades_its_edges() {
         .unwrap();
     assert_eq!(modifier_edge_count(&store, "reaction-old"), 1);
 
-    store.prune_app_events_before(&"11".repeat(32), 50).unwrap();
+    store
+        .prune_app_events_before(&"11".repeat(32), 50, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(
         modifier_edge_count(&store, "reaction-old"),
