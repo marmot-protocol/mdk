@@ -76,6 +76,14 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+    /// Sync summary for group events the engine applied as a side effect of an
+    /// outbound send: a send that lands while inbound convergence input is
+    /// retained folds those commits before publishing, so its effects can carry
+    /// peer `GroupStateChanged` / `EpochChanged` events. The runtime account
+    /// worker drains this after each command and broadcasts it like an inbound
+    /// sync summary so live chat-list/group-state subscriptions observe the
+    /// applied commits.
+    pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
@@ -1762,8 +1770,16 @@ impl AppClient {
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
+        // A send that lands while inbound convergence input is retained folds
+        // those commits before publishing, so `effects.events` can carry peer
+        // state changes (e.g. a mid-window group rename). Observe them through
+        // the same pipeline as inbound deliveries — state group refresh plus
+        // kind-1210 system-row synthesis (replacing the narrower
+        // `queue_own_group_system_projection_updates`) — and buffer the summary
+        // for the account worker to broadcast; dropping the events here leaves
+        // storage renamed while chat-list/group-state subscribers never wake.
+        self.observe_send_applied_effects(&effects).await?;
         self.app.save_state(&self.state)?;
-        self.queue_own_group_system_projection_updates(&effects);
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,

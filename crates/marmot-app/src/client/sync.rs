@@ -259,6 +259,57 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Observe group events the engine applied as a side effect of an outbound
+    /// send and buffer them for the account worker to broadcast.
+    ///
+    /// A send that lands while inbound convergence input is retained folds the
+    /// retained commits before publishing, so its effects can carry peer
+    /// `GroupStateChanged` / `EpochChanged` events (e.g. a group rename applied
+    /// mid-window). Those events never pass through the inbound ingest or
+    /// scheduled-convergence seams, so without this pass they reach no runtime
+    /// subscriber: storage shows the new state while chat-list and group-state
+    /// subscriptions stay silent. Runs the same observe pipeline as those seams
+    /// — state group refresh, push-gossip handling, kind-1210 system-row
+    /// synthesis (a deterministic upsert) — and merges the result into
+    /// `pending_applied_sync_summary`. The caller persists state afterwards.
+    pub(crate) async fn observe_send_applied_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if effects.events.is_empty() {
+            return Ok(());
+        }
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        // Synthetic source identity: these events have no single inbound
+        // transport message (see `drain_pending_session_events`).
+        let source_message_id_hex = String::new();
+        let source_received_at = unix_now_seconds();
+        let routes_dirty = self
+            .observe_account_device_effects(
+                effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
+        self.pending_applied_sync_summary.merge(summary);
+        Ok(())
+    }
+
+    /// Drain the buffered summary of send-applied group events. Called by the
+    /// account worker after each command so the events broadcast on the same
+    /// seam that published the command's response.
+    pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
+        std::mem::take(&mut self.pending_applied_sync_summary)
+    }
+
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
     /// component lookup fails (e.g. the group is quarantined and not live).
     /// Used by the no-inbound drain path where a missing projection must not

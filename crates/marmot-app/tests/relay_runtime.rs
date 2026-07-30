@@ -3422,6 +3422,81 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
     runtime.shutdown().await;
 }
 
+/// A member send that lands while a peer's rename commit sits in the
+/// convergence collection window folds that commit inside the send, so its
+/// group events surface through the send's effects rather than the inbound
+/// ingest or scheduled-convergence seams. The runtime must still broadcast
+/// them: bob's group-state subscription has to observe the rename even though
+/// his own send — not a receive — applied it.
+#[tokio::test]
+async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "interleaved send",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let mut group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .unwrap();
+
+    runtime
+        .update_group_profile(
+            &alice_id,
+            &group_id,
+            Some("renamed mid send".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    // Give the rename commit time to reach bob's collection window, then send
+    // from bob while the window is still open so the send folds the commit.
+    // If timing shifts and convergence applies the commit first, the rename
+    // still broadcasts through the scheduled-convergence seam — either way the
+    // subscription must deliver it.
+    sleep(Duration::from_millis(300)).await;
+    runtime
+        .send_message(&bob_id, &group_id, b"bob interleaved".to_vec())
+        .await
+        .unwrap();
+
+    let updated = wait_for_group_state_update(&mut group_state, |group| {
+        group.profile.name == "renamed mid send"
+    })
+    .await;
+    assert_eq!(updated.group_id_hex, group_id_hex);
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     let dir = tempfile::tempdir().unwrap();

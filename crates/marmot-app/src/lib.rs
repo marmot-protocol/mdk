@@ -1295,6 +1295,7 @@ impl MarmotApp {
             transport_signer: open.signer,
             state: open.state,
             pending_projection_updates: Vec::new(),
+            pending_applied_sync_summary: SyncSummary::default(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),

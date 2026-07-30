@@ -615,6 +615,7 @@ async fn run_app_runtime_account_worker(
         .retry_pending_push_registration_shares_best_effort()
         .await;
     scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
+    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -771,6 +772,12 @@ async fn run_app_runtime_account_worker(
                                 .retry_pending_push_registration_shares_best_effort()
                                 .await;
                             scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
+                            publish_client_pending_applied_summary(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
                         }
                     }
                     Err(err) => {
@@ -921,6 +928,12 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         let _ = summary;
                         publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        publish_client_pending_applied_summary(
                             &mut client,
                             &events,
                             &account_id_hex,
@@ -1714,6 +1727,10 @@ async fn handle_account_worker_command(
             let _ = respond.send(Ok(()));
         }
     }
+    // Publishing from this seam — rather than inside each send arm — keeps
+    // every command path covered; the summary is empty for commands that
+    // applied nothing.
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
 }
 
 #[derive(Debug, Clone)]
@@ -2197,6 +2214,22 @@ fn publish_client_pending_projection_updates(
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
     }
+}
+
+/// Broadcast group events a send applied as a side effect (retained inbound
+/// convergence commits folded before publishing). Called from every worker seam
+/// that can run a send — the command chokepoint, the receive arm's post-join
+/// push retry, the maintenance tick, and startup — so the applied events reach
+/// chat-list/group-state subscribers instead of buffering indefinitely. A no-op
+/// when the buffered summary is empty.
+fn publish_client_pending_applied_summary(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    let summary = client.take_pending_applied_sync_summary();
+    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
