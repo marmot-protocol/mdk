@@ -2284,6 +2284,15 @@ fn publish_app_runtime_summary(
             event: event.clone(),
         }));
     }
+    for escalation in &summary.epoch_stall_escalations {
+        let _ = events.send(MarmotAppEvent::EpochStallEscalated {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            group_id: escalation.group_id.clone(),
+            stalled_epoch: escalation.stalled_epoch,
+            arms: escalation.arms,
+        });
+    }
 }
 
 fn publish_app_runtime_projection_update(
@@ -2423,6 +2432,40 @@ mod tests {
         let message = account_error_message("runtime receive failed", &err);
         assert_eq!(message, "runtime receive failed: transport");
         assert!(!message.contains("private-relay.example"), "{message}");
+    }
+
+    #[test]
+    fn a_summary_escalation_reaches_subscribers_as_one_typed_event() {
+        // The escalation rides the sync summary that observed it, so every worker
+        // seam that publishes a summary publishes it. Without this fan-out the
+        // signal would stop inside the client — the silent failure the
+        // escalation exists to end.
+        let (events, mut subscriber) = broadcast::channel(4);
+        let summary = SyncSummary {
+            epoch_stall_escalations: vec![crate::EpochStallEscalation {
+                group_id: test_group_id(3),
+                stalled_epoch: 12,
+                arms: 3,
+            }],
+            ..SyncSummary::default()
+        };
+
+        publish_app_runtime_summary(&events, "account-id", "label", &summary);
+
+        assert_eq!(
+            subscriber.try_recv().unwrap(),
+            MarmotAppEvent::EpochStallEscalated {
+                account_id_hex: "account-id".to_owned(),
+                account_label: "label".to_owned(),
+                group_id: test_group_id(3),
+                stalled_epoch: 12,
+                arms: 3,
+            }
+        );
+        assert!(
+            subscriber.try_recv().is_err(),
+            "one escalation must publish exactly one event"
+        );
     }
 
     #[test]

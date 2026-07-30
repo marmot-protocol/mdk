@@ -10,6 +10,20 @@
 //! epoch does not advance, and signals a backfill once that count crosses a
 //! threshold.
 //!
+//! It also decides when that recovery is not working. A device can arm backfill
+//! after backfill and still trail the group — the replay recovers some backlog,
+//! the device advances an epoch, and the next epoch stalls just the same. The
+//! detector counts the arms in such a run and escalates once it reaches
+//! [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`], so the runtime can report a group
+//! that full-history replay cannot repair instead of retrying it silently.
+//!
+//! All of this state is process-local, like the stall counts it extends: a
+//! restart forgets an escalated run, so a group that is still stalled escalates
+//! once more on the next run it accumulates. That is the intended trade — the
+//! report is cheap and the group genuinely still needs repair — and the
+//! `epoch_stall_backfill_escalated` audit row the caller writes is the durable
+//! record of every escalation across restarts.
+//!
 //! The policy is deliberately I/O-free so it can be unit-tested in isolation;
 //! the recovery action it triggers — a full-history transport replay — lives in
 //! the caller, which owns the runtime.
@@ -35,6 +49,47 @@ use cgka_traits::{EpochId, GroupId};
 /// treated as general.
 pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 
+/// Backfills a group may arm in one unrecovered run — arms with no epoch the
+/// device passed through cleanly in between — before the runtime reports the
+/// full-history replay as insufficient and escalates to the app.
+///
+/// Empirical, like `EPOCH_STALL_BACKFILL_THRESHOLD`, and chosen from the
+/// 2026-07-29 field cohort: one device armed at stalled epochs 10, 11, and 12
+/// while staying nine epochs behind for hours, and a second armed a fourth time
+/// with no new ingests in between — so both cases are worth escalating by their
+/// third arm. Two would escalate a single unlucky follow-up (a commit landing
+/// mid-replay legitimately leaves one arm's replay short of the tip); four costs
+/// another stalled epoch, each of which needs a genuine commit plus a fresh
+/// stall run, so it delays the report by the same hours the field devices lost.
+///
+/// Safety is structural on both sides: escalation only *reports*, it never
+/// changes recovery behavior — the stronger heal (key-package rotation plus full
+/// re-activation) stays an app decision — and an arm run cannot be inflated by
+/// minted traffic, because each additional arm requires a real epoch advance,
+/// which only an authenticated commit produces.
+pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
+
+/// What one undecryptable-traffic observation decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackfillDecision {
+    /// Nothing to do: the group has not (yet) crossed its stall threshold, or a
+    /// backfill for this stalled epoch was already signalled.
+    Skip,
+    /// Arm one account-wide full-history backfill.
+    Arm,
+    /// Arm, and report that repeated arming is not recovering this group:
+    /// `arms` backfills have been armed without the device passing cleanly
+    /// through a single epoch.
+    ArmAndEscalate { arms: u32 },
+}
+
+impl BackfillDecision {
+    /// Whether this decision arms a full-history backfill.
+    pub(crate) fn arms_backfill(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+}
+
 /// Per-group stall accounting.
 struct GroupStall {
     /// The epoch the undecryptable messages accumulated at; a new epoch resets
@@ -47,19 +102,91 @@ struct GroupStall {
     /// The epoch a backfill was last signalled for, so the detector signals at
     /// most once per stalled epoch.
     fired_at_epoch: Option<EpochId>,
+    /// The epoch this group last *armed* a backfill at. Distinct from
+    /// `fired_at_epoch`, which also absorbs the storm-collapse suppression a
+    /// replay applies to groups that never armed.
+    armed_at_epoch: Option<EpochId>,
+    /// Arms in the current unrecovered run: arms with no epoch the device left
+    /// without arming at it (see [`GroupStall::observe_epoch`]).
+    arms: u32,
+    /// Whether the current run already escalated, so a run that keeps arming
+    /// reports once rather than on every further arm.
+    escalated: bool,
+}
+
+impl GroupStall {
+    fn new(epoch: EpochId) -> Self {
+        Self {
+            epoch,
+            undecryptable: HashSet::new(),
+            fired_at_epoch: None,
+            armed_at_epoch: None,
+            arms: 0,
+            escalated: false,
+        }
+    }
+
+    /// Note the group's current local epoch, resetting the per-epoch stall
+    /// accounting when it changed.
+    ///
+    /// Leaving an epoch the device *armed* at continues the unrecovered run: the
+    /// replay moved the device forward but the group had already gone further.
+    /// Leaving an epoch it passed through without arming ends the run — that is
+    /// the closest this layer can observe to "the group reached the tip", since
+    /// a device that cannot decrypt a group's traffic can never learn the
+    /// group's live epoch. Ending the run also clears the escalation latch, so a
+    /// group that stalls again much later is reported again.
+    ///
+    /// Deliberately *not* "the device decrypted something": a replay that
+    /// recovers old backlog the device can read has not caught it up, and
+    /// treating that as recovery is exactly what would hide the failure this
+    /// counter exists to report. The cost of the stricter rule is that a device
+    /// which keeps up fine but cannot read one peer's traffic — a forked peer, or
+    /// minted envelopes — can also complete a run. The report stays true as
+    /// stated (this device cannot read this group's traffic), and because
+    /// escalation only reports, the app still owns whether a re-sync is the right
+    /// answer.
+    fn observe_epoch(&mut self, epoch: EpochId) {
+        if self.epoch == epoch {
+            return;
+        }
+        if self.armed_at_epoch != Some(self.epoch) {
+            self.arms = 0;
+            self.escalated = false;
+        }
+        self.epoch = epoch;
+        self.undecryptable.clear();
+        self.fired_at_epoch = None;
+    }
+
+    /// Record an arm at the current epoch and decide whether this run has now
+    /// armed enough times to escalate.
+    fn arm(&mut self, escalation_arm_threshold: u32) -> BackfillDecision {
+        self.fired_at_epoch = Some(self.epoch);
+        self.armed_at_epoch = Some(self.epoch);
+        self.arms = self.arms.saturating_add(1);
+        if self.arms >= escalation_arm_threshold && !self.escalated {
+            self.escalated = true;
+            BackfillDecision::ArmAndEscalate { arms: self.arms }
+        } else {
+            BackfillDecision::Arm
+        }
+    }
 }
 
 /// Decides, per group, when a run of undecryptable traffic at a stalled epoch
 /// means the group has advanced past this device and a backfill is warranted.
 pub(crate) struct EpochStallDetector {
     threshold: usize,
+    escalation_arm_threshold: u32,
     groups: HashMap<GroupId, GroupStall>,
 }
 
 impl EpochStallDetector {
-    pub(crate) fn new(threshold: usize) -> Self {
+    pub(crate) fn new(threshold: usize, escalation_arm_threshold: u32) -> Self {
         Self {
             threshold,
+            escalation_arm_threshold,
             groups: HashMap::new(),
         }
     }
@@ -70,6 +197,13 @@ impl EpochStallDetector {
     /// (unit tests, or a future configurable value).
     pub(crate) fn threshold(&self) -> usize {
         self.threshold
+    }
+
+    /// The arms-per-unrecovered-run count at which this detector escalates.
+    /// Reported on the `epoch_stall_backfill_escalated` audit row for the same
+    /// reason [`Self::threshold`] is reported on the arm row.
+    pub(crate) fn escalation_arm_threshold(&self) -> u32 {
+        self.escalation_arm_threshold
     }
 
     /// Record that an account-wide full-history replay was just triggered. One
@@ -83,25 +217,32 @@ impl EpochStallDetector {
         }
     }
 
+    /// Note the current local epoch of an already-tracked `group` from a
+    /// delivery that carried no stall evidence. Groups with no stall history are
+    /// deliberately left untracked: this only exists so a tracked group's
+    /// unrecovered arm run can end when the device leaves an epoch it never
+    /// armed at (see [`GroupStall::observe_epoch`]).
+    pub(crate) fn observe_group_epoch(&mut self, group: &GroupId, epoch: EpochId) {
+        if let Some(stall) = self.groups.get_mut(group) {
+            stall.observe_epoch(epoch);
+        }
+    }
+
     /// Record one undecryptable message for `group` observed while the group is
-    /// at `epoch`. Returns `true` exactly once when the group crosses the
-    /// threshold at a stalled epoch and a backfill should be triggered.
+    /// at `epoch`. Arms exactly once when the group crosses the threshold at a
+    /// stalled epoch, and escalates on the arm that completes an unrecovered run
+    /// of [`EpochStallDetector::escalation_arm_threshold`] arms.
     pub(crate) fn observe_undecryptable(
         &mut self,
         group: GroupId,
         message: String,
         epoch: EpochId,
-    ) -> bool {
-        let stall = self.groups.entry(group).or_insert_with(|| GroupStall {
-            epoch,
-            undecryptable: HashSet::new(),
-            fired_at_epoch: None,
-        });
-        if stall.epoch != epoch {
-            stall.epoch = epoch;
-            stall.undecryptable.clear();
-            stall.fired_at_epoch = None;
-        }
+    ) -> BackfillDecision {
+        let stall = self
+            .groups
+            .entry(group)
+            .or_insert_with(|| GroupStall::new(epoch));
+        stall.observe_epoch(epoch);
         // The message identity is attacker-mintable (a fresh envelope is a fresh
         // id), so the set never needs to grow past the point where it decides.
         if stall.undecryptable.len() < self.threshold {
@@ -109,10 +250,9 @@ impl EpochStallDetector {
         }
         let crossed = stall.undecryptable.len() >= self.threshold;
         if crossed && stall.fired_at_epoch != Some(epoch) {
-            stall.fired_at_epoch = Some(epoch);
-            true
+            stall.arm(self.escalation_arm_threshold)
         } else {
-            false
+            BackfillDecision::Skip
         }
     }
 
@@ -120,30 +260,34 @@ impl EpochStallDetector {
     /// history was not retained. Signal a replay immediately (once per epoch)
     /// instead of waiting for the undecryptable-message threshold: the
     /// threshold detects a likely gap, while this outcome is direct evidence
-    /// of one.
-    pub(crate) fn observe_resource_refusal(&mut self, group: GroupId, epoch: EpochId) -> bool {
-        let stall = self.groups.entry(group).or_insert_with(|| GroupStall {
-            epoch,
-            undecryptable: HashSet::new(),
-            fired_at_epoch: None,
-        });
-        if stall.epoch != epoch {
-            stall.epoch = epoch;
-            stall.undecryptable.clear();
-            stall.fired_at_epoch = None;
-        }
+    /// of one. Refusal arms count toward escalation exactly like threshold arms:
+    /// both mean "a full-history replay was armed for this group", and a run of
+    /// refusals is the stronger evidence that replay cannot recover the group,
+    /// since the objects it needs were not retained at all.
+    pub(crate) fn observe_resource_refusal(
+        &mut self,
+        group: GroupId,
+        epoch: EpochId,
+    ) -> BackfillDecision {
+        let stall = self
+            .groups
+            .entry(group)
+            .or_insert_with(|| GroupStall::new(epoch));
+        stall.observe_epoch(epoch);
         if stall.fired_at_epoch == Some(epoch) {
-            false
+            BackfillDecision::Skip
         } else {
-            stall.fired_at_epoch = Some(epoch);
-            true
+            stall.arm(self.escalation_arm_threshold)
         }
     }
 }
 
 impl Default for EpochStallDetector {
     fn default() -> Self {
-        Self::new(EPOCH_STALL_BACKFILL_THRESHOLD)
+        Self::new(
+            EPOCH_STALL_BACKFILL_THRESHOLD,
+            EPOCH_STALL_ESCALATION_ARM_THRESHOLD,
+        )
     }
 }
 
@@ -155,49 +299,217 @@ mod tests {
         GroupId::new(vec![byte])
     }
 
+    /// A detector with a small stall threshold and the production escalation
+    /// threshold, for the tests that are not about escalation.
+    fn stall_detector(threshold: usize) -> EpochStallDetector {
+        EpochStallDetector::new(threshold, EPOCH_STALL_ESCALATION_ARM_THRESHOLD)
+    }
+
+    #[test]
+    fn escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch() {
+        // One undecryptable arms, so each stalled epoch below is one arm.
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // The field shape: the replay recovers some backlog, the device advances
+        // an epoch, and it stalls again — three times over, never reaching tip.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "the threshold-th arm in an unrecovered run must escalate"
+        );
+    }
+
+    #[test]
+    fn an_escalated_run_reports_once_however_long_it_keeps_arming() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 }
+        );
+        // The device keeps arming and keeps falling behind. It is already
+        // reported; re-reporting every further arm would be the noise the app
+        // cannot act on.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(13)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(14)),
+            BackfillDecision::Arm
+        );
+    }
+
+    #[test]
+    fn an_epoch_the_device_passes_through_cleanly_ends_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // Two arms into an unrecovered run.
+        detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+
+        // The device then processes this group's traffic at 12 and moves on to 13
+        // without ever stalling at 12 — it kept up with an epoch, which is as
+        // close to "reached the tip" as this layer can observe.
+        detector.observe_group_epoch(&g, EpochId(12));
+        detector.observe_group_epoch(&g, EpochId(13));
+
+        // So a fresh stall opens a new run instead of completing the old one.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(14)),
+            BackfillDecision::Arm,
+            "the arm count must have restarted, so this is the run's second arm"
+        );
+    }
+
+    #[test]
+    fn resource_refusal_arms_count_toward_the_same_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // A refused object and a stalled epoch are both "a full-history replay
+        // was armed and did not get this device to the tip".
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(11)),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(12)),
+            BackfillDecision::ArmAndEscalate { arms: 3 }
+        );
+    }
+
+    #[test]
+    fn storm_collapse_suppression_is_not_an_arm() {
+        let mut detector = EpochStallDetector::new(2, 2);
+        let a = group(0x0A);
+        let b = group(0x0B);
+        let e = EpochId(5);
+
+        // A arms and the caller runs one account-wide replay, which suppresses
+        // every tracked group at its current epoch — including B, which was
+        // accumulating undecryptables but never armed.
+        detector.observe_undecryptable(a.clone(), "a1".into(), e);
+        assert_eq!(
+            detector.observe_undecryptable(a, "a2".into(), e),
+            BackfillDecision::Arm
+        );
+        detector.observe_undecryptable(b.clone(), "b1".into(), e);
+        detector.mark_replayed();
+
+        // B stalls at the next two epochs. Its run starts at the first of those
+        // arms: the suppression it inherited was never a repair attempt of its
+        // own, so it must not count toward escalating B.
+        detector.observe_undecryptable(b.clone(), "b2".into(), EpochId(6));
+        assert_eq!(
+            detector.observe_undecryptable(b.clone(), "b3".into(), EpochId(6)),
+            BackfillDecision::Arm
+        );
+        detector.observe_undecryptable(b.clone(), "b4".into(), EpochId(7));
+        assert_eq!(
+            detector.observe_undecryptable(b, "b5".into(), EpochId(7)),
+            BackfillDecision::ArmAndEscalate { arms: 2 }
+        );
+    }
+
     #[test]
     fn signals_backfill_after_threshold_distinct_undecryptables_at_a_stable_epoch() {
-        let mut detector = EpochStallDetector::new(3);
+        let mut detector = stall_detector(3);
         let g = group(0x01);
         let e = EpochId(19);
 
-        assert!(!detector.observe_undecryptable(g.clone(), "m1".into(), e));
-        assert!(!detector.observe_undecryptable(g.clone(), "m2".into(), e));
         assert!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), e),
+            !detector
+                .observe_undecryptable(g.clone(), "m1".into(), e)
+                .arms_backfill()
+        );
+        assert!(
+            !detector
+                .observe_undecryptable(g.clone(), "m2".into(), e)
+                .arms_backfill()
+        );
+        assert!(
+            detector
+                .observe_undecryptable(g.clone(), "m3".into(), e)
+                .arms_backfill(),
             "the threshold-crossing message should signal a backfill"
         );
     }
 
     #[test]
     fn signals_at_most_once_per_stalled_epoch() {
-        let mut detector = EpochStallDetector::new(3);
+        let mut detector = stall_detector(3);
         let g = group(0x01);
         let e = EpochId(19);
 
         detector.observe_undecryptable(g.clone(), "m1".into(), e);
         detector.observe_undecryptable(g.clone(), "m2".into(), e);
-        assert!(detector.observe_undecryptable(g.clone(), "m3".into(), e));
+        assert!(
+            detector
+                .observe_undecryptable(g.clone(), "m3".into(), e)
+                .arms_backfill()
+        );
         // Further undecryptable traffic at the same stalled epoch must not
         // re-signal: one replay per stalled epoch is enough, and re-signalling
         // would let a burst (or a spray of attacker-minted ids) trigger a storm.
-        assert!(!detector.observe_undecryptable(g.clone(), "m4".into(), e));
-        assert!(!detector.observe_undecryptable(g.clone(), "m5".into(), e));
+        assert!(
+            !detector
+                .observe_undecryptable(g.clone(), "m4".into(), e)
+                .arms_backfill()
+        );
+        assert!(
+            !detector
+                .observe_undecryptable(g.clone(), "m5".into(), e)
+                .arms_backfill()
+        );
     }
 
     #[test]
     fn resource_refusal_signals_immediately_once_per_epoch() {
-        let mut detector = EpochStallDetector::new(8);
+        let mut detector = stall_detector(8);
         let g = group(0x01);
 
-        assert!(detector.observe_resource_refusal(g.clone(), EpochId(19)));
-        assert!(!detector.observe_resource_refusal(g.clone(), EpochId(19)));
-        assert!(detector.observe_resource_refusal(g, EpochId(20)));
+        assert!(
+            detector
+                .observe_resource_refusal(g.clone(), EpochId(19))
+                .arms_backfill()
+        );
+        assert!(
+            !detector
+                .observe_resource_refusal(g.clone(), EpochId(19))
+                .arms_backfill()
+        );
+        assert!(
+            detector
+                .observe_resource_refusal(g, EpochId(20))
+                .arms_backfill()
+        );
     }
 
     #[test]
     fn mark_replayed_collapses_a_storm_of_simultaneously_stuck_groups() {
-        let mut detector = EpochStallDetector::new(3);
+        let mut detector = stall_detector(3);
         let a = group(0x0A);
         let b = group(0x0B);
         let e = EpochId(19);
@@ -206,7 +518,11 @@ mod tests {
         // replay (which re-fetches every group's history, B included).
         detector.observe_undecryptable(a.clone(), "a1".into(), e);
         detector.observe_undecryptable(a.clone(), "a2".into(), e);
-        assert!(detector.observe_undecryptable(a.clone(), "a3".into(), e));
+        assert!(
+            detector
+                .observe_undecryptable(a.clone(), "a3".into(), e)
+                .arms_backfill()
+        );
 
         // Group B was accumulating undecryptables at the same epoch in the same
         // drain but had not yet crossed the threshold.
@@ -218,24 +534,36 @@ mod tests {
         // B crossing the threshold after the replay must NOT trigger a second
         // one: the single replay already covered it.
         assert!(
-            !detector.observe_undecryptable(b.clone(), "b3".into(), e),
+            !detector
+                .observe_undecryptable(b.clone(), "b3".into(), e)
+                .arms_backfill(),
             "one account-wide replay should cover every stuck group at this epoch"
         );
     }
 
     #[test]
     fn an_epoch_advance_resets_the_count() {
-        let mut detector = EpochStallDetector::new(3);
+        let mut detector = stall_detector(3);
         let g = group(0x01);
 
         detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(19));
         detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(19));
         // The group advanced to epoch 20 — its commits are reaching us again, so
         // the earlier undecryptables must not count toward a stall at epoch 20.
-        assert!(!detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(20)));
-        assert!(!detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(20)));
         assert!(
-            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(20)),
+            !detector
+                .observe_undecryptable(g.clone(), "m3".into(), EpochId(20))
+                .arms_backfill()
+        );
+        assert!(
+            !detector
+                .observe_undecryptable(g.clone(), "m4".into(), EpochId(20))
+                .arms_backfill()
+        );
+        assert!(
+            detector
+                .observe_undecryptable(g.clone(), "m5".into(), EpochId(20))
+                .arms_backfill(),
             "the count should restart at the new epoch, not carry over"
         );
     }

@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::AppClient;
+use super::epoch_stall::BackfillDecision;
 use crate::config::CursorPersistence;
 
 /// What the convergence scheduler should do next for a group, derived from
@@ -109,7 +110,11 @@ impl AppClient {
             .extend(effects.pending_convergence.iter().cloned());
     }
 
-    fn arm_recovery_from_effects(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+    fn arm_recovery_from_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        summary: &mut SyncSummary,
+    ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
@@ -123,15 +128,16 @@ impl AppClient {
             let Ok(record) = self.runtime.group_record(group_id) else {
                 continue;
             };
-            if self
+            // Recording the recovery intent before the worker performs the
+            // external full-history replay, and reporting an escalation this
+            // arm raises, are both the shared decision handler's job: a
+            // resource-refusal arm counts toward the same unrecovered run as a
+            // deferred-delivery arm, and the detector raises the run's
+            // escalation only once, at whichever path happens to arm third.
+            let decision = self
                 .epoch_stall
-                .observe_resource_refusal(group_id.clone(), record.epoch)
-            {
-                // Record the recovery intent before the worker performs the
-                // external full-history replay.
-                self.record_epoch_stall_backfill_armed(group_id, record.epoch.0);
-                self.epoch_backfill_pending = true;
-            }
+                .observe_resource_refusal(group_id.clone(), record.epoch);
+            self.apply_backfill_decision(group_id, record.epoch.0, decision, summary);
         }
     }
 
@@ -244,9 +250,11 @@ impl AppClient {
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
         self.remember_pending_convergence_groups(&effects);
-        self.arm_recovery_from_effects(&effects);
-        fail_if_publish_failed(&effects)?;
+        // Declared before arming so a resource-refusal escalation raised here
+        // rides this summary out even when the drain carried no app events.
         let mut summary = SyncSummary::default();
+        self.arm_recovery_from_effects(&effects, &mut summary);
+        fail_if_publish_failed(&effects)?;
         if effects.events.is_empty() {
             return Ok(summary);
         }
@@ -407,6 +415,7 @@ impl AppClient {
             if summary.joined_groups.is_empty()
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
+                && summary.epoch_stall_escalations.is_empty()
                 && self.pending_convergence_groups.is_empty()
                 && !self.epoch_backfill_pending
             {
@@ -553,9 +562,14 @@ impl AppClient {
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_groups(&effects.effects);
-        self.arm_recovery_from_effects(&effects.effects);
+        self.arm_recovery_from_effects(&effects.effects, summary);
         self.remember_transport_cursor(outer_transport_at);
-        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
+        self.detect_epoch_stall(
+            group_id_hint,
+            &source_message_id_hex,
+            &effects.outcome,
+            summary,
+        );
         let routes_dirty = self
             .observe_account_device_effects(
                 &effects.effects,
@@ -588,7 +602,9 @@ impl AppClient {
     /// Feed an unavailable group delivery to the epoch-stall detector.
     /// Transport-deferred input arms a backfill after the stalled-epoch
     /// threshold; resource refusal arms it immediately because it directly
-    /// proves the fetched history was not fully retained. Only observed under
+    /// proves the fetched history was not fully retained. Repeated arming that
+    /// never recovers the group escalates onto `summary`, the seam every worker
+    /// surface already publishes. Only observed under
     /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
     /// own recovery, and the main app sees the same evidence on its own next
     /// sync.
@@ -597,6 +613,7 @@ impl AppClient {
         group_id_hint: Option<cgka_traits::GroupId>,
         message_id_hex: &str,
         outcome: &IngestOutcome,
+        summary: &mut SyncSummary,
     ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
@@ -609,7 +626,7 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
-        let should_backfill = match outcome {
+        let decision = match outcome {
             IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
                 group_id.clone(),
                 message_id_hex.to_owned(),
@@ -618,15 +635,64 @@ impl AppClient {
             IngestOutcome::ResourceRefused { .. } => self
                 .epoch_stall
                 .observe_resource_refusal(group_id.clone(), record.epoch),
-            _ => false,
+            // Any other outcome carries no stall evidence, but it does tell the
+            // detector where this device now sits: a tracked group that leaves an
+            // epoch without arming at it has stopped failing to catch up, which
+            // ends its escalation run.
+            _ => {
+                self.epoch_stall
+                    .observe_group_epoch(&group_id, record.epoch);
+                BackfillDecision::Skip
+            }
         };
-        if should_backfill {
+        self.apply_backfill_decision(&group_id, record.epoch.0, decision, summary);
+    }
+
+    /// Apply an epoch-stall backfill decision: arm the replay, and report an
+    /// escalation the detector raises.
+    ///
+    /// Every site that takes a [`BackfillDecision`] must route it through here.
+    /// The detector latches `escalated` when it raises
+    /// [`BackfillDecision::ArmAndEscalate`], so it raises that decision exactly
+    /// once per unrecovered run — a caller that armed on the decision but
+    /// dropped its escalation would lose the report permanently, since no later
+    /// arm in the run raises it again.
+    fn apply_backfill_decision(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        stalled_epoch: u64,
+        decision: BackfillDecision,
+        summary: &mut SyncSummary,
+    ) {
+        if decision.arms_backfill() {
             // Record the arm decision before the replay side effect runs (the
             // worker seam calls run_pending_epoch_backfill after this returns).
             // Best-effort, fire-and-forget: recording can never block or fail
             // the backfill.
-            self.record_epoch_stall_backfill_armed(&group_id, record.epoch.0);
+            self.record_epoch_stall_backfill_armed(group_id, stalled_epoch);
             self.epoch_backfill_pending = true;
+        }
+        if let BackfillDecision::ArmAndEscalate { arms } = decision {
+            // The replay is armed above regardless: escalating reports that
+            // replay alone is not repairing this group, it does not replace the
+            // attempt. The stronger repair (key-package rotation plus a full
+            // re-activation) publishes new key material, so it stays the app's
+            // decision — MDK reports the condition and names the repair.
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "apply_backfill_decision",
+                arms,
+                arm_threshold = self.epoch_stall.escalation_arm_threshold(),
+                "epoch-gap backfill armed repeatedly without recovering a group; escalating"
+            );
+            self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
+            summary
+                .epoch_stall_escalations
+                .push(crate::EpochStallEscalation {
+                    group_id: group_id.clone(),
+                    stalled_epoch,
+                    arms,
+                });
         }
     }
 
@@ -683,7 +749,10 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_groups(&effects);
-        self.arm_recovery_from_effects(&effects);
+        // Declared before arming so a resource-refusal escalation raised here
+        // rides the summary this pass returns.
+        let mut summary = SyncSummary::default();
+        self.arm_recovery_from_effects(&effects, &mut summary);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let publish_new_message_notification =
@@ -702,7 +771,6 @@ impl AppClient {
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
-        let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();

@@ -204,6 +204,33 @@ impl AppClient {
         );
     }
 
+    /// Record an `epoch_stall_backfill_escalated` forensic audit row at the
+    /// escalation decision: the epoch the group was stalled at
+    /// (`stalled_epoch`), the backfills armed in the unrecovered run (`arms`),
+    /// and the run length that escalates (`arm_threshold`). Recorded once per
+    /// run, alongside that arm's `epoch_stall_backfill_armed` row, so a field
+    /// export shows which groups full-history replay could not repair — the
+    /// evidence loop for tuning the empirical run length. The run counter is
+    /// in-memory, so this row is also what makes an escalation survive the
+    /// restart that clears it. Group-scoped, so `group_ref` carries the stalled
+    /// group id.
+    pub(crate) fn record_epoch_stall_backfill_escalated(
+        &self,
+        group_id: &GroupId,
+        stalled_epoch: u64,
+        arms: u32,
+    ) {
+        self.runtime.session().record_audit_event(
+            Some(group_id),
+            None,
+            AuditEventKind::EpochStallBackfillEscalated {
+                stalled_epoch,
+                arms: u64::from(arms),
+                arm_threshold: u64::from(self.epoch_stall.escalation_arm_threshold()),
+            },
+        );
+    }
+
     /// Apply the audit-logging switch to this live session by swapping the
     /// recorder in place: a file-backed recorder when `enabled`, or a no-op
     /// recorder when off. Dropping the prior recorder flushes and closes any

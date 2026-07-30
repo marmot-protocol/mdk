@@ -23,6 +23,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -38,6 +39,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::GroupEvent(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -84,6 +86,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -108,6 +111,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -141,6 +145,9 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         MarmotAppEvent::MessageReceived(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        // A stalled group's escalation reports a repair need, not a state
+        // change: the chat list has nothing new to show for it.
+        | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }

@@ -81,6 +81,18 @@ pub enum MarmotEventFfi {
         message_id_hex: String,
         recipient_hex: String,
     },
+    /// This device armed `arms` epoch-gap history backfills for the group
+    /// without catching up: it is still stalled at `stalled_epoch` while the
+    /// group has moved on. Surface it as "this group cannot catch up; re-syncing
+    /// is recommended"; the sanctioned repair is rotating this device's key
+    /// package and re-activating transport, which is the host app's call.
+    EpochStallEscalated {
+        account_id_hex: String,
+        account_label: String,
+        group_id_hex: String,
+        stalled_epoch: u64,
+        arms: u32,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -361,6 +373,19 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex,
                 recipient_hex,
+            },
+            MarmotAppEvent::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id,
+                stalled_epoch,
+                arms,
+            } => Self::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch,
+                arms,
             },
         }
     }

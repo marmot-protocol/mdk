@@ -691,6 +691,12 @@ pub(crate) async fn handle_app_runtime_event(
         // The durable record + `redeliver_welcome` handle the repair; this
         // daemon activity path has no runtime-summary shape to record for it.
         marmot_app::MarmotAppEvent::WelcomeDeliveryPending { .. } => {}
+        // A group's epoch-gap backfill kept arming without catching up. Like the
+        // welcome-repair signal above, this reports a repair need rather than
+        // runtime activity, so there is no summary shape to record: it reaches
+        // operators through the runtime event stream and the group's forensic
+        // `epoch_stall_backfill_escalated` row.
+        marmot_app::MarmotAppEvent::EpochStallEscalated { .. } => {}
     }
 }
 
