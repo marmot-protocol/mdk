@@ -432,6 +432,43 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Sentinel: an engine unit test proves that device-local committer-leaf status, roster order, and duplicate roster rows
   do not change terminal equality.
 
+### `open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip`
+
+- Setup: Alice and Carol settle at epoch 1, the scenario moves onto virtual time, and one inbound commit edge opens
+  Carol's convergence pass at base epoch 1.
+- Pressure: Carol crashes and reopens (encrypted file storage, real close/reopen) 300ms short of the pass cutoff, then
+  three more commits from Alice land on the reopened engine while the recovered pass still holds the boundary.
+- Expected: mid-history Carol is still at epoch 1 with Alice four epochs ahead — an active pass pins the tip across the
+  crash and the backlog. The settle tick at exactly the original 1000ms deadline clears the recovered pass, and Carol
+  then walks 1→2→3→4→5, one generation per quiescence window, ending exactly equivalent to Alice with no pending work.
+- Reason: scenario-level companion to the mdk#1110 stale-pass-base incident (fixed in mdk#1182). The engine tests for
+  that fix install a `base_epoch`/tip disagreement on the durable record directly, because the engine keeps a single tip
+  authority and an active pass gates every path that could move the tip. This scenario pins that precondition from the
+  public boundary: the disagreement the incident needed never arises, and the device still converges. The timing is the
+  evidence that the *same* durable pass survived the crash — a pass reopened afterwards would carry a later deadline and
+  leave Carol behind.
+- Not portable yet, for three independent reasons. First, `AdvanceTime` is required to hold a pass open between ticks,
+  and the oracle maps `VirtualTimeAdvance` to `OracleBehavior::QuiescenceState`, which only the `await_quiescence` step
+  produces — and that step cannot be used here, because it advances virtual time to a fixed point and settles the
+  recovered pass whenever it comes due, which erases the exact-deadline evidence. With `await_quiescence` appended,
+  shortening the settle tick to 900ms still passes; without it, the `VirtualTimeAdvance` recommendation stays
+  unsatisfied and `--strict-oracle` fails. Second, `ClientsExactlyEquivalent` expects observed
+  `OracleBehavior::ClientConvergence`, which is only recorded when every observation in the trace agrees on epoch,
+  member count, and group name — so this scenario's deliberate mid-history divergence observation (Carol 1, Alice 5)
+  makes it unreachable and reports `missing_observed_behaviors`. Third, the multi-process subject cannot carry the
+  contract at all: `ProcessOrchestrator` advertises `SubjectCapability::VirtualTime`, but its `AdvanceTime` handler is a
+  `tokio::time::sleep` in the orchestrator process and `node_protocol` exposes no clock surface, so the step advances no
+  subject clock and each node's pass deadlines run on real elapsed time. Promoting this to `vectors/` needs a
+  `TraceExpectation` that binds the quiescence gate without driving the clock, a step-scoped observed-convergence
+  detector, and a node-side virtual clock behind the capability the process subject already claims.
+- Mutation evidence: deleting the durable pass on reopen, or ignoring the quiescence cutoff, both turn this scenario
+  red. Shortening the post-restart settle tick from 300ms to 200ms — landing at 900ms instead of the recovered pass's
+  original 1000ms deadline — leaves Carol with an unresolved convergence input and one epoch behind, which is the direct
+  evidence that the deadline survived the reopen rather than being re-derived. Leaving an applied pass active at its old
+  base epoch (producing the mdk#1110 shape live) keeps it green, because the mdk#1182 discard reopens at the tip;
+  replacing that discard with the pre-mdk#1182 durable halt turns it red with Carol's canonical `convergence_status`
+  stuck at `unrecoverable`.
+
 ### `bidirectional_decryptability_probe_passes_for_settled_members`
 
 - Setup: Alice creates a settled three-member group with Bob and Carol.

@@ -349,6 +349,26 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
 - **Admin-gated scripted steps need admin setup.** When a scenario has an invitee later send `InviteMembers` or
   `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
   use `create_group_with_admins` explicitly for competing admin commits.
+- **Deadline-pinning virtual-time scenarios cannot become portable vectors yet.** The oracle recommends
+  `OracleBehavior::QuiescenceState` for the `VirtualTimeAdvance` stimulus, and no `TraceExpectation` produces it — only
+  the `await_quiescence` step does. That is enough for fixtures that just need to reach a fixed point, but not for ones
+  whose contract is *which* tick settles a pass: `await_quiescence` advances virtual time until the subject stops
+  changing, so it settles a pass whenever it comes due and erases the evidence that a specific deadline fired. A
+  scenario that must hold a convergence pass open across a precise boundary (see
+  `open_convergence_pass_survives_restart_and_walks_the_backlog_to_the_tip`) therefore has to tick manually, which
+  leaves the `VirtualTimeAdvance` recommendation unsatisfied and fails the `--strict-oracle` vector report CI job
+  (strict is the default; `--allow-weak-oracle` opts out). The multi-process subject blocks them independently:
+  `ProcessOrchestrator` claims `SubjectCapability::VirtualTime`, but its `AdvanceTime` is a `tokio::time::sleep` in the
+  orchestrator and `node_protocol` has no clock surface, so no subject clock moves and node deadlines run on real
+  time — fine for a step that only needs settling slack, wrong for one that must land on a boundary. Such scenarios stay
+  in `tests/canonical_scenarios.rs` until a `TraceExpectation` can bind the quiescence gate without also driving the
+  clock and the node protocol gains the virtual clock its capability advertises.
+- **`ClientsExactlyEquivalent` conflicts with deliberate mid-history divergence.** Expecting it contributes
+  `OracleBehavior::ClientConvergence`, but the observed side only records that behavior when *every* observation in the
+  trace shares an epoch, member count, and group name. A scenario that observes a deliberate mid-history divergence and
+  then converges can never produce it, so it reports `missing_observed_behaviors` and fails `--strict-oracle` even
+  though it converged. Assert the divergence through a separate mid-history `observe` in a harness test rather than a
+  vector until the observed-convergence detector is scoped to a step range.
 - **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy
   step-removal reducer when removable app/delivery noise can be dropped without changing the semantic failure identity
   (classification, action type, and failure kind). Complete state-digest fingerprints remain diagnostic evidence. There is no
