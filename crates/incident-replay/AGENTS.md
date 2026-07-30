@@ -179,9 +179,12 @@ Precedence, highest first:
 
 Rules 5 and 6 rank *below* the incident routes on purpose: a reproducible contest is
 worth replaying even when another engine's data is stale (recovery fail-closes
-downstream if the data it needs is missing). It fires only on positive
-evidence — no engine ids or timestamps means the gate stays unarmed — so
-synthetic fixtures and older exports classify as before. Lag is measured in
+downstream if the data it needs is missing). Each fires only on positive
+evidence, with its own arming requirement: rule 5 arms on an attributable
+self-reported halt — an `engine_id` plus a halt reason, no timestamps needed —
+while rule 6 needs both an `engine_id` and `wall_time_ms` activity evidence.
+Events missing those fields leave the respective rule unarmed, so synthetic
+fixtures and older exports classify as before. Rule 6 measures lag in
 epochs, not wall-clock silence: a device that is offline while nothing is
 committed misses nothing, and an idle group never reads as stale. The ≥ 2
 threshold is derived, not tuned — lag 1 is the propagation noise floor, so 2 is
