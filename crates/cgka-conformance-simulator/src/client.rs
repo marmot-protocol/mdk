@@ -447,6 +447,10 @@ impl HarnessClient {
         self.storage_backing.database_path()
     }
 
+    pub fn has_default_group(&self) -> bool {
+        self.default_group.is_some()
+    }
+
     pub fn restart(&mut self) {
         drop(self.engine.take());
         let storage = if self.storage_backing.is_file_backed() {

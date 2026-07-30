@@ -25,6 +25,7 @@ pub enum ScenarioStimulus {
     QueueReorder,
     Partition,
     Restart,
+    VirtualTimeAdvance,
     LargeGroup,
     MessageStorm,
     CommitStorm,
@@ -317,6 +318,9 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::RestartClient { .. } => {
                 stimuli.insert(ScenarioStimulus::Restart);
+            }
+            ScenarioStep::AdvanceTime { .. } => {
+                stimuli.insert(ScenarioStimulus::VirtualTimeAdvance);
             }
             ScenarioStep::DeliverAll
             | ScenarioStep::Tick { .. }
@@ -687,6 +691,7 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::ReplayDeduplication,
         ],
         ScenarioStimulus::PublishLifecycle => vec![OracleBehavior::PublishLifecycleChecked],
+        ScenarioStimulus::VirtualTimeAdvance => vec![OracleBehavior::QuiescenceState],
     }
 }
 

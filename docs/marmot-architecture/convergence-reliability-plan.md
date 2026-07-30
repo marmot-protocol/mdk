@@ -444,8 +444,10 @@ Status: `in-progress`
   semantic engine operations through declared adapter capabilities.
 - [x] Implement the first engine-adapter vertical slice: create/mutate, publication confirmation/failure, application
   send, transport delivery/ingest, event/exact/admin observation, active decryptability probing, and crash/reopen.
-- [ ] Add virtual-time advance plus explicit public outbound polling/acknowledgement; coordinate this with the dual-clock
-  and full-quiescence work rather than encoding real-time waits in the subject.
+- [x] Add a capability-gated, serializable virtual-time advance backed by one shared paired clock; run the selected
+  awake clients through the normal scheduled-convergence entry point without sleeping.
+- [ ] Add explicit public outbound polling/acknowledgement so later adapters can model publication progress without
+  exposing harness queues.
 - [x] Split normal black-box execution from the explicitly named `ConvergenceFaultSubject` queue/partition mutation
   capability; reserve a named white-box storage-fault capability for a future adapter.
 - [x] Reject scenarios that require unsupported subject capabilities before execution.
@@ -458,8 +460,8 @@ Status: `in-progress`
 
 - [x] Add an injectable paired monotonic/wall convergence clock and use it for pass deadlines, cutoff decisions, restart
   rebasing, and deterministic engine/harness tests.
-- [ ] Expose that clock through the subject-level virtual-time capability; a clock that tests can inject is not yet a
-  portable scenario operation.
+- [x] Expose that clock through the subject-level `virtual_time` capability and portable `advance_time` scenario step;
+  allow the scenario to keep selected participant runtimes paused while global time advances.
 
 - [ ] Expose a sanitized structural progress token, runnable work, earliest next wake-up, deferred/retry work, outbound
   work awaiting acknowledgement, and terminal blockers; include inbox, delayed messages, pass phase, and durable
@@ -809,3 +811,4 @@ incorrect result.
 | 2026-07-30 | M5 app-runtime ownership prerequisite | Enforced one live account session per account within a `MarmotApp`, surfaced typed contention through UniFFI, and made worker reconnect release the failed client before replacement | [MDK #1200](https://github.com/marmot-protocol/mdk/pull/1200), merge `8dc7c12b`; ownership, worker-lifecycle, FFI, and focused runtime tests |
 | 2026-07-30 | M5 projection-maintenance prerequisite | Made large-set projection pruning bounded, preserved draft-owning groups, and made secure-delete checkpoint completion durable and explicitly observable as `erasure_pending` | [MDK #1201](https://github.com/marmot-protocol/mdk/pull/1201), merge `eec70bd9`; 307 storage tests; focused app/UniFFI retention tests; `just fast-ci` |
 | 2026-07-30 | M5 account-device modeling input | Documented a non-normative multi-device design space while deliberately leaving admission, synchronization, and repair choices unresolved; future scenarios must model account-device instances without assuming those candidate semantics | [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199), merge `aac777f3`; documentation-only |
+| 2026-07-30 | 1.2c / 1.3b subject virtual time | Added a capability-gated `advance_time` scenario operation backed by one shared paired clock across the engine subject; global time advances once while scheduled convergence runs only for selected awake participants, preserving legacy `Tick` semantics for existing vectors | Focused preflight/dispatch test; real disband pass remains live at 999 ms and settles at 1,000 ms without sleeping; full simulator suite |

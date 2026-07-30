@@ -19,7 +19,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `HarnessClient` — wraps `Engine<SqliteAccountStorage>` and the real Nostr transport peeler while keeping delivery in memory.
 - `ConvergenceSubject` — a capability-declared semantic boundary between scenario execution and the implementation
   under test. `EngineHarnessSubject` is the in-process adapter; queue and partition mutation live on a separate,
-  explicitly white-box fault interface.
+  explicitly white-box fault interface. Its `virtual_time` capability advances one shared paired convergence clock and
+  runs scheduled convergence only for the selected awake participants.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue
   faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected
@@ -117,8 +118,9 @@ engine work (publish lifecycle, convergence pass/input, queued outbound, deferre
 buffers), bus queue/delayed/mailbox work addressed to that client, and that client's pending scenario-input ledger
 entries. The expectation fails with the blocking subsystem names. It is deliberately not an end-to-end delivery claim
 for an application object that a transport fault dropped; scenarios that require delivery must assert the recipient's
-ledger or output separately. It does not yet wait for quiescence: virtual-time advancement, structural progress tokens,
-timeout policy, and retry-timer coverage belong to Milestone 1.3.
+ledger or output separately. The serializable `advance_time` step now controls convergence deadlines without sleeping
+and can leave selected participants paused. It does not yet wait for quiescence: structural progress tokens, a
+fixed-point driver, timeout policy, outbound acknowledgement, and retry-timer coverage remain in Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting

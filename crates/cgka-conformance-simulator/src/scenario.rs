@@ -77,6 +77,12 @@ pub enum ScenarioStep {
     Tick {
         clients: Vec<String>,
     },
+    /// Advance both convergence-clock domains and run scheduled convergence
+    /// for the selected participant runtimes.
+    AdvanceTime {
+        delta_ms: u64,
+        clients: Vec<String>,
+    },
     Observe {
         clients: Vec<String>,
     },
@@ -135,6 +141,7 @@ impl ScenarioStep {
             ScenarioStep::Leave { .. } => "leave",
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
+            ScenarioStep::AdvanceTime { .. } => "advance_time",
             ScenarioStep::Observe { .. } => "observe",
             ScenarioStep::ObserveExact { .. } => "observe_exact",
             ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
@@ -561,6 +568,15 @@ async fn run_scenario_report_inner(
                     .await
                     .map_err(|error| subject_step_error(step_index, error))?;
             }
+            ScenarioStep::AdvanceTime {
+                delta_ms,
+                clients: labels,
+            } => {
+                subject
+                    .advance_time(*delta_ms, labels)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
+            }
             ScenarioStep::Observe { clients: labels } => {
                 observations.extend(
                     subject
@@ -834,6 +850,7 @@ mod tests {
     struct RecordingSubject {
         descriptor: SubjectDescriptor,
         send_called: bool,
+        time_advances: Vec<(u64, Vec<String>)>,
     }
 
     #[async_trait]
@@ -847,6 +864,15 @@ mod tests {
             _action: SubjectSendApplication<'_>,
         ) -> Result<(), SubjectError> {
             self.send_called = true;
+            Ok(())
+        }
+
+        async fn advance_time(
+            &mut self,
+            delta_ms: u64,
+            clients: &[String],
+        ) -> Result<(), SubjectError> {
+            self.time_advances.push((delta_ms, clients.to_vec()));
             Ok(())
         }
     }
@@ -904,6 +930,7 @@ mod tests {
                 capabilities: BTreeSet::from([SubjectCapability::ApplicationMessaging]),
             },
             send_called: false,
+            time_advances: Vec::new(),
         };
 
         let error = run_scenario_spec_with_subject(&spec, &mut subject)
@@ -913,6 +940,51 @@ mod tests {
         assert_eq!(error.step_index, Some(1));
         assert!(error.message.contains("crash_reopen"));
         assert!(!subject.send_called);
+    }
+
+    #[tokio::test]
+    async fn virtual_time_is_capability_gated_and_dispatched_with_selected_clients() {
+        let spec = ScenarioSpec {
+            name: "subject-virtual-time/v1".to_owned(),
+            spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned()],
+            steps: vec![ScenarioStep::AdvanceTime {
+                delta_ms: 750,
+                clients: vec!["bob".to_owned()],
+            }],
+        };
+        let encoded = serde_json::to_value(&spec).expect("virtual time scenario serializes");
+        assert_eq!(encoded["steps"][0]["type"], "advance_time");
+        assert_eq!(encoded["steps"][0]["delta_ms"], 750);
+        let decoded: ScenarioSpec =
+            serde_json::from_value(encoded).expect("virtual time scenario deserializes");
+        assert_eq!(decoded, spec);
+        let mut subject = RecordingSubject {
+            descriptor: SubjectDescriptor {
+                adapter: "recording-subject".to_owned(),
+                adapter_version: "1".to_owned(),
+                storage_backend: "none".to_owned(),
+                capabilities: BTreeSet::new(),
+            },
+            send_called: false,
+            time_advances: Vec::new(),
+        };
+
+        let error = run_scenario_spec_with_subject(&spec, &mut subject)
+            .await
+            .expect_err("virtual time must fail preflight when unsupported");
+        assert_eq!(error.step_index, Some(0));
+        assert!(error.message.contains("virtual_time"));
+        assert!(subject.time_advances.is_empty());
+
+        subject
+            .descriptor
+            .capabilities
+            .insert(SubjectCapability::VirtualTime);
+        run_scenario_spec_with_subject(&spec, &mut subject)
+            .await
+            .expect("supported virtual time step succeeds");
+        assert_eq!(subject.time_advances, vec![(750, vec!["bob".to_owned()])]);
     }
 
     #[test]
