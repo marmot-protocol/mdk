@@ -106,6 +106,111 @@ struct DeferredPeelAttempts {
     first_seen_sweep: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceGate {
+    Clear,
+    StagedCommit,
+    LeaveGated,
+}
+
+#[derive(Clone, Copy)]
+enum LeaveGateCheck {
+    Required,
+    DrainComplete,
+}
+
+struct AdminReservation {
+    available: bool,
+}
+
+impl AdminReservation {
+    fn load<S: StorageProvider>(
+        engine: &Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<Self, EngineError> {
+        let available = engine
+            .storage
+            .convergence_pass(group_id)?
+            .is_some_and(|pass| {
+                pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                    && pass.fairness_slot_available
+            });
+        Ok(Self { available })
+    }
+
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    fn permits(&self, intent: &SendIntent) -> bool {
+        !self.available || is_admin_group_state_intent(intent)
+    }
+
+    fn consume_if_dormant<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        if self.available && !engine.has_unresolved_convergence_inputs(group_id)? {
+            // The slot orders local group-state work before an inbound-only
+            // follow-up pass. With no such inbound work, normal queue draining
+            // proceeds and the dormant slot must not leak into a later pass.
+            self.consume(engine, group_id)?;
+        }
+        Ok(())
+    }
+
+    fn observe_hold<S: StorageProvider>(
+        &self,
+        engine: &mut Engine<S>,
+        queued: &[QueuedOutboundIntent],
+    ) {
+        if self.available
+            && queued
+                .iter()
+                .any(|record| is_admin_group_state_intent(&record.intent))
+        {
+            // Diagnostic only: the completed-pass boundary is being held for a
+            // queued admin group-state intent while retained inbound waits.
+            engine.engine_metrics.note_admin_reservation_hold();
+        }
+    }
+
+    fn consume_attempt<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+        prepared: bool,
+    ) -> Result<(), EngineError> {
+        engine
+            .engine_metrics
+            .note_admin_reservation_attempt(prepared);
+        self.consume(engine, group_id)
+    }
+
+    fn consume_ungranted<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if !self.available {
+            return Ok(false);
+        }
+        self.consume(engine, group_id)?;
+        Ok(true)
+    }
+
+    fn consume<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        engine.consume_convergence_fairness_slot(group_id)?;
+        self.available = false;
+        Ok(())
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn strict_cutover_rejects_legacy_group_addition(
         &self,
@@ -351,75 +456,45 @@ impl<S: StorageProvider> Engine<S> {
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
-        let mut fairness_slot_available =
-            self.storage
-                .convergence_pass(group_id)?
-                .is_some_and(|pass| {
-                    pass.phase == cgka_traits::ConvergencePassPhase::Completed
-                        && pass.fairness_slot_available
-                });
-        if fairness_slot_available && !self.has_unresolved_convergence_inputs(group_id)? {
-            // The slot orders local group-state work before an inbound-only
-            // follow-up pass. With no such inbound work, normal queue draining
-            // proceeds and the dormant slot must not leak into a later pass.
-            self.consume_convergence_fairness_slot(group_id)?;
-            fairness_slot_available = false;
-        }
-        if fairness_slot_available
-            && queued
-                .iter()
-                .any(|record| is_admin_group_state_intent(&record.intent))
-        {
-            // Diagnostic only: the completed-pass boundary is being held for a
-            // queued admin group-state intent while retained inbound waits.
-            self.engine_metrics.note_admin_reservation_hold();
-        }
+        let mut reservation = AdminReservation::load(self, group_id)?;
+        reservation.consume_if_dormant(self, group_id)?;
+        reservation.observe_hold(self, &queued);
         // A persisted fairness slot orders one already-queued administrative
         // evolution before automatic SelfRemove or leave-maintenance mutation.
-        if !fairness_slot_available {
-            if self
-                .stage_due_self_remove_auto_commit(group_id, now_ms)
+        if !reservation.is_available()
+            && self
+                .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                 .await?
-            {
-                return Ok(Vec::new());
-            }
-            self.try_auto_repropose_leave_request(group_id).await;
-            if self.load_leave_request_state(group_id)?.is_some() {
-                return Ok(Vec::new());
-            }
+                != MaintenanceGate::Clear
+        {
+            return Ok(Vec::new());
         }
         for record in queued {
-            if fairness_slot_available && !is_admin_group_state_intent(&record.intent) {
+            if !reservation.permits(&record.intent) {
                 continue;
             }
-            if !fairness_slot_available
+            if !reservation.is_available()
                 && !self
                     .advance_convergence_inputs_until_settled(group_id, now_ms)
                     .await?
             {
                 break;
             }
-            if !fairness_slot_available {
-                if self
-                    .stage_due_self_remove_auto_commit(group_id, now_ms)
+            if !reservation.is_available()
+                && self
+                    .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                     .await?
-                {
-                    break;
-                }
-                self.try_auto_repropose_leave_request(group_id).await;
-                if self.load_leave_request_state(group_id)?.is_some() {
-                    break;
-                }
+                    != MaintenanceGate::Clear
+            {
+                break;
             }
             let result = match self.do_send_ready(record.intent.clone()).await {
                 Ok(result) => result,
-                Err(_) if fairness_slot_available => {
+                Err(_) if reservation.is_available() => {
                     // The protocol grants one preparation attempt, not an
                     // indefinite reservation. Keep the durable intent queued,
                     // consume the slot, and let retained inbound work proceed.
-                    self.engine_metrics.note_admin_reservation_attempt(false);
-                    self.consume_convergence_fairness_slot(group_id)?;
-                    fairness_slot_available = false;
+                    reservation.consume_attempt(self, group_id, false)?;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -441,10 +516,8 @@ impl<S: StorageProvider> Engine<S> {
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
-            if fairness_slot_available {
-                self.engine_metrics.note_admin_reservation_attempt(true);
-                self.consume_convergence_fairness_slot(group_id)?;
-                fairness_slot_available = false;
+            if reservation.is_available() {
+                reservation.consume_attempt(self, group_id, true)?;
                 if self.has_unresolved_convergence_inputs(group_id)? {
                     break;
                 }
@@ -453,20 +526,40 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
         }
-        if fairness_slot_available {
+        if reservation.consume_ungranted(self, group_id)? {
             // No already-queued admin group-state intent was eligible for the
             // fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
-            self.consume_convergence_fairness_slot(group_id)?;
             if self
-                .stage_due_self_remove_auto_commit(group_id, now_ms)
+                .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::DrainComplete)
                 .await?
+                == MaintenanceGate::StagedCommit
             {
                 return Ok(drained);
             }
-            self.try_auto_repropose_leave_request(group_id).await;
         }
         Ok(drained)
+    }
+
+    async fn run_drain_maintenance(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        leave_gate_check: LeaveGateCheck,
+    ) -> Result<MaintenanceGate, EngineError> {
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(MaintenanceGate::StagedCommit);
+        }
+        self.try_auto_repropose_leave_request(group_id).await;
+        if matches!(leave_gate_check, LeaveGateCheck::Required)
+            && self.load_leave_request_state(group_id)?.is_some()
+        {
+            return Ok(MaintenanceGate::LeaveGated);
+        }
+        Ok(MaintenanceGate::Clear)
     }
 
     fn consume_convergence_fairness_slot(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
