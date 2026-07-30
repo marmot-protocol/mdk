@@ -446,6 +446,11 @@ These tests keep the simulator machinery honest.
 - `tests/report_runner.rs` checks CLI parsing, report JSON writing, fixture-candidate writing, and pass/fail summaries.
 - `src/oracle.rs` and `tests/report_runner.rs` check that reports name their stimuli, expected behavior classes,
   observed behavior classes, and weak-oracle warnings.
+- `virtual_time_is_capability_gated_serializable_and_dispatched` checks that `advance_time` round-trips through the
+  portable scenario format, fails preflight for adapters without `virtual_time`, and dispatches the exact elapsed time.
+- `engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected` checks two real durable disband passes:
+  a tick at 999 ms settles neither; at 1,000 ms Alice settles while unticked Bob stays live; Bob then settles on a later
+  tick without another time advance.
 - `failing_generated_case_records_a_minimized_reproducer` checks that a failing generated case records a smaller
   reproducer when removable delivery noise is enough to keep the same failure.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across

@@ -12,6 +12,7 @@ use crate::{
     observe_client_exact,
 };
 use async_trait::async_trait;
+use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -22,6 +23,7 @@ use cgka_traits::types::MemberId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 /// A semantic or explicitly white-box operation an adapter can execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -233,6 +235,13 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    /// Advance the subject's paired convergence clock without waking a
+    /// participant runtime. A later `tick` selects which participants observe
+    /// the elapsed deadline.
+    async fn advance_time(&mut self, _delta_ms: u64) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
+    }
+
     fn observe(&mut self, _clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::EventObservation,
@@ -309,6 +318,7 @@ pub fn required_capability(step: &ScenarioStep) -> SubjectCapability {
         ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
             SubjectCapability::TransportDelivery
         }
+        ScenarioStep::AdvanceTime { .. } => SubjectCapability::VirtualTime,
         ScenarioStep::Observe { .. } | ScenarioStep::ClearEvents { .. } => {
             SubjectCapability::EventObservation
         }
@@ -335,6 +345,7 @@ pub struct EngineHarnessSubject {
     bus: TransportBus,
     clients: BTreeMap<String, HarnessClient>,
     pending_refs: HashMap<String, PendingStateRef>,
+    convergence_clock: ManualConvergenceClock,
 }
 
 impl EngineHarnessSubject {
@@ -344,6 +355,7 @@ impl EngineHarnessSubject {
         storage_mode: HarnessStorageMode,
     ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
+        let convergence_clock = ManualConvergenceClock::new(0, 0);
         let mut attached = BTreeMap::new();
         for label in clients {
             if attached.contains_key(label) {
@@ -356,6 +368,7 @@ impl EngineHarnessSubject {
                 .registry(scenario_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
+                .convergence_clock(Arc::new(convergence_clock.clone()))
                 .attach(&bus);
             attached.insert(label.clone(), client);
         }
@@ -369,6 +382,7 @@ impl EngineHarnessSubject {
             SubjectCapability::ActiveDecryptabilityProbe,
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
+            SubjectCapability::VirtualTime,
             SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
         ]
@@ -384,6 +398,7 @@ impl EngineHarnessSubject {
             bus,
             clients: attached,
             pending_refs: HashMap::new(),
+            convergence_clock,
         })
     }
 
@@ -553,6 +568,14 @@ impl ConvergenceSubject for EngineHarnessSubject {
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
             self.client_mut(label)?.tick().await;
+        }
+        Ok(())
+    }
+
+    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
+        self.convergence_clock.advance_ms(delta_ms);
+        for client in self.clients.values_mut() {
+            client.enable_virtual_time_tick();
         }
         Ok(())
     }
@@ -832,4 +855,100 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::UnknownPending => "unknown_pending",
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ConformanceCanonicalStateSnapshot;
+
+    #[tokio::test]
+    async fn engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        assert!(
+            subject
+                .descriptor()
+                .supports(SubjectCapability::VirtualTime)
+        );
+
+        for label in &labels {
+            subject
+                .create_group(SubjectCreateGroup {
+                    creator: label,
+                    name: "virtual-time",
+                    invitees: &[],
+                    required_features: &[],
+                    initial_admins: &[],
+                    pending: "unused",
+                })
+                .await
+                .expect("founding group is created");
+            let client = subject.client_mut(label).expect("client exists");
+            client.request_disband().await.expect("request disband");
+            client
+                .advance_convergence()
+                .await
+                .expect("prepare and confirm disband commit");
+            client
+                .advance_convergence()
+                .await
+                .expect("open collecting pass");
+        }
+
+        subject
+            .advance_time(999)
+            .await
+            .expect("advance before cutoff");
+        subject
+            .tick(&["alice".to_owned()])
+            .await
+            .expect("wake alice before cutoff");
+        for label in &labels {
+            assert!(matches!(
+                subject
+                    .client(label)
+                    .expect("client exists")
+                    .canonical_state_snapshot(),
+                ConformanceCanonicalStateSnapshot::Live(_)
+            ));
+        }
+
+        subject.advance_time(1).await.expect("advance to cutoff");
+        subject
+            .tick(&["alice".to_owned()])
+            .await
+            .expect("wake alice at cutoff");
+        assert!(matches!(
+            subject
+                .client("alice")
+                .expect("alice exists")
+                .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ));
+        assert!(matches!(
+            subject
+                .client("bob")
+                .expect("bob exists")
+                .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Live(_)
+        ));
+
+        subject
+            .tick(&["bob".to_owned()])
+            .await
+            .expect("wake bob without advancing time again");
+        assert!(matches!(
+            subject
+                .client("bob")
+                .expect("bob exists")
+                .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ));
+    }
 }
