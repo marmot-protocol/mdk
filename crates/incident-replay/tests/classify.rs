@@ -313,6 +313,27 @@ fn a_convergence_run_at_the_tip_proves_the_engine_is_not_behind() {
 }
 
 #[test]
+fn a_discarded_convergence_pass_proves_the_engine_is_not_behind() {
+    // mdk#1182 replaced the `base_epoch_mismatch` halt with a repair:
+    // `convergence_pass_discarded`. Its `current_tip_epoch` comes from
+    // `convergence_tip_epoch()` at every call site, so it is the engine's own
+    // materialized tip — the same evidence class as
+    // `convergence_run_state.current_tip_epoch`. engine-b's group-state evidence
+    // stops at epoch 4 and the discard row is its only later signal, so ignoring
+    // the row reports a healthy engine as two epochs behind.
+    //
+    // `stale_base_epoch` is deliberately *ahead* of the tip here (9 > 6): it is
+    // inherited scheduling state that can split from the tip in either direction,
+    // never an epoch any engine materialized, so folding it into the group's
+    // high-water mark would invent a tip nobody reached and report every engine
+    // behind it. Only the tip counts.
+    assert_eq!(
+        classify(&load("healthy-convergence-pass-discarded-at-tip.json")),
+        Verdict::Healthy
+    );
+}
+
+#[test]
 fn halt_advisory_surfaces_behind_an_incident_verdict() {
     // A halt is a client failure, not a branch contest, so it must not preempt a
     // replayable incident — the fork still routes. But it must not be lost to

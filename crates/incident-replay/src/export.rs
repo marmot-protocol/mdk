@@ -167,6 +167,23 @@ pub enum EventKind {
         #[serde(default)]
         current_tip_epoch: Option<u64>,
     },
+    /// A durable convergence pass whose base epoch disagreed with the device's
+    /// tip was discarded so convergence could reopen at the tip (mdk #1182,
+    /// which replaced the `base_epoch_mismatch` halt this repairs). Non-terminal
+    /// by construction, so it arms no gate — but `current_tip_epoch` is read from
+    /// `convergence_tip_epoch()` at every emitting call site, making it the
+    /// engine's own materialized tip and therefore epoch evidence of the same
+    /// class as `convergence_run_state.current_tip_epoch`.
+    ///
+    /// `stale_base_epoch` is deliberately not modelled. It is inherited
+    /// scheduling state that can sit either behind *or ahead of* the tip, so it
+    /// is not an epoch any engine reached; folding it into the high-water mark
+    /// could invent a group tip nobody materialized and report every engine
+    /// behind it.
+    ConvergencePassDiscarded {
+        #[serde(default)]
+        current_tip_epoch: Option<u64>,
+    },
     /// A snapshot of the group as the engine sees it; its epoch is the
     /// engine's own current epoch.
     GroupContext {
@@ -328,7 +345,8 @@ impl EventKind {
             } => (*current_tip_epoch).max(*selected_tip_epoch),
             EventKind::ConvergenceRunState {
                 current_tip_epoch, ..
-            } => *current_tip_epoch,
+            }
+            | EventKind::ConvergencePassDiscarded { current_tip_epoch } => *current_tip_epoch,
             _ => None,
         }
     }
