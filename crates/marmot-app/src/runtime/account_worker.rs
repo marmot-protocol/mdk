@@ -795,92 +795,103 @@ async fn run_app_runtime_account_worker(
                             _ = &mut shutdown => return,
                             _ = sleep(reconnect_backoff.next_delay()) => {}
                         }
-                        match tokio::select! {
-                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                            _ = &mut shutdown => return,
-                            result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
-                        } {
-                            Ok(mut reopened) => {
-                                // Reconnect restores transport activation and
-                                // subscriptions, then resumes the live receive
-                                // tail. Do not block the command loop on a full
-                                // catch-up; the maintenance path performs
-                                // bounded repair syncs when required.
-                                let prepare_transport = tokio::select! {
-                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                    _ = &mut shutdown => return,
-                                    result = reopened.prepare_transport() => result,
-                                };
-                                if let Err(transport_err) = prepare_transport {
+                        // The account-session ownership guard is held by
+                        // `AppClient`.
+                        // Destroy the failed engine before attempting to
+                        // hydrate its replacement; otherwise reconnect would
+                        // create two independent engines over one session DB.
+                        drop(client);
+                        client = loop {
+                            match tokio::select! {
+                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                _ = &mut shutdown => return,
+                                result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+                            } {
+                                Ok(mut reopened) => {
+                                    // Reconnect restores transport activation
+                                    // and subscriptions, then resumes the live
+                                    // receive tail. Do not block the command
+                                    // loop on a full catch-up; the maintenance
+                                    // path performs bounded repair syncs when
+                                    // required.
+                                    let prepare_transport = tokio::select! {
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                        _ = &mut shutdown => return,
+                                        result = reopened.prepare_transport() => result,
+                                    };
+                                    if let Err(transport_err) = prepare_transport {
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message(
+                                                "runtime restart transport failed",
+                                                &transport_err,
+                                            ),
+                                        );
+                                        tokio::select! {
+                                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                            _ = &mut shutdown => return,
+                                            _ = sleep(reconnect_backoff.next_delay()) => {}
+                                        }
+                                        drop(reopened);
+                                        continue;
+                                    }
+                                    app.finish_client_open_network_maintenance(&mut reopened)
+                                        .await;
+                                    match reopened.drain_pending_session_events().await {
+                                        Ok(summary) => {
+                                            publish_app_runtime_summary(
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                &summary,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            publish_app_runtime_account_error(
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                account_error_message(
+                                                    "runtime restart queued-work wake failed",
+                                                    &error,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    let pending = reopened
+                                        .retry_pending_push_registration_shares_best_effort()
+                                        .await;
+                                    scheduled_push_retry
+                                        .schedule_after_attempt(pending, &command_tx);
+                                    publish_client_pending_applied_summary(
+                                        &mut reopened,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                    );
+                                    break reopened;
+                                }
+                                Err(setup_err) => {
                                     publish_app_runtime_account_error(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
-                                        account_error_message(
-                                            "runtime restart transport failed",
-                                            &transport_err,
-                                        ),
+                                        account_error_message("runtime restart failed", &setup_err),
                                     );
                                     tokio::select! {
                                         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                                         _ = &mut shutdown => return,
                                         _ = sleep(reconnect_backoff.next_delay()) => {}
                                     }
-                                    continue;
-                                }
-                                app.finish_client_open_network_maintenance(&mut reopened)
-                                    .await;
-                                match reopened.drain_pending_session_events().await {
-                                    Ok(summary) => {
-                                        publish_app_runtime_summary(
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            &summary,
-                                        );
-                                    }
-                                    Err(error) => {
-                                        publish_app_runtime_account_error(
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            account_error_message(
-                                                "runtime restart queued-work wake failed",
-                                                &error,
-                                            ),
-                                        );
-                                    }
-                                }
-                                let pending = reopened
-                                    .retry_pending_push_registration_shares_best_effort()
-                                    .await;
-                                scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
-                                publish_client_pending_applied_summary(
-                                    &mut reopened,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                client = reopened;
-                                schedule_pending_convergence_groups(
-                                    &mut scheduled_convergence,
-                                    &mut client,
-                                );
-                            }
-                            Err(setup_err) => {
-                                publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    account_error_message("runtime restart failed", &setup_err),
-                                );
-                                tokio::select! {
-                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                    _ = &mut shutdown => return,
-                                    _ = sleep(reconnect_backoff.next_delay()) => {}
                                 }
                             }
-                        }
+                        };
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                     }
                 }
             }

@@ -24,6 +24,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- `MarmotApp` now permits only one live in-memory engine session per account
+  across direct clients and managed workers. Concurrent opens return the typed
+  `AccountSessionBusy` error, and worker reconnect drops the failed session
+  before reopening, preventing two engines over one session database from
+  staging conflicting epoch work.
+
 - Group state changes settle promptly again when messages are queued for
   sending: a queued ordinary message no longer delays the next convergence
   pass (only an admin group-state change may briefly hold that boundary, as

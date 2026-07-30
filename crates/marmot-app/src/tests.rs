@@ -213,6 +213,43 @@ where
 }
 
 #[test]
+fn account_session_guard_is_exclusive_until_client_drop() {
+    run_composed_app_runtime_test("account-session-guard", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+
+        let alice = app.client("alice").await.unwrap();
+        assert!(matches!(
+            app.client("alice").await,
+            Err(AppError::AccountSessionBusy)
+        ));
+
+        // Ownership is scoped per account, not across the whole app.
+        let bob = app.client("bob").await.unwrap();
+        drop(bob);
+
+        // One-shot operations can release their client and managed workers can
+        // then hydrate the accounts normally.
+        drop(alice);
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.start().await.unwrap();
+        assert!(matches!(
+            app.client("alice").await,
+            Err(AppError::AccountSessionBusy)
+        ));
+
+        // Worker shutdown releases the same guard for a later one-shot open.
+        runtime.shutdown().await;
+        let reopened = app.client("alice").await.unwrap();
+        drop(reopened);
+    });
+}
+
+#[test]
 fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
     run_composed_app_runtime_test(
         "disable-native-push-removal",

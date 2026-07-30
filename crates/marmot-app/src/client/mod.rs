@@ -67,6 +67,7 @@ pub(crate) use sync::is_own_relay_echo;
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
+    pub(crate) _session_guard: crate::AppAccountSessionGuard,
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,

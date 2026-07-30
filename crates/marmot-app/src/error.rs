@@ -115,6 +115,10 @@ pub enum AppError {
     /// iOS notification extension can take its bounded fallback path.
     #[error("marmot runtime root is already in use")]
     RuntimeBusy,
+    /// Another [`crate::AppClient`] from this [`crate::MarmotApp`] currently
+    /// owns the account's in-memory engine session.
+    #[error("marmot account session is already in use")]
+    AccountSessionBusy,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -195,6 +199,7 @@ impl AppError {
             Self::SqlcipherKeyDerivation(_) => "sqlcipher_key_derivation",
             Self::BlockingTask(_) => "blocking_task",
             Self::RuntimeBusy => "runtime_busy",
+            Self::AccountSessionBusy => "account_session_busy",
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",
