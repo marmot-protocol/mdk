@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
     encrypted_media_secrets::{
         encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
         replace_encrypted_media_secret_references_tx,
@@ -41,8 +41,6 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// materialized window kept above this cannot be re-fetched in one query, so
 /// window owners should not exceed it.
 pub const MAX_TIMELINE_LIMIT: usize = 200;
-const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -195,7 +193,7 @@ pub struct TimelineProjectionUpdate {
     pub changes: Vec<TimelineMessageChange>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurePruneAppEventsResult {
     pub pruned_messages: usize,
     /// Number of versioned encrypted-media epoch secrets whose final retained
@@ -204,6 +202,11 @@ pub struct SecurePruneAppEventsResult {
     /// Sorted set of encrypted-media blob ids referenced by pruned messages.
     /// Callers should treat this as an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when logical deletion committed but WAL truncation remains
+    /// durably pending. A later prune call retries the checkpoint even when
+    /// it finds no additional rows to delete.
+    #[serde(default)]
+    pub erasure_pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -943,6 +946,8 @@ pub(crate) fn secure_prune_app_events_before_tx(
     tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     debug_assert_eq!(
         tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
@@ -951,7 +956,13 @@ pub(crate) fn secure_prune_app_events_before_tx(
         "secure_delete must be ON before the prune transaction is opened"
     );
     let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
-    secure_prune_selected_app_events_tx(tx, group_id_hex, pruned_events)
+    secure_prune_selected_app_events_tx(
+        tx,
+        group_id_hex,
+        pruned_events,
+        local_account_id_hex,
+        mention_classifier,
+    )
 }
 
 /// Securely prune only rows whose source-epoch retention decision has reached
@@ -961,6 +972,8 @@ pub(crate) fn secure_prune_expired_app_events_tx(
     tx: &Connection,
     group_id_hex: &str,
     now: u64,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     debug_assert_eq!(
         tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
@@ -969,13 +982,21 @@ pub(crate) fn secure_prune_expired_app_events_tx(
         "secure_delete must be ON before the prune transaction is opened"
     );
     let pruned_events = expired_app_events_tx(tx, group_id_hex, now)?;
-    secure_prune_selected_app_events_tx(tx, group_id_hex, pruned_events)
+    secure_prune_selected_app_events_tx(
+        tx,
+        group_id_hex,
+        pruned_events,
+        local_account_id_hex,
+        mention_classifier,
+    )
 }
 
 fn secure_prune_selected_app_events_tx(
     tx: &Connection,
     group_id_hex: &str,
     pruned_events: Vec<PrunedAppEvent>,
+    local_account_id_hex: &str,
+    mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     if pruned_events.is_empty() {
         return Ok(SecurePruneAppEventsResult::default());
@@ -1025,11 +1046,18 @@ fn secure_prune_selected_app_events_tx(
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
     }
     refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
+    crate::chat_list::refresh_chat_list_unread_after_secure_prune_tx(
+        tx,
+        local_account_id_hex,
+        group_id_hex,
+        mention_classifier,
+    )?;
 
     Ok(SecurePruneAppEventsResult {
         pruned_messages: pruned,
         pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+        erasure_pending: false,
     })
 }
 

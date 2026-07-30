@@ -374,6 +374,7 @@ mod tests {
             pruned_messages: 2,
             secrets_deleted: 1,
             media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
+            erasure_pending: true,
         });
 
         assert_eq!(ffi.pruned_messages, 2);
@@ -382,6 +383,7 @@ mod tests {
             ffi.media_ciphertext_sha256,
             vec!["aa".repeat(32), "bb".repeat(32)]
         );
+        assert!(ffi.erasure_pending);
     }
 
     #[test]

@@ -792,6 +792,9 @@ pub struct SecureDeleteExpiredResult {
     /// list is sorted for deterministic output, but callers should treat it as
     /// an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when logical deletion committed but secure WAL truncation remains
+    /// pending. A later retention pass will retry it.
+    pub erasure_pending: bool,
 }
 
 impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
@@ -800,6 +803,7 @@ impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
             pruned_messages: value.pruned_messages as u64,
             secrets_deleted: value.pruned_media_epoch_secrets as u64,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
         }
     }
 }
@@ -3715,7 +3719,7 @@ impl MarmotApp {
         {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
-        let deleted = storage.delete_local_group_data(group_id_hex)?;
+        let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4095,9 +4099,16 @@ impl MarmotApp {
         group_id_hex: &str,
         now: u64,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         Ok(self
-            .account_storage(label)?
-            .secure_prune_expired_app_events(group_id_hex, now)?
+            .account_storage(&account.label)?
+            .secure_prune_expired_app_events(
+                group_id_hex,
+                now,
+                &account.account_id_hex,
+                &classifier,
+            )?
             .into())
     }
 

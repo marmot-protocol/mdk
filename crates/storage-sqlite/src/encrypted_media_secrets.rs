@@ -415,6 +415,10 @@ mod tests {
     use crate::StoredAppEvent;
     use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 
+    fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+        false
+    }
+
     fn media_event(id: &str, recorded_at: u64, source_epoch: u64) -> StoredAppEvent {
         media_event_with_versions(id, recorded_at, source_epoch, &[ENCRYPTED_MEDIA_FORMAT_V1])
     }
@@ -573,7 +577,9 @@ mod tests {
             .unwrap();
         store.record_app_event(&media_event("old", 10, 7)).unwrap();
 
-        let outcome = store.secure_prune_app_events_before("aa", 11).unwrap();
+        let outcome = store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
         assert_eq!(outcome.pruned_messages, 1);
         assert_eq!(outcome.pruned_media_epoch_secrets, 1);
         assert_eq!(
@@ -674,7 +680,9 @@ mod tests {
         store.record_app_event(&media_event("old", 10, 7)).unwrap();
         store.record_app_event(&media_event("new", 20, 7)).unwrap();
 
-        let partial = store.secure_prune_app_events_before("aa", 15).unwrap();
+        let partial = store
+            .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap();
         assert_eq!(partial.pruned_messages, 1);
         assert_eq!(partial.pruned_media_epoch_secrets, 0);
         assert!(secret_is_referenced(&store, "aa", 0x8008, 7));
@@ -683,7 +691,9 @@ mod tests {
             Some(vec![1, 2, 3])
         );
 
-        let final_sweep = store.secure_prune_app_events_before("aa", 21).unwrap();
+        let final_sweep = store
+            .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+            .unwrap();
         assert_eq!(final_sweep.pruned_messages, 1);
         assert_eq!(final_sweep.pruned_media_epoch_secrets, 1);
         assert_eq!(
@@ -724,7 +734,9 @@ mod tests {
             GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
             7,
         ));
-        let outcome = store.secure_prune_app_events_before("aa", 11).unwrap();
+        let outcome = store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
         assert_eq!(outcome.pruned_media_epoch_secrets, 1);
         assert_eq!(
             store
@@ -741,7 +753,9 @@ mod tests {
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
         store.record_app_event(&media_event("old", 10, 7)).unwrap();
-        store.secure_prune_app_events_before("aa", 11).unwrap();
+        store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
 
         store
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
@@ -782,7 +796,9 @@ mod tests {
         store
             .record_app_event(&media_event("seven", 10, 7))
             .unwrap();
-        store.secure_prune_app_events_before("aa", 11).unwrap();
+        store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
 
         store
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 6, &[6])
@@ -809,7 +825,9 @@ mod tests {
         store
             .record_app_event(&media_event("eight", 20, 8))
             .unwrap();
-        store.secure_prune_app_events_before("aa", 21).unwrap();
+        store
+            .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+            .unwrap();
         let watermark: (i64, i64) = store
             .lock()
             .unwrap()
@@ -836,7 +854,9 @@ mod tests {
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
         store.record_app_event(&media_event("old", 10, 7)).unwrap();
-        store.secure_prune_app_events_before("aa", 11).unwrap();
+        store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
         drop(store);
 
         let reopened = SqliteAccountStorage::from_connection_with_options(
@@ -869,7 +889,9 @@ mod tests {
         store
             .record_app_event(&media_event("reference-only", 10, 7))
             .unwrap();
-        store.secure_prune_app_events_before("aa", 11).unwrap();
+        store
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+            .unwrap();
         store
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
@@ -924,7 +946,9 @@ mod tests {
             ))
             .unwrap();
 
-        let partial = store.secure_prune_app_events_before("aa", 15).unwrap();
+        let partial = store
+            .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap();
         assert_eq!(partial.pruned_messages, 1);
         assert_eq!(partial.pruned_media_epoch_secrets, 0);
         assert_eq!(
@@ -935,7 +959,9 @@ mod tests {
             "a retained V2 sibling needs the same source-epoch exporter secret"
         );
 
-        let final_sweep = store.secure_prune_app_events_before("aa", 21).unwrap();
+        let final_sweep = store
+            .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+            .unwrap();
         assert_eq!(final_sweep.pruned_messages, 1);
         assert_eq!(final_sweep.pruned_media_epoch_secrets, 1);
         assert_eq!(
@@ -966,7 +992,7 @@ mod tests {
             .unwrap();
 
         let error = store
-            .secure_prune_app_events_before("aa", 11)
+            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .expect_err("secret-delete failure must abort the whole prune");
         assert!(format!("{error}").contains("abort media secret delete"));
         assert_eq!(store.app_message_count().unwrap(), 1);

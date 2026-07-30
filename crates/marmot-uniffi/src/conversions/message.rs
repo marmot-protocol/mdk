@@ -57,6 +57,7 @@ pub struct SecureDeleteExpiredResultFfi {
     pub pruned_messages: u64,
     pub secrets_deleted: u64,
     pub media_ciphertext_sha256: Vec<String>,
+    pub erasure_pending: bool,
 }
 
 impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
@@ -65,6 +66,7 @@ impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
             pruned_messages: value.pruned_messages,
             secrets_deleted: value.secrets_deleted,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
         }
     }
 }

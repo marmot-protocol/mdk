@@ -1391,7 +1391,8 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     assert!(
         storage
             .delete_local_group_data(&hex::encode(group_id.as_slice()))
-            .unwrap(),
+            .unwrap()
+            .did_delete(),
         "terminal local deletion should remove history and the full group row"
     );
     let mut tombstone_only =

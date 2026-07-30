@@ -99,7 +99,9 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
         None
     );
 
-    let outcome = store.secure_prune_expired_app_events("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
+        .unwrap();
     assert_eq!(outcome.pruned_messages, 1);
     let surviving_ids = store
         .app_messages(StoredAppMessageQuery {
@@ -119,7 +121,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
 
     assert_eq!(
         store
-            .secure_prune_expired_app_events("aa", 16)
+            .secure_prune_expired_app_events("aa", 16, "local", &no_mentions)
             .unwrap()
             .pruned_messages,
         1
@@ -727,6 +729,81 @@ fn account_projection_state_deletes_groups_removed_from_snapshot() {
 }
 
 #[test]
+fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit() {
+    const GROUP_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: The raw handle is only used to lower this test connection's
+        // bind-parameter limit before any concurrent use; rusqlite keeps owning
+        // the connection and no pointer is retained.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+    }
+    let groups = (0..GROUP_COUNT)
+        .map(|index| {
+            let mut stored_group = group(&format!("group-{index:04}"), "group");
+            stored_group.components.clear();
+            stored_group
+        })
+        .collect::<Vec<_>>();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: groups.clone(),
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    let retained = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: groups[1..].to_vec(),
+    };
+    store
+        .save_account_projection_state(&retained, 16, MAX_FUTURE_SKEW_SECS)
+        .expect("an unbounded retained set must not become SQL bind parameters");
+    assert_eq!(
+        store
+            .load_account_projection_state("alice", GROUP_COUNT)
+            .unwrap()
+            .groups
+            .len(),
+        GROUP_COUNT - 1
+    );
+
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                groups: Vec::new(),
+                ..retained
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .expect("more than one chunk of stale group keys should be deleted");
+    assert!(
+        store
+            .load_account_projection_state("alice", GROUP_COUNT)
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+}
+
+#[test]
 fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {
@@ -798,7 +875,12 @@ fn app_messages_list_raw_events_and_prune_updates_timeline() {
         .record_app_event(&app_event("old-bb", "bb", 10))
         .unwrap();
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let aa = store
         .app_messages(StoredAppMessageQuery {
@@ -881,7 +963,12 @@ fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let conn = store.lock().unwrap();
     let rows = conn
@@ -980,7 +1067,9 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         "fixture should place plaintext in the database file before secure prune"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash.clone()]);
     assert!(
@@ -1056,7 +1145,9 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         "fixture should place indexed plaintext in the database file before secure prune"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     drop(store);
@@ -1109,7 +1200,9 @@ fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
         "chat list should not retain this"
     );
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     assert!(
@@ -1134,14 +1227,16 @@ fn secure_prune_restores_caller_secure_delete_setting() {
         .record_app_event(&app_event("old-aa", "aa", 10))
         .unwrap();
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(secure_delete_pragma(&store), 0);
 }
 
 #[test]
-fn secure_prune_returns_hashes_when_wal_checkpoint_is_busy() {
+fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("account.sqlite");
     let store = SqliteAccountStorage::from_connection_with_options(
@@ -1167,11 +1262,167 @@ fn secure_prune_returns_hashes_when_wal_checkpoint_is_busy() {
         .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
         .unwrap();
 
-    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    let pending = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .expect("checkpoint contention is a committed result with pending erasure");
 
+    assert_eq!(pending.pruned_messages, 1);
+    assert_eq!(pending.media_ciphertext_sha256, vec![media_hash.clone()]);
+    assert!(pending.erasure_pending);
+    assert_eq!(
+        store.app_message_count().unwrap(),
+        0,
+        "logical deletion commits before the checkpoint failure is surfaced"
+    );
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    drop(store);
+
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let outcome = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .expect("retry after reopen must re-drive the durable pending checkpoint");
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
-    reader.execute_batch("COMMIT").unwrap();
+    assert!(!outcome.erasure_pending);
+
+    let empty = store
+        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .unwrap();
+    assert_eq!(
+        empty,
+        crate::SecurePruneAppEventsResult::default(),
+        "the committed result is consumed exactly once after checkpoint completion"
+    );
+}
+
+#[test]
+fn competing_storage_handles_consume_one_checkpoint_intent_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("competing-checkpoint.sqlite");
+    let store_a = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        SqliteStorageOptions::default(),
+    )
+    .unwrap();
+    let store_b = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        SqliteStorageOptions::default(),
+    )
+    .unwrap();
+    let expected = crate::SecurePruneAppEventsResult {
+        pruned_messages: 1,
+        pruned_media_epoch_secrets: 0,
+        media_ciphertext_sha256: vec!["ab".repeat(32)],
+        erasure_pending: false,
+    };
+    {
+        let conn = store_a.lock().unwrap();
+        upsert_secure_delete_intent_tx(
+            &conn,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+            &serde_json::to_string(&expected).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let a = std::thread::spawn(move || {
+        finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
+            &store_a,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+        )
+        .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
+            &store_b,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+        )
+        .unwrap()
+    });
+    let outcomes = [a.join().unwrap().result, b.join().unwrap().result];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+        1,
+        "exactly one competing finisher should consume the durable result"
+    );
+    assert!(
+        outcomes
+            .into_iter()
+            .flatten()
+            .all(|outcome| outcome == expected)
+    );
+}
+
+#[test]
+fn recreated_checkpoint_intent_cannot_be_deleted_by_a_stale_nonce() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let first_result = crate::SecurePruneAppEventsResult {
+        pruned_messages: 1,
+        ..crate::SecurePruneAppEventsResult::default()
+    };
+    let second_result = crate::SecurePruneAppEventsResult {
+        pruned_messages: 2,
+        ..crate::SecurePruneAppEventsResult::default()
+    };
+    let conn = store.lock().unwrap();
+    upsert_secure_delete_intent_tx(
+        &conn,
+        SECURE_DELETE_RETENTION_OPERATION,
+        "aa",
+        &serde_json::to_string(&first_result).unwrap(),
+    )
+    .unwrap();
+    let first = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "DELETE FROM secure_delete_checkpoint_intents
+         WHERE operation_kind = ?1 AND scope = ?2",
+        params![SECURE_DELETE_RETENTION_OPERATION, "aa"],
+    )
+    .unwrap();
+    upsert_secure_delete_intent_tx(
+        &conn,
+        SECURE_DELETE_RETENTION_OPERATION,
+        "aa",
+        &serde_json::to_string(&second_result).unwrap(),
+    )
+    .unwrap();
+    let second = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.nonce.len(), 16);
+    assert_eq!(second.nonce.len(), 16);
+    assert_ne!(first.nonce, second.nonce);
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM secure_delete_checkpoint_intents
+             WHERE operation_kind = ?1 AND scope = ?2 AND intent_nonce = ?3",
+            params![SECURE_DELETE_RETENTION_OPERATION, "aa", &first.nonce],
+        )
+        .unwrap(),
+        0,
+        "a stale finisher must not consume a recreated intent"
+    );
+    let remaining = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::SecurePruneAppEventsResult>(&remaining.result_json).unwrap(),
+        second_result
+    );
 }
 
 fn secure_delete_pragma(store: &SqliteAccountStorage) -> i64 {
@@ -1204,7 +1455,12 @@ fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1248,7 +1504,12 @@ fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let conn = store.lock().unwrap();
     let stream_start_ids = conn
@@ -1286,7 +1547,9 @@ fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit
     }
 
     assert_eq!(
-        store.prune_app_events_before("aa", 2_000).unwrap(),
+        store
+            .prune_app_events_before("aa", 2_000, "local", &no_mentions)
+            .unwrap(),
         EVENT_COUNT
     );
 
@@ -1329,7 +1592,12 @@ fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1366,7 +1634,12 @@ fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1403,7 +1676,12 @@ fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
         .unwrap();
     }
 
-    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_app_events_before("aa", 15, "local", &no_mentions)
+            .unwrap(),
+        1
+    );
 
     let timeline = store
         .message_timeline(crate::TimelineMessageQuery {
@@ -1957,7 +2235,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .queue_push_registration_removals(&registration, 11)
         .unwrap();
 
-    assert!(store.delete_local_group_data("aa").unwrap());
+    assert!(store.delete_local_group_data("aa").unwrap().did_delete());
     store
         .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
         .unwrap();
@@ -2012,7 +2290,102 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     }
     assert_eq!(all_row_count(&store, "seen_events"), 1);
     assert_eq!(all_row_count(&store, "cgka_groups"), 1);
-    assert!(!store.delete_local_group_data("aa").unwrap());
+    assert!(!store.delete_local_group_data("aa").unwrap().did_delete());
+}
+
+#[test]
+fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("local-wipe.sqlite");
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            secure_delete: false,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let group_id_hex = "aa";
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group(group_id_hex, "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let secret = "local-wipe-plaintext-secret";
+    let mut message = app_event("wipe-me", group_id_hex, 10);
+    message.plaintext = secret.to_owned();
+    store.record_app_event(&message).unwrap();
+    {
+        let conn = store.lock().unwrap();
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+    }
+    assert!(file_contains(&db_path, secret.as_bytes()));
+
+    let reader = rusqlite::Connection::open(&db_path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
+        .unwrap();
+
+    let pending = store
+        .delete_local_group_data(group_id_hex)
+        .expect("logical wipe commits while WAL erasure remains pending");
+    assert!(pending.did_delete());
+    assert!(pending.erasure_pending);
+    assert!(!pending.completed_pending_checkpoint);
+    assert_eq!(store.app_message_count().unwrap(), 0);
+    assert_eq!(
+        secure_delete_pragma(&store),
+        0,
+        "the caller's secure_delete setting must be restored after the committed wipe"
+    );
+
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    drop(store);
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            secure_delete: false,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let completed = store
+        .delete_local_group_data(group_id_hex)
+        .expect("retry after reopen should finish the prior checkpoint");
+    assert!(completed.did_delete());
+    assert!(completed.completed_pending_checkpoint);
+    assert!(!completed.erasure_pending);
+    assert!(completed.deleted_rows > 0);
+    drop(store);
+    for path in [
+        db_path.clone(),
+        db_path.with_extension("sqlite-wal"),
+        db_path.with_extension("sqlite-shm"),
+    ] {
+        if path.exists() {
+            assert!(
+                !file_contains(&path, secret.as_bytes()),
+                "{} must not retain locally wiped plaintext",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -2329,6 +2702,77 @@ fn member_cleanup_clears_tokens_and_tombstones() {
             .apply_group_push_token(&push_token(&g, &m, 10, "d1"))
             .unwrap()
     );
+}
+
+#[test]
+fn stale_push_token_cleanup_chunks_stale_keys_and_does_not_bind_retained_members() {
+    const ACTIVE_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+    const STALE_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 1;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "aa".repeat(32);
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: The raw handle is only used to lower this test connection's
+        // bind-parameter limit before any concurrent use; rusqlite keeps owning
+        // the connection and no pointer is retained.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+        let mut token = conn
+            .prepare(
+                "INSERT INTO group_push_tokens (
+                    group_id_hex, member_id_hex, leaf_index, platform,
+                    token_fingerprint, server_pubkey_hex, relay_hint,
+                    encrypted_token, owner_ts, owner_sig, record_digest,
+                    updated_at_ms
+                 ) VALUES (?1, ?2, 0, 1, 'token', ?3, NULL, x'01', 1, 'sig', 'digest', 1)",
+            )
+            .unwrap();
+        let mut tombstone = conn
+            .prepare(
+                "INSERT INTO group_push_token_tombstones (
+                    group_id_hex, member_id_hex, leaf_index, platform,
+                    server_pubkey_hex, owner_ts, record_digest, created_at_ms
+                 ) VALUES (?1, ?2, 0, 1, ?3, 1, 'digest', 1)",
+            )
+            .unwrap();
+        for index in 0..(ACTIVE_COUNT + STALE_COUNT) {
+            let member_id = format!("member-{index:04}");
+            let server_key = "cc".repeat(32);
+            token
+                .execute(params![&group_id, &member_id, &server_key])
+                .unwrap();
+            tombstone
+                .execute(params![&group_id, &member_id, &server_key])
+                .unwrap();
+        }
+    }
+    let active_members = (0..ACTIVE_COUNT)
+        .map(|index| format!("member-{index:04}"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        store
+            .remove_stale_group_push_tokens(&group_id, &active_members)
+            .expect("retained members must not become an unbounded NOT IN bind set"),
+        STALE_COUNT
+    );
+    let conn = store.lock().unwrap();
+    for table in ["group_push_tokens", "group_push_token_tombstones"] {
+        let remaining: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE group_id_hex = ?1"),
+                params![&group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, ACTIVE_COUNT as i64, "{table}");
+    }
 }
 
 fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
