@@ -197,7 +197,7 @@ async fn malformed_group_message_does_not_starve_messages_behind_it() {
     assert_eq!(
         account_sync_failures(&runtime_bob_boot2),
         0,
-        "hostile wire input must classify as stale inside the engine, never \
+        "hostile wire input must classify as rejected inside the engine, never \
          surface as a sync failure",
     );
     runtime_bob_boot2.shutdown().await;

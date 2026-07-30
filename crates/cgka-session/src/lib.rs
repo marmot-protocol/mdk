@@ -1177,6 +1177,8 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",
+        IngestOutcome::TransportDeferred { .. } => "transport_deferred",
+        IngestOutcome::ResourceRefused { .. } => "resource_refused",
         IngestOutcome::Stale { .. } => "stale",
         IngestOutcome::Rejected { .. } => "rejected",
     }

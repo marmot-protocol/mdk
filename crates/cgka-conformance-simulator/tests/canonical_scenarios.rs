@@ -16,7 +16,7 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::GroupEvent;
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::TransportMessage;
@@ -158,14 +158,9 @@ async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
     let outcomes = carol.tick().await;
 
     assert!(
-        outcomes.iter().all(|outcome| {
-            !matches!(
-                outcome,
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed
-                })
-            )
-        }),
+        outcomes
+            .iter()
+            .all(|outcome| { !matches!(outcome, Ok(IngestOutcome::TransportDeferred { .. })) }),
         "past-epoch app should peel from the retained epoch context: {outcomes:?}"
     );
     // The delayed past-epoch app message is stored under its content-derived
@@ -1949,26 +1944,27 @@ async fn welcome_before_commit_rejects_commit_echo_cleanly_via_harness() {
     alice.confirm(invite_pending).await;
 
     // Both arrive in the same delivery. Carol processes the welcome, then
-    // treats the group-message echo as a stale peel failure because the
+    // treats the group-message echo as transport-deferred because the
     // outer wrapper was encrypted for the pre-join epoch.
     bus.deliver_all();
     let outcomes = carol.tick().await;
     let saw_welcome = outcomes
         .iter()
         .any(|o| matches!(o, Ok(cgka_traits::ingest::IngestOutcome::Processed)));
-    let saw_peel_failed = outcomes.iter().any(|o| {
+    let saw_transport_deferred = outcomes.iter().any(|o| {
         matches!(
             o,
-            Ok(cgka_traits::ingest::IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::PeelFailed,
-            })
+            Ok(cgka_traits::ingest::IngestOutcome::TransportDeferred { .. })
         )
     });
     assert!(
         saw_welcome,
         "expected welcome to be processed: {outcomes:?}"
     );
-    assert!(saw_peel_failed, "expected stale peel failure: {outcomes:?}");
+    assert!(
+        saw_transport_deferred,
+        "expected transport-deferred commit echo: {outcomes:?}"
+    );
 }
 
 /// End-to-end proof of the convergence assert surface: an observer's engine

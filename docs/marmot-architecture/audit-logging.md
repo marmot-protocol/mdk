@@ -36,8 +36,8 @@ treated like telemetry.
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`fork_recovery.rs`](../../crates/cgka-engine/src/fork_recovery.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
-| Runtime tracker scheduling | [`crates/marmot-app/src/runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
-| UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions.rs`](../../crates/marmot-uniffi/src/conversions.rs) |
+| Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
+| UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions/`](../../crates/marmot-uniffi/src/conversions) |
 | Tests | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/cgka-engine/tests/audit_log.rs`](../../crates/cgka-engine/tests/audit_log.rs), [`crates/marmot-app/tests/audit_logs.rs`](../../crates/marmot-app/tests/audit_logs.rs) |
 
 ## Enablement and lifecycle
@@ -328,7 +328,7 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex `MessageId` of the inbound message. |
-| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `stale`, or `rejected`. |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, or `rejected`. |
 | `stale_reason` | Legacy optional category field used by non-processed outcomes. |
 | `epoch` | Present for buffered outcomes and `already_at_epoch` stale outcomes. |
 
@@ -341,14 +341,27 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | `wrong_recipient` | Welcome/inbox message was not addressed to this client. |
 | `unknown_group` | Message referenced a group the engine does not know. |
 | `own_echo` | Message was produced by this engine and bounced back through ingest. |
-| `peel_failed` | MLS/transport peeling failed or could not be recovered. |
+| `invalid_encoding` | Transport or recovered protocol bytes failed structural validation. |
+| `invalid_signature` | A required transport or protocol signature failed validation. |
+| `unsupported_required_feature` | The input requires a feature the engine does not support. |
+| `authorization_failed` | Authenticated input was not authorized in the applicable state. |
+| `transport_deferred` | Current transport context cannot decrypt the object; a changed context may recover it. |
+| `resource_refused_deferred_capacity` | The per-group retained transport-deferred row cap was full. |
+| `resource_refused_retry_budget` | A retained transport object exhausted its changed-context retry budget and was released. |
+| `pre_membership` | The message predates this account-device's membership. |
+| `beyond_anchor` | Convergence excluded input below the retained anchor. |
+| `beyond_rollback_horizon` | Convergence excluded input beyond the rollback horizon. |
+| `beyond_app_retention` | The application-message source epoch is outside retained decryption history. |
+| `losing_branch` | The message belongs only to a losing branch. |
+| `invalid_against_canonical_state` | Authenticated input is invalid against the selected candidate state. |
 | `removed` | Authenticated canonical state records this local member's removal. |
 | `quarantined` | Hydration validation froze the local group pending repair. |
 
 Metadata notes:
 
 - This event is not emitted if `do_ingest()` returns an `Err`.
-- It has `group_ref` when the outcome is `buffered`, because that outcome carries the group id.
+- It has `group_ref` when the outcome is `buffered`, `transport_deferred`, or `resource_refused`, because those
+  outcomes carry the group id.
 - The JSON field remains named `stale_reason` for v1/v2 schema compatibility. Its type and required-field set did not
   change, so this additive outcome taxonomy does not require a forensic schema-version bump.
 
@@ -779,9 +792,11 @@ Current `reason` values found in production call sites:
 | `state_update` | Generic `update_stored_message_state` path updates a stored message. |
 | `publish_confirmed` | A pending commit message is promoted to processed after publish confirmation. |
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
-| `peel_failed_no_snapshot` | Group-message peel failed and no fallback snapshot could recover it; state becomes `peel_deferred`. |
+| `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
+| `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
+| `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
-| `too_distant_in_the_past` | A deferred raw transport message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained past-epoch window; state becomes `failed`. |
+| `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
 
 Metadata notes:
 
@@ -813,8 +828,8 @@ metadata keys for indexing.
 | Category | Values |
 | --- | --- |
 | `envelope_kind` | `welcome`, `group_message` |
-| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `stale`, `rejected` |
-| `stale_reason` | `duplicate`, `already_at_epoch`, `wrong_recipient`, `unknown_group`, `own_echo`, `peel_failed`, `removed`, `quarantined` |
+| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, `rejected` |
+| `stale_reason` | `duplicate`, `already_at_epoch`, `wrong_recipient`, `unknown_group`, `own_echo`, `invalid_encoding`, `invalid_signature`, `unsupported_required_feature`, `authorization_failed`, `transport_deferred`, `resource_refused_deferred_capacity`, `resource_refused_retry_budget`, `pre_membership`, `beyond_anchor`, `beyond_rollback_horizon`, `beyond_app_retention`, `losing_branch`, `invalid_against_canonical_state`, `removed`, `quarantined` |
 | `engine error_kind` | `unknown_group`, `unknown_pending`, `not_a_member`, `not_group_admin`, `unknown_member`, `invalid_credential_identity`, `admin_cannot_self_remove`, `admin_depletion`, `missing_required_capabilities`, `unsupported_ciphersuite`, `invalid_app_message_payload`, `invalid_account_identity_proof`, `forked_epoch`, `invalid_transition`, `storage`, `peeler`, `serialize`, `backend`, `other` |
 | `peeler error_kind` | `malformed`, `decrypt_failed`, `stale_epoch`, `missing_context`, `wrap_failed`, `backend` |
 | `intent_kind` | `app_message`, `invite`, `remove_members`, `leave`, `update_app_components`, `update_group_data` |

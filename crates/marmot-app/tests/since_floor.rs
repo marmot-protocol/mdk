@@ -72,7 +72,7 @@
 //! this: kind-445 senders are always a fresh per-event key, unrelated to any
 //! account identity, and this test exercises *delivery*, not decryption). An
 //! undecryptable delivery produces no `MarmotAppEvent` — decrypt failure
-//! yields `IngestOutcome::Stale` with no observable side effect at the
+//! yields `IngestOutcome::TransportDeferred` with no observable side effect at the
 //! `MarmotAppRuntime` event-stream layer. The chosen observable is instead
 //! `MarmotApp::relay_telemetry().metrics.inbound_events_delivered`
 //! (`transport-nostr-adapter`'s `NostrAdapterMetrics`, already public,
@@ -244,7 +244,7 @@ async fn wait_for_inbound_delivered(app: &MarmotApp, target: usize) {
 /// authenticate under no key, so the recipient peels it to a clean
 /// `PeelerError::DecryptFailed` — the same shape as real traffic sealed under
 /// an exporter secret this device does not hold, and the shape the epoch-stall
-/// detector counts as `IngestOutcome::Stale { reason: PeelFailed }`. (A
+/// detector counts as `IngestOutcome::TransportDeferred`. (A
 /// shorter-than-envelope body would instead be `Malformed`, a hard ingest
 /// error rather than an undecryptable-message observation.)
 async fn publish_garbage_group_message_at(

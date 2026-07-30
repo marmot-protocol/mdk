@@ -347,9 +347,7 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
     // The epoch-3 commit does not peel at carol's epoch 1: deferred.
     assert!(matches!(
         carol.ingest(commit3.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(
         carol_storage.get_message(&commit3.id).unwrap().state,
@@ -420,11 +418,11 @@ async fn deferred_peel_retries_after_epoch_advance() {
     );
 }
 
-/// A row that exhausts its retry budget without ever peeling goes terminal
-/// `Failed` (`permanently_undecryptable`) and is never attempted again.
+/// A row that exhausts its retry budget is resource-refused and released
+/// without poisoning same-id redelivery as a terminal duplicate.
 #[tokio::test]
-async fn deferred_peel_terminal_after_attempt_budget() {
-    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, _commit3) =
+async fn deferred_peel_retry_budget_refuses_without_terminal_dedup() {
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs().await;
     carol.set_deferred_peel_retry_budget(1);
 
@@ -433,9 +431,7 @@ async fn deferred_peel_terminal_after_attempt_budget() {
     let stuck_app = send_app(&mut alice, &group_id, "forever ahead").await;
     assert!(matches!(
         carol.ingest(stuck_app.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
 
     // Sweep 1 (context: epoch 1) consumes the single budgeted attempt.
@@ -449,28 +445,41 @@ async fn deferred_peel_terminal_after_attempt_budget() {
     );
 
     // The epoch-2 commit changes the context; the next sweep finds the row
-    // over budget and goes terminal without another peel attempt.
+    // over budget and releases it without another peel attempt.
     carol.ingest(commit2.clone()).await.unwrap();
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
         .await
         .unwrap();
-    assert_eq!(
-        carol_storage.get_message(&stuck_app.id).unwrap().state,
-        MessageState::Failed,
-        "budget-exhausted deferred row must go terminal"
+    assert!(
+        matches!(
+            carol_storage.get_message(&stuck_app.id),
+            Err(StorageError::NotFound)
+        ),
+        "budget-exhausted deferred row must be released, not terminally retained"
     );
 
-    // Terminal rows are out of the lifecycle: further context changes do not
-    // re-peel them.
-    let attempts_at_terminal = carol_peeler.attempts_for(&stuck_app.id);
+    // The same transport id remains eligible and is retained again rather
+    // than short-circuiting as a duplicate.
+    let attempts_at_refusal = carol_peeler.attempts_for(&stuck_app.id);
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert!(
+        carol_peeler.attempts_for(&stuck_app.id) > attempts_at_refusal,
+        "same-id redelivery must reach the peeler again"
+    );
+
+    // Once the missing commit arrives, the redelivered row peels and applies.
+    carol.ingest(commit3).await.unwrap();
     carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_002)
         .await
         .unwrap();
     assert_eq!(
-        carol_peeler.attempts_for(&stuck_app.id),
-        attempts_at_terminal
+        carol_storage.get_message(&stuck_app.id).unwrap().state,
+        MessageState::Processed
     );
 }
 
@@ -494,12 +503,7 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         };
         let outcome = carol.ingest(wrapped.clone()).await.unwrap();
         assert!(
-            matches!(
-                outcome,
-                IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed
-                }
-            ),
+            matches!(outcome, IngestOutcome::TransportDeferred { .. }),
             "flood message {i} classified unexpectedly: {outcome:?}"
         );
     }
@@ -511,8 +515,9 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
     };
     assert!(matches!(
         carol.ingest(overflow.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
         }
     ));
 
@@ -539,8 +544,9 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
     let attempts_before_redelivery = carol_peeler.attempts_for(&overflow.id);
     assert!(matches!(
         carol.ingest(overflow.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
         }
     ));
     assert_eq!(
@@ -625,7 +631,7 @@ async fn pre_membership_application_message_is_terminal_not_deferred() {
     assert!(matches!(
         outcome,
         IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+            reason: StaleReason::PreMembership
         }
     ));
     let record = carol_storage
@@ -768,9 +774,7 @@ async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
     // Carol (epoch 1) ingests the future commit: undecryptable → PeelDeferred.
     assert!(matches!(
         carol.ingest(future_commit.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(
         carol_storage.get_message(&future_commit.id).unwrap().state,

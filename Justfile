@@ -295,6 +295,11 @@ dead-code-audit:
 naming-gate:
     ./scripts/check_legacy_naming.sh
 
+# Keep convergence policy, resource, scheduler, and history-recovery constants
+# attached to reviewed Milestone 0 ledger entries.
+convergence-ledger-gate:
+    ./scripts/check_convergence_constant_ledger.sh
+
 # Prove the normal-build convergence policy pin (mdk#970). The broader test
 # matrix explicitly enables test-policy-overrides; this target must not.
 test-convergence-policy-pin:
@@ -302,6 +307,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI runs the full `just ci` suite (including the workspace test matrix).
-fast-ci: fmt-check naming-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate convergence-ledger-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate convergence-ledger-gate check clippy test-convergence-policy-pin test

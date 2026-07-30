@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::IngestOutcome;
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
@@ -539,11 +539,13 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
-    /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
-    /// backfill once a group has accumulated enough undecryptable traffic at a
-    /// stalled epoch (see [`super::epoch_stall`]). Only observed under
-    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not own
-    /// recovery, and the main app sees the same evidence on its own next sync.
+    /// Feed an unavailable group delivery to the epoch-stall detector.
+    /// Transport-deferred input arms a backfill after the stalled-epoch
+    /// threshold; resource refusal arms it immediately because it directly
+    /// proves the fetched history was not fully retained. Only observed under
+    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
+    /// own recovery, and the main app sees the same evidence on its own next
+    /// sync.
     fn detect_epoch_stall(
         &mut self,
         group_id_hint: Option<cgka_traits::GroupId>,
@@ -551,14 +553,6 @@ impl AppClient {
         outcome: &IngestOutcome,
     ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
-        }
-        if !matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
-            }
-        ) {
             return;
         }
         let Some(group_id) = group_id_hint else {
@@ -569,11 +563,18 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
-        if self.epoch_stall.observe_undecryptable(
-            group_id.clone(),
-            message_id_hex.to_owned(),
-            record.epoch,
-        ) {
+        let should_backfill = match outcome {
+            IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
+                group_id.clone(),
+                message_id_hex.to_owned(),
+                record.epoch,
+            ),
+            IngestOutcome::ResourceRefused { .. } => self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch),
+            _ => false,
+        };
+        if should_backfill {
             // Record the arm decision before the replay side effect runs (the
             // worker seam calls run_pending_epoch_backfill after this returns).
             // Best-effort, fire-and-forget: recording can never block or fail

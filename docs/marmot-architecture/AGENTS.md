@@ -12,10 +12,11 @@ Agent map for the Marmot architecture docs.
 6. `overview/whitenoise-integration-map.md`
 7. `cgka-engine-spec.md`
 8. `cgka-engine-canonicalization-contract.md`
-9. `distributed-convergence.md`
-10. `relay-delivery-telemetry.md`
-11. `relay-observability.md`
-12. `github.com/marmot-protocol/marmot` when the task touches the Marmot protocol specification.
+9. `convergence-reliability-plan.md`
+10. `distributed-convergence.md`
+11. `relay-delivery-telemetry.md`
+12. `relay-observability.md`
+13. `github.com/marmot-protocol/marmot` when the task touches the Marmot protocol specification.
 
 ## Document roles
 
@@ -51,6 +52,10 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `cgka-engine-canonicalization-contract.md`
   - **Role:** Detailed post-peeling convergence contract.
+
+- **Path:** `convergence-reliability-plan.md`
+  - **Role:** Tracked convergence assurance, constant classification, simulator roadmap, verification gates, and
+    campaign evidence.
 
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.
@@ -91,3 +96,6 @@ Agent map for the Marmot architecture docs.
   components in `github.com/marmot-protocol/marmot`.
 - If Tamarin or Rust tests add a named scenario, mirror the name in the docs when that scenario becomes part of the
   contract.
+- When adding or changing a convergence policy, resource, scheduler, or history-recovery constant, update
+  `convergence-reliability-plan.md` and `convergence-constant-inventory.txt`, then run
+  `just convergence-ledger-gate`.

@@ -21,7 +21,9 @@ use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
+};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -36,8 +38,8 @@ const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 /// actual re-peel attempt under a *changed* peel context (the fingerprint
 /// gate skips unchanged contexts entirely), so a legitimate future-epoch
 /// message would need to trail the group by this many context changes before
-/// its retained row goes terminal — and content-level redelivery under a
-/// fresh transport id still recovers it afterwards.
+/// its retained row is resource-refused and released. The same transport id
+/// remains eligible if the transport delivers it again afterwards.
 pub const MAX_DEFERRED_PEEL_ATTEMPTS: u32 = 32;
 
 /// Per-group cap on retained `PeelDeferred` rows (mdk#339). Raw
@@ -889,8 +891,8 @@ impl<S: StorageProvider> Engine<S> {
     ///   unproductive cycle over the backlog the context fingerprint gates
     ///   whole sweeps until the context actually changes.
     /// - **Budgeted**: a row that exhausts its retry budget without ever
-    ///   peeling goes terminal `Failed` (`permanently_undecryptable`) instead
-    ///   of retrying forever.
+    ///   peeling is resource-refused and released without terminal
+    ///   deduplication instead of retrying forever.
     /// - **Bounded**: at most [`MAX_DEFERRED_ROWS_PER_SWEEP`] rows are
     ///   attempted per sweep (cursor resumes next pass) so a large historical
     ///   backlog never starves current-event processing.
@@ -958,8 +960,10 @@ impl<S: StorageProvider> Engine<S> {
         let mut progressed = 0usize;
         let mut terminal = 0usize;
         for record in &deferred[start..end] {
-            // Budget check first: bump this row's attempt count and go
-            // terminal once it exceeds the budget without ever peeling.
+            // Budget check first: bump this row's attempt count and release it
+            // as resource-refused once it exceeds the budget without peeling.
+            // Deleting the row is intentional: retaining it as `Failed` would
+            // turn a later same-id delivery into a terminal duplicate.
             let (attempts, first_seen_sweep) = {
                 let state = self.deferred_peel.entry(group_id.clone()).or_default();
                 let entry =
@@ -974,14 +978,13 @@ impl<S: StorageProvider> Engine<S> {
                 (entry.attempts, entry.first_seen_sweep)
             };
             if attempts > retry_budget {
-                self.update_stored_message_state(&record.id, MessageState::Failed)?;
+                self.storage.delete_message(&record.id)?;
                 self.audit_group(
                     group_id,
-                    crate::audit_helpers::deferred_peel_terminal_event(
+                    crate::audit_helpers::deferred_peel_resource_refused_event(
                         hex::encode(record.id.as_slice()),
                         Some(record.epoch),
-                        crate::message_disposition::MessageDisposition::PermanentlyUndecryptable
-                            .tag(),
+                        crate::message_disposition::MessageDisposition::RetryBudgetRefused.tag(),
                         u64::from(attempts.saturating_sub(1)),
                         sweep_index.saturating_sub(first_seen_sweep),
                     ),
@@ -1000,8 +1003,10 @@ impl<S: StorageProvider> Engine<S> {
                 .ingest_group_message(&msg, group_id.as_slice().to_vec())
                 .await
             {
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                Ok(IngestOutcome::TransportDeferred { .. }) => {}
+                Ok(IngestOutcome::ResourceRefused {
+                    resource: InboundResourceLimit::TransportDeferredCapacity,
+                    ..
                 }) => {}
                 Ok(IngestOutcome::LocalState {
                     state: LocalIngestState::Quarantined,
@@ -1036,6 +1041,7 @@ impl<S: StorageProvider> Engine<S> {
                     IngestOutcome::Stale { .. }
                     | IngestOutcome::Ignored { .. }
                     | IngestOutcome::LocalState { .. }
+                    | IngestOutcome::ResourceRefused { .. }
                     | IngestOutcome::Rejected { .. },
                 ) => {
                     // Terminal stale classifications are still successful
@@ -1333,9 +1339,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Ok(
-                    IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
-                    }
+                    IngestOutcome::TransportDeferred { .. }
                     | IngestOutcome::LocalState {
                         state: LocalIngestState::Quarantined,
                     }
@@ -1344,9 +1348,8 @@ impl<S: StorageProvider> Engine<S> {
                     },
                 ) => {
                     // Leave the row in its retry state so a later pass re-attempts
-                    // it. `PeelFailed`: still un-peelable, or already retired to
-                    // `Failed` by a terminal-after-peel path inside
-                    // `ingest_group_message`
+                    // it. `TransportDeferred`: still un-peelable.
+                    // A terminal-after-peel path inside `ingest_group_message`
                     // (`mark_raw_transport_message_failed_if_awaiting_retry`,
                     // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
                     // is frozen; the row replays once repair clears it.

@@ -431,7 +431,7 @@ async fn publish_nostr_event_at(
 /// ephemeral key, h-tagged to `nostr_group_id_hex`. Mirrors the probe publisher
 /// in `next_event_backfill.rs`: real kind-445 senders always sign with a fresh
 /// per-event key, and a zero-nonce marker body peels to a clean
-/// `PeelFailed` — the `IngestOutcome::Stale` shape the epoch-stall detector
+/// `TransportDeferred` — the typed availability outcome the epoch-stall detector
 /// counts toward arming a backfill. Distinct `marker`s yield distinct event ids,
 /// hence distinct undecryptables at the group's one stalled epoch.
 async fn publish_garbage_group_message(

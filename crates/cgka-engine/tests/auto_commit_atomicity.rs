@@ -207,6 +207,9 @@ impl MessageStorage for FaultStorage {
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
         self.inner.get_message(id)
     }
+    fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_message(id)
+    }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
         self.inner.update_message_state(id, new_state)
     }

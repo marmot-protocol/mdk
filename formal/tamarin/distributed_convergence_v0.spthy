@@ -1340,8 +1340,12 @@ rule Emit_Invalidated_App_Disposition:
   []
 
 lemma same_input_set_converges:
-  "All run client_a client_b branch_a branch_b reason_a reason_b #i #j.
-      Selected(run, client_a, branch_a, reason_a) @ #i
+  "All run client_a client_b branch_a branch_b reason_a reason_b group policy
+       #inputs_a #inputs_b #policy #i #j.
+      SameInputSet(run, client_a) @ #inputs_a
+    & SameInputSet(run, client_b) @ #inputs_b
+    & PolicyLoaded(run, group, policy) @ #policy
+    & Selected(run, client_a, branch_a, reason_a) @ #i
     & Selected(run, client_b, branch_b, reason_b) @ #j
     ==> branch_a = branch_b"
 
@@ -1468,8 +1472,12 @@ lemma duplicate_delivery_requires_prior_pending_input:
     )"
 
 lemma delivery_reordered_clients_select_same_branch:
-  "All run branch_a branch_b reason_a reason_b #s #i #j.
+  "All run branch_a branch_b reason_a reason_b group policy
+       #s #inputs_carol #inputs_frank #policy #i #j.
       Scenario(run, 'delivery_order_robustness') @ #s
+    & SameInputSet(run, 'carol') @ #inputs_carol
+    & SameInputSet(run, 'frank') @ #inputs_frank
+    & PolicyLoaded(run, group, policy) @ #policy
     & Selected(run, 'carol', branch_a, reason_a) @ #i
     & Selected(run, 'frank', branch_b, reason_b) @ #j
     ==> branch_a = branch_b"

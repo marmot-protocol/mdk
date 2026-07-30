@@ -1094,7 +1094,7 @@ async fn removed_member_applying_removal_commit_marks_local_copy_removed() {
 /// `Stale {{ SelfEvicted }}` and performs "realizing removal"
 /// (member-departure.md) when the local copy is not yet marked removed —
 /// emitting the self-removed notification and marking the copy removed —
-/// instead of failing silently as generic `PeelFailed` stale traffic.
+/// instead of failing silently as generic stale traffic.
 #[tokio::test]
 async fn post_eviction_message_realizes_self_removal_and_returns_self_evicted() {
     let (mut alice, mut bob, bob_storage, group_id, routed_commit) =

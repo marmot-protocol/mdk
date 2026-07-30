@@ -19,7 +19,9 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -395,9 +397,57 @@ fn snapshot_ingest_outcomes() {
         }
     );
     insta::assert_json_snapshot!(
-        "stale_peel_failed",
+        "transport_deferred",
+        IngestOutcome::TransportDeferred { group_id: gid() }
+    );
+    insta::assert_json_snapshot!(
+        "resource_refused_deferred_capacity",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredCapacity
+        }
+    );
+    insta::assert_json_snapshot!(
+        "resource_refused_retry_budget",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredRetryBudget
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_pre_membership",
         IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+            reason: StaleReason::PreMembership
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_anchor",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondAnchor
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_rollback_horizon",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondRollbackHorizon
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_beyond_app_retention",
+        IngestOutcome::Stale {
+            reason: StaleReason::BeyondAppRetention
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_losing_branch",
+        IngestOutcome::Stale {
+            reason: StaleReason::LosingBranch
+        }
+    );
+    insta::assert_json_snapshot!(
+        "stale_invalid_against_canonical_state",
+        IngestOutcome::Stale {
+            reason: StaleReason::InvalidAgainstCanonicalState
         }
     );
     insta::assert_json_snapshot!(

@@ -507,7 +507,7 @@ async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
         matches!(
             outcome,
             IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
+                reason: StaleReason::InvalidAgainstCanonicalState
             }
         ),
         "probe-time strict cutover must reject the candidate before selection, got {outcome:?}"

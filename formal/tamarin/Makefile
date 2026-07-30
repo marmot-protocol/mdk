@@ -1,11 +1,13 @@
 TAMARIN ?= tamarin-prover
+DERIVCHECK_TIMEOUT ?= 60
 MODEL := distributed_convergence_v0.spthy
 
 .PHONY: prove interactive
 
 prove:
 	@tmp=$$(mktemp); \
-	$(TAMARIN) $(MODEL) --prove > "$$tmp" 2>&1; \
+	$(TAMARIN) $(MODEL) --prove --quit-on-warning \
+		--derivcheck-timeout=$(DERIVCHECK_TIMEOUT) > "$$tmp" 2>&1; \
 	status=$$?; \
 	if [ $$status -ne 0 ]; then \
 		cat "$$tmp"; \

@@ -1912,11 +1912,11 @@ async fn consumed_last_resort_private_material_survives_pending_replacement_then
         .session_mut()
         .ingest(dave_welcome)
         .await
-        .expect("missing private material is a classified stale ingest");
+        .expect("missing private material is a classified rejection");
     assert!(matches!(
         rejected.outcome,
-        cgka_traits::IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        cgka_traits::IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding
         }
     ));
 }

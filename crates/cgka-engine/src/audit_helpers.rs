@@ -12,7 +12,9 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
@@ -68,6 +70,8 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",
+        IngestOutcome::TransportDeferred { .. } => "transport_deferred",
+        IngestOutcome::ResourceRefused { .. } => "resource_refused",
         IngestOutcome::Stale { .. } => "stale",
         IngestOutcome::Rejected { .. } => "rejected",
     }
@@ -81,7 +85,12 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::NotForThisClient => "not_for_this_client",
         StaleReason::UnknownGroup => "unknown_group",
         StaleReason::OwnEcho => "own_echo",
-        StaleReason::PeelFailed => "peel_failed",
+        StaleReason::PreMembership => "pre_membership",
+        StaleReason::BeyondAnchor => "beyond_anchor",
+        StaleReason::BeyondRollbackHorizon => "beyond_rollback_horizon",
+        StaleReason::BeyondAppRetention => "beyond_app_retention",
+        StaleReason::LosingBranch => "losing_branch",
+        StaleReason::InvalidAgainstCanonicalState => "invalid_against_canonical_state",
         StaleReason::SelfEvicted => "self_evicted",
         StaleReason::Quarantined => "quarantined",
     }
@@ -99,7 +108,9 @@ pub(crate) fn ingest_outcome_epoch(outcome: &IngestOutcome) -> Option<u64> {
 
 pub(crate) fn ingest_outcome_group_ref(outcome: &IngestOutcome) -> Option<String> {
     match outcome {
-        IngestOutcome::Buffered { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        IngestOutcome::Buffered { group_id, .. }
+        | IngestOutcome::TransportDeferred { group_id }
+        | IngestOutcome::ResourceRefused { group_id, .. } => Some(hex::encode(group_id.as_slice())),
         _ => None,
     }
 }
@@ -465,6 +476,12 @@ pub(crate) fn ingest_outcome_event(
                     InputRejectionCategory::OwnEcho => "own_echo",
                     InputRejectionCategory::WrongRecipient => "wrong_recipient",
                     InputRejectionCategory::UnknownGroup => "unknown_group",
+                    InputRejectionCategory::InvalidEncoding => "invalid_encoding",
+                    InputRejectionCategory::InvalidSignature => "invalid_signature",
+                    InputRejectionCategory::UnsupportedRequiredFeature => {
+                        "unsupported_required_feature"
+                    }
+                    InputRejectionCategory::AuthorizationFailed => "authorization_failed",
                 }
                 .to_string(),
             ),
@@ -478,6 +495,18 @@ pub(crate) fn ingest_outcome_event(
             IngestOutcome::Rejected { category } => {
                 Some(crate::app_components::proposal_rejection_category_tag(*category).to_string())
             }
+            IngestOutcome::TransportDeferred { .. } => Some("transport_deferred".to_string()),
+            IngestOutcome::ResourceRefused { resource, .. } => Some(
+                match resource {
+                    InboundResourceLimit::TransportDeferredCapacity => {
+                        "resource_refused_deferred_capacity"
+                    }
+                    InboundResourceLimit::TransportDeferredRetryBudget => {
+                        "resource_refused_retry_budget"
+                    }
+                }
+                .to_string(),
+            ),
             _ => None,
         },
         epoch: ingest_outcome_epoch(outcome),
@@ -521,11 +550,12 @@ pub(crate) fn message_state_transition_event(
     }
 }
 
-/// Terminal transition of a deferred-peel row, carrying the lifecycle's
-/// per-row telemetry: how many re-peel attempts it consumed and how many
-/// retry sweeps it waited between first attempt and this transition
-/// (mdk#339).
-pub(crate) fn deferred_peel_terminal_event(
+/// Resource-refusal release of a deferred-peel row, carrying the lifecycle's
+/// per-row telemetry: how many re-peel attempts it consumed and how many retry
+/// sweeps it waited before release (mdk#339). `released` deliberately does not
+/// claim a terminal message state; the row no longer exists and same-id
+/// redelivery remains eligible.
+pub(crate) fn deferred_peel_resource_refused_event(
     msg_id_hex: MessageRefHex,
     epoch: Option<EpochId>,
     reason: &str,
@@ -536,7 +566,7 @@ pub(crate) fn deferred_peel_terminal_event(
         msg_id: msg_id_hex,
         artifact_kind: None,
         previous_state: Some(message_state_str(MessageState::PeelDeferred).to_string()),
-        new_state: message_state_str(MessageState::Failed).to_string(),
+        new_state: "released".to_string(),
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
         retry_count: Some(retry_count),
