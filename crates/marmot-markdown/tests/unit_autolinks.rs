@@ -17,6 +17,13 @@ fn email(addr: &str) -> Inline {
         classification: LinkDestinationKind::Contact,
     }
 }
+fn www(url: &str) -> Inline {
+    Inline::Autolink {
+        url: url.to_string(),
+        kind: AutolinkKind::Www,
+        classification: LinkDestinationKind::Web,
+    }
+}
 
 // HTML is NOT parsed: tag-like sequences are literal text in both the
 // block pass (no HTML blocks) and the inline pass (no raw-HTML inline).
@@ -166,6 +173,22 @@ fn dangerous_uri_autolinks_are_preserved_and_classified() {
 }
 
 // ----- Bare URLs (GFM-style extended autolinks) ------------------------
+
+#[test]
+fn bare_www() {
+    assert_eq!(
+        parse_inlines("www.example.com/path"),
+        vec![www("www.example.com/path")]
+    );
+}
+
+#[test]
+fn bare_www_strips_trailing_period() {
+    assert_eq!(
+        parse_inlines("See www.example.com/path."),
+        vec![t("See "), www("www.example.com/path"), t(".")]
+    );
+}
 
 #[test]
 fn bare_https() {

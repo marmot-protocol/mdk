@@ -228,6 +228,41 @@
       "Paragraph": {
         "inlines": [
           {
+            "Text": "Bare www: "
+          },
+          {
+            "Autolink": {
+              "url": "www.example.com/path",
+              "kind": "Www",
+              "classification": "Web"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
+            "Text": "Sentence www: See "
+          },
+          {
+            "Autolink": {
+              "url": "www.example.com/path",
+              "kind": "Www",
+              "classification": "Web"
+            }
+          },
+          {
+            "Text": "."
+          }
+        ]
+      }
+    },
+    {
+      "Paragraph": {
+        "inlines": [
+          {
             "Text": "Trailing-punct stripping: visit "
           },
           {
@@ -557,6 +592,8 @@
   ],
   "blank_lines_before": [
     0,
+    1,
+    1,
     1,
     1,
     1,

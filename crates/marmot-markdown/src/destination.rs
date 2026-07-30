@@ -50,6 +50,7 @@ pub(crate) fn classify_autolink_destination(
 ) -> LinkDestinationKind {
     match kind {
         AutolinkKind::Email => LinkDestinationKind::Contact,
+        AutolinkKind::Www => LinkDestinationKind::Web,
         AutolinkKind::Uri => classify_link_destination(destination),
     }
 }

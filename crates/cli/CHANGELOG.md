@@ -9,6 +9,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot-markdown` now recognizes bare `www.example.com/path` text as web
+  autolinks. The AST preserves the displayed `www.` source while exposing an
+  explicit `Www` autolink kind so renderers can synthesize `https://`
+  destinations without a second client-side URL parser.
+  
+- MarmotKit and the agent connector now acquire a nonblocking, kernel-released
+  exclusive lease on their root before opening shared state. MarmotKit exposes
+  typed `RuntimeBusy` contention so foreground apps can retry and notification
+  extensions can return bounded fallback content instead of creating a second
+  stateful writer.
+  
 ### Fixed
 
 - Group state changes settle promptly again when messages are queued for
@@ -22,14 +35,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   applied by folding retained convergence commits. Previously those events were
   dropped on the send path, so storage showed the new state while live
   subscribers were never notified.
-
-### Added
-
-- MarmotKit and the agent connector now acquire a nonblocking, kernel-released
-  exclusive lease on their root before opening shared state. MarmotKit exposes
-  typed `RuntimeBusy` contention so foreground apps can retry and notification
-  extensions can return bounded fallback content instead of creating a second
-  stateful writer.
 
 ### Changed
 
