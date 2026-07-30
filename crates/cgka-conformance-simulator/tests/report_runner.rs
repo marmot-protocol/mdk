@@ -201,17 +201,14 @@ async fn report_runner_writes_send_leave_json_reports() {
     .await
     .expect("runner writes reports");
     assert_eq!(summary.total(), 2);
-    assert_eq!(summary.failed(), 1);
-    assert!(summary.scenarios[0].failures.is_empty());
-    // Seed 42 case 1 deliberately retains the self-remove proposal/scheduler
-    // work exposed by the strict final observation. Keep the named finding
-    // visible until the engine lifecycle defect is fixed; it is not a generic
-    // report-runner failure.
+    assert_eq!(summary.failed(), 0);
     assert!(
-        summary.scenarios[1]
-            .failures
+        summary
+            .scenarios
             .iter()
-            .any(|failure| failure.kind == "pending_work_remaining")
+            .all(|scenario| scenario.failures.is_empty()),
+        "consumed self-remove proposals must not leave failed send/leave reports: {:?}",
+        summary.scenarios
     );
 
     let case0 = out_dir.join("send-leave-v1-seed-42-case-0.json");

@@ -4894,7 +4894,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
 
 #[tokio::test]
 async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
-    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
 
@@ -4973,6 +4973,23 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         .next()
         .expect("alice auto-commits bob's self-remove");
     alice.confirm_published(auto_commit.pending).await.unwrap();
+    assert_message_state(&alice_storage, &proposal, MessageState::Processed);
+    assert!(
+        !alice.drain_valid_proposal_groups().contains(&group_id),
+        "confirming the proposal-consuming commit retires the obsolete proposal schedule signal"
+    );
+
+    let mut restarted_alice = build_client_with_storage(b"alice", alice_storage.clone());
+    restarted_alice
+        .hydrate_stable_groups_from_storage()
+        .expect("rebuild after proposal-consuming commit");
+    assert_message_state(&alice_storage, &proposal, MessageState::Processed);
+    assert!(
+        restarted_alice
+            .drain_pending_convergence_groups()
+            .is_empty(),
+        "processed consumed proposals must not recreate convergence scheduling work after restart"
+    );
 
     let commit = route(auto_commit.msg, &group_id);
     let commit_outcome = carol.ingest(commit.clone()).await.unwrap();

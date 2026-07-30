@@ -1322,29 +1322,12 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
         let report = run_generated_case_report(&case, None)
             .await
             .expect("strict send/leave case report runs");
-        let includes_leave = case
-            .scenario
-            .steps
-            .iter()
-            .any(|step| matches!(step, ScenarioStep::Leave { .. }));
-        if includes_leave {
-            assert!(
-                report
-                    .expectation_failures
-                    .iter()
-                    .any(|failure| failure.kind == "pending_work_remaining"),
-                "leave case {} must retain the strict pending-work regression until proposal work is retired: {:?}",
-                case.case_index,
-                report.expectation_failures
-            );
-        } else {
-            assert!(
-                report.expectation_failures.is_empty(),
-                "non-leave case {} failed strict expectations: {:?}",
-                case.case_index,
-                report.expectation_failures
-            );
-        }
+        assert!(
+            report.expectation_failures.is_empty(),
+            "send/leave case {} failed strict expectations: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
     }
 }
 
@@ -1716,11 +1699,6 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
             "rolled-back transported commit",
         ),
         (
-            3usize,
-            "pending_work_remaining",
-            "self-remove proposal work",
-        ),
-        (
             4usize,
             "pending_work_remaining",
             "pre-join deferred application object",
@@ -1740,6 +1718,15 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
             report.expectation_failures
         );
     }
+
+    let self_remove_report = run_generated_case_report(&cases[3], None)
+        .await
+        .expect("strict self-remove case reports");
+    assert!(
+        self_remove_report.expectation_failures.is_empty(),
+        "strict self-remove case must retire consumed proposal work: {:?}",
+        self_remove_report.expectation_failures
+    );
 }
 
 #[tokio::test]
