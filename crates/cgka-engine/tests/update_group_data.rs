@@ -353,7 +353,7 @@ fn build_with_storage_and_component(
 
 fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
     let result = engine
-        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(group_id, 1_000_000)
         .expect("buffered commit converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
@@ -977,7 +977,7 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
         .await
         .expect("malicious commit enters convergence");
     let result = alice
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("convergence should reject unauthorized commit without failing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -1047,7 +1047,7 @@ async fn inbound_commit_cannot_unrequire_current_admin_policy() {
         .await
         .expect("commit is retained for convergence");
     let result = bob
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("invalid commit receives a terminal disposition");
 
     assert!(result.accepted_commits.is_empty());
@@ -1433,7 +1433,7 @@ async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
         .await
         .expect("atomic unrequire and remove is retained");
     let result = bob
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("atomic unrequire and remove converges");
     assert_eq!(
         result.accepted_commits.len(),
@@ -2277,10 +2277,10 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
         build_with_storage_and_peeler(loser_id, loser_storage.clone(), ephemeral_peeler());
     loser.drain_events();
     loser
-        .buffer_openmls_convergence_message(&gid, route_to_group(&winner_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&winner_commit, &gid), 1_000)
         .expect("winning sibling commit buffered on the restarted loser");
     let result = loser
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("loser converges over the fork");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     let loser_after = loser.drain_events();
@@ -2462,10 +2462,10 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
         build_with_storage_and_peeler(winner_id, winner_storage.clone(), ephemeral_peeler());
     winner.drain_events();
     winner
-        .buffer_openmls_convergence_message(&gid, route_to_group(&loser_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&loser_commit, &gid), 1_000)
         .expect("losing sibling commit buffered on the restarted winner");
     let result = winner
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("winner converges over the fork");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     let winner_after = winner.drain_events();
@@ -2621,15 +2621,15 @@ async fn mutually_rebuilt_engines_converge_on_same_branch_after_concurrent_renam
     alice.drain_events();
     bob.drain_events();
     alice
-        .buffer_openmls_convergence_message(&gid, route_to_group(&bob_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&bob_commit, &gid), 1_000)
         .expect("bob's sibling commit buffered on restarted alice");
-    bob.buffer_openmls_convergence_message(&gid, route_to_group(&alice_commit, &gid), 1_000)
+    bob.buffer_openmls_convergence_message_at(&gid, route_to_group(&alice_commit, &gid), 1_000)
         .expect("alice's sibling commit buffered on restarted bob");
     let alice_result = alice
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("alice converges over the fork");
     let bob_result = bob
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("bob converges over the fork");
     assert_eq!(alice_result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(bob_result.convergence_status, ConvergenceStatus::Settled);
@@ -2895,10 +2895,10 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
 
     // The losing sibling commit arrives through stored convergence.
     winner
-        .buffer_openmls_convergence_message(&gid, route_to_group(&loser_commit, &gid), 1_000)
+        .buffer_openmls_convergence_message_at(&gid, route_to_group(&loser_commit, &gid), 1_000)
         .expect("losing sibling auto-commit buffered on the restarted winner");
     let result = winner
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .expect("apply must not replay the proposal consumed by the skipped own commit");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 

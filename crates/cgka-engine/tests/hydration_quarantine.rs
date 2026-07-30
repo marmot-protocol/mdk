@@ -1198,7 +1198,7 @@ async fn quarantined_group_blocks_convergence_and_send() {
     ));
 
     let result = alice
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("quarantined convergence reports a blocked no-op run");
     assert_eq!(
         result.convergence_status,

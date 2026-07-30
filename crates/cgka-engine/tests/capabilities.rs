@@ -1237,7 +1237,7 @@ async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
     };
     bob.ingest(routed).await.unwrap();
     let result = bob
-        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .unwrap();
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 

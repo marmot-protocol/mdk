@@ -1187,10 +1187,10 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
         ..bob_commit
     };
     alice
-        .buffer_openmls_convergence_message(&group_id, routed_bob_commit, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, routed_bob_commit, 1_000)
         .expect("bob commit buffered");
     alice
-        .converge_stored_openmls_messages(&group_id, 3_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000)
         .expect("bob commit settles");
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -1315,10 +1315,10 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
         ..bob_commit
     };
     alice
-        .buffer_openmls_convergence_message(&group_id, routed_bob_commit, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, routed_bob_commit, 1_000)
         .expect("bob commit buffered");
     alice
-        .converge_stored_openmls_messages(&group_id, 3_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000)
         .expect("bob commit settles");
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
 

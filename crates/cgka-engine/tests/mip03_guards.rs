@@ -616,7 +616,7 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
         "same-epoch commits are classified against the frozen pass, got {outcome:?}"
     );
     let result = alice
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("convergence should classify spoofed update");
     assert!(
         result.accepted_commits.is_empty(),
@@ -721,7 +721,7 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
         "same-epoch commits are classified against the frozen pass, got {outcome:?}"
     );
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("convergence should classify spoofed by-reference update");
     assert!(
         result.accepted_commits.is_empty(),
@@ -784,7 +784,7 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
     };
     alice.confirm_published(pending).await.unwrap();
     bob.ingest(commit).await.unwrap();
-    bob.converge_stored_openmls_messages(&group_id, 1_000_000)
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("bob applies Carol's invite");
     carol.join_welcome(welcomes.remove(0)).await.unwrap();
 
@@ -813,7 +813,7 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
         "same-epoch commits are classified against the frozen pass, got {outcome:?}"
     );
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("convergence should classify unauthorized by-reference update");
     assert!(
         result.dropped_messages.iter().any(|dropped| {
@@ -1137,10 +1137,10 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
     };
     alice.confirm_published(alice_pending).await.unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit, 1_000)
         .expect("buffer alice branch commit");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("settle alice branch and retain the epoch-one anchor");
     assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
 
@@ -1199,10 +1199,10 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
     );
 
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit, 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit, 2_000)
         .expect("buffer competing fork commit");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("replay with retained alternate parent");
     assert!(
         !result.dropped_messages.iter().any(|dropped| {

@@ -45,6 +45,7 @@ pub mod capability_manager;
 #[cfg(feature = "test-conformance-snapshot")]
 pub mod conformance_snapshot;
 pub mod convergence;
+pub mod convergence_clock;
 pub(crate) mod convergence_input;
 pub mod disband;
 pub mod distributed_convergence;
@@ -72,6 +73,9 @@ pub mod update_group_data;
 pub mod upgrade;
 pub mod wire_format;
 
+pub use convergence_clock::{
+    ConvergenceClock, ConvergenceTime, ManualConvergenceClock, SystemConvergenceClock,
+};
 pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,

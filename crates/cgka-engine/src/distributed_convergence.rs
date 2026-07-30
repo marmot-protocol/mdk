@@ -27,6 +27,7 @@ use crate::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
     ConvergenceStatus, InvalidatedAppMessageReason,
 };
+use crate::convergence_clock::ConvergenceTime;
 use crate::convergence_input::{
     ClassifiedConvergenceInput, ConvergenceInputContext, role_for_content_kind,
 };
@@ -130,11 +131,11 @@ impl<S: StorageProvider> Engine<S> {
         }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
-        let now_ms = self.convergence_now_ms();
-        let pass = self.load_or_open_convergence_pass(group_id, tip, &policy, now_ms)?;
+        let now = self.convergence_now();
+        let pass = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?;
         Ok(match pass {
             Some(pass) if pass.phase == ConvergencePassPhase::Collecting => {
-                Some(pass.cutoff_monotonic_ms().saturating_sub(now_ms))
+                Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
             }
             Some(pass) if pass.is_active() => Some(0),
             _ => None,
@@ -280,11 +281,37 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| cgka_traits::error::EngineError::Backend(format!("retain anchor: {e}")))
     }
 
+    #[doc(hidden)]
+    pub fn buffer_openmls_convergence_message_at(
+        &mut self,
+        group_id: &GroupId,
+        message: TransportMessage,
+        monotonic_ms: u64,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.buffer_openmls_convergence_message_with_time(
+            group_id,
+            message,
+            ConvergenceTime {
+                monotonic_ms,
+                wall_ms: self.convergence_now().wall_ms,
+            },
+        )
+    }
+
+    /// Buffer convergence input using the installed dual clock.
     pub fn buffer_openmls_convergence_message(
         &mut self,
         group_id: &GroupId,
         message: TransportMessage,
-        now_ms: u64,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.buffer_openmls_convergence_message_with_time(group_id, message, self.convergence_now())
+    }
+
+    pub(crate) fn buffer_openmls_convergence_message_with_time(
+        &mut self,
+        group_id: &GroupId,
+        message: TransportMessage,
+        now: ConvergenceTime,
     ) -> Result<(), OpenMlsProjectionError> {
         // Key the convergence store on the content-derived dedup id (SHA-256 of
         // the recovered MLS bytes), not the outer transport id (#238). This
@@ -336,7 +363,7 @@ impl<S: StorageProvider> Engine<S> {
         let admission = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
             let admission =
-                self.admit_stored_message_to_convergence_pass(group_id, &content_id, now_ms)?;
+                self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
                 let mut group = storage.get_group(group_id)?;
                 group.unrecoverable = true;
@@ -359,7 +386,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
         message_id: &MessageId,
-        now_ms: u64,
+        now: ConvergenceTime,
     ) -> Result<ConvergenceAdmissionOutcome, OpenMlsProjectionError> {
         let epoch_state = self.epoch_manager.state(group_id);
         let admission_allowed = matches!(epoch_state, Some(EpochState::Stable { .. }))
@@ -371,7 +398,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
-        let Some(mut pass) = self.load_or_open_convergence_pass(group_id, tip, &policy, now_ms)?
+        let Some(mut pass) = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?
         else {
             return Ok(ConvergenceAdmissionOutcome::Retained);
         };
@@ -385,8 +412,8 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(ConvergenceAdmissionOutcome::Retained);
         }
-        if now_ms >= pass.cutoff_monotonic_ms() {
-            self.freeze_collecting_convergence_pass(&mut pass)?;
+        if now.monotonic_ms >= pass.cutoff_monotonic_ms() {
+            self.freeze_collecting_convergence_pass(&mut pass, now)?;
             let outcome = match self.verify_frozen_pass_members(&pass) {
                 Ok(()) => ConvergenceAdmissionOutcome::Frozen,
                 Err(FrozenPassVerificationError::Integrity) => {
@@ -426,12 +453,11 @@ impl<S: StorageProvider> Engine<S> {
         // reaches this path; a future app without competing candidate edges is
         // retained but does not move the pass boundary.
         if context.is_potentially_selection_relevant(admitted_input) {
-            pass.quiescence_deadline_monotonic_ms =
-                now_ms.saturating_add(policy.settlement_quiescence_ms);
-            pass.quiescence_deadline_wall_ms = self
-                .wall_clock
-                .now_ms()
+            pass.quiescence_deadline_monotonic_ms = now
+                .monotonic_ms
                 .saturating_add(policy.settlement_quiescence_ms);
+            pass.quiescence_deadline_wall_ms =
+                now.wall_ms.saturating_add(policy.settlement_quiescence_ms);
         }
         self.storage
             .put_convergence_pass(&pass)
@@ -442,11 +468,11 @@ impl<S: StorageProvider> Engine<S> {
     fn freeze_collecting_convergence_pass(
         &self,
         pass: &mut DurableConvergencePass,
+        now: ConvergenceTime,
     ) -> Result<(), OpenMlsProjectionError> {
-        let wall_now_ms = self.wall_clock.now_ms();
         pass.phase = ConvergencePassPhase::Frozen;
-        pass.frozen_at_wall_ms = Some(wall_now_ms);
-        pass.cutoff_cause = Some(if wall_now_ms < pass.opened_wall_ms {
+        pass.frozen_at_wall_ms = Some(now.wall_ms);
+        pass.cutoff_cause = Some(if now.wall_ms < pass.opened_wall_ms {
             ConvergenceCutoffCause::ClockDiscontinuity
         } else if pass.absolute_deadline_monotonic_ms <= pass.quiescence_deadline_monotonic_ms {
             ConvergenceCutoffCause::AbsoluteDeadline
@@ -515,7 +541,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         base_epoch: EpochId,
         policy: &CanonicalizationPolicy,
-        now_ms: u64,
+        now: ConvergenceTime,
     ) -> Result<Option<DurableConvergencePass>, OpenMlsProjectionError> {
         let previous = self
             .storage
@@ -579,23 +605,25 @@ impl<S: StorageProvider> Engine<S> {
                 // Rebase every build, including policy-override tests, from the
                 // same persisted millisecond wall deadlines. A backwards wall
                 // jump fails closed by making the cutoff due immediately.
-                let wall_now_ms = self.wall_clock.now_ms();
-                let backwards = wall_now_ms < pass.opened_wall_ms;
+                let backwards = now.wall_ms < pass.opened_wall_ms;
                 let quiescence_remaining = if backwards {
                     0
                 } else {
-                    pass.quiescence_deadline_wall_ms.saturating_sub(wall_now_ms)
+                    pass.quiescence_deadline_wall_ms.saturating_sub(now.wall_ms)
                 };
                 let absolute_remaining = if backwards {
                     0
                 } else {
-                    pass.absolute_deadline_wall_ms.saturating_sub(wall_now_ms)
+                    pass.absolute_deadline_wall_ms.saturating_sub(now.wall_ms)
                 };
                 pass.clock_instance_id = self.convergence_clock_instance_id;
-                pass.opened_monotonic_ms =
-                    now_ms.saturating_sub(wall_now_ms.saturating_sub(pass.opened_wall_ms));
-                pass.quiescence_deadline_monotonic_ms = now_ms.saturating_add(quiescence_remaining);
-                pass.absolute_deadline_monotonic_ms = now_ms.saturating_add(absolute_remaining);
+                pass.opened_monotonic_ms = now
+                    .monotonic_ms
+                    .saturating_sub(now.wall_ms.saturating_sub(pass.opened_wall_ms));
+                pass.quiescence_deadline_monotonic_ms =
+                    now.monotonic_ms.saturating_add(quiescence_remaining);
+                pass.absolute_deadline_monotonic_ms =
+                    now.monotonic_ms.saturating_add(absolute_remaining);
                 self.storage
                     .put_convergence_pass(&pass)
                     .map_err(storage_projection_error)?;
@@ -614,11 +642,10 @@ impl<S: StorageProvider> Engine<S> {
         if members.is_empty() || !has_trigger {
             return Ok(None);
         }
-        let wall_now_ms = self.wall_clock.now_ms();
         let generation = previous
             .as_ref()
             .map_or(0, |pass| pass.generation.saturating_add(1));
-        let opened_monotonic_ms = now_ms;
+        let opened_monotonic_ms = now.monotonic_ms;
         let pass = DurableConvergencePass {
             group_id: group_id.clone(),
             generation,
@@ -630,10 +657,11 @@ impl<S: StorageProvider> Engine<S> {
                 .saturating_add(policy.settlement_quiescence_ms),
             absolute_deadline_monotonic_ms: opened_monotonic_ms
                 .saturating_add(policy.max_convergence_pass_ms),
-            opened_wall_ms: wall_now_ms,
-            quiescence_deadline_wall_ms: wall_now_ms
+            opened_wall_ms: now.wall_ms,
+            quiescence_deadline_wall_ms: now
+                .wall_ms
                 .saturating_add(policy.settlement_quiescence_ms),
-            absolute_deadline_wall_ms: wall_now_ms.saturating_add(policy.max_convergence_pass_ms),
+            absolute_deadline_wall_ms: now.wall_ms.saturating_add(policy.max_convergence_pass_ms),
             members,
             frozen_at_wall_ms: None,
             cutoff_cause: None,
@@ -852,11 +880,35 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Canonicalize retained stored OpenMLS messages and, once the caller's
     /// quiescence window has elapsed, apply the selected branch to storage.
+    #[doc(hidden)]
+    pub fn converge_stored_openmls_messages_at(
+        &mut self,
+        group_id: &GroupId,
+        monotonic_ms: u64,
+    ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        self.converge_stored_openmls_messages_with_time(
+            group_id,
+            ConvergenceTime {
+                monotonic_ms,
+                wall_ms: self.convergence_now().wall_ms,
+            },
+        )
+    }
+
+    /// Converge stored input using the installed dual clock.
     pub fn converge_stored_openmls_messages(
         &mut self,
         group_id: &GroupId,
-        now_ms: u64,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        self.converge_stored_openmls_messages_with_time(group_id, self.convergence_now())
+    }
+
+    pub(crate) fn converge_stored_openmls_messages_with_time(
+        &mut self,
+        group_id: &GroupId,
+        now: ConvergenceTime,
+    ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        let now_ms = now.monotonic_ms;
         // A hydration-quarantined group is frozen until explicit repair: no
         // canonicalization pass may read or mutate its state, and no
         // set_stable may re-activate it out of band (mdk#364). Check this
@@ -924,7 +976,7 @@ impl<S: StorageProvider> Engine<S> {
         let previous_tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let Some(mut pass) =
-            self.load_or_open_convergence_pass(group_id, previous_tip, &policy, now_ms)?
+            self.load_or_open_convergence_pass(group_id, previous_tip, &policy, now)?
         else {
             // Preserve the observable no-op convergence run used by diagnostics
             // and manual repair tooling. With no eligible input there is no
@@ -963,7 +1015,7 @@ impl<S: StorageProvider> Engine<S> {
             if now_ms < cutoff {
                 return Ok(waiting_result(previous_tip.0));
             }
-            self.freeze_collecting_convergence_pass(&mut pass)?;
+            self.freeze_collecting_convergence_pass(&mut pass, now)?;
             // Diagnostic only: scheduler lag between the cutoff elapsing and
             // this freeze actually running (remediation-plan telemetry).
             self.engine_metrics

@@ -10,7 +10,7 @@ use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsProjectionError, project_mls_message};
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::app_components::{AppComponentId, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -42,7 +42,6 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
@@ -72,27 +71,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 
 struct MockPeeler;
 struct EpochGatePeeler;
-
-#[derive(Clone)]
-struct TestWallClock(Arc<AtomicU64>);
-
-impl cgka_traits::maintenance::WallClock for TestWallClock {
-    fn now(&self) -> cgka_traits::Timestamp {
-        cgka_traits::Timestamp(self.0.load(Ordering::SeqCst) / 1_000)
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-struct FixedMaintenanceRandom;
-
-impl cgka_traits::maintenance::MaintenanceRandom for FixedMaintenanceRandom {
-    fn next_u64(&self) -> u64 {
-        0
-    }
-}
 
 fn commit_tiebreak_winner_index(first: &MemberId, second: &MemberId) -> usize {
     if first.as_slice() < second.as_slice() {
@@ -318,7 +296,7 @@ fn build_client_with_storage(
 fn build_client_with_storage_and_clock(
     id: &[u8],
     storage: SqliteAccountStorage,
-    wall_clock: TestWallClock,
+    clock: ManualConvergenceClock,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
         .legacy_compatibility_profile()
@@ -326,7 +304,7 @@ fn build_client_with_storage_and_clock(
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
-        .maintenance_sources(Arc::new(wall_clock), Arc::new(FixedMaintenanceRandom))
+        .convergence_clock(Arc::new(clock))
         .build()
         .unwrap()
 }
@@ -760,17 +738,17 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     };
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_messages[0].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_messages[0].clone(), 1_000)
         .expect("first commit buffered");
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_messages[1].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_messages[1].clone(), 1_000)
         .expect("second commit buffered");
     carol
-        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, app_msg.clone(), 1_000)
         .expect("app witness buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -813,7 +791,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     assert!(!members.iter().any(|member| member.id == losing_invitee));
 
     let repeated = carol
-        .converge_stored_openmls_messages(&group_id, 3_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000)
         .expect("repeated convergence after applying is a no-op");
     assert!(repeated.accepted_commits.is_empty());
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -914,11 +892,11 @@ async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
         &group_id,
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, invalid_remove.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, invalid_remove.clone(), 1_000)
         .expect("invalid remove commit buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -1055,11 +1033,11 @@ async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
         &group_id,
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, valid_remove.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, valid_remove.clone(), 1_000)
         .expect("valid remove commit buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -1253,17 +1231,17 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     };
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_messages[0].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_messages[0].clone(), 1_000)
         .expect("first commit buffered");
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_messages[1].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_messages[1].clone(), 1_000)
         .expect("second commit buffered");
     carol
-        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, app_msg.clone(), 1_000)
         .expect("app witness buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -1458,7 +1436,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         "removal commit buffers for convergence, got {outcome:?}"
     );
     let applied = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("removal branch applies");
     assert_eq!(applied.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(applied.accepted_commits, vec![content_hex(&remove_commit)]);
@@ -1501,10 +1479,10 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
     // is removed, so this is the stored-message path (e.g. a session-layer
     // replay after restart).
     carol
-        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_001_000)
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_001_000)
         .expect("sibling rename commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .expect("reorg over the superseded removal");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
@@ -1671,10 +1649,10 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
     alice.confirm_published(rename_pending).await.unwrap();
     let rename_commit = route(rename_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_000)
         .expect("rename commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("forward apply converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
@@ -1764,10 +1742,10 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
     alice.confirm_published(rename_pending).await.unwrap();
     let rename_commit = route(rename_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_000)
         .expect("rename commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("forward apply converges");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
@@ -1845,11 +1823,11 @@ async fn engine_does_not_apply_stored_branch_before_stability_gate() {
     let (commit, _pending) = evolution(invite);
     let commit = route(commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
         .expect("commit buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_500)
+        .converge_stored_openmls_messages_at(&group_id, 1_500)
         .expect("stored OpenMLS messages canonicalize while syncing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Syncing);
@@ -1915,7 +1893,7 @@ async fn engine_ingest_buffers_commit_for_convergence_before_quiescence() {
     assert_message_state(&carol_storage, &commit, MessageState::Created);
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored commit applies after quiescence");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -1983,17 +1961,17 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     let commit_eve = route(commit_eve, &group_id);
     let commit_david = route(commit_david, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve.clone(), 1_000)
         .expect("child commit buffered first");
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david.clone(), 1_000)
         .expect("parent commit buffered second");
     carol
-        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, app_msg.clone(), 1_000)
         .expect("app message buffered after child and parent");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored parent and child commits converge as one path");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -2083,14 +2061,14 @@ async fn engine_reuses_bfs_materialized_candidates_when_no_pending_app_messages(
     // Buffer the child before the parent, and crucially NO app message — this keeps the
     // canonicalization pass free of pending application messages so the reuse branch fires.
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve.clone(), 1_000)
         .expect("child commit buffered first");
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david.clone(), 1_000)
         .expect("parent commit buffered second");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored parent and child commits converge as one reused path");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -2160,7 +2138,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     let commit_eve = route(commit_eve, &group_id);
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve.clone(), 1_000)
         .expect("child commit buffered without parent");
     let queued_intent_id = MessageId::new(b"fairness-before-generation-one".to_vec());
     carol_storage
@@ -2177,7 +2155,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
         .expect("persist already-queued admin group-state intent");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("missing parent is a pending graph input, not a hard error");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -2200,7 +2178,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     // mutate that completed membership set; generation 1 seeds both retained
     // inputs and resolves the fixed batch.
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000_001)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david.clone(), 1_000_001)
         .expect("late parent retained for next pass");
     let fairness_turn = carol
         .converge_and_drain_queued_outbound_intents(&group_id, 1_002_000)
@@ -2235,14 +2213,14 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
     );
 
     let collecting_second = carol
-        .converge_stored_openmls_messages(&group_id, 1_002_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_002_000)
         .expect("next generation opens only after the fairness turn");
     assert_eq!(
         collecting_second.convergence_status,
         ConvergenceStatus::Syncing
     );
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 1_003_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_003_000)
         .expect("next frozen generation resolves parent and child");
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
@@ -2341,10 +2319,10 @@ async fn pass_opens_while_app_message_intents_are_queued() {
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     let settled = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
     let completed = carol_storage
@@ -2369,7 +2347,7 @@ async fn pass_opens_while_app_message_intents_are_queued() {
     );
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 1_000_100)
         .unwrap();
     let pass = carol_storage
         .convergence_pass(&group_id)
@@ -2380,7 +2358,7 @@ async fn pass_opens_while_app_message_intents_are_queued() {
     assert!(!pass.fairness_slot_available);
 
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000_000)
         .unwrap();
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
@@ -2398,10 +2376,10 @@ async fn admin_group_state_intent_gets_one_attempt_before_next_inbound_generatio
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     let settled = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
 
@@ -2420,7 +2398,7 @@ async fn admin_group_state_intent_gets_one_attempt_before_next_inbound_generatio
     // Retained inbound arrives while the admin intent holds the boundary:
     // admission stays parked on the completed generation.
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 1_000_100)
         .unwrap();
     let parked = carol_storage
         .convergence_pass(&group_id)
@@ -2450,11 +2428,11 @@ async fn admin_group_state_intent_gets_one_attempt_before_next_inbound_generatio
     // consumed and retained inbound proceeds into generation 1.
     carol.publish_failed(pending).await.unwrap();
     let syncing = carol
-        .converge_stored_openmls_messages(&group_id, 1_100_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_100_000)
         .unwrap();
     assert_eq!(syncing.convergence_status, ConvergenceStatus::Syncing);
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 1_200_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_200_000)
         .unwrap();
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
@@ -2473,10 +2451,10 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
 
     // An Invite whose KeyPackage bytes cannot parse fails preparation
@@ -2492,7 +2470,7 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
         1_000_001,
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 1_000_100)
         .unwrap();
 
     let drained = carol
@@ -2515,11 +2493,11 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
     );
 
     let syncing = carol
-        .converge_stored_openmls_messages(&group_id, 1_100_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_100_000)
         .unwrap();
     assert_eq!(syncing.convergence_status, ConvergenceStatus::Syncing);
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 1_200_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_200_000)
         .unwrap();
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
@@ -2549,7 +2527,7 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
     let opened_at = 10_000u64;
     for (index, commit) in commits.iter().take(6).enumerate() {
         carol
-            .buffer_openmls_convergence_message(
+            .buffer_openmls_convergence_message_at(
                 &group_id,
                 commit.clone(),
                 opened_at + flood_interval_ms * index as u64,
@@ -2569,7 +2547,7 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
     );
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, opened_at + V1_MAX_CONVERGENCE_PASS_MS + 50)
+        .converge_stored_openmls_messages_at(&group_id, opened_at + V1_MAX_CONVERGENCE_PASS_MS + 50)
         .unwrap();
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(7));
@@ -2585,7 +2563,7 @@ async fn continuous_inbound_cannot_starve_admin_attempt() {
 
     // The flood continues, but the boundary now belongs to the admin intent.
     carol
-        .buffer_openmls_convergence_message(
+        .buffer_openmls_convergence_message_at(
             &group_id,
             commits[6].clone(),
             opened_at + V1_MAX_CONVERGENCE_PASS_MS + 100,
@@ -2624,10 +2602,10 @@ async fn restart_preserves_admin_reservation() {
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     queue_intent(
         &carol_storage,
@@ -2641,7 +2619,7 @@ async fn restart_preserves_admin_reservation() {
         1_000_001,
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 1_000_100)
         .unwrap();
     drop(carol);
 
@@ -2681,10 +2659,10 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     queue_intent(
         &carol_storage,
@@ -2704,7 +2682,7 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
         .expect("session-open hydration succeeds");
 
     restarted
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 2_000_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 2_000_000)
         .unwrap();
     let pass = carol_storage
         .convergence_pass(&group_id)
@@ -2714,7 +2692,7 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
     assert_eq!(pass.phase, cgka_traits::ConvergencePassPhase::Collecting);
 
     let second = restarted
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .unwrap();
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(3));
@@ -2733,10 +2711,10 @@ async fn reservation_consumption_schedules_next_generation_immediately() {
     let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_one.clone(), 1_000)
         .unwrap();
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     queue_intent(
         &carol_storage,
@@ -2750,7 +2728,7 @@ async fn reservation_consumption_schedules_next_generation_immediately() {
         1_000_001,
     );
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .buffer_openmls_convergence_message_at(&group_id, commit_two.clone(), 1_000_100)
         .unwrap();
     // Clear scheduling noise from setup so the assertion isolates the
     // consumption edge.
@@ -2822,10 +2800,10 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
     let (alice_commit, _alice_pending) = evolution(alice_invite);
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit.clone(), 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("alice branch applies and retains epoch 1 anchor");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -2840,13 +2818,13 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered");
 
     let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("late same-epoch commit replays from retained anchor");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -2930,10 +2908,10 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
     let (alice_commit, _alice_pending) = evolution(alice_invite);
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit.clone(), 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("alice branch applies via convergence");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -2957,7 +2935,7 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("late same-epoch commit ingested through the inline path converges");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -3040,10 +3018,10 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
     let (alice_commit, _alice_pending) = evolution(alice_invite);
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit.clone(), 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 3_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000)
         .expect("alice branch applies and retains epoch 1 anchor");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -3072,10 +3050,10 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
     let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
 
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 3_100)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 3_100)
         .expect("late bob commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 4_500)
+        .converge_stored_openmls_messages_at(&group_id, 4_500)
         .expect("late same-epoch commit replays from retained anchor");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
@@ -3173,10 +3151,10 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
     let (alice_commit, _alice_pending) = evolution(alice_invite);
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit.clone(), 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("alice branch applies and retains epoch 1 anchor");
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap().epoch,
@@ -3198,10 +3176,10 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered after restart");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("rebuilt engine replays late same-epoch commit from retained anchor");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -3283,10 +3261,10 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     let (alice_commit, _alice_pending) = evolution(alice_invite);
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit, 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("alice branch applies and retains epoch 1 anchor");
     carol_storage
         .release_group_snapshot(&group_id, "openmls-retained-anchor-1")
@@ -3303,11 +3281,11 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("missing retained anchor is reported as a local result");
 
     assert_eq!(
@@ -3339,7 +3317,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     // applying group-state changes. A second convergence pass still reports
     // MissingRetainedAnchor and applies nothing.
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 4_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
         .expect("convergence on an unrecoverable group is a no-op result");
     assert_eq!(
         second.errors,
@@ -3473,10 +3451,10 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     alice.confirm_published(alice_pending).await.unwrap();
     let alice_commit = route(alice_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, alice_commit, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit, 1_000)
         .expect("alice commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("alice branch applies and retains epoch 1 anchor");
     carol_storage
         .release_group_snapshot(&group_id, "openmls-retained-anchor-1")
@@ -3493,11 +3471,11 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("missing retained anchor is reported as a local result");
     assert_eq!(
         result.errors,
@@ -3527,7 +3505,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     );
 
     let after_restart = restarted
-        .converge_stored_openmls_messages(&group_id, 4_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
         .expect("convergence on a restarted unrecoverable group is a no-op result");
     assert_eq!(
         after_restart.errors,
@@ -3676,10 +3654,10 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
     alice.confirm_published(pending_david).await.unwrap();
     let commit_david = route(commit_david, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david, 1_000)
         .expect("david commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("david branch applies");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -3694,10 +3672,10 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
     let (commit_eve, _pending_eve) = evolution(invite_eve);
     let commit_eve = route(commit_eve, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve, 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve, 2_000)
         .expect("eve commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("eve branch applies");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
 
@@ -3779,10 +3757,10 @@ async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
     alice.confirm_published(pending_david).await.unwrap();
     let commit_david = route(commit_david, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david, 1_000)
         .expect("david commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("david branch applies");
 
     let eve_kp = eve.fresh_key_package().await.unwrap();
@@ -3796,18 +3774,18 @@ async fn engine_does_not_reseed_commit_older_than_retained_anchor() {
     let (commit_eve, _pending_eve) = evolution(invite_eve);
     let commit_eve = route(commit_eve, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve, 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve, 2_000)
         .expect("eve commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("eve branch applies");
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
 
     carol
-        .buffer_openmls_convergence_message(&group_id, stale_bob_commit.clone(), 4_000)
+        .buffer_openmls_convergence_message_at(&group_id, stale_bob_commit.clone(), 4_000)
         .expect("stale bob commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .expect("stale commit outside the retained horizon is ignored");
 
     assert!(result.dropped_messages.is_empty());
@@ -3901,10 +3879,10 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
     alice.confirm_published(pending_david).await.unwrap();
     let commit_david = route(commit_david, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_david, 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_david, 1_000)
         .expect("david commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("david branch applies");
 
     let eve_kp = eve.fresh_key_package().await.unwrap();
@@ -3918,10 +3896,10 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
     let (commit_eve, _pending_eve) = evolution(invite_eve);
     let commit_eve = route(commit_eve, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit_eve, 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit_eve, 2_000)
         .expect("eve commit buffered");
     carol
-        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
         .expect("eve branch applies");
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap().epoch,
@@ -3931,10 +3909,10 @@ async fn rebuilt_engine_does_not_reseed_commit_older_than_retained_anchor() {
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
     carol
-        .buffer_openmls_convergence_message(&group_id, stale_bob_commit.clone(), 4_000)
+        .buffer_openmls_convergence_message_at(&group_id, stale_bob_commit.clone(), 4_000)
         .expect("stale bob commit buffered after restart");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 5_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 5_000_000)
         .expect("rebuilt engine ignores input outside the retained horizon");
 
     assert!(result.dropped_messages.is_empty());
@@ -4014,7 +3992,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
     // settle is deterministic: a small value like 2_000 races the real elapsed
     // time under parallel load and only intermittently clears quiescence.
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("future app witness applies after selected commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4184,7 +4162,7 @@ async fn terminal_undecryptable_app_emits_invalidation_without_message_received(
         .await
         .expect("commit is buffered by ingest");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("convergence settles despite forged app message");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4317,13 +4295,13 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     // no candidate branch that decrypts it (it targets epoch 3), so it is
     // classified UndecryptableInCanonicalState — the retryable case.
     carol
-        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch2, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(commit_to_epoch2, &group_id), 1_000)
         .expect("epoch-2 commit buffered");
     carol
-        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, app_msg.clone(), 1_000)
         .expect("future app message buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("convergence settles on the epoch-2 commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4353,10 +4331,10 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     // buffered app message (it was kept Retryable and not marked seen) and
     // apply it on the canonical branch.
     carol
-        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch3, &group_id), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(commit_to_epoch3, &group_id), 2_000)
         .expect("epoch-3 commit buffered");
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000_000)
         .expect("convergence applies the re-fed app message after the commit lands");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4445,12 +4423,12 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
 
     for message in commit_messages.iter().chain(app_messages.iter()) {
         carol
-            .buffer_openmls_convergence_message(&group_id, message.clone(), 1_000)
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
             .expect("message buffered");
     }
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4571,13 +4549,13 @@ async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
     // Settle and deliver the branch that will lose once the deterministic
     // winner arrives late.
     carol
-        .buffer_openmls_convergence_message(&group_id, commits[losing_index].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commits[losing_index].clone(), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, apps[losing_index].clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, apps[losing_index].clone(), 1_000)
         .unwrap();
     let first = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     assert_eq!(
         first.accepted_app_messages,
@@ -4597,13 +4575,13 @@ async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
     }));
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commits[winning_index].clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, commits[winning_index].clone(), 2_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, apps[winning_index].clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, apps[winning_index].clone(), 2_000)
         .unwrap();
     let second = carol
-        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .unwrap();
 
     assert!(second.invalidated_app_messages.iter().any(|invalidated| {
@@ -4695,7 +4673,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
         .unwrap();
 
     let result = restarted
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000)
         .expect("rebuilt engine converges stored OpenMLS messages");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -4719,10 +4697,9 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
 async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
-    let wall_ms = Arc::new(AtomicU64::new(10_000));
-    let wall_clock = TestWallClock(wall_ms.clone());
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
     let mut david = build_client(b"david").0;
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -4756,12 +4733,12 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
         .unwrap();
     let (commit, _) = evolution(invite);
     carol
-        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id))
         .unwrap();
 
-    wall_ms.store(10_400, Ordering::SeqCst);
+    clock.set_wall_ms(10_400);
     let mut restarted =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
     let remaining = restarted
         .prepare_convergence_cutoff_delay_ms(&group_id)
         .unwrap()
@@ -4771,9 +4748,19 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
         "restart must preserve the original 600ms remainder"
     );
 
-    wall_ms.store(9_000, Ordering::SeqCst);
-    let mut backwards =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
+    clock.set_wall_ms(20_000);
+    let mut forwards =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+    assert_eq!(
+        forwards
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        Some(0),
+        "a forward wall-clock jump past the persisted cutoff must make it immediately due"
+    );
+
+    clock.set_wall_ms(9_000);
+    let mut backwards = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
     assert_eq!(
         backwards
             .prepare_convergence_cutoff_delay_ms(&group_id)
@@ -4788,10 +4775,9 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
-    let wall_ms = Arc::new(AtomicU64::new(10_000));
-    let wall_clock = TestWallClock(wall_ms.clone());
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -4856,16 +4842,15 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
 
     for message in commit_messages.iter().chain(app_messages.iter()) {
         carol
-            .buffer_openmls_convergence_message(&group_id, message.clone(), 1_000)
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
             .expect("message buffered");
     }
 
-    wall_ms.store(12_000, Ordering::SeqCst);
-    let mut restarted =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
+    clock.set_wall_ms(12_000);
+    let mut restarted = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
 
     let result = restarted
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("rebuilt engine converges stored OpenMLS messages");
 
     assert_eq!(
@@ -4997,7 +4982,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
     ));
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("proposal-consuming commit converges");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -5076,13 +5061,13 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
     let first_commit = route(first_commit, &group_id);
 
     carol
-        .buffer_openmls_convergence_message(&group_id, stale_proposal.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, stale_proposal.clone(), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, first_commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, first_commit.clone(), 1_000)
         .unwrap();
     let first = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
     assert_eq!(first.accepted_commits, vec![content_hex(&first_commit)]);
     assert!(first.dropped_messages.iter().any(|dropped| {
@@ -5110,10 +5095,10 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
     alice.confirm_published(second_pending).await.unwrap();
     let second_commit = route(second_commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, second_commit.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, second_commit.clone(), 2_000)
         .unwrap();
     let second = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .unwrap();
 
     assert_eq!(second.accepted_commits, vec![content_hex(&second_commit)]);
@@ -5125,7 +5110,10 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
 async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
     let (mut david, _david_storage) = build_client(b"david");
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -5163,14 +5151,30 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let commit = route(commit, &group_id);
 
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .buffer_openmls_convergence_message(&group_id, commit.clone())
         .expect("commit buffered");
+    let opened = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(opened.opened_monotonic_ms, 1_000);
+    assert_eq!(opened.opened_wall_ms, 10_000);
+    assert_eq!(opened.quiescence_deadline_monotonic_ms, 2_000);
+    assert_eq!(opened.quiescence_deadline_wall_ms, 11_000);
+    assert_eq!(opened.absolute_deadline_monotonic_ms, 6_000);
+    assert_eq!(opened.absolute_deadline_wall_ms, 15_000);
+    clock.advance_ms(900);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_900)
+        .buffer_openmls_convergence_message(&group_id, commit.clone())
         .expect("duplicate commit ignored");
 
+    assert_eq!(
+        carol
+            .converge_stored_openmls_messages(&group_id)
+            .expect("the instant before quiescence remains open")
+            .convergence_status,
+        ConvergenceStatus::Syncing
+    );
+    clock.advance_ms(100);
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages(&group_id)
         .expect("duplicate should not pin syncing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -5216,18 +5220,18 @@ async fn application_input_does_not_reset_convergence_quiescence() {
     let (commit, pending) = evolution(rename);
     alice.confirm_published(pending).await.unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(commit, &group_id), 1_000)
         .unwrap();
     let app = send_app(&mut alice, &group_id, b"ordinary application".to_vec()).await;
     carol
-        .buffer_openmls_convergence_message(&group_id, app, 1_900)
+        .buffer_openmls_convergence_message_at(&group_id, app, 1_900)
         .unwrap();
 
     let pass = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
     assert_eq!(pass.quiescence_deadline_monotonic_ms, 2_000);
     assert_eq!(
         carol
-            .converge_stored_openmls_messages(&group_id, 2_000)
+            .converge_stored_openmls_messages_at(&group_id, 2_000)
             .unwrap()
             .convergence_status,
         ConvergenceStatus::Settled
@@ -5288,13 +5292,13 @@ async fn app_witness_beside_competing_commits_resets_convergence_quiescence() {
     let app = send_app(&mut alice, &group_id, b"branch witness".to_vec()).await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, route(alice_commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(alice_commit, &group_id), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, route(bob_commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(bob_commit, &group_id), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, app, 1_900)
+        .buffer_openmls_convergence_message_at(&group_id, app, 1_900)
         .unwrap();
 
     let pass = carol_storage
@@ -5370,10 +5374,10 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
     let far_future_app = send_app(&mut alice, &group_id, b"outside active horizon".to_vec()).await;
 
     carol
-        .buffer_openmls_convergence_message(&group_id, route(first_commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(first_commit, &group_id), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, far_future_app.clone(), 1_900)
+        .buffer_openmls_convergence_message_at(&group_id, far_future_app.clone(), 1_900)
         .unwrap();
 
     let pass = carol_storage
@@ -5394,7 +5398,10 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
 #[tokio::test]
 async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let (group_id, create) = alice
@@ -5418,10 +5425,7 @@ async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_inp
         .await
         .unwrap();
 
-    for (index, now_ms) in [1_000, 1_900, 2_800, 3_700, 4_600, 5_500]
-        .into_iter()
-        .enumerate()
-    {
+    for index in 0..6 {
         let update = alice
             .send(SendIntent::UpdateGroupData {
                 group_id: group_id.clone(),
@@ -5433,8 +5437,11 @@ async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_inp
         let (message, pending) = evolution(update);
         alice.confirm_published(pending).await.unwrap();
         carol
-            .buffer_openmls_convergence_message(&group_id, route(message, &group_id), now_ms)
+            .buffer_openmls_convergence_message(&group_id, route(message, &group_id))
             .unwrap();
+        if index < 5 {
+            clock.advance_ms(900);
+        }
     }
 
     let pass = carol_storage
@@ -5444,16 +5451,18 @@ async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_inp
     assert_eq!(pass.quiescence_deadline_monotonic_ms, 6_500);
     assert_eq!(pass.absolute_deadline_monotonic_ms, 6_000);
     assert_eq!(pass.members.len(), 6);
+    clock.advance_ms(499);
     assert_eq!(
         carol
-            .converge_stored_openmls_messages(&group_id, 5_999)
+            .converge_stored_openmls_messages(&group_id)
             .unwrap()
             .convergence_status,
         ConvergenceStatus::Syncing
     );
+    clock.advance_ms(1);
     assert_eq!(
         carol
-            .converge_stored_openmls_messages(&group_id, 6_000)
+            .converge_stored_openmls_messages(&group_id)
             .unwrap()
             .convergence_status,
         ConvergenceStatus::Settled
@@ -5515,10 +5524,10 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
     alice.confirm_published(pending).await.unwrap();
     let at_cutoff = route(at_cutoff, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, first.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, first.clone(), 1_000)
         .unwrap();
     carol
-        .buffer_openmls_convergence_message(&group_id, at_cutoff.clone(), 2_000)
+        .buffer_openmls_convergence_message_at(&group_id, at_cutoff.clone(), 2_000)
         .unwrap();
 
     let collecting = carol_storage
@@ -5542,7 +5551,7 @@ async fn input_at_effective_cutoff_is_retained_for_the_next_generation() {
     );
 
     carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000)
         .expect("generation zero freezes and resolves at the exact cutoff");
     let completed = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
     assert_eq!(completed.generation, 0);
@@ -5677,7 +5686,7 @@ async fn buffered_convergence_pass_fixture(group_name: &str) -> BufferedPassFixt
     let (commit, _) = evolution(invite);
     let commit = route(commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
         .unwrap();
 
     let tip = carol.epoch(&group_id).unwrap();
@@ -5721,7 +5730,7 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
 
     let compensated = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 2_000)
         .expect("a stale pass base is compensated, not fatal");
     assert_ne!(
         compensated.convergence_status,
@@ -5750,7 +5759,7 @@ async fn stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() {
 
     let settled = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 3_000)
         .expect("the reopened pass converges at the current tip");
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
@@ -5788,7 +5797,7 @@ async fn frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halt
 
     let compensated = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 2_000)
         .expect("a frozen stale pass base is compensated, not fatal");
     assert_ne!(
         compensated.convergence_status,
@@ -5823,7 +5832,7 @@ async fn frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halt
 
     let settled = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 3_000)
         .expect("the reopened pass converges at the current tip");
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
@@ -5858,7 +5867,7 @@ async fn future_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() 
 
     let compensated = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 2_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 2_000)
         .expect("a future pass base is compensated, not fatal");
     assert_ne!(
         compensated.convergence_status,
@@ -5890,7 +5899,7 @@ async fn future_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting() 
 
     let settled = fixture
         .carol
-        .converge_stored_openmls_messages(&fixture.group_id, 3_000)
+        .converge_stored_openmls_messages_at(&fixture.group_id, 3_000)
         .expect("the reopened pass converges at the current tip");
     assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
@@ -5944,7 +5953,7 @@ async fn frozen_pass_member_tampering_fails_closed_to_unrecoverable() {
     let (commit, _) = evolution(invite);
     let commit = route(commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
         .unwrap();
 
     let id = content_id(&commit);
@@ -5953,7 +5962,7 @@ async fn frozen_pass_member_tampering_fails_closed_to_unrecoverable() {
     carol_storage.put_message(&record).unwrap();
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000)
         .expect("integrity failure is a classified halt");
     assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
     assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
@@ -6000,7 +6009,7 @@ async fn missing_frozen_pass_member_fails_closed_to_unrecoverable() {
         .unwrap();
     let (commit, _) = evolution(invite);
     carol
-        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, route(commit, &group_id), 1_000)
         .unwrap();
 
     let mut pass = carol_storage.convergence_pass(&group_id).unwrap().unwrap();
@@ -6063,17 +6072,17 @@ async fn malformed_convergence_input_does_not_reset_quiescence() {
     let (commit, _pending) = evolution(invite);
     let commit = route(commit, &group_id);
     carol
-        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
         .expect("valid commit buffered");
 
     let mut malformed = commit.clone();
     malformed.payload = b"not an OpenMLS message".to_vec();
     carol
-        .buffer_openmls_convergence_message(&group_id, malformed, 1_900)
+        .buffer_openmls_convergence_message_at(&group_id, malformed, 1_900)
         .expect_err("malformed input must fail before touching quiescence");
 
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000)
         .expect("malformed input should not pin syncing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
@@ -6270,7 +6279,7 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
     );
 
     carol
-        .buffer_openmls_convergence_message(&group_id, far_future_msg.clone(), 1_000)
+        .buffer_openmls_convergence_message_at(&group_id, far_future_msg.clone(), 1_000)
         .expect("far-future message buffered");
 
     // Convergence is not perpetually unsettled on account of the beyond-ceiling
@@ -6362,10 +6371,10 @@ async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
         Some(1)
     );
 
-    bob.buffer_openmls_convergence_message(&group_id, invalid_commit.clone(), 1_000)
+    bob.buffer_openmls_convergence_message_at(&group_id, invalid_commit.clone(), 1_000)
         .expect("invalid commit buffered");
     let result = bob
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("invalid commit classified");
 
     assert!(result.dropped_messages.iter().any(|dropped| {
@@ -7271,10 +7280,9 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
-    let wall_ms = Arc::new(AtomicU64::new(10_000));
-    let wall_clock = TestWallClock(wall_ms.clone());
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock.clone());
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
     let (mut david, _david_storage) = build_client(b"david");
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -7334,9 +7342,8 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         1
     );
 
-    wall_ms.store(12_000, Ordering::SeqCst);
-    let mut restarted =
-        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), wall_clock);
+    clock.set_wall_ms(12_000);
+    let mut restarted = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
     let drained = restarted
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await
@@ -7611,7 +7618,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
     }
 
     alice
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages_at(&group_id, 2_000)
         .expect("converge");
     drop(alice);
 

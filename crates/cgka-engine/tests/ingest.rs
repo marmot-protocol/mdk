@@ -993,9 +993,9 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
         }
         other => panic!("expected invite commit, got {other:?}"),
     };
-    bob.buffer_openmls_convergence_message(&group_id, invite, 1_000)
+    bob.buffer_openmls_convergence_message_at(&group_id, invite, 1_000)
         .expect("invite commit buffered");
-    bob.converge_stored_openmls_messages(&group_id, 1_000_000)
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("invite commit applies and retains the pre-commit anchor");
     assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(live_epoch));
 
@@ -1344,9 +1344,9 @@ async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest()
     // elapsed, so buffer at one instant and converge at a later one (mirroring
     // the retained-anchor convergence tests) to apply the commit and retain the
     // pre-commit epoch anchor.
-    bob.buffer_openmls_convergence_message(&group_id, invite, 1_000)
+    bob.buffer_openmls_convergence_message_at(&group_id, invite, 1_000)
         .expect("invite commit buffered");
-    bob.converge_stored_openmls_messages(&group_id, 1_000_000)
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
         .expect("invite commit applies and retains the pre-commit anchor");
     assert_eq!(
         bob.epoch(&group_id).unwrap(),

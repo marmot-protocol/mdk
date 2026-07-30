@@ -720,7 +720,13 @@ impl<S: StorageProvider> Engine<S> {
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
                 let result = self
-                    .converge_stored_openmls_messages(group_id, now_ms)
+                    .converge_stored_openmls_messages_with_time(
+                        group_id,
+                        crate::convergence_clock::ConvergenceTime {
+                            monotonic_ms: now_ms,
+                            wall_ms: self.convergence_now().wall_ms,
+                        },
+                    )
                     .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
                 if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled
                 {

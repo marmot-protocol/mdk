@@ -9,6 +9,7 @@
 //! convergence, and capability logic live in focused sibling modules.
 
 use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
+use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
@@ -44,7 +45,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
@@ -241,7 +242,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
-    pub(crate) convergence_clock_started_at: Instant,
+    pub(crate) convergence_clock: Arc<dyn ConvergenceClock>,
     /// Identifies the process-local monotonic clock domain persisted in active
     /// convergence passes. A mismatch on hydration forces deadline rebasing
     /// from the required millisecond wall clock.
@@ -336,6 +337,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     max_past_epochs: usize,
     wall_clock: Arc<dyn WallClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
+    convergence_clock: Arc<dyn ConvergenceClock>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
@@ -354,6 +356,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
             wall_clock: Arc::new(SystemWallClock),
             maintenance_random: Arc::new(OsMaintenanceRandom),
+            convergence_clock: Arc::new(SystemConvergenceClock::default()),
             recorder: None,
         }
     }
@@ -425,6 +428,15 @@ impl<S: StorageProvider> EngineBuilder<S> {
     ) -> Self {
         self.wall_clock = wall_clock;
         self.maintenance_random = maintenance_random;
+        self
+    }
+
+    /// Install the convergence-only dual clock.
+    ///
+    /// This does not affect protocol, identity, transport-event, or
+    /// maintenance timestamps.
+    pub fn convergence_clock(mut self, clock: Arc<dyn ConvergenceClock>) -> Self {
+        self.convergence_clock = clock;
         self
     }
 
@@ -515,7 +527,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 app_message_past_epoch_limit: self.max_past_epochs as u64,
                 ..crate::canonicalization::CanonicalizationPolicy::default()
             },
-            convergence_clock_started_at: Instant::now(),
+            convergence_clock: self.convergence_clock,
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
@@ -2040,12 +2052,12 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    pub(crate) fn convergence_now(&self) -> ConvergenceTime {
+        self.convergence_clock.now()
+    }
+
     pub(crate) fn convergence_now_ms(&self) -> u64 {
-        self.convergence_clock_started_at
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+        self.convergence_now().monotonic_ms
     }
 
     /// Aggregate, privacy-safe snapshot of engine diagnostic telemetry.
