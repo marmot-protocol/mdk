@@ -184,6 +184,11 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
     alice.drain_events();
 
     alice.request_disband().await.expect("request disband");
+    // Milestone 1.3 replaces this production-clock wait with the simulator's
+    // injected monotonic/wall clocks. Until that subject boundary exists, run
+    // the real pinned-v1 quiescence policy rather than weakening its constants
+    // just for this terminal-projection test.
+    let mut reached_terminal = false;
     for _ in 0..24 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         alice
@@ -194,9 +199,14 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
             alice.canonical_state_snapshot(),
             ConformanceCanonicalStateSnapshot::Disbanded(_)
         ) {
+            reached_terminal = true;
             break;
         }
     }
+    assert!(
+        reached_terminal,
+        "disband did not reach terminal state within the 6-second pinned-v1 test budget"
+    );
     bus.deliver_all();
 
     let before_restart = alice.canonical_state_snapshot();
@@ -513,25 +523,43 @@ async fn no_pending_work_rejects_bus_queue_and_unread_mailbox() {
     bob.drain_events();
 
     bob.send_app(b"queued".to_vec()).await;
-    let queued = observe_client_exact("alice", &mut alice);
+    let queued_for_alice = observe_client_exact("alice", &mut alice);
     assert_eq!(
-        queued
+        queued_for_alice
             .pending_work
             .as_ref()
             .expect("exact pending snapshot")
             .bus_queued_messages,
         1
     );
+    let sender_does_not_own_queued_delivery = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_does_not_own_queued_delivery
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_queued_messages,
+        0
+    );
 
     bus.deliver_all();
-    let unread = observe_client_exact("bob", &mut bob);
+    let unread_for_alice = observe_client_exact("alice", &mut alice);
     assert_eq!(
-        unread
+        unread_for_alice
             .pending_work
             .as_ref()
             .expect("exact pending snapshot")
             .bus_mailbox_messages,
         1
+    );
+    let sender_mailbox_remains_empty = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_mailbox_remains_empty
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_mailbox_messages,
+        0
     );
 
     alice.tick().await;
@@ -543,6 +571,82 @@ async fn no_pending_work_rejects_bus_queue_and_unread_mailbox() {
             .expect("exact pending snapshot")
             .is_empty(),
         "all transport and engine work should be drained: {drained:#?}"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_does_not_claim_delivery_of_dropped_application_input() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("dropped-is-not-pending", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    alice.send_app(b"intentionally-dropped".to_vec()).await;
+    assert!(bus.drop_queued(0), "drop the application transport object");
+
+    let alice_observation = observe_client_exact("alice", &mut alice);
+    let bob_observation = observe_client_exact("bob", &mut bob);
+    let sender_entry = alice_observation
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.payload == "intentionally-dropped")
+        .expect("sender records the published application input");
+    assert_eq!(
+        sender_entry.disposition,
+        ScenarioInputDisposition::Accepted,
+        "sender acceptance is not an end-to-end delivery claim"
+    );
+    assert!(
+        bob_observation.scenario_input_ledger.is_empty(),
+        "a recipient cannot classify an object the scenario removed before delivery"
+    );
+
+    let trace = ScenarioTrace {
+        name: "dropped-is-not-pending".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![alice_observation, bob_observation],
+    };
+    let no_pending_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into(), "bob".into()],
+        }],
+        &trace,
+    );
+    assert!(
+        no_pending_failures.is_empty(),
+        "NoPendingWork is local execution quiescence, not transport completeness: \
+         {no_pending_failures:#?}"
+    );
+
+    let delivery_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::ClientState {
+            client: "bob".into(),
+            epoch: 1,
+            member_count: 2,
+            received_payloads: Some(vec!["intentionally-dropped".into()]),
+            added_members: None,
+            removed_members: None,
+        }],
+        &trace,
+    );
+    assert_eq!(
+        delivery_failures.len(),
+        1,
+        "delivery must be asserted independently from local quiescence"
     );
 }
 

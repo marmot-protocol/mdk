@@ -569,6 +569,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<crate::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError> {
+        self.ensure_group_live(group_id)?;
         if let Some(tombstone) = self.storage.disband_tombstone(group_id)? {
             return Ok(
                 crate::conformance_snapshot::ConformanceCanonicalStateSnapshot::Disbanded(

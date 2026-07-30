@@ -269,6 +269,15 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Pressure: exact observation while the engine remains in `PendingPublish`.
 - Expected: `NoPendingWork` fails with an engine blocker even if public epoch/member facts otherwise look coherent.
 
+### `no_pending_work_does_not_claim_delivery_of_dropped_application_input`
+
+- Setup: Alice sends an application event to Bob after a stable two-member join, then a transport fault drops the queued
+  object before Bob receives it.
+- Pressure: compare each client's local pending-work snapshot with Bob's exact recipient ledger/output observation.
+- Expected: `NoPendingWork` passes for both clients once their local work is empty, while the independent delivery
+  expectation fails because Bob never observed the application input. This sentinel keeps local quiescence distinct
+  from end-to-end delivery.
+
 ### `convergence_e2e_from_peeler_ingest_to_group_events`
 
 - Setup: two admins create competing invite branches and each sends an application event on its branch; two passive

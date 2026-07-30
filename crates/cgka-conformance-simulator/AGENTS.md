@@ -23,14 +23,15 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     `GroupEvolution`.
 
 - **Module:** `src/scenario_input_ledger.rs`
-  - **Role:** Simulator-owned per-client application-message accounting. Joins the inner Marmot event id to outer
-    transport and peeled MLS content ids, then records send/queue/publication, ingest/defer/resource outcomes,
-    delivery/deduplication/expiry/invalidation, and pending state without adding production engine hooks.
+  - **Role:** Simulator-owned per-client commit, proposal, and application-input accounting. Joins stable scenario
+    action ids to outer transport and peeled MLS content ids; application entries also retain the inner Marmot event id.
+    It records send/queue/publication, ingest/defer/resource outcomes, delivery/deduplication/expiry/invalidation, and
+    pending state without adding production engine hooks.
 
 - **Module:** `src/pending_work.rs`
-  - **Role:** Instantaneous strict progress observation combining the conformance engine snapshot, global bus
-    queue/delay/mailbox counts, and per-client logical pending entries. It reports blockers for `NoPendingWork`; it does
-    not implement virtual-time quiescence waiting.
+  - **Role:** Instantaneous strict local-progress observation combining a group-scoped conformance engine snapshot,
+    client-addressed bus queue/delay/mailbox counts, and per-client logical pending entries. It reports blockers for
+    `NoPendingWork`; it does not claim end-to-end delivery or implement virtual-time quiescence waiting.
 
 - **Module:** `src/decryptability.rs`
   - **Role:** Serializable active application-message probe results. A

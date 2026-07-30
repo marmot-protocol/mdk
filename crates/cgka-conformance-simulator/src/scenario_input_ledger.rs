@@ -284,8 +284,9 @@ impl ScenarioInputTracker {
         };
         match state {
             MessageState::Processed => {
-                if kind != ScenarioInputKind::Application
-                    || entry.disposition != ScenarioInputDisposition::Delivered
+                if !is_terminal(&entry.disposition)
+                    && (kind != ScenarioInputKind::Application
+                        || entry.disposition != ScenarioInputDisposition::Delivered)
                 {
                     entry.disposition = ScenarioInputDisposition::Accepted;
                 }
@@ -512,5 +513,37 @@ mod tests {
         assert_eq!(entry.transport_deferred, 1);
         assert_eq!(entry.disposition, ScenarioInputDisposition::Pending);
         assert!(entry.pending);
+    }
+
+    #[test]
+    fn processed_storage_does_not_overwrite_terminal_semantic_disposition() {
+        let terminal_dispositions = [
+            ScenarioInputDisposition::Delivered,
+            ScenarioInputDisposition::Expired,
+            ScenarioInputDisposition::Invalidated,
+            ScenarioInputDisposition::Rejected,
+            ScenarioInputDisposition::Stale,
+            ScenarioInputDisposition::Ignored,
+            ScenarioInputDisposition::ResourceRefused,
+            ScenarioInputDisposition::RolledBack,
+        ];
+        for disposition in terminal_dispositions {
+            let mut tracker = ScenarioInputTracker::default();
+            let metadata = metadata(ScenarioInputKind::Application);
+            tracker.record_send_attempt(&metadata);
+            let entry = tracker.entries.get_mut(&metadata.scenario_id).unwrap();
+            entry.disposition = disposition.clone();
+            entry.pending = false;
+
+            tracker.record_storage_state(
+                &metadata.scenario_id,
+                ScenarioInputKind::Application,
+                MessageState::Processed,
+            );
+
+            let entry = &tracker.snapshot()[0];
+            assert_eq!(entry.disposition, disposition);
+            assert!(!entry.pending);
+        }
     }
 }

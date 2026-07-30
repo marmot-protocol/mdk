@@ -107,11 +107,13 @@ work. In particular,
 `TransportDeferred` remains pending but is not mislabeled as application acceptance: until peeling succeeds, the engine
 cannot make a logical validity or branch claim about that object.
 
-`NoPendingWork` is the strict instantaneous progress assertion. An `observe_exact` step captures aggregate engine work
-(publish lifecycle, convergence pass/input, queued outbound, deferred/retryable storage, and scheduling buffers), the
-bus queue/delayed/mailbox counts, and pending scenario-input ledger entries. The expectation fails with the blocking subsystem
-names. It does not yet wait for quiescence: virtual-time advancement, two unchanged observations, timeout policy, and
-retry-timer coverage belong to Milestone 1.3.
+`NoPendingWork` is the strict instantaneous local-progress assertion. An `observe_exact` step captures group-scoped
+engine work (publish lifecycle, convergence pass/input, queued outbound, deferred/retryable storage, and scheduling
+buffers), bus queue/delayed/mailbox work addressed to that client, and that client's pending scenario-input ledger
+entries. The expectation fails with the blocking subsystem names. It is deliberately not an end-to-end delivery claim
+for an application object that a transport fault dropped; scenarios that require delivery must assert the recipient's
+ledger or output separately. It does not yet wait for quiescence: virtual-time advancement, structural progress tokens,
+timeout policy, and retry-timer coverage belong to Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting
@@ -234,9 +236,10 @@ without inventing a separate execution path. We promote a case only when it shou
 as a regression fixture or the smallest readable example of a semantic edge.
 
 Send/leave and convergence-chaos reliability cases finish with a global transport/mailbox drain, an exact observation,
-and a `NoPendingWork` expectation. Multi-client settled claims also require `ClientsExactlyEquivalent`. These checks are
-intentionally capable of making a generated campaign red even when its earlier legacy observation passed; that is how
-hidden unread input, branch divergence, and retained work become visible.
+and a per-client `NoPendingWork` expectation. Multi-client settled claims also require `ClientsExactlyEquivalent`, and
+delivery-sensitive cases assert recipient ledgers or outputs. These checks are intentionally capable of making a
+generated campaign red even when its earlier legacy observation passed; that is how hidden unread input, branch
+divergence, and retained work become visible.
 
 `generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic variants of
 `convergence-e2e-group-events/v1`. Each variant keeps the logical branch race stable but mutates queued delivery with

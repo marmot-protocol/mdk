@@ -697,20 +697,11 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
-                let scenario_input =
-                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-                self.scenario_input_tracker
-                    .record_send_attempt(&scenario_input);
-                self.scenario_input_tracker
-                    .record_send_accepted(&scenario_input, false);
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
                 let routed = route(msg, &gid);
-                let scenario_input = self
-                    .register_published_scenario_input(&routed, scenario_input)
-                    .await;
-                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
             }
@@ -739,17 +730,8 @@ impl HarnessClient {
                     welcomes.is_empty(),
                     "group-data update should not create welcomes"
                 );
-                let scenario_input =
-                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-                self.scenario_input_tracker
-                    .record_send_attempt(&scenario_input);
-                self.scenario_input_tracker
-                    .record_send_accepted(&scenario_input, false);
                 let routed = route(msg, &gid);
-                let scenario_input = self
-                    .register_published_scenario_input(&routed, scenario_input)
-                    .await;
-                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
             }
@@ -783,17 +765,8 @@ impl HarnessClient {
                     welcomes.is_empty(),
                     "admin policy update should not create welcomes"
                 );
-                let scenario_input =
-                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-                self.scenario_input_tracker
-                    .record_send_attempt(&scenario_input);
-                self.scenario_input_tracker
-                    .record_send_accepted(&scenario_input, false);
                 let routed = route(msg, &gid);
-                let scenario_input = self
-                    .register_published_scenario_input(&routed, scenario_input)
-                    .await;
-                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 Ok(pending)
             }
@@ -952,17 +925,8 @@ impl HarnessClient {
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
-                let scenario_input =
-                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-                self.scenario_input_tracker
-                    .record_send_attempt(&scenario_input);
-                self.scenario_input_tracker
-                    .record_send_accepted(&scenario_input, false);
                 let routed = route(msg, &gid);
-                let scenario_input = self
-                    .register_published_scenario_input(&routed, scenario_input)
-                    .await;
-                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 Ok(pending)
             }
@@ -1207,16 +1171,7 @@ impl HarnessClient {
                 } else {
                     msg
                 };
-                let scenario_input =
-                    self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-                self.scenario_input_tracker
-                    .record_send_attempt(&scenario_input);
-                self.scenario_input_tracker
-                    .record_send_accepted(&scenario_input, false);
-                let scenario_input = self
-                    .register_published_scenario_input(&routed, scenario_input)
-                    .await;
-                self.remember_pending_scenario_input(pending, &scenario_input);
+                self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 self.try_confirm(pending).await?;
                 self.capture_engine_events();
@@ -1251,18 +1206,15 @@ impl HarnessClient {
             } else {
                 auto.msg
             };
-            let scenario_input =
-                self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
-            self.scenario_input_tracker
-                .record_send_attempt(&scenario_input);
-            self.scenario_input_tracker
-                .record_send_accepted(&scenario_input, false);
-            let scenario_input = self
-                .register_published_scenario_input(&routed, scenario_input)
+            self.publish_commit_scenario_input(&routed, auto.pending)
                 .await;
-            self.remember_pending_scenario_input(auto.pending, &scenario_input);
             self.bus.send(self.bus_id, routed);
             if let Err(e) = self.try_confirm(auto.pending).await {
+                // A confirmation error is not evidence that the engine rolled
+                // back the staged state. Keep the mapping pending so the
+                // strict oracle exposes the unresolved publish lifecycle; an
+                // actual rollback is recorded only through publish_failed or
+                // the corresponding engine event.
                 outcomes.push(Err(e));
                 continue;
             }
@@ -1380,7 +1332,7 @@ impl HarnessClient {
             .engine()
             .conformance_pending_work_snapshot(&group_id)
             .expect("capture conformance pending work");
-        let bus = self.bus.pending_work_snapshot();
+        let bus = self.bus.pending_work_snapshot(self.bus_id);
         PendingWorkObservation {
             engine,
             bus_queued_messages: bus.queued_messages,
@@ -1397,6 +1349,23 @@ impl HarnessClient {
             .checked_add(1)
             .expect("app event counter exhausted");
         encode_harness_app_payload(&self.engine().self_id(), seq, payload)
+    }
+
+    async fn publish_commit_scenario_input(
+        &mut self,
+        message: &TransportMessage,
+        pending: PendingStateRef,
+    ) {
+        let scenario_input =
+            self.next_scenario_input_metadata(ScenarioInputKind::Commit, None, None);
+        self.scenario_input_tracker
+            .record_send_attempt(&scenario_input);
+        self.scenario_input_tracker
+            .record_send_accepted(&scenario_input, false);
+        let scenario_input = self
+            .register_published_scenario_input(message, scenario_input)
+            .await;
+        self.remember_pending_scenario_input(pending, &scenario_input);
     }
 
     async fn register_published_scenario_input(
@@ -1522,12 +1491,17 @@ impl HarnessClient {
                 GroupEvent::ForkRecovered {
                     invalidated_commit_id,
                     ..
+                } => {
+                    if let Some(scenario_input) = self
+                        .bus
+                        .scenario_input_for_transport(invalidated_commit_id)
+                        .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
+                    {
+                        self.scenario_input_tracker
+                            .record_commit_invalidated(&scenario_input, "fork_recovered");
+                    }
                 }
-                | GroupEvent::CommitRolledBack {
-                    invalidated_commit_id,
-                    ..
-                }
-                | GroupEvent::GroupStateInvalidated {
+                GroupEvent::CommitRolledBack {
                     invalidated_commit_id,
                     ..
                 } => {
@@ -1537,7 +1511,22 @@ impl HarnessClient {
                         .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
                     {
                         self.scenario_input_tracker
-                            .record_commit_invalidated(&scenario_input, "superseded");
+                            .record_commit_invalidated(&scenario_input, "commit_rolled_back");
+                    }
+                }
+                GroupEvent::GroupStateInvalidated {
+                    invalidated_commit_id,
+                    ..
+                } => {
+                    if let Some(scenario_input) = self
+                        .bus
+                        .scenario_input_for_transport(invalidated_commit_id)
+                        .or_else(|| self.bus.scenario_input_for_content(invalidated_commit_id))
+                    {
+                        self.scenario_input_tracker.record_commit_invalidated(
+                            &scenario_input,
+                            "group_state_invalidated_superseded",
+                        );
                     }
                 }
                 _ => {}

@@ -1,8 +1,10 @@
 //! Instantaneous pending-work observations for strict simulator assertions.
 //!
 //! This deliberately does not decide quiescence over time. It captures one
-//! privacy-safe progress boundary; Milestone 1.3 will add virtual-time waiting
-//! and repeated stable observations.
+//! privacy-safe, client-scoped local execution boundary; Milestone 1.3 will
+//! add structural progress tokens and bounded virtual-time fixed-point
+//! evaluation. It does not assert end-to-end delivery of transport objects
+//! that a scenario dropped.
 
 use cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot;
 use serde::{Deserialize, Serialize};

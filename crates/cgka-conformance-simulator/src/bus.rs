@@ -235,12 +235,25 @@ impl TransportBus {
         self.inner.lock().unwrap().queue.len()
     }
 
-    pub(crate) fn pending_work_snapshot(&self) -> BusPendingWorkSnapshot {
+    pub(crate) fn pending_work_snapshot(&self, client: ClientId) -> BusPendingWorkSnapshot {
         let inner = self.inner.lock().unwrap();
+        let identity = inner
+            .clients
+            .get(&client)
+            .expect("pending-work client is attached");
         BusPendingWorkSnapshot {
-            queued_messages: inner.queue.len(),
-            delayed_messages: inner.delayed.values().map(Vec::len).sum(),
-            mailbox_messages: inner.mailboxes.values().map(Vec::len).sum(),
+            queued_messages: inner
+                .queue
+                .iter()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            delayed_messages: inner
+                .delayed
+                .values()
+                .flatten()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            mailbox_messages: inner.mailboxes.get(&client).map_or(0, Vec::len),
         }
     }
 
@@ -322,6 +335,28 @@ impl TransportBus {
     /// when a test wants to inspect ordering before stepping.
     pub fn peek_policy(&self) -> DeliveryPolicy {
         self.inner.lock().unwrap().policy.clone()
+    }
+}
+
+fn targets_client(
+    policy: &DeliveryPolicy,
+    identity: &MemberId,
+    client: ClientId,
+    in_flight: &InFlight,
+) -> bool {
+    if in_flight.sender == client {
+        return false;
+    }
+    match &in_flight.msg.envelope {
+        TransportEnvelope::GroupMessage { .. } => true,
+        TransportEnvelope::Welcome { recipient } => {
+            matches!(
+                policy,
+                DeliveryPolicy::Ordered {
+                    broadcast_welcomes: true
+                }
+            ) || recipient == identity
+        }
     }
 }
 

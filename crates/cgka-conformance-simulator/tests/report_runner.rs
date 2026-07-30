@@ -203,6 +203,10 @@ async fn report_runner_writes_send_leave_json_reports() {
     assert_eq!(summary.total(), 2);
     assert_eq!(summary.failed(), 1);
     assert!(summary.scenarios[0].failures.is_empty());
+    // Seed 42 case 1 deliberately retains the self-remove proposal/scheduler
+    // work exposed by the strict final observation. Keep the named finding
+    // visible until the engine lifecycle defect is fixed; it is not a generic
+    // report-runner failure.
     assert!(
         summary.scenarios[1]
             .failures

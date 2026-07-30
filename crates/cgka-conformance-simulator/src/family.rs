@@ -557,13 +557,18 @@ fn convergence_chaos_delayed_past_epoch_app(
             },
             ScenarioStep::DeliverAll,
             tick(["carol"]),
-            observe(["carol"]),
+            observe(["carol", "david"]),
         ],
     };
     let expected = vec![
         confirmed(1, "alice", "create"),
         confirmed(8, "alice", "invite-david"),
         client_state("carol", 2, 4, vec![payload]),
+        // David joined after the application input was authored and therefore
+        // does not claim historical delivery. Naming his state explicitly
+        // also makes him part of the strict exact/pending-work boundary,
+        // where the retained pre-join transport object remains visible.
+        client_state("david", 2, 4, vec![]),
     ];
     (scenario, expected)
 }
@@ -1315,31 +1320,14 @@ fn add_strict_reliability_oracle(
 ) {
     let exact_clients = expected
         .iter()
-        .find_map(|expectation| match expectation {
-            TraceExpectation::ClientsConverged { clients, .. } => Some(clients.clone()),
-            _ => None,
+        .flat_map(|expectation| match expectation {
+            TraceExpectation::ClientsConverged { clients, .. } => clients.clone(),
+            TraceExpectation::ClientState { client, .. } => vec![client.clone()],
+            _ => Vec::new(),
         })
-        .or_else(|| {
-            expected.iter().find_map(|expectation| match expectation {
-                TraceExpectation::ClientState { member_count, .. }
-                    if *member_count == scenario.clients.len() =>
-                {
-                    Some(scenario.clients.clone())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| {
-            expected
-                .iter()
-                .filter_map(|expectation| match expectation {
-                    TraceExpectation::ClientState { client, .. } => Some(client.clone()),
-                    _ => None,
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        });
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     if exact_clients.is_empty() {
         return;

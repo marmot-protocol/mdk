@@ -143,7 +143,12 @@ pub enum TraceExpectation {
         entries: Vec<ScenarioInputLedgerEntry>,
     },
     /// Require every named client's exact progress snapshot to contain no
-    /// outstanding engine, transport, or logical-message work.
+    /// outstanding local engine, client-addressed transport, or logical-input
+    /// work.
+    ///
+    /// This is not an end-to-end delivery assertion for transport objects that
+    /// a fault policy dropped. Assert recipient ledger/output dispositions
+    /// separately when delivery is required.
     NoPendingWork {
         clients: Vec<String>,
     },
@@ -379,21 +384,25 @@ impl TraceExpectation {
             TraceExpectation::ClientsExactlyEquivalent { clients } => {
                 let mut snapshots = Vec::with_capacity(clients.len());
                 for client in clients {
-                    let Some(observation) = client_observation(observed, client) else {
+                    let Some(latest_observation) = client_observation(observed, client) else {
                         missing_client(client, self, mismatches);
                         return;
                     };
-                    let Some(snapshot) = observation.canonical_state.as_ref() else {
+                    let Some(observation) = client_canonical_observation(observed, client) else {
                         mismatches.push(ExpectationFailure {
                             kind: "missing_canonical_state".into(),
                             message: format!(
                                 "client {client} was not observed with observe_client_exact"
                             ),
                             expected: json!(self),
-                            actual: json!(observation),
+                            actual: json!(latest_observation),
                         });
                         return;
                     };
+                    let snapshot = observation
+                        .canonical_state
+                        .as_ref()
+                        .expect("canonical observation carries canonical state");
                     snapshots.push((client, snapshot));
                 }
                 if snapshots.is_empty() {
@@ -429,7 +438,9 @@ impl TraceExpectation {
                 }
             }
             TraceExpectation::ScenarioInputLedger { client, entries } => {
-                match client_observation(observed, client) {
+                match client_canonical_observation(observed, client)
+                    .or_else(|| client_observation(observed, client))
+                {
                     Some(observation) if &observation.scenario_input_ledger == entries => {}
                     Some(observation) => mismatches.push(ExpectationFailure {
                         kind: "scenario_input_ledger_mismatch".into(),
@@ -453,21 +464,25 @@ impl TraceExpectation {
                     return;
                 }
                 for client in clients {
-                    let Some(observation) = client_observation(observed, client) else {
+                    let Some(latest_observation) = client_observation(observed, client) else {
                         missing_client(client, self, mismatches);
                         return;
                     };
-                    let Some(pending_work) = observation.pending_work.as_ref() else {
+                    let Some(observation) = client_pending_work_observation(observed, client) else {
                         mismatches.push(ExpectationFailure {
                             kind: "missing_pending_work_observation".into(),
                             message: format!(
                                 "client {client} was not observed with observe_client_exact"
                             ),
                             expected: json!(self),
-                            actual: json!(observation),
+                            actual: json!(latest_observation),
                         });
                         continue;
                     };
+                    let pending_work = observation
+                        .pending_work
+                        .as_ref()
+                        .expect("pending-work observation carries pending work");
                     if !pending_work.is_empty() {
                         mismatches.push(ExpectationFailure {
                             kind: "pending_work_remaining".into(),
@@ -889,6 +904,28 @@ fn client_observation<'a>(
         .find(|observation| observation.client == client)
 }
 
+fn client_canonical_observation<'a>(
+    observed: &'a ScenarioTrace,
+    client: &str,
+) -> Option<&'a ClientObservation> {
+    observed
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == client && observation.canonical_state.is_some())
+}
+
+fn client_pending_work_observation<'a>(
+    observed: &'a ScenarioTrace,
+    client: &str,
+) -> Option<&'a ClientObservation> {
+    observed
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == client && observation.pending_work.is_some())
+}
+
 /// Legacy semantic expectations describe the event window captured by an
 /// `observe` step. A later `observe_exact` intentionally drains a fresh event
 /// window, so it must not replace the earlier observation for payload/member
@@ -1200,6 +1237,7 @@ fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScenarioInputDisposition;
     use cgka_engine::conformance_snapshot::{ConformanceGroupSnapshot, ConformanceLeafSnapshot};
 
     fn observation(client: &str, epoch: u64, member_count: usize) -> ClientObservation {
@@ -1587,6 +1625,53 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn exact_expectations_use_latest_qualifying_sample_before_later_legacy_observation() {
+        let snapshot = exact_snapshot("shared-id", "shared-commitment");
+        let mut alice_exact = observation("alice", 7, 1);
+        alice_exact.canonical_state = Some(snapshot.clone());
+        alice_exact.pending_work = Some(PendingWorkObservation::default());
+        alice_exact.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-4:send_app_message".into(),
+            disposition: ScenarioInputDisposition::Delivered,
+            delivered: 1,
+            ..Default::default()
+        }];
+        let expected_ledger = alice_exact.scenario_input_ledger.clone();
+
+        let mut bob_exact = observation("bob", 7, 1);
+        bob_exact.canonical_state = Some(snapshot);
+        bob_exact.pending_work = Some(PendingWorkObservation::default());
+
+        let observed = trace(vec![
+            alice_exact,
+            bob_exact,
+            observation("alice", 7, 1),
+            observation("bob", 7, 1),
+        ]);
+        let failures = compare_trace_expectations(
+            None,
+            &[
+                TraceExpectation::ClientsExactlyEquivalent {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+                TraceExpectation::ScenarioInputLedger {
+                    client: "alice".into(),
+                    entries: expected_ledger,
+                },
+                TraceExpectation::NoPendingWork {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+            ],
+            &observed,
+        );
+
+        assert!(
+            failures.is_empty(),
+            "later legacy observations must not hide exact evidence: {failures:#?}"
+        );
     }
 
     #[test]

@@ -390,7 +390,9 @@ Verification:
 - duplicate application delivery appears once in the scenario-input ledger;
 - commit, proposal, and application actions retain stable scenario ids and exact current dispositions;
 - losing-branch payload/state output is absent or explicitly invalidated;
-- queued, delayed, unread, unconfirmed-publish, and retained transport-deferred work fail `NoPendingWork`;
+- queued, delayed, unread, unconfirmed-publish, and retained transport-deferred work addressed to the observed client
+  fail `NoPendingWork`; a deliberately dropped object does not masquerade as local pending work, and its missing
+  recipient delivery fails an independent ledger/output assertion;
 - every directed application-message edge succeeds after settled convergence; a deliberately missed commit produces a
   visible one-way decryptability failure while the reverse past-epoch edge succeeds;
 - terminal disband state survives restart and compares independently of device-local committer-leaf metadata;
@@ -402,13 +404,20 @@ strict scenarios opt in with `observe_client_exact` / `observe_exact`, `ClientsE
 `ScenarioInputLedger`. The ledger names every commit, proposal, and application action independently of randomized
 transport/MLS ids, correlates aliases through the feature-gated durable conformance view, and uses the deterministic
 inner application event only for delivery correlation. It preserves the protocol distinction between authenticated
-acceptance and pre-admission `TransportDeferred`. `NoPendingWork` adds an instantaneous aggregate progress snapshot
-across engine, bus, and scenario-input ledger state; it deliberately does not replace Milestone 1.3's repeated
-virtual-time quiescence test. The active
+acceptance and pre-admission `TransportDeferred`. `NoPendingWork` adds an instantaneous, client-scoped local-progress
+snapshot across group-scoped engine state, client-addressed bus state, and the client's scenario-input ledger. It is not
+an end-to-end delivery assertion for objects removed by an explicit transport fault; required delivery is checked
+through recipient ledger/output expectations. It deliberately does not replace Milestone 1.3's structural virtual-time
+quiescence test. The active
 decryptability probe sends one exact logical event per client, correlates every directed delivery by logical event id,
 and retains the recipient ledger disposition for failed edges. Exact canonical state is a tagged live-or-disbanded
 projection; the terminal form is derived from the durable authenticated tombstone and excludes
 `local_was_committer_leaf`, which is device-local rather than a shared protocol fact.
+
+This Milestone 1.1 slice supplies exact engine observations and sentinels; it does not close the cross-layer Scenario IR
+operational-semantics and adapter-refinement acceptance criteria tracked in
+[#1189](https://github.com/marmot-protocol/mdk/issues/1189). Those remain owned by Milestones 2.1 and 2.2 before
+campaign/process expansion relies on equivalence across adapters.
 
 The strict campaign migration deliberately exposed three pre-existing reliability failures that the legacy observation
 point hid:
@@ -438,11 +447,13 @@ gap, distinct from the three engine-state failures.
 
 ### 1.3 Full-system quiescence
 
-- [ ] Include deliverable input, inbox, delayed messages, pass phase, deferred replay, outbound publication, retry
-  timers, and durable transitions in a progress snapshot.
-- [ ] Inject an advancing monotonic clock plus a controlled wall clock; do not infer time progress from repeated calls
-  at one synthetic timestamp.
-- [ ] Require two stable virtual-time observations with no state or ledger progress.
+- [ ] Expose a sanitized structural progress token, runnable work, earliest next wake-up, deferred/retry work, outbound
+  work awaiting acknowledgement, and terminal blockers; include inbox, delayed messages, pass phase, and durable
+  transitions.
+- [ ] Inject an advancing monotonic clock plus a controlled wall clock throughout the subject and its tests; do not
+  infer time progress from repeated calls at one synthetic timestamp or wait on real wall time.
+- [ ] Compute a bounded virtual-time fixed point from structural work and the earliest next wake-up. Treat step, time,
+  and work limits only as watchdog/performance evidence, not as the definition of quiescence.
 - [ ] Report which subsystem prevents quiescence.
 - [ ] Bound quiescence waiting by scenario policy and emit a terminal timeout artifact.
 - [ ] Add controlled metamorphic runs that preserve retained input and horizon eligibility while varying delivery across
@@ -751,7 +762,7 @@ incorrect result.
 | 2026-07-30 | Milestone 0 completion verification | Rebased onto MDK `master` at `1b949655`; fast CI, the full feature-enabled engine suite, full simulator suite, session suite, focused app deferral/backfill coverage, and all 76 strict Tamarin lemmas passed | `just fast-ci`; `cargo test -p cgka-engine --features test-policy-overrides`; `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-session --features test-policy-overrides`; focused `marmot-app` tests; `just tamarin` |
 | 2026-07-30 | 1.1 exact live-group state oracle | Added a conformance-only canonical snapshot and strict equivalence expectation; exact member and exporter semantic mutations now fail while two independently joined clients match | `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-engine --features "test-conformance-snapshot test-policy-overrides"` |
 | 2026-07-30 | 1.1 generalized scenario-input disposition ledger | Added strict per-client commit, proposal, and application dispositions keyed by stable scenario action ids and joined to outer transport/content aliases; duplicate application delivery is one delivery plus one dedup, and unpeeled input remains visibly transport-pending | `cargo test -p cgka-conformance-simulator exact_observation_ledgers_commit_proposal_and_application_dispositions`; full simulator suite |
-| 2026-07-30 | 1.1 instantaneous pending-work oracle | Added `NoPendingWork` over aggregate engine, bus, and scenario-input-ledger progress; queued, delayed, unread, unconfirmed-publish, and transport-deferred sentinels fail while a drained joined group passes | `cargo test -p cgka-conformance-simulator` |
+| 2026-07-30 | 1.1 instantaneous pending-work oracle | Added client-scoped `NoPendingWork` over group-scoped engine, client-addressed bus, and per-client scenario-input-ledger progress; queued, delayed, unread, unconfirmed-publish, and transport-deferred sentinels fail, while a dropped-object sentinel proves delivery remains an independent recipient assertion | `cargo test -p cgka-conformance-simulator` |
 | 2026-07-30 | 1.1 bidirectional decryptability probe | Added an active exact-ID application-message matrix; settled members pass every directed edge, a missed commit exposes future-epoch deferral in only one direction, and a named nonmember cannot pass | `cargo test -p cgka-conformance-simulator bidirectional_decryptability` |
 | 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
 | 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |

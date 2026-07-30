@@ -764,6 +764,14 @@ async fn run_bidirectional_decryptability_probe(
         client_mut(clients, &label, step_index)?.tick().await;
     }
 
+    let mut recipient_ledgers = BTreeMap::new();
+    for recipient in labels {
+        recipient_ledgers.insert(
+            recipient.clone(),
+            client_mut(clients, recipient, step_index)?.scenario_input_ledger(),
+        );
+    }
+
     let mut probes = Vec::with_capacity(labels.len() * (labels.len() - 1));
     for sender in labels {
         let (payload, (send_status, logical_id)) = sends
@@ -773,10 +781,10 @@ async fn run_bidirectional_decryptability_probe(
             if recipient == sender {
                 continue;
             }
-            let recipient_ledger = client_mut(clients, recipient, step_index)?
-                .scenario_input_ledger()
-                .into_iter()
-                .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref());
+            let recipient_ledger = recipient_ledgers[recipient]
+                .iter()
+                .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref())
+                .cloned();
             probes.push(DirectionalDecryptabilityProbe {
                 sender: sender.clone(),
                 recipient: recipient.clone(),

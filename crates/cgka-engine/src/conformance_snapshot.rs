@@ -10,7 +10,7 @@ use cgka_traits::engine_state::{EpochState, GroupLifecycleState};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::message::MessageState;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls::prelude::ProtocolVersion;
@@ -368,10 +368,8 @@ pub(crate) fn capture_pending_work_snapshot<S: StorageProvider>(
     engine: &crate::Engine<S>,
     group_id: &GroupId,
 ) -> Result<ConformancePendingWorkSnapshot, EngineError> {
+    engine.ensure_group_live(group_id)?;
     let disbanded = engine.storage.disband_tombstone(group_id)?.is_some();
-    if !disbanded {
-        engine.ensure_group_live(group_id)?;
-    }
     let epoch_state = engine
         .epoch_manager
         .state(group_id)
@@ -417,11 +415,33 @@ pub(crate) fn capture_pending_work_snapshot<S: StorageProvider>(
         stored_created_messages,
         stored_retryable_messages,
         stored_transport_deferred_messages,
-        pending_engine_events: engine.events_buf.len(),
-        pending_auto_publish: engine.auto_publish_buf.len(),
-        pending_auto_proposals: engine.auto_proposal_buf.len(),
-        valid_proposal_schedule_signals: engine.valid_proposal_groups.len(),
-        pending_state_changes: engine.pending_state_changes.len(),
+        pending_engine_events: engine
+            .events_buf
+            .iter()
+            .filter(|event| event_group_id(event) == group_id)
+            .count(),
+        pending_auto_publish: engine
+            .auto_publish_buf
+            .iter()
+            .filter(|auto| {
+                engine
+                    .epoch_manager
+                    .group_for_pending(auto.pending)
+                    .as_ref()
+                    == Some(group_id)
+            })
+            .count(),
+        pending_auto_proposals: pending_auto_proposals_for_group(engine, group_id)?,
+        valid_proposal_schedule_signals: usize::from(
+            engine.valid_proposal_groups.contains(group_id),
+        ),
+        pending_state_changes: engine
+            .pending_state_changes
+            .keys()
+            .filter(|pending| {
+                engine.epoch_manager.group_for_pending(**pending).as_ref() == Some(group_id)
+            })
+            .count(),
         pending_leave_requests: usize::from(engine.leave_requests.contains_key(group_id)),
         scheduled_self_remove_auto_commits: engine
             .scheduled_self_remove_auto_commits
@@ -442,6 +462,46 @@ pub(crate) fn capture_pending_work_snapshot<S: StorageProvider>(
             .filter(|(queued_group_id, _)| queued_group_id == group_id)
             .count(),
     })
+}
+
+fn pending_auto_proposals_for_group<S: StorageProvider>(
+    engine: &crate::Engine<S>,
+    group_id: &GroupId,
+) -> Result<usize, EngineError> {
+    let mut count = 0;
+    for proposal in &engine.auto_proposal_buf {
+        match engine.storage.get_message(&proposal.id) {
+            Ok(record) if record.group_id == *group_id => count += 1,
+            Ok(_) => {}
+            Err(StorageError::NotFound) => {
+                return Err(EngineError::Backend(
+                    "conformance auto-proposal buffer references a missing durable row".into(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(count)
+}
+
+fn event_group_id(event: &cgka_traits::engine::GroupEvent) -> &GroupId {
+    use cgka_traits::engine::GroupEvent;
+
+    match event {
+        GroupEvent::GroupCreated { group_id }
+        | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::MessageReceived { group_id, .. }
+        | GroupEvent::AppMessageInvalidated { group_id, .. }
+        | GroupEvent::GroupStateChanged { group_id, .. }
+        | GroupEvent::GroupHydrationQuarantined { group_id, .. }
+        | GroupEvent::EpochChanged { group_id, .. }
+        | GroupEvent::ForkRecovered { group_id, .. }
+        | GroupEvent::CommitRolledBack { group_id, .. }
+        | GroupEvent::GroupStateInvalidated { group_id, .. }
+        | GroupEvent::GroupUnrecoverable { group_id }
+        | GroupEvent::PendingCommitRecovered { group_id, .. }
+        | GroupEvent::GroupHydrationRecovered { group_id, .. } => group_id,
+    }
 }
 
 fn protocol_version_u16(version: &ProtocolVersion) -> Result<u16, EngineError> {
