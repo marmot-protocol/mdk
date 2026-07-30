@@ -32,6 +32,7 @@ pub mod proptest_support;
 pub mod report;
 pub mod scenario;
 mod scenario_input_ledger;
+pub mod subject;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
@@ -68,10 +69,17 @@ pub use scenario::{
     ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, VectorFixtureMetadata,
     run_scenario_report, run_scenario_report_with_outcomes,
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_storage_mode,
-    run_scenario_spec, run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
+    run_scenario_report_with_subject, run_scenario_spec, run_scenario_spec_with_subject,
+    run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
+    validate_scenario_for_subject,
 };
 pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+};
+pub use subject::{
+    ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
+    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
+    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capability,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

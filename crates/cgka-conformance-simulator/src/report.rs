@@ -429,6 +429,7 @@ mod tests {
                 spec_version: "1".into(),
                 step_count: 0,
                 storage_backend: "in-memory-sqlite".into(),
+                subject: None,
                 generated: None,
                 fixture: None,
             },
