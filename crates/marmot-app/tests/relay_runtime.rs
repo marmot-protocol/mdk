@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(feature = "test-policy-overrides")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
@@ -76,9 +77,11 @@ fn install_mock_keyring() {
 
 /// Rejects kind-445 group messages while armed. Lets a test accept setup
 /// traffic normally, then fail exactly one member's outbound publish window.
+#[cfg(feature = "test-policy-overrides")]
 #[derive(Debug)]
 struct RejectGroupMessagesWhileArmed(Arc<AtomicBool>);
 
+#[cfg(feature = "test-policy-overrides")]
 impl WritePolicy for RejectGroupMessagesWhileArmed {
     fn admit_event<'a>(
         &'a self,
@@ -3451,16 +3454,15 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 /// them: bob's group-state subscription has to observe the rename even though
 /// his own send — not a receive — applied it.
 ///
-/// The collection window is pinned to 1s explicitly: under
-/// `test-policy-overrides` the dev knob replaces the instant-settlement
-/// default (a zero window would let scheduled convergence apply the rename
-/// before the send), and normal builds ignore the knob but keep the pinned
-/// ~1s production window — so both build modes run the same interleaving.
-/// Each round demands a strict fold witness (pre-send old row, published
-/// send, immediate post-send renamed row) before the subscription assertion
-/// runs, so a round where scheduled convergence preempts the fold or the
-/// send queues is discarded and retried with a fresh rename rather than
-/// passing through an alternate broadcasting seam.
+/// This regression uses explicit test-policy overrides to create the precise
+/// post-cutoff/pre-scheduler state. `update_group_profile` completes its
+/// cross-account catch-up before returning, proving bob has ingested the
+/// rename. The test then lets the 100ms engine cutoff elapse while holding the
+/// scheduled worker for 60s. The send is therefore the only operation that can
+/// move bob's durable row from the old name to the new one, and the
+/// subscription must update within 5s, well before scheduled convergence can
+/// provide an alternate broadcasting seam.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
     let dir = tempfile::tempdir().unwrap();
@@ -3471,7 +3473,8 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         MarmotAppConfig::default()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true)
-            .with_dev_settlement_quiescence_ms(1_000),
+            .with_dev_settlement_quiescence_ms(100)
+            .with_dev_scheduled_convergence_delay_ms(60_000),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -3509,50 +3512,36 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         .subscribe_group_state(&bob_id, &group_id_hex)
         .unwrap();
 
-    // Witness the fold strictly, retrying with a fresh rename when timing
-    // spoils a round: immediately before the send bob's row must still show
-    // the previous name (scheduled convergence has not applied the rename),
-    // the send must publish (`published > 0`; a queued send never folds), and
-    // immediately after the send returns the row must show the new name (the
-    // fold is synchronous inside the send, and the chat-list projection
-    // rebuilds on read). Only a send-folded commit satisfies all three.
-    let mut witnessed = None;
-    for round in 0..8u32 {
-        let renamed = format!("renamed mid send {round}");
-        runtime
-            .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
-            .await
-            .unwrap();
-        // ~300ms lands the send mid-window, after bob ingested and retained
-        // the commit; observed timing folds it into the send at that offset.
-        sleep(Duration::from_millis(300)).await;
-        let pre_send = row_title(&app, &bob.account.label, &group_id_hex);
-        if pre_send.as_deref() == Some(renamed.as_str()) {
-            // Scheduled convergence preempted the fold on this runner; this
-            // round cannot witness the interleaving. Rename again.
-            continue;
-        }
-        let summary = runtime
-            .send_message(
-                &bob_id,
-                &group_id,
-                format!("bob interleaved {round}").into_bytes(),
-            )
-            .await
-            .unwrap();
-        let post = row_title(&app, &bob.account.label, &group_id_hex);
-        if summary.published == 0 {
-            // Queued: the send never reached the fold; the queued drain
-            // broadcasts on its own seam. Retry with a fresh rename.
-            continue;
-        }
-        if post.as_deref() == Some(renamed.as_str()) {
-            witnessed = Some(renamed);
-            break;
-        }
-    }
-    let renamed =
-        witnessed.expect("a mid-window send from bob should fold the retained rename commit");
+    let renamed = "renamed during retained send".to_owned();
+    runtime
+        .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+        .await
+        .unwrap();
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "bob's completed catch-up must retain the rename without applying it"
+    );
+    sleep(Duration::from_millis(250)).await;
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the test scheduler delay must hold the post-cutoff rename"
+    );
+
+    let summary = runtime
+        .send_message(&bob_id, &group_id, b"bob interleaved".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        summary.published > 0,
+        "the interleaved send must publish rather than queue"
+    );
+    assert_eq!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the send must synchronously fold the retained rename"
+    );
 
     // After a witnessed fold the retained input is consumed, so scheduled
     // convergence has nothing left to broadcast for this rename: only the
@@ -3573,9 +3562,8 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 /// injected publish error plus the immediate post-send row flip, and the
 /// subscription assertion runs while the relay still rejects bob's publishes,
 /// so the queued-drain seam stays blocked and cannot deliver the rename on a
-/// build that drops send-applied events. Rounds where the send queued or a
-/// plain (unfolded) publish was rejected are discarded and retried with a
-/// fresh rename after letting the relay accept again.
+/// build that drops send-applied events.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn group_state_subscription_observes_rename_applied_during_failed_send() {
     let dir = tempfile::tempdir().unwrap();
@@ -3591,7 +3579,8 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         MarmotAppConfig::default()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true)
-            .with_dev_settlement_quiescence_ms(1_000),
+            .with_dev_settlement_quiescence_ms(100)
+            .with_dev_scheduled_convergence_delay_ms(60_000),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -3629,48 +3618,35 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         .subscribe_group_state(&bob_id, &group_id_hex)
         .unwrap();
 
-    // Witness a fold whose own publish hard-fails: pre-send the row must
-    // still show the previous name, the send (with the relay rejecting bob's
-    // kind-445 publishes) must return the injected publish error, and the row
-    // must show the new name immediately after — the fold applied durably
-    // even though the message reached no one. Rounds where the send queued
-    // (`Ok`, nothing published) or a plain unfolded publish was rejected (an
-    // error without the row flip) are retried with a fresh rename after
-    // letting the relay accept again.
-    let mut witnessed = None;
-    for round in 0..8u32 {
-        let renamed = format!("renamed mid failed send {round}");
-        runtime
-            .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
-            .await
-            .unwrap();
-        sleep(Duration::from_millis(300)).await;
-        let pre_send = row_title(&app, &bob.account.label, &group_id_hex);
-        if pre_send.as_deref() == Some(renamed.as_str()) {
-            continue;
-        }
-        reject_armed.store(true, Ordering::Relaxed);
-        let send_result = runtime
-            .send_message(
-                &bob_id,
-                &group_id,
-                format!("bob rejected {round}").into_bytes(),
-            )
-            .await;
-        let folded_and_failed = matches!(send_result, Err(AppError::Publish(_)))
-            && row_title(&app, &bob.account.label, &group_id_hex).as_deref()
-                == Some(renamed.as_str());
-        if folded_and_failed {
-            witnessed = Some(renamed);
-            break;
-        }
-        // Let queued drains and the next round's rename publish again.
-        reject_armed.store(false, Ordering::Relaxed);
-        sleep(Duration::from_millis(200)).await;
-    }
-    let renamed = witnessed.expect(
-        "a mid-window send from bob should fold the retained rename commit and \
-         fail its own publish",
+    let renamed = "renamed during rejected send".to_owned();
+    runtime
+        .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+        .await
+        .unwrap();
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "bob's completed catch-up must retain the rename without applying it"
+    );
+    sleep(Duration::from_millis(250)).await;
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the test scheduler delay must hold the post-cutoff rename"
+    );
+
+    reject_armed.store(true, Ordering::Relaxed);
+    let send_result = runtime
+        .send_message(&bob_id, &group_id, b"bob rejected".to_vec())
+        .await;
+    assert!(
+        matches!(send_result, Err(AppError::Publish(_))),
+        "the folded send must reach the injected hard-publish failure"
+    );
+    assert_eq!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the failed send must still synchronously fold the retained rename"
     );
 
     // The relay still rejects bob's publishes here, so the queued-drain seam
@@ -3888,6 +3864,7 @@ where
 /// Current chat-list row title for one group, read fresh from the projection
 /// (rebuilt on read after any state save). Used as the durable witness that a
 /// group-state commit has been applied locally.
+#[cfg(feature = "test-policy-overrides")]
 fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String> {
     app.chat_list_row(label, group_id_hex)
         .unwrap()

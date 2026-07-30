@@ -439,7 +439,10 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
-    let mut scheduled_convergence = ScheduledConvergence::new(convergence_settlement_delay(&app));
+    let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
+        convergence_settlement_delay(&app),
+        scheduled_convergence_test_delay(&app),
+    );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
     // The session is hydrated. Capture a read snapshot and signal
@@ -852,6 +855,12 @@ async fn run_app_runtime_account_worker(
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;
                                 scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
+                                publish_client_pending_applied_summary(
+                                    &mut reopened,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                );
                                 client = reopened;
                                 schedule_pending_convergence_groups(
                                     &mut scheduled_convergence,
@@ -1895,6 +1904,7 @@ const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 struct ScheduledConvergence {
     delay: Duration,
+    test_delay: Duration,
     deadlines: HashMap<GroupId, TokioInstant>,
     retry_attempts: HashMap<GroupId, u32>,
     unsettled_rearm_attempts: HashMap<GroupId, u32>,
@@ -1902,9 +1912,15 @@ struct ScheduledConvergence {
 }
 
 impl ScheduledConvergence {
+    #[cfg(test)]
     fn new(delay: Duration) -> Self {
+        Self::with_test_delay(delay, Duration::ZERO)
+    }
+
+    fn with_test_delay(delay: Duration, test_delay: Duration) -> Self {
         Self {
             delay,
+            test_delay,
             deadlines: HashMap::new(),
             retry_attempts: HashMap::new(),
             unsettled_rearm_attempts: HashMap::new(),
@@ -1926,7 +1942,8 @@ impl ScheduledConvergence {
                 self.unsettled_rearm_attempts.remove(group_id);
                 let delay = Duration::from_millis(
                     remaining_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
-                );
+                )
+                .saturating_add(self.test_delay);
                 self.arm_no_later(group_id.clone(), TokioInstant::now() + delay);
                 self.reset_timer_to_earliest();
             }
@@ -1935,7 +1952,8 @@ impl ScheduledConvergence {
                 self.unsettled_rearm_attempts.remove(group_id);
                 self.arm_no_later(
                     group_id.clone(),
-                    TokioInstant::now() + MIN_CONVERGENCE_SETTLEMENT_DELAY,
+                    TokioInstant::now()
+                        + MIN_CONVERGENCE_SETTLEMENT_DELAY.saturating_add(self.test_delay),
                 );
                 self.reset_timer_to_earliest();
             }
@@ -2104,6 +2122,18 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
         cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
     };
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
+}
+
+fn scheduled_convergence_test_delay(app: &MarmotApp) -> Duration {
+    if cfg!(feature = "test-policy-overrides") {
+        Duration::from_millis(
+            app.config
+                .dev_scheduled_convergence_delay_ms
+                .unwrap_or_default(),
+        )
+    } else {
+        Duration::ZERO
+    }
 }
 
 fn retry_delay_for_attempt(attempt: u32) -> Duration {
