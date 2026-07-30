@@ -421,6 +421,35 @@ fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
     assert_eq!(parsed.kind, kind);
 }
 
+#[test]
+fn epoch_stall_backfill_escalated_roundtrips_and_carries_its_fields() {
+    let kind = AuditEventKind::EpochStallBackfillEscalated {
+        stalled_epoch: 12,
+        arms: 3,
+        arm_threshold: 3,
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 9,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["kind"]["type"], "epoch_stall_backfill_escalated");
+    assert_eq!(value["kind"]["stalled_epoch"], 12);
+    assert_eq!(value["kind"]["arms"], 3);
+    assert_eq!(value["kind"]["arm_threshold"], 3);
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
+}
+
 fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
     vec![
         AuditEventKind::RecorderStarted {
@@ -834,6 +863,11 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::EpochStallBackfillArmed {
             stalled_epoch: 19,
             threshold: 8,
+        },
+        AuditEventKind::EpochStallBackfillEscalated {
+            stalled_epoch: 12,
+            arms: 3,
+            arm_threshold: 3,
         },
         AuditEventKind::ConvergencePassDiscarded {
             stale_base_epoch: 7,
