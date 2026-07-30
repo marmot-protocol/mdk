@@ -76,6 +76,14 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+    /// Sync summary for group events the engine applied as a side effect of an
+    /// outbound send: a send that lands while inbound convergence input is
+    /// retained folds those commits before publishing, so its effects can carry
+    /// peer `GroupStateChanged` / `EpochChanged` events. The runtime account
+    /// worker drains this after each command and broadcasts it like an inbound
+    /// sync summary so live chat-list/group-state subscriptions observe the
+    /// applied commits.
+    pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
@@ -1680,64 +1688,74 @@ impl AppClient {
             on_local_projection(update);
         }
 
-        let effects = match async {
-            let effects = match self.sync_runtime_groups().await {
-                Ok(()) => {
-                    let send_intent = SendIntent::AppMessage {
-                        group_id: group_id.clone(),
-                        payload,
-                    };
-                    // Thread the human-action context through the engine so the
-                    // send's audit rows carry `human_action`, matching
-                    // create_group/invite/etc.
-                    match &audit_context {
-                        Some(context) => {
-                            self.runtime
-                                .send_with_audit_context(send_intent, context.clone())
-                                .await?
-                        }
-                        None => self.runtime.send(send_intent).await?,
+        let send_result = match self.sync_runtime_groups().await {
+            Ok(()) => {
+                let send_intent = SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                };
+                // Thread the human-action context through the engine so the
+                // send's audit rows carry `human_action`, matching
+                // create_group/invite/etc.
+                match &audit_context {
+                    Some(context) => {
+                        self.runtime
+                            .send_with_audit_context(send_intent, context.clone())
+                            .await
                     }
+                    None => self.runtime.send(send_intent).await,
                 }
-                Err(error) if error.is_account_not_active() => {
-                    let context = audit_context.clone().unwrap_or_default();
-                    self.runtime
-                        .queue_app_message_with_audit_context(group_id.clone(), payload, context)
-                        .await?
-                }
-                Err(error) => return Err(error),
-            };
-            fail_if_publish_failed(&effects)?;
-            Ok::<_, AppError>(effects)
-        }
-        .await
-        {
+                .map_err(AppError::from)
+            }
+            Err(error) if error.is_account_not_active() => {
+                let context = audit_context.clone().unwrap_or_default();
+                self.runtime
+                    .queue_app_message_with_audit_context(group_id.clone(), payload, context)
+                    .await
+                    .map_err(AppError::from)
+            }
+            Err(error) => Err(error),
+        };
+        // The publish-status gate is applied separately from obtaining the
+        // effects: even when the outbound publish hard-fails, the engine may
+        // already have folded retained peer commits into this send, and those
+        // applied `GroupStateChanged` / `EpochChanged` events must still be
+        // observed and broadcast — only the local message is retracted.
+        let effects = match send_result {
             Ok(effects) => effects,
             Err(err) => {
-                if should_project_locally {
-                    // No read-marker rollback needed: the marker only advances
-                    // in the post-publish success projection below.
-                    match self.app.invalidate_timeline_app_event(
-                        &self.state.label,
-                        &group_id_hex,
-                        &app_event_id,
-                        "local_publish_failed",
-                    ) {
-                        Ok(Some(update)) => on_local_projection(update),
-                        Ok(None) => {}
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "marmot_app::messages",
-                                method = "send_app_event_with_local_projection",
-                                error_code = "local_projection_retract_failed",
-                                "failed to retract local projection after publish failure"
-                            );
-                        }
-                    }
-                }
+                self.retract_failed_local_projection(
+                    should_project_locally,
+                    &group_id_hex,
+                    &app_event_id,
+                    &mut on_local_projection,
+                );
                 return Err(err);
             }
         };
+        if let Err(publish_err) = fail_if_publish_failed(&effects) {
+            // The send itself failed to reach anyone, but any peer commits it
+            // folded are durably applied — broadcast them before surfacing the
+            // publish failure, best-effort so a projection error cannot mask
+            // the primary error.
+            self.observe_send_applied_effects_best_effort(&effects)
+                .await;
+            if let Err(_save_err) = self.app.save_state(&self.state) {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_code = "send_applied_state_save_failed",
+                    "failed to persist state observed from a failed send"
+                );
+            }
+            self.retract_failed_local_projection(
+                should_project_locally,
+                &group_id_hex,
+                &app_event_id,
+                &mut on_local_projection,
+            );
+            return Err(publish_err);
+        }
         if let Some(context) = &audit_context {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
@@ -1762,8 +1780,18 @@ impl AppClient {
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
+        // A send that lands while inbound convergence input is retained folds
+        // those commits before publishing, so `effects.events` can carry peer
+        // state changes (e.g. a mid-window group rename). Observe them through
+        // the same pipeline as inbound deliveries — state group refresh plus
+        // kind-1210 system-row synthesis (replacing the narrower
+        // `queue_own_group_system_projection_updates`) — and buffer the summary
+        // for the account worker to broadcast; dropping the events here leaves
+        // storage renamed while chat-list/group-state subscribers never wake.
+        // Best-effort: a projection failure must not fail a completed publish.
+        self.observe_send_applied_effects_best_effort(&effects)
+            .await;
         self.app.save_state(&self.state)?;
-        self.queue_own_group_system_projection_updates(&effects);
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
@@ -1779,6 +1807,40 @@ impl AppClient {
                 maintenance_disposition: effects.maintenance_disposition,
             },
         ))
+    }
+
+    /// Retract the optimistic local timeline row for a send that failed. No
+    /// read-marker rollback is needed: the marker only advances in the
+    /// post-publish success projection.
+    fn retract_failed_local_projection<F>(
+        &mut self,
+        should_project_locally: bool,
+        group_id_hex: &str,
+        app_event_id: &str,
+        on_local_projection: &mut F,
+    ) where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        if !should_project_locally {
+            return;
+        }
+        match self.app.invalidate_timeline_app_event(
+            &self.state.label,
+            group_id_hex,
+            app_event_id,
+            "local_publish_failed",
+        ) {
+            Ok(Some(update)) => on_local_projection(update),
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_code = "local_projection_retract_failed",
+                    "failed to retract local projection after publish failure"
+                );
+            }
+        }
     }
 
     /// Most recent kind-7 reaction this account authored that targets

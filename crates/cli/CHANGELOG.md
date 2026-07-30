@@ -16,7 +16,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   pass (only an admin group-state change may briefly hold that boundary, as
   the protocol requires), and busy groups are no longer demoted to retry
   backoff while convergence is legitimately still collecting.
-  
+
+- Runtime chat-list and group-state subscriptions now observe group state
+  changes (for example a group rename) that a member's own outbound send
+  applied by folding retained convergence commits. Previously those events were
+  dropped on the send path, so storage showed the new state while live
+  subscribers were never notified.
+
 ### Added
 
 - MarmotKit and the agent connector now acquire a nonblocking, kernel-released

@@ -439,7 +439,10 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
-    let mut scheduled_convergence = ScheduledConvergence::new(convergence_settlement_delay(&app));
+    let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
+        convergence_settlement_delay(&app),
+        scheduled_convergence_test_delay(&app),
+    );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
     // The session is hydrated. Capture a read snapshot and signal
@@ -615,6 +618,7 @@ async fn run_app_runtime_account_worker(
         .retry_pending_push_registration_shares_best_effort()
         .await;
     scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
+    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -771,6 +775,12 @@ async fn run_app_runtime_account_worker(
                                 .retry_pending_push_registration_shares_best_effort()
                                 .await;
                             scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
+                            publish_client_pending_applied_summary(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
                         }
                     }
                     Err(err) => {
@@ -845,6 +855,12 @@ async fn run_app_runtime_account_worker(
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;
                                 scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
+                                publish_client_pending_applied_summary(
+                                    &mut reopened,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                );
                                 client = reopened;
                                 schedule_pending_convergence_groups(
                                     &mut scheduled_convergence,
@@ -921,6 +937,12 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         let _ = summary;
                         publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        publish_client_pending_applied_summary(
                             &mut client,
                             &events,
                             &account_id_hex,
@@ -1714,6 +1736,10 @@ async fn handle_account_worker_command(
             let _ = respond.send(Ok(()));
         }
     }
+    // Publishing from this seam — rather than inside each send arm — keeps
+    // every command path covered; the summary is empty for commands that
+    // applied nothing.
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
 }
 
 #[derive(Debug, Clone)]
@@ -1878,6 +1904,7 @@ const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 struct ScheduledConvergence {
     delay: Duration,
+    test_delay: Duration,
     deadlines: HashMap<GroupId, TokioInstant>,
     retry_attempts: HashMap<GroupId, u32>,
     unsettled_rearm_attempts: HashMap<GroupId, u32>,
@@ -1885,9 +1912,15 @@ struct ScheduledConvergence {
 }
 
 impl ScheduledConvergence {
+    #[cfg(test)]
     fn new(delay: Duration) -> Self {
+        Self::with_test_delay(delay, Duration::ZERO)
+    }
+
+    fn with_test_delay(delay: Duration, test_delay: Duration) -> Self {
         Self {
             delay,
+            test_delay,
             deadlines: HashMap::new(),
             retry_attempts: HashMap::new(),
             unsettled_rearm_attempts: HashMap::new(),
@@ -1909,7 +1942,8 @@ impl ScheduledConvergence {
                 self.unsettled_rearm_attempts.remove(group_id);
                 let delay = Duration::from_millis(
                     remaining_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
-                );
+                )
+                .saturating_add(self.test_delay);
                 self.arm_no_later(group_id.clone(), TokioInstant::now() + delay);
                 self.reset_timer_to_earliest();
             }
@@ -1918,7 +1952,8 @@ impl ScheduledConvergence {
                 self.unsettled_rearm_attempts.remove(group_id);
                 self.arm_no_later(
                     group_id.clone(),
-                    TokioInstant::now() + MIN_CONVERGENCE_SETTLEMENT_DELAY,
+                    TokioInstant::now()
+                        + MIN_CONVERGENCE_SETTLEMENT_DELAY.saturating_add(self.test_delay),
                 );
                 self.reset_timer_to_earliest();
             }
@@ -2089,6 +2124,18 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }
 
+fn scheduled_convergence_test_delay(app: &MarmotApp) -> Duration {
+    if cfg!(feature = "test-policy-overrides") {
+        Duration::from_millis(
+            app.config
+                .dev_scheduled_convergence_delay_ms
+                .unwrap_or_default(),
+        )
+    } else {
+        Duration::ZERO
+    }
+}
+
 fn retry_delay_for_attempt(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     let multiplier = 1u32 << shift;
@@ -2197,6 +2244,22 @@ fn publish_client_pending_projection_updates(
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
     }
+}
+
+/// Broadcast group events a send applied as a side effect (retained inbound
+/// convergence commits folded before publishing). Called from every worker seam
+/// that can run a send — the command chokepoint, the receive arm's post-join
+/// push retry, the maintenance tick, and startup — so the applied events reach
+/// chat-list/group-state subscribers instead of buffering indefinitely. A no-op
+/// when the buffered summary is empty.
+fn publish_client_pending_applied_summary(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    let summary = client.take_pending_applied_sync_summary();
+    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
