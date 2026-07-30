@@ -328,16 +328,13 @@ fn convergence_chaos_rollback_queue_faults(
     rng: &mut StdRng,
     case_index: u64,
 ) -> (ScenarioSpec, Vec<TraceExpectation>) {
-    // After alice's group-data update rolls back, alice's own commit stays on
-    // the bus queue (FailPending only retracts the local pending state) and bob
-    // sends several app messages behind it. Drive the delivery schedule of those
-    // app messages from the seed so distinct seeds exercise distinct adversarial
-    // orderings of the post-rollback queue, not just a different payload string.
+    // A definite publish failure retracts alice's undelivered group-data commit
+    // before rolling back local pending state. Bob then sends several app
+    // messages. Drive their delivery schedule from the seed so distinct seeds
+    // exercise distinct adversarial orderings, not just a different payload
+    // string.
     // FIFO delivery makes the observed payload order the permuted queue order,
-    // so recompute the expectation from the same permutation. The rolled-back
-    // commit is pinned at queue head so the duplicate/delay/release still pins
-    // dedup of the redelivered commit across the rollback (the shape's reason
-    // for existing) regardless of the seeded app order.
+    // so recompute the expectation from the same permutation.
     let payloads = (0..6)
         .map(|index| format!("bob-after-rollback-{case_index}-{index}"))
         .collect::<Vec<_>>();
@@ -346,11 +343,7 @@ fn convergence_chaos_rollback_queue_faults(
         .iter()
         .map(|index| payloads[*index].clone())
         .collect::<Vec<_>>();
-    // Full-queue permutation: the rolled-back commit stays at index 0, the app
-    // messages (queue indices 1..) are permuted per the seed.
-    let order = std::iter::once(0)
-        .chain(app_order.iter().map(|index| index + 1))
-        .collect::<Vec<_>>();
+    let order = app_order.clone();
 
     let mut steps = vec![
         create_group(
@@ -381,13 +374,12 @@ fn convergence_chaos_rollback_queue_faults(
     }
     // Seed-driven delivery schedule for the post-rollback messages.
     steps.push(ScenarioStep::ReorderQueued { order });
-    // Duplicate the first post-rollback app message, not the rolled-back commit
-    // pinned at queue head. The original reaches alice in the first delivery
-    // pass; the delayed copy is released and ticked separately, so this shape
-    // exercises duplicate app-message handling under a rollback-tainted queue.
-    steps.push(ScenarioStep::DuplicateQueued { index: 1 });
+    // The original reaches alice in the first delivery pass; the delayed copy
+    // is released and ticked separately, so this shape exercises duplicate
+    // app-message handling after a definite publish rollback.
+    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
     steps.push(ScenarioStep::DelayQueued {
-        index: 2,
+        index: 1,
         delayed: "duplicate-app".into(),
     });
     steps.push(ScenarioStep::DeliverAll);

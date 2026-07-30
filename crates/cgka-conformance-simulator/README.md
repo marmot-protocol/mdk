@@ -218,7 +218,9 @@ recovery without pinning which invite branch wins.
 
 Pending operations are referenced by string labels chosen inside the scenario. Client labels are stable logical names;
 the Rust harness maps them to deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the same
-identity shape as production. Queue fault steps select messages by the current zero-based queue index at that step.
+identity shape as production. `fail_pending` represents a definite publication failure: it retracts all matching
+undelivered commit/Welcome artifacts before local rollback and fails the scenario if any matching artifact has already
+reached a recipient mailbox. Queue fault steps select messages by the current zero-based queue index at that step.
 `reorder_queued.order` is a full permutation of current queue indices; each entry names which old queue slot moves into
 the next position. `delay_queued` stores selected messages under a string label, and `release_delayed` returns that
 label's messages to the end of the queue.

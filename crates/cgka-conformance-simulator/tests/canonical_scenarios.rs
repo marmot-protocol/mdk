@@ -1006,6 +1006,173 @@ async fn scenario_spec_supports_publish_fail() {
 }
 
 #[tokio::test]
+async fn definite_publish_failure_retracts_commit_before_local_rollback() {
+    let spec = ScenarioSpec {
+        name: "transported-commit-after-local-rollback/minimal/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "before".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "after".into(),
+                pending: "update".into(),
+            },
+            ScenarioStep::FailPending {
+                client: "alice".into(),
+                pending: "update".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
+
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: "alice".into(),
+                pending: "create".into(),
+                resolution: "confirmed".into(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 5,
+                client: "alice".into(),
+                pending: "update".into(),
+                resolution: "rolled_back".into(),
+            },
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    )
+    .await
+    .expect("definite-failure scenario reports");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "definite failure must leave no transported commit: {:?}",
+        report.expectation_failures
+    );
+    let trace = report.observed_trace.as_ref().expect("observed trace");
+    assert!(
+        trace
+            .observations
+            .iter()
+            .all(|observation| observation.epoch == 1),
+        "both clients must remain at the pre-publish epoch"
+    );
+    let bob = trace
+        .observations
+        .iter()
+        .find(|observation| observation.client == "bob")
+        .expect("bob observation");
+    assert!(
+        bob.scenario_input_ledger.is_empty(),
+        "bob must never observe the retracted commit"
+    );
+}
+
+#[tokio::test]
+async fn definite_publish_failure_retracts_commit_and_welcome() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol")).attach(&bus);
+    let (_group_id, create_pending) = alice
+        .create_group(
+            "retract-invite-artifacts",
+            vec![bob.fresh_key_package().await],
+            vec![],
+        )
+        .await;
+    alice.confirm(create_pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let invite_pending = alice.invite(vec![carol.fresh_key_package().await]).await;
+    assert_eq!(bus.queued_len(), 2, "invite commit and Welcome are queued");
+    assert!(
+        bus.delay_queued(0, "pending-welcome"),
+        "hold the Welcome in the delayed set"
+    );
+    alice.fail(invite_pending).await;
+    assert_eq!(
+        bus.queued_len(),
+        0,
+        "definite failure must retract the complete publication"
+    );
+    assert!(
+        !bus.release_delayed("pending-welcome"),
+        "definite failure must retract delayed publication artifacts too"
+    );
+    bus.deliver_all();
+    carol.tick().await;
+    assert_eq!(alice.epoch(), EpochId(1));
+    assert_eq!(alice.members().len(), 2);
+}
+
+#[tokio::test]
+async fn fail_pending_rejects_artifact_that_already_reached_a_recipient() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let (_group_id, create_pending) = alice
+        .create_group(
+            "ambiguous-exposure-guard",
+            vec![bob.fresh_key_package().await],
+            vec![],
+        )
+        .await;
+    alice.confirm(create_pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let pending = alice.update_group_data("after").await;
+    bus.deliver_all();
+    bob.tick().await;
+    let error = alice
+        .try_fail(pending)
+        .await
+        .expect_err("mailbox exposure is not a definite failure");
+    assert!(
+        error.to_string().contains("reached a recipient mailbox"),
+        "unexpected error: {error}"
+    );
+
+    alice.confirm(pending).await;
+    assert_eq!(alice.epoch(), EpochId(2));
+    assert_eq!(bob.epoch(), EpochId(2));
+    assert_eq!(alice.group_name(), "after");
+    assert_eq!(bob.group_name(), "after");
+}
+
+#[tokio::test]
 async fn scenario_spec_supports_leave_and_clear_partition() {
     let spec = ScenarioSpec {
         name: "leave-and-clear-partition/v1".into(),
@@ -1635,8 +1802,8 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 #[tokio::test]
 async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message() {
     // Regression for mdk#163: the rollback arm must duplicate and delay
-    // a Bob app message that Alice actually ticks, not the rolled-back commit
-    // pinned at queue index 0 and addressed to Bob.
+    // a Bob app message that Alice actually ticks. The definitely failed
+    // group-data commit must already have been retracted from the bus.
     let cases = generate_convergence_chaos_family(123, 3);
     let case = &cases[2];
 
@@ -1649,10 +1816,7 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
             _ => None,
         })
         .expect("rollback arm should duplicate a queued message");
-    assert_eq!(
-        duplicate_index, 1,
-        "queue index 0 is Alice's rolled-back commit to Bob; duplicate the first post-rollback app message instead",
-    );
+    assert_eq!(duplicate_index, 0);
 
     let delayed_copy = case
         .scenario
@@ -1663,10 +1827,9 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
             _ => None,
         })
         .expect("rollback arm should delay the duplicate copy");
-    assert_eq!(delayed_copy, (2, "duplicate-app"));
+    assert_eq!(delayed_copy, (1, "duplicate-app"));
 
-    let baseline_case = without_strict_reliability_outcomes(case.clone());
-    let report = run_generated_case_report(&baseline_case, None)
+    let report = run_generated_case_report(case, None)
         .await
         .expect("rollback duplicate-app case reports");
     assert!(
@@ -1692,18 +1855,20 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
 #[tokio::test]
 async fn strict_chaos_boundary_retains_known_reliability_failures() {
     let cases = generate_convergence_chaos_family(123, 5);
-    let expected_failures = [
-        (
-            2usize,
-            "clients_not_exactly_equivalent",
-            "rolled-back transported commit",
-        ),
-        (
-            4usize,
-            "pending_work_remaining",
-            "pre-join deferred application object",
-        ),
-    ];
+    let expected_failures = [(
+        4usize,
+        "pending_work_remaining",
+        "pre-join deferred application object",
+    )];
+
+    let repaired = run_generated_case_report(&cases[2], None)
+        .await
+        .expect("repaired rollback case reports");
+    assert!(
+        repaired.expectation_failures.is_empty(),
+        "definite publish rollback must retract transport artifacts before the strict drain: {:?}",
+        repaired.expectation_failures
+    );
 
     for (case_index, failure_kind, description) in expected_failures {
         let report = run_generated_case_report(&cases[case_index], None)

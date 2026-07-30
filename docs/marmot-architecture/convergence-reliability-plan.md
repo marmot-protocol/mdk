@@ -420,20 +420,20 @@ operational-semantics and adapter-refinement acceptance criteria tracked in
 campaign/process expansion relies on equivalence across adapters.
 
 The strict campaign migration deliberately exposed three pre-existing reliability failures that the legacy observation
-point hid:
+point hid. The transported-commit case is now resolved by making simulator `FailPending` mean definite
+non-publication: it atomically retracts every matching undelivered commit/Welcome before local rollback and refuses the
+operation after any artifact reaches a recipient mailbox. Two engine-state failures remain:
 
-1. a locally rolled-back but already transported group-data commit can later advance another member, splitting exact
-   state after the final mailbox drain;
-2. a member invited after an old application event can retain that pre-join object as transport/scenario-input pending
+1. a member invited after an old application event can retain that pre-join object as transport/scenario-input pending
    work;
-3. after self-remove convergence, selected remaining members can retain a created proposal row and valid-proposal
+2. after self-remove convergence, selected remaining members can retain a created proposal row and valid-proposal
    schedule signal.
 
 These remain red strict-campaign evidence, not relaxed oracle rules. The ordinary generated-family regression tests keep
 checking their original semantic observation windows and explicitly retain the leave pending-work sentinel; report
 campaigns run the complete strict expectations by default. Strict coverage also flags the mixed large storm because its
 application phase is cleared before any delivery-or-invalidation expectation accounts for it; that is an oracle coverage
-gap, distinct from the three engine-state failures.
+gap, distinct from the two remaining engine-state failures.
 
 ### 1.2 Public subject boundary
 
@@ -771,3 +771,4 @@ incorrect result.
 | 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
 | 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |
 | 2026-07-30 | 1.2a public convergence subject | Extracted scenario execution behind a capability-declared `ConvergenceSubject`, added the in-process engine adapter, separated queue/partition mutation behind `ConvergenceFaultSubject`, rejected unsupported scenarios before actions, and recorded adapter identity/capabilities in reports | Subject preflight/fault-classification tests; default-versus-explicit engine subject trace equivalence; report metadata test |
+| 2026-07-30 | 1.1 definite publish-failure semantics | Minimized the transported-commit rollback split to nine steps; made simulator `FailPending` retract the complete undelivered commit/Welcome artifact set and reject artifacts that already reached any recipient, restoring strict exact equivalence without changing production lifecycle behavior | `definite_publish_failure_retracts_commit_before_local_rollback`; `definite_publish_failure_retracts_commit_and_welcome`; `fail_pending_rejects_artifact_that_already_reached_a_recipient`; full simulator suite |

@@ -379,8 +379,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of one app
   message released after Alice has already processed the original.
 - Expected: Alice remains at epoch 1 and receives Bob's post-rollback payloads once each, in the seed-driven delivery
-  order (the released app duplicate is deduped). The strict final drain currently demonstrates that Bob can apply the
-  already-transported rolled-back commit and diverge from Alice.
+  order (the released app duplicate is deduped). Definite publication failure retracts the undelivered commit before
+  local rollback, so Bob remains at epoch 1 and the strict final drain observes exact equivalence.
 
 #### Chaos Class `3`: Partition Leave
 

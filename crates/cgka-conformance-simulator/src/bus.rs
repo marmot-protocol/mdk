@@ -66,6 +66,7 @@ struct Inner {
     delayed: HashMap<String, Vec<InFlight>>,
     scenario_input_by_transport_id: HashMap<MessageId, ScenarioInputMetadata>,
     scenario_input_by_content_id: HashMap<MessageId, ScenarioInputMetadata>,
+    exposed_recipient_counts: HashMap<MessageId, usize>,
 }
 
 impl TransportBus {
@@ -87,6 +88,7 @@ impl TransportBus {
                 delayed: HashMap::new(),
                 scenario_input_by_transport_id: HashMap::new(),
                 scenario_input_by_content_id: HashMap::new(),
+                exposed_recipient_counts: HashMap::new(),
             })),
         }
     }
@@ -106,6 +108,50 @@ impl TransportBus {
     pub fn send(&self, sender: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
         inner.queue.push(InFlight { sender, msg });
+    }
+
+    /// Retract every still-undelivered artifact for one pending publication.
+    ///
+    /// A definite publication failure is valid only while none of the
+    /// artifacts has reached a recipient mailbox. Check that precondition
+    /// before mutating the queue or delayed sets so a caller cannot partially
+    /// retract an already-exposed publication.
+    pub(crate) fn retract_undelivered_publication(
+        &self,
+        sender: ClientId,
+        message_ids: &[MessageId],
+    ) -> Result<usize, usize> {
+        let mut inner = self.inner.lock().unwrap();
+        let delivered = message_ids
+            .iter()
+            .map(|message_id| {
+                inner
+                    .exposed_recipient_counts
+                    .get(message_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum();
+        if delivered > 0 {
+            return Err(delivered);
+        }
+
+        let queued_before = inner.queue.len();
+        inner.queue.retain(|in_flight| {
+            in_flight.sender != sender || !message_ids.contains(&in_flight.msg.id)
+        });
+        let mut retracted = queued_before - inner.queue.len();
+
+        for delayed in inner.delayed.values_mut() {
+            let delayed_before = delayed.len();
+            delayed.retain(|in_flight| {
+                in_flight.sender != sender || !message_ids.contains(&in_flight.msg.id)
+            });
+            retracted += delayed_before - delayed.len();
+        }
+        inner.delayed.retain(|_, messages| !messages.is_empty());
+
+        Ok(retracted)
     }
 
     pub(crate) fn register_scenario_input(
@@ -186,6 +232,10 @@ impl TransportBus {
                 };
                 if deliver {
                     inner.mailboxes.get_mut(cid).unwrap().push(msg.clone());
+                    *inner
+                        .exposed_recipient_counts
+                        .entry(msg.id.clone())
+                        .or_default() += 1;
                 }
             }
         }
@@ -226,7 +276,8 @@ impl TransportBus {
     pub fn inject(&self, client: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(mb) = inner.mailboxes.get_mut(&client) {
-            mb.push(msg);
+            mb.push(msg.clone());
+            *inner.exposed_recipient_counts.entry(msg.id).or_default() += 1;
         }
     }
 

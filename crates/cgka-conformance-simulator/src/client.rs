@@ -66,6 +66,7 @@ pub struct HarnessClient {
     next_scenario_input_id: Option<String>,
     scenario_input_tracker: ScenarioInputTracker,
     pending_scenario_inputs: HashMap<PendingStateRef, String>,
+    pending_publication_artifacts: HashMap<PendingStateRef, Vec<MessageId>>,
     /// Shared in-memory capture of the engine's forensic audit events, used to
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
@@ -275,6 +276,7 @@ impl ClientBuilder {
             next_scenario_input_id: None,
             scenario_input_tracker: ScenarioInputTracker::default(),
             pending_scenario_inputs: HashMap::new(),
+            pending_publication_artifacts: HashMap::new(),
             audit_capture,
             convergence_checkpoints: HashMap::new(),
         }
@@ -658,6 +660,12 @@ impl HarnessClient {
                 )));
             }
         };
+        if let Some(pending) = pending {
+            self.remember_pending_publication(
+                pending,
+                welcomes.iter().map(|welcome| welcome.id.clone()),
+            );
+        }
         for w in welcomes {
             self.bus.send(self.bus_id, w);
         }
@@ -677,6 +685,7 @@ impl HarnessClient {
 
     async fn try_confirm(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
         self.engine_mut().confirm_published(pending).await?;
+        self.pending_publication_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
             self.scenario_input_tracker.record_confirmed(&scenario_id);
         }
@@ -687,13 +696,28 @@ impl HarnessClient {
     /// discards the staged commit and rewinds to `Stable` at the prior
     /// epoch. Used by the rollback proptest property.
     pub async fn fail(&mut self, pending: PendingStateRef) {
-        self.engine_mut()
-            .publish_failed(pending)
-            .await
-            .expect("publish_failed");
+        self.try_fail(pending).await.expect("publish_failed");
+    }
+
+    pub async fn try_fail(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
+        let message_ids = self
+            .pending_publication_artifacts
+            .get(&pending)
+            .cloned()
+            .unwrap_or_default();
+        self.bus
+            .retract_undelivered_publication(self.bus_id, &message_ids)
+            .map_err(|delivered| {
+                EngineError::Other(format!(
+                    "cannot report definite publication failure after {delivered} matching artifact(s) reached a recipient mailbox"
+                ))
+            })?;
+        self.engine_mut().publish_failed(pending).await?;
+        self.pending_publication_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
             self.scenario_input_tracker.record_rolled_back(&scenario_id);
         }
+        Ok(())
     }
 
     /// Issue a `SendIntent::UpgradeCapabilities` for the default group
@@ -712,10 +736,17 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
+                let routed = route(msg, &gid);
+                self.remember_pending_publication(
+                    pending,
+                    welcomes
+                        .iter()
+                        .map(|welcome| welcome.id.clone())
+                        .chain(std::iter::once(routed.id.clone())),
+                );
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
-                let routed = route(msg, &gid);
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
@@ -746,6 +777,7 @@ impl HarnessClient {
                     "group-data update should not create welcomes"
                 );
                 let routed = route(msg, &gid);
+                self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
@@ -781,6 +813,7 @@ impl HarnessClient {
                     "admin policy update should not create welcomes"
                 );
                 let routed = route(msg, &gid);
+                self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 Ok(pending)
@@ -937,10 +970,17 @@ impl HarnessClient {
                 // Send welcomes before the commit so new members join via
                 // welcome and only then classify the commit echo as
                 // AlreadyAtEpoch.
+                let routed = route(msg, &gid);
+                self.remember_pending_publication(
+                    pending,
+                    welcomes
+                        .iter()
+                        .map(|welcome| welcome.id.clone())
+                        .chain(std::iter::once(routed.id.clone())),
+                );
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
-                let routed = route(msg, &gid);
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 Ok(pending)
@@ -1438,6 +1478,17 @@ impl HarnessClient {
     ) {
         self.pending_scenario_inputs
             .insert(pending, metadata.scenario_id.clone());
+    }
+
+    fn remember_pending_publication(
+        &mut self,
+        pending: PendingStateRef,
+        message_ids: impl IntoIterator<Item = MessageId>,
+    ) {
+        self.pending_publication_artifacts
+            .entry(pending)
+            .or_default()
+            .extend(message_ids);
     }
 
     /// Return a clone of `msg` whose payload is the peeled MLS wire bytes.
