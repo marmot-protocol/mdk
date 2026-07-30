@@ -79,9 +79,10 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     scenario runner owns step semantics and stable action ids; subjects implement semantic group, publication,
     application, delivery, observation, and restart operations. Every adapter declares a versioned capability set that
     is checked before execution. The engine adapter installs one shared manual paired clock; `AdvanceTime` moves both
-    clock domains and invokes the normal scheduled-convergence entry point only for selected awake clients.
-    Queue/partition mutation is available only through the separately named `ConvergenceFaultSubject` white-box
-    interface.
+    clock domains without waking a runtime, activates virtual-time ticks for that subject, and `Tick` selects which
+    participants run convergence against that time. Scenarios that never call `AdvanceTime` and standalone clients
+    retain the legacy far-future `Tick` shortcut. Queue/partition mutation is available only through the separately
+    named `ConvergenceFaultSubject` white-box interface.
 
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload

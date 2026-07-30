@@ -235,16 +235,10 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
-    /// Advance the subject's paired convergence clock and run the normal
-    /// scheduled-convergence entry point for the selected clients.
-    ///
-    /// Time is shared by the subject, while selecting clients models which
-    /// participant runtimes are awake to observe the elapsed deadline.
-    async fn advance_time(
-        &mut self,
-        _delta_ms: u64,
-        _clients: &[String],
-    ) -> Result<(), SubjectError> {
+    /// Advance the subject's paired convergence clock without waking a
+    /// participant runtime. A later `tick` selects which participants observe
+    /// the elapsed deadline.
+    async fn advance_time(&mut self, _delta_ms: u64) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
     }
 
@@ -578,29 +572,10 @@ impl ConvergenceSubject for EngineHarnessSubject {
         Ok(())
     }
 
-    async fn advance_time(
-        &mut self,
-        delta_ms: u64,
-        clients: &[String],
-    ) -> Result<(), SubjectError> {
-        let mut selected = BTreeSet::new();
-        for label in clients {
-            self.client(label)?;
-            if !selected.insert(label) {
-                return Err(SubjectError::new(
-                    "duplicate_time_client",
-                    format!("duplicate virtual-time client {label}"),
-                ));
-            }
-        }
+    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
         self.convergence_clock.advance_ms(delta_ms);
-        for label in clients {
-            if self.client(label)?.has_default_group() {
-                self.client_mut(label)?
-                    .advance_convergence()
-                    .await
-                    .map_err(subject_engine_error)?;
-            }
+        for client in self.clients.values_mut() {
+            client.enable_virtual_time_tick();
         }
         Ok(())
     }
@@ -888,8 +863,8 @@ mod tests {
     use crate::ConformanceCanonicalStateSnapshot;
 
     #[tokio::test]
-    async fn engine_subject_virtual_time_closes_the_real_convergence_window() {
-        let labels = vec!["alice".to_owned()];
+    async fn engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
         let mut subject = EngineHarnessSubject::new(
             &labels,
             ProtocolProfile::Current,
@@ -902,49 +877,76 @@ mod tests {
                 .supports(SubjectCapability::VirtualTime)
         );
 
-        subject
-            .create_group(SubjectCreateGroup {
-                creator: "alice",
-                name: "virtual-time",
-                invitees: &[],
-                required_features: &[],
-                initial_admins: &[],
-                pending: "unused",
-            })
-            .await
-            .expect("founding group is created");
+        for label in &labels {
+            subject
+                .create_group(SubjectCreateGroup {
+                    creator: label,
+                    name: "virtual-time",
+                    invitees: &[],
+                    required_features: &[],
+                    initial_admins: &[],
+                    pending: "unused",
+                })
+                .await
+                .expect("founding group is created");
+            let client = subject.client_mut(label).expect("client exists");
+            client.request_disband().await.expect("request disband");
+            client
+                .advance_convergence()
+                .await
+                .expect("prepare and confirm disband commit");
+            client
+                .advance_convergence()
+                .await
+                .expect("open collecting pass");
+        }
 
-        let alice = subject.client_mut("alice").expect("alice exists");
-        alice.request_disband().await.expect("request disband");
-        alice
-            .advance_convergence()
-            .await
-            .expect("prepare and confirm disband commit");
-        alice
-            .advance_convergence()
-            .await
-            .expect("open collecting pass");
-
         subject
-            .advance_time(999, &labels)
+            .advance_time(999)
             .await
             .expect("advance before cutoff");
+        subject
+            .tick(&["alice".to_owned()])
+            .await
+            .expect("wake alice before cutoff");
+        for label in &labels {
+            assert!(matches!(
+                subject
+                    .client(label)
+                    .expect("client exists")
+                    .canonical_state_snapshot(),
+                ConformanceCanonicalStateSnapshot::Live(_)
+            ));
+        }
+
+        subject.advance_time(1).await.expect("advance to cutoff");
+        subject
+            .tick(&["alice".to_owned()])
+            .await
+            .expect("wake alice at cutoff");
         assert!(matches!(
             subject
                 .client("alice")
                 .expect("alice exists")
                 .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ));
+        assert!(matches!(
+            subject
+                .client("bob")
+                .expect("bob exists")
+                .canonical_state_snapshot(),
             ConformanceCanonicalStateSnapshot::Live(_)
         ));
 
         subject
-            .advance_time(1, &labels)
+            .tick(&["bob".to_owned()])
             .await
-            .expect("advance to cutoff");
+            .expect("wake bob without advancing time again");
         assert!(matches!(
             subject
-                .client("alice")
-                .expect("alice exists")
+                .client("bob")
+                .expect("bob exists")
                 .canonical_state_snapshot(),
             ConformanceCanonicalStateSnapshot::Disbanded(_)
         ));

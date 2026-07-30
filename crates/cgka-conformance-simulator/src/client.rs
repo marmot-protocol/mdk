@@ -57,6 +57,7 @@ pub struct HarnessClient {
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    virtual_time_tick_enabled: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
     /// automatically after the first create/join.
@@ -269,6 +270,7 @@ impl ClientBuilder {
             registry: self.registry,
             protocol_profile: self.protocol_profile,
             convergence_clock: self.convergence_clock,
+            virtual_time_tick_enabled: false,
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
@@ -447,8 +449,8 @@ impl HarnessClient {
         self.storage_backing.database_path()
     }
 
-    pub fn has_default_group(&self) -> bool {
-        self.default_group.is_some()
+    pub(crate) fn enable_virtual_time_tick(&mut self) {
+        self.virtual_time_tick_enabled = true;
     }
 
     pub fn restart(&mut self) {
@@ -1032,9 +1034,10 @@ impl HarnessClient {
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
         let mut outcomes = self.tick_ingest_only().await;
         if let Some(gid) = self.default_group.clone() {
+            let now_ms = self.harness_convergence_now_ms();
             match self
                 .engine_mut()
-                .advance_convergence_inputs_until_settled(&gid, HARNESS_CONVERGENCE_SETTLED_AT_MS)
+                .advance_convergence_inputs_until_settled(&gid, now_ms)
                 .await
             {
                 Ok(_) => {}
@@ -1144,6 +1147,7 @@ impl HarnessClient {
         &mut self,
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
     ) {
+        let now_ms = self.harness_convergence_now_ms();
         for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
             let groups = self.engine_mut().drain_pending_convergence_groups();
             if groups.is_empty() {
@@ -1152,10 +1156,7 @@ impl HarnessClient {
             for group_id in groups {
                 let results = match self
                     .engine_mut()
-                    .converge_and_drain_queued_outbound_intents(
-                        &group_id,
-                        HARNESS_CONVERGENCE_SETTLED_AT_MS,
-                    )
+                    .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
                     .await
                 {
                     Ok(results) => results,
@@ -1176,6 +1177,20 @@ impl HarnessClient {
         outcomes.push(Err(EngineError::Backend(
             "convergence drain did not settle within harness pass limit".into(),
         )));
+    }
+
+    /// A subject switches to its injected clock on the first virtual-time
+    /// advance. Other harness clients retain the historical far-future
+    /// settlement shortcut.
+    fn harness_convergence_now_ms(&self) -> u64 {
+        if self.virtual_time_tick_enabled {
+            self.convergence_clock
+                .as_ref()
+                .map(|clock| clock.now().monotonic_ms)
+                .unwrap_or(HARNESS_CONVERGENCE_SETTLED_AT_MS)
+        } else {
+            HARNESS_CONVERGENCE_SETTLED_AT_MS
+        }
     }
 
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {

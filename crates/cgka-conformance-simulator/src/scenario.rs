@@ -77,11 +77,10 @@ pub enum ScenarioStep {
     Tick {
         clients: Vec<String>,
     },
-    /// Advance both convergence-clock domains and run scheduled convergence
-    /// for the selected participant runtimes.
+    /// Advance both convergence-clock domains without waking a participant.
+    /// Use `Tick` to select which participant runtimes observe elapsed time.
     AdvanceTime {
         delta_ms: u64,
-        clients: Vec<String>,
     },
     Observe {
         clients: Vec<String>,
@@ -568,12 +567,9 @@ async fn run_scenario_report_inner(
                     .await
                     .map_err(|error| subject_step_error(step_index, error))?;
             }
-            ScenarioStep::AdvanceTime {
-                delta_ms,
-                clients: labels,
-            } => {
+            ScenarioStep::AdvanceTime { delta_ms } => {
                 subject
-                    .advance_time(*delta_ms, labels)
+                    .advance_time(*delta_ms)
                     .await
                     .map_err(|error| subject_step_error(step_index, error))?;
             }
@@ -850,7 +846,7 @@ mod tests {
     struct RecordingSubject {
         descriptor: SubjectDescriptor,
         send_called: bool,
-        time_advances: Vec<(u64, Vec<String>)>,
+        time_advances: Vec<u64>,
     }
 
     #[async_trait]
@@ -867,12 +863,8 @@ mod tests {
             Ok(())
         }
 
-        async fn advance_time(
-            &mut self,
-            delta_ms: u64,
-            clients: &[String],
-        ) -> Result<(), SubjectError> {
-            self.time_advances.push((delta_ms, clients.to_vec()));
+        async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
+            self.time_advances.push(delta_ms);
             Ok(())
         }
     }
@@ -943,15 +935,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn virtual_time_is_capability_gated_and_dispatched_with_selected_clients() {
+    async fn virtual_time_is_capability_gated_serializable_and_dispatched() {
         let spec = ScenarioSpec {
             name: "subject-virtual-time/v1".to_owned(),
             spec_version: "1".to_owned(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
-            steps: vec![ScenarioStep::AdvanceTime {
-                delta_ms: 750,
-                clients: vec!["bob".to_owned()],
-            }],
+            steps: vec![ScenarioStep::AdvanceTime { delta_ms: 750 }],
         };
         let encoded = serde_json::to_value(&spec).expect("virtual time scenario serializes");
         assert_eq!(encoded["steps"][0]["type"], "advance_time");
@@ -984,7 +973,7 @@ mod tests {
         run_scenario_spec_with_subject(&spec, &mut subject)
             .await
             .expect("supported virtual time step succeeds");
-        assert_eq!(subject.time_advances, vec![(750, vec!["bob".to_owned()])]);
+        assert_eq!(subject.time_advances, vec![750]);
     }
 
     #[test]
