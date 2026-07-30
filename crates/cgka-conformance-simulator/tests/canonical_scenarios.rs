@@ -5,17 +5,20 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance_simulator::{
-    ClientBuilder, EpochChangeObservation, GeneratedScenarioCase, HarnessClient,
-    PendingResolutionObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
-    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
+    ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
+    GeneratedScenarioCase, HarnessClient, PendingResolutionObservation, ScenarioInputDisposition,
+    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioReport, ScenarioSpec, ScenarioStep,
+    ScenarioTrace, TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
     generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
-    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
+    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
+    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_vector_fixture_report,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::GroupEvent;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::MessageStorage;
@@ -115,6 +118,588 @@ async fn three_client_happy_path_via_harness() {
     // Convergence: same epoch, same member set across all clients.
     assert_eq!(alice.epoch(), bob.epoch());
     assert_eq!(alice.epoch(), carol.epoch());
+}
+
+#[tokio::test]
+async fn exact_oracle_matches_full_canonical_state_after_join() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("exact-state", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+
+    let alice_snapshot = alice.canonical_group_snapshot();
+    let bob_snapshot = bob.canonical_group_snapshot();
+    assert_eq!(alice_snapshot, bob_snapshot);
+    assert_eq!(alice_snapshot.leaves.len(), 2);
+    assert_eq!(alice_snapshot.sorted_member_identities_hex.len(), 2);
+    assert_eq!(alice_snapshot.exporter_commitment_sha256.len(), 64);
+    assert_eq!(alice_snapshot.group_context_sha256.len(), 64);
+
+    let trace = ScenarioTrace {
+        name: "exact-state-after-join/v1".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![
+            observe_client_exact("alice", &mut alice),
+            observe_client_exact("bob", &mut bob),
+        ],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+        &trace,
+    );
+    assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+}
+
+#[tokio::test]
+async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let (_group_id, pending) = alice
+        .create_group_with_admins_maybe_pending("terminal", vec![], vec![], vec![])
+        .await;
+    assert!(
+        pending.is_none(),
+        "current founding group is immediately live"
+    );
+    alice.drain_events();
+
+    alice.request_disband().await.expect("request disband");
+    // Milestone 1.3 replaces this production-clock wait with the simulator's
+    // injected monotonic/wall clocks. Until that subject boundary exists, run
+    // the real pinned-v1 quiescence policy rather than weakening its constants
+    // just for this terminal-projection test.
+    let mut reached_terminal = false;
+    for _ in 0..24 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        alice
+            .advance_convergence()
+            .await
+            .expect("advance disband convergence");
+        if matches!(
+            alice.canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ) {
+            reached_terminal = true;
+            break;
+        }
+    }
+    assert!(
+        reached_terminal,
+        "disband did not reach terminal state within the 6-second pinned-v1 test budget"
+    );
+    bus.deliver_all();
+
+    let before_restart = alice.canonical_state_snapshot();
+    let ConformanceCanonicalStateSnapshot::Disbanded(tombstone) = &before_restart else {
+        panic!("expected terminal tombstone, got {before_restart:#?}");
+    };
+    assert_eq!(tombstone.epoch, 1);
+    assert_eq!(tombstone.former_member_identities_hex.len(), 1);
+    assert_eq!(tombstone.commit_digest_hex.len(), 64);
+
+    let trace = ScenarioTrace {
+        name: "exact-disband-tombstone".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into()],
+            },
+        ],
+        &trace,
+    );
+    assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+    alice.restart();
+    assert_eq!(alice.canonical_state_snapshot(), before_restart);
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_passes_for_settled_members() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/settled".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into()],
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![
+            TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            TraceExpectation::ClientsBidirectionallyDecryptable {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    )
+    .await
+    .expect("run settled decryptability probe");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "unexpected failures: {:#?}",
+        report.expectation_failures
+    );
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    assert!(probe.succeeded());
+    assert_eq!(probe.probes.len(), 6);
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachability() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/asymmetric-epoch".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "advanced-without-bob".into(),
+                pending: "advance".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "advance".into(),
+            },
+            ScenarioStep::DropQueued { index: 0 },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: vec!["alice".into(), "bob".into()],
+        }],
+    )
+    .await
+    .expect("run asymmetric decryptability probe");
+
+    assert_eq!(report.expectation_failures.len(), 1);
+    assert_eq!(
+        report.expectation_failures[0].kind,
+        "bidirectional_decryptability_failed"
+    );
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    let alice_to_bob = probe
+        .probes
+        .iter()
+        .find(|edge| edge.sender == "alice" && edge.recipient == "bob")
+        .expect("alice to bob edge");
+    assert!(!alice_to_bob.succeeded());
+    assert_eq!(
+        alice_to_bob
+            .recipient_ledger
+            .as_ref()
+            .expect("deferred ledger")
+            .transport_deferred,
+        1
+    );
+    assert!(
+        probe
+            .probes
+            .iter()
+            .find(|edge| edge.sender == "bob" && edge.recipient == "alice")
+            .expect("bob to alice edge")
+            .succeeded()
+    );
+}
+
+#[tokio::test]
+async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
+    let spec = ScenarioSpec {
+        name: "bidirectional-decryptability/nonmember".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "decryptability".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report_with_outcomes(
+        &spec,
+        None,
+        vec![TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        }],
+    )
+    .await
+    .expect("run nonmember decryptability probe");
+
+    assert_eq!(report.expectation_failures.len(), 1);
+    let probe = &report
+        .observed_trace
+        .as_ref()
+        .expect("trace")
+        .decryptability_probes[0];
+    assert!(!probe.succeeded());
+    assert!(probe.probes.iter().any(|edge| {
+        edge.sender == "carol"
+            && matches!(
+                edge.send_status,
+                cgka_conformance_simulator::DecryptabilityProbeSendStatus::Failed { .. }
+            )
+    }));
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_delayed_transport_then_accepts_drained_delivery() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-delayed", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    bob.send_app(b"held".to_vec()).await;
+    assert!(bus.delay_queued(0, "held-message"));
+    let held_trace = ScenarioTrace {
+        name: "pending-delayed/held".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &held_trace,
+    );
+    assert_eq!(failures.len(), 1, "expected delayed blocker: {failures:#?}");
+    assert_eq!(failures[0].kind, "pending_work_remaining");
+    assert!(
+        failures[0].message.contains("bus_delayed"),
+        "delayed subsystem should be named: {failures:#?}"
+    );
+
+    assert!(bus.release_delayed("held-message"));
+    bus.deliver_all();
+    alice.tick().await;
+    let drained_trace = ScenarioTrace {
+        name: "pending-delayed/drained".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observe_client_exact("alice", &mut alice)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &drained_trace,
+    );
+    assert!(
+        failures.is_empty(),
+        "unexpected pending work: {failures:#?}"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_bus_queue_and_unread_mailbox() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-bus", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    bob.send_app(b"queued".to_vec()).await;
+    let queued_for_alice = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        queued_for_alice
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_queued_messages,
+        1
+    );
+    let sender_does_not_own_queued_delivery = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_does_not_own_queued_delivery
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_queued_messages,
+        0
+    );
+
+    bus.deliver_all();
+    let unread_for_alice = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        unread_for_alice
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_mailbox_messages,
+        1
+    );
+    let sender_mailbox_remains_empty = observe_client_exact("bob", &mut bob);
+    assert_eq!(
+        sender_mailbox_remains_empty
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .bus_mailbox_messages,
+        0
+    );
+
+    alice.tick().await;
+    let drained = observe_client_exact("alice", &mut alice);
+    assert!(
+        drained
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .is_empty(),
+        "all transport and engine work should be drained: {drained:#?}"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_does_not_claim_delivery_of_dropped_application_input() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("dropped-is-not-pending", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    alice.send_app(b"intentionally-dropped".to_vec()).await;
+    assert!(bus.drop_queued(0), "drop the application transport object");
+
+    let alice_observation = observe_client_exact("alice", &mut alice);
+    let bob_observation = observe_client_exact("bob", &mut bob);
+    let sender_entry = alice_observation
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.payload == "intentionally-dropped")
+        .expect("sender records the published application input");
+    assert_eq!(
+        sender_entry.disposition,
+        ScenarioInputDisposition::Accepted,
+        "sender acceptance is not an end-to-end delivery claim"
+    );
+    assert!(
+        bob_observation.scenario_input_ledger.is_empty(),
+        "a recipient cannot classify an object the scenario removed before delivery"
+    );
+
+    let trace = ScenarioTrace {
+        name: "dropped-is-not-pending".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![alice_observation, bob_observation],
+    };
+    let no_pending_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into(), "bob".into()],
+        }],
+        &trace,
+    );
+    assert!(
+        no_pending_failures.is_empty(),
+        "NoPendingWork is local execution quiescence, not transport completeness: \
+         {no_pending_failures:#?}"
+    );
+
+    let delivery_failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::ClientState {
+            client: "bob".into(),
+            epoch: 1,
+            member_count: 2,
+            received_payloads: Some(vec!["intentionally-dropped".into()]),
+            added_members: None,
+            removed_members: None,
+        }],
+        &trace,
+    );
+    assert_eq!(
+        delivery_failures.len(),
+        1,
+        "delivery must be asserted independently from local quiescence"
+    );
+}
+
+#[tokio::test]
+async fn no_pending_work_rejects_unconfirmed_publish() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol")).attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+
+    let (_group_id, pending) = alice
+        .create_group("pending-publish", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    alice.drain_events();
+    bob.drain_events();
+
+    let pending_invite = alice.invite(vec![carol.fresh_key_package().await]).await;
+    let observation = observe_client_exact("alice", &mut alice);
+    assert_eq!(
+        observation
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot")
+            .engine
+            .non_stable_epoch_state,
+        1
+    );
+    let trace = ScenarioTrace {
+        name: "pending-publish/unconfirmed".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![observation],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        }],
+        &trace,
+    );
+    assert_eq!(failures.len(), 1, "expected publish blocker: {failures:#?}");
+    assert!(
+        failures[0].message.contains("engine"),
+        "engine subsystem should be named: {failures:#?}"
+    );
+
+    alice.fail(pending_invite).await;
 }
 
 #[tokio::test]
@@ -242,6 +827,7 @@ async fn three_client_message_exchange_vector_is_stable() {
         }],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -261,12 +847,16 @@ async fn three_client_message_exchange_vector_is_stable() {
             }],
             errors: vec![],
             admin_policies: vec![],
+            decryptability_probes: vec![],
             observations: vec![
                 cgka_conformance_simulator::ClientObservation {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -284,6 +874,9 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -301,6 +894,9 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch: 1,
                     member_count: 3,
                     group_name: "vector-smoke".into(),
+                    canonical_state: None,
+                    scenario_input_ledger: vec![],
+                    pending_work: None,
                     event_counts: cgka_conformance_simulator::ClientEventCounts {
                         message_received: 2,
                         ..Default::default()
@@ -571,7 +1167,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
             },
-            ScenarioStep::Observe {
+            ScenarioStep::ObserveExact {
                 clients: vec!["alice".into()],
             },
         ],
@@ -583,6 +1179,105 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
         trace.observations[0].received_payloads,
         vec!["carol:second", "bob:first"]
     );
+    let bob_message = trace.observations[0]
+        .scenario_input_ledger
+        .iter()
+        .find(|entry| entry.payload == "bob:first")
+        .expect("bob's logical message is tracked");
+    assert_eq!(bob_message.ingest_attempts, 2);
+    assert_eq!(bob_message.ingest_accepted, 1);
+    assert_eq!(bob_message.delivered, 1);
+    assert_eq!(bob_message.deduplicated, 1);
+    assert!(!bob_message.pending);
+}
+
+#[tokio::test]
+async fn exact_observation_ledgers_commit_proposal_and_application_dispositions() {
+    let spec = ScenarioSpec {
+        name: "generalized-scenario-input-ledger/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "ledger".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "ledger-updated".into(),
+                pending: "rename".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "rename".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "ledger-message".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Leave {
+                client: "bob".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+    let ledger = &trace.observations[0].scenario_input_ledger;
+
+    let commit = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-4:update_group_data")
+        .expect("named commit input");
+    assert_eq!(commit.kind, ScenarioInputKind::Commit);
+    assert_eq!(commit.disposition, ScenarioInputDisposition::Accepted);
+
+    let application = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-8:send_app_message")
+        .expect("named application input");
+    assert_eq!(application.kind, ScenarioInputKind::Application);
+    assert_eq!(application.payload, "ledger-message");
+    assert_eq!(application.disposition, ScenarioInputDisposition::Accepted);
+
+    let proposal = ledger
+        .iter()
+        .find(|entry| entry.scenario_id == "step-11:leave")
+        .expect("named proposal input");
+    assert_eq!(proposal.kind, ScenarioInputKind::Proposal);
+    assert!(
+        matches!(
+            proposal.disposition,
+            ScenarioInputDisposition::Pending | ScenarioInputDisposition::Accepted
+        ),
+        "the ledger must expose the proposal's current durable disposition: {proposal:?}"
+    );
 }
 
 #[tokio::test]
@@ -593,7 +1288,7 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
     assert_eq!(cases.len(), 3);
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "send-leave/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 42);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -606,7 +1301,51 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
 
     let json = serde_json::to_value(&cases[0]).expect("case serializes");
     assert_eq!(json["seed"], 42);
-    assert_eq!(json["generator_version"], "1");
+    assert_eq!(json["generator_version"], "2");
+
+    for case in cases {
+        assert!(
+            case.scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+        );
+        assert!(case.expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::ClientsExactlyEquivalent { .. }
+        )));
+        assert!(
+            case.expected_outcomes
+                .iter()
+                .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. }))
+        );
+        let report = run_generated_case_report(&case, None)
+            .await
+            .expect("strict send/leave case report runs");
+        let includes_leave = case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::Leave { .. }));
+        if includes_leave {
+            assert!(
+                report
+                    .expectation_failures
+                    .iter()
+                    .any(|failure| failure.kind == "pending_work_remaining"),
+                "leave case {} must retain the strict pending-work regression until proposal work is retired: {:?}",
+                case.case_index,
+                report.expectation_failures
+            );
+        } else {
+            assert!(
+                report.expectation_failures.is_empty(),
+                "non-leave case {} failed strict expectations: {:?}",
+                case.case_index,
+                report.expectation_failures
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -692,6 +1431,17 @@ where
     }
 }
 
+fn without_strict_reliability_outcomes(mut case: GeneratedScenarioCase) -> GeneratedScenarioCase {
+    case.expected_outcomes.retain(|expectation| {
+        !matches!(
+            expectation,
+            TraceExpectation::ClientsExactlyEquivalent { .. }
+                | TraceExpectation::NoPendingWork { .. }
+        )
+    });
+    case
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
     let cases = generate_convergence_chaos_family(123, 24);
@@ -702,6 +1452,17 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         cases.iter().all(|case| !case.expected_outcomes.is_empty()),
         "chaos cases should carry semantic expectations"
     );
+    assert!(cases.iter().all(|case| {
+        case.scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+    }));
+    assert!(cases.iter().all(|case| {
+        case.expected_outcomes
+            .iter()
+            .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. }))
+    }));
     assert!(
         cases.iter().any(|case| case
             .scenario
@@ -800,12 +1561,16 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "3");
+        assert_eq!(case.generator_version, "4");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
     }
 
-    for_each_chaos_case_concurrently(cases, |case, report| {
+    let baseline_cases = cases
+        .into_iter()
+        .map(without_strict_reliability_outcomes)
+        .collect();
+    for_each_chaos_case_concurrently(baseline_cases, |case, report| {
         assert_eq!(report.expected_outcomes, case.expected_outcomes);
         assert!(
             report.expectation_failures.is_empty(),
@@ -865,8 +1630,12 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
     // Every seed-driven scenario must still satisfy its pinned expectations,
     // so the divergence reflects real behavior variation, not breakage.
-    let seeded_cases: Vec<GeneratedScenarioCase> =
-        seed_a.iter().chain(seed_b.iter()).cloned().collect();
+    let seeded_cases: Vec<GeneratedScenarioCase> = seed_a
+        .iter()
+        .chain(seed_b.iter())
+        .cloned()
+        .map(without_strict_reliability_outcomes)
+        .collect();
     for_each_chaos_case_concurrently(seeded_cases, |case, report| {
         assert!(
             report.expectation_failures.is_empty(),
@@ -913,7 +1682,8 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
         .expect("rollback arm should delay the duplicate copy");
     assert_eq!(delayed_copy, (2, "duplicate-app"));
 
-    let report = run_generated_case_report(case, None)
+    let baseline_case = without_strict_reliability_outcomes(case.clone());
+    let report = run_generated_case_report(&baseline_case, None)
         .await
         .expect("rollback duplicate-app case reports");
     assert!(
@@ -934,6 +1704,42 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
         6,
         "Alice should receive the six unique post-rollback app payloads; the released duplicate must not emit a seventh",
     );
+}
+
+#[tokio::test]
+async fn strict_chaos_boundary_retains_known_reliability_failures() {
+    let cases = generate_convergence_chaos_family(123, 5);
+    let expected_failures = [
+        (
+            2usize,
+            "clients_not_exactly_equivalent",
+            "rolled-back transported commit",
+        ),
+        (
+            3usize,
+            "pending_work_remaining",
+            "self-remove proposal work",
+        ),
+        (
+            4usize,
+            "pending_work_remaining",
+            "pre-join deferred application object",
+        ),
+    ];
+
+    for (case_index, failure_kind, description) in expected_failures {
+        let report = run_generated_case_report(&cases[case_index], None)
+            .await
+            .expect("strict known-gap case reports");
+        assert!(
+            report
+                .expectation_failures
+                .iter()
+                .any(|failure| failure.kind == failure_kind),
+            "strict case {case_index} must retain the {description} regression until the engine behavior is fixed: {:?}",
+            report.expectation_failures
+        );
+    }
 }
 
 #[tokio::test]
@@ -1267,6 +2073,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![],
     };
 
@@ -1280,7 +2087,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
 
 #[tokio::test]
 async fn generated_case_report_records_generator_metadata() {
-    let case = generate_send_leave_family(7, 1).remove(0);
+    let case = generate_send_leave_family(42, 1).remove(0);
 
     let report = run_generated_case_report(&case, None)
         .await
@@ -1292,8 +2099,8 @@ async fn generated_case_report_records_generator_metadata() {
         .expect("generated metadata");
 
     assert_eq!(generated.family_name, "send-leave/v1");
-    assert_eq!(generated.generator_version, "1");
-    assert_eq!(generated.seed, 7);
+    assert_eq!(generated.generator_version, "2");
+    assert_eq!(generated.seed, 42);
     assert_eq!(generated.case_index, 0);
     assert!(generated.minimized_case.is_none());
 }
@@ -1341,6 +2148,7 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
         }],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1486,6 +2294,7 @@ async fn deliberate_fork_via_harness() {
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
+        decryptability_probes: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1612,6 +2421,18 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     let frank_outcomes = frank.tick().await;
     assert_tick_reached_convergence("carol", &carol_outcomes);
     assert_tick_reached_convergence("frank", &frank_outcomes);
+    assert_canonical_scenario_input_ledger(
+        "carol",
+        &carol.scenario_input_ledger(),
+        &expected_payload,
+        &losing_payload,
+    );
+    assert_canonical_scenario_input_ledger(
+        "frank",
+        &frank.scenario_input_ledger(),
+        &expected_payload,
+        &losing_payload,
+    );
 
     assert_canonical_application_event(
         "carol",
@@ -1637,6 +2458,51 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
             "{name} should not contain the losing branch invitee"
         );
     }
+
+    let deferred_trace = ScenarioTrace {
+        name: "convergence-e2e/deferred-losing-transport".into(),
+        pending_resolutions: vec![],
+        errors: vec![],
+        admin_policies: vec![],
+        decryptability_probes: vec![],
+        observations: vec![
+            observe_client_exact("carol", &mut carol),
+            observe_client_exact("frank", &mut frank),
+        ],
+    };
+    for observation in &deferred_trace.observations {
+        let pending = observation
+            .pending_work
+            .as_ref()
+            .expect("exact pending snapshot");
+        assert!(
+            pending.engine.stored_transport_deferred_messages > 0,
+            "{} should expose the retained unpeeled transport object: {pending:#?}",
+            observation.client
+        );
+        assert!(
+            pending.scenario_inputs_pending > 0,
+            "{} should expose the unresolved scenario input: {pending:#?}",
+            observation.client
+        );
+    }
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::NoPendingWork {
+            clients: vec!["carol".into(), "frank".into()],
+        }],
+        &deferred_trace,
+    );
+    assert_eq!(
+        failures.len(),
+        2,
+        "each observer should fail quiescence while transport work remains: {failures:#?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.kind == "pending_work_remaining")
+    );
 }
 
 #[tokio::test]
@@ -1782,6 +2648,42 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
             },
         ],
     }
+}
+
+fn assert_canonical_scenario_input_ledger(
+    client: &str,
+    ledger: &[ScenarioInputLedgerEntry],
+    expected_payload: &[u8],
+    losing_payload: &[u8],
+) {
+    let expected_payload = String::from_utf8_lossy(expected_payload);
+    let losing_payload = String::from_utf8_lossy(losing_payload);
+    let expected = ledger
+        .iter()
+        .find(|entry| entry.payload == expected_payload)
+        .unwrap_or_else(|| panic!("{client} missing selected logical message: {ledger:#?}"));
+    let losing = ledger
+        .iter()
+        .find(|entry| entry.payload == losing_payload)
+        .unwrap_or_else(|| panic!("{client} missing losing logical message: {ledger:#?}"));
+
+    assert_eq!(
+        expected.delivered, 1,
+        "{client} must deliver the selected branch exactly once: {ledger:#?}"
+    );
+    assert_eq!(
+        losing.delivered, 0,
+        "{client} must not project losing-branch application output: {ledger:#?}"
+    );
+    assert!(
+        losing
+            .invalidated
+            .iter()
+            .any(|reason| reason == "losing_branch")
+            || (losing.transport_deferred > 0 && losing.pending),
+        "{client} must classify losing output as invalidated or visibly transport-pending: \
+         {ledger:#?}"
+    );
 }
 
 fn assert_tick_reached_convergence(
@@ -2033,6 +2935,7 @@ async fn harness_captures_and_asserts_convergence_decision() {
         pending_resolutions: Vec::new(),
         errors: Vec::new(),
         admin_policies: Vec::new(),
+        decryptability_probes: Vec::new(),
         observations: vec![observe_client("carol", &mut carol)],
     };
     let failures = compare_trace_expectations(

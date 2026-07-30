@@ -42,6 +42,8 @@ pub(crate) mod bounded_id_set;
 pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+#[cfg(feature = "test-conformance-snapshot")]
+pub mod conformance_snapshot;
 pub mod convergence;
 pub(crate) mod convergence_input;
 pub mod disband;

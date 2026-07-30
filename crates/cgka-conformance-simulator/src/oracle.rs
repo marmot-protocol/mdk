@@ -17,6 +17,7 @@ pub enum ScenarioStimulus {
     PublishConfirm,
     PublishFail,
     AppMessage,
+    BidirectionalDecryptabilityProbe,
     Leave,
     QueueDrop,
     QueueDuplicate,
@@ -47,6 +48,10 @@ pub enum OracleBehavior {
     AdminPolicyObserved,
     ClientState,
     ClientConvergence,
+    ExactStateEquivalence,
+    ScenarioInputDisposition,
+    NoPendingWorkObserved,
+    BidirectionalDecryptabilityObserved,
     DeliveredPayload,
     MemberAdded,
     MemberRemoved,
@@ -80,6 +85,12 @@ pub struct BehaviorEvidenceSummary {
     pub app_invalidations: usize,
     pub recoveries: usize,
     pub convergence_decisions: usize,
+    pub scenario_input_entries: usize,
+    pub scenario_inputs_deduplicated: usize,
+    pub no_pending_work_observations: usize,
+    pub decryptability_probe_edges: usize,
+    pub decryptability_probe_edges_delivered: usize,
+    pub bidirectional_decryptability_observations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +292,11 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
                 stimuli.insert(ScenarioStimulus::AppMessage);
                 sends += 1;
             }
+            ScenarioStep::ProbeBidirectionalDecryptability { clients } => {
+                stimuli.insert(ScenarioStimulus::AppMessage);
+                stimuli.insert(ScenarioStimulus::BidirectionalDecryptabilityProbe);
+                sends += clients.len();
+            }
             ScenarioStep::Leave { .. } => {
                 stimuli.insert(ScenarioStimulus::Leave);
             }
@@ -305,6 +321,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::DeliverAll
             | ScenarioStep::Tick { .. }
             | ScenarioStep::Observe { .. }
+            | ScenarioStep::ObserveExact { .. }
             | ScenarioStep::ObserveAdminPolicy { .. }
             | ScenarioStep::ClearEvents { .. } => {}
         }
@@ -377,6 +394,18 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if evidence.convergence_decisions > 0 {
         behaviors.insert(OracleBehavior::ConvergenceDecisionObserved);
     }
+    if evidence.scenario_input_entries > 0 {
+        behaviors.insert(OracleBehavior::ScenarioInputDisposition);
+    }
+    if evidence.scenario_inputs_deduplicated > 0 {
+        behaviors.insert(OracleBehavior::ReplayDeduplication);
+    }
+    if evidence.no_pending_work_observations > 0 {
+        behaviors.insert(OracleBehavior::NoPendingWorkObserved);
+    }
+    if evidence.bidirectional_decryptability_observations > 0 {
+        behaviors.insert(OracleBehavior::BidirectionalDecryptabilityObserved);
+    }
     if evidence.max_member_count >= 20 {
         behaviors.insert(OracleBehavior::LargeGroupObserved);
     }
@@ -390,6 +419,18 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
                 && &observation.group_name == first_group_name
         }) {
             behaviors.insert(OracleBehavior::ClientConvergence);
+        }
+        let exact_states = trace
+            .observations
+            .iter()
+            .filter_map(|observation| observation.canonical_state.as_ref())
+            .collect::<Vec<_>>();
+        if exact_states.len() >= 2
+            && exact_states
+                .iter()
+                .all(|snapshot| *snapshot == exact_states[0])
+        {
+            behaviors.insert(OracleBehavior::ExactStateEquivalence);
         }
     }
     behaviors.into_iter().collect()
@@ -409,6 +450,17 @@ pub fn behavior_evidence(trace: &ScenarioTrace) -> BehaviorEvidenceSummary {
     }
     evidence.expected_errors += trace.errors.len();
     evidence.admin_policy_observations += trace.admin_policies.len();
+    for observation in &trace.decryptability_probes {
+        evidence.decryptability_probe_edges += observation.probes.len();
+        evidence.decryptability_probe_edges_delivered += observation
+            .probes
+            .iter()
+            .filter(|probe| probe.succeeded())
+            .count();
+        if observation.succeeded() {
+            evidence.bidirectional_decryptability_observations += 1;
+        }
+    }
     for observation in &trace.observations {
         evidence.max_member_count = evidence.max_member_count.max(observation.member_count);
         evidence.delivered_payloads += observation.received_payloads.len();
@@ -418,6 +470,19 @@ pub fn behavior_evidence(trace: &ScenarioTrace) -> BehaviorEvidenceSummary {
         evidence.app_invalidations += observation.app_invalidations.len();
         evidence.recoveries += observation.recoveries.len();
         evidence.convergence_decisions += observation.convergence_decisions.len();
+        evidence.scenario_input_entries += observation.scenario_input_ledger.len();
+        evidence.scenario_inputs_deduplicated += observation
+            .scenario_input_ledger
+            .iter()
+            .map(|entry| entry.deduplicated)
+            .sum::<usize>();
+        if observation
+            .pending_work
+            .as_ref()
+            .is_some_and(|pending| pending.is_empty())
+        {
+            evidence.no_pending_work_observations += 1;
+        }
     }
     evidence
 }
@@ -477,6 +542,28 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
             if member_count.is_some_and(|count| count >= 20) {
                 behaviors.insert(OracleBehavior::LargeGroupObserved);
             }
+        }
+        TraceExpectation::ClientsExactlyEquivalent { .. } => {
+            behaviors.insert(OracleBehavior::ClientConvergence);
+            behaviors.insert(OracleBehavior::ExactStateEquivalence);
+        }
+        TraceExpectation::ScenarioInputLedger { entries, .. } => {
+            behaviors.insert(OracleBehavior::ScenarioInputDisposition);
+            if entries.iter().any(|entry| entry.delivered > 0) {
+                behaviors.insert(OracleBehavior::DeliveredPayload);
+            }
+            if entries.iter().any(|entry| entry.deduplicated > 0) {
+                behaviors.insert(OracleBehavior::ReplayDeduplication);
+            }
+            if entries.iter().any(|entry| !entry.invalidated.is_empty()) {
+                behaviors.insert(OracleBehavior::AppInvalidated);
+            }
+        }
+        TraceExpectation::NoPendingWork { .. } => {
+            behaviors.insert(OracleBehavior::NoPendingWorkObserved);
+        }
+        TraceExpectation::ClientsBidirectionallyDecryptable { .. } => {
+            behaviors.insert(OracleBehavior::BidirectionalDecryptabilityObserved);
         }
         TraceExpectation::ClientEpochChanges { .. } => {
             behaviors.insert(OracleBehavior::EpochChanged);
@@ -553,6 +640,9 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
                 OracleBehavior::AppInvalidated,
             ]
         }
+        ScenarioStimulus::BidirectionalDecryptabilityProbe => {
+            vec![OracleBehavior::BidirectionalDecryptabilityObserved]
+        }
         ScenarioStimulus::Leave => vec![
             OracleBehavior::MemberRemoved,
             OracleBehavior::ClientConvergence,
@@ -603,7 +693,7 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClientEventCounts, ClientObservation};
+    use crate::{ClientEventCounts, ClientObservation, ConformanceCanonicalStateSnapshot};
 
     fn observation(
         client: &str,
@@ -616,6 +706,9 @@ mod tests {
             epoch,
             member_count,
             group_name: group_name.into(),
+            canonical_state: None,
+            scenario_input_ledger: Vec::new(),
+            pending_work: None,
             event_counts: ClientEventCounts::default(),
             received_payloads: Vec::new(),
             added_members: Vec::new(),
@@ -633,6 +726,7 @@ mod tests {
             pending_resolutions: Vec::new(),
             errors: Vec::new(),
             admin_policies: Vec::new(),
+            decryptability_probes: Vec::new(),
             observations,
         }
     }
@@ -664,6 +758,25 @@ mod tests {
         assert!(
             behaviors.contains(&OracleBehavior::ClientConvergence),
             "same epoch/member_count/group_name should count as convergence: {behaviors:#?}"
+        );
+    }
+
+    #[test]
+    fn trace_behaviors_finds_exact_equivalence_after_legacy_observations() {
+        let mut alice_exact = observation("alice", 2, 2, "winner");
+        alice_exact.canonical_state = Some(ConformanceCanonicalStateSnapshot::Live(Box::default()));
+        let mut bob_exact = observation("bob", 2, 2, "winner");
+        bob_exact.canonical_state = alice_exact.canonical_state.clone();
+        let observed = trace(vec![
+            observation("alice", 2, 2, "winner"),
+            observation("bob", 2, 2, "winner"),
+            alice_exact,
+            bob_exact,
+        ]);
+
+        assert!(
+            trace_behaviors(&observed).contains(&OracleBehavior::ExactStateEquivalence),
+            "legacy observations must not hide a later equivalent exact sample"
         );
     }
 }

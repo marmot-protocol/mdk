@@ -20,8 +20,10 @@
 //! broadcast welcomes (then the engine's `NotForThisClient` filter kicks
 //! in client-side).
 
+use crate::pending_work::BusPendingWorkSnapshot;
+use crate::scenario_input_ledger::ScenarioInputMetadata;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::types::MemberId;
+use cgka_traits::types::{MemberId, MessageId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +64,8 @@ struct Inner {
     /// If Some, only deliver to clients in this allowlist (partition).
     partition_allowed: Option<std::collections::HashSet<ClientId>>,
     delayed: HashMap<String, Vec<InFlight>>,
+    scenario_input_by_transport_id: HashMap<MessageId, ScenarioInputMetadata>,
+    scenario_input_by_content_id: HashMap<MessageId, ScenarioInputMetadata>,
 }
 
 impl TransportBus {
@@ -81,6 +85,8 @@ impl TransportBus {
                 mailboxes: HashMap::new(),
                 partition_allowed: None,
                 delayed: HashMap::new(),
+                scenario_input_by_transport_id: HashMap::new(),
+                scenario_input_by_content_id: HashMap::new(),
             })),
         }
     }
@@ -100,6 +106,46 @@ impl TransportBus {
     pub fn send(&self, sender: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
         inner.queue.push(InFlight { sender, msg });
+    }
+
+    pub(crate) fn register_scenario_input(
+        &self,
+        transport_id: MessageId,
+        content_id: MessageId,
+        mut metadata: ScenarioInputMetadata,
+    ) {
+        metadata.aliases = vec![transport_id.clone(), content_id.clone()];
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .scenario_input_by_transport_id
+            .insert(transport_id, metadata.clone());
+        inner
+            .scenario_input_by_content_id
+            .insert(content_id, metadata);
+    }
+
+    pub(crate) fn scenario_input_for_transport(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<ScenarioInputMetadata> {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_input_by_transport_id
+            .get(message_id)
+            .cloned()
+    }
+
+    pub(crate) fn scenario_input_for_content(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<ScenarioInputMetadata> {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_input_by_content_id
+            .get(message_id)
+            .cloned()
     }
 
     /// Deliver up to `n` messages from the queue into per-client mailboxes,
@@ -189,6 +235,28 @@ impl TransportBus {
         self.inner.lock().unwrap().queue.len()
     }
 
+    pub(crate) fn pending_work_snapshot(&self, client: ClientId) -> BusPendingWorkSnapshot {
+        let inner = self.inner.lock().unwrap();
+        let identity = inner
+            .clients
+            .get(&client)
+            .expect("pending-work client is attached");
+        BusPendingWorkSnapshot {
+            queued_messages: inner
+                .queue
+                .iter()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            delayed_messages: inner
+                .delayed
+                .values()
+                .flatten()
+                .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
+                .count(),
+            mailbox_messages: inner.mailboxes.get(&client).map_or(0, Vec::len),
+        }
+    }
+
     /// Snapshot queued messages without altering delivery order.
     pub fn queued_messages(&self) -> Vec<TransportMessage> {
         self.inner
@@ -267,6 +335,28 @@ impl TransportBus {
     /// when a test wants to inspect ordering before stepping.
     pub fn peek_policy(&self) -> DeliveryPolicy {
         self.inner.lock().unwrap().policy.clone()
+    }
+}
+
+fn targets_client(
+    policy: &DeliveryPolicy,
+    identity: &MemberId,
+    client: ClientId,
+    in_flight: &InFlight,
+) -> bool {
+    if in_flight.sender == client {
+        return false;
+    }
+    match &in_flight.msg.envelope {
+        TransportEnvelope::GroupMessage { .. } => true,
+        TransportEnvelope::Welcome { recipient } => {
+            matches!(
+                policy,
+                DeliveryPolicy::Ordered {
+                    broadcast_welcomes: true
+                }
+            ) || recipient == identity
+        }
     }
 }
 

@@ -4,7 +4,11 @@
 //! ids. They capture the deterministic observable outcome a conforming engine
 //! should produce after running the same scripted scenario.
 
-use crate::{HarnessClient, ScenarioSpec};
+use crate::{
+    BidirectionalDecryptabilityObservation, HarnessClient, PendingWorkObservation,
+    ScenarioInputLedgerEntry, ScenarioSpec,
+};
+use cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot;
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
     GroupStateChange,
@@ -122,6 +126,36 @@ pub enum TraceExpectation {
         epoch: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         member_count: Option<usize>,
+    },
+    /// Require the adopted canonical live-group projection to match exactly.
+    ///
+    /// Unlike `ClientsConverged`, this compares exact leaf identities and
+    /// capabilities, required capabilities, application profile/state,
+    /// lifecycle, GroupContext hash, and the conformance exporter commitment.
+    /// Scenario-input dispositions are asserted separately through
+    /// `ScenarioInputLedger`.
+    ClientsExactlyEquivalent {
+        clients: Vec<String>,
+    },
+    /// Require the complete per-client commit/proposal/application input ledger.
+    ScenarioInputLedger {
+        client: String,
+        entries: Vec<ScenarioInputLedgerEntry>,
+    },
+    /// Require every named client's exact progress snapshot to contain no
+    /// outstanding local engine, client-addressed transport, or logical-input
+    /// work.
+    ///
+    /// This is not an end-to-end delivery assertion for transport objects that
+    /// a fault policy dropped. Assert recipient ledger/output dispositions
+    /// separately when delivery is required.
+    NoPendingWork {
+        clients: Vec<String>,
+    },
+    /// Require a completed active application-message probe in every direction
+    /// between the named clients.
+    ClientsBidirectionallyDecryptable {
+        clients: Vec<String>,
     },
     ClientEpochChanges {
         client: String,
@@ -253,7 +287,7 @@ impl TraceExpectation {
                 received_payloads,
                 added_members,
                 removed_members,
-            } => match client_observation(observed, client) {
+            } => match client_legacy_observation(observed, client) {
                 Some(observation)
                     if observation.epoch == *epoch
                         && observation.member_count == *member_count
@@ -295,7 +329,7 @@ impl TraceExpectation {
             } => {
                 let mut observations = Vec::with_capacity(clients.len());
                 for client in clients {
-                    match client_observation(observed, client) {
+                    match client_legacy_observation(observed, client) {
                         Some(observation) => observations.push(observation),
                         None => {
                             missing_client(client, self, mismatches);
@@ -344,6 +378,173 @@ impl TraceExpectation {
                             "member_count": member_count,
                         }),
                         actual: json!(observations),
+                    });
+                }
+            }
+            TraceExpectation::ClientsExactlyEquivalent { clients } => {
+                let mut snapshots = Vec::with_capacity(clients.len());
+                for client in clients {
+                    let Some(latest_observation) = client_observation(observed, client) else {
+                        missing_client(client, self, mismatches);
+                        return;
+                    };
+                    let Some(observation) = client_canonical_observation(observed, client) else {
+                        mismatches.push(ExpectationFailure {
+                            kind: "missing_canonical_state".into(),
+                            message: format!(
+                                "client {client} was not observed with observe_client_exact"
+                            ),
+                            expected: json!(self),
+                            actual: json!(latest_observation),
+                        });
+                        return;
+                    };
+                    let snapshot = observation
+                        .canonical_state
+                        .as_ref()
+                        .expect("canonical observation carries canonical state");
+                    snapshots.push((client, snapshot));
+                }
+                if snapshots.is_empty() {
+                    mismatches.push(ExpectationFailure {
+                        kind: "empty_exact_equivalence_expectation".into(),
+                        message: "clients_exactly_equivalent did not name any clients".into(),
+                        expected: json!(self),
+                        actual: json!(observed.observations),
+                    });
+                    return;
+                }
+                let first = snapshots[0].1;
+                if snapshots.iter().any(|(_, snapshot)| *snapshot != first) {
+                    mismatches.push(ExpectationFailure {
+                        kind: "clients_not_exactly_equivalent".into(),
+                        message: format!(
+                            "clients {clients:?} have different canonical group snapshots"
+                        ),
+                        expected: json!({
+                            "clients": clients,
+                            "canonical_state": first,
+                        }),
+                        actual: json!(
+                            snapshots
+                                .into_iter()
+                                .map(|(client, snapshot)| json!({
+                                    "client": client,
+                                    "canonical_state": snapshot,
+                                }))
+                                .collect::<Vec<_>>()
+                        ),
+                    });
+                }
+            }
+            TraceExpectation::ScenarioInputLedger { client, entries } => {
+                match client_canonical_observation(observed, client)
+                    .or_else(|| client_observation(observed, client))
+                {
+                    Some(observation) if &observation.scenario_input_ledger == entries => {}
+                    Some(observation) => mismatches.push(ExpectationFailure {
+                        kind: "scenario_input_ledger_mismatch".into(),
+                        message: format!(
+                            "client {client} scenario-input disposition ledger did not match"
+                        ),
+                        expected: json!(entries),
+                        actual: json!(observation.scenario_input_ledger),
+                    }),
+                    None => missing_client(client, self, mismatches),
+                }
+            }
+            TraceExpectation::NoPendingWork { clients } => {
+                if clients.is_empty() {
+                    mismatches.push(ExpectationFailure {
+                        kind: "empty_no_pending_work_expectation".into(),
+                        message: "no_pending_work did not name any clients".into(),
+                        expected: json!(self),
+                        actual: json!(observed.observations),
+                    });
+                    return;
+                }
+                for client in clients {
+                    let Some(latest_observation) = client_observation(observed, client) else {
+                        missing_client(client, self, mismatches);
+                        return;
+                    };
+                    let Some(observation) = client_pending_work_observation(observed, client) else {
+                        mismatches.push(ExpectationFailure {
+                            kind: "missing_pending_work_observation".into(),
+                            message: format!(
+                                "client {client} was not observed with observe_client_exact"
+                            ),
+                            expected: json!(self),
+                            actual: json!(latest_observation),
+                        });
+                        continue;
+                    };
+                    let pending_work = observation
+                        .pending_work
+                        .as_ref()
+                        .expect("pending-work observation carries pending work");
+                    if !pending_work.is_empty() {
+                        mismatches.push(ExpectationFailure {
+                            kind: "pending_work_remaining".into(),
+                            message: format!(
+                                "client {client} still has pending work in {:?}",
+                                pending_work.blocking_subsystems()
+                            ),
+                            expected: json!({
+                                "client": client,
+                                "pending_work": PendingWorkObservation::default(),
+                            }),
+                            actual: json!(pending_work),
+                        });
+                    }
+                }
+            }
+            TraceExpectation::ClientsBidirectionallyDecryptable { clients } => {
+                let mut unique_clients = clients.clone();
+                unique_clients.sort();
+                unique_clients.dedup();
+                if clients.len() < 2 || unique_clients.len() != clients.len() {
+                    mismatches.push(ExpectationFailure {
+                        kind: "invalid_bidirectional_decryptability_expectation".into(),
+                        message: "clients_bidirectionally_decryptable requires at least two unique clients"
+                            .into(),
+                        expected: json!(self),
+                        actual: json!(observed.decryptability_probes),
+                    });
+                    return;
+                }
+                let Some(probe) = observed
+                    .decryptability_probes
+                    .iter()
+                    .rev()
+                    .find(|probe| probe.matches_clients(clients))
+                else {
+                    mismatches.push(ExpectationFailure {
+                        kind: "missing_bidirectional_decryptability_probe".into(),
+                        message: format!(
+                            "no bidirectional decryptability probe was run for clients {clients:?}"
+                        ),
+                        expected: json!(self),
+                        actual: json!(observed.decryptability_probes),
+                    });
+                    return;
+                };
+                if !probe.succeeded() {
+                    let failed_edges = probe
+                        .failed_edges()
+                        .into_iter()
+                        .map(|edge| format!("{}->{}", edge.sender, edge.recipient))
+                        .collect::<Vec<_>>();
+                    mismatches.push(ExpectationFailure {
+                        kind: "bidirectional_decryptability_failed".into(),
+                        message: format!(
+                            "application-message decryptability failed for directed edges {failed_edges:?}"
+                        ),
+                        expected: json!({
+                            "clients": clients,
+                            "all_directional_probes_delivered": true,
+                        }),
+                        actual: json!(probe),
                     });
                 }
             }
@@ -610,6 +811,8 @@ pub struct ScenarioTrace {
     pub errors: Vec<ScenarioErrorObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admin_policies: Vec<ScenarioAdminPolicyObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decryptability_probes: Vec<BidirectionalDecryptabilityObservation>,
     pub observations: Vec<ClientObservation>,
 }
 
@@ -650,6 +853,18 @@ pub struct ClientObservation {
     /// that predate the field.
     #[serde(default)]
     pub group_name: String,
+    /// Adopted canonical live-group projection. Legacy observations leave this
+    /// absent; strict reliability scenarios opt in through
+    /// [`observe_client_exact`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_state: Option<ConformanceCanonicalStateSnapshot>,
+    /// Application-message dispositions observed through public simulator
+    /// send, ingest, and event boundaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenario_input_ledger: Vec<ScenarioInputLedgerEntry>,
+    /// Instantaneous progress snapshot used only by strict observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_work: Option<PendingWorkObservation>,
     #[serde(default)]
     pub event_counts: ClientEventCounts,
     pub received_payloads: Vec<String>,
@@ -687,6 +902,45 @@ fn client_observation<'a>(
         .iter()
         .rev()
         .find(|observation| observation.client == client)
+}
+
+fn client_canonical_observation<'a>(
+    observed: &'a ScenarioTrace,
+    client: &str,
+) -> Option<&'a ClientObservation> {
+    observed
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == client && observation.canonical_state.is_some())
+}
+
+fn client_pending_work_observation<'a>(
+    observed: &'a ScenarioTrace,
+    client: &str,
+) -> Option<&'a ClientObservation> {
+    observed
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == client && observation.pending_work.is_some())
+}
+
+/// Legacy semantic expectations describe the event window captured by an
+/// `observe` step. A later `observe_exact` intentionally drains a fresh event
+/// window, so it must not replace the earlier observation for payload/member
+/// assertions. Fall back to any observation for fixtures that only use the
+/// exact step but still carry a legacy state expectation.
+fn client_legacy_observation<'a>(
+    observed: &'a ScenarioTrace,
+    client: &str,
+) -> Option<&'a ClientObservation> {
+    observed
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.client == client && observation.canonical_state.is_none())
+        .or_else(|| client_observation(observed, client))
 }
 
 fn missing_client(
@@ -842,6 +1096,9 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
         epoch: client.epoch().0,
         member_count: client.members().len(),
         group_name: client.group_name(),
+        canonical_state: None,
+        scenario_input_ledger: Vec::new(),
+        pending_work: None,
         event_counts,
         received_payloads: events
             .iter()
@@ -926,6 +1183,19 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
     }
 }
 
+/// Capture the normal application/event observation plus the adopted exact
+/// canonical group-state projection.
+pub fn observe_client_exact(
+    label: impl Into<String>,
+    client: &mut HarnessClient,
+) -> ClientObservation {
+    let mut observation = observe_client(label, client);
+    observation.canonical_state = Some(client.canonical_state_snapshot());
+    observation.scenario_input_ledger = client.scenario_input_ledger();
+    observation.pending_work = Some(client.pending_work_observation());
+    observation
+}
+
 fn observe_member_id(bytes: &[u8]) -> String {
     if let Some(label) = crate::client::logical_label_for_member_id(bytes) {
         return label;
@@ -967,6 +1237,8 @@ fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScenarioInputDisposition;
+    use cgka_engine::conformance_snapshot::{ConformanceGroupSnapshot, ConformanceLeafSnapshot};
 
     fn observation(client: &str, epoch: u64, member_count: usize) -> ClientObservation {
         ClientObservation {
@@ -974,6 +1246,9 @@ mod tests {
             epoch,
             member_count,
             group_name: String::new(),
+            canonical_state: None,
+            scenario_input_ledger: Vec::new(),
+            pending_work: None,
             event_counts: ClientEventCounts::default(),
             received_payloads: Vec::new(),
             added_members: Vec::new(),
@@ -991,8 +1266,31 @@ mod tests {
             pending_resolutions: Vec::new(),
             errors: Vec::new(),
             admin_policies: Vec::new(),
+            decryptability_probes: Vec::new(),
             observations,
         }
+    }
+
+    fn exact_snapshot(
+        member_identity: &str,
+        exporter_commitment: &str,
+    ) -> ConformanceCanonicalStateSnapshot {
+        ConformanceCanonicalStateSnapshot::Live(Box::new(ConformanceGroupSnapshot {
+            group_id_hex: "0102".into(),
+            epoch: 7,
+            group_context_sha256: "group-context".into(),
+            selected_branch_id: "group-context".into(),
+            exporter_commitment_sha256: exporter_commitment.into(),
+            leaves: vec![ConformanceLeafSnapshot {
+                leaf_index: 0,
+                account_identity_hex: member_identity.into(),
+                signature_public_key_hex: "shared-signature-key".into(),
+                ..Default::default()
+            }],
+            sorted_member_identities_hex: vec![member_identity.into()],
+            group_name: "group".into(),
+            ..Default::default()
+        }))
     }
 
     fn convergence_decision(
@@ -1058,6 +1356,173 @@ mod tests {
     }
 
     #[test]
+    fn scenario_input_ledger_expectation_is_exact() {
+        let mut alice = observation("alice", 1, 2);
+        alice.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-4:send_app_message".into(),
+            logical_id: Some("event-id".into()),
+            sender: "bob".into(),
+            payload: "hello".into(),
+            ingest_attempts: 2,
+            ingest_accepted: 1,
+            delivered: 1,
+            deduplicated: 1,
+            ..Default::default()
+        }];
+        let expected = alice.scenario_input_ledger.clone();
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ScenarioInputLedger {
+                client: "alice".into(),
+                entries: expected,
+            }],
+            &trace(vec![alice.clone()]),
+        );
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+        alice.scenario_input_ledger[0].delivered = 2;
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ScenarioInputLedger {
+                client: "alice".into(),
+                entries: vec![ScenarioInputLedgerEntry {
+                    scenario_id: "step-4:send_app_message".into(),
+                    logical_id: Some("event-id".into()),
+                    sender: "bob".into(),
+                    payload: "hello".into(),
+                    ingest_attempts: 2,
+                    ingest_accepted: 1,
+                    delivered: 1,
+                    deduplicated: 1,
+                    ..Default::default()
+                }],
+            }],
+            &trace(vec![alice]),
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "scenario_input_ledger_mismatch");
+    }
+
+    #[test]
+    fn no_pending_work_requires_an_empty_exact_progress_snapshot() {
+        let mut alice = observation("alice", 1, 2);
+        alice.pending_work = Some(PendingWorkObservation::default());
+        let expectation = TraceExpectation::NoPendingWork {
+            clients: vec!["alice".into()],
+        };
+
+        let failures = compare_trace_expectations(
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![alice.clone()]),
+        );
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+        alice
+            .pending_work
+            .as_mut()
+            .expect("pending snapshot")
+            .bus_delayed_messages = 1;
+        let failures = compare_trace_expectations(None, &[expectation], &trace(vec![alice]));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "pending_work_remaining");
+        assert!(
+            failures[0].message.contains("bus_delayed"),
+            "failure should name the blocking subsystem: {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn no_pending_work_rejects_legacy_observation_without_progress_snapshot() {
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::NoPendingWork {
+                clients: vec!["alice".into()],
+            }],
+            &trace(vec![observation("alice", 1, 2)]),
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "missing_pending_work_observation");
+    }
+
+    #[test]
+    fn bidirectional_decryptability_requires_every_directed_edge() {
+        let mut observed = trace(Vec::new());
+        observed.decryptability_probes = vec![BidirectionalDecryptabilityObservation {
+            step_index: 7,
+            clients: vec!["alice".into(), "bob".into()],
+            probes: vec![
+                crate::DirectionalDecryptabilityProbe {
+                    sender: "alice".into(),
+                    recipient: "bob".into(),
+                    payload: "alice-probe".into(),
+                    logical_id: Some("alice-id".into()),
+                    send_status: crate::DecryptabilityProbeSendStatus::Published,
+                    recipient_ledger: Some(ScenarioInputLedgerEntry {
+                        scenario_id: "probe:alice".into(),
+                        logical_id: Some("alice-id".into()),
+                        sender: "alice".into(),
+                        payload: "alice-probe".into(),
+                        delivered: 1,
+                        ..Default::default()
+                    }),
+                },
+                crate::DirectionalDecryptabilityProbe {
+                    sender: "bob".into(),
+                    recipient: "alice".into(),
+                    payload: "bob-probe".into(),
+                    logical_id: Some("bob-id".into()),
+                    send_status: crate::DecryptabilityProbeSendStatus::Published,
+                    recipient_ledger: Some(ScenarioInputLedgerEntry {
+                        scenario_id: "probe:bob".into(),
+                        logical_id: Some("bob-id".into()),
+                        sender: "bob".into(),
+                        payload: "bob-probe".into(),
+                        delivered: 1,
+                        ..Default::default()
+                    }),
+                },
+            ],
+        }];
+        let expectation = TraceExpectation::ClientsBidirectionallyDecryptable {
+            clients: vec!["alice".into(), "bob".into()],
+        };
+
+        let failures =
+            compare_trace_expectations(None, std::slice::from_ref(&expectation), &observed);
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+        observed.decryptability_probes[0].probes[0]
+            .recipient_ledger
+            .as_mut()
+            .expect("ledger")
+            .delivered = 0;
+        let failures = compare_trace_expectations(None, &[expectation], &observed);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "bidirectional_decryptability_failed");
+        assert!(failures[0].message.contains("alice->bob"));
+    }
+
+    #[test]
+    fn bidirectional_decryptability_requires_a_matching_active_probe() {
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsBidirectionallyDecryptable {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+            &trace(Vec::new()),
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].kind,
+            "missing_bidirectional_decryptability_probe"
+        );
+    }
+
+    #[test]
     fn clients_converged_expectation_rejects_group_data_branch_fork() {
         // Regression for mdk#162: a multi-committer group-data storm fork
         // leaves the committers on competing branches that share an epoch and
@@ -1103,6 +1568,110 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn exact_equivalence_rejects_same_count_with_different_member_identities() {
+        let mut alice = observation("alice", 7, 1);
+        alice.canonical_state = Some(exact_snapshot("alice-id", "commitment"));
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(exact_snapshot("bob-id", "commitment"));
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+            &trace(vec![alice, bob]),
+        );
+
+        assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
+        assert_eq!(failures[0].kind, "clients_not_exactly_equivalent");
+    }
+
+    #[test]
+    fn exact_equivalence_rejects_different_exporter_commitments() {
+        let mut alice = observation("alice", 7, 1);
+        alice.canonical_state = Some(exact_snapshot("shared-id", "alice-commitment"));
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(exact_snapshot("shared-id", "bob-commitment"));
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+            &trace(vec![alice, bob]),
+        );
+
+        assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
+        assert_eq!(failures[0].kind, "clients_not_exactly_equivalent");
+    }
+
+    #[test]
+    fn exact_equivalence_accepts_identical_canonical_snapshots() {
+        let snapshot = exact_snapshot("shared-id", "shared-commitment");
+        let mut alice = observation("alice", 7, 1);
+        alice.canonical_state = Some(snapshot.clone());
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(snapshot);
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsExactlyEquivalent {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+            &trace(vec![alice, bob]),
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn exact_expectations_use_latest_qualifying_sample_before_later_legacy_observation() {
+        let snapshot = exact_snapshot("shared-id", "shared-commitment");
+        let mut alice_exact = observation("alice", 7, 1);
+        alice_exact.canonical_state = Some(snapshot.clone());
+        alice_exact.pending_work = Some(PendingWorkObservation::default());
+        alice_exact.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-4:send_app_message".into(),
+            disposition: ScenarioInputDisposition::Delivered,
+            delivered: 1,
+            ..Default::default()
+        }];
+        let expected_ledger = alice_exact.scenario_input_ledger.clone();
+
+        let mut bob_exact = observation("bob", 7, 1);
+        bob_exact.canonical_state = Some(snapshot);
+        bob_exact.pending_work = Some(PendingWorkObservation::default());
+
+        let observed = trace(vec![
+            alice_exact,
+            bob_exact,
+            observation("alice", 7, 1),
+            observation("bob", 7, 1),
+        ]);
+        let failures = compare_trace_expectations(
+            None,
+            &[
+                TraceExpectation::ClientsExactlyEquivalent {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+                TraceExpectation::ScenarioInputLedger {
+                    client: "alice".into(),
+                    entries: expected_ledger,
+                },
+                TraceExpectation::NoPendingWork {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+            ],
+            &observed,
+        );
+
+        assert!(
+            failures.is_empty(),
+            "later legacy observations must not hide exact evidence: {failures:#?}"
+        );
     }
 
     #[test]

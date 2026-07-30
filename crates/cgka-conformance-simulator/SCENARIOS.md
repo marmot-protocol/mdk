@@ -122,7 +122,9 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/queue-faults.v1.json`
 - Setup: Alice creates a group with Bob and Carol. Bob and Carol send app messages.
 - Pressure: the bus duplicates, delays, releases, and reorders queued messages.
-- Expected: Alice receives each valid payload once in the expected observed order.
+- Expected: Alice receives each valid payload once in the expected observed order. The Rust mechanics regression for
+  this shape additionally captures the strict scenario-input ledger: two ingest attempts for the duplicated Bob event, one
+  application acceptance, one delivery, one deduplication, and no remaining work for that event.
 
 ### `partition-clear-leave/v1`
 
@@ -195,6 +197,95 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Expected: all clients converge and each receives the other two messages.
 - Reason: this duplicates the smoke vector at direct harness level.
 
+### `exact_oracle_matches_full_canonical_state_after_join`
+
+- Setup: Alice creates a group with Bob and Bob joins from the Welcome.
+- Pressure: the strict conformance projection is captured independently from both live engines.
+- Expected: every exact leaf/capability, required and application component, lifecycle/profile/admin field, GroupContext
+  hash, and exporter commitment matches. Sentinel unit tests separately prove that different member identities or
+  exporter commitments fail `ClientsExactlyEquivalent` even when epoch and member count match. Both joined clients
+  also pass `NoPendingWork`.
+
+### `exact_observation_ledgers_commit_proposal_and_application_dispositions`
+
+- Setup: Alice and Bob settle a group, Alice publishes a group-data commit and application event, and Bob publishes a
+  self-remove proposal.
+- Pressure: the exact observation correlates each action through randomized transport and content-derived ids after the
+  commit sender has already advanced MLS state.
+- Expected: the ledger contains stable scenario ids for all three input classes, the confirmed commit and published
+  application event are accepted, and the proposal exposes its exact current pending-or-accepted disposition.
+
+### `exact_oracle_projects_terminal_disband_tombstone_across_restart`
+
+- Setup: a current-profile solo member creates a group, requests disband, and advances the normal convergence path
+  until the authenticated disband commit terminalizes the group.
+- Pressure: live MLS state is deleted; exact observation must use only the durable tombstone, then survive a full
+  engine/storage restart.
+- Expected: the tagged terminal canonical state preserves group id, epoch, actor, origin commit, commit digest, and the
+  canonical former-member roster; it passes `NoPendingWork` and is byte-for-byte unchanged after restart.
+- Sentinel: an engine unit test proves that device-local committer-leaf status, roster order, and duplicate roster rows
+  do not change terminal equality.
+
+### `bidirectional_decryptability_probe_passes_for_settled_members`
+
+- Setup: Alice creates a settled three-member group with Bob and Carol.
+- Pressure: the active probe sends one exact logical application event from each member and exercises all six directed
+  sender-to-recipient edges through normal send, Nostr transport peel, MLS decrypt, and application delivery.
+- Expected: all six edges deliver, the exact canonical snapshots remain equivalent, and the probe leaves no pending
+  work.
+
+### `bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachability`
+
+- Setup: Alice and Bob begin settled; Alice confirms a group-data commit whose transport object is then dropped, leaving
+  Alice one epoch ahead of Bob.
+- Pressure: the active probe runs in both directions.
+- Expected: Bob's past-epoch event still decrypts at Alice, while Alice's future-epoch event remains
+  `transport_deferred` at Bob. `ClientsBidirectionallyDecryptable` reports only the failed Alice-to-Bob edge.
+
+### `bidirectional_decryptability_probe_rejects_a_named_nonmember`
+
+- Setup: Alice and Bob form a group while attached client Carol is deliberately not invited.
+- Pressure: Carol is included in the active probe client set.
+- Expected: Carol's send is recorded as a typed failed probe and the complete directed matrix cannot pass.
+
+### `no_pending_work_rejects_bus_queue_and_unread_mailbox`
+
+- Setup: Bob sends an application event to Alice after a stable two-member join.
+- Pressure: observe once while the transport object remains queued, then again after delivery but before Alice ingests
+  her mailbox.
+- Expected: the progress snapshot names `bus_queue` and `bus_mailboxes` as blockers; after Alice ticks, the exact
+  snapshot is empty.
+
+### `no_pending_work_rejects_delayed_transport_then_accepts_drained_delivery`
+
+- Setup: Bob sends an application event to Alice and the bus moves it into a named delayed queue.
+- Pressure: assert before and after release/delivery/ingest.
+- Expected: `NoPendingWork` initially fails with `bus_delayed`, then passes after the logical event is delivered and all
+  transport work drains.
+
+### `no_pending_work_rejects_unconfirmed_publish`
+
+- Setup: a stable group stages an invite without confirming publication.
+- Pressure: exact observation while the engine remains in `PendingPublish`.
+- Expected: `NoPendingWork` fails with an engine blocker even if public epoch/member facts otherwise look coherent.
+
+### `no_pending_work_does_not_claim_delivery_of_dropped_application_input`
+
+- Setup: Alice sends an application event to Bob after a stable two-member join, then a transport fault drops the queued
+  object before Bob receives it.
+- Pressure: compare each client's local pending-work snapshot with Bob's exact recipient ledger/output observation.
+- Expected: `NoPendingWork` passes for both clients once their local work is empty, while the independent delivery
+  expectation fails because Bob never observed the application input. This sentinel keeps local quiescence distinct
+  from end-to-end delivery.
+
+### `convergence_e2e_from_peeler_ingest_to_group_events`
+
+- Setup: two admins create competing invite branches and each sends an application event on its branch; two passive
+  observers ingest the real Nostr-wrapped transport objects.
+- Expected: each observer delivers the selected branch event exactly once and never projects the losing event. If the
+  losing transport object never peels, its ledger entry remains explicitly `transport_deferred` and pending rather than
+  being falsely labeled application-accepted or losing-branch-invalidated.
+
 ### `delayed_past_epoch_app_message_peels_from_retained_anchor`
 
 - Setup: Bob sends an epoch-1 app message. Alice advances the group by inviting David. The old app message arrives late.
@@ -247,9 +338,10 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `send-leave/v1`
 
-- Generator: `generate_send_leave_family`
+- Generator: `generate_send_leave_family` (generator version `2`)
 - Setup: three clients start in one group. The generator emits app sends and self-remove leaves.
-- Expected: remaining live members converge on the same epoch and member set.
+- Expected: remaining live members converge on exact canonical state after a final global drain and report no pending
+  work. The current leave shapes intentionally expose retained proposal/schedule work as a strict failure.
 
 ### `convergence-e2e-delivery/v1`
 
@@ -260,9 +352,10 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `convergence-chaos/v1`
 
-- Generator: `generate_convergence_chaos_family` (generator version `3`).
+- Generator: `generate_convergence_chaos_family` (generator version `4`).
 - Setup: the family rotates through the case classes below.
-- Expected: each case carries semantic expectations for convergence, rollback, payload delivery, or recovery.
+- Expected: each case carries semantic expectations for convergence, rollback, payload delivery, or recovery, then
+  performs a final global drain with exact-state and pending-work assertions.
 - Seed behavior: the rollback (`2`) and storm shapes (`6`, `7`, `8`, `9`) draw their delivery schedule from the seed,
   so distinct seeds exercise distinct adversarial orderings. Convergence, rollback, and payload-set expectations are
   invariant under delivery schedule, so they stay fixed while coverage grows with the seed. The remaining shapes are
@@ -286,7 +379,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of one app
   message released after Alice has already processed the original.
 - Expected: Alice remains at epoch 1 and receives Bob's post-rollback payloads once each, in the seed-driven delivery
-  order (the released app duplicate is deduped).
+  order (the released app duplicate is deduped). The strict final drain currently demonstrates that Bob can apply the
+  already-transported rolled-back commit and diverge from Alice.
 
 #### Chaos Class `3`: Partition Leave
 
@@ -298,7 +392,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 - Setup: Bob's epoch-1 app message is delayed while Alice invites David.
 - Pressure: late app delivery after an epoch advance.
-- Expected: Carol accepts the late app payload from retained context.
+- Expected: Carol accepts the late app payload from retained context. The strict pending-work boundary currently also
+  exposes that post-invite David retains the pre-join object as deferred logical work.
 
 #### Chaos Class `5`: Stable Queue Faults
 
@@ -331,7 +426,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Setup: Alice creates a 21-member group. Members send app messages, then eight members race group-data commits.
 - Pressure: large app-message load (seed-driven reorder) followed by a commit storm with a seed-driven duplicate and reorder.
 - Expected: the committers converge at epoch 2 with 21 members and the same branch-sensitive group name (see Chaos Class
-  `8`).
+  `8`). Strict oracle coverage currently also reports that the cleared application phase lacks a delivery or
+  invalidation expectation; this is a tracked oracle gap, not an engine-state failure.
 
 #### Chaos Class `10`: Restart Delivery Faults
 

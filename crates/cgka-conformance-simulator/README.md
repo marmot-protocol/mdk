@@ -23,6 +23,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
   step logs, recoveries, and expectation failures.
+- `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
+  and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
+  domain-separated exporter commitment. Raw exporter material is never serialized.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families, writes JSON reports, and
   emits fixture candidates for generated cases.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
@@ -73,8 +76,7 @@ To run every portable vector fixture and write a report for each one:
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
   --vectors crates/cgka-conformance-simulator/vectors \
   --out target/cgka-conformance-simulator-reports \
-  --storage file \
-  --strict-oracle
+  --storage file
 ```
 
 The normal `cargo test -p cgka-conformance-simulator` run already validates the top-level vector fixtures and checks the
@@ -85,6 +87,40 @@ pass/fail summary outside the test harness.
 The report command exits non-zero when any fixture expectation fails. Each report includes the exact scenario input,
 selected storage backend, observed trace, flattened recovery and epoch observations, and the mismatched expected/actual
 JSON.
+
+## Exact state oracle
+
+Legacy `observe_client` traces retain the portable epoch/member-count/group-name observation used by existing vectors.
+Reliability scenarios call `observe_client_exact` (or use the serializable `observe_exact` step) and assert
+`ClientsExactlyEquivalent` plus `ScenarioInputLedger`. The canonical-state expectation compares a tagged
+`ConformanceCanonicalStateSnapshot`: either the complete live-group `ConformanceGroupSnapshot` or the authenticated
+terminal disband tombstone. Equal member counts cannot hide different member identities, equal public metadata cannot
+hide different exporter state, and device-local `local_was_committer_leaf` metadata cannot split otherwise equivalent
+terminal clients. The engine interface is enabled only for this simulator through `test-conformance-snapshot`; it
+exposes the commitment, never the raw exporter secret.
+
+The scenario-input ledger gives every commit, proposal, and application action a stable scenario id, then joins it to
+the outer transport id and content-derived MLS id; application entries also retain the inner Marmot event id for
+delivery correlation. Per client it distinguishes send attempt/acceptance/queue/publication, protocol acceptance,
+transport deferral, application delivery, deduplication, expiry, invalidation, resource refusal, rejection, and pending
+work. In particular,
+`TransportDeferred` remains pending but is not mislabeled as application acceptance: until peeling succeeds, the engine
+cannot make a logical validity or branch claim about that object.
+
+`NoPendingWork` is the strict instantaneous local-progress assertion. An `observe_exact` step captures group-scoped
+engine work (publish lifecycle, convergence pass/input, queued outbound, deferred/retryable storage, and scheduling
+buffers), bus queue/delayed/mailbox work addressed to that client, and that client's pending scenario-input ledger
+entries. The expectation fails with the blocking subsystem names. It is deliberately not an end-to-end delivery claim
+for an application object that a transport fault dropped; scenarios that require delivery must assert the recipient's
+ledger or output separately. It does not yet wait for quiescence: virtual-time advancement, structural progress tokens,
+timeout policy, and retry-timer coverage belong to Milestone 1.3.
+
+`probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
+uniquely identified application event through the normal engine and transport path; the runner delivers the resulting
+objects, ticks every attached client, and records every directed sender-to-recipient edge. The
+`ClientsBidirectionallyDecryptable` expectation requires every edge to reach application delivery and preserves queued,
+failed, deferred, rejected, expired, and invalidated ledger evidence when it does not. The probe mutates the scenario by
+sending application messages, so place it after the state whose decryptability is being tested.
 
 ## Property tests
 
@@ -164,6 +200,8 @@ recovery without pinning which invite branch wins.
 - `deliver_all`
 - `tick`
 - `observe`
+- `observe_exact`
+- `probe_bidirectional_decryptability`
 - `clear_events`
 - `drop_queued`
 - `duplicate_queued`
@@ -183,7 +221,8 @@ label's messages to the end of the queue.
 
 ## Generated scenario families
 
-`generate_send_leave_family(seed, cases)` produces deterministic `GeneratedScenarioCase` values. Each case records:
+`generate_send_leave_family(seed, cases)` produces deterministic `GeneratedScenarioCase` values (generator version
+`2`). Each case records:
 
 - `family_name`
 - `generator_version`
@@ -196,6 +235,12 @@ The generated `scenario` is a normal `ScenarioSpec`, so a selected generated cas
 without inventing a separate execution path. We promote a case only when it should become a stable named contract, such
 as a regression fixture or the smallest readable example of a semantic edge.
 
+Send/leave and convergence-chaos reliability cases finish with a global transport/mailbox drain, an exact observation,
+and a per-client `NoPendingWork` expectation. Multi-client settled claims also require `ClientsExactlyEquivalent`, and
+delivery-sensitive cases assert recipient ledgers or outputs. These checks are intentionally capable of making a
+generated campaign red even when its earlier legacy observation passed; that is how hidden unread input, branch
+divergence, and retained work become visible.
+
 `generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic variants of
 `convergence-e2e-group-events/v1`. Each variant keeps the logical branch race stable but mutates queued delivery with
 duplicate, delay/release, and reorder steps before observer clients tick. Under the real Nostr peeler the settled
@@ -207,7 +252,7 @@ trace includes exactly the selected branch application payload.
 semantic expectations. The generator rotates through invite forks, group-data forks, publish rollback plus delayed app
 duplicates, partition/heal/leave, delayed past-epoch app delivery, stable duplicate/delay/reorder queue faults, 20+
 client message storms, partitioned large-group delivery storms, multi-committer group-data storms, mixed large
-message/commit storms, and restart plus duplicate delivery faults. Generator version `3` draws the delivery schedule of
+message/commit storms, and restart plus duplicate delivery faults. Generator version `4` draws the delivery schedule of
 the rollback and storm shapes from the seed, so distinct seeds exercise distinct adversarial orderings while the
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed. These cases are ordinary
 `ScenarioSpec`s, so the same runner and report path can turn selected generated cases into fixed vectors when that makes
@@ -272,8 +317,9 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 Reports are written as one file per case, for example
 `target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`. Generated family runs also write fixture
 candidates such as `target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.
-Pass `--strict-oracle` when a report run should fail on oracle coverage problems (`weak_oracle_warnings` or
-`missing_observed_behaviors`) instead of treating them as advisory metadata.
+Report runs are strict by default: oracle coverage problems (`weak_oracle_warnings` or
+`missing_observed_behaviors`) count as failures. `--strict-oracle` remains accepted for explicit scripts. Use
+`--allow-weak-oracle` only for exploratory legacy or diagnostic runs where advisory coverage is intentional.
 
 File-backed restart tests and the engine subprocess-kill tests cover durability when the encrypted database and WAL are
 intact: handles are closed or the process is killed, the database is reopened, and hydration reconciles interrupted

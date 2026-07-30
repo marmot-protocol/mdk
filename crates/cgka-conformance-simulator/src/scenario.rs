@@ -5,10 +5,11 @@
 //! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    ClientBuilder, ExpectationFailure, HarnessClient, HarnessStorageMode,
+    BidirectionalDecryptabilityObservation, ClientBuilder, DecryptabilityProbeSendStatus,
+    DirectionalDecryptabilityProbe, ExpectationFailure, HarnessClient, HarnessStorageMode,
     PendingResolutionObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
     ScenarioOracleReport, ScenarioTrace, TraceExpectation, TransportBus, VectorFixture,
-    build_scenario_oracle_report, compare_trace_expectations, observe_client,
+    build_scenario_oracle_report, compare_trace_expectations, observe_client, observe_client_exact,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
@@ -84,6 +85,16 @@ pub enum ScenarioStep {
     Observe {
         clients: Vec<String>,
     },
+    /// Capture the exact canonical state and scenario-input ledger used by
+    /// reliability expectations.
+    ObserveExact {
+        clients: Vec<String>,
+    },
+    /// Actively prove the application-message path in every direction between
+    /// the named clients.
+    ProbeBidirectionalDecryptability {
+        clients: Vec<String>,
+    },
     ObserveAdminPolicy {
         clients: Vec<String>,
     },
@@ -130,6 +141,10 @@ impl ScenarioStep {
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
             ScenarioStep::Observe { .. } => "observe",
+            ScenarioStep::ObserveExact { .. } => "observe_exact",
+            ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
+                "probe_bidirectional_decryptability"
+            }
             ScenarioStep::ObserveAdminPolicy { .. } => "observe_admin_policy",
             ScenarioStep::ClearEvents { .. } => "clear_events",
             ScenarioStep::DropQueued { .. } => "drop_queued",
@@ -385,6 +400,7 @@ async fn run_scenario_report_inner(
     let mut pending_refs = HashMap::new();
     let mut pending_resolutions = Vec::new();
     let mut observations = Vec::new();
+    let mut decryptability_probes = Vec::new();
     let mut admin_policy_observations = Vec::new();
     let mut error_observations = Vec::new();
     let mut step_log = Vec::new();
@@ -426,6 +442,7 @@ async fn run_scenario_report_inner(
             } => {
                 let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
                 let inviter = client_mut(&mut clients, inviter, step_index)?;
+                inviter.name_next_scenario_input(scenario_input_id(step_index, step));
                 let pending_ref = inviter.invite(key_packages).await;
                 insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
             }
@@ -435,6 +452,7 @@ async fn run_scenario_report_inner(
                 pending,
             } => {
                 let client = client_mut(&mut clients, client, step_index)?;
+                client.name_next_scenario_input(scenario_input_id(step_index, step));
                 let pending_ref = client.update_group_data(name.clone()).await;
                 insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
             }
@@ -445,6 +463,7 @@ async fn run_scenario_report_inner(
             } => {
                 let admin_ids = member_ids(&clients, admins, step_index)?;
                 let client = client_mut(&mut clients, client, step_index)?;
+                client.name_next_scenario_input(scenario_input_id(step_index, step));
                 let pending_ref = client.update_admin_policy(admin_ids).await.map_err(|e| {
                     err(
                         step_index,
@@ -513,10 +532,12 @@ async fn run_scenario_report_inner(
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 let sender = client_mut(&mut clients, sender, step_index)?;
+                sender.name_next_scenario_input(scenario_input_id(step_index, step));
                 sender.send_app(payload.clone().into_bytes()).await;
             }
             ScenarioStep::Leave { client } => {
                 let client = client_mut(&mut clients, client, step_index)?;
+                client.name_next_scenario_input(scenario_input_id(step_index, step));
                 client.leave().await;
             }
             ScenarioStep::DeliverAll => bus.deliver_all(),
@@ -531,6 +552,18 @@ async fn run_scenario_report_inner(
                     let client = client_mut(&mut clients, label, step_index)?;
                     observations.push(observe_client(label.clone(), client));
                 }
+            }
+            ScenarioStep::ObserveExact { clients: labels } => {
+                for label in labels {
+                    let client = client_mut(&mut clients, label, step_index)?;
+                    observations.push(observe_client_exact(label.clone(), client));
+                }
+            }
+            ScenarioStep::ProbeBidirectionalDecryptability { clients: labels } => {
+                decryptability_probes.push(
+                    run_bidirectional_decryptability_probe(&mut clients, &bus, labels, step_index)
+                        .await?,
+                );
             }
             ScenarioStep::ObserveAdminPolicy { clients: labels } => {
                 for label in labels {
@@ -613,6 +646,7 @@ async fn run_scenario_report_inner(
         pending_resolutions,
         errors: error_observations,
         admin_policies: admin_policy_observations,
+        decryptability_probes,
         observations,
     };
     let pending_resolution_observations = observed_trace.pending_resolutions.clone();
@@ -680,6 +714,92 @@ async fn run_scenario_report_inner(
         app_invalidation_observations,
         expectation_failures,
         invariant_failures,
+    })
+}
+
+fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
+    format!("step-{step_index}:{}", step.kind())
+}
+
+async fn run_bidirectional_decryptability_probe(
+    clients: &mut BTreeMap<String, HarnessClient>,
+    bus: &TransportBus,
+    labels: &[String],
+    step_index: usize,
+) -> Result<BidirectionalDecryptabilityObservation, ScenarioRunError> {
+    let mut unique_labels = labels.to_vec();
+    unique_labels.sort();
+    unique_labels.dedup();
+    if labels.len() < 2 || unique_labels.len() != labels.len() {
+        return Err(err(
+            step_index,
+            "bidirectional decryptability probe requires at least two unique clients".into(),
+        ));
+    }
+    for label in labels {
+        client_ref(clients, label, step_index)?;
+    }
+
+    let mut sends = BTreeMap::new();
+    for sender in labels {
+        let payload = format!("cgka-decryptability-probe/v1/{step_index}/{sender}");
+        let status = match client_mut(clients, sender, step_index)?
+            .try_send_app(payload.clone().into_bytes())
+            .await
+        {
+            Ok((status, logical_id)) => (status, Some(logical_id)),
+            Err(error) => (
+                DecryptabilityProbeSendStatus::Failed {
+                    error: observe_engine_error(&error),
+                },
+                None,
+            ),
+        };
+        sends.insert(sender.clone(), (payload, status));
+    }
+
+    bus.deliver_all();
+    let all_clients = clients.keys().cloned().collect::<Vec<_>>();
+    for label in all_clients {
+        client_mut(clients, &label, step_index)?.tick().await;
+    }
+
+    let mut recipient_ledgers = BTreeMap::new();
+    for recipient in labels {
+        recipient_ledgers.insert(
+            recipient.clone(),
+            client_mut(clients, recipient, step_index)?.scenario_input_ledger(),
+        );
+    }
+
+    let mut probes = Vec::with_capacity(labels.len() * (labels.len() - 1));
+    for sender in labels {
+        let (payload, (send_status, logical_id)) = sends
+            .get(sender)
+            .expect("probe send result exists for every validated sender");
+        for recipient in labels {
+            if recipient == sender {
+                continue;
+            }
+            let recipient_ledger = recipient_ledgers[recipient]
+                .iter()
+                .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref())
+                .cloned();
+            probes.push(DirectionalDecryptabilityProbe {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                payload: payload.clone(),
+                logical_id: logical_id.clone(),
+                send_status: send_status.clone(),
+                recipient_ledger,
+            });
+        }
+    }
+
+    Ok(BidirectionalDecryptabilityObservation {
+        step_index,
+        clients: labels.to_vec(),
+        probes,
     })
 }
 
