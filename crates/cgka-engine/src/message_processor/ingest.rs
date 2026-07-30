@@ -25,7 +25,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{
-    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
+    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
     ProposalRejectionCategory, StaleReason,
 };
 use cgka_traits::message::{MessageState, StoredMessagePayload};
@@ -128,9 +128,21 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
-                })
+                let category = match error {
+                    EngineError::Peeler(PeelerError::InvalidSignature)
+                    | EngineError::InvalidCredentialIdentity(_)
+                    | EngineError::InvalidAccountIdentityProof(_) => {
+                        InputRejectionCategory::InvalidSignature
+                    }
+                    EngineError::MissingRequiredCapabilities { .. } => {
+                        InputRejectionCategory::UnsupportedRequiredFeature
+                    }
+                    EngineError::NotGroupAdmin { .. } => {
+                        InputRejectionCategory::AuthorizationFailed
+                    }
+                    _ => InputRejectionCategory::InvalidEncoding,
+                };
+                Ok(IngestOutcome::Ignored { category })
             }
             Err(other) => Err(other),
         }
@@ -183,20 +195,27 @@ impl<S: StorageProvider> Engine<S> {
                         crate::message_disposition::MessageDisposition::Quarantined.tag(),
                     ),
                 );
-            } else if self.should_audit_peel_deferred_cap_rejection(&group_id) {
-                // Same flood cap as the deferral seam (mdk#339): a
-                // quarantined group's replay buffer must not grow unboundedly
-                // either. Audited once per cap-full episode so a flood does
-                // not emit one write per rejected message.
-                self.audit_group(
-                    &group_id,
-                    marmot_forensics::AuditEventKind::Rejection {
-                        msg_id: hex::encode(msg.id.as_slice()),
-                        reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
-                            .tag()
-                            .to_string(),
-                    },
-                );
+            } else {
+                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+                if self.should_audit_peel_deferred_cap_rejection(&group_id) {
+                    // Same flood cap as the deferral seam (mdk#339): a
+                    // quarantined group's replay buffer must not grow
+                    // unboundedly either. Audited once per cap-full episode so
+                    // a flood does not emit one write per rejected message.
+                    self.audit_group(
+                        &group_id,
+                        marmot_forensics::AuditEventKind::Rejection {
+                            msg_id: hex::encode(msg.id.as_slice()),
+                            reason: crate::message_disposition::MessageDisposition::DeferredCapacityRefused
+                                .tag()
+                                .to_string(),
+                        },
+                    );
+                }
+                return Ok(IngestOutcome::ResourceRefused {
+                    group_id,
+                    resource: InboundResourceLimit::TransportDeferredCapacity,
+                });
             }
             return Ok(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
@@ -352,13 +371,18 @@ impl<S: StorageProvider> Engine<S> {
                         // storage errors keep propagating as genuine engine
                         // faults.
                         Err(EngineError::Peeler(
-                            PeelerError::Malformed(_) | PeelerError::InvalidSignature,
+                            rejection @ (PeelerError::Malformed(_) | PeelerError::InvalidSignature),
                         )) => {
-                            return self.terminal_peel_rejection_stale(
+                            let category = if matches!(rejection, PeelerError::InvalidSignature) {
+                                InputRejectionCategory::InvalidSignature
+                            } else {
+                                InputRejectionCategory::InvalidEncoding
+                            };
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "malformed_payload_snapshot_fallback",
-                                StaleReason::PeelFailed,
+                                category,
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
@@ -406,7 +430,7 @@ impl<S: StorageProvider> Engine<S> {
                                     &group_id,
                                     marmot_forensics::AuditEventKind::Rejection {
                                         msg_id: msg_id_hex.clone(),
-                                        reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
+                                        reason: crate::message_disposition::MessageDisposition::DeferredCapacityRefused
                                             .tag()
                                             .to_string(),
                                     },
@@ -417,8 +441,9 @@ impl<S: StorageProvider> Engine<S> {
                                 method = "ingest_group_message",
                                 "peel-deferred row cap reached; dropping undecryptable input unpersisted"
                             );
-                            return Ok(IngestOutcome::Stale {
-                                reason: StaleReason::PeelFailed,
+                            return Ok(IngestOutcome::ResourceRefused {
+                                group_id,
+                                resource: InboundResourceLimit::TransportDeferredCapacity,
                             });
                         }
                         self.persist_transport_message(
@@ -438,12 +463,13 @@ impl<S: StorageProvider> Engine<S> {
                                 crate::message_disposition::MessageDisposition::RetryPending.tag(),
                             ),
                         );
-                        return Ok(IngestOutcome::Stale {
-                            reason: StaleReason::PeelFailed,
-                        });
+                        return Ok(IngestOutcome::TransportDeferred { group_id });
                     }
                 }
-                Err(PeelerError::StaleEpoch { .. }) => {
+                Err(PeelerError::StaleEpoch {
+                    message_epoch,
+                    context_epoch,
+                }) => {
                     let recovered = match self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
@@ -463,13 +489,18 @@ impl<S: StorageProvider> Engine<S> {
                         // storage errors keep propagating as genuine engine
                         // faults.
                         Err(EngineError::Peeler(
-                            PeelerError::Malformed(_) | PeelerError::InvalidSignature,
+                            rejection @ (PeelerError::Malformed(_) | PeelerError::InvalidSignature),
                         )) => {
-                            return self.terminal_peel_rejection_stale(
+                            let category = if matches!(rejection, PeelerError::InvalidSignature) {
+                                InputRejectionCategory::InvalidSignature
+                            } else {
+                                InputRejectionCategory::InvalidEncoding
+                            };
+                            return self.terminal_peel_rejection_ignored(
                                 &raw_msg_id,
                                 &msg.id,
                                 "malformed_payload_snapshot_fallback",
-                                StaleReason::PeelFailed,
+                                category,
                             );
                         }
                         Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
@@ -524,7 +555,10 @@ impl<S: StorageProvider> Engine<S> {
                             ),
                         );
                         return Ok(IngestOutcome::Stale {
-                            reason: StaleReason::PeelFailed,
+                            reason: StaleReason::AlreadyAtEpoch {
+                                current: context_epoch,
+                                msg_epoch: message_epoch,
+                            },
                         });
                     }
                 }
@@ -546,11 +580,16 @@ impl<S: StorageProvider> Engine<S> {
                     } else {
                         "malformed_payload"
                     };
-                    return self.terminal_peel_rejection_stale(
+                    let category = if matches!(rejection, PeelerError::InvalidSignature) {
+                        InputRejectionCategory::InvalidSignature
+                    } else {
+                        InputRejectionCategory::InvalidEncoding
+                    };
+                    return self.terminal_peel_rejection_ignored(
                         &raw_msg_id,
                         &msg.id,
                         reason,
-                        StaleReason::PeelFailed,
+                        category,
                     );
                 }
                 Err(PeelerError::WrongRecipient) => {
@@ -579,8 +618,8 @@ impl<S: StorageProvider> Engine<S> {
                         current_epoch,
                         MessageState::Failed,
                     )?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                    return Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::InvalidEncoding,
                     });
                 }
             };
@@ -644,8 +683,8 @@ impl<S: StorageProvider> Engine<S> {
                         &raw_msg_id,
                         "malformed_mls_message",
                     )?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                    return Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::InvalidEncoding,
                     });
                 }
             };
@@ -667,8 +706,8 @@ impl<S: StorageProvider> Engine<S> {
                         &raw_msg_id,
                         "non_mls_message_body",
                     )?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                    return Ok(IngestOutcome::Ignored {
+                        category: InputRejectionCategory::InvalidEncoding,
                     });
                 }
             };
@@ -702,7 +741,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                 return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                    reason: StaleReason::PreMembership,
                 });
             }
 
@@ -777,16 +816,21 @@ impl<S: StorageProvider> Engine<S> {
                     // before the join epoch the message was never decryptable
                     // here by design; at or after it, this device was a
                     // member but the past-epoch secrets are gone.
-                    let tag = if self.msg_is_pre_membership(&group_id, msg_epoch) {
+                    let pre_membership = self.msg_is_pre_membership(&group_id, msg_epoch);
+                    let tag = if pre_membership {
                         crate::message_disposition::MessageDisposition::PreMembershipEvent.tag()
                     } else {
-                        crate::message_disposition::MessageDisposition::ValidHistorySnapshotMissing
+                        crate::message_disposition::MessageDisposition::AppPayloadRetentionExpired
                             .tag()
                     };
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                     return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                        reason: if pre_membership {
+                            StaleReason::PreMembership
+                        } else {
+                            StaleReason::BeyondAppRetention
+                        },
                     });
                 }
                 Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
@@ -856,7 +900,7 @@ impl<S: StorageProvider> Engine<S> {
                                     "invalid_fork_candidate_probe",
                                 )?;
                                 return Ok(IngestOutcome::Stale {
-                                    reason: StaleReason::PeelFailed,
+                                    reason: StaleReason::InvalidAgainstCanonicalState,
                                 });
                             }
                             Err(ForkProbeError::Engine(error)) => return Err(error),
@@ -982,8 +1026,8 @@ impl<S: StorageProvider> Engine<S> {
                             &raw_msg_id,
                             "unattributable_sender",
                         )?;
-                        return Ok(IngestOutcome::Stale {
-                            reason: StaleReason::PeelFailed,
+                        return Ok(IngestOutcome::Ignored {
+                            category: InputRejectionCategory::InvalidSignature,
                         });
                     };
                     let payload = bytes.into_bytes();
@@ -1004,8 +1048,8 @@ impl<S: StorageProvider> Engine<S> {
                                 &raw_msg_id,
                                 "invalid_app_payload",
                             )?;
-                            return Ok(IngestOutcome::Stale {
-                                reason: StaleReason::PeelFailed,
+                            return Ok(IngestOutcome::Ignored {
+                                category: InputRejectionCategory::InvalidEncoding,
                             });
                         }
                     };
@@ -2041,27 +2085,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Terminal disposition for malformed, unauthenticated, or misaddressed
-    /// transport input: retire the awaiting-retry raw transport row (a no-op on
-    /// the direct path, where no deferred row exists), mark the id seen so a
-    /// redelivery short-circuits, and classify the input with the supplied
-    /// typed stale reason. Shared by the direct peel and both
-    /// snapshot-fallback seams so the terminal behavior has a single
-    /// definition — a guard living on one seam only is a bug (mdk#707).
-    fn terminal_peel_rejection_stale(
-        &mut self,
-        raw_msg_id: &MessageId,
-        msg_id: &MessageId,
-        reason: &'static str,
-        stale_reason: StaleReason,
-    ) -> Result<IngestOutcome, EngineError> {
-        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
-        self.seen_message_ids.insert(msg_id.clone());
-        Ok(IngestOutcome::Stale {
-            reason: stale_reason,
-        })
-    }
-
     fn terminal_peel_rejection_ignored(
         &mut self,
         raw_msg_id: &MessageId,
@@ -2510,8 +2533,26 @@ fn convergence_ingest_outcome(
         if let Some(category) = dropped.rejection_category {
             return IngestOutcome::Rejected { category };
         }
-        return IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed,
+        use crate::canonicalization::DroppedMessageReason;
+        return match dropped.reason {
+            DroppedMessageReason::BeyondRollbackHorizon => IngestOutcome::Stale {
+                reason: StaleReason::BeyondRollbackHorizon,
+            },
+            DroppedMessageReason::BeyondAnchor => IngestOutcome::Stale {
+                reason: StaleReason::BeyondAnchor,
+            },
+            DroppedMessageReason::BeyondAppRetention => IngestOutcome::Stale {
+                reason: StaleReason::BeyondAppRetention,
+            },
+            DroppedMessageReason::InvalidAgainstCandidateState => IngestOutcome::Stale {
+                reason: StaleReason::InvalidAgainstCanonicalState,
+            },
+            DroppedMessageReason::UnsupportedPolicy => IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnsupportedRequiredFeature,
+            },
+            DroppedMessageReason::Malformed => IngestOutcome::Ignored {
+                category: InputRejectionCategory::InvalidEncoding,
+            },
         };
     }
     if let Some(inv) = result
@@ -2526,11 +2567,19 @@ fn convergence_ingest_outcome(
                 // Buffered so the application keeps the message and
                 // waits for branch selection to advance.
             }
-            InvalidatedAppMessageReason::LosingBranch
-            | InvalidatedAppMessageReason::BeyondAnchor
-            | InvalidatedAppMessageReason::BeyondAppRetention => {
+            InvalidatedAppMessageReason::LosingBranch => {
                 return IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                    reason: StaleReason::LosingBranch,
+                };
+            }
+            InvalidatedAppMessageReason::BeyondAnchor => {
+                return IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAnchor,
+                };
+            }
+            InvalidatedAppMessageReason::BeyondAppRetention => {
+                return IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAppRetention,
                 };
             }
         }

@@ -80,6 +80,12 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides` feature is enabled; normal debug and release
     /// builds ignore it so hosts cannot fork the pinned v1 baseline (mdk#970).
     pub dev_settlement_quiescence_ms: Option<u64>,
+    /// Dev/test-only delay added after the engine-reported convergence cutoff
+    /// before the account worker runs scheduled convergence. `None` (the
+    /// default) adds no delay. Honored only with `test-policy-overrides`; this
+    /// lets integration tests hold the precise post-cutoff/pre-scheduler state
+    /// without changing protocol timing in normal builds.
+    pub dev_scheduled_convergence_delay_ms: Option<u64>,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -130,6 +136,7 @@ impl Default for MarmotAppConfig {
             allow_loopback_blob_endpoints: false,
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
+            dev_scheduled_convergence_delay_ms: None,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -200,6 +207,13 @@ impl MarmotAppConfig {
     /// ignore this field; explicit test harnesses set `0` for instant settlement.
     pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
         self.dev_settlement_quiescence_ms = Some(ms);
+        self
+    }
+
+    /// Add a test-only delay between the engine cutoff and the account
+    /// worker's scheduled convergence pass. Normal builds ignore this field.
+    pub fn with_dev_scheduled_convergence_delay_ms(mut self, ms: u64) -> Self {
+        self.dev_scheduled_convergence_delay_ms = Some(ms);
         self
     }
 }

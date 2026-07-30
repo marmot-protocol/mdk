@@ -426,6 +426,10 @@ mod tests {
             unused()
         }
 
+        fn delete_message(&self, _id: &MessageId) -> StorageResult<()> {
+            unused()
+        }
+
         fn update_message_state(
             &self,
             _id: &MessageId,

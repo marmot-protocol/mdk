@@ -15,6 +15,33 @@ versioning through the workspace version in the root `Cargo.toml`.
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`
   destinations without a second client-side URL parser.
+  
+- MarmotKit and the agent connector now acquire a nonblocking, kernel-released
+  exclusive lease on their root before opening shared state. MarmotKit exposes
+  typed `RuntimeBusy` contention so foreground apps can retry and notification
+  extensions can return bounded fallback content instead of creating a second
+  stateful writer.
+  
+### Fixed
+
+- Group state changes settle promptly again when messages are queued for
+  sending: a queued ordinary message no longer delays the next convergence
+  pass (only an admin group-state change may briefly hold that boundary, as
+  the protocol requires), and busy groups are no longer demoted to retry
+  backoff while convergence is legitimately still collecting.
+
+- Runtime chat-list and group-state subscriptions now observe group state
+  changes (for example a group rename) that a member's own outbound send
+  applied by folding retained convergence commits. Previously those events were
+  dropped on the send path, so storage showed the new state while live
+  subscribers were never notified.
+
+### Changed
+
+- The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
+  providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
+  corruption fix. The pinned Rust toolchain is now 1.95.0, the minimum release
+  that supports this libsqlite3-sys build.
 
 ## [0.9.10] - 2026-07-29
 

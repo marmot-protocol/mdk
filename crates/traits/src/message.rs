@@ -196,6 +196,7 @@ pub struct MessageRecord {
 ///   `Created` → `PeelDeferred` (transport bytes retained for later peel)
 ///   `Retryable` → `Processed` (retry succeeded)
 ///   `PeelDeferred` → `Created` (peel succeeded and MLS bytes are buffered)
+///   `PeelDeferred` → deleted (local retry budget exhausted; redelivery remains eligible)
 ///   any → `EpochInvalidated` (group forked past; message will never apply)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageState {

@@ -110,6 +110,11 @@ pub enum AppError {
     SqlcipherKeyDerivation(String),
     #[error("blocking app task failed: {0}")]
     BlockingTask(String),
+    /// Another process or independently constructed production runtime owns
+    /// the same Marmot root. Acquisition is intentionally nonblocking so an
+    /// iOS notification extension can take its bounded fallback path.
+    #[error("marmot runtime root is already in use")]
+    RuntimeBusy,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -189,6 +194,7 @@ impl AppError {
             Self::NotificationsDisabled => "notifications_disabled",
             Self::SqlcipherKeyDerivation(_) => "sqlcipher_key_derivation",
             Self::BlockingTask(_) => "blocking_task",
+            Self::RuntimeBusy => "runtime_busy",
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",

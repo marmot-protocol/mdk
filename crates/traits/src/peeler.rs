@@ -97,8 +97,9 @@ impl GroupMessageMetadata {
 ///   when that hint is older than the supplied context; transports without
 ///   such a hint (e.g. the Nostr binding, whose kind-445 content is opaque
 ///   `base64(nonce || ciphertext)`) simply return `DecryptFailed`. The engine
-///   maps both to `StaleReason::PeelFailed`, choosing retry or terminal
-///   storage from the available epoch evidence.
+///   maps a potentially recoverable miss to
+///   `IngestOutcome::TransportDeferred`; authenticated epoch evidence can
+///   instead establish a terminal stale classification.
 /// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
 ///   local identity — the engine maps that to
 ///   `InputRejectionCategory::WrongRecipient`.

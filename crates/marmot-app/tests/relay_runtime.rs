@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(feature = "test-policy-overrides")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
@@ -71,6 +73,29 @@ fn install_mock_keyring() {
             keyring_core::set_default_store(store);
         }
     });
+}
+
+/// Rejects kind-445 group messages while armed. Lets a test accept setup
+/// traffic normally, then fail exactly one member's outbound publish window.
+#[cfg(feature = "test-policy-overrides")]
+#[derive(Debug)]
+struct RejectGroupMessagesWhileArmed(Arc<AtomicBool>);
+
+#[cfg(feature = "test-policy-overrides")]
+impl WritePolicy for RejectGroupMessagesWhileArmed {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if self.0.load(Ordering::Relaxed) && event.kind == Kind::MlsGroupMessage {
+                PolicyResult::Reject("injected group-message rejection".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -406,7 +431,7 @@ async fn publish_nostr_event_at(
 /// ephemeral key, h-tagged to `nostr_group_id_hex`. Mirrors the probe publisher
 /// in `next_event_backfill.rs`: real kind-445 senders always sign with a fresh
 /// per-event key, and a zero-nonce marker body peels to a clean
-/// `PeelFailed` — the `IngestOutcome::Stale` shape the epoch-stall detector
+/// `TransportDeferred` — the typed availability outcome the epoch-stall detector
 /// counts toward arming a backfill. Distinct `marker`s yield distinct event ids,
 /// hence distinct undecryptables at the group's one stalled epoch.
 async fn publish_garbage_group_message(
@@ -3422,6 +3447,219 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
     runtime.shutdown().await;
 }
 
+/// A member send that lands while a peer's rename commit sits in the
+/// convergence collection window folds that commit inside the send, so its
+/// group events surface through the send's effects rather than the inbound
+/// ingest or scheduled-convergence seams. The runtime must still broadcast
+/// them: bob's group-state subscription has to observe the rename even though
+/// his own send — not a receive — applied it.
+///
+/// This regression uses explicit test-policy overrides to create the precise
+/// post-cutoff/pre-scheduler state. `update_group_profile` completes its
+/// cross-account catch-up before returning, proving bob has ingested the
+/// rename. The test then lets the 100ms engine cutoff elapse while holding the
+/// scheduled worker for 60s. The send is therefore the only operation that can
+/// move bob's durable row from the old name to the new one, and the
+/// subscription must update within 5s, well before scheduled convergence can
+/// provide an alternate broadcasting seam.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100)
+            .with_dev_scheduled_convergence_delay_ms(60_000),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "interleaved send",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let mut group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .unwrap();
+
+    let renamed = "renamed during retained send".to_owned();
+    runtime
+        .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+        .await
+        .unwrap();
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "bob's completed catch-up must retain the rename without applying it"
+    );
+    sleep(Duration::from_millis(250)).await;
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the test scheduler delay must hold the post-cutoff rename"
+    );
+
+    let summary = runtime
+        .send_message(&bob_id, &group_id, b"bob interleaved".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        summary.published > 0,
+        "the interleaved send must publish rather than queue"
+    );
+    assert_eq!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the send must synchronously fold the retained rename"
+    );
+
+    // After a witnessed fold the retained input is consumed, so scheduled
+    // convergence has nothing left to broadcast for this rename: only the
+    // send-path observe/broadcast can satisfy this assertion.
+    let updated =
+        wait_for_group_state_update(&mut group_state, |group| group.profile.name == renamed).await;
+    assert_eq!(updated.group_id_hex, group_id_hex);
+
+    runtime.shutdown().await;
+}
+
+/// Same interleaving as
+/// `group_state_subscription_observes_rename_applied_during_interleaved_send`,
+/// but bob's own outbound publish is rejected by the relay. A send that folds
+/// the retained rename commit has durably applied it before the publish
+/// attempt, so the commit's group events must reach the subscription even
+/// when the message itself hard-fails: the witnessed round requires the
+/// injected publish error plus the immediate post-send row flip, and the
+/// subscription assertion runs while the relay still rejects bob's publishes,
+/// so the queued-drain seam stays blocked and cannot deliver the rename on a
+/// build that drops send-applied events.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn group_state_subscription_observes_rename_applied_during_failed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let reject_armed = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectGroupMessagesWhileArmed(reject_armed.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100)
+            .with_dev_scheduled_convergence_delay_ms(60_000),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "failed send fold",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let mut group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .unwrap();
+
+    let renamed = "renamed during rejected send".to_owned();
+    runtime
+        .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+        .await
+        .unwrap();
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "bob's completed catch-up must retain the rename without applying it"
+    );
+    sleep(Duration::from_millis(250)).await;
+    assert_ne!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the test scheduler delay must hold the post-cutoff rename"
+    );
+
+    reject_armed.store(true, Ordering::Relaxed);
+    let send_result = runtime
+        .send_message(&bob_id, &group_id, b"bob rejected".to_vec())
+        .await;
+    assert!(
+        matches!(send_result, Err(AppError::Publish(_))),
+        "the folded send must reach the injected hard-publish failure"
+    );
+    assert_eq!(
+        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
+        Some(renamed.as_str()),
+        "the failed send must still synchronously fold the retained rename"
+    );
+
+    // The relay still rejects bob's publishes here, so the queued-drain seam
+    // cannot rescue the rename: only the send-path observe/broadcast of the
+    // failed send can satisfy this assertion.
+    let updated =
+        wait_for_group_state_update(&mut group_state, |group| group.profile.name == renamed).await;
+    assert_eq!(updated.group_id_hex, group_id_hex);
+    reject_armed.store(false, Ordering::Relaxed);
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
     let dir = tempfile::tempdir().unwrap();
@@ -3621,6 +3859,16 @@ where
     })
     .await
     .expect("runtime chat update")
+}
+
+/// Current chat-list row title for one group, read fresh from the projection
+/// (rebuilt on read after any state save). Used as the durable witness that a
+/// group-state commit has been applied locally.
+#[cfg(feature = "test-policy-overrides")]
+fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String> {
+    app.chat_list_row(label, group_id_hex)
+        .unwrap()
+        .map(|row| row.title)
 }
 
 async fn wait_for_group_state_update<F>(
@@ -6665,4 +6913,125 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
             .is_some(),
         "the winning leave leaves exactly one durable request behind"
     );
+}
+
+/// Convergence remediation-plan liveness guard: successive inbound commits,
+/// each with a member send fired while the commit is still converging, must
+/// keep settling promptly through the real worker scheduling path.
+///
+/// The queued mid-window path is asserted *opportunistically*: measured on
+/// both a dev machine and CI, a healthy in-proc relay settles a linear
+/// rename commit in well under one quiescence window, so the interval in
+/// which a member send lands mid-window is a sub-300ms race that can be won
+/// or lost systematically per machine (CI lost it 8/8 with no delay; a dev
+/// machine lost it 12/12 with a 300ms delay). A round whose send does
+/// report `published == 0` (durably queued, nothing on transport) gets the
+/// hard latency assertion; rounds that publish directly still assert
+/// liveness through the real worker scheduling path.
+///
+/// The deterministic queued-path and parking contracts live in the engine
+/// tests (`cgka-engine/tests/distributed_convergence.rs`:
+/// `pass_opens_while_app_message_intents_are_queued` and the reservation
+/// suite), which fail outright against the pre-fix engine. Forcing the
+/// queued path at this layer through public APIs would require a test-only
+/// transport-pause or pass-phase diagnostics seam (PR-B candidate).
+#[tokio::test]
+async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "settling liveness",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    const ROUNDS: u32 = 3;
+    for round in 0..ROUNDS {
+        let renamed = format!("settling-round-{round}");
+        runtime
+            .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
+            .await
+            .unwrap();
+        // Fire bob's send immediately: when it wins the race into bob's
+        // collection window, `published == 0` marks the queued path and the
+        // hard latency bound below applies.
+        let text = format!("bob mid-window {round}");
+        let send_accepted_at = Instant::now();
+        let summary = runtime
+            .send_message(&bob_id, &group_id, text.clone().into_bytes())
+            .await
+            .unwrap();
+        let send_was_queued = summary.published == 0;
+
+        // Wait on bob's *projection* (poll), not the group-state
+        // subscription: the projection is the authoritative apply witness
+        // here, and the subscription can stay silent for a rename when a
+        // send interleaves (tracked separately; not this test's contract).
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let row = app
+                    .chat_list_row(&bob.account.label, &group_id_hex)
+                    .unwrap();
+                if row.is_some_and(|row| row.title == renamed) {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("bob applies the rename commit");
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == alice_id
+                        && message.message.group_id == group_id
+                        && message.message.plaintext == text
+            )
+        })
+        .await;
+
+        if send_was_queued {
+            let queued_send_latency = send_accepted_at.elapsed();
+            // One settlement cycle plus drain: nominally ~1.1-1.4s (1000ms
+            // quiescence + 100ms schedule margin + worker/publish slack). The
+            // pre-fix drain deferred a queued app intent past the apply tick
+            // whenever retained inbound was present, adding at least one more
+            // full settlement cycle (>= ~2.2s nominal, more on a loaded
+            // runner). 2.5s separates the classes with CI headroom.
+            assert!(
+                queued_send_latency < Duration::from_millis(2_500),
+                "queued mid-window send must publish within one settlement \
+                 cycle plus drain; took {queued_send_latency:?}"
+            );
+        }
+    }
+
+    runtime.shutdown().await;
 }

@@ -115,6 +115,30 @@ impl EpochStallDetector {
             false
         }
     }
+
+    /// A resource refusal proves that at least one object in the fetched
+    /// history was not retained. Signal a replay immediately (once per epoch)
+    /// instead of waiting for the undecryptable-message threshold: the
+    /// threshold detects a likely gap, while this outcome is direct evidence
+    /// of one.
+    pub(crate) fn observe_resource_refusal(&mut self, group: GroupId, epoch: EpochId) -> bool {
+        let stall = self.groups.entry(group).or_insert_with(|| GroupStall {
+            epoch,
+            undecryptable: HashSet::new(),
+            fired_at_epoch: None,
+        });
+        if stall.epoch != epoch {
+            stall.epoch = epoch;
+            stall.undecryptable.clear();
+            stall.fired_at_epoch = None;
+        }
+        if stall.fired_at_epoch == Some(epoch) {
+            false
+        } else {
+            stall.fired_at_epoch = Some(epoch);
+            true
+        }
+    }
 }
 
 impl Default for EpochStallDetector {
@@ -159,6 +183,16 @@ mod tests {
         // would let a burst (or a spray of attacker-minted ids) trigger a storm.
         assert!(!detector.observe_undecryptable(g.clone(), "m4".into(), e));
         assert!(!detector.observe_undecryptable(g.clone(), "m5".into(), e));
+    }
+
+    #[test]
+    fn resource_refusal_signals_immediately_once_per_epoch() {
+        let mut detector = EpochStallDetector::new(8);
+        let g = group(0x01);
+
+        assert!(detector.observe_resource_refusal(g.clone(), EpochId(19)));
+        assert!(!detector.observe_resource_refusal(g.clone(), EpochId(19)));
+        assert!(detector.observe_resource_refusal(g, EpochId(20)));
     }
 
     #[test]

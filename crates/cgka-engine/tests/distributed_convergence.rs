@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DroppedMessageReason,
-    InvalidatedAppMessageReason, MessageKind,
+    InvalidatedAppMessageReason, MessageKind, V1_MAX_CONVERGENCE_PASS_MS,
+    V1_SETTLEMENT_QUIESCENCE_MS,
 };
 use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -2255,6 +2256,516 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
         .expect("second pass persisted");
     assert_eq!(second_pass.generation, 1);
     assert!(second_pass.members.len() >= 2);
+}
+
+/// Create a two-member group (alice creator/admin, carol member+admin) and
+/// return its id with carol joined. Shared setup for the scoped-reservation
+/// tests below.
+async fn create_reservation_test_group(
+    alice: &mut Engine<SqliteAccountStorage>,
+    carol: &mut Engine<SqliteAccountStorage>,
+    name: &str,
+) -> GroupId {
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: name.into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    group_id
+}
+
+/// Produce one confirmed linear group-state commit from `alice` (a profile
+/// rename), routed for convergence delivery. Each call advances alice by one
+/// epoch, so repeated calls model continuous inbound commit traffic.
+async fn alice_rename_commit(
+    alice: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    name: &str,
+) -> TransportMessage {
+    let result = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some(name.into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = evolution(result);
+    alice.confirm_published(pending).await.unwrap();
+    route(commit, group_id)
+}
+
+fn queue_intent(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    id: &[u8],
+    intent: SendIntent,
+    created_at_ms: u64,
+) {
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(id.to_vec()),
+            group_id: group_id.clone(),
+            intent,
+            created_at_ms,
+        })
+        .expect("persist queued outbound intent");
+}
+
+/// Regression test for the settling fix: a queued ordinary app message must
+/// never hold the completed-pass boundary — retained inbound opens the next
+/// generation immediately, with the dormant reservation consumed.
+#[tokio::test]
+async fn pass_opens_while_app_message_intents_are_queued() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "app-queue-never-parks").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    let settled = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    let completed = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("generation 0 completed");
+    assert_eq!(
+        completed.phase,
+        cgka_traits::ConvergencePassPhase::Completed
+    );
+    assert!(completed.fairness_slot_available);
+
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-app-message",
+        SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"queued-chat".to_vec(),
+        },
+        1_000_001,
+    );
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .unwrap();
+    let pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("next generation opened despite the queued app message");
+    assert_eq!(pass.generation, 1);
+    assert_eq!(pass.phase, cgka_traits::ConvergencePassPhase::Collecting);
+    assert!(!pass.fairness_slot_available);
+
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .unwrap();
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
+/// The spec's one-attempt rule (convergence.md, marmot#375): a queued
+/// admin-authorized group-state intent holds the completed-pass boundary and
+/// gets exactly one preparation attempt before the next inbound-only pass.
+#[tokio::test]
+async fn admin_group_state_intent_gets_one_attempt_before_next_inbound_generation() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "admin-one-attempt").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    let settled = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-admin-evolution",
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("held for one attempt".into()),
+            description: None,
+        },
+        1_000_001,
+    );
+
+    // Retained inbound arrives while the admin intent holds the boundary:
+    // admission stays parked on the completed generation.
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .unwrap();
+    let parked = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("completed pass holds the boundary for the admin intent");
+    assert_eq!(parked.generation, 0);
+    assert_eq!(parked.phase, cgka_traits::ConvergencePassPhase::Completed);
+    assert!(parked.fairness_slot_available);
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_200)
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    let pending = match drained[0] {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        ref other => panic!("expected the admin evolution attempt, got {other:?}"),
+    };
+    let consumed = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("pass survives the attempt");
+    assert_eq!(consumed.generation, 0);
+    assert!(!consumed.fairness_slot_available);
+
+    // The attempt failed to publish: roll it back. The reservation stays
+    // consumed and retained inbound proceeds into generation 1.
+    carol.publish_failed(pending).await.unwrap();
+    let syncing = carol
+        .converge_stored_openmls_messages(&group_id, 1_100_000)
+        .unwrap();
+    assert_eq!(syncing.convergence_status, ConvergenceStatus::Syncing);
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 1_200_000)
+        .unwrap();
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
+/// A failing preparation consumes the one-attempt reservation (spec: "the
+/// scheduler proceeds rather than waiting indefinitely") and retained inbound
+/// convergence continues.
+#[tokio::test]
+async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "admin-attempt-failure").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+
+    // An Invite whose KeyPackage bytes cannot parse fails preparation
+    // deterministically.
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-broken-invite",
+        SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![cgka_traits::engine::KeyPackage::new(b"garbage".to_vec())],
+        },
+        1_000_001,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .unwrap();
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_200)
+        .await
+        .expect("a failed reservation attempt is not a drain error");
+    assert!(drained.is_empty());
+    let consumed = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("pass survives the failed attempt");
+    assert!(!consumed.fairness_slot_available);
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "the durable intent stays queued after its failed attempt"
+    );
+
+    let syncing = carol
+        .converge_stored_openmls_messages(&group_id, 1_100_000)
+        .unwrap();
+    assert_eq!(syncing.convergence_status, ConvergenceStatus::Syncing);
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 1_200_000)
+        .unwrap();
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
+/// The marmot#375 starvation property: continuous inbound commits keep
+/// restarting quiescence, but the absolute deadline freezes the pass and the
+/// queued admin intent gets its preparation attempt at the generation
+/// boundary.
+#[tokio::test]
+async fn continuous_inbound_cannot_starve_admin_attempt() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "no-admin-starvation").await;
+
+    let mut commits = Vec::new();
+    for index in 0..7 {
+        commits.push(alice_rename_commit(&mut alice, &group_id, &format!("flood-{index}")).await);
+    }
+
+    // Admissions arrive faster than the quiescence window so each one
+    // restarts it; only the absolute deadline can freeze the pass. Derive the
+    // cadence from the pinned v1 constants so a policy change re-derives the
+    // flood shape instead of silently invalidating it.
+    let flood_interval_ms = V1_SETTLEMENT_QUIESCENCE_MS * 4 / 5;
+    let opened_at = 10_000u64;
+    for (index, commit) in commits.iter().take(6).enumerate() {
+        carol
+            .buffer_openmls_convergence_message(
+                &group_id,
+                commit.clone(),
+                opened_at + flood_interval_ms * index as u64,
+            )
+            .unwrap();
+    }
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-admin-remediation",
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("admin remediation".into()),
+            description: None,
+        },
+        opened_at + 1,
+    );
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, opened_at + V1_MAX_CONVERGENCE_PASS_MS + 50)
+        .unwrap();
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(7));
+    let completed = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("flooded pass completed");
+    assert_eq!(
+        completed.cutoff_cause,
+        Some(cgka_traits::ConvergenceCutoffCause::AbsoluteDeadline),
+        "continuous admissions must be cut off by the absolute deadline"
+    );
+
+    // The flood continues, but the boundary now belongs to the admin intent.
+    carol
+        .buffer_openmls_convergence_message(
+            &group_id,
+            commits[6].clone(),
+            opened_at + V1_MAX_CONVERGENCE_PASS_MS + 100,
+        )
+        .unwrap();
+    let parked = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("boundary held for the admin intent");
+    assert_eq!(parked.generation, 0);
+    assert!(parked.fairness_slot_available);
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(
+            &group_id,
+            opened_at + V1_MAX_CONVERGENCE_PASS_MS + 200,
+        )
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(
+        matches!(drained[0], SendResult::GroupEvolution { .. }),
+        "the admin intent gets its one attempt despite continuous inbound"
+    );
+}
+
+/// Restart must not erase the durable one-attempt reservation: the queued
+/// admin intent still gets its boundary attempt on the rebuilt engine.
+#[tokio::test]
+async fn restart_preserves_admin_reservation() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "restart-keeps-reservation").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-admin-survives-restart",
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("after restart".into()),
+            description: None,
+        },
+        1_000_001,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .unwrap();
+    drop(carol);
+
+    let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds");
+    let preserved = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("completed pass survives restart");
+    assert!(
+        preserved.fairness_slot_available,
+        "hydration must not consume the durable reservation"
+    );
+
+    let drained = restarted
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(
+        matches!(drained[0], SendResult::GroupEvolution { .. }),
+        "the restarted engine still grants the one boundary attempt"
+    );
+}
+
+/// Restart with only app messages queued must not manufacture a boundary
+/// hold: retained inbound opens the next generation without extra delay.
+#[tokio::test]
+async fn restart_with_only_app_messages_opens_pass_without_delay() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "restart-app-queue-no-delay").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-app-survives-restart",
+        SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"queued-chat".to_vec(),
+        },
+        1_000_001,
+    );
+    drop(carol);
+
+    let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds");
+
+    restarted
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 2_000_000)
+        .unwrap();
+    let pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("next generation opened on the restarted engine");
+    assert_eq!(pass.generation, 1);
+    assert_eq!(pass.phase, cgka_traits::ConvergencePassPhase::Collecting);
+
+    let second = restarted
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .unwrap();
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(3));
+}
+
+/// Consuming the reservation schedules the group for another convergence
+/// drain immediately, so the next retained generation is not discovered one
+/// scheduler cycle late.
+#[tokio::test]
+async fn reservation_consumption_schedules_next_generation_immediately() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let group_id =
+        create_reservation_test_group(&mut alice, &mut carol, "reservation-reschedules").await;
+    let commit_one = alice_rename_commit(&mut alice, &group_id, "one").await;
+    let commit_two = alice_rename_commit(&mut alice, &group_id, "two").await;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_one.clone(), 1_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    queue_intent(
+        &carol_storage,
+        &group_id,
+        b"queued-admin-reschedules",
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("reschedule".into()),
+            description: None,
+        },
+        1_000_001,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_two.clone(), 1_000_100)
+        .unwrap();
+    // Clear scheduling noise from setup so the assertion isolates the
+    // consumption edge.
+    let _ = carol.drain_pending_convergence_groups();
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_200)
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "consuming the reservation must schedule the next generation immediately"
+    );
 }
 
 #[tokio::test]
@@ -5766,9 +6277,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     ));
     assert!(matches!(
         carol.ingest(commit_to_epoch3.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_eq!(
@@ -5819,7 +6328,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
 /// forged, unattributable application payload) must be retired from the
 /// deferred queue — marked terminal and released from the retry lifecycle —
 /// not left durably `PeelDeferred` holding a per-group cap slot. Without the
-/// fix, `retry_deferred_peels` treats the post-peel terminal `PeelFailed`
+/// fix, `retry_deferred_peels` treats the post-peel terminal rejection
 /// like "still cannot peel" and leaves the raw row deferred forever.
 #[tokio::test]
 async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
@@ -5879,9 +6388,7 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
     // message, so it is retained as a PeelDeferred raw row.
     assert!(matches!(
         carol.ingest(forged.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(
         carol_storage.get_message(&forged.id).unwrap().state,

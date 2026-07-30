@@ -74,7 +74,7 @@ fn test_unix_now_seconds() -> u64 {
 /// ephemeral key and a caller-chosen `created_at`, h-tagged to
 /// `nostr_group_id_hex`. Copied from `next_event_backfill.rs`: real kind-445
 /// senders are always a fresh per-event key, and a zero-nonce marker body peels
-/// to a clean `PeelerError::DecryptFailed`, the `IngestOutcome::Stale { PeelFailed }`
+/// to a clean `PeelerError::DecryptFailed`, the `IngestOutcome::TransportDeferred`
 /// shape the epoch-stall detector counts.
 async fn publish_garbage_group_message_at(
     relay_url: &str,

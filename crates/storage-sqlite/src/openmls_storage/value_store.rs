@@ -498,7 +498,7 @@ mod tests {
 
         mls.write_value(label, key.clone(), None, serde_json::to_vec(&8u8).unwrap())
             .unwrap();
-        let legacy_count: u64 = mls
+        let legacy_count: i64 = mls
             .lock()
             .unwrap()
             .query_row(
@@ -550,7 +550,7 @@ mod tests {
             mls.read_list::<TestEntity>(label, key.clone()).unwrap(),
             vec![TestEntity(1), TestEntity(2)]
         );
-        let legacy_count: u64 = mls
+        let legacy_count: i64 = mls
             .lock()
             .unwrap()
             .query_row(

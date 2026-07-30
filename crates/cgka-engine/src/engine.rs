@@ -309,12 +309,12 @@ pub struct Engine<S: StorageProvider> {
     /// context-fingerprint sweep gate, per-row attempt/first-seen bookkeeping,
     /// bounded-sweep cursor, and the cached `PeelDeferred` row count backing
     /// the per-group flood cap. In-memory by design — a restart costs one free
-    /// re-sweep and a count rescan; terminal decisions are durable via
-    /// `MessageState::Failed`.
+    /// re-sweep and a count rescan; protocol-terminal decisions remain
+    /// durable, while resource-refused rows are released for redelivery.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
 
-    /// Retry budget before a `PeelDeferred` row transitions to terminal
-    /// `Failed` (`permanently_undecryptable`). Field (not a const) so tests
+    /// Retry budget before a `PeelDeferred` row is resource-refused and
+    /// released without terminal deduplication. Field (not a const) so tests
     /// can exhaust it quickly via [`Self::set_deferred_peel_retry_budget`].
     pub(crate) deferred_peel_retry_budget: u32,
 }
@@ -2040,8 +2040,8 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that
-    /// exceed it without ever peeling transition to terminal `Failed`
-    /// (`permanently_undecryptable`). Exposed so tests can exhaust the budget
+    /// exceed it without ever peeling are resource-refused and released.
+    /// Exposed so tests can exhaust the budget
     /// quickly; production uses the default.
     pub fn set_deferred_peel_retry_budget(&mut self, budget: u32) {
         self.deferred_peel_retry_budget = budget.max(1);

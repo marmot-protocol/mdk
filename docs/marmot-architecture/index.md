@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-07-04
+updated: 2026-07-30
 tags: [marmot, architecture, index]
 ---
 
@@ -69,6 +69,10 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors,
     and byte-level vectors.
 
+- **Doc:** [`convergence-reliability-plan.md`](./convergence-reliability-plan.md)
+  - **What it covers:** Tracked assurance, constant review, simulator architecture, verification gates, workload
+    campaigns, and the path from an engine black box to app/process/container simulation.
+
 - **Doc:** [`overview/whitenoise-integration-map.md`](./overview/whitenoise-integration-map.md)
   - **What it covers:** First shim map from whitenoise-rs account/relay flows to the current engine/session/account
     boundary.
@@ -109,6 +113,10 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md)
   - **What it covers:** Draft CGKA engine canonicalization contract: post-peeling inputs, candidate-state graph, sync
     state, outputs, storage, conformance scenarios.
+
+- **Doc:** [`convergence-reliability-plan.md`](./convergence-reliability-plan.md)
+  - **What it covers:** Working program tracker for convergence assurance claims, constants, simulator milestones,
+    verification ownership, and campaign exit gates.
 
 - **Doc:** [`distributed-convergence.md`](./distributed-convergence.md)
   - **What it covers:** Draft convergence model for selecting one MLS branch from unordered multi-relay input.

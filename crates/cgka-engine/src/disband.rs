@@ -610,6 +610,7 @@ impl<S: StorageProvider> Engine<S> {
         self.transport_group_id_index
             .retain(|_, mapped_group| mapped_group != group_id);
         self.pending_convergence_groups.remove(group_id);
+        self.engine_metrics.forget_group(group_id);
         self.leaving_groups.remove(group_id);
         self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.epoch_manager.mark_disbanded(group_id, epoch)?;

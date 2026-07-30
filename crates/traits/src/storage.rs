@@ -88,6 +88,7 @@ pub trait GroupStorage {
 pub trait MessageStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()>;
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord>;
+    fn delete_message(&self, id: &MessageId) -> StorageResult<()>;
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()>;
     fn list_messages(
         &self,

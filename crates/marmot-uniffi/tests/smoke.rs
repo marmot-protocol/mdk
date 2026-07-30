@@ -156,6 +156,33 @@ async fn empty_kit_lifecycle() {
 }
 
 #[tokio::test]
+async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_string_lossy().into_owned();
+    let relays = vec!["wss://relay.invalid.test".to_string()];
+    let first = Marmot::new(root.clone(), relays.clone()).expect("open first kit");
+
+    assert!(matches!(
+        Marmot::new(root.clone(), relays.clone()),
+        Err(MarmotKitError::RuntimeBusy)
+    ));
+
+    // Shutdown closes active work, but the FFI object can still retain cached
+    // app/storage handles. Exclusive ownership therefore follows object
+    // lifetime rather than being released prematurely at shutdown return.
+    first.shutdown().await;
+    assert!(matches!(
+        Marmot::new(root.clone(), relays.clone()),
+        Err(MarmotKitError::RuntimeBusy)
+    ));
+
+    drop(first);
+    let reopened = Marmot::new(root, relays).expect("lease released after final handle drop");
+    drop(reopened);
+}
+
+#[tokio::test]
 async fn remove_account_updates_list_accounts() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -662,9 +689,12 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
         .expect("empty frozen wake collection should be valid");
     assert!(collected.notifications.is_empty());
     kit.shutdown().await;
+    drop(kit);
 
     // The same store reopens under the default constructor (Advance): the
-    // policy is a per-construction posture, not persisted store state.
+    // policy is a per-construction posture, not persisted store state. The
+    // final runtime handle must be released before another process/runtime can
+    // acquire the root lease.
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
@@ -698,6 +728,8 @@ async fn relay_telemetry_settings_binding_round_trips() {
         .expect("set telemetry settings");
     assert!(stored.export_enabled);
     assert_eq!(stored.export_interval_seconds, 30);
+    kit.shutdown().await;
+    drop(kit);
 
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
@@ -740,6 +772,8 @@ async fn audit_log_settings_binding_round_trips() {
         .expect("set audit settings");
     assert!(stored.enabled);
     assert!(matches!(stored.data_mode, AuditDataModeFfi::FullData));
+    kit.shutdown().await;
+    drop(kit);
 
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),

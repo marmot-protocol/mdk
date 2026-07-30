@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
-use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use cgka_traits::ingest::IngestOutcome;
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
@@ -21,25 +21,60 @@ use crate::{
 use super::AppClient;
 use crate::config::CursorPersistence;
 
+/// What the convergence scheduler should do next for a group, derived from
+/// the engine's durable pass state. Expected collection time is not an error;
+/// storage and projection failures are, and they surface as `Err` from
+/// [`AppClient::convergence_schedule_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConvergenceScheduleState {
+    /// No active pass and no pending inputs: cancel scheduled wakeups.
+    Idle,
+    /// A pass is collecting; wake when its cutoff elapses.
+    Collecting { remaining_ms: u64 },
+    /// A pass is frozen/resolving or its cutoff already elapsed: run now.
+    Ready,
+    /// Pending inputs exist but no pass can open yet (epoch not `Stable`, an
+    /// admin reservation holds the boundary, or the retained input has no
+    /// trigger). Re-check on the fallback delay; only this state counts
+    /// toward the unsettled re-arm cap.
+    PendingUnopenable,
+    /// No convergence work, but durable queued outbound intents remain. The
+    /// scheduled drain regenerates and publishes them (and a failed sync on
+    /// that tick triggers transport reactivation), so the wakeup stays armed
+    /// on the fallback delay — but a healthy waiting queue is not unsettled
+    /// convergence and never counts toward the re-arm cap.
+    PendingOutbound,
+}
+
 impl AppClient {
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
 
-    pub(crate) fn has_pending_convergence_inputs(&self, group_id: &cgka_traits::GroupId) -> bool {
-        self.runtime
-            .has_pending_convergence_inputs(group_id)
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn prepare_convergence_cutoff_delay_ms(
+    /// Engine-derived convergence scheduling state for one group.
+    ///
+    /// Errors propagate: a storage or engine failure must schedule a retry at
+    /// the caller, never read as "no pending work" (the previous
+    /// `unwrap_or(false)` wrapper let an error cancel future wakeups).
+    /// `prepare_convergence_cutoff_delay_ms` is a command, not a query — it
+    /// may open a pass or persist deadline rebasing before reporting.
+    pub(crate) fn convergence_schedule_state(
         &mut self,
         group_id: &cgka_traits::GroupId,
-    ) -> Option<u64> {
-        self.runtime
-            .prepare_convergence_cutoff_delay_ms(group_id)
-            .ok()
-            .flatten()
+    ) -> Result<ConvergenceScheduleState, AppError> {
+        match self.runtime.prepare_convergence_cutoff_delay_ms(group_id)? {
+            Some(0) => Ok(ConvergenceScheduleState::Ready),
+            Some(remaining_ms) => Ok(ConvergenceScheduleState::Collecting { remaining_ms }),
+            None => {
+                if self.runtime.has_pending_convergence_inputs(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound)
+                } else {
+                    Ok(ConvergenceScheduleState::Idle)
+                }
+            }
+        }
     }
 
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {
@@ -222,6 +257,75 @@ impl AppClient {
         }
         self.app.save_state(&self.state)?;
         Ok(summary)
+    }
+
+    /// Observe group events the engine applied as a side effect of an outbound
+    /// send and buffer them for the account worker to broadcast.
+    ///
+    /// A send that lands while inbound convergence input is retained folds the
+    /// retained commits before publishing, so its effects can carry peer
+    /// `GroupStateChanged` / `EpochChanged` events (e.g. a group rename applied
+    /// mid-window). Those events never pass through the inbound ingest or
+    /// scheduled-convergence seams, so without this pass they reach no runtime
+    /// subscriber: storage shows the new state while chat-list and group-state
+    /// subscriptions stay silent. Runs the same observe pipeline as those seams
+    /// — state group refresh, push-gossip handling, kind-1210 system-row
+    /// synthesis (a deterministic upsert) — and merges the result into
+    /// `pending_applied_sync_summary`. The caller persists state afterwards.
+    pub(crate) async fn observe_send_applied_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if effects.events.is_empty() {
+            return Ok(());
+        }
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        // Synthetic source identity: these events have no single inbound
+        // transport message (see `drain_pending_session_events`).
+        let source_message_id_hex = String::new();
+        let source_received_at = unix_now_seconds();
+        let routes_dirty = self
+            .observe_account_device_effects(
+                effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
+        self.pending_applied_sync_summary.merge(summary);
+        Ok(())
+    }
+
+    /// Best-effort wrapper over [`Self::observe_send_applied_effects`] for the
+    /// outbound send paths: a projection or route-refresh failure here must
+    /// not fail a publish that already completed (or mask a publish error on
+    /// the failure path), so it is logged rather than propagated.
+    pub(crate) async fn observe_send_applied_effects_best_effort(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        if let Err(_err) = self.observe_send_applied_effects(effects).await {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "observe_send_applied_effects",
+                error_code = "send_applied_observe_failed",
+                "failed to observe group events applied during a send"
+            );
+        }
+    }
+
+    /// Drain the buffered summary of send-applied group events. Called by the
+    /// account worker after each command so the events broadcast on the same
+    /// seam that published the command's response.
+    pub(crate) fn take_pending_applied_sync_summary(&mut self) -> SyncSummary {
+        std::mem::take(&mut self.pending_applied_sync_summary)
     }
 
     /// Build an [`EventGroupProjection`] for `group_id`, returning `None` if any
@@ -435,11 +539,13 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
-    /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
-    /// backfill once a group has accumulated enough undecryptable traffic at a
-    /// stalled epoch (see [`super::epoch_stall`]). Only observed under
-    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not own
-    /// recovery, and the main app sees the same evidence on its own next sync.
+    /// Feed an unavailable group delivery to the epoch-stall detector.
+    /// Transport-deferred input arms a backfill after the stalled-epoch
+    /// threshold; resource refusal arms it immediately because it directly
+    /// proves the fetched history was not fully retained. Only observed under
+    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
+    /// own recovery, and the main app sees the same evidence on its own next
+    /// sync.
     fn detect_epoch_stall(
         &mut self,
         group_id_hint: Option<cgka_traits::GroupId>,
@@ -447,14 +553,6 @@ impl AppClient {
         outcome: &IngestOutcome,
     ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
-        }
-        if !matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
-            }
-        ) {
             return;
         }
         let Some(group_id) = group_id_hint else {
@@ -465,11 +563,18 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
-        if self.epoch_stall.observe_undecryptable(
-            group_id.clone(),
-            message_id_hex.to_owned(),
-            record.epoch,
-        ) {
+        let should_backfill = match outcome {
+            IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
+                group_id.clone(),
+                message_id_hex.to_owned(),
+                record.epoch,
+            ),
+            IngestOutcome::ResourceRefused { .. } => self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch),
+            _ => false,
+        };
+        if should_backfill {
             // Record the arm decision before the replay side effect runs (the
             // worker seam calls run_pending_epoch_backfill after this returns).
             // Best-effort, fire-and-forget: recording can never block or fail

@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::TransportDeferred { group_id: gid() }"
+---
+{
+  "TransportDeferred": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ]
+  }
+}

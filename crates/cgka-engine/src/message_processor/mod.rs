@@ -21,7 +21,9 @@ use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, LocalIngestState, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
+};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -36,8 +38,8 @@ const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 /// actual re-peel attempt under a *changed* peel context (the fingerprint
 /// gate skips unchanged contexts entirely), so a legitimate future-epoch
 /// message would need to trail the group by this many context changes before
-/// its retained row goes terminal — and content-level redelivery under a
-/// fresh transport id still recovers it afterwards.
+/// its retained row is resource-refused and released. The same transport id
+/// remains eligible if the transport delivers it again afterwards.
 pub const MAX_DEFERRED_PEEL_ATTEMPTS: u32 = 32;
 
 /// Per-group cap on retained `PeelDeferred` rows (mdk#339). Raw
@@ -104,6 +106,111 @@ impl DeferredPeelGroupState {
 struct DeferredPeelAttempts {
     attempts: u32,
     first_seen_sweep: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceGate {
+    Clear,
+    StagedCommit,
+    LeaveGated,
+}
+
+#[derive(Clone, Copy)]
+enum LeaveGateCheck {
+    Required,
+    DrainComplete,
+}
+
+struct AdminReservation {
+    available: bool,
+}
+
+impl AdminReservation {
+    fn load<S: StorageProvider>(
+        engine: &Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<Self, EngineError> {
+        let available = engine
+            .storage
+            .convergence_pass(group_id)?
+            .is_some_and(|pass| {
+                pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                    && pass.fairness_slot_available
+            });
+        Ok(Self { available })
+    }
+
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    fn permits(&self, intent: &SendIntent) -> bool {
+        !self.available || is_admin_group_state_intent(intent)
+    }
+
+    fn consume_if_dormant<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        if self.available && !engine.has_unresolved_convergence_inputs(group_id)? {
+            // The slot orders local group-state work before an inbound-only
+            // follow-up pass. With no such inbound work, normal queue draining
+            // proceeds and the dormant slot must not leak into a later pass.
+            self.consume(engine, group_id)?;
+        }
+        Ok(())
+    }
+
+    fn observe_hold<S: StorageProvider>(
+        &self,
+        engine: &mut Engine<S>,
+        queued: &[QueuedOutboundIntent],
+    ) {
+        if self.available
+            && queued
+                .iter()
+                .any(|record| is_admin_group_state_intent(&record.intent))
+        {
+            // Diagnostic only: the completed-pass boundary is being held for a
+            // queued admin group-state intent while retained inbound waits.
+            engine.engine_metrics.note_admin_reservation_hold();
+        }
+    }
+
+    fn consume_attempt<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+        prepared: bool,
+    ) -> Result<(), EngineError> {
+        engine
+            .engine_metrics
+            .note_admin_reservation_attempt(prepared);
+        self.consume(engine, group_id)
+    }
+
+    fn consume_ungranted<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if !self.available {
+            return Ok(false);
+        }
+        self.consume(engine, group_id)?;
+        Ok(true)
+    }
+
+    fn consume<S: StorageProvider>(
+        &mut self,
+        engine: &mut Engine<S>,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        engine.consume_convergence_fairness_slot(group_id)?;
+        self.available = false;
+        Ok(())
+    }
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -351,65 +458,45 @@ impl<S: StorageProvider> Engine<S> {
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
-        let mut fairness_slot_available =
-            self.storage
-                .convergence_pass(group_id)?
-                .is_some_and(|pass| {
-                    pass.phase == cgka_traits::ConvergencePassPhase::Completed
-                        && pass.fairness_slot_available
-                });
-        if fairness_slot_available && !self.has_unresolved_convergence_inputs(group_id)? {
-            // The slot orders local group-state work before an inbound-only
-            // follow-up pass. With no such inbound work, normal queue draining
-            // proceeds and the dormant slot must not leak into a later pass.
-            self.consume_convergence_fairness_slot(group_id)?;
-            fairness_slot_available = false;
-        }
+        let mut reservation = AdminReservation::load(self, group_id)?;
+        reservation.consume_if_dormant(self, group_id)?;
+        reservation.observe_hold(self, &queued);
         // A persisted fairness slot orders one already-queued administrative
         // evolution before automatic SelfRemove or leave-maintenance mutation.
-        if !fairness_slot_available {
-            if self
-                .stage_due_self_remove_auto_commit(group_id, now_ms)
+        if !reservation.is_available()
+            && self
+                .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                 .await?
-            {
-                return Ok(Vec::new());
-            }
-            self.try_auto_repropose_leave_request(group_id).await;
-            if self.load_leave_request_state(group_id)?.is_some() {
-                return Ok(Vec::new());
-            }
+                != MaintenanceGate::Clear
+        {
+            return Ok(Vec::new());
         }
         for record in queued {
-            if fairness_slot_available && !is_admin_group_state_fairness_intent(&record.intent) {
+            if !reservation.permits(&record.intent) {
                 continue;
             }
-            if !fairness_slot_available
+            if !reservation.is_available()
                 && !self
                     .advance_convergence_inputs_until_settled(group_id, now_ms)
                     .await?
             {
                 break;
             }
-            if !fairness_slot_available {
-                if self
-                    .stage_due_self_remove_auto_commit(group_id, now_ms)
+            if !reservation.is_available()
+                && self
+                    .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                     .await?
-                {
-                    break;
-                }
-                self.try_auto_repropose_leave_request(group_id).await;
-                if self.load_leave_request_state(group_id)?.is_some() {
-                    break;
-                }
+                    != MaintenanceGate::Clear
+            {
+                break;
             }
             let result = match self.do_send_ready(record.intent.clone()).await {
                 Ok(result) => result,
-                Err(_) if fairness_slot_available => {
+                Err(_) if reservation.is_available() => {
                     // The protocol grants one preparation attempt, not an
                     // indefinite reservation. Keep the durable intent queued,
                     // consume the slot, and let retained inbound work proceed.
-                    self.consume_convergence_fairness_slot(group_id)?;
-                    fairness_slot_available = false;
+                    reservation.consume_attempt(self, group_id, false)?;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -431,9 +518,8 @@ impl<S: StorageProvider> Engine<S> {
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
-            if fairness_slot_available {
-                self.consume_convergence_fairness_slot(group_id)?;
-                fairness_slot_available = false;
+            if reservation.is_available() {
+                reservation.consume_attempt(self, group_id, true)?;
                 if self.has_unresolved_convergence_inputs(group_id)? {
                     break;
                 }
@@ -442,27 +528,51 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
         }
-        if fairness_slot_available {
+        if reservation.consume_ungranted(self, group_id)? {
             // No already-queued admin group-state intent was eligible for the
             // fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
-            self.consume_convergence_fairness_slot(group_id)?;
             if self
-                .stage_due_self_remove_auto_commit(group_id, now_ms)
+                .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::DrainComplete)
                 .await?
+                == MaintenanceGate::StagedCommit
             {
                 return Ok(drained);
             }
-            self.try_auto_repropose_leave_request(group_id).await;
         }
         Ok(drained)
     }
 
-    fn consume_convergence_fairness_slot(&self, group_id: &GroupId) -> Result<(), EngineError> {
+    async fn run_drain_maintenance(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        leave_gate_check: LeaveGateCheck,
+    ) -> Result<MaintenanceGate, EngineError> {
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(MaintenanceGate::StagedCommit);
+        }
+        self.try_auto_repropose_leave_request(group_id).await;
+        if matches!(leave_gate_check, LeaveGateCheck::Required)
+            && self.load_leave_request_state(group_id)?.is_some()
+        {
+            return Ok(MaintenanceGate::LeaveGated);
+        }
+        Ok(MaintenanceGate::Clear)
+    }
+
+    fn consume_convergence_fairness_slot(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
         if let Some(mut pass) = self.storage.convergence_pass(group_id)? {
             pass.fairness_slot_available = false;
             self.storage.put_convergence_pass(&pass)?;
         }
+        // The reservation attempt is over (spec: "the scheduler proceeds").
+        // Schedule the group so the next retained inbound generation opens on
+        // the next runtime drain instead of one full scheduler cycle later.
+        self.schedule_pending_convergence_group(group_id);
         Ok(())
     }
 
@@ -762,6 +872,17 @@ impl<S: StorageProvider> Engine<S> {
         self.has_unresolved_convergence_inputs(group_id)
     }
 
+    /// Whether durable queued outbound intents exist for this group. Runtime
+    /// schedulers must keep a wakeup armed while any remain: the scheduled
+    /// drain is what regenerates and publishes them (and, on an inactive
+    /// transport, what triggers reactivation).
+    pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(!self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .is_empty())
+    }
+
     /// Re-attempt retained `PeelDeferred` rows under the deferred-peel
     /// lifecycle (mdk#339):
     ///
@@ -770,8 +891,8 @@ impl<S: StorageProvider> Engine<S> {
     ///   unproductive cycle over the backlog the context fingerprint gates
     ///   whole sweeps until the context actually changes.
     /// - **Budgeted**: a row that exhausts its retry budget without ever
-    ///   peeling goes terminal `Failed` (`permanently_undecryptable`) instead
-    ///   of retrying forever.
+    ///   peeling is resource-refused and released without terminal
+    ///   deduplication instead of retrying forever.
     /// - **Bounded**: at most [`MAX_DEFERRED_ROWS_PER_SWEEP`] rows are
     ///   attempted per sweep (cursor resumes next pass) so a large historical
     ///   backlog never starves current-event processing.
@@ -839,8 +960,10 @@ impl<S: StorageProvider> Engine<S> {
         let mut progressed = 0usize;
         let mut terminal = 0usize;
         for record in &deferred[start..end] {
-            // Budget check first: bump this row's attempt count and go
-            // terminal once it exceeds the budget without ever peeling.
+            // Budget check first: bump this row's attempt count and release it
+            // as resource-refused once it exceeds the budget without peeling.
+            // Deleting the row is intentional: retaining it as `Failed` would
+            // turn a later same-id delivery into a terminal duplicate.
             let (attempts, first_seen_sweep) = {
                 let state = self.deferred_peel.entry(group_id.clone()).or_default();
                 let entry =
@@ -855,14 +978,13 @@ impl<S: StorageProvider> Engine<S> {
                 (entry.attempts, entry.first_seen_sweep)
             };
             if attempts > retry_budget {
-                self.update_stored_message_state(&record.id, MessageState::Failed)?;
+                self.storage.delete_message(&record.id)?;
                 self.audit_group(
                     group_id,
-                    crate::audit_helpers::deferred_peel_terminal_event(
+                    crate::audit_helpers::deferred_peel_resource_refused_event(
                         hex::encode(record.id.as_slice()),
                         Some(record.epoch),
-                        crate::message_disposition::MessageDisposition::PermanentlyUndecryptable
-                            .tag(),
+                        crate::message_disposition::MessageDisposition::RetryBudgetRefused.tag(),
                         u64::from(attempts.saturating_sub(1)),
                         sweep_index.saturating_sub(first_seen_sweep),
                     ),
@@ -881,8 +1003,10 @@ impl<S: StorageProvider> Engine<S> {
                 .ingest_group_message(&msg, group_id.as_slice().to_vec())
                 .await
             {
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                Ok(IngestOutcome::TransportDeferred { .. }) => {}
+                Ok(IngestOutcome::ResourceRefused {
+                    resource: InboundResourceLimit::TransportDeferredCapacity,
+                    ..
                 }) => {}
                 Ok(IngestOutcome::LocalState {
                     state: LocalIngestState::Quarantined,
@@ -917,6 +1041,7 @@ impl<S: StorageProvider> Engine<S> {
                     IngestOutcome::Stale { .. }
                     | IngestOutcome::Ignored { .. }
                     | IngestOutcome::LocalState { .. }
+                    | IngestOutcome::ResourceRefused { .. }
                     | IngestOutcome::Rejected { .. },
                 ) => {
                     // Terminal stale classifications are still successful
@@ -1214,9 +1339,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Ok(
-                    IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
-                    }
+                    IngestOutcome::TransportDeferred { .. }
                     | IngestOutcome::LocalState {
                         state: LocalIngestState::Quarantined,
                     }
@@ -1225,9 +1348,8 @@ impl<S: StorageProvider> Engine<S> {
                     },
                 ) => {
                     // Leave the row in its retry state so a later pass re-attempts
-                    // it. `PeelFailed`: still un-peelable, or already retired to
-                    // `Failed` by a terminal-after-peel path inside
-                    // `ingest_group_message`
+                    // it. `TransportDeferred`: still un-peelable.
+                    // A terminal-after-peel path inside `ingest_group_message`
                     // (`mark_raw_transport_message_failed_if_awaiting_retry`,
                     // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
                     // is frozen; the row replays once repair clears it.
@@ -1345,7 +1467,11 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     }
 }
 
-fn is_admin_group_state_fairness_intent(intent: &SendIntent) -> bool {
+/// Single classification chokepoint for the convergence.md one-attempt
+/// reservation: only an admin-authorized local group-state evolution may hold
+/// the completed-pass boundary open (marmot#375). Queued application messages
+/// must never park pass admission.
+pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }

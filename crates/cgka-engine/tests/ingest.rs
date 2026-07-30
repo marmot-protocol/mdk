@@ -656,11 +656,11 @@ async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
     let outcome = engine
         .ingest(msg.clone())
         .await
-        .expect("malformed welcome is a per-message stale outcome");
+        .expect("malformed welcome is a per-message rejection outcome");
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
         }
     ));
     assert!(storage.has_ingress_dedup_marker(&message_id).unwrap());
@@ -774,12 +774,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     };
 
     let first = bob.ingest(msg.clone()).await.unwrap();
-    assert!(matches!(
-        first,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
-        }
-    ));
+    assert!(matches!(first, IngestOutcome::TransportDeferred { .. }));
 
     let second = bob.ingest(msg).await.unwrap();
     assert!(matches!(second, IngestOutcome::Processed));
@@ -793,7 +788,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
 }
 
 #[tokio::test]
-async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
+async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client_with_peeler(b"bob", Box::new(MalformedShortPayloadPeeler));
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -821,7 +816,7 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
 
     // Anyone can publish to a group's cleartext routing tag without being a
     // member, so structurally-invalid content is ordinary hostile input. It
-    // must classify as stale — never abort ingest, or one garbage event
+    // must classify as invalid encoding — never abort ingest, or one garbage event
     // starves every message queued behind it in a transport drain.
     let garbage = TransportMessage {
         id: hash_id(b"malformed garbage"),
@@ -836,15 +831,15 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
     let outcome = bob
         .ingest(garbage)
         .await
-        .expect("malformed input must classify as stale, not abort ingest");
+        .expect("malformed input must classify as rejected, not abort ingest");
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::InvalidEncoding
             }
         ),
-        "expected terminal PeelFailed for malformed content, got {outcome:?}"
+        "expected invalid encoding for malformed content, got {outcome:?}"
     );
 
     let msg = match alice
@@ -1036,8 +1031,8 @@ async fn assert_snapshot_fallback_terminal_transport_rejection(
 async fn invalid_transport_signature_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidSignature,
         },
     )
     .await;
@@ -1102,8 +1097,8 @@ async fn invalid_transport_signature_after_decrypt_failed_fallback_is_terminal()
     assert_snapshot_fallback_terminal_transport_rejection(
         BoundaryRejection::InvalidSignature,
         InitialPeelFailure::DecryptFailed,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidSignature,
         },
     )
     .await;
@@ -1169,8 +1164,8 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
         .expect("malformed post-peel MLS bytes must not abort ingest");
     assert!(matches!(
         outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
         }
     ));
     assert_eq!(
@@ -1279,7 +1274,7 @@ async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_
 }
 
 #[tokio::test]
-async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
+async fn malformed_via_snapshot_fallback_is_rejected_and_does_not_wedge_ingest() {
     // Simulates a trait-permitted non-Nostr peeler whose `Malformed` verdict is
     // context-dependent: the direct peel at the live epoch returns
     // `DecryptFailed`, driving ingest into the retained-snapshot fallback, where
@@ -1361,7 +1356,7 @@ async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
 
     // Garbage arrives: direct peel `DecryptFailed` -> snapshot fallback peels
     // `Malformed`. The terminal contract must hold on this seam too — classify
-    // stale, do not abort the drain.
+    // invalid encoding, do not abort the drain.
     let garbage = TransportMessage {
         id: hash_id(b"malformed via snapshot fallback"),
         payload: SNAPSHOT_FALLBACK_GARBAGE.to_vec(),
@@ -1375,15 +1370,15 @@ async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
     let outcome = bob
         .ingest(garbage)
         .await
-        .expect("malformed snapshot-fallback peel must classify stale, not abort ingest");
+        .expect("malformed snapshot-fallback peel must classify, not abort ingest");
     assert!(
         matches!(
             outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::InvalidEncoding
             }
         ),
-        "expected terminal PeelFailed for a malformed snapshot-fallback peel, got {outcome:?}"
+        "expected invalid encoding for a malformed snapshot-fallback peel, got {outcome:?}"
     );
 
     // The drain is not wedged: a well-formed message queued behind the garbage

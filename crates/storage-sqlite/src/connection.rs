@@ -662,6 +662,7 @@ impl KeyPackageBundleStorage for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use std::sync::{Mutex, mpsc};
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -686,11 +687,50 @@ mod tests {
         }
     }
 
+    fn trace_sqlcipher_setup_event(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            trace_sqlcipher_setup(sql);
+        }
+    }
+
     #[test]
     fn reports_sqlite_backend() {
         assert_eq!(
             SqliteAccountStorage::in_memory().unwrap().backend(),
             Backend::Sqlite
+        );
+    }
+
+    #[test]
+    fn bundled_sqlcipher_contains_the_wal_reset_corruption_fix() {
+        fn version_tuple(value: &str) -> (u64, u64, u64) {
+            let numeric = value.split_ascii_whitespace().next().unwrap_or(value);
+            let mut components = numeric.split('.').map(|part| {
+                part.parse::<u64>()
+                    .unwrap_or_else(|_| panic!("invalid runtime version {value:?}"))
+            });
+            (
+                components.next().unwrap_or(0),
+                components.next().unwrap_or(0),
+                components.next().unwrap_or(0),
+            )
+        }
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite_version: String = connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let sqlcipher_version: String = connection
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            version_tuple(&sqlite_version) >= (3, 51, 3),
+            "SQLite {sqlite_version} predates the WAL-reset corruption fix"
+        );
+        assert!(
+            version_tuple(&sqlcipher_version) >= (4, 14, 0),
+            "SQLCipher {sqlcipher_version} does not contain fixed SQLite 3.51.3"
         );
     }
 
@@ -927,8 +967,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
         let key = SqlCipherKey::new("trace setup key").unwrap();
-        let mut connection = rusqlite::Connection::open(path).unwrap();
-        connection.trace(Some(trace_sqlcipher_setup));
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
 
         let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
             connection,
@@ -981,8 +1024,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hardened.sqlite");
         let key = SqlCipherKey::new("public hardened key").unwrap();
-        let mut connection = rusqlite::Connection::open(path).unwrap();
-        connection.trace(Some(trace_sqlcipher_setup));
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
 
         open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
 

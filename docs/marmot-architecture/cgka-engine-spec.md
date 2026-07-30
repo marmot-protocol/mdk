@@ -127,13 +127,13 @@ Stored message payloads are typed:
 
 For group messages, the engine MUST first peel with the current MLS exporter context. If that fails and retained epoch
 snapshots are available, it SHOULD try those retained contexts newest-to-oldest within the retention window before
-classifying the message as `PeelDeferred`.
+returning `IngestOutcome::TransportDeferred` and retaining it as `PeelDeferred`.
 
-Transport group envelopes SHOULD carry a clear source-epoch hint. If the peeler reports that the source epoch is older
-than the current local context and no retained snapshot can peel the message, the engine MUST classify the message as a
-terminal `PeelFailed`, not `PeelDeferred`. This is the expected path for an invitee who joined via welcome and later
-receives the invite commit that created that welcome: the invitee never had the pre-welcome epoch secret. Future-epoch
-group messages, or group messages without a usable source-epoch hint, MAY remain `PeelDeferred`.
+When a transport supplies authenticated source-epoch evidence and no retained snapshot can peel the object, the engine
+MAY establish a specific stale outcome such as `AlreadyAtEpoch`. The Nostr group envelope has no clear source-epoch
+hint, so a decrypt miss remains `TransportDeferred`: it might be a future-epoch object whose missing commit will later
+change the peel context. A local row or retry cap returns typed `ResourceRefused`, does not establish invalidity or
+permanent unreadability, and MUST leave exact-ID redelivery eligible.
 
 When convergence reaches a settled selected branch, the engine MUST retry `PeelDeferred` raw group messages for that
 group. A retry that peels into OpenMLS wire bytes promotes the stored payload from `RawTransport` to `OpenMlsWire`; it
@@ -366,8 +366,7 @@ Application-message rules:
 - A message that decrypts on the selected branch and is within the MLS past-epoch decryption limit MUST be emitted as
   `GroupEvent::MessageReceived`.
 - A transport-wrapped application message for a past epoch SHOULD be retried against retained epoch contexts before it
-  is left in `PeelDeferred` or, when source-epoch metadata proves it is older than every retained context, terminally
-  classified as `PeelFailed`.
+  returns `TransportDeferred`; authenticated source-epoch evidence can instead establish a specific stale outcome.
 - A transport-wrapped application message for a future candidate epoch SHOULD stay in `PeelDeferred` until branch
   selection advances the local MLS context; then it MUST be retried and emitted only if it decrypts on the selected
   branch.
