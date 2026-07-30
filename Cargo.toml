@@ -88,11 +88,10 @@ keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
-nostr = { version = "0.44.2", default-features = false, features = ["std", "nip49", "nip59"] }
+nostr = { version = "0.44.6", default-features = false, features = ["std", "nip49", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
@@ -128,3 +127,9 @@ marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 wn-cli = { path = "crates/cli" }
+
+# hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2
+# dependency under cfg(hax). Pin the upstream removal until the next hax
+# release contains it, then remove this patch and update the libcrux path.
+[patch.crates-io]
+hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
