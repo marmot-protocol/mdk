@@ -17,6 +17,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed
   delivery for welcomes, and replay hooks.
 - `HarnessClient` — wraps `Engine<SqliteAccountStorage>` and the real Nostr transport peeler while keeping delivery in memory.
+- `ConvergenceSubject` — a capability-declared semantic boundary between scenario execution and the implementation
+  under test. `EngineHarnessSubject` is the in-process adapter; queue and partition mutation live on a separate,
+  explicitly white-box fault interface.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue
   faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected
@@ -85,8 +88,9 @@ through encrypted file-backed storage. Use the report command when you want save
 pass/fail summary outside the test harness.
 
 The report command exits non-zero when any fixture expectation fails. Each report includes the exact scenario input,
-selected storage backend, observed trace, flattened recovery and epoch observations, and the mismatched expected/actual
-JSON.
+selected subject adapter, declared capabilities, storage backend, observed trace, flattened recovery and epoch
+observations, and the mismatched expected/actual JSON. A subject that lacks any capability required by a scenario is
+rejected before the first scenario action executes.
 
 ## Exact state oracle
 

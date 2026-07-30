@@ -229,6 +229,17 @@ async fn report_runner_writes_send_leave_json_reports() {
     assert_eq!(report["metadata"]["generated"]["seed"], 42);
     assert_eq!(report["metadata"]["generated"]["case_index"], 0);
     assert_eq!(report["metadata"]["storage_backend"], "in-memory-sqlite");
+    assert_eq!(
+        report["metadata"]["subject"]["adapter"],
+        "mdk-engine-harness"
+    );
+    assert!(
+        report["metadata"]["subject"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities
+                .iter()
+                .any(|capability| capability == "application_messaging"))
+    );
     assert!(
         report["observed_trace"]["observations"]
             .as_array()

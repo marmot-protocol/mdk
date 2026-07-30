@@ -5,21 +5,16 @@
 //! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    BidirectionalDecryptabilityObservation, ClientBuilder, DecryptabilityProbeSendStatus,
-    DirectionalDecryptabilityProbe, ExpectationFailure, HarnessClient, HarnessStorageMode,
-    PendingResolutionObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
-    ScenarioOracleReport, ScenarioTrace, TraceExpectation, TransportBus, VectorFixture,
-    build_scenario_oracle_report, compare_trace_expectations, observe_client, observe_client_exact,
+    ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, ExpectationFailure,
+    HarnessStorageMode, PendingResolutionObservation, ScenarioErrorObservation,
+    ScenarioOracleReport, ScenarioTrace, SubjectCreateGroup, SubjectDescriptor, SubjectError,
+    SubjectInviteMembers, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    TraceExpectation, VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
+    required_capability,
 };
-use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_traits::EngineError;
-use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::KeyPackage;
-use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::types::MemberId;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +195,8 @@ pub struct ScenarioReportMetadata {
     pub spec_version: String,
     pub step_count: usize,
     pub storage_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<SubjectDescriptor>,
     pub generated: Option<GeneratedScenarioMetadata>,
     pub fixture: Option<VectorFixtureMetadata>,
 }
@@ -271,6 +268,17 @@ pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, Sce
         .expect("successful report always includes an observed trace"))
 }
 
+/// Run ScenarioSpec v1 through an explicitly supplied convergence subject.
+pub async fn run_scenario_spec_with_subject(
+    spec: &ScenarioSpec,
+    subject: &mut dyn ConvergenceSubject,
+) -> Result<ScenarioTrace, ScenarioRunError> {
+    let report = run_scenario_report_with_subject(spec, None, Vec::new(), subject).await?;
+    Ok(report
+        .observed_trace
+        .expect("successful report always includes an observed trace"))
+}
+
 pub async fn run_scenario_report(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
@@ -284,15 +292,10 @@ pub async fn run_scenario_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    run_scenario_report_inner(
-        spec,
-        expected_trace,
-        vec![],
-        None,
-        ProtocolProfile::Legacy,
-        storage_mode,
-    )
-    .await
+    let mut subject =
+        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
+            .map_err(subject_setup_error)?;
+    run_scenario_report_inner(spec, expected_trace, vec![], None, &mut subject).await
 }
 
 pub async fn run_scenario_report_with_outcomes(
@@ -315,15 +318,22 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     expected_outcomes: Vec<TraceExpectation>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    run_scenario_report_inner(
-        spec,
-        expected_trace,
-        expected_outcomes,
-        None,
-        ProtocolProfile::Legacy,
-        storage_mode,
-    )
-    .await
+    let mut subject =
+        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
+            .map_err(subject_setup_error)?;
+    run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
+}
+
+/// Build a complete report using an explicitly supplied adapter.
+///
+/// Capability validation runs before the subject receives any action.
+pub async fn run_scenario_report_with_subject(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    subject: &mut dyn ConvergenceSubject,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, subject).await
 }
 
 pub async fn run_vector_fixture_report(
@@ -350,6 +360,9 @@ pub async fn run_vector_fixture_report_with_storage_mode(
             });
         }
     };
+    let mut subject =
+        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
+            .map_err(subject_setup_error)?;
     run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),
@@ -360,8 +373,7 @@ pub async fn run_vector_fixture_report_with_storage_mode(
             conformance_version: fixture.conformance_version.clone(),
             seed: fixture.seed,
         }),
-        protocol_profile,
-        storage_mode,
+        &mut subject,
     )
     .await
 }
@@ -371,33 +383,10 @@ async fn run_scenario_report_inner(
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
     fixture: Option<VectorFixtureMetadata>,
-    protocol_profile: ProtocolProfile,
-    storage_mode: HarnessStorageMode,
+    subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    if spec.spec_version != "1" {
-        return Err(ScenarioRunError {
-            step_index: None,
-            message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
-        });
-    }
-    let bus = TransportBus::ordered();
-    let mut clients = BTreeMap::new();
-    for label in &spec.clients {
-        if clients.contains_key(label) {
-            return Err(ScenarioRunError {
-                step_index: None,
-                message: format!("duplicate client label {label}"),
-            });
-        }
-        let client = ClientBuilder::new(pad32(label.as_bytes()))
-            .registry(scenario_registry())
-            .protocol_profile(protocol_profile)
-            .storage_mode(storage_mode)
-            .attach(&bus);
-        clients.insert(label.clone(), client);
-    }
-
-    let mut pending_refs = HashMap::new();
+    let descriptor = subject.descriptor();
+    validate_scenario_for_subject(spec, &descriptor)?;
     let mut pending_resolutions = Vec::new();
     let mut observations = Vec::new();
     let mut decryptability_probes = Vec::new();
@@ -406,6 +395,7 @@ async fn run_scenario_report_inner(
     let mut step_log = Vec::new();
 
     for (step_index, step) in spec.steps.iter().enumerate() {
+        let action_id = scenario_input_id(step_index, step);
         match step {
             ScenarioStep::CreateGroup {
                 creator,
@@ -418,69 +408,83 @@ async fn run_scenario_report_inner(
                 let initial_admin_labels = initial_admins
                     .clone()
                     .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
-                let initial_admins = member_ids(&clients, &initial_admin_labels, step_index)?;
-                let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
-                let required_features =
-                    required_features_from_names(required_features, step_index)?;
-                let creator = client_mut(&mut clients, creator, step_index)?;
-                let (_group_id, pending_ref) = creator
-                    .create_group_with_admins_maybe_pending(
+                subject
+                    .create_group(SubjectCreateGroup {
+                        creator,
                         name,
-                        key_packages,
+                        invitees,
                         required_features,
-                        initial_admins,
-                    )
-                    .await;
-                if let Some(pending_ref) = pending_ref {
-                    insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
-                }
+                        initial_admins: &initial_admin_labels,
+                        pending,
+                    })
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::InviteMembers {
                 inviter,
                 invitees,
                 pending,
             } => {
-                let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
-                let inviter = client_mut(&mut clients, inviter, step_index)?;
-                inviter.name_next_scenario_input(scenario_input_id(step_index, step));
-                let pending_ref = inviter.invite(key_packages).await;
-                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+                subject
+                    .invite_members(SubjectInviteMembers {
+                        action_id: &action_id,
+                        inviter,
+                        invitees,
+                        pending,
+                    })
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::UpdateGroupData {
                 client,
                 name,
                 pending,
             } => {
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.name_next_scenario_input(scenario_input_id(step_index, step));
-                let pending_ref = client.update_group_data(name.clone()).await;
-                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+                subject
+                    .update_group_data(SubjectUpdateGroupData {
+                        action_id: &action_id,
+                        client,
+                        name,
+                        pending,
+                    })
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::UpdateAdminPolicy {
                 client,
                 admins,
                 pending,
             } => {
-                let admin_ids = member_ids(&clients, admins, step_index)?;
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.name_next_scenario_input(scenario_input_id(step_index, step));
-                let pending_ref = client.update_admin_policy(admin_ids).await.map_err(|e| {
-                    err(
-                        step_index,
-                        format!("update_admin_policy unexpectedly failed: {e}"),
-                    )
-                })?;
-                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+                subject
+                    .update_admin_policy(SubjectUpdateAdminPolicy {
+                        action_id: Some(&action_id),
+                        client,
+                        admins,
+                        pending: Some(pending),
+                    })
+                    .await
+                    .map_err(|error| {
+                        err(
+                            step_index,
+                            format!("update_admin_policy unexpectedly failed: {error}"),
+                        )
+                    })?;
             }
             ScenarioStep::ExpectUpdateAdminPolicyError {
                 client,
                 admins,
                 error,
             } => {
-                let admin_ids = member_ids(&clients, admins, step_index)?;
                 let client_label = client.clone();
-                let client = client_mut(&mut clients, client, step_index)?;
-                match client.update_admin_policy(admin_ids).await {
+                match subject
+                    .update_admin_policy(SubjectUpdateAdminPolicy {
+                        action_id: None,
+                        client,
+                        admins,
+                        pending: None,
+                    })
+                    .await
+                {
                     Ok(_) => {
                         return Err(err(
                             step_index,
@@ -488,12 +492,12 @@ async fn run_scenario_report_inner(
                         ));
                     }
                     Err(actual) => {
-                        let actual = observe_engine_error(&actual);
-                        if &actual != error {
+                        if &actual.code != error {
                             return Err(err(
                                 step_index,
                                 format!(
-                                    "update_admin_policy failed with {actual}; expected {error}"
+                                    "update_admin_policy failed with {}; expected {error}",
+                                    actual.code
                                 ),
                             ));
                         }
@@ -501,16 +505,17 @@ async fn run_scenario_report_inner(
                             step_index,
                             client: client_label,
                             operation: "update_admin_policy".into(),
-                            error: actual,
+                            error: actual.code,
                         });
                     }
                 }
             }
             ScenarioStep::ConfirmPending { client, pending } => {
-                let pending_ref = take_pending(&mut pending_refs, pending, step_index)?;
                 let client_label = client.clone();
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.confirm(pending_ref).await;
+                subject
+                    .confirm_pending(client, pending)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
                 pending_resolutions.push(PendingResolutionObservation {
                     step_index,
                     client: client_label,
@@ -519,10 +524,11 @@ async fn run_scenario_report_inner(
                 });
             }
             ScenarioStep::FailPending { client, pending } => {
-                let pending_ref = take_pending(&mut pending_refs, pending, step_index)?;
                 let client_label = client.clone();
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.fail(pending_ref).await;
+                subject
+                    .fail_pending(client, pending)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
                 pending_resolutions.push(PendingResolutionObservation {
                     step_index,
                     client: client_label,
@@ -531,107 +537,101 @@ async fn run_scenario_report_inner(
                 });
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
-                let sender = client_mut(&mut clients, sender, step_index)?;
-                sender.name_next_scenario_input(scenario_input_id(step_index, step));
-                sender.send_app(payload.clone().into_bytes()).await;
+                subject
+                    .send_application(SubjectSendApplication {
+                        action_id: &action_id,
+                        sender,
+                        payload,
+                    })
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::Leave { client } => {
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.name_next_scenario_input(scenario_input_id(step_index, step));
-                client.leave().await;
+                subject
+                    .leave(&action_id, client)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
-            ScenarioStep::DeliverAll => bus.deliver_all(),
+            ScenarioStep::DeliverAll => subject
+                .deliver_all()
+                .map_err(|error| subject_step_error(step_index, error))?,
             ScenarioStep::Tick { clients: labels } => {
-                for label in labels {
-                    let client = client_mut(&mut clients, label, step_index)?;
-                    client.tick().await;
-                }
+                subject
+                    .tick(labels)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::Observe { clients: labels } => {
-                for label in labels {
-                    let client = client_mut(&mut clients, label, step_index)?;
-                    observations.push(observe_client(label.clone(), client));
-                }
+                observations.extend(
+                    subject
+                        .observe(labels)
+                        .map_err(|error| subject_step_error(step_index, error))?,
+                );
             }
             ScenarioStep::ObserveExact { clients: labels } => {
-                for label in labels {
-                    let client = client_mut(&mut clients, label, step_index)?;
-                    observations.push(observe_client_exact(label.clone(), client));
-                }
+                observations.extend(
+                    subject
+                        .observe_exact(labels)
+                        .map_err(|error| subject_step_error(step_index, error))?,
+                );
             }
             ScenarioStep::ProbeBidirectionalDecryptability { clients: labels } => {
                 decryptability_probes.push(
-                    run_bidirectional_decryptability_probe(&mut clients, &bus, labels, step_index)
-                        .await?,
+                    subject
+                        .probe_bidirectional_decryptability(labels, step_index)
+                        .await
+                        .map_err(|error| subject_step_error(step_index, error))?,
                 );
             }
             ScenarioStep::ObserveAdminPolicy { clients: labels } => {
-                for label in labels {
-                    let client = client_ref(&clients, label, step_index)?;
-                    admin_policy_observations.push(ScenarioAdminPolicyObservation {
-                        client: label.clone(),
-                        admins: client.admin_labels(),
-                    });
-                }
+                admin_policy_observations.extend(
+                    subject
+                        .observe_admin_policy(labels)
+                        .map_err(|error| subject_step_error(step_index, error))?,
+                );
             }
             ScenarioStep::ClearEvents { clients: labels } => {
-                for label in labels {
-                    let client = client_mut(&mut clients, label, step_index)?;
-                    client.drain_events();
-                    client.clear_audit_capture();
-                }
+                subject
+                    .clear_events(labels)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::DropQueued { index } => {
-                if !bus.drop_queued(*index) {
-                    return Err(err(
-                        step_index,
-                        format!("queued message index {index} does not exist"),
-                    ));
-                }
+                subject_faults(subject, step_index)?
+                    .drop_queued(*index)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::DuplicateQueued { index } => {
-                if !bus.duplicate_queued(*index) {
-                    return Err(err(
-                        step_index,
-                        format!("queued message index {index} does not exist"),
-                    ));
-                }
+                subject_faults(subject, step_index)?
+                    .duplicate_queued(*index)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::DelayQueued { index, delayed } => {
-                if !bus.delay_queued(*index, delayed.clone()) {
-                    return Err(err(
-                        step_index,
-                        format!("queued message index {index} does not exist"),
-                    ));
-                }
+                subject_faults(subject, step_index)?
+                    .delay_queued(*index, delayed)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::ReleaseDelayed { delayed } => {
-                if !bus.release_delayed(delayed) {
-                    return Err(err(
-                        step_index,
-                        format!("delayed queue label {delayed} does not exist"),
-                    ));
-                }
+                subject_faults(subject, step_index)?
+                    .release_delayed(delayed)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::ReorderQueued { order } => {
-                if !bus.reorder_queued(order) {
-                    return Err(err(
-                        step_index,
-                        format!("invalid queue reorder permutation {order:?}"),
-                    ));
-                }
+                subject_faults(subject, step_index)?
+                    .reorder_queued(order)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
             ScenarioStep::SetPartition { allow } => {
-                let mut allowed = Vec::with_capacity(allow.len());
-                for label in allow {
-                    allowed.push(client_ref(&clients, label, step_index)?.bus_id);
-                }
-                bus.set_partition(Some(allowed));
+                subject_faults(subject, step_index)?
+                    .set_partition(allow)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
-            ScenarioStep::ClearPartition => bus.set_partition(None),
+            ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
+                .clear_partition()
+                .map_err(|error| subject_step_error(step_index, error))?,
             ScenarioStep::RestartClient { client } => {
-                let client = client_mut(&mut clients, client, step_index)?;
-                client.restart();
+                subject
+                    .restart(client)
+                    .map_err(|error| subject_step_error(step_index, error))?;
             }
         }
         step_log.push(ScenarioStepLogEntry {
@@ -698,7 +698,8 @@ async fn run_scenario_report_inner(
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
             step_count: spec.steps.len(),
-            storage_backend: storage_mode.report_label().into(),
+            storage_backend: descriptor.storage_backend.clone(),
+            subject: Some(descriptor),
             generated: None,
             fixture,
         },
@@ -721,110 +722,41 @@ fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
     format!("step-{step_index}:{}", step.kind())
 }
 
-async fn run_bidirectional_decryptability_probe(
-    clients: &mut BTreeMap<String, HarnessClient>,
-    bus: &TransportBus,
-    labels: &[String],
-    step_index: usize,
-) -> Result<BidirectionalDecryptabilityObservation, ScenarioRunError> {
-    let mut unique_labels = labels.to_vec();
-    unique_labels.sort();
-    unique_labels.dedup();
-    if labels.len() < 2 || unique_labels.len() != labels.len() {
-        return Err(err(
-            step_index,
-            "bidirectional decryptability probe requires at least two unique clients".into(),
-        ));
+/// Validate adapter support before the first scenario action is executed.
+pub fn validate_scenario_for_subject(
+    spec: &ScenarioSpec,
+    descriptor: &SubjectDescriptor,
+) -> Result<(), ScenarioRunError> {
+    if spec.spec_version != "1" {
+        return Err(ScenarioRunError {
+            step_index: None,
+            message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
+        });
     }
-    for label in labels {
-        client_ref(clients, label, step_index)?;
-    }
-
-    let mut sends = BTreeMap::new();
-    for sender in labels {
-        let payload = format!("cgka-decryptability-probe/v1/{step_index}/{sender}");
-        let status = match client_mut(clients, sender, step_index)?
-            .try_send_app(payload.clone().into_bytes())
-            .await
-        {
-            Ok((status, logical_id)) => (status, Some(logical_id)),
-            Err(error) => (
-                DecryptabilityProbeSendStatus::Failed {
-                    error: observe_engine_error(&error),
-                },
-                None,
-            ),
-        };
-        sends.insert(sender.clone(), (payload, status));
-    }
-
-    bus.deliver_all();
-    let all_clients = clients.keys().cloned().collect::<Vec<_>>();
-    for label in all_clients {
-        client_mut(clients, &label, step_index)?.tick().await;
-    }
-
-    let mut recipient_ledgers = BTreeMap::new();
-    for recipient in labels {
-        recipient_ledgers.insert(
-            recipient.clone(),
-            client_mut(clients, recipient, step_index)?.scenario_input_ledger(),
-        );
-    }
-
-    let mut probes = Vec::with_capacity(labels.len() * (labels.len() - 1));
-    for sender in labels {
-        let (payload, (send_status, logical_id)) = sends
-            .get(sender)
-            .expect("probe send result exists for every validated sender");
-        for recipient in labels {
-            if recipient == sender {
-                continue;
-            }
-            let recipient_ledger = recipient_ledgers[recipient]
-                .iter()
-                .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref())
-                .cloned();
-            probes.push(DirectionalDecryptabilityProbe {
-                sender: sender.clone(),
-                recipient: recipient.clone(),
-                payload: payload.clone(),
-                logical_id: logical_id.clone(),
-                send_status: send_status.clone(),
-                recipient_ledger,
+    let mut clients = BTreeSet::new();
+    for label in &spec.clients {
+        if !clients.insert(label) {
+            return Err(ScenarioRunError {
+                step_index: None,
+                message: format!("duplicate client label {label}"),
             });
         }
     }
-
-    Ok(BidirectionalDecryptabilityObservation {
-        step_index,
-        clients: labels.to_vec(),
-        probes,
-    })
-}
-
-async fn fresh_key_packages(
-    clients: &mut BTreeMap<String, HarnessClient>,
-    labels: &[String],
-    step_index: usize,
-) -> Result<Vec<KeyPackage>, ScenarioRunError> {
-    let mut key_packages = Vec::with_capacity(labels.len());
-    for label in labels {
-        let client = client_mut(clients, label, step_index)?;
-        key_packages.push(client.fresh_key_package().await);
+    for (step_index, step) in spec.steps.iter().enumerate() {
+        let capability = required_capability(step);
+        if !descriptor.supports(capability) {
+            return Err(err(
+                step_index,
+                format!(
+                    "subject {} does not support capability {} required by {}",
+                    descriptor.adapter,
+                    capability,
+                    step.kind()
+                ),
+            ));
+        }
     }
-    Ok(key_packages)
-}
-
-fn member_ids(
-    clients: &BTreeMap<String, HarnessClient>,
-    labels: &[String],
-    step_index: usize,
-) -> Result<Vec<MemberId>, ScenarioRunError> {
-    labels
-        .iter()
-        .map(|label| client_ref(clients, label, step_index).map(HarnessClient::member_id))
-        .collect()
+    Ok(())
 }
 
 fn scenario_initial_admins(
@@ -853,82 +785,16 @@ fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
     }
 }
 
-fn insert_pending(
-    pending_refs: &mut HashMap<String, PendingStateRef>,
-    label: &str,
-    pending_ref: PendingStateRef,
+fn subject_faults(
+    subject: &mut dyn ConvergenceSubject,
     step_index: usize,
-) -> Result<(), ScenarioRunError> {
-    if pending_refs
-        .insert(label.to_string(), pending_ref)
-        .is_some()
-    {
-        return Err(err(step_index, format!("duplicate pending label {label}")));
-    }
-    Ok(())
-}
-
-fn take_pending(
-    pending_refs: &mut HashMap<String, PendingStateRef>,
-    label: &str,
-    step_index: usize,
-) -> Result<PendingStateRef, ScenarioRunError> {
-    pending_refs
-        .remove(label)
-        .ok_or_else(|| err(step_index, format!("unknown pending label {label}")))
-}
-
-fn client_ref<'a>(
-    clients: &'a BTreeMap<String, HarnessClient>,
-    label: &str,
-    step_index: usize,
-) -> Result<&'a HarnessClient, ScenarioRunError> {
-    clients
-        .get(label)
-        .ok_or_else(|| err(step_index, format!("unknown client {label}")))
-}
-
-fn client_mut<'a>(
-    clients: &'a mut BTreeMap<String, HarnessClient>,
-    label: &str,
-    step_index: usize,
-) -> Result<&'a mut HarnessClient, ScenarioRunError> {
-    clients
-        .get_mut(label)
-        .ok_or_else(|| err(step_index, format!("unknown client {label}")))
-}
-
-fn required_features_from_names(
-    names: &[String],
-    step_index: usize,
-) -> Result<Vec<Feature>, ScenarioRunError> {
-    names
-        .iter()
-        .map(|name| match name.as_str() {
-            "self-remove" => Ok(Feature("self-remove")),
-            _ => Err(err(step_index, format!("unknown required feature {name}"))),
-        })
-        .collect()
-}
-
-fn scenario_registry() -> FeatureRegistry {
-    let mut registry = FeatureRegistry::new();
-    registry.register(
-        Feature("self-remove"),
-        CapabilityRequirement {
-            requires: Capability::Proposal(10),
-            level: RequirementLevel::Required,
-            description: "MIP-03",
-        },
-    );
-    registry
-}
-
-fn pad32(name: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+) -> Result<&mut dyn ConvergenceFaultSubject, ScenarioRunError> {
+    subject.fault_injection().ok_or_else(|| {
+        err(
+            step_index,
+            "subject declared a white-box fault capability without a fault interface".into(),
+        )
+    })
 }
 
 fn err(step_index: usize, message: String) -> ScenarioRunError {
@@ -938,36 +804,15 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
     }
 }
 
-fn observe_engine_error(error: &EngineError) -> String {
-    match error {
-        EngineError::NotGroupAdmin { .. } => "not_group_admin",
-        EngineError::AdminCannotSelfRemove { .. } | EngineError::AdminDepletion { .. } => {
-            "admin_policy"
-        }
-        EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
-        EngineError::Serialize(_) => "invalid_admin_policy",
-        EngineError::InvalidWelcome => "invalid_welcome",
-        EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
-        EngineError::InvalidTransition(_) => "invalid_transition",
-        EngineError::UnknownGroup(_) => "unknown_group",
-        EngineError::UnknownMember { .. } => "unknown_member",
-        EngineError::NotAMember { .. } => "not_a_member",
-        EngineError::Other(_) => "other",
-        EngineError::Backend(_) => "backend",
-        EngineError::Storage(_) => "storage",
-        EngineError::Peeler(_) => "peeler",
-        EngineError::ForkedEpoch { .. } => "forked_epoch",
-        EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
-        EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
-        EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
-        EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
-        EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
-        EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
-        EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
-        EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
-        EngineError::UnknownPending => "unknown_pending",
+fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
+    ScenarioRunError {
+        step_index: None,
+        message: error.to_string(),
     }
-    .into()
+}
+
+fn subject_step_error(step_index: usize, error: SubjectError) -> ScenarioRunError {
+    err(step_index, error.to_string())
 }
 
 fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<InvariantFailure> {
@@ -983,6 +828,28 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SubjectCapability, SubjectSendApplication};
+    use async_trait::async_trait;
+
+    struct RecordingSubject {
+        descriptor: SubjectDescriptor,
+        send_called: bool,
+    }
+
+    #[async_trait]
+    impl ConvergenceSubject for RecordingSubject {
+        fn descriptor(&self) -> SubjectDescriptor {
+            self.descriptor.clone()
+        }
+
+        async fn send_application(
+            &mut self,
+            _action: SubjectSendApplication<'_>,
+        ) -> Result<(), SubjectError> {
+            self.send_called = true;
+            Ok(())
+        }
+    }
 
     #[test]
     fn fallback_initial_admins_include_future_admin_policy_actors() {
@@ -1011,5 +878,93 @@ mod tests {
             scenario_initial_admins(&spec, 0, &["bob".to_owned(), "carol".to_owned()]),
             vec!["bob".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_capability_is_rejected_before_subject_action() {
+        let spec = ScenarioSpec {
+            name: "unsupported-subject-capability/v1".to_owned(),
+            spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned()],
+            steps: vec![
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".to_owned(),
+                    payload: "hello".to_owned(),
+                },
+                ScenarioStep::RestartClient {
+                    client: "alice".to_owned(),
+                },
+            ],
+        };
+        let mut subject = RecordingSubject {
+            descriptor: SubjectDescriptor {
+                adapter: "recording-subject".to_owned(),
+                adapter_version: "1".to_owned(),
+                storage_backend: "none".to_owned(),
+                capabilities: BTreeSet::from([SubjectCapability::ApplicationMessaging]),
+            },
+            send_called: false,
+        };
+
+        let error = run_scenario_spec_with_subject(&spec, &mut subject)
+            .await
+            .expect_err("unsupported scenario must fail preflight");
+
+        assert_eq!(error.step_index, Some(1));
+        assert!(error.message.contains("crash_reopen"));
+        assert!(!subject.send_called);
+    }
+
+    #[test]
+    fn queue_fault_steps_require_explicit_white_box_capability() {
+        let capability = required_capability(&ScenarioStep::DropQueued { index: 0 });
+
+        assert_eq!(capability, SubjectCapability::WhiteBoxTransportQueueFaults);
+        assert!(capability.is_white_box());
+    }
+
+    #[tokio::test]
+    async fn explicit_engine_subject_preserves_default_runner_trace() {
+        let spec = ScenarioSpec {
+            name: "subject-boundary-smoke/v1".to_owned(),
+            spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".to_owned(),
+                    name: "subject-boundary".to_owned(),
+                    invitees: vec!["bob".to_owned()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".to_owned(),
+                },
+                ScenarioStep::ConfirmPending {
+                    client: "alice".to_owned(),
+                    pending: "create".to_owned(),
+                },
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["bob".to_owned()],
+                },
+                ScenarioStep::Observe {
+                    clients: vec!["alice".to_owned(), "bob".to_owned()],
+                },
+            ],
+        };
+
+        let default_trace = run_scenario_spec(&spec)
+            .await
+            .expect("default engine runner succeeds");
+        let mut subject = EngineHarnessSubject::new(
+            &spec.clients,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        let explicit_trace = run_scenario_spec_with_subject(&spec, &mut subject)
+            .await
+            .expect("explicit engine subject succeeds");
+
+        assert_eq!(explicit_trace, default_trace);
     }
 }

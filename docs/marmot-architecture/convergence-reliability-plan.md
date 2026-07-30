@@ -437,11 +437,15 @@ gap, distinct from the three engine-state failures.
 
 ### 1.2 Public subject boundary
 
-- [ ] Define a simulator-owned `ConvergenceSubject` interface using public engine behavior.
-- [ ] Implement create/mutate, ingest, virtual-time advance, public event/outbound polling, crash/reopen, and sanitized
-  observation.
-- [ ] Split normal black-box execution from explicitly named white-box storage/fault capabilities.
-- [ ] Reject scenarios that require unsupported subject capabilities before execution.
+- [x] Define a simulator-owned `ConvergenceSubject` interface that keeps scenario semantics in the runner and exposes
+  semantic engine operations through declared adapter capabilities.
+- [x] Implement the first engine-adapter vertical slice: create/mutate, publication confirmation/failure, application
+  send, transport delivery/ingest, event/exact/admin observation, active decryptability probing, and crash/reopen.
+- [ ] Add virtual-time advance plus explicit public outbound polling/acknowledgement; coordinate this with the dual-clock
+  and full-quiescence work rather than encoding real-time waits in the subject.
+- [x] Split normal black-box execution from the explicitly named `ConvergenceFaultSubject` queue/partition mutation
+  capability; reserve a named white-box storage-fault capability for a future adapter.
+- [x] Reject scenarios that require unsupported subject capabilities before execution.
 - [ ] Refresh the local canonicalization contract against the adopted protocol before freezing the public observation
   schema; keep normative behavior in the protocol repo and implementation/diagnostic detail here.
 
@@ -766,3 +770,4 @@ incorrect result.
 | 2026-07-30 | 1.1 bidirectional decryptability probe | Added an active exact-ID application-message matrix; settled members pass every directed edge, a missed commit exposes future-epoch deferral in only one direction, and a named nonmember cannot pass | `cargo test -p cgka-conformance-simulator bidirectional_decryptability` |
 | 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
 | 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |
+| 2026-07-30 | 1.2a public convergence subject | Extracted scenario execution behind a capability-declared `ConvergenceSubject`, added the in-process engine adapter, separated queue/partition mutation behind `ConvergenceFaultSubject`, rejected unsupported scenarios before actions, and recorded adapter identity/capabilities in reports | Subject preflight/fault-classification tests; default-versus-explicit engine subject trace equivalence; report metadata test |

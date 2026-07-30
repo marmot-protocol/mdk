@@ -74,6 +74,13 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
     `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
 
+- **Module:** `src/subject.rs`
+  - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The
+    scenario runner owns step semantics and stable action ids; subjects implement semantic group, publication,
+    application, delivery, observation, and restart operations. Every adapter declares a versioned capability set that
+    is checked before execution. Queue/partition mutation is available only through the separately named
+    `ConvergenceFaultSubject` white-box interface.
+
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
