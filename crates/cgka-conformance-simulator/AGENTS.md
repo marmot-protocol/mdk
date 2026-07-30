@@ -130,6 +130,11 @@ to be a group member yet.
 `drop_queued`, `duplicate_queued`, `delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
 `clear_partition` remain the partition/heal operations.
 
+`fail_pending` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
+undelivered commit and Welcome from the queue and delayed sets. It returns a scenario error instead of rolling back if
+any matching artifact has already reached a recipient mailbox; model that case as ambiguous exposure at an adapter-aware
+boundary rather than as `fail_pending`.
+
 Use `clear_events` after setup when a scenario wants the final trace to describe only the behavior under test. The
 convergence E2E scenario does this after the initial welcome joins so its trace focuses on the peeler-ingest epoch
 change and selected branch outputs. Delayed past-epoch app messages are covered via retained epoch contexts.

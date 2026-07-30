@@ -514,8 +514,17 @@ impl ConvergenceSubject for EngineHarnessSubject {
     }
 
     async fn fail_pending(&mut self, client: &str, pending: &str) -> Result<(), SubjectError> {
-        let pending_ref = self.take_pending(pending)?;
-        self.client_mut(client)?.fail(pending_ref).await;
+        let pending_ref = self.pending_refs.get(pending).cloned().ok_or_else(|| {
+            SubjectError::new(
+                "unknown_pending",
+                format!("unknown pending label {pending}"),
+            )
+        })?;
+        self.client_mut(client)?
+            .try_fail(pending_ref)
+            .await
+            .map_err(subject_engine_error)?;
+        self.pending_refs.remove(pending);
         Ok(())
     }
 
