@@ -303,6 +303,24 @@ impl AppClient {
         Ok(())
     }
 
+    /// Best-effort wrapper over [`Self::observe_send_applied_effects`] for the
+    /// outbound send paths: a projection or route-refresh failure here must
+    /// not fail a publish that already completed (or mask a publish error on
+    /// the failure path), so it is logged rather than propagated.
+    pub(crate) async fn observe_send_applied_effects_best_effort(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        if let Err(_err) = self.observe_send_applied_effects(effects).await {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "observe_send_applied_effects",
+                error_code = "send_applied_observe_failed",
+                "failed to observe group events applied during a send"
+            );
+        }
+    }
+
     /// Drain the buffered summary of send-applied group events. Called by the
     /// account worker after each command so the events broadcast on the same
     /// seam that published the command's response.

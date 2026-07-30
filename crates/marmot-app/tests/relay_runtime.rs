@@ -3428,10 +3428,26 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 /// ingest or scheduled-convergence seams. The runtime must still broadcast
 /// them: bob's group-state subscription has to observe the rename even though
 /// his own send — not a receive — applied it.
+///
+/// The collection window is pinned wide open (10s; the knob is honored under
+/// `test-policy-overrides`, and normal builds keep the pinned ~1s window) so
+/// scheduled convergence cannot apply the rename first, and bob keeps sending
+/// until his chat row shows the rename — the durable witness that a send
+/// folded the commit. The subscription must then deliver well inside the
+/// still-open window; on a build that drops send-applied events it stays
+/// silent here even though storage already shows the new name.
 #[tokio::test]
 async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(10_000),
+    );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -3477,17 +3493,37 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         )
         .await
         .unwrap();
-    // Give the rename commit time to reach bob's collection window, then send
-    // from bob while the window is still open so the send folds the commit.
-    // If timing shifts and convergence applies the commit first, the rename
-    // still broadcasts through the scheduled-convergence seam — either way the
-    // subscription must deliver it.
-    sleep(Duration::from_millis(300)).await;
-    runtime
-        .send_message(&bob_id, &group_id, b"bob interleaved".to_vec())
-        .await
-        .unwrap();
+    // Send from bob until his chat row shows the rename: a send only folds the
+    // retained commit once bob's worker has ingested it, and relay delivery
+    // timing varies, so retry rather than guess with one sleep. The row flip
+    // is the durable witness that the commit applied inside a send — the
+    // 10s collection window keeps scheduled convergence from applying it.
+    let mut rename_applied = false;
+    'sends: for round in 0..5u32 {
+        runtime
+            .send_message(
+                &bob_id,
+                &group_id,
+                format!("bob interleaved {round}").into_bytes(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            let row = app.chat_list_row(&bob.account.label, &group_id_hex).unwrap();
+            if row.is_some_and(|row| row.title == "renamed mid send") {
+                rename_applied = true;
+                break 'sends;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert!(
+        rename_applied,
+        "a send from bob should fold and apply the retained rename commit"
+    );
 
+    // Storage shows the rename; the subscription must now deliver it well
+    // inside the still-open collection window (5s timeout vs 10s quiescence).
     let updated = wait_for_group_state_update(&mut group_state, |group| {
         group.profile.name == "renamed mid send"
     })
