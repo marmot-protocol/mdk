@@ -298,9 +298,12 @@ pub async fn run_scenario_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_legacy_compatible(
+        &spec.clients,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, vec![], None, &mut subject).await
 }
 
@@ -324,9 +327,12 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     expected_outcomes: Vec<TraceExpectation>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_legacy_compatible(
+        &spec.clients,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
@@ -366,9 +372,12 @@ pub async fn run_vector_fixture_report_with_storage_mode(
             });
         }
     };
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_legacy_compatible(
+        &fixture.scenario.clients,
+        protocol_profile,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),

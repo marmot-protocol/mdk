@@ -20,7 +20,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `ConvergenceSubject` — a capability-declared semantic boundary between scenario execution and the implementation
   under test. `EngineHarnessSubject` is the in-process adapter; queue and partition mutation live on a separate,
   explicitly white-box fault interface. Its `virtual_time` capability advances one shared paired convergence clock;
-  subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline.
+  subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
+  `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
+  typed `accepted` / `reached_no_endpoint` outcomes through opaque adapter-owned acknowledgement handles.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue
   faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected
@@ -122,8 +124,17 @@ ledger or output separately. The serializable `advance_time` step advances the s
 sleeping or waking a participant; a later `tick` selects the awake runtimes and uses that same clock. Every engine
 subject carries the deterministic manual clock, but only a scenario that executes `advance_time` switches `tick` to
 that clock. Existing scenarios and standalone `HarnessClient` tests that never opt into virtual time retain the
-historical far-future `tick` shortcut. The simulator does not yet wait for quiescence: structural progress tokens, a
-fixed-point driver, timeout policy, outbound acknowledgement, and retry-timer coverage remain in Milestone 1.3.
+historical far-future `tick` shortcut.
+
+`EngineHarnessSubject::new` uses the explicit outbound lifecycle. Polling never removes work, identical repeated
+acknowledgements are idempotent, and a contradictory acknowledgement fails. An accepted state-bearing commit confirms
+the engine's pending state; a `reached_no_endpoint` result rolls back only while the complete publication remains
+unexposed. Welcome outcomes remain independent after a live commit is accepted, and regenerated queued intents are
+retired or re-armed from the same acknowledgement. A state transition with no transport artifacts is confirmed as a
+no-op publication rather than inventing a synthetic artifact. The built-in ScenarioSpec v1 runners use a legacy-compatibility
+constructor so existing fixtures retain their explicit `confirm_pending` / `fail_pending` behavior until Scenario IR v2
+adds portable outbound actions. The simulator does not yet wait for quiescence: structural progress tokens, a fixed-point
+driver, timeout policy, and retry-timer coverage remain in Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting

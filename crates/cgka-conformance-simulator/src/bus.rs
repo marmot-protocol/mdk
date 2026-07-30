@@ -49,6 +49,12 @@ struct InFlight {
     msg: TransportMessage,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundEmission {
+    pub sequence: u64,
+    pub msg: TransportMessage,
+}
+
 #[derive(Clone)]
 pub struct TransportBus {
     inner: Arc<Mutex<Inner>>,
@@ -57,7 +63,13 @@ pub struct TransportBus {
 struct Inner {
     clients: HashMap<ClientId, MemberId>,
     next_client_id: usize,
+    next_outbound_sequence: u64,
     queue: Vec<InFlight>,
+    /// Append-only observation of transport artifacts emitted by each
+    /// participant. This is deliberately separate from the mutable delivery
+    /// queue so a black-box subject can expose publication work without
+    /// leaking queue indices or fault-injection internals.
+    outbound_emissions: HashMap<ClientId, Vec<OutboundEmission>>,
     policy: DeliveryPolicy,
     /// Per-client pre-delivery buffer.
     mailboxes: HashMap<ClientId, Vec<TransportMessage>>,
@@ -81,7 +93,9 @@ impl TransportBus {
             inner: Arc::new(Mutex::new(Inner {
                 clients: HashMap::new(),
                 next_client_id: 0,
+                next_outbound_sequence: 0,
                 queue: Vec::new(),
+                outbound_emissions: HashMap::new(),
                 policy,
                 mailboxes: HashMap::new(),
                 partition_allowed: None,
@@ -103,11 +117,51 @@ impl TransportBus {
         id
     }
 
+    pub(crate) fn capture_outbound_for(&self, sender: ClientId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .outbound_emissions
+            .entry(sender)
+            .or_default();
+    }
+
     /// Send a message into the bus from `sender`. The message becomes
     /// eligible for delivery on the next `step` / `deliver_all`.
     pub fn send(&self, sender: ClientId, msg: TransportMessage) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.outbound_emissions.contains_key(&sender) {
+            let sequence = inner.next_outbound_sequence;
+            inner.next_outbound_sequence = inner
+                .next_outbound_sequence
+                .checked_add(1)
+                .expect("outbound emission sequence exhausted");
+            inner
+                .outbound_emissions
+                .get_mut(&sender)
+                .expect("outbound capture remains enabled")
+                .push(OutboundEmission {
+                    sequence,
+                    msg: msg.clone(),
+                });
+        }
         inner.queue.push(InFlight { sender, msg });
+    }
+
+    pub(crate) fn outbound_since(
+        &self,
+        sender: ClientId,
+        after_sequence: Option<u64>,
+    ) -> Vec<OutboundEmission> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .outbound_emissions
+            .get(&sender)
+            .into_iter()
+            .flatten()
+            .filter(|emission| after_sequence.is_none_or(|after| emission.sequence > after))
+            .cloned()
+            .collect()
     }
 
     /// Retract every still-undelivered artifact for one pending publication.

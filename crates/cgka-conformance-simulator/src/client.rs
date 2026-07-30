@@ -58,6 +58,7 @@ pub struct HarnessClient {
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     virtual_time_tick_enabled: bool,
+    external_publication_lifecycle: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
     /// automatically after the first create/join.
@@ -68,6 +69,8 @@ pub struct HarnessClient {
     scenario_input_tracker: ScenarioInputTracker,
     pending_scenario_inputs: HashMap<PendingStateRef, String>,
     pending_publication_artifacts: HashMap<PendingStateRef, Vec<MessageId>>,
+    pending_confirmation_artifacts: HashMap<PendingStateRef, Vec<MessageId>>,
+    regenerated_queued_intents: HashMap<MessageId, (GroupId, MessageId)>,
     /// Shared in-memory capture of the engine's forensic audit events, used to
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
@@ -83,6 +86,7 @@ pub struct ClientBuilder {
     storage_options: SqliteStorageOptions,
     explicit_file_storage: Option<ExplicitFileStorage>,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    external_publication_lifecycle: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +201,7 @@ impl ClientBuilder {
             storage_options: SqliteStorageOptions::default(),
             explicit_file_storage: None,
             convergence_clock: None,
+            external_publication_lifecycle: false,
         }
     }
 
@@ -241,6 +246,11 @@ impl ClientBuilder {
         self
     }
 
+    pub(crate) fn external_publication_lifecycle(mut self) -> Self {
+        self.external_publication_lifecycle = true;
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -259,6 +269,9 @@ impl ClientBuilder {
             self.convergence_clock.as_ref(),
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
+        if self.external_publication_lifecycle {
+            bus.capture_outbound_for(bus_id);
+        }
         HarnessClient {
             engine: Some(engine),
             bus_id,
@@ -271,6 +284,7 @@ impl ClientBuilder {
             protocol_profile: self.protocol_profile,
             convergence_clock: self.convergence_clock,
             virtual_time_tick_enabled: false,
+            external_publication_lifecycle: self.external_publication_lifecycle,
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
@@ -279,6 +293,8 @@ impl ClientBuilder {
             scenario_input_tracker: ScenarioInputTracker::default(),
             pending_scenario_inputs: HashMap::new(),
             pending_publication_artifacts: HashMap::new(),
+            pending_confirmation_artifacts: HashMap::new(),
+            regenerated_queued_intents: HashMap::new(),
             audit_capture,
             convergence_checkpoints: HashMap::new(),
         }
@@ -451,6 +467,47 @@ impl HarnessClient {
 
     pub(crate) fn enable_virtual_time_tick(&mut self) {
         self.virtual_time_tick_enabled = true;
+    }
+
+    pub(crate) fn pending_publication_for_message(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<PendingStateRef> {
+        self.pending_publication_artifacts
+            .iter()
+            .find_map(|(pending, message_ids)| message_ids.contains(message_id).then_some(*pending))
+    }
+
+    pub(crate) fn message_confirms_pending(
+        &self,
+        pending: PendingStateRef,
+        message_id: &MessageId,
+    ) -> bool {
+        self.pending_confirmation_artifacts
+            .get(&pending)
+            .is_some_and(|message_ids| message_ids.contains(message_id))
+    }
+
+    pub(crate) fn regenerated_queued_intent_for_message(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<(GroupId, MessageId)> {
+        self.regenerated_queued_intents.get(message_id).cloned()
+    }
+
+    pub(crate) fn confirm_regenerated_queued_intent(
+        &mut self,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        self.engine_mut().confirm_queued_outbound_intent(intent_id)
+    }
+
+    pub(crate) fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId) {
+        self.engine_mut().retry_queued_outbound_intent(group_id);
+    }
+
+    pub(crate) fn forget_regenerated_queued_intent(&mut self, message_id: &MessageId) {
+        self.regenerated_queued_intents.remove(message_id);
     }
 
     pub fn restart(&mut self) {
@@ -657,7 +714,7 @@ impl HarnessClient {
                 initial_admins,
             })
             .await?;
-        let (gid, pending, welcomes) = match res {
+        let (gid, mut pending, welcomes) = match res {
             (gid, SendResult::GroupCreated { pending, welcomes }) => (gid, Some(pending), welcomes),
             (gid, SendResult::FoundingGroupCreated { welcomes }) => (gid, None, welcomes),
             (_, other) => {
@@ -671,11 +728,23 @@ impl HarnessClient {
                 pending,
                 welcomes.iter().map(|welcome| welcome.id.clone()),
             );
+            self.remember_pending_confirmation(
+                pending,
+                welcomes.iter().map(|welcome| welcome.id.clone()),
+            );
         }
+        let has_outbound_artifacts = !welcomes.is_empty();
         for w in welcomes {
             self.bus.send(self.bus_id, w);
         }
         self.default_group = Some(gid.clone());
+        if self.external_publication_lifecycle
+            && !has_outbound_artifacts
+            && let Some(noop_pending) = pending
+        {
+            self.try_confirm(noop_pending).await?;
+            pending = None;
+        }
         if pending.is_none() {
             self.capture_engine_events();
         }
@@ -689,9 +758,13 @@ impl HarnessClient {
         self.try_confirm(pending).await.expect("confirm_published");
     }
 
-    async fn try_confirm(&mut self, pending: PendingStateRef) -> Result<(), EngineError> {
+    pub(crate) async fn try_confirm(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<(), EngineError> {
         self.engine_mut().confirm_published(pending).await?;
         self.pending_publication_artifacts.remove(&pending);
+        self.pending_confirmation_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
             self.scenario_input_tracker.record_confirmed(&scenario_id);
         }
@@ -720,6 +793,7 @@ impl HarnessClient {
             })?;
         self.engine_mut().publish_failed(pending).await?;
         self.pending_publication_artifacts.remove(&pending);
+        self.pending_confirmation_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
             self.scenario_input_tracker.record_rolled_back(&scenario_id);
         }
@@ -750,6 +824,7 @@ impl HarnessClient {
                         .map(|welcome| welcome.id.clone())
                         .chain(std::iter::once(routed.id.clone())),
                 );
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
@@ -784,6 +859,7 @@ impl HarnessClient {
                 );
                 let routed = route(msg, &gid);
                 self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
@@ -820,6 +896,7 @@ impl HarnessClient {
                 );
                 let routed = route(msg, &gid);
                 self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 Ok(pending)
@@ -984,6 +1061,7 @@ impl HarnessClient {
                         .map(|welcome| welcome.id.clone())
                         .chain(std::iter::once(routed.id.clone())),
                 );
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 for w in welcomes {
                     self.bus.send(self.bus_id, w);
                 }
@@ -1199,11 +1277,18 @@ impl HarnessClient {
             SendResult::ApplicationMessage {
                 msg, app_event_id, ..
             } => {
+                let queued_intent = self
+                    .engine_mut()
+                    .take_regenerated_queued_intent_for_message(&msg.id);
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
                     msg
                 };
+                if let Some(queued_intent) = queued_intent {
+                    self.regenerated_queued_intents
+                        .insert(routed.id.clone(), queued_intent);
+                }
                 let scenario_input = self
                     .scenario_input_tracker
                     .metadata_for_logical(&app_event_id)
@@ -1217,11 +1302,18 @@ impl HarnessClient {
                 self.bus.send(self.bus_id, routed);
             }
             SendResult::Proposal { msg } => {
+                let queued_intent = self
+                    .engine_mut()
+                    .take_regenerated_queued_intent_for_message(&msg.id);
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
                     msg
                 };
+                if let Some(queued_intent) = queued_intent {
+                    self.regenerated_queued_intents
+                        .insert(routed.id.clone(), queued_intent);
+                }
                 let scenario_input =
                     self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
                 self.scenario_input_tracker
@@ -1237,25 +1329,46 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
-                for welcome in welcomes {
-                    self.bus.send(self.bus_id, welcome);
-                }
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {
                     msg
                 };
-                self.publish_commit_scenario_input(&routed, pending).await;
-                self.bus.send(self.bus_id, routed);
-                self.try_confirm(pending).await?;
-                self.capture_engine_events();
-            }
-            SendResult::GroupCreated { welcomes, pending } => {
+                self.remember_pending_publication(
+                    pending,
+                    welcomes
+                        .iter()
+                        .map(|welcome| welcome.id.clone())
+                        .chain(std::iter::once(routed.id.clone())),
+                );
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 for welcome in welcomes {
                     self.bus.send(self.bus_id, welcome);
                 }
-                self.engine_mut().confirm_published(pending).await?;
-                self.capture_engine_events();
+                self.publish_commit_scenario_input(&routed, pending).await;
+                self.bus.send(self.bus_id, routed);
+                if !self.external_publication_lifecycle {
+                    self.try_confirm(pending).await?;
+                    self.capture_engine_events();
+                }
+            }
+            SendResult::GroupCreated { welcomes, pending } => {
+                let has_outbound_artifacts = !welcomes.is_empty();
+                self.remember_pending_publication(
+                    pending,
+                    welcomes.iter().map(|welcome| welcome.id.clone()),
+                );
+                self.remember_pending_confirmation(
+                    pending,
+                    welcomes.iter().map(|welcome| welcome.id.clone()),
+                );
+                for welcome in welcomes {
+                    self.bus.send(self.bus_id, welcome);
+                }
+                if !self.external_publication_lifecycle || !has_outbound_artifacts {
+                    self.try_confirm(pending).await?;
+                    self.capture_engine_events();
+                }
             }
             SendResult::FoundingGroupCreated { welcomes } => {
                 for welcome in welcomes {
@@ -1282,7 +1395,12 @@ impl HarnessClient {
             };
             self.publish_commit_scenario_input(&routed, auto.pending)
                 .await;
+            self.remember_pending_publication(auto.pending, std::iter::once(routed.id.clone()));
+            self.remember_pending_confirmation(auto.pending, std::iter::once(routed.id.clone()));
             self.bus.send(self.bus_id, routed);
+            if self.external_publication_lifecycle {
+                continue;
+            }
             if let Err(e) = self.try_confirm(auto.pending).await {
                 // A confirmation error is not evidence that the engine rolled
                 // back the staged state. Keep the mapping pending so the
@@ -1296,11 +1414,18 @@ impl HarnessClient {
         }
         let proposals = self.engine_mut().drain_auto_proposals();
         for msg in proposals {
+            let queued_intent = self
+                .engine_mut()
+                .take_regenerated_queued_intent_for_message(&msg.id);
             let routed = if let Some(gid) = &gid {
                 route(msg, gid)
             } else {
                 msg
             };
+            if let Some(queued_intent) = queued_intent {
+                self.regenerated_queued_intents
+                    .insert(routed.id.clone(), queued_intent);
+            }
             let scenario_input =
                 self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
             self.scenario_input_tracker
@@ -1505,6 +1630,17 @@ impl HarnessClient {
         message_ids: impl IntoIterator<Item = MessageId>,
     ) {
         self.pending_publication_artifacts
+            .entry(pending)
+            .or_default()
+            .extend(message_ids);
+    }
+
+    fn remember_pending_confirmation(
+        &mut self,
+        pending: PendingStateRef,
+        message_ids: impl IntoIterator<Item = MessageId>,
+    ) {
+        self.pending_confirmation_artifacts
             .entry(pending)
             .or_default()
             .extend(message_ids);

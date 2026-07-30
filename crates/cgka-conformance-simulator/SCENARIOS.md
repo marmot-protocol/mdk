@@ -451,6 +451,23 @@ These tests keep the simulator machinery honest.
 - `engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected` checks two real durable disband passes:
   a tick at 999 ms settles neither; at 1,000 ms Alice settles while unticked Bob stays live; Bob then settles on a later
   tick without another time advance.
+- `outbound_poll_is_non_destructive_and_acknowledgement_is_idempotent` checks exact application artifacts, repeatable
+  polling, same-outcome acknowledgement replay, transport delivery, and disappearance after resolution;
+  `outbound_poll_preserves_emission_order_past_single_digit_handles` guards deterministic ordering under a burst.
+- `evolution_commit_acknowledgement_and_welcome_outcome_are_independent` and
+  `no_endpoint_commit_outcome_rolls_back_the_complete_unexposed_publication` check that accepted commits advance local
+  state independently of Welcome delivery, while definite unexposed commit failure atomically retracts and rolls back
+  the complete publication.
+- `legacy_create_confirms_on_first_welcome_acceptance_and_keeps_other_welcomes_independent` checks the temporary legacy
+  creation rule, `empty_legacy_creation_confirms_without_synthetic_outbound_work` covers creation with nothing to
+  publish, and `scheduled_group_evolution_waits_for_public_outbound_acknowledgement` proves timer-produced evolution
+  work stays pending until the public acknowledgement arrives.
+- `regenerated_queued_intent_retries_then_retires_through_outbound_acknowledgement` proves a queued application is
+  re-armed after definite failure, regenerated with a fresh artifact, and retired only after transport acceptance.
+- `no_endpoint_outcome_is_rejected_after_recipient_exposure` prevents a caller from claiming definite non-publication
+  after an artifact reached a recipient mailbox;
+  `exposed_welcome_prevents_partial_commit_retraction_and_rollback` applies the same rule to the complete
+  commit/Welcome publication so a failed rollback cannot partially mutate transport state.
 - `failing_generated_case_records_a_minimized_reproducer` checks that a failing generated case records a smaller
   reproducer when removable delivery noise is enough to keep the same failure.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across

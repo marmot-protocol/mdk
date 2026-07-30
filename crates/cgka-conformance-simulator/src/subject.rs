@@ -19,7 +19,8 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::types::MemberId;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -39,6 +40,7 @@ pub enum SubjectCapability {
     AdminPolicyObservation,
     CrashReopen,
     VirtualTime,
+    OutboundPublication,
     WhiteBoxTransportQueueFaults,
     WhiteBoxTransportPartition,
     WhiteBoxStorageFaults,
@@ -57,6 +59,7 @@ impl SubjectCapability {
             Self::AdminPolicyObservation => "admin_policy_observation",
             Self::CrashReopen => "crash_reopen",
             Self::VirtualTime => "virtual_time",
+            Self::OutboundPublication => "outbound_publication",
             Self::WhiteBoxTransportQueueFaults => "white_box_transport_queue_faults",
             Self::WhiteBoxTransportPartition => "white_box_transport_partition",
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
@@ -164,6 +167,36 @@ pub struct SubjectSendApplication<'a> {
     pub payload: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectOutboundKind {
+    GroupMessage,
+    Welcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectOutboundOutcome {
+    Accepted,
+    ReachedNoEndpoint,
+}
+
+/// One transport-ready artifact emitted by a subject participant.
+///
+/// `outbound_id` is an adapter-owned opaque acknowledgement handle. The
+/// transport message is intentionally preserved as a cross-boundary value so
+/// retained-relay and process adapters can publish the exact bytes without
+/// gaining access to engine or harness storage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubjectOutboundArtifact {
+    pub outbound_id: String,
+    pub client: String,
+    pub kind: SubjectOutboundKind,
+    pub message: TransportMessage,
+    pub state_confirmation_required: bool,
+    pub regenerated_queued_intent: bool,
+}
+
 /// Normal convergence operations available to a scenario executor.
 ///
 /// Default methods fail closed. A partial adapter can therefore declare only
@@ -240,6 +273,26 @@ pub trait ConvergenceSubject: Send {
     /// the elapsed deadline.
     async fn advance_time(&mut self, _delta_ms: u64) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
+    }
+
+    fn poll_outbound(
+        &mut self,
+        _client: &str,
+    ) -> Result<Vec<SubjectOutboundArtifact>, SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::OutboundPublication,
+        ))
+    }
+
+    async fn acknowledge_outbound(
+        &mut self,
+        _client: &str,
+        _outbound_id: &str,
+        _outcome: SubjectOutboundOutcome,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::OutboundPublication,
+        ))
     }
 
     fn observe(&mut self, _clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
@@ -346,6 +399,17 @@ pub struct EngineHarnessSubject {
     clients: BTreeMap<String, HarnessClient>,
     pending_refs: HashMap<String, PendingStateRef>,
     convergence_clock: ManualConvergenceClock,
+    outbound_cursors: HashMap<String, u64>,
+    outbound_records: BTreeMap<String, EngineSubjectOutboundRecord>,
+}
+
+#[derive(Clone)]
+struct EngineSubjectOutboundRecord {
+    sequence: u64,
+    artifact: SubjectOutboundArtifact,
+    pending: Option<PendingStateRef>,
+    queued_intent: Option<(GroupId, MessageId)>,
+    resolution: Option<SubjectOutboundOutcome>,
 }
 
 impl EngineHarnessSubject {
@@ -353,6 +417,23 @@ impl EngineHarnessSubject {
         clients: &[String],
         protocol_profile: ProtocolProfile,
         storage_mode: HarnessStorageMode,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_publication_lifecycle(clients, protocol_profile, storage_mode, true)
+    }
+
+    pub(crate) fn new_legacy_compatible(
+        clients: &[String],
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_publication_lifecycle(clients, protocol_profile, storage_mode, false)
+    }
+
+    fn new_with_publication_lifecycle(
+        clients: &[String],
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        external_publication_lifecycle: bool,
     ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
@@ -364,12 +445,15 @@ impl EngineHarnessSubject {
                     format!("duplicate client label {label}"),
                 ));
             }
-            let client = ClientBuilder::new(pad32(label.as_bytes()))
+            let mut builder = ClientBuilder::new(pad32(label.as_bytes()))
                 .registry(scenario_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
-                .convergence_clock(Arc::new(convergence_clock.clone()))
-                .attach(&bus);
+                .convergence_clock(Arc::new(convergence_clock.clone()));
+            if external_publication_lifecycle {
+                builder = builder.external_publication_lifecycle();
+            }
+            let client = builder.attach(&bus);
             attached.insert(label.clone(), client);
         }
         let capabilities = [
@@ -383,6 +467,7 @@ impl EngineHarnessSubject {
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
             SubjectCapability::VirtualTime,
+            SubjectCapability::OutboundPublication,
             SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
         ]
@@ -399,6 +484,8 @@ impl EngineHarnessSubject {
             clients: attached,
             pending_refs: HashMap::new(),
             convergence_clock,
+            outbound_cursors: HashMap::new(),
+            outbound_records: BTreeMap::new(),
         })
     }
 
@@ -454,6 +541,62 @@ impl EngineHarnessSubject {
         self.pending_refs.remove(label).ok_or_else(|| {
             SubjectError::new("unknown_pending", format!("unknown pending label {label}"))
         })
+    }
+
+    fn sync_client_outbound(&mut self, label: &str) -> Result<(), SubjectError> {
+        let client = self.client(label)?;
+        let bus_id = client.bus_id;
+        let after_sequence = self.outbound_cursors.get(label).copied();
+        let emissions = self.bus.outbound_since(bus_id, after_sequence);
+        if emissions.is_empty() {
+            return Ok(());
+        }
+
+        for emission in emissions {
+            let pending = self
+                .client(label)?
+                .pending_publication_for_message(&emission.msg.id);
+            let queued_intent = self
+                .client(label)?
+                .regenerated_queued_intent_for_message(&emission.msg.id);
+            let state_confirmation_required = pending.is_some_and(|pending| {
+                self.client(label)
+                    .expect("validated client remains present")
+                    .message_confirms_pending(pending, &emission.msg.id)
+            });
+            let kind = match &emission.msg.envelope {
+                TransportEnvelope::GroupMessage { .. } => SubjectOutboundKind::GroupMessage,
+                TransportEnvelope::Welcome { .. } => SubjectOutboundKind::Welcome,
+            };
+            let outbound_id = format!("outbound/{}", emission.sequence);
+            self.outbound_records
+                .entry(outbound_id.clone())
+                .or_insert_with(|| EngineSubjectOutboundRecord {
+                    sequence: emission.sequence,
+                    artifact: SubjectOutboundArtifact {
+                        outbound_id,
+                        client: label.to_owned(),
+                        kind,
+                        message: emission.msg,
+                        state_confirmation_required,
+                        regenerated_queued_intent: queued_intent.is_some(),
+                    },
+                    pending,
+                    queued_intent,
+                    resolution: None,
+                });
+            self.outbound_cursors
+                .insert(label.to_owned(), emission.sequence);
+        }
+        Ok(())
+    }
+
+    fn mark_pending_outbound(&mut self, pending: PendingStateRef, outcome: SubjectOutboundOutcome) {
+        for record in self.outbound_records.values_mut() {
+            if record.pending == Some(pending) {
+                record.resolution = Some(outcome);
+            }
+        }
     }
 }
 
@@ -523,12 +666,18 @@ impl ConvergenceSubject for EngineHarnessSubject {
     }
 
     async fn confirm_pending(&mut self, client: &str, pending: &str) -> Result<(), SubjectError> {
+        self.sync_client_outbound(client)?;
         let pending_ref = self.take_pending(pending)?;
-        self.client_mut(client)?.confirm(pending_ref).await;
+        self.client_mut(client)?
+            .try_confirm(pending_ref)
+            .await
+            .map_err(subject_engine_error)?;
+        self.mark_pending_outbound(pending_ref, SubjectOutboundOutcome::Accepted);
         Ok(())
     }
 
     async fn fail_pending(&mut self, client: &str, pending: &str) -> Result<(), SubjectError> {
+        self.sync_client_outbound(client)?;
         let pending_ref = self.pending_refs.get(pending).cloned().ok_or_else(|| {
             SubjectError::new(
                 "unknown_pending",
@@ -540,6 +689,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
             .await
             .map_err(subject_engine_error)?;
         self.pending_refs.remove(pending);
+        self.mark_pending_outbound(pending_ref, SubjectOutboundOutcome::ReachedNoEndpoint);
         Ok(())
     }
 
@@ -576,6 +726,158 @@ impl ConvergenceSubject for EngineHarnessSubject {
         self.convergence_clock.advance_ms(delta_ms);
         for client in self.clients.values_mut() {
             client.enable_virtual_time_tick();
+        }
+        Ok(())
+    }
+
+    fn poll_outbound(
+        &mut self,
+        client: &str,
+    ) -> Result<Vec<SubjectOutboundArtifact>, SubjectError> {
+        self.sync_client_outbound(client)?;
+        let mut unresolved = self
+            .outbound_records
+            .values()
+            .filter(|record| record.artifact.client == client && record.resolution.is_none())
+            .collect::<Vec<_>>();
+        unresolved.sort_by_key(|record| record.sequence);
+        Ok(unresolved
+            .into_iter()
+            .map(|record| record.artifact.clone())
+            .collect())
+    }
+
+    async fn acknowledge_outbound(
+        &mut self,
+        client: &str,
+        outbound_id: &str,
+        outcome: SubjectOutboundOutcome,
+    ) -> Result<(), SubjectError> {
+        self.sync_client_outbound(client)?;
+        let record = self
+            .outbound_records
+            .get(outbound_id)
+            .cloned()
+            .ok_or_else(|| {
+                SubjectError::new(
+                    "unknown_outbound",
+                    format!("unknown outbound artifact {outbound_id}"),
+                )
+            })?;
+        if record.artifact.client != client {
+            return Err(SubjectError::new(
+                "outbound_client_mismatch",
+                format!("outbound artifact {outbound_id} does not belong to {client}"),
+            ));
+        }
+        if let Some(previous) = record.resolution {
+            return if previous == outcome {
+                Ok(())
+            } else {
+                Err(SubjectError::new(
+                    "outbound_already_resolved",
+                    format!("outbound artifact {outbound_id} was already resolved as {previous:?}"),
+                ))
+            };
+        }
+
+        let pending_already_confirmed = record.pending.is_some_and(|pending| {
+            self.outbound_records.values().any(|candidate| {
+                candidate.pending == Some(pending)
+                    && candidate.artifact.state_confirmation_required
+                    && candidate.resolution == Some(SubjectOutboundOutcome::Accepted)
+            })
+        });
+
+        match outcome {
+            SubjectOutboundOutcome::Accepted => {
+                if record.artifact.state_confirmation_required
+                    && !pending_already_confirmed
+                    && let Some(pending) = record.pending
+                {
+                    self.client_mut(client)?
+                        .try_confirm(pending)
+                        .await
+                        .map_err(subject_engine_error)?;
+                    self.pending_refs.retain(|_, value| *value != pending);
+                }
+                if let Some((_, intent_id)) = &record.queued_intent {
+                    self.client_mut(client)?
+                        .confirm_regenerated_queued_intent(intent_id)
+                        .map_err(subject_engine_error)?;
+                    self.client_mut(client)?
+                        .forget_regenerated_queued_intent(&record.artifact.message.id);
+                }
+                self.outbound_records
+                    .get_mut(outbound_id)
+                    .expect("validated outbound record remains present")
+                    .resolution = Some(outcome);
+            }
+            SubjectOutboundOutcome::ReachedNoEndpoint => {
+                let should_roll_back_pending = record
+                    .pending
+                    .filter(|_| record.artifact.state_confirmation_required)
+                    .is_some_and(|pending| {
+                        let another_confirmation_is_unresolved =
+                            self.outbound_records
+                                .iter()
+                                .any(|(candidate_id, candidate)| {
+                                    candidate_id != outbound_id
+                                        && candidate.pending == Some(pending)
+                                        && candidate.artifact.state_confirmation_required
+                                        && candidate.resolution.is_none()
+                                });
+                        let confirmation_was_accepted =
+                            self.outbound_records.values().any(|candidate| {
+                                candidate.pending == Some(pending)
+                                    && candidate.artifact.state_confirmation_required
+                                    && candidate.resolution
+                                        == Some(SubjectOutboundOutcome::Accepted)
+                            });
+                        !another_confirmation_is_unresolved && !confirmation_was_accepted
+                    });
+
+                if should_roll_back_pending {
+                    let pending = record
+                        .pending
+                        .expect("rollback decision requires pending state");
+                    // `try_fail` validates the complete commit/Welcome
+                    // exposure set before retracting any artifact. Do not
+                    // retract this one first: an exposed sibling must leave
+                    // both the bus and pending state untouched.
+                    self.client_mut(client)?
+                        .try_fail(pending)
+                        .await
+                        .map_err(subject_publication_error)?;
+                    self.pending_refs.retain(|_, value| *value != pending);
+                    self.mark_pending_outbound(pending, outcome);
+                } else {
+                    self.bus
+                        .retract_undelivered_publication(
+                            self.client(client)?.bus_id,
+                            std::slice::from_ref(&record.artifact.message.id),
+                        )
+                        .map_err(|delivered| {
+                            SubjectError::new(
+                                "outbound_already_exposed",
+                                format!(
+                                    "cannot report no-endpoint publication after {delivered} recipient exposure(s)"
+                                ),
+                            )
+                        })?;
+                    self.outbound_records
+                        .get_mut(outbound_id)
+                        .expect("validated outbound record remains present")
+                        .resolution = Some(outcome);
+                }
+
+                if let Some((group_id, _)) = &record.queued_intent {
+                    self.client_mut(client)?
+                        .retry_regenerated_queued_intent(group_id);
+                    self.client_mut(client)?
+                        .forget_regenerated_queued_intent(&record.artifact.message.id);
+                }
+            }
         }
         Ok(())
     }
@@ -825,6 +1127,17 @@ fn subject_engine_error(error: EngineError) -> SubjectError {
     SubjectError::new(observe_engine_error(&error), error.to_string())
 }
 
+fn subject_publication_error(error: EngineError) -> SubjectError {
+    match error {
+        EngineError::Other(message)
+            if message.starts_with("cannot report definite publication failure after") =>
+        {
+            SubjectError::new("outbound_already_exposed", message)
+        }
+        error => subject_engine_error(error),
+    }
+}
+
 fn observe_engine_error(error: &EngineError) -> String {
     match error {
         EngineError::NotGroupAdmin { .. } => "not_group_admin",
@@ -862,10 +1175,671 @@ mod tests {
     use super::*;
     use crate::ConformanceCanonicalStateSnapshot;
 
+    async fn create_current_group_and_join(
+        subject: &mut EngineHarnessSubject,
+        creator: &str,
+        invitees: &[String],
+    ) {
+        subject
+            .create_group(SubjectCreateGroup {
+                creator,
+                name: "outbound-contract",
+                invitees,
+                required_features: &[],
+                initial_admins: &[],
+                pending: "unused-current-create",
+            })
+            .await
+            .expect("current founding group is created");
+        let welcomes = subject
+            .poll_outbound(creator)
+            .expect("founding welcomes are pollable");
+        assert_eq!(welcomes.len(), invitees.len());
+        for welcome in welcomes {
+            assert_eq!(welcome.kind, SubjectOutboundKind::Welcome);
+            assert!(!welcome.state_confirmation_required);
+            subject
+                .acknowledge_outbound(
+                    creator,
+                    &welcome.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("founding welcome publication is accepted");
+        }
+        subject.deliver_all().expect("deliver founding welcomes");
+        subject
+            .tick(invitees)
+            .await
+            .expect("invitees ingest founding welcomes");
+    }
+
+    #[tokio::test]
+    async fn outbound_poll_is_non_destructive_and_acknowledgement_is_idempotent() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        assert!(
+            subject
+                .descriptor()
+                .supports(SubjectCapability::OutboundPublication)
+        );
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "app-1",
+                sender: "alice",
+                payload: "hello",
+            })
+            .await
+            .expect("application send succeeds");
+        let first = subject
+            .poll_outbound("alice")
+            .expect("application publication is pollable");
+        let second = subject
+            .poll_outbound("alice")
+            .expect("polling is non-destructive");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, SubjectOutboundKind::GroupMessage);
+        assert!(!first[0].state_confirmation_required);
+
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &first[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("application publication is accepted");
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &first[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("same acknowledgement is idempotent");
+        let contradiction = subject
+            .acknowledge_outbound(
+                "alice",
+                &first[0].outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect_err("contradictory acknowledgement is rejected");
+        assert_eq!(contradiction.code, "outbound_already_resolved");
+        assert!(
+            subject
+                .poll_outbound("alice")
+                .expect("resolved publication is absent")
+                .is_empty()
+        );
+
+        subject.deliver_all().expect("deliver application message");
+        subject
+            .tick(&["bob".to_owned()])
+            .await
+            .expect("bob ingests application message");
+        assert_eq!(
+            subject
+                .client_mut("bob")
+                .expect("bob exists")
+                .received_app_payloads(),
+            vec![b"hello".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_poll_preserves_emission_order_past_single_digit_handles() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+
+        for index in 0..12 {
+            subject
+                .send_application(SubjectSendApplication {
+                    action_id: &format!("app-{index}"),
+                    sender: "alice",
+                    payload: &format!("payload-{index}"),
+                })
+                .await
+                .expect("application send succeeds");
+        }
+
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("application publications are pollable");
+        let sequences = outbound
+            .iter()
+            .map(|artifact| {
+                subject
+                    .outbound_records
+                    .get(&artifact.outbound_id)
+                    .expect("polled artifact has an adapter record")
+                    .sequence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn evolution_commit_acknowledgement_and_welcome_outcome_are_independent() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..2]).await;
+        let prior_epoch = subject.client("alice").expect("alice exists").epoch().0;
+
+        subject
+            .invite_members(SubjectInviteMembers {
+                action_id: "invite-carol",
+                inviter: "alice",
+                invitees: &labels[2..],
+                pending: "invite-carol-pending",
+            })
+            .await
+            .expect("invite produces outbound work");
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("invite artifacts are pollable");
+        assert_eq!(outbound.len(), 2);
+        let commit = outbound
+            .iter()
+            .find(|artifact| artifact.state_confirmation_required)
+            .expect("commit requires state confirmation");
+        let welcome = outbound
+            .iter()
+            .find(|artifact| artifact.kind == SubjectOutboundKind::Welcome)
+            .expect("welcome is an independent obligation");
+        assert!(!welcome.state_confirmation_required);
+
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &commit.outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("accepted commit confirms local state");
+        assert_eq!(
+            subject.client("alice").expect("alice exists").epoch().0,
+            prior_epoch + 1
+        );
+        assert_eq!(
+            subject
+                .poll_outbound("alice")
+                .expect("welcome remains independently pending"),
+            vec![welcome.clone()]
+        );
+
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &welcome.outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect("failed welcome does not roll back an accepted commit");
+        assert_eq!(
+            subject.client("alice").expect("alice exists").epoch().0,
+            prior_epoch + 1
+        );
+        assert!(
+            subject
+                .poll_outbound("alice")
+                .expect("both obligations are resolved")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_endpoint_commit_outcome_rolls_back_the_complete_unexposed_publication() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..2]).await;
+        let prior_epoch = subject.client("alice").expect("alice exists").epoch().0;
+
+        subject
+            .invite_members(SubjectInviteMembers {
+                action_id: "invite-carol",
+                inviter: "alice",
+                invitees: &labels[2..],
+                pending: "invite-carol-pending",
+            })
+            .await
+            .expect("invite produces outbound work");
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("invite artifacts are pollable");
+        let commit = outbound
+            .iter()
+            .find(|artifact| artifact.state_confirmation_required)
+            .expect("commit requires state confirmation");
+
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &commit.outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect("unexposed commit failure rolls back");
+        assert_eq!(
+            subject.client("alice").expect("alice exists").epoch().0,
+            prior_epoch
+        );
+        assert!(
+            subject
+                .poll_outbound("alice")
+                .expect("rollback resolves the complete publication")
+                .is_empty()
+        );
+
+        subject
+            .deliver_all()
+            .expect("rolled-back artifacts are absent from the bus");
+        subject
+            .tick(&["bob".to_owned(), "carol".to_owned()])
+            .await
+            .expect("no rolled-back artifact is ingested");
+    }
+
+    #[tokio::test]
+    async fn exposed_welcome_prevents_partial_commit_retraction_and_rollback() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..2]).await;
+        subject
+            .invite_members(SubjectInviteMembers {
+                action_id: "invite-carol",
+                inviter: "alice",
+                invitees: &labels[2..],
+                pending: "invite-carol-pending",
+            })
+            .await
+            .expect("invite produces outbound work");
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("invite artifacts are pollable");
+        let commit = outbound
+            .iter()
+            .find(|artifact| artifact.state_confirmation_required)
+            .expect("commit requires state confirmation");
+        let pending_snapshot = subject
+            .client("alice")
+            .expect("alice exists")
+            .canonical_state_snapshot();
+        subject
+            .deliver_all()
+            .expect("commit and welcome reach recipient mailboxes");
+
+        let error = subject
+            .acknowledge_outbound(
+                "alice",
+                &commit.outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect_err("exposed sibling prevents definite rollback");
+        assert_eq!(error.code, "outbound_already_exposed");
+        assert_eq!(
+            subject
+                .poll_outbound("alice")
+                .expect("failed rollback leaves every obligation pending"),
+            outbound
+        );
+        assert_eq!(
+            subject
+                .client("alice")
+                .expect("alice exists")
+                .canonical_state_snapshot(),
+            pending_snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn no_endpoint_outcome_is_rejected_after_recipient_exposure() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "exposed-welcome",
+                invitees: &labels[1..],
+                required_features: &[],
+                initial_admins: &[],
+                pending: "unused-current-create",
+            })
+            .await
+            .expect("current founding group is created");
+        let welcome = subject
+            .poll_outbound("alice")
+            .expect("welcome is pollable")
+            .pop()
+            .expect("welcome exists");
+        subject.deliver_all().expect("expose welcome to bob");
+        let error = subject
+            .acknowledge_outbound(
+                "alice",
+                &welcome.outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect_err("exposed artifact cannot be declared unpublished");
+        assert_eq!(error.code, "outbound_already_exposed");
+        assert_eq!(
+            subject
+                .poll_outbound("alice")
+                .expect("failed acknowledgement leaves work pending"),
+            vec![welcome]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_legacy_creation_confirms_without_synthetic_outbound_work() {
+        let labels = vec!["alice".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "empty-legacy-group",
+                invitees: &[],
+                required_features: &[],
+                initial_admins: &[],
+                pending: "no-publication-needed",
+            })
+            .await
+            .expect("empty legacy group is created");
+
+        assert!(
+            subject
+                .poll_outbound("alice")
+                .expect("no synthetic artifact is invented")
+                .is_empty()
+        );
+        assert!(
+            subject
+                .client("alice")
+                .expect("alice exists")
+                .pending_work_observation()
+                .engine
+                .is_empty(),
+            "a no-op publication must not strand pending MLS state"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_create_confirms_on_first_welcome_acceptance_and_keeps_other_welcomes_independent()
+     {
+        let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "legacy-create",
+                invitees: &labels[1..],
+                required_features: &[],
+                initial_admins: &[],
+                pending: "legacy-create-pending",
+            })
+            .await
+            .expect("legacy create produces welcomes");
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("legacy welcomes are pollable");
+        assert_eq!(outbound.len(), 2);
+        assert!(
+            outbound
+                .iter()
+                .all(|artifact| artifact.state_confirmation_required)
+        );
+
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &outbound[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("first exposed legacy welcome confirms creation");
+        assert_eq!(
+            subject
+                .poll_outbound("alice")
+                .expect("second welcome remains pending"),
+            vec![outbound[1].clone()]
+        );
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &outbound[1].outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect("later welcome failure cannot roll back confirmed creation");
+        assert!(
+            subject
+                .poll_outbound("alice")
+                .expect("legacy obligations are resolved")
+                .is_empty()
+        );
+        assert_eq!(subject.client("alice").expect("alice exists").epoch().0, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_group_evolution_waits_for_public_outbound_acknowledgement() {
+        let labels = vec!["alice".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &[]).await;
+        let prior_epoch = subject.client("alice").expect("alice exists").epoch().0;
+
+        let alice = subject.client_mut("alice").expect("alice exists");
+        alice.request_disband().await.expect("request disband");
+        alice
+            .advance_convergence()
+            .await
+            .expect("scheduled convergence emits terminal commit");
+        assert!(matches!(
+            subject
+                .client("alice")
+                .expect("alice exists")
+                .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Live(_)
+        ));
+
+        let outbound = subject
+            .poll_outbound("alice")
+            .expect("scheduled commit is pollable");
+        assert_eq!(outbound.len(), 1);
+        assert!(outbound[0].state_confirmation_required);
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &outbound[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("scheduled commit acknowledgement applies the evolution");
+        assert_eq!(
+            subject.client("alice").expect("alice exists").epoch().0,
+            prior_epoch + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerated_queued_intent_retries_then_retires_through_outbound_acknowledgement() {
+        let labels = vec![
+            "alice".to_owned(),
+            "bob".to_owned(),
+            "carol".to_owned(),
+            "david".to_owned(),
+        ];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..3]).await;
+
+        subject
+            .invite_members(SubjectInviteMembers {
+                action_id: "invite-david",
+                inviter: "alice",
+                invitees: &labels[3..],
+                pending: "invite-david-pending",
+            })
+            .await
+            .expect("invite produces outbound work");
+        let invite_commit = subject
+            .poll_outbound("alice")
+            .expect("invite publication is pollable")
+            .into_iter()
+            .find(|artifact| artifact.state_confirmation_required)
+            .expect("invite commit requires confirmation");
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &invite_commit.outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("invite commit publication is accepted");
+        subject.deliver_all().expect("deliver invite artifacts");
+        let ingest = subject
+            .client_mut("carol")
+            .expect("carol exists")
+            .tick_ingest_only()
+            .await;
+        assert!(
+            ingest.iter().any(|outcome| matches!(
+                outcome,
+                Ok(cgka_traits::ingest::IngestOutcome::Buffered { .. })
+            )),
+            "carol must buffer the invite commit before attempting an app send: {ingest:?}"
+        );
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "queued-app",
+                sender: "carol",
+                payload: "queued while convergence is live",
+            })
+            .await
+            .expect("application intent is queued");
+        assert!(
+            subject
+                .poll_outbound("carol")
+                .expect("queued application has not emitted yet")
+                .is_empty()
+        );
+        subject
+            .advance_time(1_000)
+            .await
+            .expect("advance through the pinned settlement window");
+
+        subject
+            .client_mut("carol")
+            .expect("carol exists")
+            .advance_convergence()
+            .await
+            .expect("carol settles and regenerates queued application");
+        let first = subject
+            .poll_outbound("carol")
+            .expect("regenerated application is pollable");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].regenerated_queued_intent);
+        subject
+            .acknowledge_outbound(
+                "carol",
+                &first[0].outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect("definite failure re-arms the queued intent");
+
+        subject
+            .client_mut("carol")
+            .expect("carol exists")
+            .advance_convergence()
+            .await
+            .expect("carol retries the queued application");
+        let retry = subject
+            .poll_outbound("carol")
+            .expect("retried application is pollable");
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].regenerated_queued_intent);
+        assert_ne!(retry[0].outbound_id, first[0].outbound_id);
+        subject
+            .acknowledge_outbound(
+                "carol",
+                &retry[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .expect("accepted retry retires the queued intent");
+        subject
+            .client_mut("carol")
+            .expect("carol exists")
+            .advance_convergence()
+            .await
+            .expect("no queued retry remains");
+        assert!(
+            subject
+                .poll_outbound("carol")
+                .expect("retired queued intent stays absent")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected() {
         let labels = vec!["alice".to_owned(), "bob".to_owned()];
-        let mut subject = EngineHarnessSubject::new(
+        let mut subject = EngineHarnessSubject::new_legacy_compatible(
             &labels,
             ProtocolProfile::Current,
             HarnessStorageMode::InMemorySqlite,

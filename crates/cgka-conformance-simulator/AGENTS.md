@@ -81,8 +81,12 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     is checked before execution. The engine adapter installs one shared manual paired clock; `AdvanceTime` moves both
     clock domains without waking a runtime, activates virtual-time ticks for that subject, and `Tick` selects which
     participants run convergence against that time. Scenarios that never call `AdvanceTime` and standalone clients
-    retain the legacy far-future `Tick` shortcut. Queue/partition mutation is available only through the separately
-    named `ConvergenceFaultSubject` white-box interface.
+    retain the legacy far-future `Tick` shortcut. The explicit engine subject also captures an append-only emission
+    stream separate from the mutable bus queue: `poll_outbound` returns unresolved transport-ready artifacts
+    non-destructively, and `acknowledge_outbound` applies accepted/no-endpoint outcomes to staged commits, independent
+    Welcomes, and regenerated queued intents. Built-in v1 runners use the legacy publication mode until portable
+    outbound steps land in Scenario IR v2. Queue/partition mutation is available only through the separately named
+    `ConvergenceFaultSubject` white-box interface.
 
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload

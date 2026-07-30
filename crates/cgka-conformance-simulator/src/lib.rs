@@ -79,7 +79,8 @@ pub use scenario_input_ledger::{
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capability,
+    SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capability,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,
