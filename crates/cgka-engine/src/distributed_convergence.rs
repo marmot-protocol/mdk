@@ -1272,6 +1272,11 @@ impl<S: StorageProvider> Engine<S> {
             },
         );
 
+        // A successful settled pass has acted on the proposal-arrival edge.
+        // Keeping the one-bit per-group signal after this point can only
+        // request redundant scheduling; any later proposal ingress recreates
+        // it normally.
+        self.valid_proposal_groups.remove(group_id);
         self.remember_canonicalization_result_messages(&result);
         Ok(result)
     }

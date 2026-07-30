@@ -431,6 +431,65 @@ pub(crate) fn own_commit_stamp(
     })
 }
 
+/// Give retained proposal rows the same terminal disposition when a local
+/// commit is confirmed that stored convergence assigns when it selects that
+/// commit. The staged commit records consumed proposal references, while
+/// MessageStorage is keyed by content-derived message ids, so re-project the
+/// current-epoch proposal rows against the pre-merge group and match the exact
+/// authenticated references.
+pub(crate) fn mark_consumed_proposal_records_processed<S: StorageProvider>(
+    storage: &S,
+    crypto: &RustCrypto,
+    mls_group: &mut MlsGroup,
+    group_id: &GroupId,
+    source_epoch: EpochId,
+    consumed_proposal_refs: &[String],
+) -> Result<(), cgka_traits::error::EngineError> {
+    if consumed_proposal_refs.is_empty() {
+        return Ok(());
+    }
+    let consumed: BTreeSet<&str> = consumed_proposal_refs.iter().map(String::as_str).collect();
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+    for record in storage.list_messages(group_id, source_epoch)? {
+        if record.epoch != source_epoch
+            || !matches!(
+                record.state,
+                MessageState::Created | MessageState::Retryable
+            )
+        {
+            continue;
+        }
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            continue;
+        };
+        let Some(message) = payload.as_openmls_wire() else {
+            continue;
+        };
+        let Ok(Some(protocol)) = protocol_message_from_bytes(&message.payload) else {
+            continue;
+        };
+        // Marmot's current handshake wire-format policy is public. Do not
+        // replay a future private proposal here: OpenMLS decryption advances
+        // the persisted secret tree, which is not an acceptable side effect
+        // for disposition matching.
+        if !matches!(&protocol, ProtocolMessage::PublicMessage(_)) {
+            continue;
+        }
+        let Ok(processed) = mls_group.process_message(&provider, protocol) else {
+            continue;
+        };
+        let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content() else {
+            continue;
+        };
+        let proposal_ref = tls_hex(queued.proposal_reference_ref())
+            .map_err(|error| cgka_traits::error::EngineError::Serialize(error.to_string()))?;
+        if consumed.contains(proposal_ref.as_str()) {
+            storage.update_message_state(&record.id, MessageState::Processed)?;
+        }
+    }
+    Ok(())
+}
+
 /// Mark the origin commit record `Processed` and, when a confirm-time stamp is
 /// available, enrich its stored wire payload to `OwnCommitWire` in the same
 /// write, so stored convergence can later rebuild this commit's branch as a

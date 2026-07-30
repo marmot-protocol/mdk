@@ -1322,29 +1322,12 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
         let report = run_generated_case_report(&case, None)
             .await
             .expect("strict send/leave case report runs");
-        let includes_leave = case
-            .scenario
-            .steps
-            .iter()
-            .any(|step| matches!(step, ScenarioStep::Leave { .. }));
-        if includes_leave {
-            assert!(
-                report
-                    .expectation_failures
-                    .iter()
-                    .any(|failure| failure.kind == "pending_work_remaining"),
-                "leave case {} must retain the strict pending-work regression until proposal work is retired: {:?}",
-                case.case_index,
-                report.expectation_failures
-            );
-        } else {
-            assert!(
-                report.expectation_failures.is_empty(),
-                "non-leave case {} failed strict expectations: {:?}",
-                case.case_index,
-                report.expectation_failures
-            );
-        }
+        assert!(
+            report.expectation_failures.is_empty(),
+            "send/leave case {} failed strict expectations: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
     }
 }
 

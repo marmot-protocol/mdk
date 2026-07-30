@@ -141,6 +141,18 @@ impl<S: StorageProvider> Engine<S> {
                             self.identity.self_id().clone(),
                         )?);
                     }
+                    let source_epoch = EpochId(mls_group.epoch().as_u64());
+                    crate::openmls_projection::mark_consumed_proposal_records_processed(
+                        storage,
+                        &self.crypto,
+                        &mut mls_group,
+                        &group_id,
+                        source_epoch,
+                        &own_commit_stamp
+                            .as_ref()
+                            .expect("pending commit produced a stamp")
+                            .consumed_proposal_refs,
+                    )?;
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                     mls_group
@@ -222,6 +234,12 @@ impl<S: StorageProvider> Engine<S> {
             *fanout = confirmed;
         }
         self.queued_intent_by_pending.remove(&pending);
+        if has_pending_commit {
+            // A proposal-arrival signal only resets scheduling for its source
+            // epoch. Confirming any commit crosses that boundary, so no
+            // signal from the prior epoch remains actionable.
+            self.valid_proposal_groups.remove(&group_id);
+        }
         self.audit_with_context(
             Some(&group_id),
             audit_context.clone(),

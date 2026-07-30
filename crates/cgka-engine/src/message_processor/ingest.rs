@@ -1296,6 +1296,10 @@ impl<S: StorageProvider> Engine<S> {
                     // Update our per-group state machine + storage mirror.
                     self.epoch_manager.set_stable(group_id.clone(), after);
                     self.drop_self_remove_auto_commit_schedules_for_group(&group_id);
+                    // Proposal-arrival schedule signals are source-epoch
+                    // scoped. An accepted commit advances the group, so every
+                    // such signal from the prior epoch is obsolete.
+                    self.valid_proposal_groups.remove(&group_id);
                     self.record_applied_commit_for_recovery(
                         group_id.clone(),
                         before,
