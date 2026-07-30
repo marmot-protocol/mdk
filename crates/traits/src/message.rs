@@ -193,8 +193,10 @@ pub struct MessageRecord {
 ///   `Created` → `Processed` (happy path after successful ingest)
 ///   `Created` → `Failed` (terminal error — no retry)
 ///   `Created` → `Retryable` (transient error — can be re-tried later)
+///   `Created` → `ConvergenceDeferred` (retained for a later convergence pass)
 ///   `Created` → `PeelDeferred` (transport bytes retained for later peel)
 ///   `Retryable` → `Processed` (retry succeeded)
+///   `ConvergenceDeferred` → `Processed` (later evidence selects the input)
 ///   `PeelDeferred` → `Created` (peel succeeded and MLS bytes are buffered)
 ///   `PeelDeferred` → deleted (local retry budget exhausted; redelivery remains eligible)
 ///   any → `EpochInvalidated` (group forked past; message will never apply)
@@ -213,6 +215,10 @@ pub enum MessageState {
     /// Transient failure — eligible for retry (e.g. awaiting out-of-order
     /// commit that hasn't arrived yet).
     Retryable,
+    /// The convergence engine evaluated this input but cannot give it a
+    /// terminal disposition in the completed pass. It remains graph input for
+    /// a later pass, but does not by itself reopen convergence or gate sends.
+    ConvergenceDeferred,
     /// Transport-wrapped bytes are stored, but no available epoch context has
     /// peeled them yet. The engine may retry when it learns or retains more
     /// group epoch state.

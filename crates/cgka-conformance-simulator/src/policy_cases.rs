@@ -104,20 +104,12 @@ pub fn reason_against(expected: &BranchScore, other: &BranchScore) -> &'static s
     }
     if expected.effective_commit_depth == other.effective_commit_depth
         && expected.witness_quorum_met == other.witness_quorum_met
-        && expected.valid_commit_depth > other.valid_commit_depth
-    {
-        return "raw_depth_tie";
-    }
-    if expected.effective_commit_depth == other.effective_commit_depth
-        && expected.witness_quorum_met == other.witness_quorum_met
-        && expected.valid_commit_depth == other.valid_commit_depth
         && expected.app_witness_score > other.app_witness_score
     {
         return "witness_score_tie";
     }
     if expected.effective_commit_depth == other.effective_commit_depth
         && expected.witness_quorum_met == other.witness_quorum_met
-        && expected.valid_commit_depth == other.valid_commit_depth
         && expected.app_witness_score == other.app_witness_score
         && expected.tip_priority < other.tip_priority
     {
@@ -125,7 +117,6 @@ pub fn reason_against(expected: &BranchScore, other: &BranchScore) -> &'static s
     }
     if expected.effective_commit_depth == other.effective_commit_depth
         && expected.witness_quorum_met == other.witness_quorum_met
-        && expected.valid_commit_depth == other.valid_commit_depth
         && expected.app_witness_score == other.app_witness_score
         && expected.tip_priority == other.tip_priority
         && expected.tip_committer < other.tip_committer
@@ -134,7 +125,6 @@ pub fn reason_against(expected: &BranchScore, other: &BranchScore) -> &'static s
     }
     if expected.effective_commit_depth == other.effective_commit_depth
         && expected.witness_quorum_met == other.witness_quorum_met
-        && expected.valid_commit_depth == other.valid_commit_depth
         && expected.app_witness_score == other.app_witness_score
         && expected.tip_priority == other.tip_priority
         && expected.tip_committer == other.tip_committer

@@ -1441,7 +1441,9 @@ async fn exact_observation_ledgers_commit_proposal_and_application_dispositions(
     assert!(
         matches!(
             proposal.disposition,
-            ScenarioInputDisposition::Pending | ScenarioInputDisposition::Accepted
+            ScenarioInputDisposition::Pending
+                | ScenarioInputDisposition::Deferred
+                | ScenarioInputDisposition::Accepted
         ),
         "the ledger must expose the proposal's current durable disposition: {proposal:?}"
     );

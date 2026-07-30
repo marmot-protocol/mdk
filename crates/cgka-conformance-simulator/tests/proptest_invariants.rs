@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
-    ConvergenceStatus, DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate,
-    MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
+    ConvergenceStatus, DeferredMessageReason, DroppedMessageReason, InvalidatedAppMessageReason,
+    MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
     canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{
@@ -639,7 +639,25 @@ fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
         "only consumed selected-branch proposals are accepted",
     );
 
-    let dropped_stale_or_losing_proposals: BTreeSet<String> = observed
+    let deferred_losing_proposals: BTreeSet<String> = observed
+        .deferred_messages
+        .iter()
+        .filter(|message| {
+            message.kind == MessageKind::Proposal
+                && message.reason == DeferredMessageReason::NonSelectedEligibleBranch
+        })
+        .map(|message| message.message_id.clone())
+        .collect();
+    let expected_losing_proposals: BTreeSet<String> = (0..case.losing_proposals)
+        .map(|i| format!("losing-proposal-{i}"))
+        .collect();
+    prop_assert(
+        deferred_losing_proposals,
+        expected_losing_proposals,
+        "eligible losing-branch proposals are deferred",
+    );
+
+    let dropped_stale_proposals: BTreeSet<String> = observed
         .dropped_messages
         .iter()
         .filter(|message| {
@@ -648,14 +666,13 @@ fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
         })
         .map(|message| message.message_id.clone())
         .collect();
-    let expected_stale_or_losing_proposals: BTreeSet<String> = (0..case.losing_proposals)
-        .map(|i| format!("losing-proposal-{i}"))
-        .chain((0..case.pending_proposals).map(|i| format!("pending-proposal-{i}")))
+    let expected_stale_proposals: BTreeSet<String> = (0..case.pending_proposals)
+        .map(|i| format!("pending-proposal-{i}"))
         .collect();
     prop_assert(
-        dropped_stale_or_losing_proposals,
-        expected_stale_or_losing_proposals,
-        "stale and losing-branch proposals are dropped",
+        dropped_stale_proposals,
+        expected_stale_proposals,
+        "unconsumed proposals behind the selected tip are dropped",
     );
 
     let already_seen_ids: BTreeSet<String> = observed

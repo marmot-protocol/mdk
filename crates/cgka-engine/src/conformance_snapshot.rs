@@ -394,6 +394,7 @@ pub(crate) fn capture_pending_work_snapshot<S: StorageProvider>(
             MessageState::Sent
             | MessageState::Processed
             | MessageState::Failed
+            | MessageState::ConvergenceDeferred
             | MessageState::EpochInvalidated => {}
         }
     }

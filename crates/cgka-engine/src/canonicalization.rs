@@ -238,6 +238,9 @@ pub struct CanonicalizationResult {
     pub accepted_commits: Vec<String>,
     pub accepted_proposals: Vec<String>,
     pub accepted_app_messages: Vec<String>,
+    /// Inputs with a current protocol `deferred` disposition. They remain
+    /// retained and eligible for reconsideration in a later pass.
+    pub deferred_messages: Vec<DeferredMessage>,
     pub invalidated_app_messages: Vec<InvalidatedAppMessage>,
     pub dropped_messages: Vec<DroppedMessage>,
     pub already_seen: Vec<AlreadySeen>,
@@ -288,6 +291,21 @@ pub enum DroppedMessageReason {
 pub struct AlreadySeen {
     pub message_id: String,
     pub kind: MessageKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeferredMessage {
+    pub message_id: String,
+    pub kind: MessageKind,
+    pub reason: DeferredMessageReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeferredMessageReason {
+    MissingCandidateParent,
+    NonSelectedEligibleBranch,
+    AwaitingCanonicalCommit,
+    FutureEpoch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -378,13 +396,14 @@ fn canonicalize_internal(
         selected_branch_id: selected_branch_id.clone(),
         candidate_count,
         eligible_count,
-        // Provisional; recomputed after dispositions are known so we can
-        // distinguish Settled (fixed point) from Resolving (window
-        // closed, more work pending).
+        // Provisional; recomputed after dispositions are known so a completed
+        // frozen batch can distinguish a fixed point from an actual blocking
+        // error. Missing dependencies receive explicit deferred dispositions.
         convergence_status: ConvergenceStatus::Syncing,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen,
@@ -420,6 +439,18 @@ fn canonicalize_internal(
         })
         .cloned()
         .unwrap_or_default();
+    let all_consumed_proposal_ids = materialized_graph
+        .consumed_proposal_ids_by_branch
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let proposal_disposition_context = ProposalDispositionContext {
+        selected_consumed_proposal_ids: &selected_consumed_proposal_ids,
+        all_consumed_proposal_ids: &all_consumed_proposal_ids,
+        selected_branch_path: &selected_branch_path,
+        materialized_branch_ids: &materialized_graph.branch_ids,
+        candidate_branches: &materialized_graph.candidates,
+    };
     result.accepted_commits = selected_commit_ids;
 
     for message in unique_messages {
@@ -446,9 +477,7 @@ fn canonicalize_internal(
                 &input,
                 message,
                 branch_id,
-                &selected_consumed_proposal_ids,
-                &selected_branch_path,
-                &materialized_graph.branch_ids,
+                &proposal_disposition_context,
             ),
             PeeledMessageKind::AppMessage {
                 epoch,
@@ -466,8 +495,10 @@ fn canonicalize_internal(
             ),
         }
     }
-    drop_losing_materialized_candidate_commits(
+    classify_losing_materialized_candidate_commits(
         &mut result,
+        &input,
+        &materialized_graph.candidates,
         &materialized_graph.materialized_commit_ids_by_branch,
     );
 
@@ -475,8 +506,10 @@ fn canonicalize_internal(
     // (cgka-engine-canonicalization-contract.md §Lifecycle):
     //
     // - Syncing: convergence-relevant input window has not yet quiesced.
-    // - Resolving: window quiesced, but the canonicalize pass left
-    //   work pending (for example, a commit with no materialized parent).
+    // - Resolving: the frozen batch is actively being resolved. This
+    //   synchronous executable model returns only after resolution, so
+    //   missing dependencies receive an explicit deferred disposition
+    //   rather than pinning the completed pass in Resolving.
     // - Blocked: window quiesced and convergence cannot advance without
     //   a repair path or missing retained material.
     // - Settled: window quiesced AND every input message received a
@@ -779,12 +812,25 @@ fn handle_commit(
             result.accepted_commits.push(message.message_id.clone());
         } else if materialized_branch_ids.contains(branch_id) && result.selected_branch_id.is_some()
         {
-            result.dropped_messages.push(dropped(
+            result.deferred_messages.push(deferred(
                 message,
-                DroppedMessageReason::InvalidAgainstCandidateState,
+                DeferredMessageReason::NonSelectedEligibleBranch,
+            ));
+        } else {
+            result.deferred_messages.push(deferred(
+                message,
+                DeferredMessageReason::MissingCandidateParent,
             ));
         }
     }
+}
+
+struct ProposalDispositionContext<'a> {
+    selected_consumed_proposal_ids: &'a BTreeSet<String>,
+    all_consumed_proposal_ids: &'a BTreeSet<String>,
+    selected_branch_path: &'a BTreeSet<String>,
+    materialized_branch_ids: &'a BTreeSet<String>,
+    candidate_branches: &'a [BranchCandidate],
 }
 
 fn handle_proposal(
@@ -792,16 +838,37 @@ fn handle_proposal(
     input: &CanonicalizationInput,
     message: &PeeledMessage,
     branch_id: &str,
-    selected_consumed_proposal_ids: &BTreeSet<String>,
-    selected_branch_path: &BTreeSet<String>,
-    materialized_branch_ids: &BTreeSet<String>,
+    context: &ProposalDispositionContext<'_>,
 ) {
     if message.source_epoch < input.state.retained_anchor_epoch {
         result
             .dropped_messages
             .push(dropped(message, DroppedMessageReason::BeyondAnchor));
-    } else if selected_consumed_proposal_ids.contains(&message.message_id) {
+    } else if context
+        .selected_consumed_proposal_ids
+        .contains(&message.message_id)
+    {
         result.accepted_proposals.push(message.message_id.clone());
+    } else if context
+        .all_consumed_proposal_ids
+        .contains(&message.message_id)
+        && context.materialized_branch_ids.contains(branch_id)
+        && !context.selected_branch_path.contains(branch_id)
+        && result.selected_branch_id.is_some()
+    {
+        let ineligibility_reason = context
+            .candidate_branches
+            .iter()
+            .find(|candidate| candidate.id == branch_id)
+            .and_then(|candidate| branch_ineligibility_reason(input, candidate));
+        if let Some(reason) = ineligibility_reason {
+            result.dropped_messages.push(dropped(message, reason));
+        } else {
+            result.deferred_messages.push(deferred(
+                message,
+                DeferredMessageReason::NonSelectedEligibleBranch,
+            ));
+        }
     } else if result.selected_tip.unwrap_or(input.state.current_tip_epoch) > message.source_epoch {
         // An unconsumed proposal cannot cross an epoch boundary. Once the
         // canonical tip advances past its source epoch it is terminal and must
@@ -810,13 +877,10 @@ fn handle_proposal(
             message,
             DroppedMessageReason::InvalidAgainstCandidateState,
         ));
-    } else if materialized_branch_ids.contains(branch_id)
-        && !selected_branch_path.contains(branch_id)
-        && result.selected_branch_id.is_some()
-    {
-        result.dropped_messages.push(dropped(
+    } else {
+        result.deferred_messages.push(deferred(
             message,
-            DroppedMessageReason::InvalidAgainstCandidateState,
+            DeferredMessageReason::AwaitingCanonicalCommit,
         ));
     }
 }
@@ -881,6 +945,12 @@ fn handle_app_message(
         result
             .accepted_app_messages
             .push(message.message_id.clone());
+    } else if decrypts_on_branches.is_empty()
+        && epoch > result.selected_tip.unwrap_or(input.state.current_tip_epoch)
+    {
+        result
+            .deferred_messages
+            .push(deferred(message, DeferredMessageReason::FutureEpoch));
     } else if decrypts_on_branches.is_empty() {
         result.invalidated_app_messages.push(invalidated_app(
             message,
@@ -898,8 +968,10 @@ fn handle_app_message(
     }
 }
 
-fn drop_losing_materialized_candidate_commits(
+fn classify_losing_materialized_candidate_commits(
     result: &mut CanonicalizationResult,
+    input: &CanonicalizationInput,
+    candidates: &[BranchCandidate],
     materialized_commit_ids_by_branch: &BTreeMap<String, BTreeSet<String>>,
 ) {
     let Some(selected_branch_id) = result.selected_branch_id.as_deref() else {
@@ -909,21 +981,57 @@ fn drop_losing_materialized_candidate_commits(
         if branch_id == selected_branch_id {
             continue;
         }
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == *branch_id);
         for message_id in commit_ids {
-            if result
-                .dropped_messages
-                .iter()
-                .any(|dropped| dropped.message_id == *message_id)
+            if result.accepted_commits.contains(message_id)
+                || result
+                    .deferred_messages
+                    .iter()
+                    .any(|deferred| deferred.message_id == *message_id)
+                || result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id == *message_id)
             {
                 continue;
             }
-            result.dropped_messages.push(DroppedMessage {
-                message_id: message_id.clone(),
-                kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
-            });
+            let ineligibility_reason =
+                candidate.and_then(|candidate| branch_ineligibility_reason(input, candidate));
+            if candidate.is_some() && ineligibility_reason.is_none() {
+                result.deferred_messages.push(DeferredMessage {
+                    message_id: message_id.clone(),
+                    kind: MessageKind::Commit,
+                    reason: DeferredMessageReason::NonSelectedEligibleBranch,
+                });
+            } else {
+                result.dropped_messages.push(DroppedMessage {
+                    message_id: message_id.clone(),
+                    kind: MessageKind::Commit,
+                    reason: ineligibility_reason
+                        .unwrap_or(DroppedMessageReason::BeyondRollbackHorizon),
+                    rejection_category: None,
+                });
+            }
         }
+    }
+}
+
+fn branch_ineligibility_reason(
+    input: &CanonicalizationInput,
+    candidate: &BranchCandidate,
+) -> Option<DroppedMessageReason> {
+    if candidate.fork_epoch < input.state.retained_anchor_epoch {
+        Some(DroppedMessageReason::BeyondAnchor)
+    } else if !is_branch_eligible(
+        input.state.current_tip_epoch,
+        candidate,
+        &input.policy.convergence,
+    ) {
+        Some(DroppedMessageReason::BeyondRollbackHorizon)
+    } else {
+        None
     }
 }
 
@@ -947,6 +1055,12 @@ fn convergence_status_for_result(
         .chain(result.accepted_app_messages.iter().map(String::as_str))
         .chain(
             result
+                .deferred_messages
+                .iter()
+                .map(|d| d.message_id.as_str()),
+        )
+        .chain(
+            result
                 .dropped_messages
                 .iter()
                 .map(|d| d.message_id.as_str()),
@@ -960,29 +1074,9 @@ fn convergence_status_for_result(
         .chain(result.already_seen.iter().map(|s| s.message_id.as_str()))
         .collect();
 
-    // Resolving fires when a pending input message did not receive
-    // a disposition this pass — the typical case is a child commit
-    // whose parent has not yet been materialized into a candidate
-    // branch. `CandidateStateUnavailable` alone is *not* enough to flag
-    // Resolving: it is reported any time no eligible branch was
-    // selected, including the legitimate fixed-point case "no candidate
-    // commits in the input batch at all."
-    //
-    // A lone uncommitted Proposal is exempt: commits are the consensus log and
-    // a proposal only takes effect once a commit consumes it
-    // (convergence.md:7-8), so an un-dispositioned proposal does not leave
-    // canonical state ambiguous and MUST NOT pin the pass in `Resolving`
-    // (mdk#154). A proposal that *was* consumed by the selected branch
-    // already lands in `resolved` via `accepted_proposals`, so this exemption
-    // only affects proposals with no disposition — exactly the lone case that
-    // would otherwise wedge convergence (and, transitively, all outbound sends)
-    // until a consuming commit arrives, which never happens if the committing
-    // member is offline. When that consuming commit does arrive it is itself a
-    // Commit input that drives its own convergence pass.
-    let unresolved_input = input_messages.iter().any(|message| {
-        !matches!(message.kind, PeeledMessageKind::Proposal { .. })
-            && !resolved.contains(message.message_id.as_str())
-    });
+    let unresolved_input = input_messages
+        .iter()
+        .any(|message| !resolved.contains(message.message_id.as_str()));
 
     if unresolved_input {
         ConvergenceStatus::Resolving
@@ -1017,6 +1111,14 @@ fn dropped(message: &PeeledMessage, reason: DroppedMessageReason) -> DroppedMess
     }
 }
 
+fn deferred(message: &PeeledMessage, reason: DeferredMessageReason) -> DeferredMessage {
+    DeferredMessage {
+        message_id: message.message_id.clone(),
+        kind: message.kind_name(),
+        reason,
+    }
+}
+
 fn invalidated_app(
     message: &PeeledMessage,
     epoch: u64,
@@ -1035,6 +1137,7 @@ impl CanonicalizationResult {
     fn sort(&mut self) {
         self.accepted_proposals.sort();
         self.accepted_app_messages.sort();
+        self.deferred_messages.sort();
         self.invalidated_app_messages.sort();
         self.dropped_messages.sort();
         self.already_seen.sort();

@@ -60,6 +60,7 @@ pub(crate) fn message_state_to_i64(state: MessageState) -> i64 {
         MessageState::Retryable => 4,
         MessageState::EpochInvalidated => 5,
         MessageState::PeelDeferred => 6,
+        MessageState::ConvergenceDeferred => 7,
     }
 }
 

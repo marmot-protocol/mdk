@@ -1720,7 +1720,10 @@ impl<S: StorageProvider> Engine<S> {
             if record.epoch != source_epoch
                 || !matches!(
                     record.state,
-                    MessageState::Created | MessageState::Retryable | MessageState::Processed
+                    MessageState::Created
+                        | MessageState::Retryable
+                        | MessageState::ConvergenceDeferred
+                        | MessageState::Processed
                 )
             {
                 continue;

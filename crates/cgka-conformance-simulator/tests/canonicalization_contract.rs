@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
-    ConvergenceStatus, DroppedMessage, DroppedMessageReason, InvalidatedAppMessage,
-    InvalidatedAppMessageReason, MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage,
-    PeeledMessageKind, canonicalize, canonicalize_with_materialized_candidates,
+    ConvergenceStatus, DeferredMessage, DeferredMessageReason, DroppedMessage,
+    DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
+    MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
+    canonicalize, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{BranchCandidate, ConvergencePolicy};
 use cgka_traits::engine::CommitOrderingPriority;
@@ -268,18 +269,18 @@ fn commit_edges_materialize_candidate_branches_before_selection() {
         vec!["live-1".to_string(), "live-2".to_string()]
     );
     assert_eq!(
-        result.dropped_messages,
-        vec![DroppedMessage {
+        result.deferred_messages,
+        vec![DeferredMessage {
             message_id: "withheld-1".into(),
             kind: MessageKind::Commit,
-            reason: DroppedMessageReason::InvalidAgainstCandidateState,
-            rejection_category: None,
+            reason: DeferredMessageReason::NonSelectedEligibleBranch,
         }]
     );
+    assert!(result.dropped_messages.is_empty());
 }
 
 #[test]
-fn commit_with_missing_parent_remains_pending() {
+fn commit_with_missing_parent_is_deferred() {
     let result = canonicalize(input(
         vec![child_commit_edge(
             "orphan", "child", "missing", 1, 2, 3, 0x00,
@@ -290,6 +291,14 @@ fn commit_with_missing_parent_remains_pending() {
     assert_eq!(result.selected_branch_id.as_deref(), Some("live"));
     assert!(result.accepted_commits.is_empty());
     assert!(result.dropped_messages.is_empty());
+    assert_eq!(
+        result.deferred_messages,
+        vec![DeferredMessage {
+            message_id: "orphan".into(),
+            kind: MessageKind::Commit,
+            reason: DeferredMessageReason::MissingCandidateParent,
+        }]
+    );
 }
 
 #[test]
@@ -391,24 +400,25 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
     assert_eq!(result.accepted_proposals, vec!["accepted-proposal"]);
     assert_eq!(
         result.dropped_messages,
+        vec![DroppedMessage {
+            message_id: "pending-proposal".into(),
+            kind: MessageKind::Proposal,
+            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            rejection_category: None,
+        }]
+    );
+    assert_eq!(
+        result.deferred_messages,
         vec![
-            DroppedMessage {
+            DeferredMessage {
                 message_id: "losing-commit".into(),
                 kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
+                reason: DeferredMessageReason::NonSelectedEligibleBranch,
             },
-            DroppedMessage {
+            DeferredMessage {
                 message_id: "losing-proposal".into(),
                 kind: MessageKind::Proposal,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
-            },
-            DroppedMessage {
-                message_id: "pending-proposal".into(),
-                kind: MessageKind::Proposal,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
+                reason: DeferredMessageReason::NonSelectedEligibleBranch,
             },
         ]
     );
@@ -447,22 +457,78 @@ fn materialized_candidates_drive_commit_and_proposal_dispositions() {
     assert_eq!(result.accepted_commits, vec!["live-commit"]);
     assert_eq!(result.accepted_proposals, vec!["accepted-proposal"]);
     assert_eq!(
-        result.dropped_messages,
+        result.deferred_messages,
         vec![
-            DroppedMessage {
+            DeferredMessage {
                 message_id: "losing-commit".into(),
                 kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
+                reason: DeferredMessageReason::NonSelectedEligibleBranch,
             },
-            DroppedMessage {
+            DeferredMessage {
                 message_id: "losing-proposal".into(),
                 kind: MessageKind::Proposal,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
+                reason: DeferredMessageReason::NonSelectedEligibleBranch,
             },
         ]
     );
+    assert!(result.dropped_messages.is_empty());
+}
+
+#[test]
+fn proposal_consumed_only_by_permanently_ineligible_branch_is_dropped() {
+    let cases = [
+        (
+            "beyond rollback horizon",
+            1,
+            DroppedMessageReason::BeyondRollbackHorizon,
+        ),
+        (
+            "before retained anchor",
+            5,
+            DroppedMessageReason::BeyondAnchor,
+        ),
+    ];
+
+    for (case, retained_anchor_epoch, expected_reason) in cases {
+        let mut stale_proposal = proposal("stale-proposal", "stale");
+        // Keep the proposal itself at-or-after both retained anchors so the
+        // disposition is driven by the consuming branch's permanent
+        // ineligibility, not the proposal's source epoch alone.
+        stale_proposal.source_epoch = 6;
+        let mut canonicalization_input = input(vec![stale_proposal], vec![]);
+        canonicalization_input.state.current_tip_epoch = 10;
+        canonicalization_input.state.retained_anchor_epoch = retained_anchor_epoch;
+        canonicalization_input.policy.convergence.max_rewind_commits = 5;
+
+        let result = canonicalize_with_materialized_candidates(
+            canonicalization_input,
+            vec![
+                MaterializedCandidate {
+                    branch: branch("live", 8, 10, 0x00),
+                    commit_message_ids: vec![],
+                    consumed_proposal_ids: vec![],
+                },
+                MaterializedCandidate {
+                    branch: branch("stale", 4, 7, 0xff),
+                    commit_message_ids: vec![],
+                    consumed_proposal_ids: vec!["stale-proposal".into()],
+                },
+            ],
+        );
+
+        assert_eq!(result.selected_branch_id.as_deref(), Some("live"), "{case}");
+        assert_eq!(
+            result.dropped_messages,
+            vec![DroppedMessage {
+                message_id: "stale-proposal".into(),
+                kind: MessageKind::Proposal,
+                reason: expected_reason,
+                rejection_category: None,
+            }],
+            "{case}"
+        );
+        assert!(result.deferred_messages.is_empty(), "{case}");
+    }
 }
 
 #[test]
@@ -563,12 +629,12 @@ fn quiescence_with_no_input_is_settled() {
 }
 
 #[test]
-fn quiescence_with_orphan_commit_in_input_is_resolving() {
+fn frozen_batch_defers_orphan_commit_and_settles_at_fixed_point() {
     // Construct a commit whose parent branch isn't materialized AND
     // doesn't fork from a tracked candidate. The canonicalizer cannot
-    // give it a disposition this pass — the spec calls this state
-    // "Resolving" (window closed but pass left work pending),
-    // distinct from Settled (fixed point reached).
+    // apply it in this frozen batch. The adopted protocol gives it an explicit
+    // deferred disposition for a later pass; a missing parent does not keep
+    // this completed frozen pass in Resolving.
     let orphan = commit_edge(
         "orphan-1",
         "orphan-branch",
@@ -585,11 +651,18 @@ fn quiescence_with_orphan_commit_in_input_is_resolving() {
 
     assert_eq!(
         result.convergence_status,
-        ConvergenceStatus::Resolving,
-        "orphan commit with no parent leaves work pending -> Resolving"
+        ConvergenceStatus::Settled,
+        "the frozen batch reached a fixed point after deferring the orphan"
     );
-    // The orphan didn't get a disposition.
     assert!(result.accepted_commits.is_empty());
     assert!(result.dropped_messages.is_empty());
     assert!(result.invalidated_app_messages.is_empty());
+    assert_eq!(
+        result.deferred_messages,
+        vec![DeferredMessage {
+            message_id: "orphan-1".into(),
+            kind: MessageKind::Commit,
+            reason: DeferredMessageReason::MissingCandidateParent,
+        }]
+    );
 }

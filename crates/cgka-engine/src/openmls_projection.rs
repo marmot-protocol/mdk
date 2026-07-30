@@ -32,9 +32,10 @@ use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
 
 use crate::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
-    CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
-    InvalidatedAppMessageReason, MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage,
-    PeeledMessageKind, canonicalize_with_materialized_candidates,
+    CanonicalizationState, ConvergenceStatus, DeferredMessage, DeferredMessageReason,
+    DroppedMessage, DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate,
+    MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
+    canonicalize_with_materialized_candidates,
 };
 use crate::convergence::BranchCandidate;
 
@@ -155,6 +156,9 @@ struct StoredOpenMlsCandidatePathResult {
     /// (or shorter than `candidate_paths`) means "do not reuse".
     materialized: Vec<OpenMlsMaterializedCandidate>,
     invalid_commit_drops: Vec<DroppedMessage>,
+    /// Stored commit inputs that could not reach any candidate parent in this
+    /// frozen batch and did not fail validation terminally.
+    unmaterialized_commit_ids: Vec<String>,
 }
 
 /// Bounds the total OpenMLS replay round-trips a single convergence pass may perform, so
@@ -551,6 +555,54 @@ pub fn project_mls_message(
         kind: kind_from_content_type(protocol.content_type()),
         source_epoch: Some(protocol.epoch().as_u64()),
         message_digest: digest,
+    })
+}
+
+/// Retire deferred commits that can no longer enter the retained candidate
+/// graph.
+///
+/// The pass seeder intentionally lists only rows at or above the retained
+/// anchor. Without this pre-seed sweep, an orphaned commit that aged below the
+/// anchor would stop being admitted before canonicalization could give it a
+/// terminal disposition, leaving it `ConvergenceDeferred` forever. Malformed,
+/// non-OpenMLS, and non-commit rows remain untouched: this maintenance path
+/// must not turn old unrelated storage damage into a convergence failure.
+pub(crate) fn retire_stale_convergence_deferred_commits<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_anchor_epoch: u64,
+) -> Result<Vec<(MessageId, EpochId)>, OpenMlsProjectionError> {
+    storage.with_transaction(|storage| {
+        let records = storage.list_messages(group_id, EpochId(0))?;
+        let mut retired = Vec::new();
+
+        for record in records {
+            if record.state != MessageState::ConvergenceDeferred {
+                continue;
+            }
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            let Some(message) = payload.as_openmls_wire() else {
+                continue;
+            };
+            let Ok(projection) = project_mls_message(&message.payload) else {
+                continue;
+            };
+            let Some(source_epoch) = projection.source_epoch else {
+                continue;
+            };
+            if projection.kind != OpenMlsContentKind::Commit
+                || source_epoch >= retained_anchor_epoch
+            {
+                continue;
+            }
+
+            storage.update_message_state(&record.id, MessageState::EpochInvalidated)?;
+            retired.push((record.id, EpochId(source_epoch)));
+        }
+
+        Ok(retired)
     })
 }
 
@@ -987,6 +1039,31 @@ fn append_dropped_messages(
     result.dropped_messages.sort();
 }
 
+fn append_missing_parent_deferred_commits(
+    result: &mut CanonicalizationResult,
+    message_ids: Vec<String>,
+) {
+    for message_id in message_ids {
+        if result
+            .deferred_messages
+            .iter()
+            .any(|existing| existing.message_id == message_id)
+            || result
+                .dropped_messages
+                .iter()
+                .any(|existing| existing.message_id == message_id)
+        {
+            continue;
+        }
+        result.deferred_messages.push(DeferredMessage {
+            message_id,
+            kind: MessageKind::Commit,
+            reason: DeferredMessageReason::MissingCandidateParent,
+        });
+    }
+    result.deferred_messages.sort();
+}
+
 fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1122,6 +1199,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         )?
     };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
+    append_missing_parent_deferred_commits(&mut result, path_result.unmaterialized_commit_ids);
     Ok(result)
 }
 
@@ -1161,6 +1239,7 @@ fn missing_retained_anchor_result(
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen: Vec::new(),
@@ -1190,6 +1269,11 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
             .then_with(|| a.digest.cmp(&b.digest))
             .then_with(|| a.message.payload.cmp(&b.message.payload))
     });
+    let unresolved_commit_ids = commits
+        .iter()
+        .filter(|commit| unresolved_commit_state(commit.state))
+        .map(|commit| commit.message.id.to_string())
+        .collect::<BTreeSet<_>>();
 
     let mut budget = ReplayBudget::for_pass(commits.len(), max_rewind_commits);
     let pending_proposals = pending_proposal_messages(pending_messages)?;
@@ -1312,6 +1396,16 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
             rejection_category: None,
         });
     }
+    let terminal_commit_ids = invalid_commit_drops
+        .iter()
+        .filter(|dropped| dropped.kind == MessageKind::Commit)
+        .map(|dropped| dropped.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    let unmaterialized_commit_ids = unresolved_commit_ids
+        .difference(&materialized_commit_ids)
+        .filter(|message_id| !terminal_commit_ids.contains(*message_id))
+        .cloned()
+        .collect();
 
     let mut candidate_paths = Vec::with_capacity(completed.len());
     let mut materialized = Vec::with_capacity(completed.len());
@@ -1332,6 +1426,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         candidate_paths,
         materialized,
         invalid_commit_drops,
+        unmaterialized_commit_ids,
     })
 }
 
@@ -1545,6 +1640,12 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
                 invalidated.epoch,
                 resulting_tip,
             ),
+        );
+    }
+    for deferred in &result.deferred_messages {
+        state_by_message_id.insert(
+            deferred.message_id.clone(),
+            MessageState::ConvergenceDeferred,
         );
     }
     for accepted in result
@@ -1859,7 +1960,10 @@ fn required_capabilities_from_group(
 fn record_state_is_canonicalization_input(state: MessageState) -> bool {
     matches!(
         state,
-        MessageState::Sent | MessageState::Created | MessageState::Retryable
+        MessageState::Sent
+            | MessageState::Created
+            | MessageState::Retryable
+            | MessageState::ConvergenceDeferred
     )
 }
 
@@ -1870,7 +1974,10 @@ fn record_state_can_contribute_to_openmls_graph(state: MessageState) -> bool {
 fn unresolved_commit_state(state: MessageState) -> bool {
     matches!(
         state,
-        MessageState::Sent | MessageState::Created | MessageState::Retryable
+        MessageState::Sent
+            | MessageState::Created
+            | MessageState::Retryable
+            | MessageState::ConvergenceDeferred
     )
 }
 
@@ -1888,9 +1995,11 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 
 /// Map an app-message invalidation reason to the persisted message state.
 ///
-/// `UndecryptableInCanonicalState` (the canonicalizer found no candidate branch
-/// that decrypts the message) covers two distinct situations that must be
-/// persisted differently:
+/// The current canonicalizer reports an app message beyond the selected tip as
+/// `DeferredMessageReason::FutureEpoch`, which persists through the explicit
+/// `ConvergenceDeferred` path above. Keep the older defensive split here for
+/// manually constructed or legacy results that still encode a future message
+/// as `UndecryptableInCanonicalState`:
 ///
 /// * **Future epoch (retryable).** The message targets an epoch *beyond* the
 ///   tip convergence settled on — the commit that advances the group to its
@@ -1899,7 +2008,8 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 ///   permanently drop it: `record_state_is_canonicalization_input` never
 ///   re-admits `EpochInvalidated`, so the buffered message could never re-enter
 ///   convergence once that commit arrives. Keep it `Retryable` so a later
-///   canonicalize pass re-feeds and applies it.
+///   canonicalize pass re-feeds and applies it; ordinary current results do not
+///   take this compatibility path.
 ///
 /// * **At-or-below tip (terminal).** The message's epoch is already at or below
 ///   the settled tip yet still decrypts on no branch — the awaited commit has

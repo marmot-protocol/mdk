@@ -208,7 +208,7 @@ edges by replaying MLS bytes against retained snapshots. They MUST NOT trust tra
 Commit rules:
 
 - A commit creates a candidate edge only if it validates against exactly one parent state.
-- A child commit whose parent is unavailable remains pending until the parent appears or the child expires.
+- A child commit whose parent is unavailable is explicitly deferred until the parent appears or the child expires.
 - A commit at or after the retained anchor MAY be replayed from the retained snapshot for its source epoch.
 - A commit older than the retained anchor MUST be dropped with `BeyondAnchor`.
 - A commit that needs a retained snapshot inside the rewind window, when that snapshot is missing, MUST return
@@ -261,14 +261,15 @@ Branches are compared in this order:
 
 1. Higher effective commit depth.
 2. Witness quorum beats no quorum.
-3. Higher raw commit depth.
-4. Higher app-witness score.
-5. Lower tip commit priority (`Privileged` before `Ordinary`).
-6. Lower authenticated tip committer account id.
-7. Lower tip commit digest.
+3. Higher app-witness score.
+4. Lower tip commit priority (`Privileged` before `Ordinary`).
+5. Lower authenticated tip committer account id.
+6. Lower tip commit digest.
+
+Raw commit depth remains an input to effective depth and a diagnostic field, but it has no separate comparison step.
 
 The conformance scenario
-`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 3 and 4.
 
 Application witnesses are valid application messages that decrypt against a candidate state. Witness score counts
 distinct senders per epoch. One sender cannot increase score by sending many messages in the same epoch.
@@ -350,7 +351,8 @@ Proposal rules:
 
 - A proposal is canonical only if a canonical commit consumes it.
 - A valid proposal not yet consumed MAY remain pending until policy expiry.
-- A proposal consumed only by a losing branch MUST be dropped.
+- A proposal consumed only by an eligible losing branch is deferred until a later pass accepts it or the branch becomes
+  permanently ineligible.
 - A duplicate proposal MUST be reported as `AlreadySeen`.
 
 Production engines derive proposal consumption from OpenMLS `ProposalRef` values observed before the staged commit is
@@ -462,7 +464,7 @@ A conforming engine MUST pass scenario tests for:
 - witness quorum overriding only a bounded private-branch lead,
 - child commit delivered before parent,
 - proposal consumed by canonical commit,
-- proposal on losing branch dropped,
+- proposal on an eligible losing branch deferred,
 - app message on losing branch invalidated with payload reference when known,
 - late same-epoch commit replayed from a retained anchor,
 - missing retained anchor reported without mutation,

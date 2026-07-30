@@ -37,6 +37,7 @@ impl ScenarioInputKind {
 pub enum ScenarioInputDisposition {
     #[default]
     Pending,
+    Deferred,
     Accepted,
     Delivered,
     Deduplicated,
@@ -298,6 +299,12 @@ impl ScenarioInputTracker {
                     entry.pending = true;
                 }
             }
+            MessageState::ConvergenceDeferred => {
+                if !is_terminal(&entry.disposition) {
+                    entry.disposition = ScenarioInputDisposition::Deferred;
+                    entry.pending = false;
+                }
+            }
             MessageState::Sent => {
                 if kind == ScenarioInputKind::Application {
                     entry.disposition = ScenarioInputDisposition::Accepted;
@@ -513,6 +520,37 @@ mod tests {
         assert_eq!(entry.transport_deferred, 1);
         assert_eq!(entry.disposition, ScenarioInputDisposition::Pending);
         assert!(entry.pending);
+    }
+
+    #[test]
+    fn convergence_deferred_is_current_but_non_terminal() {
+        let mut tracker = ScenarioInputTracker::default();
+        let metadata = metadata(ScenarioInputKind::Commit);
+        tracker.record_ingest(
+            &metadata,
+            Ok(&IngestOutcome::Buffered {
+                group_id: GroupId::new(vec![1]),
+                epoch: EpochId(1),
+            }),
+        );
+
+        tracker.record_storage_state(
+            &metadata.scenario_id,
+            metadata.kind,
+            MessageState::ConvergenceDeferred,
+        );
+        let entry = &tracker.snapshot()[0];
+        assert_eq!(entry.disposition, ScenarioInputDisposition::Deferred);
+        assert!(!entry.pending);
+
+        tracker.record_storage_state(
+            &metadata.scenario_id,
+            metadata.kind,
+            MessageState::Processed,
+        );
+        let entry = &tracker.snapshot()[0];
+        assert_eq!(entry.disposition, ScenarioInputDisposition::Accepted);
+        assert!(!entry.pending);
     }
 
     #[test]
