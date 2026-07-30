@@ -696,6 +696,7 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Sent
                         | MessageState::Created
                         | MessageState::Retryable
+                        | MessageState::ConvergenceDeferred
                         | MessageState::Processed
                 )
             })
@@ -1685,20 +1686,14 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this
-    /// convergence pass dropped because it lost branch selection
-    /// (`InvalidAgainstCandidateState`). This is the convergence-path analog of
+    /// convergence pass deferred because its still-eligible branch lost
+    /// selection. This is the convergence-path analog of
     /// the direct seam's [`GroupEvent::ForkRecovered`] commit attribution: a
     /// commit that was previously applied through stored convergence (and so
     /// synthesized kind-1210 group system rows stamped with its `origin_commit_id`)
     /// can later lose a same-epoch fork during a reorg. The app uses
     /// `invalidated_commit_id` to tombstone those origin-linked rows so a losing
     /// branch's "Alice added Bob"-style history does not survive.
-    ///
-    /// Only `InvalidAgainstCandidateState` drops are reported: malformed /
-    /// unsupported-policy commits never produced authenticated state changes,
-    /// and the app-side tombstone is a no-op when no row carries the commit id,
-    /// so emitting here is idempotent and safe even for commits this client
-    /// never applied.
     ///
     /// Each rolled-back commit also gets a [`GroupEvent::GroupStateInvalidated`]:
     /// the spec-required explicit withdrawal of every state notification
@@ -1711,16 +1706,16 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         result: &CanonicalizationResult,
     ) -> Result<(), OpenMlsProjectionError> {
-        for dropped in &result.dropped_messages {
-            if dropped.kind != crate::canonicalization::MessageKind::Commit {
+        for deferred in &result.deferred_messages {
+            if deferred.kind != crate::canonicalization::MessageKind::Commit {
                 continue;
             }
-            if dropped.reason
-                != crate::canonicalization::DroppedMessageReason::InvalidAgainstCandidateState
+            if deferred.reason
+                != crate::canonicalization::DeferredMessageReason::NonSelectedEligibleBranch
             {
                 continue;
             }
-            let invalidated_commit_id = message_id_from_hex(&dropped.message_id)?;
+            let invalidated_commit_id = message_id_from_hex(&deferred.message_id)?;
             // The stored record's epoch is the commit's source epoch (the fork
             // it lost). A missing record falls back to the selected branch's
             // fork epoch — the id-matched withdrawal is what conformance
@@ -1815,9 +1810,13 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
             if result
-                .dropped_messages
+                .deferred_messages
                 .iter()
-                .any(|dropped| dropped.message_id == record_id_hex)
+                .any(|deferred| deferred.message_id == record_id_hex)
+                || result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id == record_id_hex)
             {
                 continue;
             }
@@ -1936,6 +1935,7 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen: Vec::new(),
@@ -1960,6 +1960,7 @@ fn waiting_result(current_tip: u64) -> CanonicalizationResult {
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen: Vec::new(),
@@ -1991,6 +1992,7 @@ fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
         invalidated_app_messages: Vec::new(),
         dropped_messages: Vec::new(),
         already_seen: Vec::new(),

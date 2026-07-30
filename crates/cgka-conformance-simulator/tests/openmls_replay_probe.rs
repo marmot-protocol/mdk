@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
-    CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
-    InvalidatedAppMessage, InvalidatedAppMessageReason, MessageKind,
-    canonicalize_with_materialized_candidates,
+    CanonicalizationState, ConvergenceStatus, DeferredMessage, DeferredMessageReason,
+    DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
+    MessageKind, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::ConvergencePolicy;
 use cgka_conformance_simulator::openmls_projection::{
@@ -497,10 +497,10 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
         .find(|candidate| candidate.branch_id != selected_candidate.branch_id)
         .and_then(|candidate| candidate.commit_message_ids.first())
         .expect("losing commit exists");
-    assert!(canonicalized.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == *losing_commit_id
-            && dropped.kind == MessageKind::Commit
-            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    assert!(canonicalized.deferred_messages.iter().any(|deferred| {
+        deferred.message_id == *losing_commit_id
+            && deferred.kind == MessageKind::Commit
+            && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
     }));
     assert_eq!(
         carol.epoch().0,
@@ -1145,7 +1145,7 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
     assert_message_state(
         carol.storage(),
         &commit_messages[quiet_branch_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
 }
@@ -1275,7 +1275,7 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
     assert_message_state(
         carol.storage(),
         &commit_messages[quiet_branch_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     assert_message_state(carol.storage(), &app_msg, MessageState::Processed);
 }
@@ -1683,6 +1683,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
             .collect(),
         accepted_proposals: vec![],
         accepted_app_messages: vec![],
+        deferred_messages: vec![],
         invalidated_app_messages: vec![],
         dropped_messages: vec![],
         already_seen: vec![],
@@ -1742,26 +1743,23 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
         accepted_commits: vec![hex::encode(accepted_commit_id.as_slice())],
         accepted_proposals: vec![],
         accepted_app_messages: vec![hex::encode(accepted_app_id.as_slice())],
+        deferred_messages: vec![DeferredMessage {
+            message_id: hex::encode(losing_commit_id.as_slice()),
+            kind: MessageKind::Commit,
+            reason: DeferredMessageReason::NonSelectedEligibleBranch,
+        }],
         invalidated_app_messages: vec![InvalidatedAppMessage {
             message_id: hex::encode(losing_app_id.as_slice()),
             epoch: 2,
             reason: InvalidatedAppMessageReason::LosingBranch,
             decrypted_payload_ref: Some("stored-payload".into()),
         }],
-        dropped_messages: vec![
-            DroppedMessage {
-                message_id: hex::encode(losing_commit_id.as_slice()),
-                kind: MessageKind::Commit,
-                reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                rejection_category: None,
-            },
-            DroppedMessage {
-                message_id: hex::encode(malformed_proposal_id.as_slice()),
-                kind: MessageKind::Proposal,
-                reason: DroppedMessageReason::Malformed,
-                rejection_category: None,
-            },
-        ],
+        dropped_messages: vec![DroppedMessage {
+            message_id: hex::encode(malformed_proposal_id.as_slice()),
+            kind: MessageKind::Proposal,
+            reason: DroppedMessageReason::Malformed,
+            rejection_category: None,
+        }],
         already_seen: vec![],
         queued_outbound_intents: vec![],
         publishable_outbound_messages: vec![],
@@ -1774,7 +1772,11 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
 
     assert_message_id_state(&storage, &accepted_commit_id, MessageState::Processed);
     assert_message_id_state(&storage, &accepted_app_id, MessageState::Processed);
-    assert_message_id_state(&storage, &losing_commit_id, MessageState::EpochInvalidated);
+    assert_message_id_state(
+        &storage,
+        &losing_commit_id,
+        MessageState::ConvergenceDeferred,
+    );
     assert_message_id_state(&storage, &losing_app_id, MessageState::EpochInvalidated);
     assert_message_id_state(&storage, &malformed_proposal_id, MessageState::Failed);
 }

@@ -131,8 +131,8 @@ rule Init_Witness_Score_Tie:
 /*
   Scenario 4:
 
-  Branches tie on effective depth, quorum, raw depth, and witness score. The
-  lower digest rank is the deterministic final tie-break.
+  Branches tie on effective depth, quorum, and witness score. The lower digest
+  rank is the deterministic final tie-break.
 */
 rule Init_Digest_Tie:
   [ Fr(~run) ]
@@ -784,8 +784,8 @@ rule Init_Own_Commit_Fork_Handoff:
   Scenario 18:
 
   A selected canonical commit consumes one pending proposal. A different
-  proposal that only belongs to the losing branch is dropped instead of
-  becoming accepted application state.
+  proposal that only belongs to the eligible losing branch is deferred for a
+  later pass instead of becoming accepted application state.
 */
 rule Init_Proposal_Canonical_Consumption:
   [ Fr(~run) ]
@@ -937,25 +937,11 @@ rule Derive_Better_By_Quorum_Tie:
     !BetterState(run, winner, loser, 'quorum_tie')
   ]
 
-rule Derive_Better_By_Raw_Depth_Tie:
+rule Derive_Better_By_Witness_Score_Tie:
   [
     Compare(run, winner, loser),
     !ScoreState(run, winner, raw_w, effective, quorum, witness_w, priority_w, committer_w, digest_w),
     !ScoreState(run, loser, raw_l, effective, quorum, witness_l, priority_l, committer_l, digest_l),
-    !GtState(run, raw_w, raw_l)
-  ]
---[
-    DerivedBetter(run, winner, loser, 'raw_depth_tie')
-  ]->
-  [
-    !BetterState(run, winner, loser, 'raw_depth_tie')
-  ]
-
-rule Derive_Better_By_Witness_Score_Tie:
-  [
-    Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness_w, priority_w, committer_w, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness_l, priority_l, committer_l, digest_l),
     !GtState(run, witness_w, witness_l)
   ]
 --[
@@ -968,8 +954,8 @@ rule Derive_Better_By_Witness_Score_Tie:
 rule Derive_Better_By_Priority_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness, priority_w, committer_w, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness, priority_l, committer_l, digest_l),
+    !ScoreState(run, winner, raw_w, effective, quorum, witness, priority_w, committer_w, digest_w),
+    !ScoreState(run, loser, raw_l, effective, quorum, witness, priority_l, committer_l, digest_l),
     !PriorityLtState(run, priority_w, priority_l)
   ]
 --[
@@ -982,8 +968,8 @@ rule Derive_Better_By_Priority_Tie:
 rule Derive_Better_By_Committer_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness, priority, committer_w, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness, priority, committer_l, digest_l),
+    !ScoreState(run, winner, raw_w, effective, quorum, witness, priority, committer_w, digest_w),
+    !ScoreState(run, loser, raw_l, effective, quorum, witness, priority, committer_l, digest_l),
     !CommitterLtState(run, committer_w, committer_l)
   ]
 --[
@@ -996,8 +982,8 @@ rule Derive_Better_By_Committer_Tie:
 rule Derive_Better_By_Digest_Tie:
   [
     Compare(run, winner, loser),
-    !ScoreState(run, winner, raw, effective, quorum, witness, priority, committer, digest_w),
-    !ScoreState(run, loser, raw, effective, quorum, witness, priority, committer, digest_l),
+    !ScoreState(run, winner, raw_w, effective, quorum, witness, priority, committer, digest_w),
+    !ScoreState(run, loser, raw_l, effective, quorum, witness, priority, committer, digest_l),
     !DigestLtState(run, digest_w, digest_l)
   ]
 --[
@@ -1302,14 +1288,15 @@ rule Accept_Proposal_Consumed_By_Canonical_Branch:
   ]->
   []
 
-rule Drop_Losing_Branch_Proposal:
+rule Defer_Eligible_Losing_Branch_Proposal:
   [
     !AppliedCanonicalBranchState(run, client, selected),
     !ProposalMessageState(run, proposal, losing),
-    !BranchDifferentState(run, losing, selected)
+    !BranchDifferentState(run, losing, selected),
+    !EligibleState(run, losing)
   ]
 --[
-    DroppedProposal(run, proposal, losing, 'losing_branch')
+    DeferredProposal(run, proposal, losing, 'eligible_losing_branch')
   ]->
   []
 
@@ -1537,22 +1524,25 @@ lemma accepted_proposal_requires_applied_consuming_branch:
         & #j < #i
     )"
 
-lemma dropped_proposal_requires_applied_different_branch:
+lemma deferred_proposal_requires_applied_different_branch:
   "All run proposal losing reason #i.
-      DroppedProposal(run, proposal, losing, reason) @ #i
+      DeferredProposal(run, proposal, losing, reason) @ #i
     ==> (
-      Ex client selected #j #k #m.
+      Ex client selected #j #k #m #n.
           AppliedCanonicalBranch(run, client, selected) @ #j
         & ProposalMessage(run, proposal, losing) @ #k
         & BranchDifferent(run, losing, selected) @ #m
+        & Eligible(run, losing) @ #n
         & #j < #i
     )"
 
-lemma dropped_proposals_are_never_accepted:
-  "All run client proposal losing reason branch #i #j.
-      DroppedProposal(run, proposal, losing, reason) @ #i
-    & AcceptedProposal(run, client, proposal, branch) @ #j
-    ==> F"
+lemma deferred_proposal_requires_eligible_losing_branch:
+  "All run proposal losing reason #i.
+      DeferredProposal(run, proposal, losing, reason) @ #i
+    ==> (
+      Ex #j.
+          Eligible(run, losing) @ #j
+    )"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -1888,7 +1878,7 @@ lemma proposal_canonical_consumption_executable:
   "Ex run #i #j #k.
       Scenario(run, 'proposal_canonical_consumption') @ #i
     & AcceptedProposal(run, 'alice', 'remove_bob', 'selected') @ #j
-    & DroppedProposal(run, 'losing_remove', 'losing', 'losing_branch') @ #k"
+    & DeferredProposal(run, 'losing_remove', 'losing', 'eligible_losing_branch') @ #k"
 
 lemma delivery_order_robustness_executable:
   exists-trace

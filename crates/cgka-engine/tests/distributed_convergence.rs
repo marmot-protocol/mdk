@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
-    CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DroppedMessageReason,
-    InvalidatedAppMessageReason, MessageKind, V1_MAX_CONVERGENCE_PASS_MS,
+    CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DeferredMessageReason,
+    DroppedMessageReason, InvalidatedAppMessageReason, MessageKind, V1_MAX_CONVERGENCE_PASS_MS,
     V1_SETTLEMENT_QUIESCENCE_MS,
 };
 use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
@@ -772,7 +772,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     assert_message_state(
         &carol_storage,
         &commit_messages[quiet_branch_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
 
@@ -1245,26 +1245,26 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         .expect("stored OpenMLS messages converge");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    // Exactly one commit was accepted; the sibling is dropped as a losing
-    // branch (`InvalidAgainstCandidateState`).
+    // Exactly one commit was accepted; the eligible sibling is deferred so a
+    // later pass can reconsider it if new retained evidence changes selection.
     assert_eq!(
         result.accepted_commits,
         vec![content_hex(&commit_messages[app_branch_index])]
     );
     let losing_commit = &commit_messages[quiet_branch_index];
     assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.kind == MessageKind::Commit
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-                && dropped.message_id == content_hex(losing_commit)
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+                && deferred.message_id == content_hex(losing_commit)
         }),
-        "expected losing commit dropped as InvalidAgainstCandidateState, got {:?}",
-        result.dropped_messages
+        "expected eligible losing commit deferred for a later pass, got {:?}",
+        result.deferred_messages
     );
     assert_message_state(
         &carol_storage,
         losing_commit,
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
 
     let winning_commit_id = content_id(&commit_messages[app_branch_index]);
@@ -1489,7 +1489,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
     assert_message_state(
         &carol_storage,
         &remove_commit,
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
 
     // Final presented state: the removal never canonically happened. The copy
@@ -2086,7 +2086,7 @@ async fn engine_reuses_bfs_materialized_candidates_when_no_pending_app_messages(
 }
 
 #[tokio::test]
-async fn engine_keeps_child_commit_pending_until_parent_arrives() {
+async fn engine_defers_child_commit_until_parent_arrives() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");
     let (mut david, _david_storage) = build_client(b"david");
@@ -2156,13 +2156,22 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
 
     let result = carol
         .converge_stored_openmls_messages_at(&group_id, 1_000_000)
-        .expect("missing parent is a pending graph input, not a hard error");
+        .expect("missing parent is deferred graph input, not a hard error");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(result.accepted_commits.is_empty());
     assert!(result.dropped_messages.is_empty());
+    assert!(result.deferred_messages.iter().any(|deferred| {
+        deferred.message_id == content_hex(&commit_eve)
+            && deferred.kind == MessageKind::Commit
+            && deferred.reason == DeferredMessageReason::MissingCandidateParent
+    }));
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    assert_message_state(&carol_storage, &commit_eve, MessageState::Created);
+    assert_message_state(
+        &carol_storage,
+        &commit_eve,
+        MessageState::ConvergenceDeferred,
+    );
     let first_pass = carol_storage
         .convergence_pass(&group_id)
         .unwrap()
@@ -4212,28 +4221,23 @@ async fn terminal_undecryptable_app_emits_invalidation_without_message_received(
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 }
 
-/// Regression for mdk#144: a future-epoch app message that is
-/// canonicalized as `UndecryptableInCanonicalState` (the retryable case — the
-/// commit advancing the group to the message's epoch has not been selected
-/// yet) must NOT be persisted as the terminal `EpochInvalidated`, and must not
+/// Regression for mdk#144: a future-epoch app message whose advancing commit
+/// has not arrived receives the explicit `deferred` disposition and must not
 /// emit `AppMessageInvalidated`. Otherwise the buffered message can never
 /// re-enter convergence and is silently dropped once that commit arrives.
 ///
 /// To reach the stored-convergence persistence path the pass must settle on a
 /// tip: here convergence selects the epoch-2 commit while the app message
-/// lives at epoch 3 (its commit withheld), so the message is classified
-/// `UndecryptableInCanonicalState` and persisted alongside the applied branch.
+/// lives at epoch 3 (its commit withheld), so the message is deferred and
+/// persisted alongside the applied branch.
 ///
-/// Note the retryable mapping is scoped to messages whose epoch is *beyond* the
-/// settled tip (here msg epoch 3 > tip 2). An `UndecryptableInCanonicalState`
-/// message at or below the settled tip is instead stranded — the awaited commit
-/// already passed on a branch it does not belong to — and stays terminal
-/// `EpochInvalidated`; mapping that case to `Retryable` would wedge convergence
-/// (it never clears, so the group reports perpetually unsettled and all later
-/// sends stall). That at/below-tip path is covered end-to-end by the CLI test
+/// An undecryptable message at or below the settled tip is instead stranded:
+/// the awaited commit already passed on a branch it does not belong to, so it
+/// remains terminal `EpochInvalidated`. That at/below-tip path is covered
+/// end-to-end by the CLI test
 /// `three_user_message_lifecycle_covers_invite_remove_and_later_delivery`.
 #[tokio::test]
-async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
+async fn future_epoch_app_message_stays_deferred_until_commit_arrives() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -4293,7 +4297,7 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     // Carol buffers the epoch-2 commit and the epoch-3 app message, but NOT
     // the epoch-3 commit. Convergence settles on epoch 2; the app message has
     // no candidate branch that decrypts it (it targets epoch 3), so it is
-    // classified UndecryptableInCanonicalState — the retryable case.
+    // explicitly deferred as future-epoch input.
     carol
         .buffer_openmls_convergence_message_at(&group_id, route(commit_to_epoch2, &group_id), 1_000)
         .expect("epoch-2 commit buffered");
@@ -4306,16 +4310,17 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(
-        result.invalidated_app_messages.iter().any(|invalidated| {
-            invalidated.message_id == content_hex(&app_msg)
-                && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == content_hex(&app_msg)
+                && deferred.kind == MessageKind::AppMessage
+                && deferred.reason == DeferredMessageReason::FutureEpoch
         }),
-        "future-epoch app message should be UndecryptableInCanonicalState, got {:?}",
-        result.invalidated_app_messages
+        "future-epoch app message should be explicitly deferred, got {:?}",
+        result.deferred_messages
     );
-    // The fix: retryable, not terminal. Pre-fix this was EpochInvalidated and
-    // the message could never re-enter convergence.
-    assert_message_state(&carol_storage, &app_msg, MessageState::Retryable);
+    // The fix: durably deferred, not terminal. Pre-fix this was
+    // EpochInvalidated and the message could never re-enter convergence.
+    assert_message_state(&carol_storage, &app_msg, MessageState::ConvergenceDeferred);
 
     // The app must NOT have been told the message is permanently invalidated.
     let events = carol.drain_events();

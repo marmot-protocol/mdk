@@ -215,11 +215,12 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     group id into an 8-byte digest instead of hex-encoding the full id.
   - **Test:** `tests/snapshot_privacy.rs`
 
-- **Item:** **S2** `Resolving` convergence status emission
-  - **What changed:** `canonicalization::convergence_status_for_result` now emits `Resolving` when the input window has
-    closed but a pending message did not receive a disposition this pass (e.g. a child commit waiting for its parent).
-    `Settled` strictly requires fixed-point.
-  - **Test:** `quiescence_with_orphan_commit_in_input_is_resolving` in
+- **Item:** **S2** Explicit frozen-batch deferral
+  - **What changed:** every admitted message receives a current disposition. A child commit missing its parent from the
+    frozen batch is explicitly `deferred`, and the completed pass reaches its local fixed point instead of returning
+    `Resolving`. Deferred rows remain replayable when later evidence opens another pass, but do not immediately reopen
+    the unchanged completed pass.
+  - **Test:** `frozen_batch_defers_orphan_commit_and_settles_at_fixed_point` in
     `crates/cgka-conformance-simulator/tests/canonicalization_contract.rs`
 
 - **Item:** **S3** Unattributable application messages

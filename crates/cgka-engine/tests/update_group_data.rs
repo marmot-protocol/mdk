@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 use cgka_engine::DEFAULT_CIPHERSUITE;
-use cgka_engine::canonicalization::{ConvergenceStatus, DroppedMessageReason};
+use cgka_engine::canonicalization::{
+    ConvergenceStatus, DeferredMessageReason, DroppedMessageReason, MessageKind,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
@@ -2471,8 +2473,8 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
     let winner_after = winner.drain_events();
 
     // The winner's own branch was selected: canonical name and epoch are
-    // unchanged, and the losing sibling was dropped against the candidate
-    // state rather than applied.
+    // unchanged, and the eligible losing sibling was deferred rather than
+    // applied.
     assert_eq!(
         winner_storage.get_group(&gid).unwrap().name,
         winner_name,
@@ -2481,13 +2483,14 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
     );
     assert_eq!(winner.epoch(&gid).unwrap().0, 2);
     assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.message_id == hex::encode(content_id(&loser_commit).as_slice())
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == hex::encode(content_id(&loser_commit).as_slice())
+                && deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
         }),
-        "losing sibling must be dropped against the selected candidate state, \
+        "eligible losing sibling must be deferred for a later pass, \
          got {:?}",
-        result.dropped_messages
+        result.deferred_messages
     );
 
     // No withdrawal may name the winner's own confirmed commit: its rename is
@@ -2903,17 +2906,18 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
     // Own branch selected and intact: carol removed, epoch unchanged, the
-    // losing sibling dropped against the candidate state.
+    // eligible losing sibling deferred for a later pass.
     assert_eq!(winner.epoch(&gid).unwrap().0, 3);
     let members = winner.members(&gid).unwrap();
     assert_eq!(members.len(), 2, "carol must stay removed; got {members:?}");
     assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.message_id == hex::encode(content_id(&loser_commit).as_slice())
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == hex::encode(content_id(&loser_commit).as_slice())
+                && deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
         }),
-        "losing sibling must be dropped against the selected candidate state, got {:?}",
-        result.dropped_messages
+        "eligible losing sibling must be deferred for a later pass, got {:?}",
+        result.deferred_messages
     );
 
     // The re-opened proposal was accepted on the selected branch WITHOUT being

@@ -271,6 +271,7 @@ mod tests {
                 MessageState::Sent,
                 MessageState::Created,
                 MessageState::Retryable,
+                MessageState::ConvergenceDeferred,
             ] {
                 let non_edge = input(role, 3, state, 1);
                 let context = ConvergenceInputContext::from_inputs([non_edge]);
@@ -281,6 +282,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn convergence_deferred_commit_is_context_but_not_a_fresh_trigger() {
+        let deferred = input(
+            ConvergencePassMemberRole::CommitEdge,
+            3,
+            MessageState::ConvergenceDeferred,
+            1,
+        );
+        let fresh = input(
+            ConvergencePassMemberRole::CommitEdge,
+            3,
+            MessageState::Created,
+            2,
+        );
+        let context = ConvergenceInputContext::from_inputs([deferred, fresh]);
+
+        assert!(!context.opens_pass(deferred));
+        assert!(!context.gates_outbound(deferred));
+        assert!(context.opens_pass(fresh));
+        assert!(context.gates_outbound(fresh));
     }
 
     #[test]

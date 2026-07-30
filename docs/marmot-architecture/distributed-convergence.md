@@ -188,14 +188,16 @@ Branches are compared in this order:
 
 1. Higher `effective_commit_depth`.
 2. Witness quorum beats no quorum.
-3. Higher `valid_commit_depth`.
-4. Higher `app_witness_score`.
-5. Prefer a `Privileged` tip commit over an `Ordinary` one.
-6. Lower authenticated tip committer account id.
-7. Lower tip commit digest.
+3. Higher `app_witness_score`.
+4. Prefer a `Privileged` tip commit over an `Ordinary` one.
+5. Lower authenticated tip committer account id.
+6. Lower tip commit digest.
+
+`valid_commit_depth` remains a score diagnostic and an input to effective depth. It has no separate comparison step:
+when effective depth and quorum status tie, raw depth is necessarily tied as well.
 
 The conformance scenario
-`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 3 and 4.
 
 ```mermaid
 flowchart TD
@@ -344,7 +346,7 @@ Initial lemmas:
     arriving afterward is `AlreadyAtEpoch` and does not trigger convergence selection or fork recovery. A stale
     same-source commit is fork-shaped only when the local client previously committed from that source epoch.
 14. **Proposal disposition:** a proposal is accepted only when a canonical branch consumes it; proposals that belong
-    only to losing branches are dropped and cannot also become accepted.
+    only to an eligible losing branch are deferred for reconsideration in a later pass.
 15. **Delivery-order robustness:** reordered, duplicate, and delayed peeled delivery yields the same canonical branch,
     creates only one pending input per logical message, emits selected-branch app output once per client, and emits
     losing-branch invalidation dispositions once.

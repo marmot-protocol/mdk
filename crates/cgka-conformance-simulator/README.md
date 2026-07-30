@@ -106,8 +106,9 @@ exposes the commitment, never the raw exporter secret.
 The scenario-input ledger gives every commit, proposal, and application action a stable scenario id, then joins it to
 the outer transport id and content-derived MLS id; application entries also retain the inner Marmot event id for
 delivery correlation. Per client it distinguishes send attempt/acceptance/queue/publication, protocol acceptance,
-transport deferral, application delivery, deduplication, expiry, invalidation, resource refusal, rejection, and pending
-work. In particular,
+convergence deferral, transport deferral, application delivery, deduplication, expiry, invalidation, resource refusal,
+rejection, and pending work. A convergence-deferred input has a current non-terminal protocol disposition and is not
+counted as active work until later evidence opens another pass. In particular,
 `TransportDeferred` remains pending but is not mislabeled as application acceptance: until peeling succeeds, the engine
 cannot make a logical validity or branch claim about that object.
 

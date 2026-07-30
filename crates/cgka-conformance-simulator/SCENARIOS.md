@@ -213,7 +213,8 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Pressure: the exact observation correlates each action through randomized transport and content-derived ids after the
   commit sender has already advanced MLS state.
 - Expected: the ledger contains stable scenario ids for all three input classes, the confirmed commit and published
-  application event are accepted, and the proposal exposes its exact current pending-or-accepted disposition.
+  application event are accepted, and the proposal exposes its exact current pending, convergence-deferred, or accepted
+  disposition. Convergence-deferred proposals are reported distinctly from transport-pending input.
 
 ### `exact_oracle_projects_terminal_disband_tombstone_across_restart`
 

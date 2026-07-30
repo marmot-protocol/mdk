@@ -49,11 +49,12 @@ impl<S: StorageProvider> Engine<S> {
                 epoch: record.epoch,
             },
             MessageState::PeelDeferred => return Ok(None),
-            MessageState::Processed | MessageState::Failed | MessageState::EpochInvalidated => {
-                IngestOutcome::Ignored {
-                    category: InputRejectionCategory::Duplicate,
-                }
-            }
+            MessageState::Processed
+            | MessageState::Failed
+            | MessageState::ConvergenceDeferred
+            | MessageState::EpochInvalidated => IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            },
         };
         Ok(Some(outcome))
     }

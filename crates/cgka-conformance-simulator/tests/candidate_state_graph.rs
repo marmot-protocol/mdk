@@ -415,6 +415,14 @@ fn traced_selection_records_decisive_rule_candidates_and_losers() {
     assert_eq!(decisive[0].rule_name, "effective_commit_depth");
     assert_eq!(decisive[0].winner_branch_id, "deeper");
     assert_eq!(decisive[0].other_branch_id, "shallower");
-    // All seven comparison rules are present.
-    assert_eq!(trace.rule_trace.len(), 7);
+    // All six adopted comparison rules are present. Raw commit depth remains
+    // diagnostic data, but is necessarily tied once effective depth and
+    // witness-quorum status tie, so it is not a separate selector step.
+    assert_eq!(trace.rule_trace.len(), 6);
+    assert!(
+        trace
+            .rule_trace
+            .iter()
+            .all(|rule| rule.rule_name != "valid_commit_depth")
+    );
 }

@@ -169,6 +169,7 @@ pub(crate) fn message_state_str(state: MessageState) -> &'static str {
         MessageState::Processed => "processed",
         MessageState::Failed => "failed",
         MessageState::Retryable => "retryable",
+        MessageState::ConvergenceDeferred => "convergence_deferred",
         MessageState::PeelDeferred => "peel_deferred",
         MessageState::EpochInvalidated => "epoch_invalidated",
     }

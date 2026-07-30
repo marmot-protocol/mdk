@@ -139,7 +139,6 @@ fn compare_scores(a: &BranchScore, b: &BranchScore) -> Ordering {
     a.effective_commit_depth
         .cmp(&b.effective_commit_depth)
         .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))
-        .then_with(|| a.valid_commit_depth.cmp(&b.valid_commit_depth))
         .then_with(|| a.app_witness_score.cmp(&b.app_witness_score))
         .then_with(|| b.tip_priority.cmp(&a.tip_priority))
         .then_with(|| b.tip_committer.cmp(&a.tip_committer))
@@ -281,7 +280,7 @@ fn build_rule_trace(
     winner_id: &str,
     other_id: &str,
 ) -> Vec<RuleEvaluation> {
-    let entries: [(&'static str, Ordering, String, String); 7] = [
+    let entries: [(&'static str, Ordering, String, String); 6] = [
         (
             "effective_commit_depth",
             winner
@@ -295,12 +294,6 @@ fn build_rule_trace(
             winner.witness_quorum_met.cmp(&other.witness_quorum_met),
             winner.witness_quorum_met.to_string(),
             other.witness_quorum_met.to_string(),
-        ),
-        (
-            "valid_commit_depth",
-            winner.valid_commit_depth.cmp(&other.valid_commit_depth),
-            winner.valid_commit_depth.to_string(),
-            other.valid_commit_depth.to_string(),
         ),
         (
             "app_witness_score",
