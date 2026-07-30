@@ -1832,6 +1832,7 @@ fn store_dummy_created_message(
             epoch: EpochId(1),
             state: MessageState::Created,
             payload: Vec::new(),
+            deferred_peel: None,
         })
         .expect("message stored");
 }
@@ -1871,6 +1872,7 @@ fn store_created_message(
             epoch: EpochId(epoch),
             state: MessageState::Created,
             payload: serde_json::to_vec(msg).expect("transport serializes"),
+            deferred_peel: None,
         })
         .expect("message stored");
 }

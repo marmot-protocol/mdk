@@ -505,6 +505,9 @@ pub(crate) fn ingest_outcome_event(
                     InboundResourceLimit::TransportDeferredRetryBudget => {
                         "resource_refused_retry_budget"
                     }
+                    InboundResourceLimit::TransportDeferredResidenceBudget => {
+                        "resource_refused_residence_budget"
+                    }
                 }
                 .to_string(),
             ),

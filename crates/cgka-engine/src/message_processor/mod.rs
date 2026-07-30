@@ -42,6 +42,11 @@ const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 /// remains eligible if the transport delivers it again afterwards.
 pub const MAX_DEFERRED_PEEL_ATTEMPTS: u32 = 32;
 
+/// Maximum local residence for an opaque transport object. This is deliberately
+/// conservative: it bounds storage across stable contexts and restarts without
+/// turning elapsed time into a protocol-validity claim.
+pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
 /// Per-group cap on retained `PeelDeferred` rows (mdk#339). Raw
 /// transport ids are attacker-controllable (a fresh wrap yields a fresh id),
 /// so without a cap a peer flooding undecryptable group-routed events grows
@@ -87,9 +92,6 @@ pub(crate) struct DeferredPeelGroupState {
     /// per rejected message; this suppresses the repeats until the backlog
     /// drops back below the cap and re-arms.
     cap_rejection_audited: bool,
-    /// Per-row attempt count and first-seen sweep, keyed by the raw
-    /// transport message id.
-    attempts: std::collections::HashMap<MessageId, DeferredPeelAttempts>,
 }
 
 impl DeferredPeelGroupState {
@@ -100,12 +102,6 @@ impl DeferredPeelGroupState {
     fn note_row_persisted(&mut self) {
         self.deferred_rows += 1;
     }
-}
-
-#[derive(Clone, Copy, Default)]
-struct DeferredPeelAttempts {
-    attempts: u32,
-    first_seen_sweep: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,6 +916,45 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(0);
         }
 
+        let now = self.convergence_now();
+        let mut deferred: Vec<_> = self
+            .storage
+            .list_messages(group_id, EpochId(0))?
+            .into_iter()
+            .filter(|record| record.state == MessageState::PeelDeferred)
+            .collect();
+        for record in &mut deferred {
+            self.normalize_deferred_peel_lifecycle(record, now)?;
+        }
+
+        // Residence expiry is independent of peel-context changes. Check it
+        // before the fingerprint gate so a permanently stable group can still
+        // release opaque local resource state.
+        let due = deferred
+            .iter()
+            .filter(|record| {
+                record.deferred_peel.as_ref().is_some_and(|lifecycle| {
+                    lifecycle.clock_instance_id == self.convergence_clock_instance_id
+                        && now.monotonic_ms >= lifecycle.residence_deadline_monotonic_ms
+                })
+            })
+            .take(MAX_DEFERRED_ROWS_PER_SWEEP)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !due.is_empty() {
+            for record in &due {
+                self.release_deferred_peel_row(
+                    record,
+                    InboundResourceLimit::TransportDeferredResidenceBudget,
+                    crate::message_disposition::MessageDisposition::ResidenceBudgetRefused,
+                )?;
+            }
+            if deferred.len() > due.len() {
+                self.schedule_pending_convergence_group(group_id);
+            }
+            return Ok(due.len());
+        }
+
         let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
         if self
             .deferred_peel
@@ -939,15 +974,9 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let sweep_started = std::time::Instant::now();
-        let deferred: Vec<_> = self
-            .storage
-            .list_messages(group_id, EpochId(0))?
-            .into_iter()
-            .filter(|record| record.state == MessageState::PeelDeferred)
-            .collect();
         let total = deferred.len();
 
-        let (sweep_index, start, retry_budget) = {
+        let (_sweep_index, start, retry_budget) = {
             let budget = self.deferred_peel_retry_budget;
             let state = self.deferred_peel.entry(group_id.clone()).or_default();
             // The full row list is in hand: refresh the flood-cap count.
@@ -969,40 +998,32 @@ impl<S: StorageProvider> Engine<S> {
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
         let mut progressed = 0usize;
         let mut terminal = 0usize;
-        for record in &deferred[start..end] {
-            // Budget check first: bump this row's attempt count and release it
-            // as resource-refused once it exceeds the budget without peeling.
-            // Deleting the row is intentional: retaining it as `Failed` would
-            // turn a later same-id delivery into a terminal duplicate.
-            let (attempts, first_seen_sweep) = {
-                let state = self.deferred_peel.entry(group_id.clone()).or_default();
-                let entry =
-                    state
-                        .attempts
-                        .entry(record.id.clone())
-                        .or_insert(DeferredPeelAttempts {
-                            attempts: 0,
-                            first_seen_sweep: sweep_index,
-                        });
-                entry.attempts += 1;
-                (entry.attempts, entry.first_seen_sweep)
-            };
-            if attempts > retry_budget {
-                self.storage.delete_message(&record.id)?;
-                self.audit_group(
-                    group_id,
-                    crate::audit_helpers::deferred_peel_resource_refused_event(
-                        hex::encode(record.id.as_slice()),
-                        Some(record.epoch),
-                        crate::message_disposition::MessageDisposition::RetryBudgetRefused.tag(),
-                        u64::from(attempts.saturating_sub(1)),
-                        sweep_index.saturating_sub(first_seen_sweep),
-                    ),
-                );
-                self.note_peel_deferred_row_retired(group_id, &record.id);
+        for mut record in deferred[start..end].iter().cloned() {
+            let lifecycle = record
+                .deferred_peel
+                .as_mut()
+                .expect("deferred lifecycle normalized before sweep");
+            // A restart loses the in-memory group gate, but the durable row
+            // still proves this exact context was already attempted.
+            if lifecycle.last_context_fingerprint == Some(fingerprint) {
+                continue;
+            }
+            if lifecycle.distinct_context_attempts >= retry_budget {
+                self.release_deferred_peel_row(
+                    &record,
+                    InboundResourceLimit::TransportDeferredRetryBudget,
+                    crate::message_disposition::MessageDisposition::RetryBudgetRefused,
+                )?;
                 terminal += 1;
                 continue;
             }
+            lifecycle.distinct_context_attempts =
+                lifecycle.distinct_context_attempts.saturating_add(1);
+            lifecycle.last_context_fingerprint = Some(fingerprint);
+            lifecycle.wall_high_water_ms = lifecycle.wall_high_water_ms.max(now.wall_ms);
+            // Persist the consumed context before invoking the peeler. A crash
+            // may conservatively consume an attempt, but cannot reset it.
+            self.storage.put_message(&record)?;
 
             let stored_payload = StoredMessagePayload::decode(&record.payload)
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1118,6 +1139,111 @@ impl<S: StorageProvider> Engine<S> {
         Ok(progressed)
     }
 
+    /// Return the remaining time until the earliest durable deferred-peel
+    /// residence deadline. Legacy rows receive a fresh conservative deadline;
+    /// process-local monotonic deadlines are rebased after restart.
+    pub fn deferred_peel_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError> {
+        if self.quarantined_reason(group_id).is_some() {
+            return Ok(None);
+        }
+        let now = self.convergence_now();
+        let mut earliest = None;
+        for mut record in self
+            .storage
+            .list_messages(group_id, EpochId(0))?
+            .into_iter()
+            .filter(|record| record.state == MessageState::PeelDeferred)
+        {
+            self.normalize_deferred_peel_lifecycle(&mut record, now)?;
+            let deadline = record
+                .deferred_peel
+                .as_ref()
+                .expect("deferred lifecycle normalized")
+                .residence_deadline_monotonic_ms;
+            let remaining = deadline.saturating_sub(now.monotonic_ms);
+            earliest = Some(earliest.map_or(remaining, |current: u64| current.min(remaining)));
+        }
+        Ok(earliest)
+    }
+
+    fn normalize_deferred_peel_lifecycle(
+        &self,
+        record: &mut cgka_traits::message::MessageRecord,
+        now: crate::convergence_clock::ConvergenceTime,
+    ) -> Result<(), EngineError> {
+        let mut changed = false;
+        let lifecycle = record.deferred_peel.get_or_insert_with(|| {
+            changed = true;
+            cgka_traits::message::DeferredPeelLifecycle {
+                first_observed_wall_ms: now.wall_ms,
+                wall_high_water_ms: now.wall_ms,
+                clock_instance_id: self.convergence_clock_instance_id,
+                residence_deadline_monotonic_ms: now
+                    .monotonic_ms
+                    .saturating_add(self.deferred_peel_residence_ms),
+                residence_deadline_wall_ms: now
+                    .wall_ms
+                    .saturating_add(self.deferred_peel_residence_ms),
+                distinct_context_attempts: 0,
+                last_context_fingerprint: None,
+            }
+        });
+        if lifecycle.clock_instance_id != self.convergence_clock_instance_id {
+            // Monotonic values do not survive restart. Preserve elapsed wall
+            // residence through a high-water mark. If wall time moved
+            // backwards, use the prior high water rather than the smaller
+            // observation, so the jump cannot cause premature expiry.
+            let observed_wall = lifecycle.wall_high_water_ms.max(now.wall_ms);
+            let remaining = lifecycle
+                .residence_deadline_wall_ms
+                .saturating_sub(observed_wall);
+            lifecycle.clock_instance_id = self.convergence_clock_instance_id;
+            lifecycle.residence_deadline_monotonic_ms = now.monotonic_ms.saturating_add(remaining);
+            lifecycle.wall_high_water_ms = observed_wall;
+            changed = true;
+        } else if now.wall_ms > lifecycle.wall_high_water_ms {
+            lifecycle.wall_high_water_ms = now.wall_ms;
+            changed = true;
+        }
+        if changed {
+            self.storage.put_message(record)?;
+        }
+        Ok(())
+    }
+
+    fn release_deferred_peel_row(
+        &mut self,
+        record: &cgka_traits::message::MessageRecord,
+        resource: InboundResourceLimit,
+        disposition: crate::message_disposition::MessageDisposition,
+    ) -> Result<(), EngineError> {
+        let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            u64::from(lifecycle.distinct_context_attempts)
+        });
+        self.storage.delete_message(&record.id)?;
+        self.audit_group(
+            &record.group_id,
+            crate::audit_helpers::deferred_peel_resource_refused_event(
+                hex::encode(record.id.as_slice()),
+                Some(record.epoch),
+                disposition.tag(),
+                retry_count,
+                0,
+            ),
+        );
+        self.events_buf
+            .push_back(GroupEvent::TransportObjectResourceRefused {
+                group_id: record.group_id.clone(),
+                message_id: record.id.clone(),
+                resource,
+            });
+        self.note_peel_deferred_row_retired(&record.group_id, &record.id);
+        Ok(())
+    }
+
     /// Fingerprint of everything that can change a deferred peel's outcome:
     /// the group's live epoch and the retained peel-snapshot set. While this
     /// is unchanged, re-peeling a deferred row is guaranteed wasted work.
@@ -1186,11 +1312,10 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn note_peel_deferred_row_retired(
         &mut self,
         group_id: &GroupId,
-        msg_id: &MessageId,
+        _msg_id: &MessageId,
     ) {
         if let Some(state) = self.deferred_peel.get_mut(group_id) {
             state.deferred_rows = state.deferred_rows.saturating_sub(1);
-            state.attempts.remove(msg_id);
             if state.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
                 state.cap_rejection_audited = false;
             }

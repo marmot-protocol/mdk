@@ -135,6 +135,13 @@ hint, so a decrypt miss remains `TransportDeferred`: it might be a future-epoch 
 change the peel context. A local row or retry cap returns typed `ResourceRefused`, does not establish invalidity or
 permanent unreadability, and MUST leave exact-ID redelivery eligible.
 
+`PeelDeferred` rows MUST persist their distinct-context attempt count and conservative local residence deadline.
+Restart MUST NOT reset either budget. Live-process expiry uses monotonic time; restart rebases from durable wall time,
+and backwards wall movement MUST NOT shorten the remaining residence. The scheduler MUST keep a wakeup armed for the
+earliest deferred deadline even when the peel-context fingerprint stays unchanged. Deadline release is a local
+`ResourceRefused` outcome, deletes the raw row and releases its cap slot, creates no terminal dedup marker, and arms
+transport-history recovery before synchronization is considered complete.
+
 When convergence reaches a settled selected branch, the engine MUST retry `PeelDeferred` raw group messages for that
 group. A retry that peels into OpenMLS wire bytes promotes the stored payload from `RawTransport` to `OpenMlsWire`; it
 is then either processed immediately if it belongs to the current selected epoch or buffered as convergence input if it

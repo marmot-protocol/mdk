@@ -29,7 +29,8 @@ use crate::config::CursorPersistence;
 pub(crate) enum ConvergenceScheduleState {
     /// No active pass and no pending inputs: cancel scheduled wakeups.
     Idle,
-    /// A pass is collecting; wake when its cutoff elapses.
+    /// A pass is collecting or local deferred-peel residence is pending; wake
+    /// when the earliest cutoff elapses.
     Collecting { remaining_ms: u64 },
     /// A pass is frozen/resolving or its cutoff already elapsed: run now.
     Ready,
@@ -62,7 +63,14 @@ impl AppClient {
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<ConvergenceScheduleState, AppError> {
-        match self.runtime.prepare_convergence_cutoff_delay_ms(group_id)? {
+        let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        let deferred_delay = self.runtime.deferred_peel_cutoff_delay_ms(group_id)?;
+        let earliest_delay = match (convergence_delay, deferred_delay) {
+            (Some(convergence), Some(deferred)) => Some(convergence.min(deferred)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
+        };
+        match earliest_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => Ok(ConvergenceScheduleState::Collecting { remaining_ms }),
             None => {
@@ -89,6 +97,26 @@ impl AppClient {
     ) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
+        for event in &effects.events {
+            let cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                group_id, ..
+            } = event
+            else {
+                continue;
+            };
+            let Ok(record) = self.runtime.group_record(group_id) else {
+                continue;
+            };
+            if self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch)
+            {
+                // Record the recovery intent before the worker performs the
+                // external full-history replay.
+                self.record_epoch_stall_backfill_armed(group_id, record.epoch.0);
+                self.epoch_backfill_pending = true;
+            }
+        }
     }
 
     pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {

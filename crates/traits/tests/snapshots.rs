@@ -415,6 +415,13 @@ fn snapshot_ingest_outcomes() {
         }
     );
     insta::assert_json_snapshot!(
+        "resource_refused_residence_budget",
+        IngestOutcome::ResourceRefused {
+            group_id: gid(),
+            resource: InboundResourceLimit::TransportDeferredResidenceBudget
+        }
+    );
+    insta::assert_json_snapshot!(
         "stale_pre_membership",
         IngestOutcome::Stale {
             reason: StaleReason::PreMembership
@@ -606,6 +613,14 @@ fn snapshot_group_events() {
             group_id: gid(),
             via_welcome: mid(),
             welcomer: Some(mem_id()),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_transport_object_resource_refused",
+        GroupEvent::TransportObjectResourceRefused {
+            group_id: gid(),
+            message_id: mid(),
+            resource: InboundResourceLimit::TransportDeferredResidenceBudget,
         }
     );
     insta::assert_json_snapshot!(

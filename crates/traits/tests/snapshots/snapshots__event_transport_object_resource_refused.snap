@@ -1,0 +1,21 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::TransportObjectResourceRefused\n{\n    group_id: gid(), message_id: mid(), resource:\n    InboundResourceLimit::TransportDeferredResidenceBudget,\n}"
+---
+{
+  "TransportObjectResourceRefused": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "message_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "resource": "TransportDeferredResidenceBudget"
+  }
+}

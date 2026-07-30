@@ -5,7 +5,9 @@ use super::content_dedup_id;
 use crate::engine::Engine;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    DeferredPeelLifecycle, MessageRecord, MessageState, StoredMessagePayload,
+};
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
@@ -169,6 +171,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state: MessageState::Sent,
             payload,
+            deferred_peel: None,
         };
         let previous = match self.storage.get_message(&record.id) {
             Ok(record) => Some(record),
@@ -315,6 +318,29 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
         };
+        let deferred_peel = if state == MessageState::PeelDeferred {
+            previous
+                .as_ref()
+                .and_then(|record| record.deferred_peel.clone())
+                .or_else(|| {
+                    let now = self.convergence_now();
+                    Some(DeferredPeelLifecycle {
+                        first_observed_wall_ms: now.wall_ms,
+                        wall_high_water_ms: now.wall_ms,
+                        clock_instance_id: self.convergence_clock_instance_id,
+                        residence_deadline_monotonic_ms: now
+                            .monotonic_ms
+                            .saturating_add(self.deferred_peel_residence_ms),
+                        residence_deadline_wall_ms: now
+                            .wall_ms
+                            .saturating_add(self.deferred_peel_residence_ms),
+                        distinct_context_attempts: 0,
+                        last_context_fingerprint: None,
+                    })
+                })
+        } else {
+            None
+        };
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -328,6 +354,7 @@ impl<S: StorageProvider> Engine<S> {
                 && record.epoch == epoch
                 && record.state == state
                 && record.payload == payload
+                && record.deferred_peel == deferred_peel
         }) {
             return Ok(());
         }
@@ -337,6 +364,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             payload,
+            deferred_peel,
         })?;
         self.audit_group(
             group_id,

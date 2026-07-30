@@ -2335,6 +2335,7 @@ async fn deferred_commit_ages_out_when_it_falls_below_retained_anchor() {
                 payload: StoredMessagePayload::openmls_wire(message.clone())
                     .encode()
                     .unwrap(),
+                deferred_peel: None,
             })
             .unwrap();
         id
@@ -6576,6 +6577,7 @@ async fn undecodable_convergence_row_does_not_gate_sends() {
             epoch: EpochId(1),
             state: MessageState::Created,
             payload: b"not-a-valid-stored-message-payload".to_vec(),
+            deferred_peel: None,
         })
         .unwrap();
     assert!(
@@ -6659,6 +6661,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
             payload: StoredMessagePayload::raw_transport(tm(b"raw-transport-bytes".to_vec()))
                 .encode()
                 .unwrap(),
+            deferred_peel: None,
         })
         .unwrap();
 
@@ -6672,6 +6675,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
             payload: StoredMessagePayload::openmls_wire(tm(b"not-mls-bytes".to_vec()))
                 .encode()
                 .unwrap(),
+            deferred_peel: None,
         })
         .unwrap();
 
@@ -6971,6 +6975,7 @@ async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epo
             payload: StoredMessagePayload::raw_transport(old_app.clone())
                 .encode()
                 .unwrap(),
+            deferred_peel: None,
         })
         .unwrap();
 

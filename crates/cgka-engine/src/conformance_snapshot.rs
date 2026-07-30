@@ -491,6 +491,7 @@ fn event_group_id(event: &cgka_traits::engine::GroupEvent) -> &GroupId {
     match event {
         GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }

@@ -177,12 +177,41 @@ impl StoredMessagePayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredPeelLifecycle {
+    /// Wall-clock time when this account-device first retained the opaque
+    /// transport object. This is local resource metadata, never wire data.
+    pub first_observed_wall_ms: u64,
+    /// Greatest wall-clock observation persisted for this row. A later
+    /// backwards jump cannot erase already-observed residence.
+    pub wall_high_water_ms: u64,
+    /// Process-local convergence clock instance that owns
+    /// `residence_deadline_monotonic_ms`.
+    pub clock_instance_id: u64,
+    /// Live-process deadline. It is rebased from the durable wall deadline
+    /// after restart because monotonic clock values do not survive processes.
+    pub residence_deadline_monotonic_ms: u64,
+    /// Durable deadline used only to reconstruct the monotonic deadline after
+    /// restart. Backwards wall movement must never make this deadline earlier.
+    pub residence_deadline_wall_ms: u64,
+    /// Number of distinct peel contexts actually consumed by this row.
+    pub distinct_context_attempts: u32,
+    /// Last `(epoch, retained snapshot set)` fingerprint attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_fingerprint: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRecord {
     pub id: MessageId,
     pub group_id: GroupId,
     pub epoch: EpochId,
     pub state: MessageState,
     pub payload: Vec<u8>,
+    /// Durable local bookkeeping for raw transport objects in
+    /// [`MessageState::PeelDeferred`]. Older rows deserialize without it and
+    /// receive a fresh conservative residence window on first maintenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel: Option<DeferredPeelLifecycle>,
 }
 
 /// Per-message state.
