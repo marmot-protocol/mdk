@@ -157,14 +157,14 @@ test is evidence for only the behavior in its name; it does not establish the la
 | S1 | Protocol `convergence.md` branch selection; local canonicalization contract “Determinism and convergence” | Tamarin `same_input_set_converges`; `prop_candidate_graph_selection_is_order_invariant`; `prop_stored_convergence_restart_equivalence` | M1.1 exact-state oracle; M4.1 independent reference model; M4.2 arbitrary schedule/lifecycle model |
 | S2 | Protocol `convergence.md` “Applying the selected branch”; local canonicalization output contract | Tamarin application-output/invalidation lemmas; `engine_emits_only_canonical_branch_app_messages_after_convergence`; `rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence` | M1.1 exact scenario-input/output ledger; M5.1 app projection adapter |
 | S3 | Protocol retained-anchor error rules; local canonicalization errors and fail-closed replay contract | Tamarin missing/beyond-anchor lemmas; `frozen_pass_member_tampering_fails_closed_to_unrecoverable`; `missing_frozen_pass_member_fails_closed_to_unrecoverable`; replay-budget unit tests | M3.1 end-to-end resource exhaustion; M4.3 mutations |
-| S4 | Protocol publish lifecycle and bounded-pass persistence; local multi-step-state-change rules | `convergence_pass_round_trips_updates_and_cascades`; `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `reopen_after_crash_during_publish_recovers_stranded_pending_commit`; crash-recovery SQLite tests | M3.1 complete durable-transition kill matrix; M5.1 runtime crash matrix |
+| S4 | Protocol publish lifecycle and bounded-pass persistence; local multi-step-state-change rules | `convergence_pass_round_trips_updates_and_cascades`; `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `reopen_after_crash_during_publish_recovers_stranded_pending_commit`; crash-recovery SQLite tests; transaction-boundary contention tests from [MDK #1191](https://github.com/marmot-protocol/mdk/pull/1191) | [MDK #1184](https://github.com/marmot-protocol/mdk/pull/1184) inbound commit mirror atomicity; M3.1 complete durable-transition kill matrix; M5.1 runtime crash matrix |
 | S5 | Protocol pass-partition invariance and bounded collection window; relay telemetry claim that quiescence is not a correctness boundary | `prop_quiescence_gate_controls_settlement`; cutoff and scheduler unit tests | M1.3 controlled partition metamorphic test; M3.2 cross-value campaign; M4.2 scheduler model |
-| L1 | Protocol pass freeze and completion rules; group convergence status | Individual settle/fail-closed integration tests | M4.2 TLA+/TLC liveness specification; M2.3 retained-relay scenarios; named repair tests for every durable non-progress state |
+| L1 | Protocol pass freeze and completion rules; group convergence status | Individual settle/fail-closed integration tests; stale collecting/frozen pass compensation at the current tip from [MDK #1182](https://github.com/marmot-protocol/mdk/pull/1182) | M4.2 TLA+/TLC liveness specification; M2.3 retained-relay scenarios; named repair tests for every durable non-progress state |
 | L2 | Protocol outbound gating; local queued-intent lifecycle | Tamarin queued-outbound lemmas; `engine_queues_app_send_until_convergence_is_settled`; `trait_advance_convergence_drains_queued_outbound_intent`; scheduler tests | M1.3 complete quiescence; M3.1 crash/failure workload |
 | L3 | Protocol same-epoch priority and depth rules; no sustained-progress guarantee currently stated | `convergence_privileged_remove_beats_grinding_ordinary_self_update`; `continuous_inbound_cannot_starve_admin_attempt` | M3.1 sustained self-update family; M4.2 fairness model; protocol decision PDR-2 below |
 | S6 | Protocol `foundation/conformance.md`, adopted by [marmot#410](https://github.com/marmot-protocol/marmot/pull/410) | Domain separation and 33-byte commitment prefix checked in the protocol PR | M1.1 public snapshot API and exact-equivalence sentinels |
 | S7 | Protocol conformance projection and input-disposition requirements | M1.1 exact canonical snapshot plus commit/proposal/application disposition ledger | M2.2 common adapter observation schema; M5.1 app projection layer |
-| R1 | Protocol durable pass wall/monotonic deadline rules; local storage/restart contract | `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `h5_kill_before_historical_apply_commit_preserves_live_inputs`; `h6_kill_after_retained_anchor_rewind_recovers_live_snapshot` | M3.1 every-phase crash matrix; M5.3 process kill/reopen |
+| R1 | Protocol durable pass wall/monotonic deadline rules; local storage/restart contract | Injectable paired convergence clocks from [MDK #1195](https://github.com/marmot-protocol/mdk/pull/1195); `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `h5_kill_before_historical_apply_commit_preserves_live_inputs`; `h6_kill_after_retained_anchor_rewind_recovers_live_snapshot` | M3.1 every-phase crash matrix; M5.3 process kill/reopen |
 | R2 | Relay telemetry EOSE/backfill/reconciliation architecture; protocol requires equalized relevant history for equivalent selection | `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed`; `next_event_returns_when_a_live_delivery_arms_the_epoch_backfill` | M2.3 retained multi-relay model; M3.1 unequal-history family |
 | R3 | Relay sync/backfill architecture; incremental cursors do not establish full offline history | Existing since-floor regressions expose the blind spot; epoch-stall backfill is armed only after qualifying live evidence | M2.3 EOSE/completeness policy and full-history/set-reconciliation backstop; M5.1 production runtime adapter |
 | D1 | Local forensic audit/report contracts and privacy rules | Generated reports, oracle coverage, conservative minimizer, incident archetype synthesis | M1.4 failure capsule and self-replay; M3.3 exact incident import; R3 silent-absence detection |
@@ -369,6 +369,8 @@ git diff --check
 
 ### 1.1 Exact state and scenario-input oracle
 
+Status: `complete`
+
 - [x] Add exact sorted member identities to strict observations, while also preserving nonblank leaves in MLS leaf-index
   order.
 - [x] Include epoch, selected branch commitment, admin policy, application profile, required capabilities, exact
@@ -420,22 +422,23 @@ operational-semantics and adapter-refinement acceptance criteria tracked in
 campaign/process expansion relies on equivalence across adapters.
 
 The strict campaign migration deliberately exposed three pre-existing reliability failures that the legacy observation
-point hid. The transported-commit case is now resolved by making simulator `FailPending` mean definite
-non-publication: it atomically retracts every matching undelivered commit/Welcome before local rollback and refuses the
-operation after any artifact reaches a recipient mailbox. Two engine-state failures remain:
+point hid. Two are resolved without weakening the oracle:
 
-1. a member invited after an old application event can retain that pre-join object as transport/scenario-input pending
-   work;
-2. after self-remove convergence, selected remaining members can retain a created proposal row and valid-proposal
-   schedule signal.
+- [MDK #1196](https://github.com/marmot-protocol/mdk/pull/1196) made simulator `FailPending` mean definite
+  non-publication: it atomically retracts every matching undelivered commit/Welcome before local rollback and refuses
+  the operation after any artifact reaches a recipient mailbox.
+- [MDK #1192](https://github.com/marmot-protocol/mdk/pull/1192) terminally retires proposal rows and proposal-arrival
+  schedule signals consumed by a confirmed or converged commit, including across restart.
 
-These remain red strict-campaign evidence, not relaxed oracle rules. The ordinary generated-family regression tests keep
-checking their original semantic observation windows and explicitly retain the leave pending-work sentinel; report
+One engine-state failure remains: a member invited after an old application event can retain that pre-join object as
+transport/scenario-input pending work. It remains red strict-campaign evidence, not a relaxed oracle rule. Report
 campaigns run the complete strict expectations by default. Strict coverage also flags the mixed large storm because its
 application phase is cleared before any delivery-or-invalidation expectation accounts for it; that is an oracle coverage
-gap, distinct from the two remaining engine-state failures.
+gap, distinct from the remaining engine-state failure.
 
 ### 1.2 Public subject boundary
+
+Status: `in-progress`
 
 - [x] Define a simulator-owned `ConvergenceSubject` interface that keeps scenario semantics in the runner and exposes
   semantic engine operations through declared adapter capabilities.
@@ -451,10 +454,17 @@ gap, distinct from the two remaining engine-state failures.
 
 ### 1.3 Full-system quiescence
 
+Status: `in-progress`
+
+- [x] Add an injectable paired monotonic/wall convergence clock and use it for pass deadlines, cutoff decisions, restart
+  rebasing, and deterministic engine/harness tests.
+- [ ] Expose that clock through the subject-level virtual-time capability; a clock that tests can inject is not yet a
+  portable scenario operation.
+
 - [ ] Expose a sanitized structural progress token, runnable work, earliest next wake-up, deferred/retry work, outbound
   work awaiting acknowledgement, and terminal blockers; include inbox, delayed messages, pass phase, and durable
   transitions.
-- [ ] Inject an advancing monotonic clock plus a controlled wall clock throughout the subject and its tests; do not
+- [ ] Drive subject operations and scheduled wakes from the shared advancing monotonic/controlled wall clock; do not
   infer time progress from repeated calls at one synthetic timestamp or wait on real wall time.
 - [ ] Compute a bounded virtual-time fixed point from structural work and the earliest next wake-up. Treat step, time,
   and work limits only as watchdog/performance evidence, not as the definition of quiescence.
@@ -465,6 +475,8 @@ gap, distinct from the two remaining engine-state failures.
 
 ### 1.4 Deterministic failure capsules
 
+Status: `not-started`
+
 - [ ] Define a versioned capsule schema.
 - [ ] Save original scenario, canonical IR, seeds, expanded schedule, policy/constant snapshot, adapter/binary versions,
   captured wire bytes, virtual time, scenario-input/output ledger, state commitments, and resource measurements.
@@ -474,8 +486,8 @@ gap, distinct from the two remaining engine-state failures.
 
 ### Milestone 1 Exit Gate
 
-- [ ] A wrong exact state cannot pass as converged.
-- [ ] A normal scenario cannot access engine/storage internals.
+- [x] A wrong exact state cannot pass as converged.
+- [x] A normal scenario cannot access engine/storage internals.
 - [ ] Hidden pending work prevents quiescence.
 - [ ] A captured byte-level failure replays with the same outcome.
 - [ ] Targeted semantic mutations are detected.
@@ -624,6 +636,22 @@ test-only constants while preserving a stable semantic oracle.
 
 ### 5.1 `MarmotAppRuntime` adapter
 
+Recent runtime/storage hardening constrains this adapter without completing it:
+
+- [MDK #1186](https://github.com/marmot-protocol/mdk/pull/1186) fixed group-state updates applied inside an outbound
+  send reaching durable projections without waking app subscriptions. The adapter must therefore assert stored
+  projection state and notification/event delivery independently rather than treating either as evidence for the other.
+- [MDK #1200](https://github.com/marmot-protocol/mdk/pull/1200) enforces one live `AppClient`/engine session per account
+  inside a `MarmotApp`. The adapter must allocate one account-device identity per participant and classify
+  `AccountSessionBusy` as an explicit local operational outcome rather than opening a second session over the same
+  database.
+- [MDK #1201](https://github.com/marmot-protocol/mdk/pull/1201) makes projection pruning and secure deletion durable
+  and exposes `erasure_pending`. App/process comparison must keep that local maintenance outcome separate from shared
+  protocol-state and application-projection equivalence.
+- [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199) is a non-normative multi-device exploration, not an
+  adopted identity model. Scenario IR and process adapters must identify account-device instances explicitly and must
+  not assume that same-account device admission, synchronization, or repair semantics already exist.
+
 - [ ] Give every participant a unique restrictive root and SQLCipher database.
 - [ ] Drive only public app-runtime operations.
 - [ ] Exercise real account/device lifecycle, projections, outbound publication, relay sync/backfill, and retries.
@@ -764,12 +792,20 @@ incorrect result.
 | 2026-07-30 | 0.1 typed deferred/resource outcomes | Replaced ambiguous `Stale(PeelFailed)` results with typed transport availability, protocol rejection, and stale-disposition categories; retry-budget release no longer terminally deduplicates exact-ID redelivery | `cargo test -p cgka-engine --features test-policy-overrides --test deferred_peel_lifecycle`; `--test ingest`; `--test fork_detection` |
 | 2026-07-30 | 0.1 resource-refusal recovery signal | Resource refusal immediately arms one account-wide history backfill per group epoch; ordinary transport deferral retains the existing evidence threshold | `cargo test -p marmot-app client::epoch_stall --lib` |
 | 2026-07-30 | Milestone 0 completion verification | Rebased onto MDK `master` at `1b949655`; fast CI, the full feature-enabled engine suite, full simulator suite, session suite, focused app deferral/backfill coverage, and all 76 strict Tamarin lemmas passed | `just fast-ci`; `cargo test -p cgka-engine --features test-policy-overrides`; `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-session --features test-policy-overrides`; focused `marmot-app` tests; `just tamarin` |
-| 2026-07-30 | 1.1 exact live-group state oracle | Added a conformance-only canonical snapshot and strict equivalence expectation; exact member and exporter semantic mutations now fail while two independently joined clients match | `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-engine --features "test-conformance-snapshot test-policy-overrides"` |
+| 2026-07-30 | 1.1 exact live-group state oracle | Added a conformance-only canonical snapshot and strict equivalence expectation; exact member and exporter semantic mutations now fail while two independently joined clients match | [MDK #1190](https://github.com/marmot-protocol/mdk/pull/1190), merge `f4464902`; `cargo test -p cgka-conformance-simulator`; `cargo test -p cgka-engine --features "test-conformance-snapshot test-policy-overrides"` |
 | 2026-07-30 | 1.1 generalized scenario-input disposition ledger | Added strict per-client commit, proposal, and application dispositions keyed by stable scenario action ids and joined to outer transport/content aliases; duplicate application delivery is one delivery plus one dedup, and unpeeled input remains visibly transport-pending | `cargo test -p cgka-conformance-simulator exact_observation_ledgers_commit_proposal_and_application_dispositions`; full simulator suite |
 | 2026-07-30 | 1.1 instantaneous pending-work oracle | Added client-scoped `NoPendingWork` over group-scoped engine, client-addressed bus, and per-client scenario-input-ledger progress; queued, delayed, unread, unconfirmed-publish, and transport-deferred sentinels fail, while a dropped-object sentinel proves delivery remains an independent recipient assertion | `cargo test -p cgka-conformance-simulator` |
 | 2026-07-30 | 1.1 bidirectional decryptability probe | Added an active exact-ID application-message matrix; settled members pass every directed edge, a missed commit exposes future-epoch deferral in only one direction, and a named nonmember cannot pass | `cargo test -p cgka-conformance-simulator bidirectional_decryptability` |
 | 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
 | 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |
-| 2026-07-30 | 1.2a public convergence subject | Extracted scenario execution behind a capability-declared `ConvergenceSubject`, added the in-process engine adapter, separated queue/partition mutation behind `ConvergenceFaultSubject`, rejected unsupported scenarios before actions, and recorded adapter identity/capabilities in reports | Subject preflight/fault-classification tests; default-versus-explicit engine subject trace equivalence; report metadata test |
-| 2026-07-30 | 1.1 definite publish-failure semantics | Minimized the transported-commit rollback split to nine steps; made simulator `FailPending` retract the complete undelivered commit/Welcome artifact set and reject artifacts that already reached any recipient, restoring strict exact equivalence without changing production lifecycle behavior | `definite_publish_failure_retracts_commit_before_local_rollback`; `definite_publish_failure_retracts_commit_and_welcome`; `fail_pending_rejects_artifact_that_already_reached_a_recipient`; full simulator suite |
-| 2026-07-30 | 1.2 adopted canonicalization contract refresh | Reconciled the executable selector, dispositions, durable message state, simulator ledger, local architecture docs, and Tamarin model with adopted Marmot convergence commit `4ad4ae2`: removed the redundant raw-depth selector step; made missing-parent, future-epoch, and eligible losing-branch outcomes explicitly deferred; and added `ConvergenceDeferred` so retained inputs can be reconsidered without immediately reopening an unchanged completed pass | canonicalization/candidate/proptest contracts; full engine/simulator/storage/traits suites; all 76 strict Tamarin lemmas |
+| 2026-07-30 | L1 stale-pass repair path | Reclassified inherited convergence-pass base/tip disagreement as recoverable local scheduling drift: collecting and frozen stale passes are discarded, audited, and reseeded at the current tip while frozen-member integrity failures remain fail-closed | [MDK #1182](https://github.com/marmot-protocol/mdk/pull/1182), merge `66c7162c`; behind-tip, ahead-tip, and frozen-phase compensation regressions |
+| 2026-07-30 | 1.2a public convergence subject | Extracted scenario execution behind a capability-declared `ConvergenceSubject`, added the in-process engine adapter, separated queue/partition mutation behind `ConvergenceFaultSubject`, rejected unsupported scenarios before actions, and recorded adapter identity/capabilities in reports | [MDK #1194](https://github.com/marmot-protocol/mdk/pull/1194), merge `2cee3f94`; subject preflight/fault-classification tests; default-versus-explicit engine subject trace equivalence; report metadata test |
+| 2026-07-30 | S4 SQLite transaction-boundary contention | Made transient `COMMIT`/`ROLLBACK` busy conditions retry in place without rerunning application closures; persistent contention remains a typed retryable error and releases a clean connection | [MDK #1191](https://github.com/marmot-protocol/mdk/pull/1191), merge `cff57a5d`; 300 storage tests; `just fast-ci` |
+| 2026-07-30 | 1.3a injectable convergence dual clock | Routed convergence deadlines, pass timestamps, cutoff decisions, and restart rebasing through paired monotonic/wall-clock samples; clock-sensitive engine and harness tests advance deterministically without sleeping | [MDK #1195](https://github.com/marmot-protocol/mdk/pull/1195), merge `5db10d68`; feature-enabled engine and simulator suites; `just fast-ci` |
+| 2026-07-30 | 1.1 consumed self-remove work retirement | Made confirmed and converged commits terminally retire exact consumed proposal rows and epoch-scoped proposal schedule signals; strict send/leave scenarios and restart now reach no-pending-work without an exception | [MDK #1192](https://github.com/marmot-protocol/mdk/pull/1192), merge `1a611eec`; feature-enabled engine suite; strict send/leave family; `just fast-ci` |
+| 2026-07-30 | 1.1 definite publish-failure semantics | Minimized the transported-commit rollback split to nine steps; made simulator `FailPending` retract the complete undelivered commit/Welcome artifact set and reject artifacts that already reached any recipient, restoring strict exact equivalence without changing production lifecycle behavior | [MDK #1196](https://github.com/marmot-protocol/mdk/pull/1196), merge `1985d9a8`; `definite_publish_failure_retracts_commit_before_local_rollback`; `definite_publish_failure_retracts_commit_and_welcome`; `fail_pending_rejects_artifact_that_already_reached_a_recipient`; full simulator suite |
+| 2026-07-30 | 1.2b adopted canonicalization contract refresh | Reconciled the executable selector, dispositions, durable message state, simulator ledger, local architecture docs, and Tamarin model with adopted Marmot convergence commit `4ad4ae2`: removed the redundant raw-depth selector step; made missing-parent, future-epoch, and eligible losing-branch outcomes explicitly deferred; added `ConvergenceDeferred` so retained inputs can be reconsidered without immediately reopening an unchanged completed pass; and terminally retires deferred commits only after they age below the retained horizon | [MDK #1198](https://github.com/marmot-protocol/mdk/pull/1198), merge `562c5d5f`; `just fast-ci`; full engine/simulator/storage/traits suites; relay runtime and simulator/vector CI; all 78 strict Tamarin lemmas |
+| 2026-07-30 | M5 projection/event-delivery prerequisite | Fixed state changes folded into outbound sends reaching stored projections without waking runtime subscriptions; established that process-level simulation must observe projection state and notification delivery as separate surfaces | [MDK #1186](https://github.com/marmot-protocol/mdk/pull/1186), merge `1b949655`; focused interleaved-send subscription regression; `just fast-ci` |
+| 2026-07-30 | M5 app-runtime ownership prerequisite | Enforced one live account session per account within a `MarmotApp`, surfaced typed contention through UniFFI, and made worker reconnect release the failed client before replacement | [MDK #1200](https://github.com/marmot-protocol/mdk/pull/1200), merge `8dc7c12b`; ownership, worker-lifecycle, FFI, and focused runtime tests |
+| 2026-07-30 | M5 projection-maintenance prerequisite | Made large-set projection pruning bounded, preserved draft-owning groups, and made secure-delete checkpoint completion durable and explicitly observable as `erasure_pending` | [MDK #1201](https://github.com/marmot-protocol/mdk/pull/1201), merge `eec70bd9`; 307 storage tests; focused app/UniFFI retention tests; `just fast-ci` |
+| 2026-07-30 | M5 account-device modeling input | Documented a non-normative multi-device design space while deliberately leaving admission, synchronization, and repair choices unresolved; future scenarios must model account-device instances without assuming those candidate semantics | [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199), merge `aac777f3`; documentation-only |
