@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
     encrypted_media_secrets::{
         encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
         replace_encrypted_media_secret_references_tx,
@@ -41,8 +41,6 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// materialized window kept above this cannot be re-fetched in one query, so
 /// window owners should not exceed it.
 pub const MAX_TIMELINE_LIMIT: usize = 200;
-const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -204,6 +202,11 @@ pub struct SecurePruneAppEventsResult {
     /// Sorted set of encrypted-media blob ids referenced by pruned messages.
     /// Callers should treat this as an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// True when logical deletion committed but WAL truncation remains
+    /// durably pending. A later prune call retries the checkpoint even when
+    /// it finds no additional rows to delete.
+    #[serde(default)]
+    pub erasure_pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1054,6 +1057,7 @@ fn secure_prune_selected_app_events_tx(
         pruned_messages: pruned,
         pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+        erasure_pending: false,
     })
 }
 

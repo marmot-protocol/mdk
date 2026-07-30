@@ -887,6 +887,11 @@ mod tests {
                 .iter()
                 .any(|column| column == "checkpoint_completed")
         );
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "created_at_unix_seconds")
+        );
     }
 
     #[test]

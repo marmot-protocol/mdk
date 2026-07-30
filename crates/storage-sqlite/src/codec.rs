@@ -5,6 +5,11 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::EpochId;
 use serde::{Serialize, de::DeserializeOwned};
 
+/// Total bind-parameter budget for generated statements that use chunked
+/// positive-`IN` lists. This stays below SQLite's historical 999-variable
+/// default and includes any fixed parameters that precede the list.
+pub(crate) const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
+
 pub(crate) fn serialize<T: Serialize>(value: &T) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| StorageError::Serialization(e.to_string()))
 }

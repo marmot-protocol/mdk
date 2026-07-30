@@ -561,6 +561,7 @@ mod tests {
                     pruned_messages: 2,
                     secrets_deleted: 1,
                     media_ciphertext_sha256: vec!["dd".repeat(32)],
+                    erasure_pending: false,
                 },
             ))
         });

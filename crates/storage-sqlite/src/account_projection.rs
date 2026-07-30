@@ -1,5 +1,6 @@
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt, bool_i64,
+    connection::retry_on_busy,
     encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, i64_to_usize,
     tags_from_json, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
@@ -10,20 +11,23 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Keep generated positive-`IN` deletes below SQLite's historical 999-variable
-/// default, including any scope parameters that precede the key list.
-const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
 const SECURE_DELETE_RETENTION_OPERATION: &str = "retention";
 const SECURE_DELETE_LOCAL_GROUP_OPERATION: &str = "local_group";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteLocalGroupDataResult {
-    /// Rows removed by the logical wipe represented by this completed request.
-    /// On a retry this is recovered from the durable checkpoint intent.
+    /// Rows removed by every logical wipe accumulated in the durable
+    /// checkpoint intent. If a group is re-created and wiped again before WAL
+    /// truncation succeeds, this count spans those wipes.
     pub deleted_rows: usize,
     /// True when this call completed a WAL erasure checkpoint left pending by
     /// an earlier call whose logical deletion had already committed.
     pub completed_pending_checkpoint: bool,
+    /// True when logical deletion committed but WAL truncation remains
+    /// durably pending. A later local wipe call retries the checkpoint even
+    /// when it finds no additional rows to delete.
+    #[serde(default)]
+    pub erasure_pending: bool,
 }
 
 impl DeleteLocalGroupDataResult {
@@ -36,6 +40,12 @@ impl DeleteLocalGroupDataResult {
 struct SecureDeleteIntent {
     nonce: Vec<u8>,
     result_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct SecureDeleteCheckpointFinish<T> {
+    result: Option<T>,
+    erasure_pending: bool,
 }
 
 /// Whether a stored per-chat mute row is effective at `now_ms`.
@@ -492,7 +502,10 @@ impl SqliteAccountStorage {
     /// - Group and component rows are snapshot-replaced (last writer wins),
     ///   except a group row remains while it owns an unsent draft so pruning
     ///   re-derivable metadata cannot cascade-delete user-authored content.
-    ///   Full multi-writer reconciliation is an explicit non-goal.
+    ///   Consequently, a stale draft-owning group remains visible in the
+    ///   projection/chat list until its draft is removed and a later save can
+    ///   prune the group. Full multi-writer reconciliation is an explicit
+    ///   non-goal.
     ///
     /// `max_future_skew_secs` is caller policy (the app layer passes its
     /// transport-cursor skew); this crate only enforces the column merge rule.
@@ -566,8 +579,10 @@ impl SqliteAccountStorage {
             // Draft text and attachment plaintext are user-authored durable data,
             // unlike this re-derivable projection. Exclude their owning groups
             // from stale candidates so the account_groups FK cascade cannot
-            // destroy them. Once the draft is deleted, the next save selects the
-            // group as a candidate and cleans it up normally.
+            // destroy them. This intentionally keeps that stale group visible in
+            // projection/chat-list reads while its draft exists. Once the draft
+            // is deleted, the next save selects the group as a candidate and
+            // cleans it up normally.
             delete_stale_text_keys(
                 &conn,
                 "SELECT group_id_hex
@@ -712,9 +727,10 @@ impl SqliteAccountStorage {
     /// MLS state is already erased, so this transaction also removes the full
     /// `cgka_groups` row and retains only `cgka_disband_tombstones` as the
     /// permanent anti-resurrection guard. The logical wipe and a durable WAL
-    /// checkpoint intent commit together under `secure_delete = ON`; success is
-    /// returned only after `wal_checkpoint(TRUNCATE)` completes. A retry after
-    /// checkpoint contention recovers the original result from that intent.
+    /// checkpoint intent commit together under `secure_delete = ON`. If
+    /// `wal_checkpoint(TRUNCATE)` is blocked by a reader, the committed result
+    /// is returned with `erasure_pending`; a retry recovers the accumulated
+    /// result from the intent and attempts truncation again.
     pub fn delete_local_group_data(
         &self,
         group_id_hex: &str,
@@ -787,13 +803,16 @@ impl SqliteAccountStorage {
             combine_secure_delete_operation_and_restore(delete_result, restore)
         })?;
 
-        match finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
+        let finish = finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
             self,
             SECURE_DELETE_LOCAL_GROUP_OPERATION,
             group_id_hex,
-        )? {
+        )?;
+        match finish.result {
             Some(mut result) => {
-                result.completed_pending_checkpoint = newly_deleted == 0 && result.deleted_rows > 0;
+                result.completed_pending_checkpoint =
+                    newly_deleted == 0 && result.deleted_rows > 0 && !finish.erasure_pending;
+                result.erasure_pending = finish.erasure_pending;
                 Ok(result)
             }
             // Another process may have checkpointed and consumed this intent
@@ -803,6 +822,7 @@ impl SqliteAccountStorage {
             None => Ok(DeleteLocalGroupDataResult {
                 deleted_rows: newly_deleted,
                 completed_pending_checkpoint: false,
+                erasure_pending: false,
             }),
         }
     }
@@ -1010,8 +1030,9 @@ impl SqliteAccountStorage {
 
     /// Delete only app events whose durable source-epoch retention decision
     /// has expired at or before `now`. Logical deletion and its result commit
-    /// with a durable checkpoint intent, so a failed WAL truncation is surfaced
-    /// and a retry can complete erasure without losing counts or media hashes.
+    /// with a durable checkpoint intent. Checkpoint contention is reported as
+    /// `erasure_pending`, and a retry can complete erasure without losing
+    /// counts or media hashes.
     pub fn secure_prune_expired_app_events(
         &self,
         group_id_hex: &str,
@@ -1080,10 +1101,11 @@ impl SqliteAccountStorage {
             let restore = restore_secure_delete_pragma(&conn, original);
             combine_secure_delete_operation_and_restore(prune_outcome, restore)
         })?;
-        let outcome = finish_secure_delete_checkpoint_intent::<
+        let finish = finish_secure_delete_checkpoint_intent::<
             crate::timeline::SecurePruneAppEventsResult,
-        >(self, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)?
-        .unwrap_or(outcome);
+        >(self, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)?;
+        let mut outcome = finish.result.unwrap_or(outcome);
+        outcome.erasure_pending = finish.erasure_pending;
         if outcome.pruned_media_epoch_secrets > 0 {
             tracing::debug!(
                 target: "storage_sqlite::retention",
@@ -2279,14 +2301,12 @@ fn upsert_secure_delete_intent_tx(
 ) -> StorageResult<()> {
     tx.execute(
         "INSERT INTO secure_delete_checkpoint_intents (
-            operation_kind, scope, intent_nonce, result_json,
-            created_at_unix_seconds
-         ) VALUES (?1, ?2, randomblob(16), ?3, ?4)
+            operation_kind, scope, intent_nonce, result_json
+         ) VALUES (?1, ?2, randomblob(16), ?3)
          ON CONFLICT(operation_kind, scope) DO UPDATE SET
             intent_nonce = randomblob(16),
-            result_json = excluded.result_json,
-            created_at_unix_seconds = excluded.created_at_unix_seconds",
-        params![operation_kind, scope, result_json, unix_now_seconds_i64()],
+            result_json = excluded.result_json",
+        params![operation_kind, scope, result_json],
     )
     .storage()?;
     Ok(())
@@ -2316,6 +2336,7 @@ fn merge_secure_prune_intent_tx(
         .collect::<std::collections::BTreeSet<_>>();
     hashes.extend(new_result.media_ciphertext_sha256.iter().cloned());
     merged.media_ciphertext_sha256 = hashes.into_iter().collect();
+    merged.erasure_pending = false;
     let result_json = serde_json::to_string(&merged)
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
     upsert_secure_delete_intent_tx(
@@ -2340,6 +2361,7 @@ fn merge_local_group_delete_intent_tx(
         .unwrap_or_default();
     merged.deleted_rows = merged.deleted_rows.saturating_add(deleted_rows);
     merged.completed_pending_checkpoint = false;
+    merged.erasure_pending = false;
     let result_json = serde_json::to_string(&merged)
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
     upsert_secure_delete_intent_tx(
@@ -2354,18 +2376,31 @@ fn finish_secure_delete_checkpoint_intent<T>(
     storage: &SqliteAccountStorage,
     operation_kind: &str,
     scope: &str,
-) -> StorageResult<Option<T>>
+) -> StorageResult<SecureDeleteCheckpointFinish<T>>
 where
     T: serde::de::DeserializeOwned,
 {
+    let mut last_result = None;
     for _ in 0..8 {
         let conn = storage.lock()?;
         let Some(intent) = secure_delete_intent(&conn, operation_kind, scope)? else {
-            return Ok(None);
+            return Ok(SecureDeleteCheckpointFinish {
+                result: None,
+                erasure_pending: false,
+            });
         };
         let result = serde_json::from_str(&intent.result_json)
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
-        checkpoint_wal_truncate_after_secure_delete(&conn)?;
+        match checkpoint_wal_truncate_after_secure_delete(&conn) {
+            Ok(()) => {}
+            Err(StorageError::Busy(_)) => {
+                return Ok(SecureDeleteCheckpointFinish {
+                    result: Some(result),
+                    erasure_pending: true,
+                });
+            }
+            Err(error) => return Err(error),
+        }
         let deleted = conn
             .execute(
                 "DELETE FROM secure_delete_checkpoint_intents
@@ -2375,13 +2410,18 @@ where
             )
             .storage()?;
         if deleted == 0 {
+            last_result = Some(result);
             continue;
         }
-        return Ok(Some(result));
+        return Ok(SecureDeleteCheckpointFinish {
+            result: Some(result),
+            erasure_pending: false,
+        });
     }
-    Err(StorageError::Busy(
-        "secure-delete checkpoint intent changed repeatedly while completing".to_owned(),
-    ))
+    Ok(SecureDeleteCheckpointFinish {
+        result: last_result,
+        erasure_pending: true,
+    })
 }
 
 fn checkpoint_wal_truncate_after_secure_delete(conn: &Connection) -> StorageResult<()> {
@@ -2467,7 +2507,15 @@ fn delete_stale_text_keys(
         .filter(|key| !retained_keys.contains(key.as_str()))
         .collect::<Vec<_>>();
     let mut deleted = 0;
-    for chunk in stale_keys.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+    let key_chunk_size = SQLITE_BIND_PARAMETER_CHUNK
+        .checked_sub(delete_prefix_params.len())
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            StorageError::Backend(
+                "stale-key delete prefix exceeds SQLite bind-parameter budget".to_owned(),
+            )
+        })?;
+    for chunk in stale_keys.chunks(key_chunk_size) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");

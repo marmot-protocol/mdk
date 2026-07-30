@@ -1262,11 +1262,13 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
         .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
         .unwrap();
 
-    let error = store
+    let pending = store
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
-        .expect_err("a committed prune is not securely erased until WAL truncation succeeds");
+        .expect("checkpoint contention is a committed result with pending erasure");
 
-    assert!(matches!(error, StorageError::Busy(_)));
+    assert_eq!(pending.pruned_messages, 1);
+    assert_eq!(pending.media_ciphertext_sha256, vec![media_hash.clone()]);
+    assert!(pending.erasure_pending);
     assert_eq!(
         store.app_message_count().unwrap(),
         0,
@@ -1289,6 +1291,7 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
         .expect("retry after reopen must re-drive the durable pending checkpoint");
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
+    assert!(!outcome.erasure_pending);
 
     let empty = store
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
@@ -1318,6 +1321,7 @@ fn competing_storage_handles_consume_one_checkpoint_intent_once() {
         pruned_messages: 1,
         pruned_media_epoch_secrets: 0,
         media_ciphertext_sha256: vec!["ab".repeat(32)],
+        erasure_pending: false,
     };
     {
         let conn = store_a.lock().unwrap();
@@ -1346,7 +1350,7 @@ fn competing_storage_handles_consume_one_checkpoint_intent_once() {
         )
         .unwrap()
     });
-    let outcomes = [a.join().unwrap(), b.join().unwrap()];
+    let outcomes = [a.join().unwrap().result, b.join().unwrap().result];
     assert_eq!(
         outcomes.iter().filter(|outcome| outcome.is_some()).count(),
         1,
@@ -2336,10 +2340,12 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
         .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
         .unwrap();
 
-    let error = store
+    let pending = store
         .delete_local_group_data(group_id_hex)
-        .expect_err("logical wipe must not report success while WAL erasure is pending");
-    assert!(matches!(error, StorageError::Busy(_)));
+        .expect("logical wipe commits while WAL erasure remains pending");
+    assert!(pending.did_delete());
+    assert!(pending.erasure_pending);
+    assert!(!pending.completed_pending_checkpoint);
     assert_eq!(store.app_message_count().unwrap(), 0);
     assert_eq!(
         secure_delete_pragma(&store),
@@ -2364,6 +2370,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
         .expect("retry after reopen should finish the prior checkpoint");
     assert!(completed.did_delete());
     assert!(completed.completed_pending_checkpoint);
+    assert!(!completed.erasure_pending);
     assert!(completed.deleted_rows > 0);
     drop(store);
     for path in [

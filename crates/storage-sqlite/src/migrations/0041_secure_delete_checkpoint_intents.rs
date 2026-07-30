@@ -10,7 +10,6 @@ CREATE TABLE secure_delete_checkpoint_intents (
     scope TEXT NOT NULL,
     intent_nonce BLOB NOT NULL,
     result_json TEXT NOT NULL,
-    created_at_unix_seconds INTEGER NOT NULL,
     PRIMARY KEY (operation_kind, scope)
 );
 "#,
