@@ -6277,9 +6277,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     ));
     assert!(matches!(
         carol.ingest(commit_to_epoch3.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_eq!(
@@ -6330,7 +6328,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
 /// forged, unattributable application payload) must be retired from the
 /// deferred queue — marked terminal and released from the retry lifecycle —
 /// not left durably `PeelDeferred` holding a per-group cap slot. Without the
-/// fix, `retry_deferred_peels` treats the post-peel terminal `PeelFailed`
+/// fix, `retry_deferred_peels` treats the post-peel terminal rejection
 /// like "still cannot peel" and leaves the raw row deferred forever.
 #[tokio::test]
 async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
@@ -6390,9 +6388,7 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
     // message, so it is retained as a PeelDeferred raw row.
     assert!(matches!(
         carol.ingest(forged.clone()).await.unwrap(),
-        IngestOutcome::Stale {
-            reason: cgka_traits::ingest::StaleReason::PeelFailed
-        }
+        IngestOutcome::TransportDeferred { .. }
     ));
     assert_eq!(
         carol_storage.get_message(&forged.id).unwrap().state,

@@ -59,6 +59,23 @@ impl MessageStorage for SqliteAccountStorage {
         deserialize(&record)
     }
 
+    fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
+        let delete = || {
+            self.lock()?
+                .execute(
+                    "DELETE FROM cgka_messages WHERE id = ?1",
+                    params![id.as_slice()],
+                )
+                .storage()?;
+            Ok(())
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            delete()
+        } else {
+            retry_on_busy(delete)
+        }
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
         // #424: when this runs inside an engine `with_transaction` (convergence
         // apply path), the outer SQL transaction is already open and owns
@@ -200,7 +217,7 @@ mod tests {
     use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
     use cgka_traits::message::MessageState;
-    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::storage::{GroupStorage, MessageStorage, StorageError};
     use cgka_traits::types::EpochId;
 
     #[test]
@@ -232,6 +249,23 @@ mod tests {
     }
 
     #[test]
+    fn deleted_message_id_can_be_inserted_again() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_message(&message).unwrap();
+
+        store.delete_message(&message.id).unwrap();
+        assert!(matches!(
+            store.get_message(&message.id),
+            Err(StorageError::NotFound)
+        ));
+
+        store.put_message(&message).unwrap();
+        assert_eq!(store.get_message(&message.id).unwrap(), message);
+    }
+
+    #[test]
     fn ingress_dedup_markers_are_group_independent_and_idempotent() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let id = mid(42);
@@ -259,7 +293,7 @@ mod tests {
         // writes inside an engine `with_transaction`, `update_message_state`
         // must reuse the open transaction instead of opening a nested one
         // ("cannot start a transaction within a transaction").
-        use cgka_traits::storage::{StorageError, StorageProvider};
+        use cgka_traits::storage::StorageProvider;
 
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();

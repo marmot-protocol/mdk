@@ -1,0 +1,15 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::ResourceRefused\n{ group_id: gid(), resource: InboundResourceLimit::TransportDeferredCapacity }"
+---
+{
+  "ResourceRefused": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "resource": "TransportDeferredCapacity"
+  }
+}

@@ -12,23 +12,22 @@ pub(crate) enum MessageDisposition {
     /// (`Group::join_epoch`). Permanently undecryptable by design — terminal,
     /// never retried.
     PreMembershipEvent,
-    /// The device was (or may have been) a member at the message's epoch, but
-    /// no retained snapshot or past-epoch secret can decrypt it anymore.
-    /// Terminal for this device; content-level redelivery is the recovery
-    /// path.
-    ValidHistorySnapshotMissing,
+    /// The device was a member at the application message's source epoch, but
+    /// that epoch is now outside the retained app-payload decryption window.
+    /// Terminal under the active convergence policy.
+    AppPayloadRetentionExpired,
     /// The transport bytes failed to peel against the current epoch context
     /// and every retained snapshot. Retained as `PeelDeferred`; retried only
     /// when the (epoch, snapshot-set) peel context actually changes.
     RetryPending,
-    /// A retained `PeelDeferred` row exhausted its retry budget without ever
-    /// peeling. Terminal: indistinguishable from garbage; a legitimate
-    /// message re-delivered under a fresh transport id starts over.
-    PermanentlyUndecryptable,
+    /// A retained `PeelDeferred` row exhausted its changed-context retry
+    /// budget without peeling. The row is released as a local resource
+    /// refusal; the same transport id remains eligible on later redelivery.
+    RetryBudgetRefused,
     /// The per-group cap on retained `PeelDeferred` rows is reached; the
     /// message was dropped without being persisted so a flood of
     /// undecryptable input cannot grow the durable store unboundedly.
-    DeferredCapExceeded,
+    DeferredCapacityRefused,
     /// The group is under hydration quarantine; input is retained for
     /// post-repair replay (see `LocalIngestState::Quarantined`).
     Quarantined,
@@ -39,11 +38,11 @@ impl MessageDisposition {
     pub(crate) fn tag(self) -> &'static str {
         match self {
             Self::PreMembershipEvent => "pre_membership_event",
-            Self::ValidHistorySnapshotMissing => "valid_history_snapshot_missing",
+            Self::AppPayloadRetentionExpired => "app_payload_retention_expired",
             // Historical audit string, kept for dashboard continuity.
             Self::RetryPending => "peel_failed_no_snapshot",
-            Self::PermanentlyUndecryptable => "permanently_undecryptable",
-            Self::DeferredCapExceeded => "peel_deferred_cap_exceeded",
+            Self::RetryBudgetRefused => "resource_refused_retry_budget",
+            Self::DeferredCapacityRefused => "resource_refused_deferred_capacity",
             Self::Quarantined => "quarantined_group_input_deferred",
         }
     }

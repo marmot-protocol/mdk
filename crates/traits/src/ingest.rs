@@ -24,6 +24,18 @@ pub enum IngestOutcome {
     /// A canonical local condition blocked processing. This is deliberately
     /// separate from convergence dispositions.
     LocalState { state: LocalIngestState },
+    /// The transport object could not be decoded or decrypted with the
+    /// currently available transport context, but a later canonical epoch,
+    /// retained candidate, staged state, or repair may make it recoverable.
+    /// The object remains outside convergence until peeling succeeds.
+    TransportDeferred { group_id: GroupId },
+    /// A local resource bound prevented the engine from retaining or
+    /// processing an otherwise unclassified transport object. This is not a
+    /// protocol rejection and must not make same-id redelivery a duplicate.
+    ResourceRefused {
+        group_id: GroupId,
+        resource: InboundResourceLimit,
+    },
     /// Message was not applied. The variant names why — callers log by
     /// category rather than pattern-matching error strings.
     Stale { reason: StaleReason },
@@ -38,6 +50,19 @@ pub enum InputRejectionCategory {
     OwnEcho,
     WrongRecipient,
     UnknownGroup,
+    InvalidEncoding,
+    InvalidSignature,
+    UnsupportedRequiredFeature,
+    AuthorizationFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InboundResourceLimit {
+    /// The per-group durable transport-deferred row cap is full.
+    TransportDeferredCapacity,
+    /// A retained transport object exhausted its changed-context retry budget
+    /// and was retired without a terminal validity claim.
+    TransportDeferredRetryBudget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,10 +113,20 @@ pub enum StaleReason {
     /// The message is our own commit echoed back by the transport.
     #[deprecated(note = "use IngestOutcome::Ignored { category: OwnEcho }")]
     OwnEcho,
-    /// The peeler rejected the message. The stored message may be terminal or
-    /// retryable depending on whether the engine has evidence that another
-    /// epoch context could later peel it.
-    PeelFailed,
+    /// The message predates this account-device's membership and can never
+    /// decrypt on this local copy.
+    PreMembership,
+    /// Convergence excluded the input below the retained anchor.
+    BeyondAnchor,
+    /// Convergence excluded the input beyond the rollback horizon.
+    BeyondRollbackHorizon,
+    /// The application-message decryption window no longer retains its
+    /// source epoch.
+    BeyondAppRetention,
+    /// The message belongs only to a losing canonical branch.
+    LosingBranch,
+    /// Authenticated input is invalid against the selected candidate state.
+    InvalidAgainstCanonicalState,
     /// The local retained canonical state records our own removal from this
     /// group, so later group input can never be processed here. Terminal for
     /// the group on this client. Processing input that classifies as

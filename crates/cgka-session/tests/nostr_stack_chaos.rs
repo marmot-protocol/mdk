@@ -147,7 +147,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_eq!(bob.session.members(&group_id).unwrap().len(), 3);
 
     let carol_late_commit = take_effect_for(&mut commit_deliveries, &carol_account_id);
-    assert_peel_failed(&carol_late_commit);
+    assert_transport_deferred(&carol_late_commit);
 
     let mut replay_deliveries = stack
         .deliver_event_to_sessions(
@@ -264,7 +264,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     assert_already_seen(&bob_shared_replay);
 
     let carol_late_commit = take_effect_for(&mut shared_replay, &carol_account_id);
-    assert_peel_failed(&carol_late_commit);
+    assert_transport_deferred(&carol_late_commit);
 }
 
 #[derive(Clone, Debug)]
@@ -877,8 +877,8 @@ fn assert_already_seen(effects: &IngestEffects) {
             IngestOutcome::Ignored {
                 category: InputRejectionCategory::Duplicate
             } | IngestOutcome::Stale {
-                reason: StaleReason::AlreadyAtEpoch { .. } | StaleReason::PeelFailed
-            }
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            } | IngestOutcome::TransportDeferred { .. }
         ),
         "expected duplicate/stale epoch outcome, got {:?}",
         effects.outcome
@@ -886,15 +886,10 @@ fn assert_already_seen(effects: &IngestEffects) {
     assert!(effects.effects.events.is_empty());
 }
 
-fn assert_peel_failed(effects: &IngestEffects) {
+fn assert_transport_deferred(effects: &IngestEffects) {
     assert!(
-        matches!(
-            effects.outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed
-            }
-        ),
-        "unexpected peel failure outcome: {:?}",
+        matches!(effects.outcome, IngestOutcome::TransportDeferred { .. }),
+        "unexpected transport-deferred outcome: {:?}",
         effects.outcome
     );
     assert!(effects.effects.events.is_empty());

@@ -3,7 +3,7 @@
 //! When a *live* delivery arms the epoch-gap backfill — a run of undecryptable
 //! traffic at a stalled epoch crossing `EPOCH_STALL_BACKFILL_THRESHOLD` — the
 //! arming produces no visible `SyncSummary` content (an undecryptable kind-445
-//! yields `IngestOutcome::Stale`, no `MarmotAppEvent`). `next_event` must still
+//! yields `IngestOutcome::TransportDeferred`, no `MarmotAppEvent`). `next_event` must still
 //! RETURN so the worker's post-`next_event`
 //! `run_pending_epoch_backfill` seam (`runtime/account_worker.rs`) runs. If the
 //! empty-summary guard does not also check `epoch_backfill_pending`, the call
@@ -75,7 +75,7 @@ fn test_unix_now_seconds() -> u64 {
 /// ephemeral key and a caller-chosen `created_at`, h-tagged to
 /// `nostr_group_id_hex`. Copied from `since_floor.rs`: real kind-445 senders are
 /// always a fresh per-event key, and a zero-nonce marker body peels to a clean
-/// `PeelerError::DecryptFailed`, the `IngestOutcome::Stale { PeelFailed }` shape
+/// `PeelerError::DecryptFailed`, the `IngestOutcome::TransportDeferred` shape
 /// the epoch-stall detector counts.
 async fn publish_garbage_group_message_at(
     relay_url: &str,

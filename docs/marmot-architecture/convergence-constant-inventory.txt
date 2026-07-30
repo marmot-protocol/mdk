@@ -1,0 +1,31 @@
+# Machine-checked convergence constant inventory.
+#
+# Format: ledger-id|repository-relative Rust source path|Rust constant name
+# Keep this aligned with convergence-reliability-plan.md. The gate in
+# scripts/check_convergence_constant_ledger.sh verifies the declarations,
+# the documented IDs, and the scoped source-name families.
+P1|crates/cgka-engine/src/convergence.rs|V1_MAX_REWIND_COMMITS
+P2|crates/cgka-engine/src/canonicalization.rs|V1_APP_MESSAGE_PAST_EPOCH_LIMIT
+P3|crates/cgka-engine/src/wire_format.rs|DEFAULT_MAX_PAST_EPOCHS
+P4|crates/cgka-engine/src/canonicalization.rs|V1_SETTLEMENT_QUIESCENCE_MS
+P5|crates/cgka-engine/src/canonicalization.rs|V1_MAX_CONVERGENCE_PASS_MS
+P6|crates/cgka-engine/src/convergence.rs|V1_WITNESS_QUORUM_SENDERS_PER_EPOCH
+P7|crates/cgka-engine/src/convergence.rs|V1_WITNESS_QUORUM_EPOCHS
+P8|crates/cgka-engine/src/convergence.rs|V1_MAX_WITNESS_OVERRIDE_DEPTH
+E1|crates/cgka-engine/src/message_processor/mod.rs|MAX_CONVERGENCE_REPROCESSING_PASSES
+E2|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_PEEL_ATTEMPTS
+E3|crates/cgka-engine/src/message_processor/mod.rs|MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+E4|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_ROWS_PER_SWEEP
+E5|crates/cgka-engine/src/openmls_projection.rs|CANDIDATE_REPLAY_BUDGET_SLACK
+E6|crates/cgka-engine/src/openmls_projection.rs|CANDIDATE_REPLAY_BUDGET_FLOOR
+E7|crates/cgka-engine/src/message_processor/mod.rs|SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS
+E7|crates/cgka-engine/src/message_processor/mod.rs|SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS
+A1|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS
+A2|crates/marmot-app/src/runtime/account_worker.rs|MIN_CONVERGENCE_SETTLEMENT_DELAY
+A3|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_RETRY_BASE_DELAY
+A3|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_RETRY_MAX_DELAY
+A4|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_UNSETTLED_MAX_REARMS
+A5|crates/marmot-app/src/runtime/account_worker.rs|IDLE_CONVERGENCE_TIMER_DELAY
+A6|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_BACKFILL_THRESHOLD
+A7|crates/marmot-app/src/lib.rs|APP_RUNTIME_RELAY_REBUILD_LOOKBACK
+A8|crates/marmot-app/src/lib.rs|TRANSPORT_CURSOR_MAX_FUTURE_SKEW
