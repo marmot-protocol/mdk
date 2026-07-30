@@ -36,7 +36,7 @@ use crate::openmls_projection::{
     OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
     StoredCanonicalizationOptions, apply_openmls_canonicalization_result_with_profile_policy,
     canonicalize_stored_openmls_messages_with_profile_policy, project_mls_message,
-    retain_current_group_epoch_snapshot,
+    retain_current_group_epoch_snapshot, retire_stale_convergence_deferred_commits,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -685,6 +685,20 @@ impl<S: StorageProvider> Engine<S> {
         let ceiling = base_epoch
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
+        for (message_id, source_epoch) in
+            retire_stale_convergence_deferred_commits(&self.storage, group_id, floor)?
+        {
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(message_id.as_slice()),
+                    Some(MessageState::ConvergenceDeferred),
+                    MessageState::EpochInvalidated,
+                    Some(source_epoch),
+                    "beyond_retained_anchor",
+                ),
+            );
+        }
         let projected = self
             .storage
             .list_messages(group_id, EpochId(floor))

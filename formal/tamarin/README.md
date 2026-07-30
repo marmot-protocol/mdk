@@ -241,7 +241,7 @@ cargo test -p cgka-conformance-simulator --test generated_policy_cases
 cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
 ```
 
-The seven-rule adjacency cases stay grep-aligned across both consumers:
+The six-rule adjacency cases stay grep-aligned across both consumers:
 
 - `generated_priority_tie` / `generated_priority_tie_executable` /
   `generated_priority_tie_matches_selector_before_digest`

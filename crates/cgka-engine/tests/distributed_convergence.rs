@@ -2245,6 +2245,118 @@ async fn engine_defers_child_commit_until_parent_arrives() {
     assert!(second_pass.members.len() >= 2);
 }
 
+#[tokio::test]
+async fn deferred_commit_ages_out_when_it_falls_below_retained_anchor() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-deferred-commit-retirement".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+
+    // Alice creates a competing source-epoch-1 commit while Carol advances her
+    // canonical copy to epoch 3. At that point Carol's retained floor is epoch
+    // 2, so Alice's previously deferred commit can never re-enter a pass.
+    let old_update = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("old competing branch".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (old_commit, _old_pending) = evolution(old_update);
+    let old_commit = route(old_commit, &group_id);
+
+    let mut active_commit = None;
+    for index in 0..2 {
+        let update = carol
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("canonical advance {index}")),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let (message, pending) = evolution(update);
+        carol.confirm_published(pending).await.unwrap();
+        active_commit = Some(route(message, &group_id));
+    }
+    let active_commit = active_commit.expect("second canonical commit exists");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        project_mls_message(&old_commit.payload)
+            .unwrap()
+            .source_epoch,
+        Some(1)
+    );
+    assert_eq!(
+        project_mls_message(&active_commit.payload)
+            .unwrap()
+            .source_epoch,
+        Some(2)
+    );
+
+    let store_deferred = |message: &TransportMessage, epoch: EpochId| {
+        let id = content_id(message);
+        carol_storage
+            .put_message(&MessageRecord {
+                id: id.clone(),
+                group_id: group_id.clone(),
+                epoch,
+                state: MessageState::ConvergenceDeferred,
+                payload: StoredMessagePayload::openmls_wire(message.clone())
+                    .encode()
+                    .unwrap(),
+            })
+            .unwrap();
+        id
+    };
+    let stale_id = store_deferred(&old_commit, EpochId(1));
+    let active_id = store_deferred(&active_commit, EpochId(2));
+
+    // Pass preparation owns the admission boundary. It must terminally retire
+    // work below that boundary while preserving deferred work still inside it.
+    carol
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .expect("convergence preparation succeeds");
+    assert_eq!(
+        carol_storage.get_message(&stale_id).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    assert_eq!(
+        carol_storage.get_message(&active_id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+}
+
 /// Create a two-member group (alice creator/admin, carol member+admin) and
 /// return its id with carol joined. Shared setup for the scoped-reservation
 /// tests below.

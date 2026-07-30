@@ -418,11 +418,19 @@ fn traced_selection_records_decisive_rule_candidates_and_losers() {
     // All six adopted comparison rules are present. Raw commit depth remains
     // diagnostic data, but is necessarily tied once effective depth and
     // witness-quorum status tie, so it is not a separate selector step.
-    assert_eq!(trace.rule_trace.len(), 6);
-    assert!(
+    assert_eq!(
         trace
             .rule_trace
             .iter()
-            .all(|rule| rule.rule_name != "valid_commit_depth")
+            .map(|rule| rule.rule_name)
+            .collect::<Vec<_>>(),
+        vec![
+            "effective_commit_depth",
+            "witness_quorum_met",
+            "app_witness_score",
+            "tip_priority",
+            "tip_committer",
+            "tip_digest",
+        ]
     );
 }

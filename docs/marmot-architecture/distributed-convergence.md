@@ -205,7 +205,7 @@ flowchart TD
     B --> C["Drop branches outside rewind horizon"]
     C --> D["Count distinct app witnesses per epoch"]
     D --> E["Apply bounded quorum boost"]
-    E --> F["Tie-break by raw depth, witness score, priority, committer, digest"]
+    E --> F["Compare effective depth, quorum, witness score, priority, committer, digest"]
     F --> G["Materialize selected branch"]
     F --> H["Mark losing-branch messages invalidated"]
 ```

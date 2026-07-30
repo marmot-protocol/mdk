@@ -558,6 +558,54 @@ pub fn project_mls_message(
     })
 }
 
+/// Retire deferred commits that can no longer enter the retained candidate
+/// graph.
+///
+/// The pass seeder intentionally lists only rows at or above the retained
+/// anchor. Without this pre-seed sweep, an orphaned commit that aged below the
+/// anchor would stop being admitted before canonicalization could give it a
+/// terminal disposition, leaving it `ConvergenceDeferred` forever. Malformed,
+/// non-OpenMLS, and non-commit rows remain untouched: this maintenance path
+/// must not turn old unrelated storage damage into a convergence failure.
+pub(crate) fn retire_stale_convergence_deferred_commits<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_anchor_epoch: u64,
+) -> Result<Vec<(MessageId, EpochId)>, OpenMlsProjectionError> {
+    storage.with_transaction(|storage| {
+        let records = storage.list_messages(group_id, EpochId(0))?;
+        let mut retired = Vec::new();
+
+        for record in records {
+            if record.state != MessageState::ConvergenceDeferred {
+                continue;
+            }
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            let Some(message) = payload.as_openmls_wire() else {
+                continue;
+            };
+            let Ok(projection) = project_mls_message(&message.payload) else {
+                continue;
+            };
+            let Some(source_epoch) = projection.source_epoch else {
+                continue;
+            };
+            if projection.kind != OpenMlsContentKind::Commit
+                || source_epoch >= retained_anchor_epoch
+            {
+                continue;
+            }
+
+            storage.update_message_state(&record.id, MessageState::EpochInvalidated)?;
+            retired.push((record.id, EpochId(source_epoch)));
+        }
+
+        Ok(retired)
+    })
+}
+
 /// Fail-open decode of a stored payload into its openmls-wire
 /// [`TransportMessage`] and MLS [`OpenMlsMessageProjection`]. Returns `None`
 /// when the row cannot be decoded, is not an openmls-wire payload, or does not
