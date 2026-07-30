@@ -805,7 +805,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             epoch: Some(3),
             reason: "fork_loser".into(),
             retry_count: Some(2),
-            sweeps_waited: Some(5),
+            residence_ms: Some(5_000),
         },
         AuditEventKind::Rejection {
             msg_id: "m".into(),

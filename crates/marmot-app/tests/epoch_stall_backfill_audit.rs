@@ -253,11 +253,14 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
         .await;
     }
 
-    // The threshold-crossing delivery arms the backfill; `next_event` returns.
-    timeout(NEXT_EVENT_DEADLINE, bob.next_event())
-        .await
-        .expect("next_event must return once a live delivery arms the epoch backfill")
-        .expect("next_event should not error");
+    // Each deferred delivery now also returns a pending scheduler edge. Drive
+    // the whole burst so the threshold-crossing delivery arms the backfill.
+    for _ in 0..BACKFILL_THRESHOLD {
+        timeout(NEXT_EVENT_DEADLINE, bob.next_event())
+            .await
+            .expect("next_event must return for each live deferred delivery")
+            .expect("next_event should not error");
+    }
 
     let mut audit_rows = AuditRowTracker::default();
     let rows = audit_rows.new_rows(&app_bob, "bob");
@@ -359,10 +362,12 @@ async fn a_second_stall_burst_at_the_same_epoch_records_no_further_row() {
         )
         .await;
     }
-    timeout(NEXT_EVENT_DEADLINE, bob.next_event())
-        .await
-        .expect("next_event must return once the first burst arms the backfill")
-        .expect("next_event should not error");
+    for _ in 0..BACKFILL_THRESHOLD {
+        timeout(NEXT_EVENT_DEADLINE, bob.next_event())
+            .await
+            .expect("next_event must return for each first-burst delivery")
+            .expect("next_event should not error");
+    }
     let arm_rows = audit_rows.new_rows(&app_bob, "bob");
     assert_eq!(
         rows_of_kind(&arm_rows, "epoch_stall_backfill_armed").len(),

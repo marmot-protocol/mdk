@@ -70,7 +70,7 @@ pub(crate) struct DeferredPeelGroupState {
     /// skipped — a deferred row can only become peelable when the group
     /// epoch advances or the retained-snapshot set changes.
     gate: Option<[u8; 32]>,
-    /// Monotonic sweep counter; also the clock behind `sweeps_waited`.
+    /// Monotonic sweep counter used to report aggregate sweep progress.
     sweep_count: u64,
     /// Resume offset into the (stable-ordered) deferred-row list for the
     /// bounded sweep.
@@ -923,8 +923,12 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .filter(|record| record.state == MessageState::PeelDeferred)
             .collect();
-        for record in &mut deferred {
-            self.normalize_deferred_peel_lifecycle(record, now)?;
+        if self.normalize_deferred_peel_lifecycles(&mut deferred, now)? {
+            // Legacy initialization and restart rebasing are durable writes,
+            // so migrate them in the same bounded slices as peel attempts.
+            // The pending edge keeps the scheduler advancing the backlog.
+            self.schedule_pending_convergence_group(group_id);
+            return Ok(0);
         }
 
         // Residence expiry is independent of peel-context changes. Check it
@@ -1065,7 +1069,7 @@ impl<S: StorageProvider> Engine<S> {
                     // Release the flood-cap slot whenever the row leaves the
                     // retry lifecycle, whether this arm retired it or ingest
                     // already terminalized it.
-                    self.note_peel_deferred_row_retired(group_id, &record.id);
+                    self.note_peel_deferred_row_retired(group_id);
                     progressed += 1;
                 }
                 Ok(
@@ -1089,7 +1093,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                     // The cap-slot release stays outside the guard: the row has
                     // left the retry lifecycle regardless of who terminalized it.
-                    self.note_peel_deferred_row_retired(group_id, &record.id);
+                    self.note_peel_deferred_row_retired(group_id);
                     progressed += 1;
                 }
                 Err(EngineError::ForkedEpoch {
@@ -1098,7 +1102,7 @@ impl<S: StorageProvider> Engine<S> {
                     conflicting_epoch,
                 }) => {
                     self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
-                    self.note_peel_deferred_row_retired(group_id, &record.id);
+                    self.note_peel_deferred_row_retired(group_id);
                     return Err(EngineError::ForkedEpoch {
                         group_id: forked_group_id,
                         last_stable,
@@ -1107,7 +1111,7 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 Err(e) => {
                     self.update_stored_message_state(&record.id, MessageState::Retryable)?;
-                    self.note_peel_deferred_row_retired(group_id, &record.id);
+                    self.note_peel_deferred_row_retired(group_id);
                     return Err(e);
                 }
             }
@@ -1149,15 +1153,21 @@ impl<S: StorageProvider> Engine<S> {
         if self.quarantined_reason(group_id).is_some() {
             return Ok(None);
         }
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(None);
+        }
         let now = self.convergence_now();
-        let mut earliest = None;
-        for mut record in self
+        let mut deferred = self
             .storage
             .list_messages(group_id, EpochId(0))?
             .into_iter()
             .filter(|record| record.state == MessageState::PeelDeferred)
-        {
-            self.normalize_deferred_peel_lifecycle(&mut record, now)?;
+            .collect::<Vec<_>>();
+        let normalization_pending = self.normalize_deferred_peel_lifecycles(&mut deferred, now)?;
+        let mut earliest = None;
+        for record in deferred {
             let deadline = record
                 .deferred_peel
                 .as_ref()
@@ -1166,52 +1176,64 @@ impl<S: StorageProvider> Engine<S> {
             let remaining = deadline.saturating_sub(now.monotonic_ms);
             earliest = Some(earliest.map_or(remaining, |current: u64| current.min(remaining)));
         }
-        Ok(earliest)
+        // Finish a legacy/restart migration promptly. Each call persists at
+        // most one sweep-sized slice, avoiding an unbounded write burst.
+        Ok(normalization_pending.then_some(0).or(earliest))
     }
 
-    fn normalize_deferred_peel_lifecycle(
+    /// Normalize legacy/restarted lifecycle rows and persist at most one
+    /// sweep-sized slice. Returns whether additional normalized rows remain
+    /// to be persisted by a later scheduler tick.
+    fn normalize_deferred_peel_lifecycles(
         &self,
-        record: &mut cgka_traits::message::MessageRecord,
+        records: &mut [cgka_traits::message::MessageRecord],
         now: crate::convergence_clock::ConvergenceTime,
-    ) -> Result<(), EngineError> {
-        let mut changed = false;
-        let lifecycle = record.deferred_peel.get_or_insert_with(|| {
-            changed = true;
-            cgka_traits::message::DeferredPeelLifecycle {
-                first_observed_wall_ms: now.wall_ms,
-                wall_high_water_ms: now.wall_ms,
-                clock_instance_id: self.convergence_clock_instance_id,
-                residence_deadline_monotonic_ms: now
-                    .monotonic_ms
-                    .saturating_add(self.deferred_peel_residence_ms),
-                residence_deadline_wall_ms: now
-                    .wall_ms
-                    .saturating_add(self.deferred_peel_residence_ms),
-                distinct_context_attempts: 0,
-                last_context_fingerprint: None,
+    ) -> Result<bool, EngineError> {
+        let mut persisted = 0usize;
+        let mut normalization_pending = false;
+        for record in records {
+            let mut changed = false;
+            let lifecycle = record.deferred_peel.get_or_insert_with(|| {
+                changed = true;
+                cgka_traits::message::DeferredPeelLifecycle {
+                    first_observed_wall_ms: now.wall_ms,
+                    wall_high_water_ms: now.wall_ms,
+                    clock_instance_id: self.convergence_clock_instance_id,
+                    residence_deadline_monotonic_ms: now
+                        .monotonic_ms
+                        .saturating_add(self.deferred_peel_residence_ms),
+                    residence_deadline_wall_ms: now
+                        .wall_ms
+                        .saturating_add(self.deferred_peel_residence_ms),
+                    distinct_context_attempts: 0,
+                    last_context_fingerprint: None,
+                }
+            });
+            if lifecycle.clock_instance_id != self.convergence_clock_instance_id {
+                // Monotonic values do not survive restart. Preserve elapsed
+                // wall residence through a high-water mark. If wall time moved
+                // backwards, using the prior high water prevents premature
+                // expiry.
+                let observed_wall = lifecycle.wall_high_water_ms.max(now.wall_ms);
+                let remaining = lifecycle
+                    .residence_deadline_wall_ms
+                    .saturating_sub(observed_wall);
+                lifecycle.clock_instance_id = self.convergence_clock_instance_id;
+                lifecycle.residence_deadline_monotonic_ms =
+                    now.monotonic_ms.saturating_add(remaining);
+                lifecycle.wall_high_water_ms = observed_wall;
+                changed = true;
             }
-        });
-        if lifecycle.clock_instance_id != self.convergence_clock_instance_id {
-            // Monotonic values do not survive restart. Preserve elapsed wall
-            // residence through a high-water mark. If wall time moved
-            // backwards, use the prior high water rather than the smaller
-            // observation, so the jump cannot cause premature expiry.
-            let observed_wall = lifecycle.wall_high_water_ms.max(now.wall_ms);
-            let remaining = lifecycle
-                .residence_deadline_wall_ms
-                .saturating_sub(observed_wall);
-            lifecycle.clock_instance_id = self.convergence_clock_instance_id;
-            lifecycle.residence_deadline_monotonic_ms = now.monotonic_ms.saturating_add(remaining);
-            lifecycle.wall_high_water_ms = observed_wall;
-            changed = true;
-        } else if now.wall_ms > lifecycle.wall_high_water_ms {
-            lifecycle.wall_high_water_ms = now.wall_ms;
-            changed = true;
+            if changed {
+                if persisted < MAX_DEFERRED_ROWS_PER_SWEEP {
+                    self.storage.put_message(record)?;
+                    persisted += 1;
+                } else {
+                    normalization_pending = true;
+                }
+            }
         }
-        if changed {
-            self.storage.put_message(record)?;
-        }
-        Ok(())
+        Ok(normalization_pending)
     }
 
     fn release_deferred_peel_row(
@@ -1223,6 +1245,12 @@ impl<S: StorageProvider> Engine<S> {
         let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
             u64::from(lifecycle.distinct_context_attempts)
         });
+        let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            lifecycle
+                .wall_high_water_ms
+                .max(self.convergence_now().wall_ms)
+                .saturating_sub(lifecycle.first_observed_wall_ms)
+        });
         self.storage.delete_message(&record.id)?;
         self.audit_group(
             &record.group_id,
@@ -1231,7 +1259,7 @@ impl<S: StorageProvider> Engine<S> {
                 Some(record.epoch),
                 disposition.tag(),
                 retry_count,
-                0,
+                residence_ms,
             ),
         );
         self.events_buf
@@ -1240,7 +1268,7 @@ impl<S: StorageProvider> Engine<S> {
                 message_id: record.id.clone(),
                 resource,
             });
-        self.note_peel_deferred_row_retired(&record.group_id, &record.id);
+        self.note_peel_deferred_row_retired(&record.group_id);
         Ok(())
     }
 
@@ -1309,11 +1337,7 @@ impl<S: StorageProvider> Engine<S> {
     /// attempt-tracking entry. Once the backlog drops back below the cap, the
     /// cap-rejection audit re-arms so a fresh cap-full episode is recorded
     /// once more.
-    pub(crate) fn note_peel_deferred_row_retired(
-        &mut self,
-        group_id: &GroupId,
-        _msg_id: &MessageId,
-    ) {
+    pub(crate) fn note_peel_deferred_row_retired(&mut self, group_id: &GroupId) {
         if let Some(state) = self.deferred_peel.get_mut(group_id) {
             state.deferred_rows = state.deferred_rows.saturating_sub(1);
             if state.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
@@ -1468,7 +1492,7 @@ impl<S: StorageProvider> Engine<S> {
                         // so it leaves the retry lifecycle and frees its cap
                         // slot (mdk#339), mirroring `retry_deferred_peels`.
                         self.update_stored_message_state(&record.id, MessageState::Processed)?;
-                        self.note_peel_deferred_row_retired(group_id, &record.id);
+                        self.note_peel_deferred_row_retired(group_id);
                     } else {
                         self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     }
@@ -1522,7 +1546,7 @@ impl<S: StorageProvider> Engine<S> {
                     // the slot whenever the row leaves the retry lifecycle — whether
                     // this arm retired it or ingest already terminalized it.
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id, &record.id);
+                        self.note_peel_deferred_row_retired(group_id);
                     }
                 }
                 Err(EngineError::ForkedEpoch {
@@ -1532,7 +1556,7 @@ impl<S: StorageProvider> Engine<S> {
                 }) => {
                     self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id, &record.id);
+                        self.note_peel_deferred_row_retired(group_id);
                     }
                     return Err(EngineError::ForkedEpoch {
                         group_id: forked_group_id,
@@ -1543,7 +1567,7 @@ impl<S: StorageProvider> Engine<S> {
                 Err(e) => {
                     self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id, &record.id);
+                        self.note_peel_deferred_row_retired(group_id);
                     }
                     return Err(e);
                 }
