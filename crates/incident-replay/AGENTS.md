@@ -144,9 +144,15 @@ Precedence, highest first:
    unrecoverably, so its group stays blocked until a verified repair clears the
    marker. Two audit surfaces arm it, and the reason string from whichever fired
    is reported per engine: `convergence_run_state` with `phase: unrecoverable`
-   (mdk#1110 — reasons `convergence_pass_base_changed` and
-   `frozen_pass_integrity_failure`, the latter from `error_kind:
-   frozen_member_integrity`), and `epoch_state_changed` with `new_state:
+   (mdk#1110 — reason `frozen_pass_integrity_failure` from `error_kind:
+   frozen_member_integrity`, and the reason-less `error_kind:
+   missing_retained_anchor`, which is why the gate falls back to `error_kind`.
+   mdk#1182 retired a third, `convergence_pass_base_changed` /
+   `base_epoch_mismatch`: a pass whose base epoch disagrees with the tip is now
+   discarded and reopened, emitting the non-terminal
+   `convergence_pass_discarded`. Nothing emits the retired pair today, but the
+   gate matches no reason whitelist, so historical exports carrying it still
+   arm), and `epoch_state_changed` with `new_state:
    unrecoverable` (mdk#1106 — reason `hydrate_unrecoverable_group`, a durable
    halt that survived a restart). Unlike rule 6 this is not an inference from
    lag: the engine *stated* that it stopped, so the gate needs no timestamps to

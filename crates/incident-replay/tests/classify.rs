@@ -238,6 +238,13 @@ fn a_convergence_pass_that_halted_unrecoverably_quarantines() {
     // blocked until a verified repair clears the marker. The engine is stating
     // outright that it stopped, so — unlike the epoch-divergence gate's
     // inferential lag — no timestamps are needed to believe it.
+    //
+    // This fixture carries the halt reason mdk#1182 retired: a pass whose base
+    // epoch disagreed with the tip now discards and reopens instead of halting,
+    // so nothing emits `convergence_pass_base_changed` today. Kept deliberately —
+    // exports already recorded it, and the gate matches no reason whitelist, so a
+    // historical export must still arm. `frozen_pass_integrity_failure` covers
+    // the reason a current engine emits (see `quarantine-repeated-halt.json`).
     let export = load("quarantine-convergence-pass-halt.json");
     assert_eq!(
         classify(&export),
@@ -246,6 +253,26 @@ fn a_convergence_pass_that_halted_unrecoverably_quarantines() {
                 engines: vec![HaltedEngine {
                     engine_id: "engine-a".into(),
                     reasons: vec!["convergence_pass_base_changed".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_halt_carrying_only_an_error_kind_reports_the_error_kind() {
+    // The `missing_retained_anchor` halt is the one `unrecoverable` phase a
+    // current engine emits with `reason: None`, naming itself only through
+    // `error_kind`. Reporting the reason alone would name this engine
+    // `unspecified` and lose the single field that says what broke, so the gate
+    // falls back to `error_kind`.
+    assert_eq!(
+        classify(&load("quarantine-anchorless-halt.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["missing_retained_anchor".into()],
                 }],
             }
         }

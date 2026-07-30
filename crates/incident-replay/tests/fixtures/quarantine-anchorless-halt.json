@@ -1,0 +1,22 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000000000,
+      "kind": { "type": "epoch_state_changed", "epoch": 7, "new_state": "stable", "reason": "publish_confirmed" }
+    },
+    {
+      "engine_id": "engine-a",
+      "wall_time_ms": 1000000060000,
+      "kind": {
+        "type": "convergence_run_state",
+        "phase": "unrecoverable",
+        "current_tip_epoch": 7,
+        "retained_anchor_horizon": 5,
+        "error_kind": "missing_retained_anchor"
+      }
+    }
+  ],
+  "derived_projections": { "pagination": {} }
+}

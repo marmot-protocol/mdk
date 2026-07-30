@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-07-29
+updated: 2026-07-30
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -190,10 +190,11 @@ and retain the raw line for forward-compatible reprocessing.
 
 ## Event catalogue
 
-This catalogue is not yet complete. `AuditEventKind` currently has 39 variants, and these ten have no section here
+This catalogue is not yet complete. `AuditEventKind` currently has 41 variants, and these twelve have no section here
 yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
-`audit_data_mode_changed`, `epoch_stall_backfill_armed`, `group_hydration_quarantined`, `group_hydration_recovered`,
-`message_content_decoded`, `recipient_expectation`, `source_context`, `subscription_rebuild`, `sync_drain`,
+`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_armed`,
+`group_hydration_quarantined`, `group_hydration_recovered`, `message_content_decoded`,
+`pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`, `sync_drain`,
 and `transport_received`.
 
 ### `recorder_started`
@@ -749,14 +750,12 @@ the `convergence.run_id` context, so a run's phases and its selection are one st
 - `blocked`
 - `group_quarantined`
 - `already_unrecoverable`
-- `missing_retained_anchor`
-- `convergence_pass_base_changed`
 - `frozen_pass_integrity_failure`
 
 `error_kind` values found in production call sites:
 
-- `base_epoch_mismatch`
 - `frozen_member_integrity`
+- `missing_retained_anchor`
 
 Metadata notes:
 
@@ -767,6 +766,13 @@ Metadata notes:
 - `current_tip_epoch` is the engine's own materialized tip, so analyzers may fold it into a per-engine epoch high-water
   mark the same way they fold `convergence_decision.current_tip_epoch`. Real exports carry roughly twice as many
   run-state rows as decisions, making this the denser of the two signals.
+- A pass whose base epoch disagrees with the tip is no longer a halt. Older exports carry that disagreement as
+  `phase = "unrecoverable"` with `reason = "convergence_pass_base_changed"` and `error_kind = "base_epoch_mismatch"`;
+  since mdk#1182 the engine discards the stale pass and reopens at the tip, emitting the non-terminal
+  `convergence_pass_discarded` instead. Analyzers reading historical exports should still recognize the retired pair as
+  a halt; nothing emits it today.
+- The `missing_retained_anchor` halt is the one `unrecoverable` phase that carries no `reason`, only that `error_kind`,
+  so a consumer reporting a halt reason must fall back to `error_kind`.
 
 ### `peeler_outcome`
 

@@ -151,9 +151,16 @@ pub enum EventKind {
     /// A distributed-convergence run changed lifecycle phase. The classifier
     /// reads only the terminal [`ConvergencePhase::Unrecoverable`] halt (mdk
     /// #1110): the pass stopped and the group stays blocked until a verified
-    /// repair clears the marker. `reason` names the halt
-    /// (`convergence_pass_base_changed` / `frozen_pass_integrity_failure`) and
-    /// `error_kind` its underlying cause (e.g. `frozen_member_integrity`).
+    /// repair clears the marker. `reason` names the halt (e.g.
+    /// `frozen_pass_integrity_failure`) and `error_kind` its underlying cause
+    /// (e.g. `frozen_member_integrity`). The `missing_retained_anchor` halt
+    /// carries only `error_kind`, hence the fallback in
+    /// [`EventKind::unrecoverable_halt_reason`].
+    ///
+    /// No reason is whitelisted, so a retired one still arms the gate on a
+    /// historical export — mdk#1182 retired `convergence_pass_base_changed` /
+    /// `base_epoch_mismatch`, which is now the non-terminal
+    /// [`EventKind::ConvergencePassDiscarded`] repair instead of a halt.
     ConvergenceRunState {
         #[serde(default)]
         phase: Option<ConvergencePhase>,
