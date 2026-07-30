@@ -1929,6 +1929,12 @@ fn update_group_record_from_replay<S: StorageProvider>(
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
+        crate::capability_manager::cache_own_capabilities_from_group(storage, group_id, &mls_group)
+            .map_err(|e| {
+                OpenMlsProjectionError::Replay(format!(
+                    "refresh post-replay self capabilities: {e}"
+                ))
+            })?;
     }
 
     storage
@@ -2575,6 +2581,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     committer,
                     consumed_proposal_refs,
                 });
+                // Mirror direct ingest: the staged commit is the only public
+                // source for newly added members' KeyPackage capabilities.
+                // The outer canonicalization transaction rolls these writes
+                // back with the merge, record, and dispositions.
+                crate::capability_manager::cache_from_staged_commit(storage, group_id, &staged)
+                    .map_err(|e| {
+                        OpenMlsProjectionError::Replay(format!(
+                            "cache replayed Add capabilities: {e}"
+                        ))
+                    })?;
                 mls_group
                     .merge_staged_commit(&provider, *staged)
                     .map_err(|e| {

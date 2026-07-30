@@ -350,6 +350,12 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
   never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
   helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
+- **Commit-derived group records and capability caches are atomic with the MLS apply.** Every durable projection of
+  an accepted commit must share the transaction that mutates OpenMLS state, and every projection read/write error
+  must propagate. This includes the Marmot group record, capabilities extracted from added KeyPackages, and the
+  post-path self-capability refresh. On a failed direct apply, release its unowned recovery snapshot and schedule the
+  retained commit for stored convergence; redelivery deduplicates against the retained content row and cannot itself
+  repair the apply.
 - **Hydration quarantine is enforced through `Engine::ensure_group_live`.** A quarantined group vanishes from every
   live surface (mdk#364 / #365): every public accessor that reads durable or MLS group state (`members`,
   `group_record`, `group_context`, `admin_pubkeys`, `app_component`, `feature_status`, capability queries, the

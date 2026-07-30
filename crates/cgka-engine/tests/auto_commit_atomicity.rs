@@ -186,11 +186,37 @@ impl PutGroupFault {
     }
 }
 
+/// One-shot fault that fails the Nth capability-cache write after arming.
+///
+/// Inbound Add commits write the added member first and refresh self second,
+/// which lets the regression fail specifically at the post-merge self-cache
+/// refresh.
+#[derive(Clone, Default)]
+struct CapabilityWriteFault(Arc<AtomicUsize>);
+
+impl CapabilityWriteFault {
+    fn arm_on_call(&self, call: usize) {
+        assert!(call > 0);
+        self.0.store(call, Ordering::SeqCst);
+    }
+
+    fn should_fail(&self) -> bool {
+        matches!(
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                }),
+            Ok(1)
+        )
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
-/// `put_group`. Every other call delegates unchanged.
+/// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: PutGroupFault,
+    capability_fault: CapabilityWriteFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -379,6 +405,11 @@ impl CapabilityStorage for FaultStorage {
         member: &Member,
         capabilities: GroupCapabilities,
     ) -> StorageResult<()> {
+        if self.capability_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected capability-cache write failure".into(),
+            ));
+        }
         self.inner
             .save_member_capabilities(group_id, member, capabilities)
     }
@@ -487,14 +518,39 @@ fn build_fault_selfremove_client(
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
-    let engine = EngineBuilder::new(FaultStorage { inner, fault })
-        .legacy_compatibility_profile()
-        .identity(pad32(id))
-        .account_identity_proof_signer(proof_signer(id))
-        .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
-        .build()
-        .unwrap();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault,
+        capability_fault: CapabilityWriteFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(id))
+    .account_identity_proof_signer(proof_signer(id))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    (engine, handle)
+}
+
+fn build_capability_fault_client(
+    id: &[u8],
+    capability_fault: CapabilityWriteFault,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault,
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(id))
+    .account_identity_proof_signer(proof_signer(id))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
     (engine, handle)
 }
 
@@ -901,6 +957,184 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
             })
         ),
         "redelivery after recovery must be a duplicate, got {redelivered:?}"
+    );
+}
+
+/// A failure refreshing self capabilities occurs after the MLS merge and group
+/// record write. All inbound projections must roll back together, and the
+/// retained commit must be handed to stored convergence for retry (mdk#794).
+#[tokio::test]
+async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
+    let alice_fault = CapabilityWriteFault::default();
+    let bob_fault = CapabilityWriteFault::default();
+    let (mut alice, alice_storage) =
+        build_capability_fault_client(b"alice-inbound-cap-atomic", alice_fault.clone());
+    let (mut bob, bob_storage) =
+        build_capability_fault_client(b"bob-inbound-cap-atomic", bob_fault.clone());
+    let mut david = build_selfremove_client(b"david-inbound-cap-atomic");
+    let mut eve = build_selfremove_client(b"eve-inbound-cap-atomic");
+    let david_id = david.self_id();
+    let eve_id = eve.self_id();
+
+    // Alice and Bob are co-admins at epoch 1, so they can publish competing
+    // privileged invite commits from the same source epoch.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "inbound capability atomicity".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_pending_convergence_groups();
+    bob.drain_pending_convergence_groups();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let alice_commit = match alice_invite {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let bob_commit = match bob_invite {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+
+    let ordering_key = |committer: MemberId, commit: &TransportMessage| {
+        CommitOrderingKey::from_commit_bytes(
+            EpochId(1),
+            CommitOrderingPriority::Privileged,
+            committer,
+            &commit.payload,
+        )
+    };
+    let bob_wins =
+        ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
+    let (loser, loser_storage, loser_fault, winning_commit, winning_invitee) = if bob_wins {
+        (&mut alice, &alice_storage, &alice_fault, bob_commit, eve_id)
+    } else {
+        (&mut bob, &bob_storage, &bob_fault, alice_commit, david_id)
+    };
+    let routed_winner = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..winning_commit
+    };
+
+    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(
+        loser_storage
+            .member_capabilities(&group_id, &winning_invitee)
+            .unwrap()
+            .is_none()
+    );
+    let snapshots_before: std::collections::HashSet<String> = loser_storage
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .collect();
+
+    // The added-member cache write is first; fail the self refresh after the
+    // merge and group-record write have both run inside the transaction.
+    loser_fault.arm_on_call(2);
+    let failed = loser.ingest(routed_winner.clone()).await;
+    assert!(
+        matches!(failed, Err(EngineError::Storage(StorageError::Busy(_)))),
+        "self-capability mirror failure must surface as retryable, got {failed:?}"
+    );
+
+    let record = loser_storage.get_group(&group_id).unwrap();
+    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(record.epoch, EpochId(1));
+    assert_eq!(loser.members(&group_id).unwrap().len(), 2);
+    assert_eq!(record.members.len(), 2);
+    assert!(
+        loser_storage
+            .member_capabilities(&group_id, &winning_invitee)
+            .unwrap()
+            .is_none(),
+        "the added-member cache write must roll back with the failed self refresh"
+    );
+    let snapshots_after: std::collections::HashSet<String> = loser_storage
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert!(
+        snapshots_after.is_subset(&snapshots_before),
+        "the abandoned direct apply leaked a recovery snapshot"
+    );
+
+    let scheduled = loser.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&group_id),
+        "the retained commit must be scheduled for stored-convergence retry"
+    );
+    loser
+        .converge_stored_openmls_messages_at(&group_id, 0)
+        .unwrap();
+    loser
+        .converge_stored_openmls_messages_at(&group_id, 60_000)
+        .unwrap();
+
+    let record = loser_storage.get_group(&group_id).unwrap();
+    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(record.epoch, EpochId(2));
+    assert_eq!(loser.members(&group_id).unwrap().len(), 3);
+    assert_eq!(record.members.len(), 3);
+    assert!(
+        loser_storage
+            .member_capabilities(&group_id, &winning_invitee)
+            .unwrap()
+            .is_some(),
+        "stored convergence must rebuild the added member's capability cache"
+    );
+
+    let redelivered = loser.ingest(routed_winner).await;
+    assert!(
+        matches!(
+            redelivered,
+            Ok(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
+            })
+        ),
+        "redelivery after convergence recovery must be a duplicate, got {redelivered:?}"
     );
 }
 
