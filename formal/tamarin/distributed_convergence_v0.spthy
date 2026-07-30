@@ -183,7 +183,9 @@ rule Init_Stale_Rewind:
     RewindTooDeep(~run, 'd7', 'd5'),
     Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
     Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
-    ScoreGreater(~run, 'd7', 'd3')
+    ScoreGreater(~run, 'd7', 'd3'),
+    ProposalMessage(~run, 'stale_proposal', 'late'),
+    BranchDifferent(~run, 'late', 'online')
   ]->
   [
     Compare(~run, 'online', 'late'),
@@ -199,7 +201,9 @@ rule Init_Stale_Rewind:
     !RewindTooDeepState(~run, 'd7', 'd5'),
     !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'p1', 'c00', 'gff'),
     !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'p1', 'c00', 'g00'),
-    !GtState(~run, 'd7', 'd3')
+    !GtState(~run, 'd7', 'd3'),
+    !ProposalMessageState(~run, 'stale_proposal', 'late'),
+    !BranchDifferentState(~run, 'late', 'online')
   ]
 
 /*
@@ -1300,6 +1304,18 @@ rule Defer_Eligible_Losing_Branch_Proposal:
   ]->
   []
 
+rule Drop_Permanently_Ineligible_Branch_Proposal:
+  [
+    !AppliedCanonicalBranchState(run, client, selected),
+    !ProposalMessageState(run, proposal, stale),
+    !BranchDifferentState(run, stale, selected),
+    !StaleState(run, stale)
+  ]
+--[
+    DroppedProposal(run, proposal, stale, 'permanently_ineligible')
+  ]->
+  []
+
 rule Invalidate_Losing_Branch_App:
   [
     AppInvalidationReady(run, app, losing, selected),
@@ -1543,6 +1559,24 @@ lemma deferred_proposal_requires_eligible_losing_branch:
       Ex #j.
           Eligible(run, losing) @ #j
     )"
+
+lemma dropped_proposal_requires_applied_ineligible_branch:
+  "All run proposal stale reason #i.
+      DroppedProposal(run, proposal, stale, reason) @ #i
+    ==> (
+      Ex client selected #j #k #m #n.
+          AppliedCanonicalBranch(run, client, selected) @ #j
+        & ProposalMessage(run, proposal, stale) @ #k
+        & BranchDifferent(run, stale, selected) @ #m
+        & StaleBeyondRewind(run, stale) @ #n
+        & #j < #i
+    )"
+
+lemma dropped_proposals_are_never_accepted:
+  "All run client proposal stale reason branch #i #j.
+      DroppedProposal(run, proposal, stale, reason) @ #i
+    & AcceptedProposal(run, client, proposal, branch) @ #j
+    ==> F"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -1789,9 +1823,10 @@ lemma digest_tie_executable:
 
 lemma stale_rewind_executable:
   exists-trace
-  "Ex run #i #j.
+  "Ex run #i #j #k.
       Scenario(run, 'stale_rewind') @ #i
-    & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #j"
+    & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #j
+    & DroppedProposal(run, 'stale_proposal', 'late', 'permanently_ineligible') @ #k"
 
 lemma duplicate_witness_dedupe_executable:
   exists-trace

@@ -475,6 +475,63 @@ fn materialized_candidates_drive_commit_and_proposal_dispositions() {
 }
 
 #[test]
+fn proposal_consumed_only_by_permanently_ineligible_branch_is_dropped() {
+    let cases = [
+        (
+            "beyond rollback horizon",
+            1,
+            DroppedMessageReason::BeyondRollbackHorizon,
+        ),
+        (
+            "before retained anchor",
+            5,
+            DroppedMessageReason::BeyondAnchor,
+        ),
+    ];
+
+    for (case, retained_anchor_epoch, expected_reason) in cases {
+        let mut stale_proposal = proposal("stale-proposal", "stale");
+        // Keep the proposal itself at-or-after both retained anchors so the
+        // disposition is driven by the consuming branch's permanent
+        // ineligibility, not the proposal's source epoch alone.
+        stale_proposal.source_epoch = 6;
+        let mut canonicalization_input = input(vec![stale_proposal], vec![]);
+        canonicalization_input.state.current_tip_epoch = 10;
+        canonicalization_input.state.retained_anchor_epoch = retained_anchor_epoch;
+        canonicalization_input.policy.convergence.max_rewind_commits = 5;
+
+        let result = canonicalize_with_materialized_candidates(
+            canonicalization_input,
+            vec![
+                MaterializedCandidate {
+                    branch: branch("live", 8, 10, 0x00),
+                    commit_message_ids: vec![],
+                    consumed_proposal_ids: vec![],
+                },
+                MaterializedCandidate {
+                    branch: branch("stale", 4, 7, 0xff),
+                    commit_message_ids: vec![],
+                    consumed_proposal_ids: vec!["stale-proposal".into()],
+                },
+            ],
+        );
+
+        assert_eq!(result.selected_branch_id.as_deref(), Some("live"), "{case}");
+        assert_eq!(
+            result.dropped_messages,
+            vec![DroppedMessage {
+                message_id: "stale-proposal".into(),
+                kind: MessageKind::Proposal,
+                reason: expected_reason,
+                rejection_category: None,
+            }],
+            "{case}"
+        );
+        assert!(result.deferred_messages.is_empty(), "{case}");
+    }
+}
+
+#[test]
 fn materialized_candidate_preserves_commit_application_order() {
     let result = canonicalize_with_materialized_candidates(
         input(vec![], vec![]),

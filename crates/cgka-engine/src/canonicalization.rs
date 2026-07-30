@@ -449,6 +449,7 @@ fn canonicalize_internal(
         all_consumed_proposal_ids: &all_consumed_proposal_ids,
         selected_branch_path: &selected_branch_path,
         materialized_branch_ids: &materialized_graph.branch_ids,
+        candidate_branches: &materialized_graph.candidates,
     };
     result.accepted_commits = selected_commit_ids;
 
@@ -829,6 +830,7 @@ struct ProposalDispositionContext<'a> {
     all_consumed_proposal_ids: &'a BTreeSet<String>,
     selected_branch_path: &'a BTreeSet<String>,
     materialized_branch_ids: &'a BTreeSet<String>,
+    candidate_branches: &'a [BranchCandidate],
 }
 
 fn handle_proposal(
@@ -854,10 +856,19 @@ fn handle_proposal(
         && !context.selected_branch_path.contains(branch_id)
         && result.selected_branch_id.is_some()
     {
-        result.deferred_messages.push(deferred(
-            message,
-            DeferredMessageReason::NonSelectedEligibleBranch,
-        ));
+        let ineligibility_reason = context
+            .candidate_branches
+            .iter()
+            .find(|candidate| candidate.id == branch_id)
+            .and_then(|candidate| branch_ineligibility_reason(input, candidate));
+        if let Some(reason) = ineligibility_reason {
+            result.dropped_messages.push(dropped(message, reason));
+        } else {
+            result.deferred_messages.push(deferred(
+                message,
+                DeferredMessageReason::NonSelectedEligibleBranch,
+            ));
+        }
     } else if result.selected_tip.unwrap_or(input.state.current_tip_epoch) > message.source_epoch {
         // An unconsumed proposal cannot cross an epoch boundary. Once the
         // canonical tip advances past its source epoch it is terminal and must
@@ -986,14 +997,9 @@ fn classify_losing_materialized_candidate_commits(
             {
                 continue;
             }
-            if let Some(candidate) = candidate
-                && candidate.fork_epoch >= input.state.retained_anchor_epoch
-                && is_branch_eligible(
-                    input.state.current_tip_epoch,
-                    candidate,
-                    &input.policy.convergence,
-                )
-            {
+            let ineligibility_reason =
+                candidate.and_then(|candidate| branch_ineligibility_reason(input, candidate));
+            if candidate.is_some() && ineligibility_reason.is_none() {
                 result.deferred_messages.push(DeferredMessage {
                     message_id: message_id.clone(),
                     kind: MessageKind::Commit,
@@ -1003,17 +1009,29 @@ fn classify_losing_materialized_candidate_commits(
                 result.dropped_messages.push(DroppedMessage {
                     message_id: message_id.clone(),
                     kind: MessageKind::Commit,
-                    reason: if candidate.is_some_and(|candidate| {
-                        candidate.fork_epoch < input.state.retained_anchor_epoch
-                    }) {
-                        DroppedMessageReason::BeyondAnchor
-                    } else {
-                        DroppedMessageReason::BeyondRollbackHorizon
-                    },
+                    reason: ineligibility_reason
+                        .unwrap_or(DroppedMessageReason::BeyondRollbackHorizon),
                     rejection_category: None,
                 });
             }
         }
+    }
+}
+
+fn branch_ineligibility_reason(
+    input: &CanonicalizationInput,
+    candidate: &BranchCandidate,
+) -> Option<DroppedMessageReason> {
+    if candidate.fork_epoch < input.state.retained_anchor_epoch {
+        Some(DroppedMessageReason::BeyondAnchor)
+    } else if !is_branch_eligible(
+        input.state.current_tip_epoch,
+        candidate,
+        &input.policy.convergence,
+    ) {
+        Some(DroppedMessageReason::BeyondRollbackHorizon)
+    } else {
+        None
     }
 }
 
