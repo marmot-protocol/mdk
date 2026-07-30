@@ -43,11 +43,6 @@ pub(crate) struct ManagedAccountWorker {
 }
 
 impl ManagedAccountWorker {
-    pub(crate) fn stop(self) {
-        let _ = self.shutdown.send(());
-        self.handle.abort();
-    }
-
     pub(crate) async fn shutdown(self) {
         self.shutdown_with_timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT)
             .await;
@@ -74,7 +69,11 @@ impl ManagedAccountWorker {
                     "managed account worker shutdown timed out; aborting",
                 );
                 handle.abort();
-                let _ = timeout(Duration::from_millis(250), &mut handle).await;
+                // Reaping is the ownership handoff: the task owns AppClient,
+                // whose drop releases the account-session guard. Do not return
+                // until cancellation has run its destructors, or a replacement
+                // worker could race the still-live engine.
+                let _ = handle.await;
             }
         }
     }
@@ -383,7 +382,7 @@ pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
     commands: mpsc::Receiver<AccountWorkerCommand>,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: oneshot::Sender<Result<(), AppError>>,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(run_app_runtime_account_worker(
@@ -395,7 +394,7 @@ async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
     mut commands: mpsc::Receiver<AccountWorkerCommand>,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: oneshot::Sender<Result<(), AppError>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut ready = Some(ready);
@@ -412,13 +411,17 @@ async fn run_app_runtime_account_worker(
     let mut client = match tokio::select! {
         _ = &mut shutdown => {
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Err("runtime startup cancelled".into()));
+                let _ = ready.send(Err(AppError::BlockingTask(
+                    "runtime startup cancelled".into(),
+                )));
             }
             return;
         }
         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Err("runtime startup cancelled".into()));
+                let _ = ready.send(Err(AppError::BlockingTask(
+                    "runtime startup cancelled".into(),
+                )));
             }
             return;
         }
@@ -434,7 +437,7 @@ async fn run_app_runtime_account_worker(
                 message.clone(),
             );
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(message));
+                let _ = ready.send(Err(err));
             }
             return;
         }
@@ -473,7 +476,7 @@ async fn run_app_runtime_account_worker(
                 message.clone(),
             );
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(message));
+                let _ = ready.send(Err(err));
             }
             return;
         }
@@ -633,7 +636,7 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    loop {
+    'worker: loop {
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -790,18 +793,35 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("runtime receive failed", &err),
                         );
-                        tokio::select! {
-                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                            _ = &mut shutdown => return,
-                            _ = sleep(reconnect_backoff.next_delay()) => {}
-                        }
                         // The account-session ownership guard is held by
-                        // `AppClient`.
-                        // Destroy the failed engine before attempting to
-                        // hydrate its replacement; otherwise reconnect would
-                        // create two independent engines over one session DB.
+                        // `AppClient`. Destroy the failed engine before the
+                        // backoff as well as before hydrating its replacement;
+                        // this leaves room for a one-shot client during a
+                        // prolonged transport outage.
                         drop(client);
                         client = loop {
+                            let mut retry_delay =
+                                std::pin::pin!(sleep(reconnect_backoff.next_delay()));
+                            loop {
+                                tokio::select! {
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                                    _ = &mut shutdown => return,
+                                    _ = &mut retry_delay => break,
+                                    command = commands.recv() => {
+                                        match command {
+                                            // There is deliberately no engine
+                                            // session during this backoff.
+                                            // Poll the bounded channel and
+                                            // reject callers promptly by
+                                            // dropping their response sender
+                                            // instead of letting the queue fill
+                                            // until host-side timeouts fire.
+                                            Some(command) => drop(command),
+                                            None => return,
+                                        }
+                                    }
+                                }
+                            }
                             match tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                                 _ = &mut shutdown => return,
@@ -829,11 +849,6 @@ async fn run_app_runtime_account_worker(
                                                 &transport_err,
                                             ),
                                         );
-                                        tokio::select! {
-                                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                            _ = &mut shutdown => return,
-                                            _ = sleep(reconnect_backoff.next_delay()) => {}
-                                        }
                                         drop(reopened);
                                         continue;
                                     }
@@ -880,11 +895,6 @@ async fn run_app_runtime_account_worker(
                                         &account_label,
                                         account_error_message("runtime restart failed", &setup_err),
                                     );
-                                    tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                        _ = &mut shutdown => return,
-                                        _ = sleep(reconnect_backoff.next_delay()) => {}
-                                    }
                                 }
                             }
                         };
@@ -892,6 +902,7 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
+                        continue 'worker;
                     }
                 }
             }

@@ -3356,7 +3356,7 @@ impl AccountManager {
                 .map(|account| account.account_id_hex.clone())
                 .collect::<HashSet<_>>();
 
-            let existing_account_ids = {
+            let (existing_account_ids, stale_workers) = {
                 let mut workers = self.workers.lock().await;
                 let stale_account_ids = workers
                     .iter()
@@ -3368,13 +3368,20 @@ impl AccountManager {
                         }
                     })
                     .collect::<Vec<_>>();
-                for account_id in stale_account_ids {
-                    if let Some(worker) = workers.remove(&account_id) {
-                        worker.stop();
-                    }
-                }
-                workers.keys().cloned().collect::<HashSet<_>>()
+                let stale_workers = stale_account_ids
+                    .into_iter()
+                    .filter_map(|account_id| workers.remove(&account_id))
+                    .collect::<Vec<_>>();
+                (
+                    workers.keys().cloned().collect::<HashSet<_>>(),
+                    stale_workers,
+                )
             };
+            // Worker task teardown releases AppClient's account-session guard.
+            // Reap stale tasks before opening replacements for the same labels.
+            for worker in stale_workers {
+                worker.shutdown().await;
+            }
 
             let pending = accounts
                 .into_iter()
@@ -3437,7 +3444,7 @@ impl AccountManager {
                 );
                 match ready_result {
                     Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(message))) => return Err(AppError::BlockingTask(message)),
+                    Ok(Ok(Err(error))) => return Err(error),
                     Ok(Err(_closed)) => return Err(AppError::TransportClosed),
                     Err(_elapsed) => {
                         return Err(AppError::BlockingTask(
@@ -3459,11 +3466,11 @@ impl AccountManager {
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
-        {
-            let mut workers = self.workers.lock().await;
-            if let Some(worker) = workers.remove(account_id_hex) {
-                worker.stop();
-            }
+        let worker = self.workers.lock().await.remove(account_id_hex);
+        if let Some(worker) = worker {
+            // The worker owns the AppClient and its account-session guard.
+            // Await teardown before reconcile opens the replacement.
+            worker.shutdown().await;
         }
         self.reconcile().await
     }

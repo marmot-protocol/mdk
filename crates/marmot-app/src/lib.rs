@@ -1295,7 +1295,9 @@ impl MarmotApp {
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
         let app = self.clone();
-        let label = label.to_owned();
+        // Resolve every supported account ref before touching label-keyed
+        // caches or the session-owner registry.
+        let label = self.account_home().account(label)?.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
@@ -2616,9 +2618,12 @@ impl MarmotApp {
         label: &str,
         relay_plane: &MarmotRelayPlane,
     ) -> Result<OpenAppAccount, AppError> {
+        let account = self.account_home().account(label)?;
+        // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
+        // by the canonical stored label so aliases cannot open a second engine.
+        let label = account.label.as_str();
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
-        let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();

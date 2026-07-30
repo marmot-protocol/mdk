@@ -240,9 +240,20 @@ fn newest_user_profile_keeps_newer_cached_extra_fields() {
 
 #[tokio::test]
 async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
+    struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     let (commands, _commands_rx) = mpsc::channel(1);
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let handle = tokio::spawn(async {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_signal = DropSignal(dropped.clone());
+    let handle = tokio::spawn(async move {
+        let _drop_signal = drop_signal;
         std::future::pending::<()>().await;
     });
     let worker = ManagedAccountWorker {
@@ -257,6 +268,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         .await;
 
     assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]

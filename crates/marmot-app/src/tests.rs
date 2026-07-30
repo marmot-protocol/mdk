@@ -219,6 +219,8 @@ fn account_session_guard_is_exclusive_until_client_drop() {
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         home.create_account("bob").unwrap();
+        let alice_account_id = home.account("alice").unwrap().account_id_hex;
+        let canonical_account = home.create_nostr_account().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
 
@@ -228,15 +230,47 @@ fn account_session_guard_is_exclusive_until_client_drop() {
             Err(AppError::AccountSessionBusy)
         ));
 
+        // Hex labels and npub refs for the same account share one canonical
+        // ownership key.
+        let canonical = app.client(&canonical_account.label).await.unwrap();
+        let alias_open = app
+            .client(&npub_for_account_id_lossy(
+                &canonical_account.account_id_hex,
+            ))
+            .await;
+        assert!(
+            matches!(alias_open, Err(AppError::AccountSessionBusy)),
+            "{:?}",
+            alias_open.err()
+        );
+        drop(canonical);
+
         // Ownership is scoped per account, not across the whole app.
         let bob = app.client("bob").await.unwrap();
         drop(bob);
+
+        // Managed-worker startup preserves the typed contention error instead
+        // of flattening it into BlockingTask.
+        let contended_runtime = MarmotAppRuntime::new(app.clone());
+        assert!(matches!(
+            contended_runtime.reconcile_accounts().await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        contended_runtime.shutdown().await;
 
         // One-shot operations can release their client and managed workers can
         // then hydrate the accounts normally.
         drop(alice);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.start().await.unwrap();
+        assert!(matches!(
+            app.client("alice").await,
+            Err(AppError::AccountSessionBusy)
+        ));
+
+        // Restart waits for the previous worker to release ownership before
+        // opening its replacement.
+        runtime.restart_account(&alice_account_id).await.unwrap();
         assert!(matches!(
             app.client("alice").await,
             Err(AppError::AccountSessionBusy)
