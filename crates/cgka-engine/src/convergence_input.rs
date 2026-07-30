@@ -255,6 +255,35 @@ mod tests {
     }
 
     #[test]
+    fn no_input_opens_a_pass_without_a_commit_edge_to_gate_outbound_work() {
+        // The reachability premise behind `discard_stale_convergence_pass`: an
+        // open pass always holds at least one `CommitEdge` member, and a
+        // `CommitEdge` member gates outbound work unconditionally (pinned by
+        // `processed_commit_still_gates_while_its_durable_pass_is_active`).
+        // Together those mean the tip cannot advance underneath an open pass, so
+        // a pass whose base epoch disagrees with the tip is inherited scheduling
+        // state rather than a live transition.
+        for role in [
+            ConvergencePassMemberRole::ProposalDependency,
+            ConvergencePassMemberRole::AppWitnessCandidate,
+        ] {
+            for state in [
+                MessageState::Sent,
+                MessageState::Created,
+                MessageState::Retryable,
+            ] {
+                let non_edge = input(role, 3, state, 1);
+                let context = ConvergenceInputContext::from_inputs([non_edge]);
+
+                assert!(
+                    !context.opens_pass(non_edge),
+                    "{role:?}/{state:?} opened a pass with no commit edge to gate outbound work"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn processed_commit_still_gates_while_its_durable_pass_is_active() {
         let commit = input(
             ConvergencePassMemberRole::CommitEdge,
