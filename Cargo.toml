@@ -138,3 +138,6 @@ marmot-terminal-harness = { path = "integrations/terminal-harness" }
 # release contains it, then remove this patch and update the libcrux path.
 [patch.crates-io]
 hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
+# nostr 0.44.6 leaves NIP-49 normalized passwords and derived keys in ordinary
+# buffers. Pin the upstream v0.44 fix until PR #1406 is released.
+nostr = { git = "https://github.com/agent-p1p/nostr.git", rev = "c209c22aab4883a01b1d6017752b23245afce9b3" }

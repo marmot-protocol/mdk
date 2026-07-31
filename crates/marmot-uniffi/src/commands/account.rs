@@ -420,7 +420,9 @@ impl Marmot {
     /// `ncryptsec1...` bech32 backup string (mdk#544).
     ///
     /// SENSITIVE: the passphrase is accepted as an owned FFI string and zeroed
-    /// on return by the Rust boundary. The encrypted export is logged to the
+    /// on return by the Rust boundary. This cannot wipe the caller's original
+    /// host-language string, which remains a separate host-side responsibility
+    /// and should be kept transient. The encrypted export is logged to the
     /// per-account audit log, but unlike `reveal_nsec` it does not downgrade the
     /// account's NIP-49 KEY_SECURITY_BYTE because raw plaintext key material is
     /// not returned to the host app.
