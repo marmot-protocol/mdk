@@ -24,6 +24,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- OpenMLS persistence now zeroizes temporary SQLite serialization buffers for
+  MLS private keys, epoch and message secrets, PSKs, pending group state, and
+  application-export state on success and error paths.
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session

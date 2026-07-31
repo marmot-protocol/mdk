@@ -23,6 +23,7 @@ use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
@@ -369,7 +370,8 @@ pub trait AccountDeviceSignerStorage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredKeyPackageBundle {
     pub storage_key: Vec<u8>,
-    pub value: Vec<u8>,
+    /// Serialized `KeyPackageBundle`, including its private init and leaf keys.
+    pub value: Zeroizing<Vec<u8>>,
 }
 
 pub trait KeyPackageBundleStorage {

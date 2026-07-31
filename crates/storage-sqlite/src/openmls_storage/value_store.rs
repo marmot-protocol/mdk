@@ -1,20 +1,159 @@
-use super::labels::{build_key, build_key_legacy};
+use super::labels::{OpenMlsValueLabel, ValueSensitivity, build_key, build_key_legacy};
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
 use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
+use zeroize::Zeroizing;
+
+struct SecretBytes(Zeroizing<Vec<u8>>);
+
+impl SecretBytes {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Serialize for SecretBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SecretBytesVisitor;
+
+        impl<'de> Visitor<'de> for SecretBytesVisitor {
+            type Value = SecretBytes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON byte array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = Zeroizing::new(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
+                while let Some(byte) = seq.next_element()? {
+                    bytes.push(byte);
+                }
+                Ok(SecretBytes(bytes))
+            }
+        }
+
+        deserializer.deserialize_seq(SecretBytesVisitor)
+    }
+}
+
+enum SerializedBuffer {
+    Public(Vec<u8>),
+    Secret(SecretBytes),
+}
+
+impl SerializedBuffer {
+    fn from_database(label: OpenMlsValueLabel, bytes: Vec<u8>) -> Self {
+        match label.sensitivity() {
+            ValueSensitivity::Public => Self::Public(bytes),
+            ValueSensitivity::Secret => Self::Secret(SecretBytes::new(bytes)),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Public(bytes) => bytes,
+            Self::Secret(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+fn serialize_buffer<T: Serialize + ?Sized>(
+    label: OpenMlsValueLabel,
+    value: &T,
+) -> Result<SerializedBuffer, SqliteOpenMlsStorageError> {
+    match label.sensitivity() {
+        ValueSensitivity::Public => Ok(SerializedBuffer::Public(serde_json::to_vec(value)?)),
+        ValueSensitivity::Secret => {
+            // Serialize directly into zeroizing ownership. `to_writer` may leave
+            // a partial JSON document when serialization fails; the guard wipes
+            // that partial buffer as this error unwinds.
+            let mut bytes = Zeroizing::new(Vec::new());
+            serde_json::to_writer(&mut *bytes, value)?;
+            Ok(SerializedBuffer::Secret(SecretBytes(bytes)))
+        }
+    }
+}
+
+enum SerializedList {
+    Public(Vec<Vec<u8>>),
+    Secret(Vec<SecretBytes>),
+}
+
+impl SerializedList {
+    fn deserialize(
+        label: OpenMlsValueLabel,
+        bytes: &[u8],
+    ) -> Result<Self, SqliteOpenMlsStorageError> {
+        match label.sensitivity() {
+            ValueSensitivity::Public => Ok(Self::Public(serde_json::from_slice(bytes)?)),
+            ValueSensitivity::Secret => Ok(Self::Secret(serde_json::from_slice(bytes)?)),
+        }
+    }
+
+    fn push(&mut self, value: SerializedBuffer) {
+        match (self, value) {
+            (Self::Public(values), SerializedBuffer::Public(value)) => values.push(value),
+            (Self::Secret(values), SerializedBuffer::Secret(value)) => values.push(value),
+            _ => unreachable!("label sensitivity must be stable within one list operation"),
+        }
+    }
+
+    fn remove_matching(&mut self, encoded: &SerializedBuffer) {
+        match self {
+            Self::Public(values) => {
+                if let Some(pos) = values
+                    .iter()
+                    .position(|stored| stored.as_slice() == encoded.as_slice())
+                {
+                    values.remove(pos);
+                }
+            }
+            Self::Secret(values) => {
+                if let Some(pos) = values
+                    .iter()
+                    .position(|stored| stored.as_slice() == encoded.as_slice())
+                {
+                    // Removing the SecretBytes drops its Zeroizing<Vec<u8>> here.
+                    values.remove(pos);
+                }
+            }
+        }
+    }
+}
+
+impl Serialize for SerializedList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Public(values) => values.serialize(serializer),
+            Self::Secret(values) => values.serialize(serializer),
+        }
+    }
+}
 
 impl SqliteOpenMlsStorage {
-    pub(in crate::openmls_storage) fn write_value(
+    fn write_serialized_value(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
         group_key: Option<Vec<u8>>,
-        value: Vec<u8>,
+        value: &SerializedBuffer,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key.clone());
-        let legacy_storage_key = build_key_legacy(label, key);
+        let storage_key = build_key(label.as_bytes(), key.clone());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
             write_value_on_connection(
@@ -47,14 +186,37 @@ impl SqliteOpenMlsStorage {
         }
     }
 
-    pub(in crate::openmls_storage) fn write_entity<T: Entity<CURRENT_VERSION>>(
+    pub(in crate::openmls_storage) fn write_json<T: Serialize + ?Sized>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        self.write_value(label, key, group_key, serde_json::to_vec(value)?)
+        let encoded = serialize_buffer(label, value)?;
+        self.write_serialized_value(label, key, group_key, &encoded)
+    }
+
+    #[cfg(test)]
+    pub(in crate::openmls_storage) fn write_value(
+        &self,
+        label: OpenMlsValueLabel,
+        key: Vec<u8>,
+        group_key: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<(), SqliteOpenMlsStorageError> {
+        let encoded = SerializedBuffer::from_database(label, value);
+        self.write_serialized_value(label, key, group_key, &encoded)
+    }
+
+    pub(in crate::openmls_storage) fn write_entity<T: Entity<CURRENT_VERSION>>(
+        &self,
+        label: OpenMlsValueLabel,
+        key: Vec<u8>,
+        group_key: Option<Vec<u8>>,
+        value: &T,
+    ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.write_json(label, key, group_key, value)
     }
 
     pub(in crate::openmls_storage) fn write_group_entity<
@@ -62,7 +224,7 @@ impl SqliteOpenMlsStorage {
         T: Entity<CURRENT_VERSION>,
     >(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         group_id: &GroupId,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
@@ -72,13 +234,13 @@ impl SqliteOpenMlsStorage {
 
     pub(in crate::openmls_storage) fn append_entity<T: Entity<CURRENT_VERSION>>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key.clone());
-        let legacy_storage_key = build_key_legacy(label, key);
+        let storage_key = build_key(label.as_bytes(), key.clone());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             // Inside a broader engine-owned OpenMLS transaction: execute directly
             // and let the owning transaction handle retry/rollback. Retrying a
@@ -115,14 +277,14 @@ impl SqliteOpenMlsStorage {
 
     pub(in crate::openmls_storage) fn remove_entity<T: Entity<CURRENT_VERSION>>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let encoded = serde_json::to_vec(value)?;
-        let storage_key = build_key(label, key.clone());
-        let legacy_storage_key = build_key_legacy(label, key);
+        let encoded = serialize_buffer(label, value)?;
+        let storage_key = build_key(label.as_bytes(), key.clone());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             // Inside a broader engine-owned OpenMLS transaction: see append_entity.
             let conn = self.lock()?;
@@ -132,7 +294,7 @@ impl SqliteOpenMlsStorage {
                 storage_key,
                 legacy_storage_key,
                 group_key.as_deref(),
-                encoded.as_slice(),
+                &encoded,
             )?;
             Ok(())
         } else {
@@ -145,7 +307,7 @@ impl SqliteOpenMlsStorage {
                     storage_key.clone(),
                     legacy_storage_key.clone(),
                     group_key.as_deref(),
-                    encoded.as_slice(),
+                    &encoded,
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -155,24 +317,24 @@ impl SqliteOpenMlsStorage {
 
     fn read_raw_list(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: &[u8],
-    ) -> Result<Option<Vec<Vec<u8>>>, SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key.to_vec());
-        let legacy_storage_key = build_key_legacy(label, key.to_vec());
+    ) -> Result<Option<SerializedList>, SqliteOpenMlsStorageError> {
+        let storage_key = build_key(label.as_bytes(), key.to_vec());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key.to_vec());
         let conn = self.lock()?;
-        let value = match read_value_on_connection(&conn, &storage_key)? {
+        let value = match read_value_on_connection(&conn, &storage_key, label)? {
             Some(value) => Some(value),
-            None => read_value_on_connection(&conn, &legacy_storage_key)?,
+            None => read_value_on_connection(&conn, &legacy_storage_key, label)?,
         };
         value
-            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .map(|value| SerializedList::deserialize(label, value.as_slice()))
             .transpose()
     }
 
     pub(in crate::openmls_storage) fn read_entity<T: Entity<CURRENT_VERSION>>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<Option<T>, SqliteOpenMlsStorageError> {
         self.read_json(label, key)
@@ -180,18 +342,18 @@ impl SqliteOpenMlsStorage {
 
     pub(in crate::openmls_storage) fn read_json<T: DeserializeOwned>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<Option<T>, SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key.clone());
-        let legacy_storage_key = build_key_legacy(label, key);
+        let storage_key = build_key(label.as_bytes(), key.clone());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         let conn = self.lock()?;
-        let value = match read_value_on_connection(&conn, &storage_key)? {
+        let value = match read_value_on_connection(&conn, &storage_key, label)? {
             Some(value) => Some(value),
-            None => read_value_on_connection(&conn, &legacy_storage_key)?,
+            None => read_value_on_connection(&conn, &legacy_storage_key, label)?,
         };
         value
-            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .map(|value| serde_json::from_slice(value.as_slice()).map_err(Into::into))
             .transpose()
     }
 
@@ -200,7 +362,7 @@ impl SqliteOpenMlsStorage {
         T: Entity<CURRENT_VERSION>,
     >(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         group_id: &GroupId,
     ) -> Result<Option<T>, SqliteOpenMlsStorageError> {
         self.read_entity(label, Self::group_key(group_id)?)
@@ -208,23 +370,29 @@ impl SqliteOpenMlsStorage {
 
     pub(in crate::openmls_storage) fn read_list<T: Entity<CURRENT_VERSION>>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<Vec<T>, SqliteOpenMlsStorageError> {
-        self.read_raw_list(label, &key)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
-            .collect()
+        match self.read_raw_list(label, &key)? {
+            Some(SerializedList::Public(values)) => values
+                .into_iter()
+                .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+                .collect(),
+            Some(SerializedList::Secret(values)) => values
+                .into_iter()
+                .map(|value| serde_json::from_slice(value.as_slice()).map_err(Into::into))
+                .collect(),
+            None => Ok(Vec::new()),
+        }
     }
 
     pub(in crate::openmls_storage) fn delete_value(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key.clone());
-        let legacy_storage_key = build_key_legacy(label, key);
+        let storage_key = build_key(label.as_bytes(), key.clone());
+        let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
             delete_value_on_connection(&conn, storage_key.as_slice())?;
@@ -247,7 +415,7 @@ impl SqliteOpenMlsStorage {
 
     pub(in crate::openmls_storage) fn delete_group_value<GroupId: Key<CURRENT_VERSION>>(
         &self,
-        label: &[u8],
+        label: OpenMlsValueLabel,
         group_id: &GroupId,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         self.delete_value(label, Self::group_key(group_id)?)
@@ -256,7 +424,7 @@ impl SqliteOpenMlsStorage {
     pub(in crate::openmls_storage) fn delete_group_labels<GroupId: Key<CURRENT_VERSION>>(
         &self,
         group_id: &GroupId,
-        labels: &[&[u8]],
+        labels: &[OpenMlsValueLabel],
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let group_key = Self::group_key(group_id)?;
         // Wrap every label delete in a single transaction so the operation is
@@ -288,7 +456,8 @@ impl SqliteOpenMlsStorage {
 fn read_value_on_connection(
     conn: &rusqlite::Connection,
     storage_key: &[u8],
-) -> Result<Option<Vec<u8>>, SqliteOpenMlsStorageError> {
+    label: OpenMlsValueLabel,
+) -> Result<Option<SerializedBuffer>, SqliteOpenMlsStorageError> {
     Ok(conn
         .query_row(
             "SELECT value FROM openmls_values
@@ -296,12 +465,13 @@ fn read_value_on_connection(
             params![CURRENT_VERSION, storage_key],
             |row| row.get(0),
         )
-        .optional()?)
+        .optional()?
+        .map(|bytes| SerializedBuffer::from_database(label, bytes)))
 }
 
 fn write_value_on_connection(
     conn: &rusqlite::Connection,
-    label: &[u8],
+    label: OpenMlsValueLabel,
     storage_key: &[u8],
     legacy_storage_key: &[u8],
     group_key: Option<&[u8]>,
@@ -311,7 +481,13 @@ fn write_value_on_connection(
         "INSERT OR REPLACE INTO openmls_values
             (provider_version, label, storage_key, group_key, value)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![CURRENT_VERSION, label, storage_key, group_key, value],
+        params![
+            CURRENT_VERSION,
+            label.as_bytes(),
+            storage_key,
+            group_key,
+            value
+        ],
     )?;
     delete_value_on_connection(conn, legacy_storage_key)
 }
@@ -319,49 +495,49 @@ fn write_value_on_connection(
 fn list_values_on_connection(
     conn: &rusqlite::Connection,
     storage_key: &[u8],
-) -> Result<Vec<Vec<u8>>, SqliteOpenMlsStorageError> {
-    conn.query_row(
-        "SELECT value FROM openmls_values
-         WHERE provider_version = ?1 AND storage_key = ?2",
-        params![CURRENT_VERSION, storage_key],
-        |row| row.get::<_, Vec<u8>>(0),
-    )
-    .optional()?
-    .map(|value| serde_json::from_slice(&value))
-    .transpose()
-    .map(|value| value.unwrap_or_default())
-    .map_err(Into::into)
+    label: OpenMlsValueLabel,
+) -> Result<Option<SerializedList>, SqliteOpenMlsStorageError> {
+    read_value_on_connection(conn, storage_key, label)?
+        .map(|value| SerializedList::deserialize(label, value.as_slice()))
+        .transpose()
 }
 
 fn list_values_with_legacy_fallback_on_connection(
     conn: &rusqlite::Connection,
     storage_key: &[u8],
     legacy_storage_key: &[u8],
-) -> Result<Vec<Vec<u8>>, SqliteOpenMlsStorageError> {
-    if read_value_on_connection(conn, storage_key)?.is_some() {
-        list_values_on_connection(conn, storage_key)
+    label: OpenMlsValueLabel,
+) -> Result<SerializedList, SqliteOpenMlsStorageError> {
+    if let Some(values) = list_values_on_connection(conn, storage_key, label)? {
+        Ok(values)
+    } else if let Some(values) = list_values_on_connection(conn, legacy_storage_key, label)? {
+        Ok(values)
     } else {
-        list_values_on_connection(conn, legacy_storage_key)
+        Ok(match label.sensitivity() {
+            ValueSensitivity::Public => SerializedList::Public(Vec::new()),
+            ValueSensitivity::Secret => SerializedList::Secret(Vec::new()),
+        })
     }
 }
 
 fn write_list_on_connection(
     conn: &rusqlite::Connection,
-    label: &[u8],
+    label: OpenMlsValueLabel,
     storage_key: &[u8],
     group_key: Option<&[u8]>,
-    list: &[Vec<u8>],
+    list: &SerializedList,
 ) -> Result<(), SqliteOpenMlsStorageError> {
+    let encoded = serialize_buffer(label, list)?;
     conn.execute(
         "INSERT OR REPLACE INTO openmls_values
             (provider_version, label, storage_key, group_key, value)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             CURRENT_VERSION,
-            label,
+            label.as_bytes(),
             storage_key,
             group_key,
-            serde_json::to_vec(list)?
+            encoded.as_slice()
         ],
     )?;
     Ok(())
@@ -369,7 +545,7 @@ fn write_list_on_connection(
 
 fn append_entity_on_connection<T: Entity<CURRENT_VERSION>>(
     conn: &rusqlite::Connection,
-    label: &[u8],
+    label: OpenMlsValueLabel,
     storage_key: Vec<u8>,
     legacy_storage_key: Vec<u8>,
     group_key: Option<&[u8]>,
@@ -379,28 +555,28 @@ fn append_entity_on_connection<T: Entity<CURRENT_VERSION>>(
         conn,
         storage_key.as_slice(),
         legacy_storage_key.as_slice(),
+        label,
     )?;
-    list.push(serde_json::to_vec(value)?);
+    list.push(serialize_buffer(label, value)?);
     write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)?;
     delete_value_on_connection(conn, legacy_storage_key.as_slice())
 }
 
 fn remove_entity_on_connection(
     conn: &rusqlite::Connection,
-    label: &[u8],
+    label: OpenMlsValueLabel,
     storage_key: Vec<u8>,
     legacy_storage_key: Vec<u8>,
     group_key: Option<&[u8]>,
-    encoded: &[u8],
+    encoded: &SerializedBuffer,
 ) -> Result<(), SqliteOpenMlsStorageError> {
     let mut list = list_values_with_legacy_fallback_on_connection(
         conn,
         storage_key.as_slice(),
         legacy_storage_key.as_slice(),
+        label,
     )?;
-    if let Some(pos) = list.iter().position(|stored| stored == encoded) {
-        list.remove(pos);
-    }
+    list.remove_matching(encoded);
     write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)?;
     delete_value_on_connection(conn, legacy_storage_key.as_slice())
 }
@@ -420,13 +596,13 @@ fn delete_value_on_connection(
 fn delete_group_labels_on_connection(
     conn: &rusqlite::Connection,
     group_key: &[u8],
-    labels: &[&[u8]],
+    labels: &[OpenMlsValueLabel],
 ) -> Result<(), SqliteOpenMlsStorageError> {
     for label in labels {
         conn.execute(
             "DELETE FROM openmls_values
              WHERE provider_version = ?1 AND group_key = ?2 AND label = ?3",
-            params![CURRENT_VERSION, group_key, *label],
+            params![CURRENT_VERSION, group_key, label.as_bytes()],
         )?;
     }
     Ok(())
@@ -445,38 +621,73 @@ mod tests {
     impl Entity<CURRENT_VERSION> for TestEntity {}
 
     #[test]
+    fn secret_value_paths_select_zeroizing_buffers() {
+        let label = OpenMlsValueLabel::secret(b"TestSecret");
+
+        assert!(matches!(
+            serialize_buffer(label, &TestEntity(7)).unwrap(),
+            SerializedBuffer::Secret(_)
+        ));
+        assert!(matches!(
+            SerializedBuffer::from_database(label, b"7".to_vec()),
+            SerializedBuffer::Secret(_)
+        ));
+
+        let mut list = SerializedList::deserialize(label, b"[[55],[56]]").unwrap();
+        let encoded = serialize_buffer(label, &TestEntity(7)).unwrap();
+        list.remove_matching(&encoded);
+        match list {
+            SerializedList::Secret(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].as_slice(), b"8");
+            }
+            SerializedList::Public(_) => panic!("secret list used ordinary buffers"),
+        }
+
+        assert!(SerializedList::deserialize(label, b"[[55],").is_err());
+    }
+
+    #[test]
     fn value_storage_key_length_delimits_label_and_key() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
+        let label_a = OpenMlsValueLabel::public(b"A");
+        let label_ab = OpenMlsValueLabel::public(b"AB");
 
         // These two rows collide under the legacy concatenation:
         // label("A") + key("BC") == label("AB") + key("C").
         mls.write_value(
-            b"A",
+            label_a,
             b"BC".to_vec(),
             None,
             serde_json::to_vec(&1u8).unwrap(),
         )
         .unwrap();
         mls.write_value(
-            b"AB",
+            label_ab,
             b"C".to_vec(),
             None,
             serde_json::to_vec(&2u8).unwrap(),
         )
         .unwrap();
 
-        assert_eq!(mls.read_json::<u8>(b"A", b"BC".to_vec()).unwrap(), Some(1));
-        assert_eq!(mls.read_json::<u8>(b"AB", b"C".to_vec()).unwrap(), Some(2));
+        assert_eq!(
+            mls.read_json::<u8>(label_a, b"BC".to_vec()).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mls.read_json::<u8>(label_ab, b"C".to_vec()).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
     fn value_storage_reads_and_deletes_legacy_concatenated_key() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
-        let label = b"LegacyValue";
+        let label = OpenMlsValueLabel::public(b"LegacyValue");
         let key = b"row".to_vec();
-        let legacy_key = build_key_legacy(label, key.clone());
+        let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
 
         mls.lock()
             .unwrap()
@@ -486,7 +697,7 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     CURRENT_VERSION,
-                    label,
+                    label.as_bytes(),
                     legacy_key.clone(),
                     Option::<&[u8]>::None,
                     serde_json::to_vec(&7u8).unwrap()
@@ -523,9 +734,9 @@ mod tests {
     fn list_storage_migrates_legacy_concatenated_key_on_mutation() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
-        let label = b"LegacyList";
+        let label = OpenMlsValueLabel::public(b"LegacyList");
         let key = b"list".to_vec();
-        let legacy_key = build_key_legacy(label, key.clone());
+        let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
         let legacy_list = vec![serde_json::to_vec(&TestEntity(1)).unwrap()];
 
         mls.lock()
@@ -536,7 +747,7 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     CURRENT_VERSION,
-                    label,
+                    label.as_bytes(),
                     legacy_key.clone(),
                     Option::<&[u8]>::None,
                     serde_json::to_vec(&legacy_list).unwrap()

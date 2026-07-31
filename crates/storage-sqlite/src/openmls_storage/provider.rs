@@ -207,11 +207,11 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         leaf_index: u32,
         key_pairs: &[HpkeKeyPair],
     ) -> Result<(), Self::Error> {
-        self.write_value(
+        self.write_json(
             EPOCH_KEY_PAIRS_LABEL,
             epoch_key_pairs_id(group_id, epoch, leaf_index)?,
             Some(Self::group_key(group_id)?),
-            serde_json::to_vec(key_pairs)?,
+            key_pairs,
         )
     }
 
@@ -881,7 +881,7 @@ mod tests {
         let group_id = TestGroupId(vec![1, 2, 3, 4]);
         let proposal_ref = TestProposalRef(vec![0xAA]);
         let proposal = TestQueuedProposal(vec![0xCC]);
-        let refs_label_hex = hex::encode_upper(PROPOSAL_QUEUE_REFS_LABEL);
+        let refs_label_hex = hex::encode_upper(PROPOSAL_QUEUE_REFS_LABEL.as_bytes());
         mls.lock()
             .unwrap()
             .execute_batch(&format!(
@@ -903,7 +903,7 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
-                rusqlite::params![QUEUED_PROPOSAL_LABEL],
+                rusqlite::params![QUEUED_PROPOSAL_LABEL.as_bytes()],
                 |row| row.get(0),
             )
             .unwrap();
