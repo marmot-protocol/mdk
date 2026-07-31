@@ -24,6 +24,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Account projection storage types now redact encrypted group-image decryption
+  and Blossom upload keys from `Debug` output, including nested group
+  formatting.
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session

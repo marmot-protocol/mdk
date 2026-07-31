@@ -21,7 +21,9 @@ use transport_nostr_peeler::NostrTransportEvent;
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
-use crate::conversions::{app_group_from_stored_group, stored_group_from_app_group};
+use crate::conversions::{
+    app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
+};
 use crate::directory::records::{
     FetchedFollowList, profile_content_json, public_directory_user_record,
 };
@@ -3279,6 +3281,48 @@ fn empty_follow_fetch_preserves_cached_edges() {
         selected.source_relays,
         vec!["wss://cached.example".to_owned()]
     );
+}
+
+#[test]
+fn stored_group_image_component_debug_redacts_key_material() {
+    const IMAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const UPLOAD_KEY_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let group = AppGroupRecord::new(
+        "aa".to_owned(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "group".to_owned(),
+        String::new(),
+        AppGroupImageInput {
+            image_hash_hex: hex::encode([0x11; 32]),
+            image_key_hex: IMAGE_KEY_HEX.to_owned(),
+            image_nonce_hex: hex::encode([0x22; 12]),
+            image_upload_key_hex: UPLOAD_KEY_HEX.to_owned(),
+            media_type: Some("image/png".to_owned()),
+        },
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+
+    let image_component = stored_components_from_app_group(&group)
+        .into_iter()
+        .find(|component| component.component_id == GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+        .expect("image component");
+
+    let rendered = format!("{image_component:?}");
+    assert!(!rendered.contains(IMAGE_KEY_HEX));
+    assert!(!rendered.contains(UPLOAD_KEY_HEX));
+    assert!(rendered.contains("marmot.group.blossom.image.v1"));
+    assert!(rendered.contains("redacted"));
+
+    let stored = stored_group_from_app_group(&group);
+    let parent_rendered = format!("{stored:?}");
+    assert!(!parent_rendered.contains(IMAGE_KEY_HEX));
+    assert!(!parent_rendered.contains(UPLOAD_KEY_HEX));
+    assert!(parent_rendered.contains("group"));
 }
 
 #[test]
