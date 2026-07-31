@@ -1514,4 +1514,17 @@ mod co_member_eligibility {
         frozen.unrecoverable = true;
         assert!(!group_contributes_co_members(&frozen));
     }
+
+    #[test]
+    fn account_setup_request_debug_redacts_import_nsec() {
+        let request = AccountSetupRequest {
+            import_nsec: Some(Zeroizing::new(
+                "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+            )),
+            ..AccountSetupRequest::default()
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("nsec1j4"));
+        assert!(debug.contains("redacted"));
+    }
 }

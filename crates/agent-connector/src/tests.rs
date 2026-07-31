@@ -923,7 +923,10 @@ async fn connector_socket_subscribes_to_inbound_messages() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -1738,7 +1741,7 @@ async fn connector_policy_accepts_allowed_welcomer() {
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.clone())
+        .create_identity(setup.fresh_attempt())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -1805,7 +1808,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.clone())
+        .create_identity(setup.fresh_attempt())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -1863,7 +1866,7 @@ async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer(
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.clone())
+        .create_identity(setup.fresh_attempt())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -2315,7 +2318,10 @@ async fn connector_socket_sends_final_message() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -2384,7 +2390,10 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -2616,7 +2625,10 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -2780,7 +2792,10 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -2986,7 +3001,10 @@ async fn connector_socket_cancels_stream_session() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -3228,7 +3246,10 @@ async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInvit
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
 
     let group_id = setup_runtime
@@ -3836,7 +3857,10 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(
@@ -4156,7 +4180,10 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let agent = setup_runtime
+        .create_identity(setup.fresh_attempt())
+        .await
+        .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
     let group_id = setup_runtime
         .create_group(

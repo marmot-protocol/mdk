@@ -1,6 +1,7 @@
 //! Daemon wire protocol: request/response types, framing, and the client.
 
 use super::*;
+use zeroize::Zeroizing;
 
 pub(crate) const DAEMON_SERVER_BUSY_CODE: &str = "server_busy";
 pub(crate) const DAEMON_SERVER_BUSY_MESSAGE: &str = "daemon connection capacity is busy";
@@ -68,6 +69,14 @@ pub enum DaemonClientError {
     ServerBusy,
 }
 
+/// Failed daemon execute with the original `Cli` and stdin `nsec` sidecar when
+/// the client can safely retry locally (for example connect refused).
+pub(crate) struct RecoverableDaemonExecute {
+    pub err: DaemonClientError,
+    pub cli: Cli,
+    pub import_nsec: Option<crate::secret::ImportNsec>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DaemonRuntimeActivityReport {
     pub started_at: u64,
@@ -101,17 +110,31 @@ pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
 
 pub type DaemonOutgoingStreamReport = StreamComposeReport;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum DaemonRequest {
     Ping,
     Status,
     Shutdown,
-    StreamWatch { cli: Box<Cli> },
-    MessagesSubscribe { cli: Box<Cli> },
-    ChatsSubscribe { cli: Box<Cli> },
-    GroupStateSubscribe { cli: Box<Cli> },
-    NotificationsSubscribe { cli: Box<Cli> },
-    Execute { cli: Box<Cli> },
+    StreamWatch {
+        cli: Box<Cli>,
+    },
+    MessagesSubscribe {
+        cli: Box<Cli>,
+    },
+    ChatsSubscribe {
+        cli: Box<Cli>,
+    },
+    GroupStateSubscribe {
+        cli: Box<Cli>,
+    },
+    NotificationsSubscribe {
+        cli: Box<Cli>,
+    },
+    Execute {
+        cli: Box<Cli>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_nsec: Option<crate::secret::ImportNsec>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,8 +220,73 @@ impl DaemonEventHub {
     }
 }
 
-pub(crate) async fn send_execute(socket: &Path, cli: Cli) -> Result<CliOutput, DaemonClientError> {
-    DaemonClient::new(socket).execute(cli).await
+pub(crate) async fn send_execute(
+    socket: &Path,
+    cli: Cli,
+    import_nsec: Option<crate::secret::ImportNsec>,
+) -> Result<CliOutput, RecoverableDaemonExecute> {
+    let request = DaemonRequest::Execute {
+        cli: Box::new(cli),
+        import_nsec,
+    };
+    match send_owned_daemon_request(socket, request).await {
+        Ok(output) => Ok(output),
+        Err((err, request)) => {
+            let (cli, import_nsec) = take_execute_request(request);
+            Err(RecoverableDaemonExecute {
+                err,
+                cli,
+                import_nsec,
+            })
+        }
+    }
+}
+
+fn take_execute_request(request: DaemonRequest) -> (Cli, Option<crate::secret::ImportNsec>) {
+    match request {
+        DaemonRequest::Execute { cli, import_nsec } => (*cli, import_nsec),
+        _ => panic!("expected Execute daemon request"),
+    }
+}
+
+async fn send_owned_daemon_request(
+    socket: &Path,
+    request: DaemonRequest,
+) -> Result<CliOutput, (DaemonClientError, DaemonRequest)> {
+    let bytes = match encode_daemon_request(&request) {
+        Ok(bytes) => bytes,
+        Err(err) => return Err((err, request)),
+    };
+    let mut stream = match UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        Err(source) => {
+            return Err((
+                DaemonClientError::Connect {
+                    socket: socket.to_owned(),
+                    source,
+                },
+                request,
+            ));
+        }
+    };
+    if let Err(source) = stream.write_all(&bytes).await {
+        return Err((DaemonClientError::Io(source), request));
+    }
+    if let Err(source) = stream.shutdown().await {
+        return Err((DaemonClientError::Io(source), request));
+    }
+
+    let mut response = Zeroizing::new(Vec::new());
+    if let Err(source) = stream.read_to_end(&mut response).await {
+        return Err((DaemonClientError::Io(source), request));
+    }
+    if response.is_empty() {
+        return Err((DaemonClientError::EmptyResponse, request));
+    }
+    match decode_daemon_output(&response) {
+        Ok(output) => Ok(output),
+        Err(err) => Err((err, request)),
+    }
 }
 
 pub(crate) async fn send_stream_watch(
@@ -262,10 +350,6 @@ impl DaemonClient {
 
     pub async fn shutdown(&self) -> Result<CliOutput, DaemonClientError> {
         send_request(&self.socket, &DaemonRequest::Shutdown).await
-    }
-
-    pub(crate) async fn execute(&self, cli: Cli) -> Result<CliOutput, DaemonClientError> {
-        send_request(&self.socket, &DaemonRequest::Execute { cli: Box::new(cli) }).await
     }
 
     pub(crate) async fn stream_watch(&self, cli: Cli) -> Result<CliOutput, DaemonClientError> {
@@ -361,7 +445,7 @@ where
 pub(crate) async fn read_daemon_request(
     stream: &mut UnixStream,
 ) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = Vec::new();
+    let mut request = Zeroizing::new(Vec::new());
     // Buffer the raw stream so a near-1-MiB frame (e.g. an `Execute` request
     // carrying the whole `Cli`) costs a handful of `read()` syscalls instead of
     // one per byte. Cap the read at one byte past the limit so a client that
@@ -460,8 +544,10 @@ pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {
 /// `read_daemon_request` / `MAX_DAEMON_REQUEST_BYTES`); checking client-side
 /// turns an oversized request (e.g. `messages send` with a huge body) into a
 /// clear local error instead of a connection the daemon must reject.
-pub(crate) fn encode_daemon_request(request: &DaemonRequest) -> Result<Vec<u8>, DaemonClientError> {
-    let mut bytes = serde_json::to_vec(request)?;
+pub(crate) fn encode_daemon_request(
+    request: &DaemonRequest,
+) -> Result<Zeroizing<Vec<u8>>, DaemonClientError> {
+    let mut bytes = Zeroizing::new(serde_json::to_vec(request)?);
     // The daemon reads up to and excluding the trailing newline, so compare the
     // JSON payload length (without the framing newline) against the limit.
     if bytes.len() > MAX_DAEMON_REQUEST_BYTES {

@@ -23,6 +23,7 @@ mod args;
 pub(crate) mod commands;
 pub mod daemon;
 mod error;
+mod secret;
 pub mod tui;
 
 pub use args::SecretStoreKind;
@@ -33,6 +34,7 @@ pub(crate) use args::{
     SettingsCommand, StreamCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
+pub(crate) use secret::ImportNsec;
 
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -102,7 +104,7 @@ where
 {
     let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = argv.iter().any(|arg| arg.to_string_lossy() == "--json");
-    let mut cli = match Cli::try_parse_from(argv) {
+    let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
@@ -148,10 +150,18 @@ where
             };
         }
     };
-    if let Err(err) = materialize_secret_inputs(&mut cli) {
+    if let Err(err) = validate_secret_input_flags(&cli) {
         return command_output_result(cli.json, Err(err));
     }
+    let import_nsec = match read_import_nsec_for_cli(&cli) {
+        Ok(import_nsec) => import_nsec,
+        Err(err) => return command_output_result(cli.json, Err(err)),
+    };
 
+    run_cli_with_import_nsec(cli, import_nsec).await
+}
+
+async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNsec>) -> CliOutput {
     if let Command::Daemon { command } = cli.command.clone() {
         return daemon::run_daemon_command(cli, command).await;
     }
@@ -204,39 +214,39 @@ where
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         let explicit_daemon_socket =
             cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
-        match daemon::send_execute(&socket, cli.clone()).await {
+        let json_output = cli.json;
+        match daemon::send_execute(&socket, cli, import_nsec).await {
             Ok(output) => return output,
-            // An oversized request is a client-side limit violation, not a
-            // daemon-unavailable or lost-response condition: the encoder rejects
-            // it before it ever reaches `wnd`. Surface it as a terminal error
-            // even on the implicit-socket path, otherwise the request silently
-            // falls through to `run_cli_local` and masks the size cap (see #190).
-            Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
-                return daemon_client_error(cli.json, err);
-            }
-            // Only fall back to local execution when the client could not reach
-            // `wnd` over an auto-discovered socket. If the daemon accepted the
-            // command but the response was lost/malformed, do NOT re-run locally
-            // (that would double-execute); report it via `daemon_execute_error`.
-            Err(err)
+            Err(recover) => {
+                if matches!(
+                    recover.err,
+                    daemon::DaemonClientError::RequestTooLarge { .. }
+                ) {
+                    return daemon_client_error(json_output, recover.err);
+                }
                 if should_fallback_to_local_after_daemon_execute_error(
                     explicit_daemon_socket,
-                    &err,
-                ) => {}
-            Err(err) => return daemon_execute_error(cli.json, err),
+                    &recover.err,
+                ) {
+                    cli = recover.cli;
+                    import_nsec = recover.import_nsec;
+                } else {
+                    return daemon_execute_error(json_output, recover.err);
+                }
+            }
         }
     }
 
-    run_cli_local(cli).await
+    run_cli_local(cli, import_nsec).await
 }
 
-fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), WnError> {
-    match &mut cli.command {
+fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
+    match &cli.command {
         Command::Login {
             identity,
             nsec_stdin,
             ..
-        } => materialize_identity_secret_input("login", identity, *nsec_stdin),
+        } => validate_materialized_secret_identity("login", identity, *nsec_stdin),
         Command::Account {
             command:
                 AccountCommand::Create {
@@ -252,36 +262,65 @@ fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), WnError> {
                     nsec_stdin,
                     ..
                 },
-        } => materialize_identity_secret_input("account create", identity, *nsec_stdin),
+        } => validate_materialized_secret_identity("account create", identity, *nsec_stdin),
         _ => Ok(()),
     }
 }
 
-fn materialize_identity_secret_input(
+fn read_import_nsec_for_cli(cli: &Cli) -> Result<Option<ImportNsec>, WnError> {
+    match &cli.command {
+        Command::Login {
+            identity,
+            nsec_stdin,
+            ..
+        } => read_identity_secret_input("login", identity, *nsec_stdin),
+        Command::Account {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        } => read_identity_secret_input("account create", identity, *nsec_stdin),
+        _ => Ok(None),
+    }
+}
+
+fn read_identity_secret_input(
     command: &'static str,
-    identity: &mut Option<String>,
+    identity: &Option<String>,
     nsec_stdin: bool,
-) -> Result<(), WnError> {
+) -> Result<Option<ImportNsec>, WnError> {
     if nsec_stdin {
         if identity.is_some() {
             return Err(WnError::ConflictingSecretInput { command });
         }
-        *identity = Some(read_nsec_from_stdin(command)?);
+        return Ok(Some(read_nsec_from_stdin(command)?));
     }
-    validate_materialized_secret_identity(command, identity, nsec_stdin)
+    Ok(None)
 }
 
-fn read_nsec_from_stdin(command: &'static str) -> Result<String, WnError> {
-    let mut value = String::new();
+fn read_nsec_from_stdin(command: &'static str) -> Result<ImportNsec, WnError> {
+    use zeroize::Zeroizing;
+
+    let mut value = Zeroizing::new(String::new());
     std::io::stdin().read_to_string(&mut value)?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return Err(WnError::MissingStdinSecret { command });
     }
-    if !is_nostr_secret(&value) {
+    if !is_nostr_secret(trimmed) {
         return Err(WnError::InvalidStdinSecret { command });
     }
-    Ok(value)
+    Ok(ImportNsec::new(Zeroizing::new(trimmed.to_owned())))
 }
 
 pub(crate) fn validate_materialized_secret_identity(
@@ -353,8 +392,8 @@ fn is_notifications_subscribe(cli: &Cli) -> bool {
     )
 }
 
-pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
-    match execute(cli).await {
+pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> CliOutput {
+    match execute(cli, import_nsec).await {
         Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
         Err((json_output, err)) => command_output_result(json_output, Err(err)),
     }
@@ -391,15 +430,21 @@ pub(crate) fn command_output_result(
     }
 }
 
-async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, WnError)> {
+async fn execute(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli)
+    execute_inner(cli, import_nsec)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
 }
 
-async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
+async fn execute_inner(
+    cli: Cli,
+    mut import_nsec: Option<ImportNsec>,
+) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
@@ -461,6 +506,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 &app,
                 runtime_info,
                 identity,
+                import_nsec.take(),
                 nsec_stdin,
                 relay,
                 cli.daemon_default_account_relays,
@@ -481,6 +527,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 runtime_info,
                 account_flag,
                 relay,
+                import_nsec.take(),
             )
             .await
         }
@@ -492,6 +539,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
                 runtime_info,
                 account_flag,
                 relay,
+                import_nsec.take(),
             )
             .await
         }

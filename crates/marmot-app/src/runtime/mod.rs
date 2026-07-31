@@ -696,14 +696,58 @@ fn wipe_failure_reason(err: &AppError) -> String {
     category.to_owned()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq)]
 pub struct AccountSetupRequest {
+    /// Public `npub` / hex identity for import. Never holds an `nsec`.
     pub identity: Option<String>,
+    /// Private key material for local account import. Moved into setup, not cloned.
+    pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
     pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
+}
+
+impl std::fmt::Debug for AccountSetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSetupRequest")
+            .field("identity", &self.identity)
+            .field(
+                "import_nsec",
+                &self
+                    .import_nsec
+                    .as_ref()
+                    .map(|_| &"**redacted**" as &dyn std::fmt::Debug),
+            )
+            .field("default_relays", &self.default_relays)
+            .field("bootstrap_relays", &self.bootstrap_relays)
+            .field("discovery_relays", &self.discovery_relays)
+            .field(
+                "publish_missing_relay_lists",
+                &self.publish_missing_relay_lists,
+            )
+            .field(
+                "publish_initial_key_package",
+                &self.publish_initial_key_package,
+            )
+            .finish()
+    }
+}
+
+impl AccountSetupRequest {
+    /// Copies relay/publish options for another setup attempt. Clears identity and `import_nsec`.
+    pub fn fresh_attempt(&self) -> Self {
+        Self {
+            identity: None,
+            import_nsec: None,
+            default_relays: self.default_relays.clone(),
+            bootstrap_relays: self.bootstrap_relays.clone(),
+            discovery_relays: self.discovery_relays.clone(),
+            publish_missing_relay_lists: self.publish_missing_relay_lists,
+            publish_initial_key_package: self.publish_initial_key_package,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3127,7 +3171,11 @@ impl MarmotAppRuntime {
         identity: impl Into<String>,
         mut request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
-        request.identity = Some(identity.into());
+        let identity = identity.into();
+        if is_nostr_secret(&identity) {
+            return Err(AppError::InvalidPublicKey);
+        }
+        request.identity = Some(identity);
         self.accounts.create_or_import_account(request).await
     }
 
@@ -3703,15 +3751,21 @@ impl AccountManager {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
-        let imports_private_key = request.identity.as_deref().is_some_and(is_nostr_secret);
-        let creates_new_private_key = request.identity.is_none();
+        let imports_private_key = request.import_nsec.is_some();
+        let creates_new_private_key = request.identity.is_none() && request.import_nsec.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        let (mut account, private_key_import) = match request.identity.as_deref() {
-            Some(identity) => match self.signed_out_account_for_identity(identity)? {
+        let identity_key: Option<&str> = request
+            .import_nsec
+            .as_ref()
+            .map(|value| value.as_str())
+            .or(request.identity.as_deref());
+        let (mut account, private_key_import) = if let Some(identity) = identity_key {
+            match self.signed_out_account_for_identity(identity)? {
                 Some(account) => (account, None),
-                None => self.create_nostr_account(request.identity.clone())?,
-            },
-            None => self.create_nostr_account(None)?,
+                None => self.create_nostr_account_from_setup(&request)?,
+            }
+        } else {
+            self.create_nostr_account_from_setup(&request)?
         };
         let reactivating_existing = account.signed_out;
         let rollback_on_setup_failure = !reactivating_existing;
@@ -4192,17 +4246,17 @@ impl AccountManager {
         }
     }
 
-    fn create_nostr_account(
+    fn create_nostr_account_from_setup(
         &self,
-        identity: Option<String>,
+        request: &AccountSetupRequest,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
         let account_home = self.app.account_home();
-        match identity {
-            Some(value) if is_nostr_secret(&value) => {
-                let imported = account_home.import_nostr_account_idempotent(&value)?;
-                Ok((imported.account().clone(), Some(imported)))
-            }
-            Some(value) => Ok((account_home.add_public_account(&value)?, None)),
+        if let Some(nsec) = request.import_nsec.as_deref() {
+            let imported = account_home.import_nostr_account_idempotent(nsec)?;
+            return Ok((imported.account().clone(), Some(imported)));
+        }
+        match request.identity.as_deref() {
+            Some(value) => Ok((account_home.add_public_account(value)?, None)),
             None => Ok((account_home.create_nostr_account()?, None)),
         }
     }

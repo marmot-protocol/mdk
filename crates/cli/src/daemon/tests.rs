@@ -902,7 +902,7 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        handle_execute_connection(cli, &mut server, &defaults, state, events, &workers),
+        handle_execute_connection(cli, None, &mut server, &defaults, state, events, &workers),
     )
     .await
     .expect("a relay-less Execute must not block on the held workers lock");
@@ -910,6 +910,50 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
 
     drop(busy);
     drop(client);
+}
+
+#[tokio::test]
+async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/wn-daemon-home-nsec-fallback"),
+        socket: PathBuf::from("/tmp/wn-daemon-nsec-fallback.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon-nsec-fallback.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon-nsec-fallback.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: vec!["wss://relay.example".to_owned()],
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("daemon-keychain".to_owned()),
+    };
+    let mut cli = daemon_test_cli(crate::Command::Login {
+        identity: None,
+        nsec_stdin: true,
+        relay: Some("wss://relay.example".to_owned()),
+    });
+    apply_defaults(&mut cli, &defaults);
+    let mut import_nsec = Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
+        "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+    )));
+
+    let output = handle_app_runtime_account_setup_request(
+        &cli,
+        &mut import_nsec,
+        &defaults,
+        Arc::new(Mutex::new(DaemonState {
+            pid: 1,
+            started_at: 0,
+            last_runtime_activity: None,
+        })),
+        DaemonEventHub::new(),
+        &SharedDaemonWorkers::default(),
+    )
+    .await;
+
+    assert!(output.is_none());
+    assert!(
+        import_nsec.is_some(),
+        "local fallback must retain ownership of the nsec sidecar"
+    );
 }
 
 #[tokio::test]
@@ -933,6 +977,38 @@ async fn daemon_request_reader_within_returns_request_before_timeout() {
 }
 
 #[test]
+fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let mut cli = daemon_test_cli(crate::Command::Login {
+        identity: None,
+        nsec_stdin: true,
+        relay: Some("wss://relay.example".to_owned()),
+    });
+    cli.daemon_default_account_relays = vec!["wss://relay.example".to_owned()];
+    let request = DaemonRequest::Execute {
+        cli: Box::new(cli),
+        import_nsec: Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
+            nsec.to_owned(),
+        ))),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("nsec1j4"));
+    let bytes = encode_daemon_request(&request).expect("encode execute request");
+    let payload = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let decoded: DaemonRequest = serde_json::from_slice(payload).expect("decode execute request");
+    match decoded {
+        DaemonRequest::Execute { cli, import_nsec } => {
+            assert!(import_nsec.is_some());
+            match cli.command {
+                crate::Command::Login { identity: None, .. } => {}
+                other => panic!("expected login without identity, got {other:?}"),
+            }
+        }
+        other => panic!("expected Execute, got {other:?}"),
+    }
+}
+
+#[test]
 fn encode_daemon_request_rejects_oversized_payloads() {
     // Build an Execute request whose serialized form exceeds the limit by
     // stuffing a huge relay string into the Cli. This mirrors the real
@@ -940,7 +1016,10 @@ fn encode_daemon_request_rejects_oversized_payloads() {
     let huge = "a".repeat(MAX_DAEMON_REQUEST_BYTES + 1);
     let mut cli = daemon_test_cli(crate::Command::Whoami);
     cli.relay = Some(huge);
-    let request = DaemonRequest::Execute { cli: Box::new(cli) };
+    let request = DaemonRequest::Execute {
+        cli: Box::new(cli),
+        import_nsec: None,
+    };
 
     let err = encode_daemon_request(&request)
         .expect_err("oversized request should be rejected before sending");
