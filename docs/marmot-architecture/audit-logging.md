@@ -590,6 +590,7 @@ Current `reason` values found in production call sites:
 - `hydrate_unrecoverable_group`
 - `hydrate_durable_group_evolution`
 - `join_welcome`
+- `join_welcome_repair`
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
