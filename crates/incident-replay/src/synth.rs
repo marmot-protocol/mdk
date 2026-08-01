@@ -52,10 +52,7 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
             initial_admins: None,
             pending: "create".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: winner.to_owned(),
-            pending: "create".to_owned(),
-        },
+        ScenarioStep::accept_publication(winner.to_owned(), "create".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![loser.to_owned()],
@@ -74,14 +71,8 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
             name: LOSER_BRANCH.to_owned(),
             pending: "l".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: winner.to_owned(),
-            pending: "w".to_owned(),
-        },
-        ScenarioStep::ConfirmPending {
-            client: loser.to_owned(),
-            pending: "l".to_owned(),
-        },
+        ScenarioStep::accept_publication(winner.to_owned(), "w".to_owned()),
+        ScenarioStep::accept_publication(loser.to_owned(), "l".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![winner.to_owned(), loser.to_owned()],
@@ -99,7 +90,7 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients: vec![winner.to_owned(), loser.to_owned()],
             steps,
         },
@@ -163,10 +154,7 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
             initial_admins: None,
             pending: "create".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: winner.to_owned(),
-            pending: "create".to_owned(),
-        },
+        ScenarioStep::accept_publication(winner.to_owned(), "create".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![loser.to_owned()],
@@ -191,14 +179,8 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
             invitees: vec![FORK_INVITEE_B.to_owned()],
             pending: "l".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: winner.to_owned(),
-            pending: "w".to_owned(),
-        },
-        ScenarioStep::ConfirmPending {
-            client: loser.to_owned(),
-            pending: "l".to_owned(),
-        },
+        ScenarioStep::accept_publication(winner.to_owned(), "w".to_owned()),
+        ScenarioStep::accept_publication(loser.to_owned(), "l".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![winner.to_owned(), loser.to_owned()],
@@ -216,7 +198,7 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients,
             steps,
         },
@@ -298,10 +280,7 @@ fn convergence_preamble() -> Vec<ScenarioStep> {
             initial_admins: Some(vec![COMMITTER_B.to_owned()]),
             pending: "create".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_A.to_owned(),
-            pending: "create".to_owned(),
-        },
+        ScenarioStep::accept_publication(COMMITTER_A.to_owned(), "create".to_owned()),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec![COMMITTER_B.to_owned(), OBSERVER.to_owned()],
@@ -324,14 +303,8 @@ fn convergence_preamble() -> Vec<ScenarioStep> {
             invitees: vec![INVITEE_B.to_owned()],
             pending: "invite-b".to_owned(),
         },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_A.to_owned(),
-            pending: "invite-a".to_owned(),
-        },
-        ScenarioStep::ConfirmPending {
-            client: COMMITTER_B.to_owned(),
-            pending: "invite-b".to_owned(),
-        },
+        ScenarioStep::accept_publication(COMMITTER_A.to_owned(), "invite-a".to_owned()),
+        ScenarioStep::accept_publication(COMMITTER_B.to_owned(), "invite-b".to_owned()),
     ]
 }
 
@@ -349,7 +322,7 @@ fn convergence_fixture(
         application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients: [COMMITTER_A, COMMITTER_B, OBSERVER, INVITEE_A, INVITEE_B]
                 .into_iter()
                 .map(str::to_owned)

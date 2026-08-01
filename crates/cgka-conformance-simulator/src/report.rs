@@ -426,7 +426,7 @@ mod tests {
         ScenarioReport {
             metadata: ScenarioReportMetadata {
                 scenario_name: "oracle-summary-test".into(),
-                spec_version: "1".into(),
+                spec_version: "2".into(),
                 step_count: 0,
                 storage_backend: "in-memory-sqlite".into(),
                 subject: None,
@@ -435,7 +435,7 @@ mod tests {
             },
             scenario: ScenarioSpec {
                 name: "oracle-summary-test".into(),
-                spec_version: "1".into(),
+                spec_version: "2".into(),
                 clients: Vec::new(),
                 steps: Vec::new(),
             },

@@ -65,9 +65,9 @@ pub use report::{
 };
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
-    InvariantFailure, ScenarioReport, ScenarioReportMetadata, ScenarioRunError, ScenarioSpec,
-    ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, VectorFixtureMetadata,
-    run_scenario_report, run_scenario_report_with_outcomes,
+    InvariantFailure, ScenarioOutboundSelection, ScenarioReport, ScenarioReportMetadata,
+    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus,
+    VectorFixtureMetadata, run_scenario_report, run_scenario_report_with_outcomes,
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_storage_mode,
     run_scenario_report_with_subject, run_scenario_spec, run_scenario_spec_with_subject,
     run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,

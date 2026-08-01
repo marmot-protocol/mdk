@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "delayed-past-epoch-app-message/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,11 +24,7 @@
         "required_features": [],
         "pending": "create"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "create"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },
@@ -66,11 +62,7 @@
         ],
         "pending": "invite-david"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "invite-david"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "invite-david", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },

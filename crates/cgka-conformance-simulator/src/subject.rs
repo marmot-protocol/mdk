@@ -32,7 +32,6 @@ use std::sync::Arc;
 #[serde(rename_all = "snake_case")]
 pub enum SubjectCapability {
     GroupMutation,
-    PublicationLifecycle,
     ApplicationMessaging,
     TransportDelivery,
     EventObservation,
@@ -51,7 +50,6 @@ impl SubjectCapability {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::GroupMutation => "group_mutation",
-            Self::PublicationLifecycle => "publication_lifecycle",
             Self::ApplicationMessaging => "application_messaging",
             Self::TransportDelivery => "transport_delivery",
             Self::EventObservation => "event_observation",
@@ -192,6 +190,11 @@ pub enum SubjectOutboundOutcome {
 pub struct SubjectOutboundArtifact {
     pub outbound_id: String,
     pub client: String,
+    /// Stable scenario publication label, when the emission belongs to a
+    /// scenario-requested staged state transition. Engine-generated outbound
+    /// work intentionally leaves this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<String>,
     pub kind: SubjectOutboundKind,
     pub message: TransportMessage,
     pub state_confirmation_required: bool,
@@ -230,18 +233,6 @@ pub trait ConvergenceSubject: Send {
         _action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
-    }
-
-    async fn confirm_pending(&mut self, _client: &str, _pending: &str) -> Result<(), SubjectError> {
-        Err(SubjectError::unsupported(
-            SubjectCapability::PublicationLifecycle,
-        ))
-    }
-
-    async fn fail_pending(&mut self, _client: &str, _pending: &str) -> Result<(), SubjectError> {
-        Err(SubjectError::unsupported(
-            SubjectCapability::PublicationLifecycle,
-        ))
     }
 
     async fn send_application(
@@ -356,7 +347,7 @@ pub trait ConvergenceFaultSubject {
     fn clear_partition(&mut self) -> Result<(), SubjectError>;
 }
 
-/// Capability required for one ScenarioSpec v1 step.
+/// Capability required for one ScenarioSpec v2 step.
 pub fn required_capability(step: &ScenarioStep) -> SubjectCapability {
     match step {
         ScenarioStep::CreateGroup { .. }
@@ -365,9 +356,7 @@ pub fn required_capability(step: &ScenarioStep) -> SubjectCapability {
         | ScenarioStep::UpdateAdminPolicy { .. }
         | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
         | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
-        ScenarioStep::ConfirmPending { .. } | ScenarioStep::FailPending { .. } => {
-            SubjectCapability::PublicationLifecycle
-        }
+        ScenarioStep::AcknowledgeOutbound { .. } => SubjectCapability::OutboundPublication,
         ScenarioStep::SendAppMessage { .. } => SubjectCapability::ApplicationMessaging,
         ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
             SubjectCapability::TransportDelivery
@@ -424,23 +413,6 @@ impl EngineHarnessSubject {
         protocol_profile: ProtocolProfile,
         storage_mode: HarnessStorageMode,
     ) -> Result<Self, SubjectError> {
-        Self::new_with_publication_lifecycle(clients, protocol_profile, storage_mode, true)
-    }
-
-    pub(crate) fn new_legacy_compatible(
-        clients: &[String],
-        protocol_profile: ProtocolProfile,
-        storage_mode: HarnessStorageMode,
-    ) -> Result<Self, SubjectError> {
-        Self::new_with_publication_lifecycle(clients, protocol_profile, storage_mode, false)
-    }
-
-    fn new_with_publication_lifecycle(
-        clients: &[String],
-        protocol_profile: ProtocolProfile,
-        storage_mode: HarnessStorageMode,
-        external_publication_lifecycle: bool,
-    ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
         let mut attached = BTreeMap::new();
@@ -451,20 +423,16 @@ impl EngineHarnessSubject {
                     format!("duplicate client label {label}"),
                 ));
             }
-            let mut builder = ClientBuilder::new(pad32(label.as_bytes()))
+            let builder = ClientBuilder::new(pad32(label.as_bytes()))
                 .registry(scenario_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
                 .convergence_clock(Arc::new(convergence_clock.clone()));
-            if external_publication_lifecycle {
-                builder = builder.external_publication_lifecycle();
-            }
             let client = builder.attach(&bus);
             attached.insert(label.clone(), client);
         }
-        let mut capabilities = BTreeSet::from([
+        let capabilities = BTreeSet::from([
             SubjectCapability::GroupMutation,
-            SubjectCapability::PublicationLifecycle,
             SubjectCapability::ApplicationMessaging,
             SubjectCapability::TransportDelivery,
             SubjectCapability::EventObservation,
@@ -473,12 +441,10 @@ impl EngineHarnessSubject {
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
             SubjectCapability::VirtualTime,
+            SubjectCapability::OutboundPublication,
             SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
         ]);
-        if external_publication_lifecycle {
-            capabilities.insert(SubjectCapability::OutboundPublication);
-        }
         Ok(Self {
             descriptor: SubjectDescriptor {
                 adapter: "mdk-engine-harness".into(),
@@ -550,27 +516,10 @@ impl EngineHarnessSubject {
         Ok(())
     }
 
-    fn pending_for_client(
-        &self,
-        label: &str,
-        client: &str,
-    ) -> Result<PendingStateRef, SubjectError> {
-        let pending = self.pending_refs.get(label).ok_or_else(|| {
-            SubjectError::new("unknown_pending", format!("unknown pending label {label}"))
-        })?;
-        if pending.client != client {
-            return Err(SubjectError::new(
-                "pending_client_mismatch",
-                format!("pending label {label} does not belong to {client}"),
-            ));
-        }
-        Ok(pending.pending)
-    }
-
-    fn take_pending(&mut self, label: &str, client: &str) -> Result<PendingStateRef, SubjectError> {
-        let pending = self.pending_for_client(label, client)?;
-        self.pending_refs.remove(label);
-        Ok(pending)
+    fn publication_for_pending(&self, client: &str, pending: PendingStateRef) -> Option<String> {
+        self.pending_refs.iter().find_map(|(label, candidate)| {
+            (candidate.client == client && candidate.pending == pending).then(|| label.clone())
+        })
     }
 
     fn sync_client_outbound(&mut self, label: &str) -> Result<(), SubjectError> {
@@ -586,6 +535,8 @@ impl EngineHarnessSubject {
             let pending = self
                 .client(label)?
                 .pending_publication_for_message(&emission.msg.id);
+            let publication =
+                pending.and_then(|pending| self.publication_for_pending(label, pending));
             let queued_intent = self
                 .client(label)?
                 .regenerated_queued_intent_for_message(&emission.msg.id);
@@ -605,6 +556,7 @@ impl EngineHarnessSubject {
                     artifact: SubjectOutboundArtifact {
                         outbound_id,
                         client: label.to_owned(),
+                        publication,
                         kind,
                         message: emission.msg,
                         state_confirmation_required,
@@ -676,6 +628,18 @@ impl ConvergenceSubject for EngineHarnessSubject {
             .await;
         if let Some(pending_ref) = pending_ref {
             self.insert_pending(action.pending, action.creator, pending_ref)?;
+            self.sync_client_outbound(action.creator)?;
+            let has_outbound_artifacts = self.outbound_records.values().any(|record| {
+                record.artifact.client == action.creator && record.pending == Some(pending_ref)
+            });
+            if !has_outbound_artifacts {
+                self.client_mut(action.creator)?
+                    .try_confirm(pending_ref)
+                    .await
+                    .map_err(subject_engine_error)?;
+                self.client_mut(action.creator)?.capture_engine_events();
+                self.pending_refs.remove(action.pending);
+            }
         }
         Ok(())
     }
@@ -717,41 +681,6 @@ impl ConvergenceSubject for EngineHarnessSubject {
         if let Some(pending) = action.pending {
             self.insert_pending(pending, action.client, pending_ref)?;
         }
-        Ok(())
-    }
-
-    async fn confirm_pending(&mut self, client: &str, pending: &str) -> Result<(), SubjectError> {
-        self.sync_client_outbound(client)?;
-        let pending_ref = self.take_pending(pending, client)?;
-        self.client_mut(client)?
-            .try_confirm(pending_ref)
-            .await
-            .map_err(subject_engine_error)?;
-        self.mark_pending_outbound(client, pending_ref, SubjectOutboundOutcome::Accepted);
-        Ok(())
-    }
-
-    async fn fail_pending(&mut self, client: &str, pending: &str) -> Result<(), SubjectError> {
-        self.sync_client_outbound(client)?;
-        let pending_ref = self.pending_for_client(pending, client)?;
-        if self.pending_non_confirmation_accepted(client, pending_ref) {
-            return Err(SubjectError::new(
-                "outbound_already_exposed",
-                format!(
-                    "cannot report definite publication failure for {pending} after a sibling artifact was accepted"
-                ),
-            ));
-        }
-        self.client_mut(client)?
-            .try_fail_publication(pending_ref)
-            .await
-            .map_err(subject_publication_error)?;
-        self.pending_refs.remove(pending);
-        self.mark_pending_outbound(
-            client,
-            pending_ref,
-            SubjectOutboundOutcome::ReachedNoEndpoint,
-        );
         Ok(())
     }
 
@@ -1694,11 +1623,6 @@ mod tests {
                 .canonical_state_snapshot(),
             pending_snapshot
         );
-        let named_failure = subject
-            .fail_pending("alice", "invite-carol-pending")
-            .await
-            .expect_err("legacy pending control cannot bypass accepted sibling exposure");
-        assert_eq!(named_failure.code, "outbound_already_exposed");
         subject
             .acknowledge_outbound(
                 "alice",
@@ -1876,7 +1800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_legacy_creation_confirms_without_synthetic_outbound_work() {
+    async fn empty_creation_confirms_without_synthetic_outbound_work() {
         let labels = vec!["alice".to_owned()];
         let mut subject = EngineHarnessSubject::new(
             &labels,
@@ -1888,7 +1812,7 @@ mod tests {
         subject
             .create_group(SubjectCreateGroup {
                 creator: "alice",
-                name: "empty-legacy-group",
+                name: "empty-group",
                 invitees: &[],
                 required_features: &[],
                 initial_admins: &[],
@@ -1914,25 +1838,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_compatible_subject_does_not_advertise_outbound_publication() {
-        let subject = EngineHarnessSubject::new_legacy_compatible(
-            &["alice".to_owned()],
-            ProtocolProfile::Legacy,
-            HarnessStorageMode::InMemorySqlite,
-        )
-        .expect("legacy-compatible subject constructs");
-
-        assert!(
-            !subject
-                .descriptor()
-                .supports(SubjectCapability::OutboundPublication)
-        );
-    }
-
     #[tokio::test]
-    async fn legacy_create_confirms_on_first_welcome_acceptance_and_keeps_other_welcomes_independent()
-     {
+    async fn create_confirms_on_first_welcome_acceptance_and_keeps_other_welcomes_independent() {
         let labels = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
         let mut subject = EngineHarnessSubject::new(
             &labels,
@@ -1943,17 +1850,17 @@ mod tests {
         subject
             .create_group(SubjectCreateGroup {
                 creator: "alice",
-                name: "legacy-create",
+                name: "explicit-create",
                 invitees: &labels[1..],
                 required_features: &[],
                 initial_admins: &[],
-                pending: "legacy-create-pending",
+                pending: "create-pending",
             })
             .await
-            .expect("legacy create produces welcomes");
+            .expect("create produces welcomes");
         let outbound = subject
             .poll_outbound("alice")
-            .expect("legacy welcomes are pollable");
+            .expect("welcomes are pollable");
         assert_eq!(outbound.len(), 2);
         assert!(
             outbound
@@ -2165,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected() {
         let labels = vec!["alice".to_owned(), "bob".to_owned()];
-        let mut subject = EngineHarnessSubject::new_legacy_compatible(
+        let mut subject = EngineHarnessSubject::new(
             &labels,
             ProtocolProfile::Current,
             HarnessStorageMode::InMemorySqlite,
@@ -2194,8 +2101,24 @@ mod tests {
             client
                 .advance_convergence()
                 .await
-                .expect("prepare and confirm disband commit");
-            client
+                .expect("prepare disband commit");
+            let outbound = subject
+                .poll_outbound(label)
+                .expect("disband commit is pollable");
+            assert!(!outbound.is_empty(), "disband emits outbound work");
+            for artifact in outbound {
+                subject
+                    .acknowledge_outbound(
+                        label,
+                        &artifact.outbound_id,
+                        SubjectOutboundOutcome::Accepted,
+                    )
+                    .await
+                    .expect("accept disband publication");
+            }
+            subject
+                .client_mut(label)
+                .expect("client exists")
                 .advance_convergence()
                 .await
                 .expect("open collecting pass");

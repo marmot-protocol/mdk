@@ -23,7 +23,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
   `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
   typed `accepted` / `reached_no_endpoint` outcomes through opaque adapter-owned acknowledgement handles.
-- `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue
+- `ScenarioSpec` — a serializable v2 input contract for deterministic scripted scenarios, including explicit outbound
+  acknowledgement and queue
   faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected
   outcomes.
@@ -126,16 +127,16 @@ subject carries the deterministic manual clock, but only a scenario that execute
 that clock. Existing scenarios and standalone `HarnessClient` tests that never opt into virtual time retain the
 historical far-future `tick` shortcut.
 
-`EngineHarnessSubject::new` uses the explicit outbound lifecycle. Polling never removes work, identical repeated
+`EngineHarnessSubject::new` uses the only outbound lifecycle. Polling never removes work, identical repeated
 acknowledgements are idempotent, and a contradictory acknowledgement fails. An accepted state-bearing commit confirms
 the engine's pending state; a `reached_no_endpoint` result rolls back only while the complete publication remains
 unexposed. Welcome outcomes remain independent after a live commit is accepted, and regenerated queued intents are
 retired or re-armed from the same acknowledgement. A state transition with no transport artifacts is confirmed as a
-no-op publication rather than inventing a synthetic artifact. The built-in ScenarioSpec v1 runners use a legacy-compatibility
-constructor so existing fixtures retain their explicit `confirm_pending` / `fail_pending` behavior until Scenario IR v2
-adds portable outbound actions. That compatibility subject does not advertise `outbound_publication`; removal of the
-dual lifecycle after the v2 migration is tracked in
-[MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207). The simulator does not yet wait for quiescence:
+no-op publication rather than inventing a synthetic artifact. ScenarioSpec v2 drives the same contract through
+`acknowledge_outbound`: the runner polls opaque artifacts, optionally selects a stable scenario publication label and
+artifact role, and applies the declared transport outcome. Engine-generated work has no publication label and can be
+acknowledged as the client's current unresolved outbound set. There is no compatibility constructor, silent
+auto-confirmation mode, or second subject publication capability. The simulator does not yet wait for quiescence:
 structural progress tokens, a fixed-point driver, timeout policy, and retry-timer coverage remain in Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
@@ -208,7 +209,7 @@ observes recovery from epoch 1 to epoch 2, and the winner and invalidated orderi
 `concurrent-invite-fork-recovery/v1` uses the same semantic recovery style for an invite race. It checks convergence and
 recovery without pinning which invite branch wins.
 
-`ScenarioSpec` v1 contains ordered client labels and ordered steps. Supported steps are:
+`ScenarioSpec` v2 contains ordered client labels and ordered steps. Supported steps are:
 
 - `create_group`
 - `invite_members`
@@ -216,12 +217,12 @@ recovery without pinning which invite branch wins.
 - `update_admin_policy`
 - `expect_update_admin_policy_error`
 - `observe_admin_policy`
-- `confirm_pending`
-- `fail_pending`
+- `acknowledge_outbound`
 - `send_app_message`
 - `leave`
 - `deliver_all`
 - `tick`
+- `advance_time`
 - `observe`
 - `observe_exact`
 - `probe_bidirectional_decryptability`
@@ -235,9 +236,14 @@ recovery without pinning which invite branch wins.
 - `clear_partition`
 - `restart_client`
 
-Pending operations are referenced by string labels chosen inside the scenario. Client labels are stable logical names;
+Staged publications are referenced by string labels chosen inside the scenario. `acknowledge_outbound.publication`
+selects artifacts emitted by that operation; omitting it selects all currently unresolved artifacts for the client.
+The optional `selection` further restricts the set to `all`, `state_confirmation`, `welcome`, `group_message`, or
+`regenerated_queued_intent`. `outcome` is either `accepted` or `reached_no_endpoint`. A labelled acknowledgement fails
+when no unresolved artifact matches, while an unlabelled acknowledgement is an idempotent drain and may match nothing.
+Client labels are stable logical names;
 the Rust harness maps them to deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the same
-identity shape as production. `fail_pending` represents a definite publication failure: it retracts all matching
+identity shape as production. `reached_no_endpoint` represents a definite publication failure: it retracts all matching
 undelivered commit/Welcome artifacts before local rollback and fails the scenario if any matching artifact has already
 reached a recipient mailbox. Queue fault steps select messages by the current zero-based queue index at that step.
 `reorder_queued.order` is a full permutation of current queue indices; each entry names which old queue slot moves into

@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "admin-policy-update/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob"
@@ -22,11 +22,7 @@
         "initial_admins": [],
         "pending": "create"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "create"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },
@@ -67,11 +63,7 @@
         ],
         "pending": "promote-bob"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "promote-bob"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "promote-bob", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },
@@ -94,11 +86,7 @@
         "name": "bob-renamed",
         "pending": "bob-rename"
       },
-      {
-        "type": "confirm_pending",
-        "client": "bob",
-        "pending": "bob-rename"
-      },
+      { "type": "acknowledge_outbound", "client": "bob", "publication": "bob-rename", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },
@@ -116,11 +104,7 @@
         ],
         "pending": "self-demote-bob"
       },
-      {
-        "type": "confirm_pending",
-        "client": "bob",
-        "pending": "self-demote-bob"
-      },
+      { "type": "acknowledge_outbound", "client": "bob", "publication": "self-demote-bob", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },

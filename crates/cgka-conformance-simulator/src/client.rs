@@ -58,7 +58,6 @@ pub struct HarnessClient {
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     virtual_time_tick_enabled: bool,
-    external_publication_lifecycle: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
     /// automatically after the first create/join.
@@ -86,7 +85,6 @@ pub struct ClientBuilder {
     storage_options: SqliteStorageOptions,
     explicit_file_storage: Option<ExplicitFileStorage>,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
-    external_publication_lifecycle: bool,
 }
 
 pub(crate) enum HarnessPublicationError {
@@ -225,7 +223,6 @@ impl ClientBuilder {
             storage_options: SqliteStorageOptions::default(),
             explicit_file_storage: None,
             convergence_clock: None,
-            external_publication_lifecycle: false,
         }
     }
 
@@ -270,11 +267,6 @@ impl ClientBuilder {
         self
     }
 
-    pub(crate) fn external_publication_lifecycle(mut self) -> Self {
-        self.external_publication_lifecycle = true;
-        self
-    }
-
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -293,9 +285,7 @@ impl ClientBuilder {
             self.convergence_clock.as_ref(),
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
-        if self.external_publication_lifecycle {
-            bus.capture_outbound_for(bus_id);
-        }
+        bus.capture_outbound_for(bus_id);
         HarnessClient {
             engine: Some(engine),
             bus_id,
@@ -308,7 +298,6 @@ impl ClientBuilder {
             protocol_profile: self.protocol_profile,
             convergence_clock: self.convergence_clock,
             virtual_time_tick_enabled: false,
-            external_publication_lifecycle: self.external_publication_lifecycle,
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
@@ -500,6 +489,21 @@ impl HarnessClient {
         self.pending_publication_artifacts
             .iter()
             .find_map(|(pending, message_ids)| message_ids.contains(message_id).then_some(*pending))
+    }
+
+    /// Pending publication handles currently awaiting a transport outcome.
+    ///
+    /// This is a low-level harness probe for focused engine tests. Portable
+    /// scenarios must drive opaque outbound artifacts through
+    /// `ConvergenceSubject::poll_outbound` and `acknowledge_outbound` instead.
+    pub fn pending_publication_refs(&self) -> Vec<PendingStateRef> {
+        let mut pending = self
+            .pending_publication_artifacts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|pending| pending.as_u64());
+        pending
     }
 
     pub(crate) fn message_confirms_pending(
@@ -738,7 +742,7 @@ impl HarnessClient {
                 initial_admins,
             })
             .await?;
-        let (gid, mut pending, welcomes) = match res {
+        let (gid, pending, welcomes) = match res {
             (gid, SendResult::GroupCreated { pending, welcomes }) => (gid, Some(pending), welcomes),
             (gid, SendResult::FoundingGroupCreated { welcomes }) => (gid, None, welcomes),
             (_, other) => {
@@ -757,18 +761,10 @@ impl HarnessClient {
                 welcomes.iter().map(|welcome| welcome.id.clone()),
             );
         }
-        let has_outbound_artifacts = !welcomes.is_empty();
         for w in welcomes {
             self.bus.send(self.bus_id, w);
         }
         self.default_group = Some(gid.clone());
-        if self.external_publication_lifecycle
-            && !has_outbound_artifacts
-            && let Some(noop_pending) = pending
-        {
-            self.try_confirm(noop_pending).await?;
-            pending = None;
-        }
         if pending.is_none() {
             self.capture_engine_events();
         }
@@ -1162,7 +1158,7 @@ impl HarnessClient {
             self.capture_engine_events();
         }
         self.drive_due_convergence(&mut outcomes).await;
-        outcomes.extend(self.drain_auto_publish_confirm().await);
+        self.drain_auto_publish().await;
         outcomes
     }
 
@@ -1206,9 +1202,7 @@ impl HarnessClient {
         for result in results {
             self.publish_send_result(result).await?;
         }
-        for result in self.drain_auto_publish_confirm().await {
-            result?;
-        }
+        self.drain_auto_publish().await;
         Ok(())
     }
 
@@ -1282,7 +1276,7 @@ impl HarnessClient {
                         outcomes.push(Err(e));
                     }
                 }
-                outcomes.extend(self.drain_auto_publish_confirm().await);
+                self.drain_auto_publish().await;
             }
         }
         outcomes.push(Err(EngineError::Backend(
@@ -1380,10 +1374,6 @@ impl HarnessClient {
                 }
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
-                if !self.external_publication_lifecycle {
-                    self.try_confirm(pending).await?;
-                    self.capture_engine_events();
-                }
             }
             SendResult::GroupCreated { welcomes, pending } => {
                 let has_outbound_artifacts = !welcomes.is_empty();
@@ -1398,7 +1388,7 @@ impl HarnessClient {
                 for welcome in welcomes {
                     self.bus.send(self.bus_id, welcome);
                 }
-                if !self.external_publication_lifecycle || !has_outbound_artifacts {
+                if !has_outbound_artifacts {
                     self.try_confirm(pending).await?;
                     self.capture_engine_events();
                 }
@@ -1416,8 +1406,7 @@ impl HarnessClient {
         Ok(())
     }
 
-    async fn drain_auto_publish_confirm(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
-        let mut outcomes = Vec::new();
+    async fn drain_auto_publish(&mut self) {
         let auto = self.engine_mut().drain_auto_publish();
         let gid = self.default_group.clone();
         for auto in auto {
@@ -1431,19 +1420,6 @@ impl HarnessClient {
             self.remember_pending_publication(auto.pending, std::iter::once(routed.id.clone()));
             self.remember_pending_confirmation(auto.pending, std::iter::once(routed.id.clone()));
             self.bus.send(self.bus_id, routed);
-            if self.external_publication_lifecycle {
-                continue;
-            }
-            if let Err(e) = self.try_confirm(auto.pending).await {
-                // A confirmation error is not evidence that the engine rolled
-                // back the staged state. Keep the mapping pending so the
-                // strict oracle exposes the unresolved publish lifecycle; an
-                // actual rollback is recorded only through publish_failed or
-                // the corresponding engine event.
-                outcomes.push(Err(e));
-                continue;
-            }
-            self.capture_engine_events();
         }
         let proposals = self.engine_mut().drain_auto_proposals();
         for msg in proposals {
@@ -1469,7 +1445,6 @@ impl HarnessClient {
                 .await;
             self.bus.send(self.bus_id, routed);
         }
-        outcomes
     }
 
     pub fn drain_events(&mut self) -> Vec<GroupEvent> {
@@ -1720,7 +1695,7 @@ impl HarnessClient {
 }
 
 impl HarnessClient {
-    fn capture_engine_events(&mut self) {
+    pub(crate) fn capture_engine_events(&mut self) {
         let events = self.engine_mut().drain_events();
         for event in events {
             if let GroupEvent::GroupJoined { group_id, .. } = &event

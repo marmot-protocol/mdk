@@ -8,11 +8,11 @@ use cgka_conformance_simulator::{
     ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
     GeneratedScenarioCase, HarnessClient, PendingResolutionObservation, ScenarioInputDisposition,
     ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioReport, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
-    run_vector_fixture_report,
+    ScenarioTrace, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
+    compare_trace_expectations, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    observe_client_exact, run_generated_case_report, run_scenario_report,
+    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -190,7 +190,10 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
     alice
         .advance_convergence()
         .await
-        .expect("prepare and confirm disband commit");
+        .expect("prepare disband commit");
+    let pending = alice.pending_publication_refs();
+    assert_eq!(pending.len(), 1, "disband prepares one publication");
+    alice.confirm(pending[0]).await;
     alice
         .advance_convergence()
         .await
@@ -247,7 +250,7 @@ async fn exact_oracle_projects_terminal_disband_tombstone_across_restart() {
 async fn bidirectional_decryptability_probe_passes_for_settled_members() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/settled".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -258,10 +261,7 @@ async fn bidirectional_decryptability_probe_passes_for_settled_members() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into()],
@@ -310,7 +310,7 @@ async fn bidirectional_decryptability_probe_passes_for_settled_members() {
 async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachability() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/asymmetric-epoch".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -321,10 +321,7 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -334,10 +331,7 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
                 name: "advanced-without-bob".into(),
                 pending: "advance".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "advance".into(),
-            },
+            ScenarioStep::accept_publication("alice", "advance"),
             ScenarioStep::DropQueued { index: 0 },
             ScenarioStep::ProbeBidirectionalDecryptability {
                 clients: vec!["alice".into(), "bob".into()],
@@ -392,7 +386,7 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
 async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/nonmember".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -403,10 +397,7 @@ async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -918,7 +909,7 @@ async fn three_client_message_exchange_vector_is_stable() {
 async fn scenario_spec_runs_three_client_message_exchange() {
     let spec = ScenarioSpec {
         name: "three-client-message-exchange/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -929,10 +920,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into()],
@@ -968,7 +956,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
 async fn scenario_spec_supports_publish_fail() {
     let spec = ScenarioSpec {
         name: "publish-fail/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -979,10 +967,7 @@ async fn scenario_spec_supports_publish_fail() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::FailPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::fail_publication("alice", "create"),
             ScenarioStep::Observe {
                 clients: vec!["alice".into()],
             },
@@ -1009,7 +994,7 @@ async fn scenario_spec_supports_publish_fail() {
 async fn definite_publish_failure_retracts_commit_before_local_rollback() {
     let spec = ScenarioSpec {
         name: "transported-commit-after-local-rollback/minimal/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1020,10 +1005,7 @@ async fn definite_publish_failure_retracts_commit_before_local_rollback() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1033,10 +1015,7 @@ async fn definite_publish_failure_retracts_commit_before_local_rollback() {
                 name: "after".into(),
                 pending: "update".into(),
             },
-            ScenarioStep::FailPending {
-                client: "alice".into(),
-                pending: "update".into(),
-            },
+            ScenarioStep::fail_publication("alice", "update"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1138,7 +1117,7 @@ async fn definite_publish_failure_retracts_commit_and_welcome() {
 }
 
 #[tokio::test]
-async fn fail_pending_rejects_artifact_that_already_reached_a_recipient() {
+async fn publication_failure_rejects_artifact_that_already_reached_a_recipient() {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
     let mut bob = ClientBuilder::new(pad32(b"bob")).attach(&bus);
@@ -1176,7 +1155,7 @@ async fn fail_pending_rejects_artifact_that_already_reached_a_recipient() {
 async fn scenario_spec_supports_leave_and_clear_partition() {
     let spec = ScenarioSpec {
         name: "leave-and-clear-partition/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1187,10 +1166,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1244,7 +1220,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
 async fn scenario_spec_can_drop_queued_message() {
     let spec = ScenarioSpec {
         name: "drop-queued/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1255,10 +1231,7 @@ async fn scenario_spec_can_drop_queued_message() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1290,7 +1263,7 @@ async fn scenario_spec_can_drop_queued_message() {
 async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
     let spec = ScenarioSpec {
         name: "queue-faults/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1301,10 +1274,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into()],
@@ -1362,7 +1332,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
 async fn exact_observation_ledgers_commit_proposal_and_application_dispositions() {
     let spec = ScenarioSpec {
         name: "generalized-scenario-input-ledger/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1373,10 +1343,7 @@ async fn exact_observation_ledgers_commit_proposal_and_application_dispositions(
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1386,10 +1353,7 @@ async fn exact_observation_ledgers_commit_proposal_and_application_dispositions(
                 name: "ledger-updated".into(),
                 pending: "rename".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "rename".into(),
-            },
+            ScenarioStep::accept_publication("alice", "rename"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -1640,11 +1604,15 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         "chaos cases should include group-data races"
     );
     assert!(
-        cases.iter().any(|case| case
-            .scenario
-            .steps
+        cases
             .iter()
-            .any(|step| matches!(step, ScenarioStep::FailPending { .. }))),
+            .any(|case| case.scenario.steps.iter().any(|step| matches!(
+                step,
+                ScenarioStep::AcknowledgeOutbound {
+                    outcome: SubjectOutboundOutcome::ReachedNoEndpoint,
+                    ..
+                }
+            ))),
         "chaos cases should include publish rollback"
     );
     assert!(
@@ -1900,7 +1868,7 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
 async fn failing_generated_case_records_a_minimized_reproducer() {
     let scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1911,10 +1879,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -2089,7 +2054,7 @@ async fn vector_fixture_report_records_semantic_expectation_failures() {
 fn group_data_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "group-data-fork-recovery/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2100,10 +2065,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -2121,14 +2083,8 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
                 name: "bob branch".into(),
                 pending: "bob-update".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-update".into(),
-            },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-update".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-update"),
+            ScenarioStep::accept_publication("bob", "bob-update"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into(), "bob".into()],
@@ -2143,7 +2099,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
 fn deliberate_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2154,10 +2110,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -2175,14 +2128,8 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
                 invitees: vec!["eve".into()],
                 pending: "bob-invite".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite".into(),
-            },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-invite".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite"),
+            ScenarioStep::accept_publication("bob", "bob-invite"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into(), "bob".into()],
@@ -2198,7 +2145,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
 async fn scenario_report_records_mismatch_as_invariant_failure() {
     let spec = ScenarioSpec {
         name: "report-mismatch/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2209,10 +2156,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into()],
@@ -2728,7 +2672,7 @@ async fn canonical_vector_fixtures_match_generated_traces() {
 fn convergence_e2e_group_events_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "convergence-e2e-group-events/v1".into(),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: vec![
             "alice".into(),
             "bob".into(),
@@ -2747,10 +2691,7 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
                 initial_admins: None,
                 pending: "create".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "create".into(),
-            },
+            ScenarioStep::accept_publication("alice", "create"),
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["bob".into(), "carol".into(), "frank".into()],
@@ -2763,28 +2704,19 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
                 invitees: vec!["david".into()],
                 pending: "alice-invite-david".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite-david".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite-david"),
             ScenarioStep::InviteMembers {
                 inviter: "alice".into(),
                 invitees: vec!["grace".into()],
                 pending: "alice-invite-grace".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "alice".into(),
-                pending: "alice-invite-grace".into(),
-            },
+            ScenarioStep::accept_publication("alice", "alice-invite-grace"),
             ScenarioStep::InviteMembers {
                 inviter: "bob".into(),
                 invitees: vec!["eve".into()],
                 pending: "bob-invite-eve".into(),
             },
-            ScenarioStep::ConfirmPending {
-                client: "bob".into(),
-                pending: "bob-invite-eve".into(),
-            },
+            ScenarioStep::accept_publication("bob", "bob-invite-eve"),
             ScenarioStep::SendAppMessage {
                 sender: "alice".into(),
                 payload: "alice canonical payload".into(),

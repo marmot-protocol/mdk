@@ -67,7 +67,7 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     `tests/proptest_invariants.rs` generate symbolic canonicalization, capability, lifecycle, and restart cases locally.
 
 - **Module:** `src/scenario.rs`
-  - **Role:** Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report` /
+  - **Role:** Serializable `ScenarioSpec` v2 plus `run_scenario_spec` / `run_scenario_report` /
     `run_vector_fixture_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a
     `ScenarioTrace` or a serializable report with the executed scenario, metadata, step log, flattened epoch changes,
     app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
@@ -84,8 +84,8 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     retain the legacy far-future `Tick` shortcut. The explicit engine subject also captures an append-only emission
     stream separate from the mutable bus queue: `poll_outbound` returns unresolved transport-ready artifacts
     non-destructively, and `acknowledge_outbound` applies accepted/no-endpoint outcomes to staged commits, independent
-    Welcomes, and regenerated queued intents. Built-in v1 runners use the legacy publication mode until portable
-    outbound steps land in Scenario IR v2. Queue/partition mutation is available only through the separately named
+    Welcomes, and regenerated queued intents. ScenarioSpec v2 uses the same poll/acknowledgement contract; there is no
+    auto-confirming compatibility lifecycle. Queue/partition mutation is available only through the separately named
     `ConvergenceFaultSubject` white-box interface.
 
 - **Module:** `src/vector.rs`
@@ -137,10 +137,10 @@ to be a group member yet.
 `drop_queued`, `duplicate_queued`, `delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
 `clear_partition` remain the partition/heal operations.
 
-`fail_pending` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
+`reached_no_endpoint` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
 undelivered commit and Welcome from the queue and delayed sets. It returns a scenario error instead of rolling back if
 any matching artifact has already reached a recipient mailbox; model that case as ambiguous exposure at an adapter-aware
-boundary rather than as `fail_pending`.
+boundary rather than as definite failure.
 
 Use `clear_events` after setup when a scenario wants the final trace to describe only the behavior under test. The
 convergence E2E scenario does this after the initial welcome joins so its trace focuses on the peeler-ingest epoch

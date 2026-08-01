@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "invite-member/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -22,11 +22,7 @@
         "required_features": [],
         "pending": "create"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "create"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },
@@ -52,11 +48,7 @@
         ],
         "pending": "invite-carol"
       },
-      {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "invite-carol"
-      },
+      { "type": "acknowledge_outbound", "client": "alice", "publication": "invite-carol", "outcome": "accepted" },
       {
         "type": "deliver_all"
       },

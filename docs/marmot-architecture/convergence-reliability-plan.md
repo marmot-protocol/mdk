@@ -64,7 +64,7 @@ Checkboxes represent repository state, not intention. A checked item must have e
 The repository already provides:
 
 - a real `Engine<SqliteAccountStorage>` harness with OpenMLS and the Nostr peeler;
-- scripted `ScenarioSpec` v1 cases and portable vectors;
+- scripted `ScenarioSpec` v2 cases and portable vectors;
 - seeded delivery schedules, generated chaos families, reports, and conservative failure minimization;
 - symbolic selector/canonicalization properties and engine integration tests;
 - encrypted file-backed restart coverage;
@@ -443,10 +443,10 @@ delivery-or-invalidation expectation accounts for it; that is an oracle coverage
 
 Status: `complete`
 
-Completion here means the explicit engine-subject contract and its capability boundary are implemented. Portable
-Scenario IR adoption is still owned by Milestone 2.1 and
-[MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207); until then, v1 runners use a compatibility constructor
-that deliberately does not advertise outbound-publication support.
+Completion here means the explicit engine-subject contract and its capability boundary are implemented. The
+publication-control slice of Scenario IR v2 is also complete: every built-in runner uses exact outbound polling and
+typed acknowledgement, and the temporary auto-confirming compatibility lifecycle has been removed. Broader workload,
+rate, topology, assertion, and schema work remains owned by Milestone 2.1.
 
 - [x] Define a simulator-owned `ConvergenceSubject` interface that keeps scenario semantics in the runner and exposes
   semantic engine operations through declared adapter capabilities.
@@ -456,6 +456,9 @@ that deliberately does not advertise outbound-publication support.
   separate from `Tick`, which selects the participant runtimes that wake and observe elapsed deadlines.
 - [x] Add explicit public outbound polling/acknowledgement so later adapters can model publication progress without
   exposing harness queues.
+- [x] Cut ScenarioSpec and all repository-owned vectors/generators over to v2 `acknowledge_outbound` operations; remove
+  direct pending confirmation/failure from the subject contract and delete the compatibility constructor and client
+  lifecycle branches ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)).
 - [x] Split normal black-box execution from the explicitly named `ConvergenceFaultSubject` queue/partition mutation
   capability; reserve a named white-box storage-fault capability for a future adapter.
 - [x] Reject scenarios that require unsupported subject capabilities before execution.
@@ -507,7 +510,7 @@ Status: `not-started`
 
 ### 2.1 Scenario IR v2 and authoring DSL
 
-- [ ] Land a minimal vertical slice first: versioned action/assertion IR, deterministic executor, stable action ids, and
+- [x] Land a minimal vertical slice first: versioned action/assertion IR, deterministic executor, stable action ids, and
   one engine-adapter scenario that round-trips through JSON.
 - [ ] Define the complete adapter-neutral JSON IR and JSON Schema.
 - [ ] Specify deterministic expansion and rate semantics (`repeat`, `parallel`, `rate`, `burst`, barriers, and virtual
@@ -519,8 +522,9 @@ Status: `not-started`
 - [ ] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
 - [ ] Replace queue indices with semantic action/message selectors.
 - [ ] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
-- [ ] Compile `ScenarioSpec` v1 into v2 so existing vectors retain meaning.
-- [ ] Add portable outbound poll/acknowledgement operations, migrate built-in runners to the explicit lifecycle, and
+- [x] Make a repository-owned clean cutover from `ScenarioSpec` v1 to v2 rather than retaining a runtime compatibility
+  compiler; migrate fixed vectors, generated families, tests, and incident-replay synthesis together.
+- [x] Add portable outbound poll/acknowledgement operations, migrate built-in runners to the explicit lifecycle, and
   remove the legacy-compatible constructor and dual client lifecycle
   ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)).
 
@@ -816,11 +820,11 @@ incorrect result.
 | 2026-07-30 | S4 SQLite transaction-boundary contention | Made transient `COMMIT`/`ROLLBACK` busy conditions retry in place without rerunning application closures; persistent contention remains a typed retryable error and releases a clean connection | [MDK #1191](https://github.com/marmot-protocol/mdk/pull/1191), merge `cff57a5d`; 300 storage tests; `just fast-ci` |
 | 2026-07-30 | 1.3a injectable convergence dual clock | Routed convergence deadlines, pass timestamps, cutoff decisions, and restart rebasing through paired monotonic/wall-clock samples; clock-sensitive engine and harness tests advance deterministically without sleeping | [MDK #1195](https://github.com/marmot-protocol/mdk/pull/1195), merge `5db10d68`; feature-enabled engine and simulator suites; `just fast-ci` |
 | 2026-07-30 | 1.1 consumed self-remove work retirement | Made confirmed and converged commits terminally retire exact consumed proposal rows and epoch-scoped proposal schedule signals; strict send/leave scenarios and restart now reach no-pending-work without an exception | [MDK #1192](https://github.com/marmot-protocol/mdk/pull/1192), merge `1a611eec`; feature-enabled engine suite; strict send/leave family; `just fast-ci` |
-| 2026-07-30 | 1.1 definite publish-failure semantics | Minimized the transported-commit rollback split to nine steps; made simulator `FailPending` retract the complete undelivered commit/Welcome artifact set and reject artifacts that already reached any recipient, restoring strict exact equivalence without changing production lifecycle behavior | [MDK #1196](https://github.com/marmot-protocol/mdk/pull/1196), merge `1985d9a8`; `definite_publish_failure_retracts_commit_before_local_rollback`; `definite_publish_failure_retracts_commit_and_welcome`; `fail_pending_rejects_artifact_that_already_reached_a_recipient`; full simulator suite |
+| 2026-07-30 | 1.1 definite publish-failure semantics | Minimized the transported-commit rollback split to nine steps; made definite simulator publication failure retract the complete undelivered commit/Welcome artifact set and reject artifacts that already reached any recipient, restoring strict exact equivalence without changing production lifecycle behavior | [MDK #1196](https://github.com/marmot-protocol/mdk/pull/1196), merge `1985d9a8`; `definite_publish_failure_retracts_commit_before_local_rollback`; `definite_publish_failure_retracts_commit_and_welcome`; `publication_failure_rejects_artifact_that_already_reached_a_recipient`; full simulator suite |
 | 2026-07-30 | 1.2b adopted canonicalization contract refresh | Reconciled the executable selector, dispositions, durable message state, simulator ledger, local architecture docs, and Tamarin model with adopted Marmot convergence commit `4ad4ae2`: removed the redundant raw-depth selector step; made missing-parent, future-epoch, and eligible losing-branch outcomes explicitly deferred; added `ConvergenceDeferred` so retained inputs can be reconsidered without immediately reopening an unchanged completed pass; and terminally retires deferred commits only after they age below the retained horizon | [MDK #1198](https://github.com/marmot-protocol/mdk/pull/1198), merge `562c5d5f`; `just fast-ci`; full engine/simulator/storage/traits suites; relay runtime and simulator/vector CI; all 78 strict Tamarin lemmas |
 | 2026-07-30 | M5 projection/event-delivery prerequisite | Fixed state changes folded into outbound sends reaching stored projections without waking runtime subscriptions; established that process-level simulation must observe projection state and notification delivery as separate surfaces | [MDK #1186](https://github.com/marmot-protocol/mdk/pull/1186), merge `1b949655`; focused interleaved-send subscription regression; `just fast-ci` |
 | 2026-07-30 | M5 app-runtime ownership prerequisite | Enforced one live account session per account within a `MarmotApp`, surfaced typed contention through UniFFI, and made worker reconnect release the failed client before replacement | [MDK #1200](https://github.com/marmot-protocol/mdk/pull/1200), merge `8dc7c12b`; ownership, worker-lifecycle, FFI, and focused runtime tests |
 | 2026-07-30 | M5 projection-maintenance prerequisite | Made large-set projection pruning bounded, preserved draft-owning groups, and made secure-delete checkpoint completion durable and explicitly observable as `erasure_pending` | [MDK #1201](https://github.com/marmot-protocol/mdk/pull/1201), merge `eec70bd9`; 307 storage tests; focused app/UniFFI retention tests; `just fast-ci` |
 | 2026-07-30 | M5 account-device modeling input | Documented a non-normative multi-device design space while deliberately leaving admission, synchronization, and repair choices unresolved; future scenarios must model account-device instances without assuming those candidate semantics | [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199), merge `aac777f3`; documentation-only |
 | 2026-07-30 | 1.2c / 1.3b subject virtual time | Added a capability-gated `advance_time` scenario operation backed by one shared paired clock across the engine subject; time advancement is a separate failure-free operation and `Tick` selects which participant runtimes observe it, while standalone clients without an injected clock preserve the legacy far-future shortcut | [MDK #1202](https://github.com/marmot-protocol/mdk/pull/1202), merge `1ccc4065`; focused serialization/preflight/dispatch test; two real disband passes remain live at a 999 ms tick, Alice alone settles at 1,000 ms, and Bob settles on a later tick without another time advance; full simulator suite |
-| 2026-07-30 | 1.2d public outbound lifecycle | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues; v1 lifecycle removal is tracked in [MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207) | Focused subject contract tests; full simulator suite; `just fast-ci` |
+| 2026-08-01 | 1.2d public outbound lifecycle and Scenario IR v2 cutover | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues. Migrated every repository-owned scenario producer to v2 `acknowledge_outbound` operations and removed the compatibility constructor, direct subject pending controls, client lifecycle flag, and silent auto-confirm branches ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)) | Focused subject/runner contract tests; fixed vectors; generated families; incident replay; full simulator suite; `just fast-ci` |
