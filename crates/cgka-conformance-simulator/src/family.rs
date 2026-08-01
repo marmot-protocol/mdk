@@ -89,7 +89,7 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
         add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-chaos/v1".into(),
-            generator_version: "4".into(),
+            generator_version: "5".into(),
             seed,
             case_index: case_index as u64,
             scenario,
@@ -548,7 +548,11 @@ fn convergence_chaos_delayed_past_epoch_app(
                 delayed: "old-app".into(),
             },
             ScenarioStep::DeliverAll,
-            tick(["carol"]),
+            tick(["carol", "david"]),
+            ScenarioStep::AdvanceTime {
+                delta_ms: 30 * 24 * 60 * 60 * 1_000 + 1,
+            },
+            tick(["david"]),
             observe(["carol", "david"]),
         ],
     };
@@ -558,8 +562,9 @@ fn convergence_chaos_delayed_past_epoch_app(
         client_state("carol", 2, 4, vec![payload]),
         // David joined after the application input was authored and therefore
         // does not claim historical delivery. Naming his state explicitly
-        // also makes him part of the strict exact/pending-work boundary,
-        // where the retained pre-join transport object remains visible.
+        // also makes him part of the strict exact/pending-work boundary. His
+        // opaque pre-join row is locally resource-released after the explicit
+        // virtual-time residence deadline without claiming stale delivery.
         client_state("david", 2, 4, vec![]),
     ];
     (scenario, expected)

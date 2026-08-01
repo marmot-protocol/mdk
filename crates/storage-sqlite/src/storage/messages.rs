@@ -196,6 +196,9 @@ fn update_message_state_on_connection(
         .ok_or(StorageError::NotFound)?;
     let mut record: MessageRecord = deserialize(&record_bytes)?;
     record.state = new_state;
+    if new_state != MessageState::PeelDeferred {
+        record.deferred_peel = None;
+    }
     let changed = conn
         .execute(
             "UPDATE cgka_messages SET state = ?1, record = ?2 WHERE id = ?3",
@@ -216,7 +219,7 @@ fn update_message_state_on_connection(
 mod tests {
     use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
-    use cgka_traits::message::MessageState;
+    use cgka_traits::message::{DeferredPeelLifecycle, MessageState};
     use cgka_traits::storage::{GroupStorage, MessageStorage, StorageError};
     use cgka_traits::types::EpochId;
 
@@ -246,6 +249,32 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::PeelDeferred
         );
+    }
+
+    #[test]
+    fn deferred_peel_lifecycle_round_trips_and_clears_on_retirement() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut message = sample_message(mid(1), gid(1), 0);
+        message.state = MessageState::PeelDeferred;
+        message.deferred_peel = Some(DeferredPeelLifecycle {
+            first_observed_wall_ms: 10_000,
+            wall_high_water_ms: 10_400,
+            clock_instance_id: 7,
+            residence_deadline_monotonic_ms: 2_000,
+            residence_deadline_wall_ms: 11_000,
+            distinct_context_attempts: 3,
+            last_context_fingerprint: Some([0xA5; 32]),
+        });
+        store.put_message(&message).unwrap();
+        assert_eq!(store.get_message(&message.id).unwrap(), message);
+
+        store
+            .update_message_state(&message.id, MessageState::Processed)
+            .unwrap();
+        let updated = store.get_message(&message.id).unwrap();
+        assert_eq!(updated.state, MessageState::Processed);
+        assert_eq!(updated.deferred_peel, None);
     }
 
     #[test]

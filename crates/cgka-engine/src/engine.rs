@@ -306,18 +306,18 @@ pub struct Engine<S: StorageProvider> {
     /// this rebuilds only when the set actually changed. `None` until first use.
     pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
 
-    /// Per-group deferred-peel retry lifecycle state (mdk#339):
-    /// context-fingerprint sweep gate, per-row attempt/first-seen bookkeeping,
-    /// bounded-sweep cursor, and the cached `PeelDeferred` row count backing
-    /// the per-group flood cap. In-memory by design — a restart costs one free
-    /// re-sweep and a count rescan; protocol-terminal decisions remain
-    /// durable, while resource-refused rows are released for redelivery.
+    /// Per-group deferred-peel performance state: context-fingerprint sweep
+    /// gate, bounded-sweep cursor, and cached row count. Correctness-critical
+    /// per-row attempt/residence bookkeeping lives durably on MessageRecord.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
 
     /// Retry budget before a `PeelDeferred` row is resource-refused and
     /// released without terminal deduplication. Field (not a const) so tests
     /// can exhaust it quickly via [`Self::set_deferred_peel_retry_budget`].
     pub(crate) deferred_peel_retry_budget: u32,
+    /// Durable local residence budget for a `PeelDeferred` row. Field (not a
+    /// const) so deterministic tests can advance a short deadline.
+    pub(crate) deferred_peel_residence_ms: u64,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -538,6 +538,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
             deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
+            deferred_peel_residence_ms: crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
         })
     }
 }
@@ -1444,6 +1445,12 @@ impl<S: StorageProvider> Engine<S> {
         let has_convergence_inputs = self
             .has_pending_convergence_inputs(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let has_deferred_peels = self
+            .storage
+            .list_messages(group_id, EpochId(0))
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .into_iter()
+            .any(|record| record.state == MessageState::PeelDeferred);
 
         // Do not expose any recovered pending state until every fallible
         // hydration read and validation above has succeeded. If a later step
@@ -1525,7 +1532,11 @@ impl<S: StorageProvider> Engine<S> {
                 self.convergence_now_ms(),
             )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        if has_queued_intents || has_convergence_inputs || restored_self_remove_work {
+        if has_queued_intents
+            || has_convergence_inputs
+            || has_deferred_peels
+            || restored_self_remove_work
+        {
             self.schedule_pending_convergence_group(group_id);
         }
         Ok(group.epoch)
@@ -2161,6 +2172,13 @@ impl<S: StorageProvider> Engine<S> {
     /// quickly; production uses the default.
     pub fn set_deferred_peel_retry_budget(&mut self, budget: u32) {
         self.deferred_peel_retry_budget = budget.max(1);
+    }
+
+    /// Override the durable deferred-peel residence budget. Production uses
+    /// the conservative default; tests use this to advance expiry without
+    /// sleeping.
+    pub fn set_deferred_peel_residence_ms(&mut self, residence_ms: u64) {
+        self.deferred_peel_residence_ms = residence_ms.max(1);
     }
 
     /// Replace the installed forensic recorder on a live engine. Dropping the

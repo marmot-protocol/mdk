@@ -657,6 +657,7 @@ impl<S: StorageProvider> Engine<S> {
                                 epoch: canonical_epoch,
                                 state: MessageState::Sent,
                                 payload,
+                                deferred_peel: None,
                             })?;
                         }
                         crate::capability_manager::cache_from_key_packages(
@@ -1113,7 +1114,17 @@ impl<S: StorageProvider> Engine<S> {
                     removed: false,
                     unrecoverable: false,
                     disbanded: None,
-                    join_epoch: EpochId(mls_group.epoch().as_u64()),
+                    // A first Welcome proves the lower membership bound. A
+                    // rejoin/repair replaces an older local membership
+                    // interval; without durable interval history, treating
+                    // every earlier epoch as pre-membership would incorrectly
+                    // terminalize messages authored during that interval.
+                    // Epoch zero means "unknown — apply no lower bound".
+                    join_epoch: if local_state_is_stale {
+                        EpochId(0)
+                    } else {
+                        EpochId(mls_group.epoch().as_u64())
+                    },
                 };
                 mirror_app_components_into_record(&mls_group, &mut group_record);
                 storage.put_group(&group_record)?;
@@ -1142,6 +1153,7 @@ impl<S: StorageProvider> Engine<S> {
                     epoch: EpochId(mls_group.epoch().as_u64()),
                     state: MessageState::Processed,
                     payload,
+                    deferred_peel: None,
                 })?;
                 storage.put_ingress_dedup_marker(&welcome_id)?;
                 storage.put_ingress_dedup_marker(&content_id)?;

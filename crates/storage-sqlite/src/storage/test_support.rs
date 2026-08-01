@@ -53,6 +53,7 @@ pub(crate) fn sample_message(id: MessageId, group_id: GroupId, epoch: u64) -> Me
         epoch: EpochId(epoch),
         state: MessageState::Created,
         payload: vec![0xAA, 0xBB, 0xCC],
+        deferred_peel: None,
     }
 }
 

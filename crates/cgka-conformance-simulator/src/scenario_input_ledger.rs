@@ -148,6 +148,14 @@ impl ScenarioInputTracker {
         }
     }
 
+    pub(crate) fn record_resource_refused(&mut self, metadata: &ScenarioInputMetadata) {
+        self.remember_metadata(metadata);
+        let entry = self.entry(metadata);
+        entry.resource_refused += 1;
+        entry.disposition = ScenarioInputDisposition::ResourceRefused;
+        entry.pending = false;
+    }
+
     pub(crate) fn record_ingest(
         &mut self,
         metadata: &ScenarioInputMetadata,

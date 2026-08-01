@@ -356,6 +356,7 @@ impl<S: StorageProvider> Engine<S> {
             payload: StoredMessagePayload::openmls_wire(message)
                 .encode()
                 .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?,
+            deferred_peel: None,
         };
         // The retained row and its pass membership are one durability
         // boundary. A crash may leave an unassigned row only when admission is

@@ -466,6 +466,11 @@ impl<S: StorageProvider> Engine<S> {
                         if !already_retained {
                             self.note_peel_deferred_row_persisted(&group_id);
                         }
+                        // A stable peel context may never change again. Keep
+                        // the group scheduled so the durable residence
+                        // deadline can retire this row without unrelated
+                        // traffic.
+                        self.schedule_pending_convergence_group(&group_id);
                         self.audit_group(
                             &group_id,
                             crate::audit_helpers::message_state_changed_event(

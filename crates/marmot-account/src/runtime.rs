@@ -1619,6 +1619,13 @@ where
         Ok(self.session.prepare_convergence_cutoff_delay_ms(group_id)?)
     }
 
+    pub fn deferred_peel_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<u64>> {
+        Ok(self.session.deferred_peel_cutoff_delay_ms(group_id)?)
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }

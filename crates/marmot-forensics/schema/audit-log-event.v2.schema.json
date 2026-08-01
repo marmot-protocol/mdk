@@ -1583,7 +1583,7 @@
             "retry_count": {
               "$ref": "#/$defs/u64"
             },
-            "sweeps_waited": {
+            "residence_ms": {
               "$ref": "#/$defs/u64"
             }
           }

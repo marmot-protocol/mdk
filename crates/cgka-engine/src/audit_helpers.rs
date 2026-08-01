@@ -505,6 +505,9 @@ pub(crate) fn ingest_outcome_event(
                     InboundResourceLimit::TransportDeferredRetryBudget => {
                         "resource_refused_retry_budget"
                     }
+                    InboundResourceLimit::TransportDeferredResidenceBudget => {
+                        "resource_refused_residence_budget"
+                    }
                 }
                 .to_string(),
             ),
@@ -528,7 +531,7 @@ pub(crate) fn message_state_changed_event(
         epoch: None,
         reason: reason.to_string(),
         retry_count: None,
-        sweeps_waited: None,
+        residence_ms: None,
     }
 }
 
@@ -547,13 +550,13 @@ pub(crate) fn message_state_transition_event(
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
         retry_count: None,
-        sweeps_waited: None,
+        residence_ms: None,
     }
 }
 
 /// Resource-refusal release of a deferred-peel row, carrying the lifecycle's
-/// per-row telemetry: how many re-peel attempts it consumed and how many retry
-/// sweeps it waited before release (mdk#339). `released` deliberately does not
+/// per-row telemetry: how many re-peel attempts it consumed and how long it
+/// resided locally before release (mdk#339). `released` deliberately does not
 /// claim a terminal message state; the row no longer exists and same-id
 /// redelivery remains eligible.
 pub(crate) fn deferred_peel_resource_refused_event(
@@ -561,7 +564,7 @@ pub(crate) fn deferred_peel_resource_refused_event(
     epoch: Option<EpochId>,
     reason: &str,
     retry_count: u64,
-    sweeps_waited: u64,
+    residence_ms: u64,
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
@@ -571,7 +574,7 @@ pub(crate) fn deferred_peel_resource_refused_event(
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
         retry_count: Some(retry_count),
-        sweeps_waited: Some(sweeps_waited),
+        residence_ms: Some(residence_ms),
     }
 }
 

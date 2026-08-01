@@ -70,6 +70,9 @@ pub enum InboundResourceLimit {
     /// A retained transport object exhausted its changed-context retry budget
     /// and was retired without a terminal validity claim.
     TransportDeferredRetryBudget,
+    /// A retained transport object exhausted its durable local residence
+    /// budget and was retired without a terminal validity claim.
+    TransportDeferredResidenceBudget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
