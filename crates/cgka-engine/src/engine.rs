@@ -608,6 +608,17 @@ impl<S: StorageProvider> Engine<S> {
         crate::conformance_snapshot::capture_pending_work_snapshot(self, group_id)
     }
 
+    /// Capture sanitized structural work and scheduling state for a black-box
+    /// conformance runner. This read-only surface cannot influence selection.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_structural_progress_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::conformance_snapshot::ConformanceStructuralProgressSnapshot, EngineError>
+    {
+        crate::conformance_snapshot::capture_structural_progress_snapshot(self, group_id)
+    }
+
     /// Read the durable state of one synthetic scenario input under either its
     /// transport or content-derived id.
     ///

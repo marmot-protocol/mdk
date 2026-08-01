@@ -26,6 +26,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `ScenarioSpec` — a serializable v2 input contract for deterministic scripted scenarios, including explicit outbound
   acknowledgement and queue
   faults and partitions.
+- `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
+  virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
+  exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected
   outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
@@ -140,8 +143,11 @@ auto-confirmation mode, or second subject publication capability. `ProtocolProfi
 removed lifecycle: it selects the engine's legacy application-profile compatibility through
 `legacy_compatibility_profile()`, but it uses the same explicit outbound contract as `ProtocolProfile::Current`.
 ScenarioSpec v1 is intentionally unsupported after the repository-owned v2 cutover and is rejected before any subject
-action runs. The simulator does not yet wait for quiescence: structural progress tokens, a fixed-point driver, timeout
-policy, and retry-timer coverage remain in Milestone 1.3.
+action runs. `await_quiescence` composes the subject's structural-progress, virtual-time, delivery, and outbound
+capabilities. Its progress token is diagnostic only: success requires no runnable work, future wake, deferred/retry
+work, publication acknowledgement, transport backlog, scenario-input work, or terminal engine blocker. A zero-delta
+clock activation prevents the legacy far-future harness tick from bypassing virtual deadlines. Iteration, virtual-time,
+and work budgets produce serializable timeout evidence and never redefine unfinished work as quiescent.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting
@@ -227,6 +233,7 @@ recovery without pinning which invite branch wins.
 - `deliver_all`
 - `tick`
 - `advance_time`
+- `await_quiescence`
 - `observe`
 - `observe_exact`
 - `probe_bidirectional_decryptability`

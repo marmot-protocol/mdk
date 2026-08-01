@@ -20,7 +20,7 @@
 //! broadcast welcomes (then the engine's `NotForThisClient` filter kicks
 //! in client-side).
 
-use crate::pending_work::BusPendingWorkSnapshot;
+use crate::pending_work::{BusPendingWorkSnapshot, BusStructuralProgressSnapshot};
 use crate::scenario_input_ledger::ScenarioInputMetadata;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{MemberId, MessageId};
@@ -359,6 +359,15 @@ impl TransportBus {
                 .filter(|in_flight| targets_client(&inner.policy, identity, client, in_flight))
                 .count(),
             mailbox_messages: inner.mailboxes.get(&client).map_or(0, Vec::len),
+        }
+    }
+
+    pub(crate) fn structural_progress_snapshot(&self) -> BusStructuralProgressSnapshot {
+        let inner = self.inner.lock().unwrap();
+        BusStructuralProgressSnapshot {
+            queued_messages: inner.queue.len(),
+            delayed_messages: inner.delayed.values().map(Vec::len).sum(),
+            mailbox_messages: inner.mailboxes.values().map(Vec::len).sum(),
         }
     }
 

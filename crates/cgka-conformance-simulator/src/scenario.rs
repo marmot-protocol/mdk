@@ -6,11 +6,12 @@
 
 use crate::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, ExpectationFailure,
-    HarnessStorageMode, PendingResolutionObservation, ScenarioErrorObservation,
-    ScenarioOracleReport, ScenarioTrace, SubjectCreateGroup, SubjectDescriptor, SubjectError,
-    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
-    VectorFixture, build_scenario_oracle_report, compare_trace_expectations, required_capability,
+    HarnessStorageMode, PendingResolutionObservation, QuiescenceObservation, QuiescencePolicy,
+    ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace, SubjectCreateGroup,
+    SubjectDescriptor, SubjectError, SubjectInviteMembers, SubjectOutboundArtifact,
+    SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication, SubjectUpdateAdminPolicy,
+    SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
+    compare_trace_expectations, drive_subject_to_quiescence, required_capabilities,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,13 @@ pub enum ScenarioStep {
     AdvanceTime {
         delta_ms: u64,
     },
+    /// Drive the complete subject to a bounded structural fixed point using
+    /// virtual time. A non-quiescent terminal result is retained in the report
+    /// and fails the scenario invariant.
+    AwaitQuiescence {
+        #[serde(default)]
+        policy: QuiescencePolicy,
+    },
     Observe {
         clients: Vec<String>,
     },
@@ -181,6 +189,7 @@ impl ScenarioStep {
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
             ScenarioStep::AdvanceTime { .. } => "advance_time",
+            ScenarioStep::AwaitQuiescence { .. } => "await_quiescence",
             ScenarioStep::Observe { .. } => "observe",
             ScenarioStep::ObserveExact { .. } => "observe_exact",
             ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
@@ -212,6 +221,8 @@ pub struct ScenarioReport {
     pub step_log: Vec<ScenarioStepLogEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_resolution_observations: Vec<PendingResolutionObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quiescence_observations: Vec<QuiescenceObservation>,
     pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
     pub epoch_change_observations: Vec<EpochChangeReportObservation>,
     pub app_invalidation_observations: Vec<AppInvalidationReportObservation>,
@@ -309,6 +320,7 @@ impl std::error::Error for ScenarioRunError {}
 
 pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report(spec, None).await?;
+    ensure_quiescence_steps_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -320,6 +332,7 @@ pub async fn run_scenario_spec_with_subject(
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report_with_subject(spec, None, Vec::new(), subject).await?;
+    ensure_quiescence_steps_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -438,6 +451,7 @@ async fn run_scenario_report_inner(
     let mut decryptability_probes = Vec::new();
     let mut admin_policy_observations = Vec::new();
     let mut error_observations = Vec::new();
+    let mut quiescence_observations = Vec::new();
     let mut step_log = Vec::new();
 
     for (step_index, step) in spec.steps.iter().enumerate() {
@@ -631,6 +645,13 @@ async fn run_scenario_report_inner(
                     .await
                     .map_err(|error| subject_step_error(step_index, error))?;
             }
+            ScenarioStep::AwaitQuiescence { policy } => {
+                quiescence_observations.push(
+                    drive_subject_to_quiescence(subject, &spec.clients, policy, step_index)
+                        .await
+                        .map_err(|error| subject_step_error(step_index, error))?,
+                );
+            }
             ScenarioStep::Observe { clients: labels } => {
                 observations.extend(
                     subject
@@ -753,14 +774,29 @@ async fn run_scenario_report_inner(
             })
         })
         .collect();
-    let expectation_failures =
+    let mut expectation_failures =
         compare_trace_expectations(expected_trace.as_ref(), &expected_outcomes, &observed_trace);
+    for observation in &quiescence_observations {
+        if !observation.status.is_quiescent() {
+            expectation_failures.push(ExpectationFailure {
+                kind: "quiescence_not_reached".into(),
+                message: format!(
+                    "await_quiescence step {} ended as {:?}",
+                    observation.step_index, observation.status
+                ),
+                expected: serde_json::json!({"status": "quiescent"}),
+                actual: serde_json::to_value(observation)
+                    .expect("quiescence observation serializes"),
+            });
+        }
+    }
     let invariant_failures = invariant_failures(&expectation_failures);
     let oracle = build_scenario_oracle_report(
         spec,
         expected_trace.as_ref(),
         &expected_outcomes,
         &observed_trace,
+        &quiescence_observations,
     );
 
     Ok(ScenarioReport {
@@ -780,6 +816,7 @@ async fn run_scenario_report_inner(
         oracle,
         step_log,
         pending_resolution_observations,
+        quiescence_observations,
         recovery_observations,
         epoch_change_observations,
         app_invalidation_observations,
@@ -813,17 +850,18 @@ pub fn validate_scenario_for_subject(
         }
     }
     for (step_index, step) in spec.steps.iter().enumerate() {
-        let capability = required_capability(step);
-        if !descriptor.supports(capability) {
-            return Err(err(
-                step_index,
-                format!(
-                    "subject {} does not support capability {} required by {}",
-                    descriptor.adapter,
-                    capability,
-                    step.kind()
-                ),
-            ));
+        for capability in required_capabilities(step) {
+            if !descriptor.supports(capability) {
+                return Err(err(
+                    step_index,
+                    format!(
+                        "subject {} does not support capability {} required by {}",
+                        descriptor.adapter,
+                        capability,
+                        step.kind()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -893,6 +931,21 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
             message: failure.message.clone(),
         })
         .collect()
+}
+
+fn ensure_quiescence_steps_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRunError> {
+    let Some(observation) = report
+        .quiescence_observations
+        .iter()
+        .find(|observation| !observation.status.is_quiescent())
+    else {
+        return Ok(());
+    };
+    let artifact = serde_json::to_string(observation).unwrap_or_else(|_| "unserializable".into());
+    Err(ScenarioRunError {
+        step_index: Some(observation.step_index),
+        message: format!("quiescence was not reached: {artifact}"),
+    })
 }
 
 #[cfg(test)]
@@ -1035,8 +1088,298 @@ mod tests {
     }
 
     #[test]
+    fn await_quiescence_is_serializable_and_requires_composed_capabilities() {
+        let step = ScenarioStep::AwaitQuiescence {
+            policy: QuiescencePolicy::default(),
+        };
+        let encoded = serde_json::to_value(&step).expect("quiescence step serializes");
+        assert_eq!(encoded["type"], "await_quiescence");
+        assert_eq!(encoded["policy"]["max_iterations"], 256);
+        assert_eq!(
+            serde_json::from_value::<ScenarioStep>(encoded).expect("quiescence step deserializes"),
+            step
+        );
+        assert_eq!(
+            required_capabilities(&step),
+            vec![
+                SubjectCapability::StructuralProgress,
+                SubjectCapability::VirtualTime,
+                SubjectCapability::TransportDelivery,
+                SubjectCapability::OutboundPublication,
+            ]
+        );
+
+        let manual = ScenarioStep::AwaitQuiescence {
+            policy: QuiescencePolicy {
+                outbound: crate::QuiescenceOutboundPolicy::Manual,
+                ..QuiescencePolicy::default()
+            },
+        };
+        assert!(!required_capabilities(&manual).contains(&SubjectCapability::OutboundPublication));
+    }
+
+    #[tokio::test]
+    async fn await_quiescence_drives_a_real_subject_and_records_the_terminal_artifact() {
+        let spec = ScenarioSpec {
+            name: "await-quiescence-smoke/v1".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "quiescence".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".into(),
+                },
+                ScenarioStep::AwaitQuiescence {
+                    policy: QuiescencePolicy::default(),
+                },
+                ScenarioStep::ObserveExact {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+            ],
+        };
+
+        let report = run_scenario_report(&spec, None)
+            .await
+            .expect("real subject scenario runs");
+        assert_eq!(report.quiescence_observations.len(), 1);
+        assert_eq!(
+            report.quiescence_observations[0].status,
+            crate::QuiescenceStatus::Quiescent
+        );
+        assert!(
+            report.quiescence_observations[0]
+                .final_progress
+                .is_quiescent()
+        );
+        assert!(report.expectation_failures.is_empty());
+        assert!(
+            report
+                .oracle
+                .observed_behaviors
+                .contains(&crate::OracleBehavior::QuiescenceState)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_quiescence_is_a_report_artifact_and_a_spec_run_error() {
+        let spec = ScenarioSpec {
+            name: "await-quiescence-blocked/v1".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "quiescence".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".into(),
+                },
+                ScenarioStep::AwaitQuiescence {
+                    policy: QuiescencePolicy::default(),
+                },
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "withheld".into(),
+                },
+                ScenarioStep::AcknowledgeOutbound {
+                    client: "alice".into(),
+                    publication: None,
+                    selection: ScenarioOutboundSelection::All,
+                    outcome: SubjectOutboundOutcome::Accepted,
+                },
+                ScenarioStep::DelayQueued {
+                    index: 0,
+                    delayed: "withheld".into(),
+                },
+                ScenarioStep::AwaitQuiescence {
+                    policy: QuiescencePolicy::default(),
+                },
+            ],
+        };
+
+        let report = run_scenario_report(&spec, None)
+            .await
+            .expect("blocked quiescence still produces a report");
+        assert!(matches!(
+            report.quiescence_observations[1].status,
+            crate::QuiescenceStatus::Blocked { .. }
+        ));
+        assert_eq!(
+            report.expectation_failures[0].kind,
+            "quiescence_not_reached"
+        );
+
+        let error = run_scenario_spec(&spec)
+            .await
+            .expect_err("a blocked await step cannot silently succeed");
+        assert_eq!(error.step_index, Some(5));
+        assert!(error.message.contains("transport_delayed"));
+        assert!(error.message.contains("\"status\":\"blocked\""));
+    }
+
+    #[tokio::test]
+    async fn fixed_point_is_invariant_to_same_horizon_batch_partitioning() {
+        fn scenario(split_delivery: bool) -> ScenarioSpec {
+            let clients = vec!["alice".into(), "bob".into(), "carol".into()];
+            let mut steps = vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "batch-partition".into(),
+                    invitees: vec!["bob".into(), "carol".into()],
+                    required_features: Vec::new(),
+                    initial_admins: Some(vec!["bob".into()]),
+                    pending: "create".into(),
+                },
+                ScenarioStep::AwaitQuiescence {
+                    policy: QuiescencePolicy::default(),
+                },
+                ScenarioStep::UpdateGroupData {
+                    client: "alice".into(),
+                    name: "alice branch".into(),
+                    pending: "alice-update".into(),
+                },
+                ScenarioStep::UpdateGroupData {
+                    client: "bob".into(),
+                    name: "bob branch".into(),
+                    pending: "bob-update".into(),
+                },
+                ScenarioStep::accept_publication("alice", "alice-update"),
+                ScenarioStep::accept_publication("bob", "bob-update"),
+            ];
+            if split_delivery {
+                steps.extend([
+                    ScenarioStep::DelayQueued {
+                        index: 1,
+                        delayed: "second-branch".into(),
+                    },
+                    ScenarioStep::DeliverAll,
+                    ScenarioStep::Tick {
+                        clients: clients.clone(),
+                    },
+                    ScenarioStep::AdvanceTime { delta_ms: 1_000 },
+                    ScenarioStep::Tick {
+                        clients: clients.clone(),
+                    },
+                    ScenarioStep::ReleaseDelayed {
+                        delayed: "second-branch".into(),
+                    },
+                ]);
+            }
+            steps.extend([
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: clients.clone(),
+                },
+                ScenarioStep::AwaitQuiescence {
+                    policy: QuiescencePolicy::default(),
+                },
+                ScenarioStep::ObserveExact {
+                    clients: clients.clone(),
+                },
+            ]);
+            ScenarioSpec {
+                name: if split_delivery {
+                    "same-horizon-split/v1".into()
+                } else {
+                    "same-horizon-batch/v1".into()
+                },
+                spec_version: "2".into(),
+                clients,
+                steps,
+            }
+        }
+
+        let batch = run_scenario_report(&scenario(false), None)
+            .await
+            .expect("batch scenario runs");
+        let split = run_scenario_report(&scenario(true), None)
+            .await
+            .expect("split scenario runs");
+        assert!(batch.expectation_failures.is_empty(), "{batch:#?}");
+        assert!(split.expectation_failures.is_empty(), "{split:#?}");
+
+        let states = |report: &ScenarioReport| {
+            report
+                .observed_trace
+                .as_ref()
+                .expect("trace exists")
+                .observations
+                .iter()
+                .map(|observation| {
+                    observation
+                        .canonical_state
+                        .clone()
+                        .expect("exact state exists")
+                })
+                .collect::<Vec<_>>()
+        };
+        let batch_states = states(&batch);
+        let split_states = states(&split);
+        let retention_assumption_violations = |report: &ScenarioReport| {
+            report
+                .observed_trace
+                .as_ref()
+                .expect("trace exists")
+                .observations
+                .iter()
+                .flat_map(|observation| {
+                    observation
+                        .scenario_input_ledger
+                        .iter()
+                        .filter(|entry| {
+                            entry.expired > 0
+                                || entry.resource_refused > 0
+                                || entry.rejected > 0
+                                || entry.ingest_errors > 0
+                        })
+                        .map(|entry| {
+                            format!(
+                                "{}:{}:{:?}",
+                                observation.client, entry.scenario_id, entry.disposition
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            retention_assumption_violations(&batch).is_empty(),
+            "batch retention/anchor assumption violations: {:?}",
+            retention_assumption_violations(&batch)
+        );
+        assert!(
+            retention_assumption_violations(&split).is_empty(),
+            "split retention/anchor assumption violations: {:?}",
+            retention_assumption_violations(&split)
+        );
+        assert!(batch_states.iter().all(|state| state == &batch_states[0]));
+        assert!(split_states.iter().all(|state| state == &split_states[0]));
+        let semantic_result = |state: &crate::ConformanceCanonicalStateSnapshot| match state {
+            crate::ConformanceCanonicalStateSnapshot::Live(snapshot) => (
+                snapshot.epoch,
+                snapshot.group_name.clone(),
+                snapshot.sorted_member_identities_hex.clone(),
+                snapshot.admin_identities_hex.clone(),
+                snapshot.protocol_lifecycle,
+                snapshot.protocol_profile,
+            ),
+            crate::ConformanceCanonicalStateSnapshot::Disbanded(_) => {
+                panic!("metamorphic branch race unexpectedly disbanded")
+            }
+        };
+        assert_eq!(
+            semantic_result(&batch_states[0]),
+            semantic_result(&split_states[0])
+        );
+    }
+
+    #[test]
     fn queue_fault_steps_require_explicit_white_box_capability() {
-        let capability = required_capability(&ScenarioStep::DropQueued { index: 0 });
+        let capability = crate::required_capability(&ScenarioStep::DropQueued { index: 0 });
 
         assert_eq!(capability, SubjectCapability::WhiteBoxTransportQueueFaults);
         assert!(capability.is_white_box());

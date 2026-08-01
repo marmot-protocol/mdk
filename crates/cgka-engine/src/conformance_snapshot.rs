@@ -6,6 +6,7 @@
 //! surfaces must not enable or consume this interface.
 
 use cgka_traits::app_components::GroupLifecycleV1;
+use cgka_traits::convergence_pass::ConvergencePassPhase;
 use cgka_traits::engine_state::{EpochState, GroupLifecycleState};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
@@ -153,6 +154,28 @@ impl ConformancePendingWorkSnapshot {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+/// Sanitized scheduling state used by black-box convergence simulators.
+///
+/// This is a read-only conformance surface. It exposes only aggregate work,
+/// lifecycle phase, durable generation/epoch counters, and virtual-clock
+/// deadlines. Message, member, account, and group identifiers are excluded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConformanceStructuralProgressSnapshot {
+    pub current_epoch: u64,
+    pub current_monotonic_ms: u64,
+    pub lifecycle: GroupLifecycleState,
+    pub pending_work: ConformancePendingWorkSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_phase: Option<ConvergencePassPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_next_wake_monotonic_ms: Option<u64>,
+    pub runnable_work: usize,
+    #[serde(default)]
+    pub terminal_unrecoverable: bool,
 }
 
 pub(crate) fn capture_group_snapshot<S: StorageProvider>(
@@ -462,6 +485,122 @@ pub(crate) fn capture_pending_work_snapshot<S: StorageProvider>(
             .values()
             .filter(|(queued_group_id, _)| queued_group_id == group_id)
             .count(),
+    })
+}
+
+pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
+    engine: &crate::Engine<S>,
+    group_id: &GroupId,
+) -> Result<ConformanceStructuralProgressSnapshot, EngineError> {
+    engine.ensure_group_live(group_id)?;
+    let pending_work = capture_pending_work_snapshot(engine, group_id)?;
+    let epoch_state = engine
+        .epoch_manager
+        .state(group_id)
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+    let lifecycle = GroupLifecycleState::from(epoch_state);
+    let current_epoch = engine.epoch_manager.epoch(group_id).unwrap_or_default().0;
+    let now = engine.convergence_now();
+    let pass = engine.storage.convergence_pass(group_id)?;
+
+    let mut runnable_work = 0usize;
+    let mut next_wake = None;
+    if let Some(active) = pass.as_ref().filter(|pass| pass.is_active()) {
+        match active.phase {
+            ConvergencePassPhase::Collecting => {
+                let cutoff = if active.clock_instance_id == engine.convergence_clock_instance_id {
+                    active.cutoff_monotonic_ms()
+                } else {
+                    let backwards = now.wall_ms < active.opened_wall_ms;
+                    let remaining = if backwards {
+                        0
+                    } else {
+                        active.cutoff_wall_ms().saturating_sub(now.wall_ms)
+                    };
+                    now.monotonic_ms.saturating_add(remaining)
+                };
+                if cutoff <= now.monotonic_ms {
+                    runnable_work = runnable_work.saturating_add(1);
+                } else {
+                    next_wake = Some(cutoff);
+                }
+            }
+            ConvergencePassPhase::Frozen | ConvergencePassPhase::Resolving => {
+                runnable_work = runnable_work.saturating_add(1);
+            }
+            ConvergencePassPhase::Completed => {}
+        }
+    }
+
+    let messages = engine.storage.list_messages(group_id, EpochId(0))?;
+    for record in messages
+        .iter()
+        .filter(|record| record.state == MessageState::PeelDeferred)
+    {
+        let Some(deferred) = record.deferred_peel.as_ref() else {
+            runnable_work = runnable_work.saturating_add(1);
+            continue;
+        };
+        let deadline = if deferred.clock_instance_id == engine.convergence_clock_instance_id {
+            deferred.residence_deadline_monotonic_ms
+        } else {
+            let observed_wall = deferred.wall_high_water_ms.max(now.wall_ms);
+            let remaining = deferred
+                .residence_deadline_wall_ms
+                .saturating_sub(observed_wall);
+            now.monotonic_ms.saturating_add(remaining)
+        };
+        if deadline <= now.monotonic_ms {
+            runnable_work = runnable_work.saturating_add(1);
+        } else {
+            next_wake = Some(next_wake.map_or(deadline, |current: u64| current.min(deadline)));
+        }
+    }
+
+    for scheduled in engine
+        .scheduled_self_remove_auto_commits
+        .values()
+        .filter(|scheduled| scheduled.group_id == *group_id)
+    {
+        if scheduled.due_at_ms <= now.monotonic_ms {
+            runnable_work = runnable_work.saturating_add(1);
+        } else {
+            next_wake = Some(next_wake.map_or(scheduled.due_at_ms, |current: u64| {
+                current.min(scheduled.due_at_ms)
+            }));
+        }
+    }
+
+    let future_scheduled_work = pass
+        .as_ref()
+        .is_some_and(|pass| pass.phase == ConvergencePassPhase::Collecting)
+        || engine
+            .scheduled_self_remove_auto_commits
+            .values()
+            .any(|scheduled| scheduled.group_id == *group_id);
+    if engine.pending_convergence_groups.contains(group_id) && !future_scheduled_work {
+        runnable_work = runnable_work.saturating_add(1);
+    }
+    if pass.is_none() && pending_work.unresolved_convergence_inputs > 0 {
+        runnable_work = runnable_work.saturating_add(1);
+    }
+    runnable_work = runnable_work
+        .saturating_add(pending_work.recovering_buffered_messages)
+        .saturating_add(pending_work.pending_engine_events)
+        .saturating_add(pending_work.pending_auto_publish)
+        .saturating_add(pending_work.pending_auto_proposals)
+        .saturating_add(pending_work.valid_proposal_schedule_signals);
+
+    Ok(ConformanceStructuralProgressSnapshot {
+        current_epoch,
+        current_monotonic_ms: now.monotonic_ms,
+        lifecycle,
+        pending_work,
+        pass_generation: pass.as_ref().map(|pass| pass.generation),
+        pass_phase: pass.as_ref().map(|pass| pass.phase),
+        earliest_next_wake_monotonic_ms: next_wake,
+        runnable_work,
+        terminal_unrecoverable: lifecycle == GroupLifecycleState::Unrecoverable,
     })
 }
 
