@@ -23,7 +23,12 @@
         "required_features": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -65,8 +70,18 @@
         ],
         "pending": "l"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "w", "outcome": "accepted" },
-      { "type": "acknowledge_outbound", "client": "bob", "publication": "l", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "w",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "l",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },

@@ -21,7 +21,12 @@
         "required_features": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -88,7 +93,11 @@
           "alice"
         ]
       },
-      { "type": "acknowledge_outbound", "client": "alice", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },

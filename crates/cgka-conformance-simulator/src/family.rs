@@ -1330,6 +1330,18 @@ fn add_strict_reliability_oracle(
         return;
     }
 
+    assert!(
+        scenario.steps.iter().any(|step| matches!(
+            step,
+            ScenarioStep::AcknowledgeOutbound {
+                publication: Some(_),
+                ..
+            }
+        )),
+        "generated reliability scenario {} must exercise at least one labelled outbound acknowledgement",
+        scenario.name
+    );
+
     scenario.steps.push(ScenarioStep::DeliverAll);
     scenario.steps.push(ScenarioStep::Tick {
         clients: scenario.clients.clone(),
@@ -1353,4 +1365,30 @@ fn add_strict_reliability_oracle(
     expected.push(TraceExpectation::NoPendingWork {
         clients: exact_clients,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "must exercise at least one labelled outbound acknowledgement")]
+    fn strict_oracle_rejects_family_without_outbound_lifecycle_coverage() {
+        let mut scenario = ScenarioSpec {
+            name: "missing-outbound-coverage".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            steps: vec![],
+        };
+        let mut expected = vec![TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 0,
+            member_count: 1,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        }];
+
+        add_strict_reliability_oracle(&mut scenario, &mut expected);
+    }
 }

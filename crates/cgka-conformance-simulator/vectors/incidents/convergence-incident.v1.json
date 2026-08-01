@@ -28,7 +28,12 @@
         ],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -63,8 +68,18 @@
         ],
         "pending": "invite-b"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "invite-a", "outcome": "accepted" },
-      { "type": "acknowledge_outbound", "client": "bob", "publication": "invite-b", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "invite-a",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "invite-b",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },

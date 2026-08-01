@@ -21,7 +21,12 @@
         "required_features": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "reached_no_endpoint" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "reached_no_endpoint"
+      },
       {
         "type": "observe",
         "clients": [

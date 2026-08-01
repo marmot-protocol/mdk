@@ -629,15 +629,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
         if let Some(pending_ref) = pending_ref {
             self.insert_pending(action.pending, action.creator, pending_ref)?;
             self.sync_client_outbound(action.creator)?;
-            let has_outbound_artifacts = self.outbound_records.values().any(|record| {
-                record.artifact.client == action.creator && record.pending == Some(pending_ref)
-            });
-            if !has_outbound_artifacts {
-                self.client_mut(action.creator)?
-                    .try_confirm(pending_ref)
-                    .await
-                    .map_err(subject_engine_error)?;
-                self.client_mut(action.creator)?.capture_engine_events();
+            if self
+                .client_mut(action.creator)?
+                .confirm_empty_publication(pending_ref)
+                .await
+                .map_err(subject_engine_error)?
+            {
                 self.pending_refs.remove(action.pending);
             }
         }

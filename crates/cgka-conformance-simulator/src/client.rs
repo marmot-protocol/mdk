@@ -791,6 +791,25 @@ impl HarnessClient {
         Ok(())
     }
 
+    /// Confirm a pending transition only when it produced no transport
+    /// artifacts. Both direct subject actions and engine-generated creation
+    /// results use this helper so the no-op publication rule has one predicate.
+    pub(crate) async fn confirm_empty_publication(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<bool, EngineError> {
+        let artifact_ids = self
+            .pending_publication_artifacts
+            .get(&pending)
+            .ok_or_else(|| EngineError::Other("missing pending publication bookkeeping".into()))?;
+        if !artifact_ids.is_empty() {
+            return Ok(false);
+        }
+        self.try_confirm(pending).await?;
+        self.capture_engine_events();
+        Ok(true)
+    }
+
     /// Report a publish failure for a pending operation. The engine
     /// discards the staged commit and rewinds to `Stable` at the prior
     /// epoch. Used by the rollback proptest property.
@@ -1376,7 +1395,6 @@ impl HarnessClient {
                 self.bus.send(self.bus_id, routed);
             }
             SendResult::GroupCreated { welcomes, pending } => {
-                let has_outbound_artifacts = !welcomes.is_empty();
                 self.remember_pending_publication(
                     pending,
                     welcomes.iter().map(|welcome| welcome.id.clone()),
@@ -1388,10 +1406,7 @@ impl HarnessClient {
                 for welcome in welcomes {
                     self.bus.send(self.bus_id, welcome);
                 }
-                if !has_outbound_artifacts {
-                    self.try_confirm(pending).await?;
-                    self.capture_engine_events();
-                }
+                self.confirm_empty_publication(pending).await?;
             }
             SendResult::FoundingGroupCreated { welcomes } => {
                 for welcome in welcomes {

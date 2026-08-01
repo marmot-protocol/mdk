@@ -9,15 +9,30 @@
     "clients": ["alice", "bob", "carol", "david", "eve"],
     "steps": [
       { "type": "create_group", "creator": "alice", "name": "convergence", "invitees": ["bob", "carol"], "required_features": [], "initial_admins": ["bob"], "pending": "create" },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       { "type": "deliver_all" },
       { "type": "tick", "clients": ["bob", "carol"] },
       { "type": "clear_events", "clients": ["alice", "bob", "carol"] },
 
       { "type": "invite_members", "inviter": "alice", "invitees": ["david"], "pending": "invite-a" },
       { "type": "invite_members", "inviter": "bob", "invitees": ["eve"], "pending": "invite-b" },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "invite-a", "outcome": "accepted" },
-      { "type": "acknowledge_outbound", "client": "bob", "publication": "invite-b", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "invite-a",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "invite-b",
+        "outcome": "accepted"
+      },
 
       { "type": "delay_queued", "index": 3, "delayed": "held-b" },
       { "type": "deliver_all" },

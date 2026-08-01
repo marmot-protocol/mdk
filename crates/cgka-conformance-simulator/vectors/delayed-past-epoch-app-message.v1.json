@@ -24,7 +24,12 @@
         "required_features": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -62,7 +67,12 @@
         ],
         "pending": "invite-david"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "invite-david", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "invite-david",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },

@@ -22,7 +22,12 @@
         "initial_admins": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -63,7 +68,12 @@
         ],
         "pending": "promote-bob"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "promote-bob", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "promote-bob",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -86,7 +96,12 @@
         "name": "bob-renamed",
         "pending": "bob-rename"
       },
-      { "type": "acknowledge_outbound", "client": "bob", "publication": "bob-rename", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "bob-rename",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
@@ -104,7 +119,12 @@
         ],
         "pending": "self-demote-bob"
       },
-      { "type": "acknowledge_outbound", "client": "bob", "publication": "self-demote-bob", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "self-demote-bob",
+        "outcome": "accepted"
+      },
       {
         "type": "deliver_all"
       },
