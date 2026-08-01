@@ -136,8 +136,12 @@ no-op publication rather than inventing a synthetic artifact. ScenarioSpec v2 dr
 `acknowledge_outbound`: the runner polls opaque artifacts, optionally selects a stable scenario publication label and
 artifact role, and applies the declared transport outcome. Engine-generated work has no publication label and can be
 acknowledged as the client's current unresolved outbound set. There is no compatibility constructor, silent
-auto-confirmation mode, or second subject publication capability. The simulator does not yet wait for quiescence:
-structural progress tokens, a fixed-point driver, timeout policy, and retry-timer coverage remain in Milestone 1.3.
+auto-confirmation mode, or second subject publication capability. `ProtocolProfile::Legacy` is separate from that
+removed lifecycle: it selects the engine's legacy application-profile compatibility through
+`legacy_compatibility_profile()`, but it uses the same explicit outbound contract as `ProtocolProfile::Current`.
+ScenarioSpec v1 is intentionally unsupported after the repository-owned v2 cutover and is rejected before any subject
+action runs. The simulator does not yet wait for quiescence: structural progress tokens, a fixed-point driver, timeout
+policy, and retry-timer coverage remain in Milestone 1.3.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting
@@ -241,7 +245,10 @@ selects artifacts emitted by that operation; omitting it selects all currently u
 The optional `selection` further restricts the set to `all`, `state_confirmation`, `welcome`, `group_message`, or
 `regenerated_queued_intent`. `outcome` is either `accepted` or `reached_no_endpoint`. A labelled acknowledgement fails
 when no unresolved artifact matches, while an unlabelled acknowledgement is an idempotent drain and may match nothing.
-Client labels are stable logical names;
+`group_message` includes both application messages and proposals because both use the group-message transport envelope.
+Proposal artifacts are engine-generated and have no scenario publication label, so scenarios select them with an
+unlabelled `group_message` acknowledgement unless a future proposal action introduces labels. Client labels are stable
+logical names;
 the Rust harness maps them to deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the same
 identity shape as production. `reached_no_endpoint` represents a definite publication failure: it retracts all matching
 undelivered commit/Welcome artifacts before local rollback and fails the scenario if any matching artifact has already
