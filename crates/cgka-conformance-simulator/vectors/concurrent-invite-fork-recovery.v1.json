@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "concurrent-invite-fork-recovery/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,9 +24,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -70,14 +71,16 @@
         "pending": "bob-invite"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "alice-invite"
+        "publication": "alice-invite",
+        "outcome": "accepted"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "bob",
-        "pending": "bob-invite"
+        "publication": "bob-invite",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"

@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "restart-delivery-faults/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -24,9 +24,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"

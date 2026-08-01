@@ -283,11 +283,13 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => {
                 stimuli.insert(ScenarioStimulus::AdminPolicyUpdate);
             }
-            ScenarioStep::ConfirmPending { .. } => {
-                stimuli.insert(ScenarioStimulus::PublishConfirm);
-            }
-            ScenarioStep::FailPending { .. } => {
-                stimuli.insert(ScenarioStimulus::PublishFail);
+            ScenarioStep::AcknowledgeOutbound { outcome, .. } => {
+                stimuli.insert(match outcome {
+                    crate::SubjectOutboundOutcome::Accepted => ScenarioStimulus::PublishConfirm,
+                    crate::SubjectOutboundOutcome::ReachedNoEndpoint => {
+                        ScenarioStimulus::PublishFail
+                    }
+                });
             }
             ScenarioStep::SendAppMessage { .. } => {
                 stimuli.insert(ScenarioStimulus::AppMessage);

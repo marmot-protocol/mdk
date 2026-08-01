@@ -4,9 +4,9 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioReport, ScenarioRunError, ScenarioSpec,
-    ScenarioStep, ScenarioTrace, TraceExpectation, VectorFixture,
-    run_scenario_report_with_outcomes_and_storage_mode,
+    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport,
+    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioTrace, SubjectOutboundOutcome,
+    TraceExpectation, VectorFixture, run_scenario_report_with_outcomes_and_storage_mode,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -244,7 +244,7 @@ fn convergence_chaos_case(
 fn convergence_chaos_invite_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob", "david", "eve"]),
         steps: vec![
             create_group(
@@ -284,7 +284,7 @@ fn convergence_chaos_invite_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExp
 fn convergence_chaos_group_data_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob"]),
         steps: vec![
             create_group(
@@ -361,10 +361,7 @@ fn convergence_chaos_rollback_queue_faults(
             name: format!("rolled back {case_index}"),
             pending: "update".into(),
         },
-        ScenarioStep::FailPending {
-            client: "alice".into(),
-            pending: "update".into(),
-        },
+        acknowledged_step("alice", "update", SubjectOutboundOutcome::ReachedNoEndpoint),
     ];
     for payload in &payloads {
         steps.push(ScenarioStep::SendAppMessage {
@@ -393,7 +390,7 @@ fn convergence_chaos_rollback_queue_faults(
 
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob"]),
         steps,
     };
@@ -412,7 +409,7 @@ fn convergence_chaos_stable_queue_faults(case_index: u64) -> (ScenarioSpec, Vec<
     let carol_payload = format!("carol-second-{case_index}");
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob", "carol"]),
         steps: vec![
             create_group(
@@ -460,7 +457,7 @@ fn convergence_chaos_partition_leave(case_index: u64) -> (ScenarioSpec, Vec<Trac
     let visible_payload = format!("bob-visible-{case_index}");
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob"]),
         steps: vec![
             create_group(
@@ -494,6 +491,7 @@ fn convergence_chaos_partition_leave(case_index: u64) -> (ScenarioSpec, Vec<Trac
             },
             ScenarioStep::DeliverAll,
             tick(["alice"]),
+            accept_all_outbound("alice"),
             ScenarioStep::DeliverAll,
             tick(["bob"]),
             observe(["alice"]),
@@ -519,7 +517,7 @@ fn convergence_chaos_delayed_past_epoch_app(
     let payload = format!("epoch-one-delayed-{case_index}");
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob", "carol", "david"]),
         steps: vec![
             create_group(
@@ -608,7 +606,7 @@ fn convergence_chaos_large_message_storm(
 
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients,
         steps,
     };
@@ -661,7 +659,7 @@ fn convergence_chaos_large_partitioned_storm(
 
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients,
         steps,
     };
@@ -693,10 +691,7 @@ fn convergence_chaos_large_commit_storm(
         });
     }
     for committer in &committers {
-        steps.push(ScenarioStep::ConfirmPending {
-            client: committer.clone(),
-            pending: format!("{committer}-update"),
-        });
+        steps.push(confirmed_step(committer, &format!("{committer}-update")));
     }
     // Vary which queued commit is duplicated and how the queue is reordered
     // from the seed. Convergence and per-committer confirmation are invariant
@@ -714,7 +709,7 @@ fn convergence_chaos_large_commit_storm(
 
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients,
         steps,
     };
@@ -770,10 +765,10 @@ fn convergence_chaos_large_mixed_message_commit_storm(
         });
     }
     for committer in &committers {
-        steps.push(ScenarioStep::ConfirmPending {
-            client: committer.clone(),
-            pending: format!("{committer}-mixed-update"),
-        });
+        steps.push(confirmed_step(
+            committer,
+            &format!("{committer}-mixed-update"),
+        ));
     }
     // Vary the commit-storm duplicate target and reorder from the seed.
     // Convergence and per-committer confirmation are schedule-invariant.
@@ -789,7 +784,7 @@ fn convergence_chaos_large_mixed_message_commit_storm(
 
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients,
         steps,
     };
@@ -813,7 +808,7 @@ fn convergence_chaos_restart_delivery_faults(
     let payload = format!("bob:restart-delivery:{case_index}");
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients: labels(["alice", "bob", "carol"]),
         steps: vec![
             create_group(
@@ -922,9 +917,28 @@ fn invite<const N: usize>(inviter: &str, invitees: [&str; N], pending: &str) -> 
 }
 
 fn confirmed_step(client: &str, pending: &str) -> ScenarioStep {
-    ScenarioStep::ConfirmPending {
+    acknowledged_step(client, pending, SubjectOutboundOutcome::Accepted)
+}
+
+fn acknowledged_step(
+    client: &str,
+    publication: &str,
+    outcome: SubjectOutboundOutcome,
+) -> ScenarioStep {
+    ScenarioStep::AcknowledgeOutbound {
         client: client.into(),
-        pending: pending.into(),
+        publication: Some(publication.into()),
+        selection: ScenarioOutboundSelection::All,
+        outcome,
+    }
+}
+
+fn accept_all_outbound(client: &str) -> ScenarioStep {
+    ScenarioStep::AcknowledgeOutbound {
+        client: client.into(),
+        publication: None,
+        selection: ScenarioOutboundSelection::All,
+        outcome: SubjectOutboundOutcome::Accepted,
     }
 }
 
@@ -1108,7 +1122,7 @@ fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioS
 
     ScenarioSpec {
         name: format!("convergence-e2e-delivery/v1/case-{case_index}"),
-        spec_version: "1".into(),
+        spec_version: "2".into(),
         clients,
         steps,
     }
@@ -1124,10 +1138,7 @@ fn convergence_e2e_prefix_steps(case_index: u64) -> Vec<ScenarioStep> {
             initial_admins: None,
             pending: "create".into(),
         },
-        ScenarioStep::ConfirmPending {
-            client: "alice".into(),
-            pending: "create".into(),
-        },
+        confirmed_step("alice", "create"),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec!["bob".into(), "carol".into(), "frank".into()],
@@ -1140,28 +1151,19 @@ fn convergence_e2e_prefix_steps(case_index: u64) -> Vec<ScenarioStep> {
             invitees: vec!["david".into()],
             pending: "alice-invite-david".into(),
         },
-        ScenarioStep::ConfirmPending {
-            client: "alice".into(),
-            pending: "alice-invite-david".into(),
-        },
+        confirmed_step("alice", "alice-invite-david"),
         ScenarioStep::InviteMembers {
             inviter: "alice".into(),
             invitees: vec!["grace".into()],
             pending: "alice-invite-grace".into(),
         },
-        ScenarioStep::ConfirmPending {
-            client: "alice".into(),
-            pending: "alice-invite-grace".into(),
-        },
+        confirmed_step("alice", "alice-invite-grace"),
         ScenarioStep::InviteMembers {
             inviter: "bob".into(),
             invitees: vec!["eve".into()],
             pending: "bob-invite-eve".into(),
         },
-        ScenarioStep::ConfirmPending {
-            client: "bob".into(),
-            pending: "bob-invite-eve".into(),
-        },
+        confirmed_step("bob", "bob-invite-eve"),
         ScenarioStep::SendAppMessage {
             sender: "alice".into(),
             payload: "alice canonical payload".into(),
@@ -1215,10 +1217,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
             initial_admins: None,
             pending: "create".into(),
         },
-        ScenarioStep::ConfirmPending {
-            client: "alice".into(),
-            pending: "create".into(),
-        },
+        confirmed_step("alice", "create"),
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: vec!["bob".into(), "carol".into()],
@@ -1263,6 +1262,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
         steps.push(ScenarioStep::Tick {
             clients: vec!["alice".into()],
         });
+        steps.push(accept_all_outbound("alice"));
         steps.push(ScenarioStep::DeliverAll);
         steps.push(ScenarioStep::Tick {
             clients: clients.clone(),
@@ -1299,7 +1299,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
     (
         ScenarioSpec {
             name: format!("send-leave/v1/case-{case_index}"),
-            spec_version: "1".into(),
+            spec_version: "2".into(),
             clients,
             steps,
         },
@@ -1330,10 +1330,25 @@ fn add_strict_reliability_oracle(
         return;
     }
 
+    assert!(
+        scenario.steps.iter().any(|step| matches!(
+            step,
+            ScenarioStep::AcknowledgeOutbound {
+                publication: Some(_),
+                ..
+            }
+        )),
+        "generated reliability scenario {} must exercise at least one labelled outbound acknowledgement",
+        scenario.name
+    );
+
     scenario.steps.push(ScenarioStep::DeliverAll);
     scenario.steps.push(ScenarioStep::Tick {
         clients: scenario.clients.clone(),
     });
+    for client in &scenario.clients {
+        scenario.steps.push(accept_all_outbound(client));
+    }
     scenario.steps.push(ScenarioStep::DeliverAll);
     scenario.steps.push(ScenarioStep::Tick {
         clients: scenario.clients.clone(),
@@ -1350,4 +1365,30 @@ fn add_strict_reliability_oracle(
     expected.push(TraceExpectation::NoPendingWork {
         clients: exact_clients,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "must exercise at least one labelled outbound acknowledgement")]
+    fn strict_oracle_rejects_family_without_outbound_lifecycle_coverage() {
+        let mut scenario = ScenarioSpec {
+            name: "missing-outbound-coverage".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            steps: vec![],
+        };
+        let mut expected = vec![TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 0,
+            member_count: 1,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        }];
+
+        add_strict_reliability_oracle(&mut scenario, &mut expected);
+    }
 }

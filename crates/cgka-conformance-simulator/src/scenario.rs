@@ -1,6 +1,6 @@
 //! Serializable scripted scenarios for the harness.
 //!
-//! `ScenarioSpec` is the v1 input-side companion to `ScenarioTrace`: external
+//! `ScenarioSpec` is the v2 input-side companion to `ScenarioTrace`: external
 //! implementations can drive the same logical client operations, then compare
 //! their observed trace to exact or semantic fixture expectations.
 
@@ -8,9 +8,9 @@ use crate::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, ExpectationFailure,
     HarnessStorageMode, PendingResolutionObservation, ScenarioErrorObservation,
     ScenarioOracleReport, ScenarioTrace, SubjectCreateGroup, SubjectDescriptor, SubjectError,
-    SubjectInviteMembers, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
-    TraceExpectation, VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
-    required_capability,
+    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
+    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
+    VectorFixture, build_scenario_oracle_report, compare_trace_expectations, required_capability,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,29 @@ pub struct ScenarioSpec {
     pub spec_version: String,
     pub clients: Vec<String>,
     pub steps: Vec<ScenarioStep>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioOutboundSelection {
+    #[default]
+    All,
+    StateConfirmation,
+    Welcome,
+    GroupMessage,
+    RegeneratedQueuedIntent,
+}
+
+impl ScenarioOutboundSelection {
+    fn matches(self, artifact: &SubjectOutboundArtifact) -> bool {
+        match self {
+            Self::All => true,
+            Self::StateConfirmation => artifact.state_confirmation_required,
+            Self::Welcome => artifact.kind == SubjectOutboundKind::Welcome,
+            Self::GroupMessage => artifact.kind == SubjectOutboundKind::GroupMessage,
+            Self::RegeneratedQueuedIntent => artifact.regenerated_queued_intent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,13 +81,13 @@ pub enum ScenarioStep {
         admins: Vec<String>,
         error: String,
     },
-    ConfirmPending {
+    AcknowledgeOutbound {
         client: String,
-        pending: String,
-    },
-    FailPending {
-        client: String,
-        pending: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        publication: Option<String>,
+        #[serde(default)]
+        selection: ScenarioOutboundSelection,
+        outcome: SubjectOutboundOutcome,
     },
     SendAppMessage {
         sender: String,
@@ -127,6 +150,24 @@ pub enum ScenarioStep {
 }
 
 impl ScenarioStep {
+    pub fn accept_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
+        Self::AcknowledgeOutbound {
+            client: client.into(),
+            publication: Some(publication.into()),
+            selection: ScenarioOutboundSelection::All,
+            outcome: SubjectOutboundOutcome::Accepted,
+        }
+    }
+
+    pub fn fail_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
+        Self::AcknowledgeOutbound {
+            client: client.into(),
+            publication: Some(publication.into()),
+            selection: ScenarioOutboundSelection::All,
+            outcome: SubjectOutboundOutcome::ReachedNoEndpoint,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             ScenarioStep::CreateGroup { .. } => "create_group",
@@ -134,8 +175,7 @@ impl ScenarioStep {
             ScenarioStep::UpdateGroupData { .. } => "update_group_data",
             ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
-            ScenarioStep::ConfirmPending { .. } => "confirm_pending",
-            ScenarioStep::FailPending { .. } => "fail_pending",
+            ScenarioStep::AcknowledgeOutbound { .. } => "acknowledge_outbound",
             ScenarioStep::SendAppMessage { .. } => "send_app_message",
             ScenarioStep::Leave { .. } => "leave",
             ScenarioStep::DeliverAll => "deliver_all",
@@ -274,7 +314,7 @@ pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, Sce
         .expect("successful report always includes an observed trace"))
 }
 
-/// Run ScenarioSpec v1 through an explicitly supplied convergence subject.
+/// Run ScenarioSpec v2 through an explicitly supplied convergence subject.
 pub async fn run_scenario_spec_with_subject(
     spec: &ScenarioSpec,
     subject: &mut dyn ConvergenceSubject,
@@ -516,31 +556,49 @@ async fn run_scenario_report_inner(
                     }
                 }
             }
-            ScenarioStep::ConfirmPending { client, pending } => {
+            ScenarioStep::AcknowledgeOutbound {
+                client,
+                publication,
+                selection,
+                outcome,
+            } => {
                 let client_label = client.clone();
-                subject
-                    .confirm_pending(client, pending)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-                pending_resolutions.push(PendingResolutionObservation {
-                    step_index,
-                    client: client_label,
-                    pending: pending.clone(),
-                    resolution: "confirmed".into(),
-                });
-            }
-            ScenarioStep::FailPending { client, pending } => {
-                let client_label = client.clone();
-                subject
-                    .fail_pending(client, pending)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-                pending_resolutions.push(PendingResolutionObservation {
-                    step_index,
-                    client: client_label,
-                    pending: pending.clone(),
-                    resolution: "rolled_back".into(),
-                });
+                let artifacts = subject
+                    .poll_outbound(client)
+                    .map_err(|error| subject_step_error(step_index, error))?
+                    .into_iter()
+                    .filter(|artifact| {
+                        publication.as_ref().is_none_or(|publication| {
+                            artifact.publication.as_ref() == Some(publication)
+                        }) && selection.matches(artifact)
+                    })
+                    .collect::<Vec<_>>();
+                if artifacts.is_empty() && publication.is_some() {
+                    return Err(err(
+                        step_index,
+                        format!(
+                            "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
+                        ),
+                    ));
+                }
+                for artifact in artifacts {
+                    subject
+                        .acknowledge_outbound(client, &artifact.outbound_id, *outcome)
+                        .await
+                        .map_err(|error| subject_step_error(step_index, error))?;
+                }
+                if let Some(publication) = publication {
+                    pending_resolutions.push(PendingResolutionObservation {
+                        step_index,
+                        client: client_label,
+                        pending: publication.clone(),
+                        resolution: match outcome {
+                            SubjectOutboundOutcome::Accepted => "confirmed",
+                            SubjectOutboundOutcome::ReachedNoEndpoint => "rolled_back",
+                        }
+                        .into(),
+                    });
+                }
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 subject
@@ -739,7 +797,7 @@ pub fn validate_scenario_for_subject(
     spec: &ScenarioSpec,
     descriptor: &SubjectDescriptor,
 ) -> Result<(), ScenarioRunError> {
-    if spec.spec_version != "1" {
+    if spec.spec_version != "2" {
         return Err(ScenarioRunError {
             step_index: None,
             message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
@@ -873,7 +931,7 @@ mod tests {
     fn fallback_initial_admins_include_future_admin_policy_actors() {
         let spec = ScenarioSpec {
             name: "admin policy fallback".to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients: vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -902,7 +960,7 @@ mod tests {
     async fn unsupported_capability_is_rejected_before_subject_action() {
         let spec = ScenarioSpec {
             name: "unsupported-subject-capability/v1".to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients: vec!["alice".to_owned()],
             steps: vec![
                 ScenarioStep::SendAppMessage {
@@ -938,7 +996,7 @@ mod tests {
     async fn virtual_time_is_capability_gated_serializable_and_dispatched() {
         let spec = ScenarioSpec {
             name: "subject-virtual-time/v1".to_owned(),
-            spec_version: "1".to_owned(),
+            spec_version: "2".to_owned(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![ScenarioStep::AdvanceTime { delta_ms: 750 }],
         };
@@ -984,11 +1042,33 @@ mod tests {
         assert!(capability.is_white_box());
     }
 
-    #[tokio::test]
-    async fn explicit_engine_subject_preserves_default_runner_trace() {
+    #[test]
+    fn scenario_spec_v1_is_rejected_after_clean_v2_cutover() {
         let spec = ScenarioSpec {
-            name: "subject-boundary-smoke/v1".to_owned(),
+            name: "removed-v1".to_owned(),
             spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned()],
+            steps: Vec::new(),
+        };
+        let descriptor = SubjectDescriptor {
+            adapter: "recording-subject".to_owned(),
+            adapter_version: "1".to_owned(),
+            storage_backend: "none".to_owned(),
+            capabilities: BTreeSet::new(),
+        };
+
+        let error = validate_scenario_for_subject(&spec, &descriptor)
+            .expect_err("ScenarioSpec v1 must not retain a runtime compatibility path");
+
+        assert_eq!(error.step_index, None);
+        assert!(error.message.contains("unsupported ScenarioSpec version 1"));
+    }
+
+    #[tokio::test]
+    async fn default_and_explicit_engine_subjects_share_outbound_lifecycle() {
+        let spec = ScenarioSpec {
+            name: "subject-boundary-smoke/v2".to_owned(),
+            spec_version: "2".to_owned(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -999,10 +1079,7 @@ mod tests {
                     initial_admins: None,
                     pending: "create".to_owned(),
                 },
-                ScenarioStep::ConfirmPending {
-                    client: "alice".to_owned(),
-                    pending: "create".to_owned(),
-                },
+                ScenarioStep::accept_publication("alice".to_owned(), "create".to_owned()),
                 ScenarioStep::DeliverAll,
                 ScenarioStep::Tick {
                     clients: vec!["bob".to_owned()],

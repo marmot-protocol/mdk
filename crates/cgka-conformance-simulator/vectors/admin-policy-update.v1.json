@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "admin-policy-update/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob"
@@ -23,9 +23,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -68,9 +69,10 @@
         "pending": "promote-bob"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "promote-bob"
+        "publication": "promote-bob",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -95,9 +97,10 @@
         "pending": "bob-rename"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "bob",
-        "pending": "bob-rename"
+        "publication": "bob-rename",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -117,9 +120,10 @@
         "pending": "self-demote-bob"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "bob",
-        "pending": "self-demote-bob"
+        "publication": "self-demote-bob",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"

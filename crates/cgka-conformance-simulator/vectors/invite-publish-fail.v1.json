@@ -5,7 +5,7 @@
   "seed": null,
   "scenario": {
     "name": "invite-publish-fail/v1",
-    "spec_version": "1",
+    "spec_version": "2",
     "clients": [
       "alice",
       "bob",
@@ -23,9 +23,10 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "create"
+        "publication": "create",
+        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -52,9 +53,10 @@
         "pending": "invite-carol"
       },
       {
-        "type": "fail_pending",
+        "type": "acknowledge_outbound",
         "client": "alice",
-        "pending": "invite-carol"
+        "publication": "invite-carol",
+        "outcome": "reached_no_endpoint"
       },
       {
         "type": "observe",
