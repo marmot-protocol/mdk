@@ -1276,13 +1276,6 @@ impl<S: StorageProvider> Engine<S> {
                     let before_message_retention =
                         crate::app_components::message_retention_seconds_of_group(&mls_group)?;
                     self.retain_current_epoch_snapshot_for_group(&group_id)?;
-                    // Extract capabilities from Add proposals before the
-                    // staged commit is consumed by merge.
-                    crate::capability_manager::cache_from_staged_commit(
-                        &self.storage,
-                        &group_id,
-                        &staged,
-                    )?;
                     // Merge and mirror the Marmot record in one durable unit, the
                     // same rule `do_confirm_published` applies to its own merge.
                     // Session open seeds the epoch state machine FROM that
@@ -1298,6 +1291,13 @@ impl<S: StorageProvider> Engine<S> {
                         message_retention_seconds: after_message_retention,
                     } = match self.storage.with_transaction(
                         |storage| -> Result<AppliedCommitProjection, EngineError> {
+                            // The staged commit is the only public source for
+                            // newly added members' KeyPackage capabilities.
+                            // Cache them on the same transaction rail as the
+                            // merge and every other durable projection.
+                            crate::capability_manager::cache_from_staged_commit(
+                                storage, &group_id, &staged,
+                            )?;
                             let tx_provider = EngineOpenMlsProvider::<S>::new(
                                 &self.crypto,
                                 storage.mls_storage(),
@@ -1342,6 +1342,16 @@ impl<S: StorageProvider> Engine<S> {
                                 g.removed = true;
                             }
                             storage.put_group(&g)?;
+                            // A commit path update may change our own leaf.
+                            // Feature-status correctness requires this cache to
+                            // advance atomically with MLS and the group record.
+                            crate::capability_manager::cache_self_capabilities(
+                                storage,
+                                &group_id,
+                                &mls_group,
+                                self.identity.self_id(),
+                                self.ciphersuite,
+                            )?;
                             Ok(AppliedCommitProjection {
                                 epoch: after,
                                 remaining_member_ids: after_ids,
@@ -1413,15 +1423,6 @@ impl<S: StorageProvider> Engine<S> {
                     // index so the new nostr_group_id resolves (prior id retained
                     // for the overlap window). No-op when routing was unchanged.
                     self.reindex_transport_group_id(&group_id);
-                    // Refresh self-cache since our own leaf may have been
-                    // updated by the commit's path.
-                    crate::capability_manager::cache_self_capabilities(
-                        &self.storage,
-                        &group_id,
-                        &mls_group,
-                        self.identity.self_id(),
-                        self.ciphersuite,
-                    )?;
                     self.prune_fork_recovery_for_group(&group_id)?;
 
                     if let Some((source_epoch, winner, invalidated, invalidated_commit_id)) =

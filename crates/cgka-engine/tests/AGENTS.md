@@ -67,11 +67,11 @@ backend on the same rail.
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `auto_commit_atomicity.rs`
-  - **Owns:** Group-record write atomicity under an injected `put_group` failure (mdk#333), one test per seam that
-    projects the record: auto-commit staging, Welcome join, group-profile staging, and inbound commit apply. No torn
-    record, no orphaned pending publish, no leaked snapshot, no stale stored proposal, no epoch split between the
-    record and the epoch manager; the group stays usable, and an apply the fault abandoned hands its still-retained
-    winning commit back to stored convergence so it is eventually applied
+  - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
+    seam that projects the record plus direct-ingest capability-cache coverage. No torn record or capability cache,
+    orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
+    manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
+    stored convergence so it is eventually applied
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
