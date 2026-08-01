@@ -1,11 +1,14 @@
 //! Durable persistence, dedup classification, and stored-message state
 //! transitions for the ingest/send paths of [`Engine`].
 
-use super::content_dedup_id;
+use super::{MAX_DEFERRED_ROWS_PER_SWEEP, content_dedup_id};
 use crate::engine::Engine;
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::EngineError;
-use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome, InputRejectionCategory};
+use cgka_traits::message::{
+    DeferredPeelLifecycle, MessageRecord, MessageState, StoredMessagePayload,
+};
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
@@ -169,6 +172,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state: MessageState::Sent,
             payload,
+            deferred_peel: None,
         };
         let previous = match self.storage.get_message(&record.id) {
             Ok(record) => Some(record),
@@ -315,6 +319,29 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
         };
+        let deferred_peel = if state == MessageState::PeelDeferred {
+            previous
+                .as_ref()
+                .and_then(|record| record.deferred_peel.clone())
+                .or_else(|| {
+                    let now = self.convergence_now();
+                    Some(DeferredPeelLifecycle {
+                        first_observed_wall_ms: now.wall_ms,
+                        wall_high_water_ms: now.wall_ms,
+                        clock_instance_id: self.convergence_clock_instance_id,
+                        residence_deadline_monotonic_ms: now
+                            .monotonic_ms
+                            .saturating_add(self.deferred_peel_residence_ms),
+                        residence_deadline_wall_ms: now
+                            .wall_ms
+                            .saturating_add(self.deferred_peel_residence_ms),
+                        distinct_context_attempts: 0,
+                        last_context_fingerprint: None,
+                    })
+                })
+        } else {
+            None
+        };
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -328,6 +355,7 @@ impl<S: StorageProvider> Engine<S> {
                 && record.epoch == epoch
                 && record.state == state
                 && record.payload == payload
+                && record.deferred_peel == deferred_peel
         }) {
             return Ok(());
         }
@@ -337,6 +365,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             payload,
+            deferred_peel,
         })?;
         self.audit_group(
             group_id,
@@ -373,6 +402,97 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Normalize legacy/restarted lifecycle rows and persist at most one
+    /// sweep-sized slice. Returns whether additional normalized rows remain
+    /// to be persisted by a later scheduler tick.
+    pub(super) fn normalize_deferred_peel_lifecycles(
+        &self,
+        records: &mut [MessageRecord],
+        now: crate::convergence_clock::ConvergenceTime,
+    ) -> Result<bool, EngineError> {
+        let mut persisted = 0usize;
+        let mut normalization_pending = false;
+        for record in records {
+            let mut changed = false;
+            let lifecycle = record.deferred_peel.get_or_insert_with(|| {
+                changed = true;
+                DeferredPeelLifecycle {
+                    first_observed_wall_ms: now.wall_ms,
+                    wall_high_water_ms: now.wall_ms,
+                    clock_instance_id: self.convergence_clock_instance_id,
+                    residence_deadline_monotonic_ms: now
+                        .monotonic_ms
+                        .saturating_add(self.deferred_peel_residence_ms),
+                    residence_deadline_wall_ms: now
+                        .wall_ms
+                        .saturating_add(self.deferred_peel_residence_ms),
+                    distinct_context_attempts: 0,
+                    last_context_fingerprint: None,
+                }
+            });
+            if lifecycle.clock_instance_id != self.convergence_clock_instance_id {
+                // Monotonic values do not survive restart. Preserve elapsed
+                // wall residence through a high-water mark. If wall time moved
+                // backwards, using the prior high water prevents premature
+                // expiry.
+                let observed_wall = lifecycle.wall_high_water_ms.max(now.wall_ms);
+                let remaining = lifecycle
+                    .residence_deadline_wall_ms
+                    .saturating_sub(observed_wall);
+                lifecycle.clock_instance_id = self.convergence_clock_instance_id;
+                lifecycle.residence_deadline_monotonic_ms =
+                    now.monotonic_ms.saturating_add(remaining);
+                lifecycle.wall_high_water_ms = observed_wall;
+                changed = true;
+            }
+            if changed {
+                if persisted < MAX_DEFERRED_ROWS_PER_SWEEP {
+                    self.storage.put_message(record)?;
+                    persisted += 1;
+                } else {
+                    normalization_pending = true;
+                }
+            }
+        }
+        Ok(normalization_pending)
+    }
+
+    pub(super) fn release_deferred_peel_row(
+        &mut self,
+        record: &MessageRecord,
+        resource: InboundResourceLimit,
+        disposition: crate::message_disposition::MessageDisposition,
+    ) -> Result<(), EngineError> {
+        let retry_count = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            u64::from(lifecycle.distinct_context_attempts)
+        });
+        let residence_ms = record.deferred_peel.as_ref().map_or(0, |lifecycle| {
+            lifecycle
+                .wall_high_water_ms
+                .max(self.convergence_now().wall_ms)
+                .saturating_sub(lifecycle.first_observed_wall_ms)
+        });
+        self.storage.delete_message(&record.id)?;
+        self.audit_group(
+            &record.group_id,
+            crate::audit_helpers::deferred_peel_resource_refused_event(
+                hex::encode(record.id.as_slice()),
+                Some(record.epoch),
+                disposition.tag(),
+                retry_count,
+                residence_ms,
+            ),
+        );
+        self.events_buf
+            .push_back(GroupEvent::TransportObjectResourceRefused {
+                group_id: record.group_id.clone(),
+                message_id: record.id.clone(),
+                resource,
+            });
+        self.note_peel_deferred_row_retired(&record.group_id);
+        Ok(())
+    }
+
     pub(crate) fn mark_raw_transport_message_failed_if_awaiting_retry(
         &mut self,
         raw_msg_id: &MessageId,
@@ -401,7 +521,7 @@ impl<S: StorageProvider> Engine<S> {
                 // a `Retryable` row — input buffered pre-peel while the group
                 // could not ingest — sits outside the cap.
                 if record.state == MessageState::PeelDeferred {
-                    self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
+                    self.note_peel_deferred_row_retired(&record.group_id);
                 }
                 Ok(())
             }

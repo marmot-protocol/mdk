@@ -24,6 +24,10 @@ pub(crate) enum MessageDisposition {
     /// budget without peeling. The row is released as a local resource
     /// refusal; the same transport id remains eligible on later redelivery.
     RetryBudgetRefused,
+    /// A retained `PeelDeferred` row exhausted its durable local residence
+    /// budget. Like retry-budget refusal, this is not a validity claim and
+    /// exact-id redelivery remains eligible.
+    ResidenceBudgetRefused,
     /// The per-group cap on retained `PeelDeferred` rows is reached; the
     /// message was dropped without being persisted so a flood of
     /// undecryptable input cannot grow the durable store unboundedly.
@@ -42,6 +46,7 @@ impl MessageDisposition {
             // Historical audit string, kept for dashboard continuity.
             Self::RetryPending => "peel_failed_no_snapshot",
             Self::RetryBudgetRefused => "resource_refused_retry_budget",
+            Self::ResidenceBudgetRefused => "resource_refused_residence_budget",
             Self::DeferredCapacityRefused => "resource_refused_deferred_capacity",
             Self::Quarantined => "quarantined_group_input_deferred",
         }

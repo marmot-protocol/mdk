@@ -29,7 +29,8 @@ use crate::config::CursorPersistence;
 pub(crate) enum ConvergenceScheduleState {
     /// No active pass and no pending inputs: cancel scheduled wakeups.
     Idle,
-    /// A pass is collecting; wake when its cutoff elapses.
+    /// A pass is collecting or local deferred-peel residence is pending; wake
+    /// when the earliest cutoff elapses.
     Collecting { remaining_ms: u64 },
     /// A pass is frozen/resolving or its cutoff already elapsed: run now.
     Ready,
@@ -62,16 +63,33 @@ impl AppClient {
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<ConvergenceScheduleState, AppError> {
-        match self.runtime.prepare_convergence_cutoff_delay_ms(group_id)? {
+        let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
-            Some(remaining_ms) => Ok(ConvergenceScheduleState::Collecting { remaining_ms }),
+            Some(remaining_ms) => {
+                let remaining_ms = self
+                    .runtime
+                    .deferred_peel_cutoff_delay_ms(group_id)?
+                    .map_or(remaining_ms, |deferred| remaining_ms.min(deferred));
+                if remaining_ms == 0 {
+                    Ok(ConvergenceScheduleState::Ready)
+                } else {
+                    Ok(ConvergenceScheduleState::Collecting { remaining_ms })
+                }
+            }
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)? {
                     Ok(ConvergenceScheduleState::PendingOutbound)
                 } else {
-                    Ok(ConvergenceScheduleState::Idle)
+                    match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
+                        Some(0) => Ok(ConvergenceScheduleState::Ready),
+                        Some(remaining_ms) => {
+                            Ok(ConvergenceScheduleState::Collecting { remaining_ms })
+                        }
+                        None => Ok(ConvergenceScheduleState::Idle),
+                    }
                 }
             }
         }
@@ -83,12 +101,38 @@ impl AppClient {
         }
     }
 
-    fn remember_pending_convergence_effects(
+    fn remember_pending_convergence_groups(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
+    }
+
+    fn arm_recovery_from_effects(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return;
+        }
+        for event in &effects.events {
+            let cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                group_id, ..
+            } = event
+            else {
+                continue;
+            };
+            let Ok(record) = self.runtime.group_record(group_id) else {
+                continue;
+            };
+            if self
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), record.epoch)
+            {
+                // Record the recovery intent before the worker performs the
+                // external full-history replay.
+                self.record_epoch_stall_backfill_armed(group_id, record.epoch.0);
+                self.epoch_backfill_pending = true;
+            }
+        }
     }
 
     pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {
@@ -199,7 +243,8 @@ impl AppClient {
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
-        self.remember_pending_convergence_effects(&effects);
+        self.remember_pending_convergence_groups(&effects);
+        self.arm_recovery_from_effects(&effects);
         fail_if_publish_failed(&effects)?;
         let mut summary = SyncSummary::default();
         if effects.events.is_empty() {
@@ -507,7 +552,8 @@ impl AppClient {
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
-        self.remember_pending_convergence_effects(&effects.effects);
+        self.remember_pending_convergence_groups(&effects.effects);
+        self.arm_recovery_from_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         let routes_dirty = self
@@ -613,7 +659,8 @@ impl AppClient {
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
-        self.remember_pending_convergence_effects(&effects);
+        self.remember_pending_convergence_groups(&effects);
+        self.arm_recovery_from_effects(&effects);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let publish_new_message_notification =

@@ -131,7 +131,9 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             | GroupEvent::GroupHydrationRecovered { .. } => {
                 ChatListUpdateTrigger::MembershipChanged
             }
-            GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => {
+            GroupEvent::MessageReceived { .. }
+            | GroupEvent::AppMessageInvalidated { .. }
+            | GroupEvent::TransportObjectResourceRefused { .. } => {
                 ChatListUpdateTrigger::SnapshotRefresh
             }
         },
@@ -147,6 +149,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }

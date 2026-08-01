@@ -1704,6 +1704,13 @@ impl HarnessClient {
                 self.default_group = Some(group_id.clone());
             }
             match &event {
+                GroupEvent::TransportObjectResourceRefused { message_id, .. } => {
+                    if let Some(scenario_input) = self.bus.scenario_input_for_transport(message_id)
+                    {
+                        self.scenario_input_tracker
+                            .record_resource_refused(&scenario_input);
+                    }
+                }
                 GroupEvent::MessageReceived { payload, .. } => {
                     let (logical_id, _) = logical_message_fields(payload);
                     self.scenario_input_tracker

@@ -404,6 +404,15 @@ pub enum GroupEvent {
         /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
     },
+    /// A raw transport object was released solely because a local durable
+    /// resource budget expired. This is not a protocol validity verdict and
+    /// does not create terminal duplicate state; exact-id redelivery remains
+    /// eligible. Applications use it to arm transport-history recovery.
+    TransportObjectResourceRefused {
+        group_id: GroupId,
+        message_id: MessageId,
+        resource: crate::ingest::InboundResourceLimit,
+    },
     MessageReceived {
         group_id: GroupId,
         sender: MemberId,

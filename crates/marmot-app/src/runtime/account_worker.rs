@@ -674,6 +674,14 @@ async fn run_app_runtime_account_worker(
                                         &mut scheduled_convergence,
                                         &mut client,
                                     );
+                                    run_pending_epoch_backfill_reporting_arm(
+                                        &mut client,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                    )
+                                    .await;
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
                                         shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                     }

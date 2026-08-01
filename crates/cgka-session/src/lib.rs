@@ -837,6 +837,13 @@ impl AccountDeviceSession {
         )?)
     }
 
+    pub fn deferred_peel_cutoff_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<u64>> {
+        Ok(self.engine.deferred_peel_cutoff_delay_ms(group_id)?)
+    }
+
     pub fn confirm_regenerated_queued_intent(
         &mut self,
         intent: &QueuedIntentRef,

@@ -241,6 +241,7 @@ Categories:
 | E5 | `CANDIDATE_REPLAY_BUDGET_SLACK` | 4× | resource | Scales replay budget over linear commit/rewind estimate | `ReplayBudgetExceeded` fails closed without partial selection | intended no | Branch-explosion campaign and recovery policy test |
 | E6 | `CANDIDATE_REPLAY_BUDGET_FLOOR` | 32 probes | resource | Gives small passes minimum replay headroom | Same as E5 | intended no | Small/large boundary matrix |
 | E7 | self-remove auto-commit jitter | 10 ms + [0, 40] ms (10–50 ms inclusive) | scheduler | Reduces synchronized automatic self-remove commits | Jitter changes ordering only, not admissible final behavior after closure | intended no | Seeded schedule invariance and collision tests |
+| E8 | `MAX_DEFERRED_PEEL_RESIDENCE_MS` | 30 days | resource, scheduler | Durably bounds opaque local transport residence across stable contexts and restart | Release is `resource_refused`, exact-ID redelivery remains eligible, and backwards wall movement cannot expire early | may affect locally available input until refetch | First-join opaque reproducer, restart/backwards-clock test, redelivery, and app backfill signal |
 
 #### App scheduler and input-recovery bounds
 
@@ -277,7 +278,7 @@ future inventory revision should encode machine-checked expected values where th
 | P5 | `canonicalization.rs`; `convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input`; `input_at_effective_cutoff_is_retained_for_the_next_generation`; collecting-pass restart test | M3.1 sustained flood; M3.2 eventual fixed-point comparison |
 | P6, P7, P8 | `convergence.rs`; generated policy cases; Tamarin score/bound lemmas; multi-device witness-deduplication replay probe | M3.1 group-size/device/Sybil sweeps; M4.1 independent reference |
 | E1 | `message_processor/mod.rs`; existing multi-pass integration flows | M3.1 force exhaustion, verify durable continuation and no partial settle |
-| E2, E3, E4 | `message_processor/mod.rs`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `peel_deferred_rows_capped_per_group_under_flood`; `resource_refusal_signals_immediately_once_per_epoch`; deferred retry/context tests | M3.1 fairness/restart/redelivery campaign |
+| E2, E3, E4, E8 | `message_processor/mod.rs`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `deferred_peel_residence_survives_restart_and_backward_clock`; `peel_deferred_rows_capped_per_group_under_flood`; `resource_refusal_signals_immediately_once_per_epoch`; strict first-join chaos case; deferred retry/context tests | M3.1 fairness/restart/redelivery campaign |
 | E5, E6 | `openmls_projection.rs`; `for_pass_scales_with_commits_and_rewind_and_keeps_a_floor`; `for_pass_saturates_instead_of_overflowing`; `consume_fails_closed_when_exhausted` | M3.1 branch-explosion end-to-end recovery; M4.3 mutation |
 | E7 | `message_processor/mod.rs`; `reopen_preserves_deferred_selfremove_auto_commit` | M3.1 deterministic jitter/collision schedules |
 | A1, A2, A4, A5 | `account_worker.rs`; clamp, re-arm, collecting, pending-outbound, cutoff-order, and backoff scheduler tests | M3.2 virtual-time scheduler invariance; M4.2 lifecycle model |
@@ -431,13 +432,12 @@ point hid. Two are resolved without weakening the oracle:
 - [MDK #1192](https://github.com/marmot-protocol/mdk/pull/1192) terminally retires proposal rows and proposal-arrival
   schedule signals consumed by a confirmed or converged commit, including across restart.
 
-One engine-state failure remains: a member invited after an old application event can retain that pre-join object as
-transport/scenario-input pending work. [MDK #1193](https://github.com/marmot-protocol/mdk/issues/1193) contains the
-minimized production-shaped reproducer, source trace, privacy-preserving durable resource-retirement design, and
-restart/clock/rejoin/redelivery acceptance criteria. It remains red strict-campaign evidence until that researched
-resource-lifecycle change lands; the oracle rule is not relaxed. Report campaigns run the complete strict expectations
-by default. Strict coverage also flags the mixed large storm because its application phase is cleared before any
-delivery-or-invalidation expectation accounts for it; that is an oracle coverage gap distinct from #1193.
+The remaining engine-state failure was closed by durably bounding opaque local transport residence: after controlled
+virtual time, the pre-join object is released as `resource_refused`, exact-ID redelivery remains eligible, and the
+strict scenario-input/pending-work boundary settles without claiming a protocol stale reason. Report campaigns run the
+complete strict expectations by default. Strict coverage still flags the mixed large storm because its application
+phase is cleared before any delivery-or-invalidation expectation accounts for it; that is a separate oracle coverage
+gap.
 
 ### 1.2 Public subject boundary
 
@@ -815,6 +815,7 @@ incorrect result.
 | 2026-07-30 | 1.1 bidirectional decryptability probe | Added an active exact-ID application-message matrix; settled members pass every directed edge, a missed commit exposes future-epoch deferral in only one direction, and a named nonmember cannot pass | `cargo test -p cgka-conformance-simulator bidirectional_decryptability` |
 | 2026-07-30 | 1.1 terminal disband projection | Added a shared-fact-only canonical tombstone projection; terminal state passes exact/no-pending observation across restart, while device-local authorship and roster ordering cannot split equality | `cargo test -p cgka-conformance-simulator exact_oracle_projects_terminal_disband_tombstone_across_restart`; `cargo test -p cgka-engine --features test-conformance-snapshot disband_projection_excludes_device_local_authorship_and_canonicalizes_roster` |
 | 2026-07-30 | 1.1 strict reliability campaigns | Made report oracle coverage strict by default, added `--allow-weak-oracle`, and appended final global drain/exact/no-pending checks to send-leave and chaos cases. The stronger boundary exposed rollback divergence, pre-join deferred work, unretired leave proposal work, and an unasserted mixed-storm application phase rather than masking them | `strict_chaos_boundary_retains_known_reliability_failures`; focused generator/report tests; generated JSON reports |
+| 2026-07-30 | 1.1 durable opaque-input retirement | Persisted deferred-peel residence/context budgets, rebased deadlines conservatively across restart and backwards wall movement, scheduled stable-context expiry, preserved exact-ID redelivery, armed history recovery, and repaired strict chaos seed 123 case 4 | `deferred_peel_residence_survives_restart_and_backward_clock`; `strict_chaos_boundary_retires_pre_join_opaque_resource_work`; focused app scheduler/backfill tests |
 | 2026-07-30 | L1 stale-pass repair path | Reclassified inherited convergence-pass base/tip disagreement as recoverable local scheduling drift: collecting and frozen stale passes are discarded, audited, and reseeded at the current tip while frozen-member integrity failures remain fail-closed | [MDK #1182](https://github.com/marmot-protocol/mdk/pull/1182), merge `66c7162c`; behind-tip, ahead-tip, and frozen-phase compensation regressions |
 | 2026-07-30 | 1.2a public convergence subject | Extracted scenario execution behind a capability-declared `ConvergenceSubject`, added the in-process engine adapter, separated queue/partition mutation behind `ConvergenceFaultSubject`, rejected unsupported scenarios before actions, and recorded adapter identity/capabilities in reports | [MDK #1194](https://github.com/marmot-protocol/mdk/pull/1194), merge `2cee3f94`; subject preflight/fault-classification tests; default-versus-explicit engine subject trace equivalence; report metadata test |
 | 2026-07-30 | S4 SQLite transaction-boundary contention | Made transient `COMMIT`/`ROLLBACK` busy conditions retry in place without rerunning application closures; persistent contention remains a typed retryable error and releases a clean connection | [MDK #1191](https://github.com/marmot-protocol/mdk/pull/1191), merge `cff57a5d`; 300 storage tests; `just fast-ci` |

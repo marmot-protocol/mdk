@@ -1681,7 +1681,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "4");
+        assert_eq!(case.generator_version, "5");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
     }
@@ -1823,13 +1823,8 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
 }
 
 #[tokio::test]
-async fn strict_chaos_boundary_retains_known_reliability_failures() {
+async fn strict_chaos_boundary_retires_pre_join_opaque_resource_work() {
     let cases = generate_convergence_chaos_family(123, 5);
-    let expected_failures = [(
-        4usize,
-        "pending_work_remaining",
-        "pre-join deferred application object",
-    )];
 
     let repaired = run_generated_case_report(&cases[2], None)
         .await
@@ -1840,19 +1835,14 @@ async fn strict_chaos_boundary_retains_known_reliability_failures() {
         repaired.expectation_failures
     );
 
-    for (case_index, failure_kind, description) in expected_failures {
-        let report = run_generated_case_report(&cases[case_index], None)
-            .await
-            .expect("strict known-gap case reports");
-        assert!(
-            report
-                .expectation_failures
-                .iter()
-                .any(|failure| failure.kind == failure_kind),
-            "strict case {case_index} must retain the {description} regression until the engine behavior is fixed: {:?}",
-            report.expectation_failures
-        );
-    }
+    let repaired_pre_join = run_generated_case_report(&cases[4], None)
+        .await
+        .expect("strict pre-join case reports");
+    assert!(
+        repaired_pre_join.expectation_failures.is_empty(),
+        "pre-join opaque input must leave no pending resource work after the controlled deadline: {:?}",
+        repaired_pre_join.expectation_failures
+    );
 
     let self_remove_report = run_generated_case_report(&cases[3], None)
         .await

@@ -392,9 +392,10 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 #### Chaos Class `4`: Delayed Past-Epoch App
 
 - Setup: Bob's epoch-1 app message is delayed while Alice invites David.
-- Pressure: late app delivery after an epoch advance.
-- Expected: Carol accepts the late app payload from retained context. The strict pending-work boundary currently also
-  exposes that post-invite David retains the pre-join object as deferred logical work.
+- Pressure: late app delivery after an epoch advance, followed by controlled virtual-time advancement past the durable
+  local deferred-peel residence deadline.
+- Expected: Carol accepts the late app payload from retained context. David receives no historical payload; his opaque
+  pre-join wrapper is released as `resource_refused` without terminal dedup, and strict pending work reaches zero.
 
 #### Chaos Class `5`: Stable Queue Faults
 

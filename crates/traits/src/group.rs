@@ -78,12 +78,16 @@ pub struct Group {
     /// rejoin under this group id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disbanded: Option<DisbandTombstone>,
-    /// Epoch at which this device's membership began (welcome-join or group
-    /// creation), refreshed on an authenticated re-join. Post-peel
+    /// Epoch at which this device's first known membership began
+    /// (welcome-join or group creation). Post-peel
     /// classification lower bound: an application message whose MLS epoch
     /// precedes it is pre-membership — permanently undecryptable by design
     /// and never worth retrying. `EpochId(0)` (the default for records
     /// persisted before this field existed) means "unknown — no bound".
+    /// Authenticated rejoin/repair resets this to zero because a single lower
+    /// bound cannot represent multiple membership intervals; classifying all
+    /// earlier epochs as absent would incorrectly reject prior-membership
+    /// traffic.
     #[serde(default)]
     pub join_epoch: EpochId,
 }
