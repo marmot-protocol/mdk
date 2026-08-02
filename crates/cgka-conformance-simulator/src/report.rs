@@ -635,6 +635,7 @@ mod tests {
             app_invalidation_observations: Vec::new(),
             expectation_failures: Vec::new(),
             invariant_failures: Vec::new(),
+            campaign_measurements: Default::default(),
         }
     }
 
@@ -692,6 +693,7 @@ mod tests {
                 category: crate::SubjectFailureCategory::Resource,
                 message: "convergence replay budget exceeded".into(),
             },
+            wall_us: 0,
         });
 
         let failures = scenario_report_failures(&report, false);

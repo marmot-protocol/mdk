@@ -248,6 +248,8 @@ pub struct Engine<S: StorageProvider> {
     /// Optional hard replay-probe ceiling for explicit exhaustion campaigns.
     /// Production construction cannot set it.
     pub(crate) replay_probe_budget_override: Option<u64>,
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub(crate) conformance_replay_probe_count: u64,
     pub(crate) convergence_clock: Arc<dyn ConvergenceClock>,
     /// Identifies the process-local monotonic clock domain persisted in active
     /// convergence passes. A mismatch on hydration forces deadline rebasing
@@ -559,6 +561,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             },
             admit_app_witnesses: self.admit_app_witnesses,
             replay_probe_budget_override: self.replay_probe_budget_override,
+            #[cfg(feature = "test-conformance-snapshot")]
+            conformance_replay_probe_count: 0,
             convergence_clock: self.convergence_clock,
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
@@ -677,6 +681,12 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(None)
+    }
+
+    /// Cumulative candidate replay probes since this engine process opened.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_replay_probe_count(&self) -> u64 {
+        self.conformance_replay_probe_count
     }
 
     /// Return the transport and content-derived ids for a durable synthetic

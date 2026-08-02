@@ -24,7 +24,7 @@ fn milestone3_catalog_covers_every_required_workload_shape() {
     }
 }
 
-async fn assert_generated_case(case_index: usize) {
+async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
     let cases = generate_milestone3_adversarial_family(7, case_index + 1);
     let case = &cases[case_index];
     let report = run_generated_case_report(case, None)
@@ -50,11 +50,32 @@ async fn assert_generated_case(case_index: usize) {
         case.family_name,
         report.invariant_failures
     );
+    report
 }
 
 #[tokio::test]
 async fn offline_retained_history_flood_runs_as_a_small_regression() {
-    assert_generated_case(0).await;
+    let report = assert_generated_case(0).await;
+    let measurements = &report.campaign_measurements;
+    assert_eq!(measurements.schema_version, "1");
+    assert!(measurements.total_wall_us > 0);
+    assert_eq!(measurements.steps.len(), report.step_log.len());
+    assert!(measurements.pass_count > 0);
+    assert!(measurements.max_observed_queue_depth > 0);
+    assert!(!measurements.input_dispositions.is_empty());
+    assert!(
+        measurements
+            .replay_probe_count
+            .is_some_and(|count| count > 0)
+    );
+    assert!(measurements.reorg_rewind_depth.is_some());
+    assert!(measurements.reorg_lateness_ms.is_some());
+    assert!(
+        measurements
+            .unavailable_process_fields
+            .iter()
+            .any(|field| field == "cpu_time_us")
+    );
 }
 
 #[tokio::test]
@@ -78,17 +99,17 @@ async fn sustained_mixed_traffic_runs_as_a_small_regression() {
 #[ignore = "multi-round sustained campaign; run explicitly"]
 #[tokio::test]
 async fn sustained_mixed_traffic_campaign() {
-    assert_generated_case(1).await;
+    let _ = assert_generated_case(1).await;
 }
 
 #[tokio::test]
 async fn self_update_admin_race_runs_as_a_small_regression() {
-    assert_generated_case(2).await;
+    let _ = assert_generated_case(2).await;
 }
 
 #[tokio::test]
 async fn losing_branch_invite_has_a_named_unrecoverable_outcome() {
-    assert_generated_case(3).await;
+    let _ = assert_generated_case(3).await;
 }
 
 #[test]

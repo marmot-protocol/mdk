@@ -840,6 +840,7 @@ dependencies = [
  "cgka-traits",
  "fs-private",
  "hex",
+ "libc",
  "marmot-forensics",
  "nostr",
  "openmls",

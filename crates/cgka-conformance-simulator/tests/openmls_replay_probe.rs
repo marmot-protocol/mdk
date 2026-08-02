@@ -1690,6 +1690,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         queued_outbound_intents: vec![],
         publishable_outbound_messages: vec![],
         errors: vec![],
+        replay_probe_count: 0,
         selection_trace: None,
     };
 
@@ -1764,6 +1765,7 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
         queued_outbound_intents: vec![],
         publishable_outbound_messages: vec![],
         errors: vec![],
+        replay_probe_count: 0,
         selection_trace: None,
     };
 

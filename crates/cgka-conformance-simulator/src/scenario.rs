@@ -362,6 +362,8 @@ pub struct ScenarioReport {
     #[serde(default)]
     pub expectation_failures: Vec<ExpectationFailure>,
     pub invariant_failures: Vec<InvariantFailure>,
+    #[serde(default)]
+    pub campaign_measurements: crate::CampaignMeasurementsV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +415,8 @@ pub struct ScenarioStepLogEntry {
     pub step_index: usize,
     pub step_type: String,
     pub status: ScenarioStepStatus,
+    #[serde(default)]
+    pub wall_us: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1186,13 +1190,16 @@ async fn run_scenario_report_inner(
     fixture: Option<VectorFixtureMetadata>,
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioReport, ScenarioRunError> {
+    let scenario_started = std::time::Instant::now();
     let descriptor = subject.descriptor();
     let compiled = compile_scenario(spec)?;
     preflight_compiled_scenario(&compiled, &descriptor)?;
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
+    let mut sampled_max_queue_depth = 0_usize;
 
     for action in &compiled.actions {
+        let step_started = std::time::Instant::now();
         let step_index = action.schedule.source_step_index;
         let step = &action.step;
         let step_result = if let Some(group) = action.scenario_group.as_deref() {
@@ -1206,6 +1213,16 @@ async fn run_scenario_report_inner(
             Ok(()) => execute_scenario_step(spec, step_index, step, subject, &mut outputs).await,
             Err(error) => Err(error),
         };
+        if descriptor.supports(crate::SubjectCapability::StructuralProgress)
+            && let Ok(progress) = subject.structural_progress()
+        {
+            sampled_max_queue_depth = sampled_max_queue_depth.max(
+                progress
+                    .transport_queued_messages
+                    .saturating_add(progress.transport_delayed_messages)
+                    .saturating_add(progress.transport_mailbox_messages),
+            );
+        }
         if let Err(error) = step_result {
             step_log.push(ScenarioStepLogEntry {
                 step_index,
@@ -1215,6 +1232,7 @@ async fn run_scenario_report_inner(
                     category: error.category,
                     message: error.message,
                 },
+                wall_us: elapsed_us(step_started.elapsed()),
             });
             break;
         }
@@ -1222,6 +1240,7 @@ async fn run_scenario_report_inner(
             step_index,
             step_type: step.kind().into(),
             status: ScenarioStepStatus::Completed,
+            wall_us: elapsed_us(step_started.elapsed()),
         });
     }
 
@@ -1303,7 +1322,10 @@ async fn run_scenario_report_inner(
         &quiescence_observations,
     );
 
-    Ok(ScenarioReport {
+    let database_bytes = subject.database_bytes();
+    let replay_probe_count = subject.replay_probe_count();
+    let engine_metrics = subject.engine_metrics();
+    let mut report = ScenarioReport {
         metadata: ScenarioReportMetadata {
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
@@ -1330,7 +1352,21 @@ async fn run_scenario_report_inner(
         app_invalidation_observations,
         expectation_failures,
         invariant_failures,
-    })
+        campaign_measurements: crate::CampaignMeasurementsV1::default(),
+    };
+    report.campaign_measurements = crate::CampaignMeasurementsV1::from_report(
+        &report,
+        elapsed_us(scenario_started.elapsed()),
+        database_bytes,
+        sampled_max_queue_depth,
+        replay_probe_count,
+        engine_metrics.as_ref(),
+    );
+    Ok(report)
+}
+
+fn elapsed_us(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {

@@ -247,6 +247,10 @@ pub struct CanonicalizationResult {
     pub queued_outbound_intents: Vec<OutboundIntent>,
     pub publishable_outbound_messages: Vec<OutboundIntent>,
     pub errors: Vec<CanonicalizationError>,
+    /// OpenMLS candidate replay probes consumed by this stored pass. Pure
+    /// symbolic canonicalization reports zero.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub replay_probe_count: u64,
     /// Forensic audit trace of the branch-selection decision (per-candidate
     /// scores, the rule-by-rule comparison, and the losing branches). `None`
     /// when no selection was attempted (early-return result builders).
@@ -428,6 +432,8 @@ fn canonicalize_internal(
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace,
     };
 

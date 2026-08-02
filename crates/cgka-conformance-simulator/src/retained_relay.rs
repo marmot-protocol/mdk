@@ -438,6 +438,18 @@ impl ConvergenceSubject for RetainedRelaySubject {
         self.descriptor.clone()
     }
 
+    fn database_bytes(&self) -> Option<u64> {
+        self.engine.database_bytes()
+    }
+
+    fn replay_probe_count(&self) -> Option<u64> {
+        self.engine.replay_probe_count()
+    }
+
+    fn engine_metrics(&self) -> Option<cgka_engine::engine_metrics::EngineMetricsSnapshot> {
+        self.engine.engine_metrics()
+    }
+
     fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {
         self.engine.select_scenario_group(group)
     }

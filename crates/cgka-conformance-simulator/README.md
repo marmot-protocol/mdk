@@ -109,7 +109,35 @@ cargo test -p cgka-conformance-simulator --test milestone3_campaigns \
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
   --family milestone3-adversarial/v1 --seed 7 --cases 12 \
   --out target/cgka-milestone3-reports --storage file --strict-oracle
+
+# Run each adversarial case in its own process and add OS resource measurements.
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
+  --seed 7 --cases 12 --out target/cgka-milestone3-process-campaign --storage file
+
+# Test-only one-variable policy curves around fixed retained inputs/horizons.
+cargo test -p cgka-conformance-simulator --features test-policy-overrides \
+  --test policy_sweeps
 ```
+
+Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latency is the conservative whole-scenario
+wall-time envelope; queued-send blocking time starts only when an engine accepts a send as queued and ends at
+publication or terminal refusal/rollback. Passes count observed convergence decisions across clients. Reorg count,
+rewind depth, and lateness use the engine's diagnostic counters/histograms and survive harness restarts. Input
+dispositions and logical delivery/expiry/invalidation come from the final per-client scenario ledger; queue depth is
+the maximum sampled after scenario actions; replay probes are exact completed OpenMLS replay probes; database size is
+the aggregate SQLite, WAL, and SHM footprint for file-backed subjects.
+
+CPU time, peak RSS, and filesystem write blocks require process isolation and are therefore listed as unavailable in
+an in-process report. `cgka-conformance-campaign` adds those fields with one worker process per case. Write bytes are
+the operating system's child `rusage` block-write accounting and can remain zero when writes are satisfied through
+cache; they are not a SQLite logical-write counter. Generated artifacts are private-by-construction and belong under
+`target/` or another ignored private location.
+
+Policy sweeps are experiments, not configuration. They clone one retained symbolic input, hold current tip, anchor,
+time, and every non-selected policy value fixed, then vary one constant and emit a curve plus named rejected boundary
+values. The runner never writes a production policy. Pass-partition invariance is tested separately with the same
+retained horizon; witness expiry, deferred-commit retirement, and retained-anchor pruning remain separately named
+eligibility-boundary tests rather than being mixed into the scheduler comparison.
 
 To run every portable vector fixture and write a report for each one:
 

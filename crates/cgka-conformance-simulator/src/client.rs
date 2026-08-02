@@ -13,6 +13,7 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationResult};
+use cgka_engine::engine_metrics::{EngineMetricsSnapshot, HistogramSnapshot};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -59,6 +60,8 @@ pub struct HarnessClient {
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
+    completed_replay_probe_count: u64,
+    completed_engine_metrics: EngineMetricsSnapshot,
     virtual_time_tick_enabled: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
@@ -76,6 +79,49 @@ pub struct HarnessClient {
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
     convergence_checkpoints: HashMap<String, (GroupId, DurableConvergencePass)>,
+}
+
+pub(crate) fn merge_engine_metrics(
+    target: &mut EngineMetricsSnapshot,
+    source: &EngineMetricsSnapshot,
+) {
+    target.settles = target.settles.saturating_add(source.settles);
+    target.post_settle_reorgs = target
+        .post_settle_reorgs
+        .saturating_add(source.post_settle_reorgs);
+    merge_histogram(&mut target.reorg_rewind_depth, &source.reorg_rewind_depth);
+    merge_histogram(&mut target.reorg_lateness_ms, &source.reorg_lateness_ms);
+    merge_histogram(
+        &mut target.pass_apply_latency_ms,
+        &source.pass_apply_latency_ms,
+    );
+    merge_histogram(&mut target.generation_gap_ms, &source.generation_gap_ms);
+    merge_histogram(&mut target.freeze_overdue_ms, &source.freeze_overdue_ms);
+    target.admin_reservation_hold_observations = target
+        .admin_reservation_hold_observations
+        .saturating_add(source.admin_reservation_hold_observations);
+    target.admin_reservation_prepared = target
+        .admin_reservation_prepared
+        .saturating_add(source.admin_reservation_prepared);
+    target.admin_reservation_failed = target
+        .admin_reservation_failed
+        .saturating_add(source.admin_reservation_failed);
+}
+
+fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
+    for source_bucket in &source.buckets {
+        if let Some(target_bucket) = target
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.upper_bound == source_bucket.upper_bound)
+        {
+            target_bucket.count = target_bucket.count.saturating_add(source_bucket.count);
+        } else {
+            target.buckets.push(source_bucket.clone());
+        }
+    }
+    target.buckets.sort_by_key(|bucket| bucket.upper_bound);
+    target.overflow_count = target.overflow_count.saturating_add(source.overflow_count);
 }
 
 pub struct ClientBuilder {
@@ -319,6 +365,8 @@ impl ClientBuilder {
             convergence_clock: self.convergence_clock,
             disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
             replay_probe_budget_override: self.replay_probe_budget_override,
+            completed_replay_probe_count: 0,
+            completed_engine_metrics: EngineMetricsSnapshot::default(),
             virtual_time_tick_enabled: false,
             pending_events: Vec::new(),
             default_group: None,
@@ -621,6 +669,11 @@ impl HarnessClient {
     }
 
     pub fn restart(&mut self) {
+        self.completed_replay_probe_count = self
+            .completed_replay_probe_count
+            .saturating_add(self.engine().conformance_replay_probe_count());
+        let completed_metrics = self.engine().engine_metrics();
+        merge_engine_metrics(&mut self.completed_engine_metrics, &completed_metrics);
         drop(self.engine.take());
         let storage = if self.storage_backing.is_file_backed() {
             drop(self.storage.take());
@@ -645,6 +698,17 @@ impl HarnessClient {
         self.storage = Some(storage);
         self.engine = Some(engine);
         self.pending_events.clear();
+    }
+
+    pub fn replay_probe_count(&self) -> u64 {
+        self.completed_replay_probe_count
+            .saturating_add(self.engine().conformance_replay_probe_count())
+    }
+
+    pub fn engine_metrics(&self) -> EngineMetricsSnapshot {
+        let mut metrics = self.completed_engine_metrics.clone();
+        merge_engine_metrics(&mut metrics, &self.engine().engine_metrics());
+        metrics
     }
 
     /// Change the full-engine replay ceiling without changing durable state.

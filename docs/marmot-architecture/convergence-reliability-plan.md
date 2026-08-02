@@ -653,14 +653,27 @@ explicit local rejoin/reset; v1 does not claim automatic repair for that strande
 
 ### 3.2 Resource and sensitivity measurements
 
-- [ ] Record convergence latency and blocked-send duration.
-- [ ] Record pass count, reorg count/depth/lateness, and unresolved outcomes.
-- [ ] Record commit/proposal/application dispositions and logical delivery/expiry/invalidation results.
-- [ ] Record CPU time, peak memory, database size/writes, queue depth, and replay probes.
-- [ ] Sweep constants around the pinned value in explicit test-policy builds.
-- [ ] For P4/P5, preserve one retained input set and fixed eligibility horizons while varying pass partitioning; keep
+- [x] Record convergence latency and blocked-send duration.
+- [x] Record pass count, reorg count/depth/lateness, and unresolved outcomes.
+- [x] Record commit/proposal/application dispositions and logical delivery/expiry/invalidation results.
+- [x] Record CPU time, peak memory, database size/writes, queue depth, and replay probes.
+- [x] Sweep constants around the pinned value in explicit test-policy builds.
+- [x] For P4/P5, preserve one retained input set and fixed eligibility horizons while varying pass partitioning; keep
   witness expiry, deferred commits, and anchor pruning as explicit boundary cases rather than accidental confounders.
-- [ ] Produce curves and boundary failures; never auto-tune production policy from simulator output.
+- [x] Produce curves and boundary failures; never auto-tune production policy from simulator output.
+
+`CampaignMeasurementsV1` is embedded in every scenario report. In-process reports record the conservative
+whole-scenario convergence-latency envelope, true queued-acceptance-to-publication/refusal wall time, decisions,
+restart-preserved reorg histograms, dispositions, logical outcomes, unresolved work, maximum sampled transport depth,
+exact completed OpenMLS replay probes, and file-backed SQLite/WAL/SHM size. The child-process campaign runner adds
+per-case CPU time, peak RSS, and OS-accounted write blocks and makes worker exit/signal failure explicit. OS write
+blocks may be zero under caching and are not presented as SQLite logical writes.
+
+The feature-gated policy sweep holds retained input, tip, anchor, time, eligibility horizons, and all other constants
+fixed, emits explicit rejected boundary points, and sets `production_auto_tuning_permitted` to false. P4/P5
+pass-partition invariance continues to use `fixed_point_is_invariant_to_same_horizon_batch_partitioning`; expiry,
+deferred-commit retirement, and retained-anchor pruning are covered by separately named boundary tests so a semantic
+eligibility change cannot masquerade as a scheduler result.
 
 ### 3.3 Incident replay
 
@@ -907,3 +920,5 @@ incorrect result.
 | 2026-08-02 | 2.2 initial independent reference adapter | Added a capability-limited symbolic-memory subject that executes the common group/publication/application lifecycle without production selector or canonicalizer calls; one compiled scenario now runs unchanged on reference and engine adapters with equal semantic observations, exact-only predicates add their true preflight capability, and assertion sampling no longer consumes later report evidence | `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters`; `unsupported_exact_assertion_fails_before_reference_model_executes`; scenario IR suite |
 | 2026-08-02 | 2.3 retained multi-relay model and exit scenarios | Added real-engine delivery through durable per-relay histories with topology fanout/subscriptions, cursor/since/full/set queries, EOSE-versus-completeness observations, offline reconnect, visibility omission, duplicate/order policy, history equalization, and quiet-query diagnosis; the same compiled scenario runs on all three initial adapters, offline delivery comes from history, and unequal histories reach exact state equality only after reconciliation | `one_compiled_scenario_runs_unchanged_on_all_initial_adapters`; `offline_client_recovers_from_retained_history`; `unequal_relay_histories_converge_after_set_equalization`; `eose_does_not_heal_hidden_cursor_history_but_full_backfill_does`; `relay_reverse_order_and_duplicates_are_explicit_and_deduplicated` |
 | 2026-08-02 | Milestone 2 completion verification | Completed every 2.1-2.3 work item and exit scenario; the canonical IR no longer exposes mutable queue positions, all repository vectors compile, and retained-history behavior is distinct from healed packet loss | [MDK #1233](https://github.com/marmot-protocol/mdk/pull/1233); `cargo test -p cgka-conformance-simulator`; `cargo test -p incident-replay`; `just fast-ci` |
+| 2026-08-02 | 3.1 adversarial workload campaigns | Added the twelve-family workload catalog, small and sustained headline campaigns, real durable-phase process kills, resource-exhaustion/repair, multi-group and shared-account-device topologies, retained-relay disagreement, clock/cursor attacks, witness-enabled/disabled full-engine comparison, and mixed binary/policy preflight. Recorded the current losing-branch device repair limit and the future authenticated policy-capability boundary | `milestone3_campaigns`; `actual_process_kill_recovers_at_every_durable_phase`; explicit sustained campaign; proposal-expiry and multi-parent replay tests |
+| 2026-08-02 | 3.2 campaign measurements and policy sweeps | Embedded stable latency/blocking, pass/reorg, disposition/outcome, queue/replay/database measurements in scenario reports; added an isolated child-process runner for CPU/RSS/write accounting; and added fixed-input test-policy curves with named boundary failures and no production auto-tuning | `offline_retained_history_flood_runs_as_a_small_regression`; `policy_sweeps`; child-process smoke campaign; default and feature-enabled compile gates |

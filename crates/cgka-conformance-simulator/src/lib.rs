@@ -22,6 +22,7 @@
 
 mod audit_capture;
 pub mod bus;
+mod campaign_metrics;
 pub mod client;
 mod decryptability;
 mod failure_capsule;
@@ -29,6 +30,8 @@ pub mod family;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
+#[cfg(feature = "test-policy-overrides")]
+mod policy_sweep;
 pub mod proptest_support;
 mod quiescence;
 mod reference_subject;
@@ -45,6 +48,10 @@ mod topology;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
+pub use campaign_metrics::{
+    CampaignHistogramBucketV1, CampaignHistogramV1, CampaignMeasurementsV1,
+    CampaignStepMeasurementV1,
+};
 pub use cgka_engine::conformance_snapshot::{
     ConformanceAppComponent, ConformanceCanonicalStateSnapshot, ConformanceConstantSnapshot,
     ConformanceDisbandedGroupSnapshot, ConformanceGroupSnapshot, ConformanceLeafCapabilities,
@@ -84,6 +91,10 @@ pub use oracle::{
 pub use pending_work::{
     ClientStructuralProgress, PendingWorkObservation, SubjectProgressSnapshot,
     SubjectTerminalBlocker,
+};
+#[cfg(feature = "test-policy-overrides")]
+pub use policy_sweep::{
+    PolicySweepConstantV1, PolicySweepCurveV1, PolicySweepPointV1, sweep_canonicalization_policy,
 };
 pub use quiescence::{
     QuiescenceObservation, QuiescenceOutboundPolicy, QuiescencePolicy, QuiescenceStatus,

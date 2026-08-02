@@ -149,10 +149,25 @@ the property-test registry. This file is the agent-facing model.
     `ScenarioReportSummary`, `ReportFailureSummary`) used by the report CLI. Failed reports retain subject-step errors
     and emit restrictive failure capsules with captured transport artifacts.
 
+- **Module:** `src/campaign_metrics.rs`
+  - **Role:** Stable report-native campaign measurements: scenario/convergence wall-time envelope, actual queued-send
+    blocking time, convergence decisions, engine reorg histograms, input dispositions, logical outcomes, unresolved
+    work, queue depth, replay probes, and database footprint. Fields that require an OS process boundary are explicitly
+    unavailable in an in-process report.
+
+- **Module:** `src/policy_sweep.rs`
+  - **Role:** Feature-gated, one-variable-at-a-time sweeps over a fixed canonicalization input and fixed eligibility
+    horizons. Curves record rejected boundary values and explicitly prohibit production auto-tuning.
+
 - **Module:** `src/bin/cgka-conformance-simulator-report.rs`
   - **Role:** Report writer CLI. Runs generated families or vector fixture files/directories, writes one JSON
     `ScenarioReport` per scenario plus fixture candidates and failure capsules, replays checkpoint-bearing capsules,
     prints a pass/fail summary, and exits non-zero on expectation failures.
+
+- **Module:** `src/bin/cgka-conformance-campaign.rs`
+  - **Role:** Parent/worker campaign runner. Executes each generated case in an isolated child process and combines the
+    durable scenario report with `wait4` wall/CPU/peak-RSS/write measurements. This is the engine campaign boundary for
+    real process isolation; it is not yet the app/CLI multi-process adapter planned for Milestone 5.
 
 - **Module:** `src/bin/cgka-policy-casegen.rs`
   - **Role:** Policy-case generator CLI; reads `formal/tamarin/policy_cases.json` and parses/reasons over the bounded

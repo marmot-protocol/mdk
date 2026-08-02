@@ -1172,6 +1172,12 @@ impl<S: StorageProvider> Engine<S> {
             },
         )?;
         let mut result = result;
+        #[cfg(feature = "test-conformance-snapshot")]
+        {
+            self.conformance_replay_probe_count = self
+                .conformance_replay_probe_count
+                .saturating_add(result.replay_probe_count);
+        }
         let evaluated_status = result.convergence_status;
         // Missing dependencies stay retained for the next generation. Once a
         // pass is frozen, later arrivals cannot extend or alter this batch.
@@ -1998,6 +2004,8 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }
@@ -2023,6 +2031,8 @@ fn waiting_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }
@@ -2055,6 +2065,8 @@ fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }

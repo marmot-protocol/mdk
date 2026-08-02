@@ -14,6 +14,7 @@ use crate::{
     TransportBus, observe_client, observe_client_exact,
 };
 use async_trait::async_trait;
+use cgka_engine::engine_metrics::EngineMetricsSnapshot;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
 use cgka_traits::EngineError;
@@ -263,6 +264,18 @@ pub struct SubjectOutboundArtifact {
 #[async_trait]
 pub trait ConvergenceSubject: Send {
     fn descriptor(&self) -> SubjectDescriptor;
+
+    fn database_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    fn replay_probe_count(&self) -> Option<u64> {
+        None
+    }
+
+    fn engine_metrics(&self) -> Option<EngineMetricsSnapshot> {
+        None
+    }
 
     fn select_scenario_group(&mut self, _group: &str) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::MultiGroup))
@@ -1157,6 +1170,41 @@ impl EngineHarnessSubject {
 impl ConvergenceSubject for EngineHarnessSubject {
     fn descriptor(&self) -> SubjectDescriptor {
         self.descriptor.clone()
+    }
+
+    fn database_bytes(&self) -> Option<u64> {
+        let paths = self
+            .clients
+            .values()
+            .filter_map(|client| client.database_path())
+            .collect::<Vec<_>>();
+        (!paths.is_empty()).then(|| {
+            paths
+                .into_iter()
+                .flat_map(|path| {
+                    [
+                        path.to_path_buf(),
+                        path.with_extension("sqlite-wal"),
+                        path.with_extension("sqlite-shm"),
+                    ]
+                })
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .fold(0_u64, |sum, metadata| sum.saturating_add(metadata.len()))
+        })
+    }
+
+    fn replay_probe_count(&self) -> Option<u64> {
+        Some(self.clients.values().fold(0_u64, |sum, client| {
+            sum.saturating_add(client.replay_probe_count())
+        }))
+    }
+
+    fn engine_metrics(&self) -> Option<EngineMetricsSnapshot> {
+        let mut aggregate = EngineMetricsSnapshot::default();
+        for client in self.clients.values() {
+            crate::client::merge_engine_metrics(&mut aggregate, &client.engine_metrics());
+        }
+        Some(aggregate)
     }
 
     fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {

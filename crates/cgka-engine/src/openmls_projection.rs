@@ -159,6 +159,8 @@ struct StoredOpenMlsCandidatePathResult {
     /// Stored commit inputs that could not reach any candidate parent in this
     /// frozen batch and did not fail validation terminally.
     unmaterialized_commit_ids: Vec<String>,
+    #[cfg(feature = "test-conformance-snapshot")]
+    replay_probe_count: u64,
 }
 
 /// Bounds the total OpenMLS replay round-trips a single convergence pass may perform, so
@@ -166,6 +168,8 @@ struct StoredOpenMlsCandidatePathResult {
 /// The pass fails closed (`ReplayBudgetExceeded`) rather than returning a partial result.
 struct ReplayBudget {
     remaining: u64,
+    #[cfg(feature = "test-conformance-snapshot")]
+    consumed: u64,
 }
 
 /// Multiplicative slack over the linear `commits × (max_rewind_commits + 1)` probe estimate.
@@ -177,7 +181,11 @@ pub(crate) const CANDIDATE_REPLAY_BUDGET_FLOOR: u64 = 32;
 
 impl ReplayBudget {
     fn new(limit: u64) -> Self {
-        Self { remaining: limit }
+        Self {
+            remaining: limit,
+            #[cfg(feature = "test-conformance-snapshot")]
+            consumed: 0,
+        }
     }
 
     /// Unlimited budget for callers outside the bounded convergence BFS (e.g. the public
@@ -185,6 +193,8 @@ impl ReplayBudget {
     fn unlimited() -> Self {
         Self {
             remaining: u64::MAX,
+            #[cfg(feature = "test-conformance-snapshot")]
+            consumed: 0,
         }
     }
 
@@ -203,6 +213,10 @@ impl ReplayBudget {
             return Err(OpenMlsProjectionError::ReplayBudgetExceeded);
         }
         self.remaining -= 1;
+        #[cfg(feature = "test-conformance-snapshot")]
+        {
+            self.consumed = self.consumed.saturating_add(1);
+        }
         Ok(())
     }
 }
@@ -1210,6 +1224,8 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         path_result.materialized.len(),
         path_result.candidate_paths.len(),
     );
+    #[cfg(feature = "test-conformance-snapshot")]
+    let replay_probe_count = path_result.replay_probe_count;
 
     let batch = OpenMlsCanonicalizationBatch {
         state: work.state,
@@ -1239,6 +1255,10 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
             work.admit_app_witnesses,
         )?
     };
+    #[cfg(feature = "test-conformance-snapshot")]
+    {
+        result.replay_probe_count = replay_probe_count;
+    }
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     append_missing_parent_deferred_commits(&mut result, path_result.unmaterialized_commit_ids);
     Ok(result)
@@ -1287,6 +1307,8 @@ fn missing_retained_anchor_result(
         queued_outbound_intents: outbound_intents,
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }
@@ -1472,6 +1494,8 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         materialized,
         invalid_commit_drops,
         unmaterialized_commit_ids,
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: budget.consumed,
     })
 }
 

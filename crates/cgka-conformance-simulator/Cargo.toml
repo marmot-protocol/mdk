@@ -39,6 +39,7 @@ proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 # Byte-level conformance vectors for the agent text stream QUIC feature pin
