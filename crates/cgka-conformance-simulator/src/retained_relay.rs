@@ -327,7 +327,11 @@ impl RetainedRelaySubject {
                     }
                 }
             }
-            if let Some(last_sequence) = relay.history.last().map(|event| event.sequence) {
+            // A timestamp-floor query is an independent backfill view. It must
+            // not consume the incremental cursor for events below that floor.
+            if !matches!(mode, ScenarioRelaySyncModeV2::Since { .. })
+                && let Some(last_sequence) = relay.history.last().map(|event| event.sequence)
+            {
                 self.cursors
                     .insert((client.to_owned(), relay_id.clone()), last_sequence);
             }
@@ -424,14 +428,10 @@ impl ConvergenceSubject for RetainedRelaySubject {
 
     async fn create_group(&mut self, action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {
         let client = action.creator.to_owned();
+        let action_id = action.action_id.to_owned();
         let before = self.unresolved_ids(&client)?;
         self.engine.create_group(action).await?;
-        self.tag_new_outbound(
-            &client,
-            &before,
-            "create_group",
-            ScenarioTransportClass::Commit,
-        )
+        self.tag_new_outbound(&client, &before, &action_id, ScenarioTransportClass::Commit)
     }
 
     async fn invite_members(
@@ -1083,6 +1083,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_group_stable_action_id_selects_engine_and_retained_artifacts() {
+        let create_selector = ScenarioMessageSelectorV2 {
+            action_id: Some("step-0:create_group".into()),
+            class: Some(ScenarioTransportClass::Welcome),
+            ..Default::default()
+        };
+        let engine_scenario = ScenarioSpec {
+            name: "scenario-ir/create-action-id-engine".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: single_relay_topology(),
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "engine-create-id".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+                ScenarioStep::DuplicateMessage {
+                    selector: create_selector.clone(),
+                },
+                ScenarioStep::accept_publication("alice", "create"),
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ],
+        };
+        let mut engine = EngineHarnessSubject::new(
+            &engine_scenario.clients,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        let engine_report =
+            run_scenario_report_with_subject(&engine_scenario, None, vec![], &mut engine)
+                .await
+                .unwrap();
+        assert_eq!(
+            engine_report.observed_trace.as_ref().unwrap().observations[0].member_count,
+            2
+        );
+
+        let retained_scenario = ScenarioSpec {
+            name: "scenario-ir/create-action-id-retained".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: single_relay_topology(),
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "retained-create-id".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+                ScenarioStep::accept_publication("alice", "create"),
+                ScenarioStep::SetRelayEventVisibility {
+                    relay: DEFAULT_RELAY_ID.into(),
+                    selector: create_selector.clone(),
+                    clients: vec!["bob".into()],
+                    visible: false,
+                },
+                ScenarioStep::SetRelayEventVisibility {
+                    relay: DEFAULT_RELAY_ID.into(),
+                    selector: create_selector,
+                    clients: vec!["bob".into()],
+                    visible: true,
+                },
+                ScenarioStep::SyncRelayHistory {
+                    clients: vec!["bob".into()],
+                    sync: ScenarioRelaySyncModeV2::FullHistory,
+                },
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ],
+        };
+        let mut retained = RetainedRelaySubject::new(
+            &retained_scenario.clients,
+            &retained_scenario.topology,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        let retained_report =
+            run_scenario_report_with_subject(&retained_scenario, None, vec![], &mut retained)
+                .await
+                .unwrap();
+        assert_eq!(
+            retained_report
+                .observed_trace
+                .as_ref()
+                .unwrap()
+                .observations[0]
+                .member_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_free_founding_create_does_not_leak_its_action_id() {
+        let scenario = ScenarioSpec {
+            name: "scenario-ir/artifact-free-create-action-id".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: single_relay_topology(),
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "founding-create".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "artifact-free-create".into(),
+                },
+                ScenarioStep::InviteMembers {
+                    inviter: "alice".into(),
+                    invitees: vec!["bob".into()],
+                    pending: "invite".into(),
+                },
+                ScenarioStep::accept_publication("alice", "invite"),
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ],
+        };
+        let mut engine = EngineHarnessSubject::new(
+            &scenario.clients,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+
+        let report = run_scenario_report_with_subject(&scenario, None, vec![], &mut engine)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.observed_trace.as_ref().unwrap().observations[0].member_count,
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn eose_does_not_heal_hidden_cursor_history_but_full_backfill_does() {
         let scenario = ScenarioSpec {
             name: "retained-relay/eose-versus-completeness".into(),
@@ -1189,6 +1347,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn since_query_does_not_consume_the_incremental_cursor() {
+        let scenario = ScenarioSpec {
+            name: "retained-relay/since-preserves-incremental-cursor".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: single_relay_topology(),
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "since-cursor".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+                ScenarioStep::accept_publication("alice", "create"),
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "below-since-floor".into(),
+                },
+                ScenarioStep::AcknowledgeOutbound {
+                    client: "alice".into(),
+                    publication: None,
+                    selection: Default::default(),
+                    outcome: SubjectOutboundOutcome::Accepted,
+                },
+                ScenarioStep::SyncRelayHistory {
+                    clients: vec!["bob".into()],
+                    sync: ScenarioRelaySyncModeV2::Since {
+                        timestamp: u64::MAX,
+                    },
+                },
+                ScenarioStep::SyncRelayHistory {
+                    clients: vec!["bob".into()],
+                    sync: ScenarioRelaySyncModeV2::Incremental,
+                },
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ],
+        };
+        let mut subject = RetainedRelaySubject::new(
+            &scenario.clients,
+            &scenario.topology,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+
+        let report = run_scenario_report_with_subject(&scenario, None, vec![], &mut subject)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.observed_trace.as_ref().unwrap().observations[0].received_payloads,
+            vec!["below-since-floor"]
+        );
+        assert!(report.relay_sync_observations.iter().any(|observation| {
+            matches!(observation.mode, ScenarioRelaySyncModeV2::Since { .. })
+                && observation.events_returned == 0
+        }));
+        assert!(report.relay_sync_observations.iter().any(|observation| {
+            observation.mode == ScenarioRelaySyncModeV2::Incremental
+                && observation.injected_objects > 0
+        }));
+    }
+
+    #[tokio::test]
     async fn relay_reverse_order_and_duplicates_are_explicit_and_deduplicated() {
         let scenario = ScenarioSpec {
             name: "retained-relay/order-duplicates".into(),
@@ -1278,6 +1511,7 @@ mod tests {
         .unwrap();
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-publication-lifecycle",
                 creator: "alice",
                 name: "publication-lifecycle",
                 invitees: &[],

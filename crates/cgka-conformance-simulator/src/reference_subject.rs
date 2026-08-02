@@ -501,21 +501,22 @@ impl ConvergenceSubject for ReferenceModelSubject {
             .values()
             .map(|record| (record.artifact.outbound_id.clone(), record.resolution))
             .collect::<BTreeMap<_, _>>();
-        let mut retained = Vec::new();
         for delivery in self.queued.drain(..) {
-            match resolutions.get(&delivery.outbound_id) {
-                Some(Some(SubjectOutboundOutcome::ReachedNoEndpoint)) => {}
-                Some(None | Some(SubjectOutboundOutcome::Accepted)) => {
+            let resolution = resolutions
+                .get(&delivery.outbound_id)
+                .copied()
+                .expect("queued deliveries always reference recorded outbound work");
+            match resolution {
+                Some(SubjectOutboundOutcome::ReachedNoEndpoint) => {}
+                None | Some(SubjectOutboundOutcome::Accepted) => {
                     self.exposed_outbound.insert(delivery.outbound_id);
                     self.mailboxes
                         .entry(delivery.recipient)
                         .or_default()
                         .push(delivery.effect);
                 }
-                _ => retained.push(delivery),
             }
         }
-        self.queued = retained;
         Ok(())
     }
 
@@ -836,6 +837,7 @@ mod tests {
         let mut subject = ReferenceModelSubject::new(&clients).unwrap();
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-implicit-admin",
                 creator: "alice",
                 name: "implicit-admin",
                 invitees: &[],
@@ -875,6 +877,7 @@ mod tests {
         let mut subject = ReferenceModelSubject::new(&clients).unwrap();
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-exposure",
                 creator: "alice",
                 name: "exposure",
                 invitees: &invitees,

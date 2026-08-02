@@ -580,7 +580,9 @@ Status: `complete`
 - [x] Model accounts, devices, processes, roles, groups, relays, and policy/binary versions explicitly.
 - [x] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time with a recorded expanded schedule.
 - [x] Add create, invite, remove, leave, self-update, group/admin state update, and application send.
-- [x] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
+- [x] Add executable offline/reconnect, delay, duplicate, omit, and withhold/release behavior.
+- [x] Declare adapter-neutral process crash/restart and storage-fault steps for later process/storage adapters. No
+  Milestone 2 adapter advertises those capabilities; whole-schedule preflight rejects them before action zero.
 - [x] Replace queue indices with semantic action/message selectors.
 - [x] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
 - [x] Make a repository-owned clean cutover from `ScenarioSpec` v1 to v2 rather than retaining a runtime compatibility

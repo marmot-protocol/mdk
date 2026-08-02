@@ -793,6 +793,14 @@ impl HarnessClient {
                 )));
             }
         };
+        if let Some(action_id) = self.next_scenario_input_id.take()
+            && pending.is_some()
+        {
+            for welcome in &welcomes {
+                self.bus
+                    .register_scenario_action(welcome.id.clone(), action_id.clone());
+            }
+        }
         if let Some(pending) = pending {
             self.remember_pending_publication(
                 pending,

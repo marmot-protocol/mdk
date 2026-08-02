@@ -14,10 +14,15 @@ exactly one device, and every device references one account and process. Process
 rejects duplicate or dangling labels and group admins that are not initial members. Existing repository vectors that
 omit topology resolve deterministically to one account/device/process per client with explicitly `unspecified`
 versions; new cross-adapter and retained-relay scenarios should declare topology rather than relying on that projection.
+The initial adapters consume client/process relay placement. Initial groups, account roles, and process binary/policy
+versions are validated and preserved as scenario metadata but do not yet alter adapter behavior; later compatibility
+and process adapters may interpret them without changing the canonical IR.
 
 An executor accepts only canonical `ScenarioSpec` JSON. It compiles the entire document, assigns stable action ids,
-derives the virtual time before every action, and preflights all adapter capabilities before executing action zero. A
-run report records that exact compiled schedule. Adapters do not interpret loops, concurrency, rates, or barriers.
+derives `declared_virtual_time_ms` as the sum of explicit `advance_time` deltas before every action, and preflights all
+adapter capabilities before executing action zero. A run report records that exact compiled schedule. Assertions and
+quiescence may advance the subject clock while an action executes, so the declared schedule is not described as the
+adapter's observed clock. Adapters do not interpret loops, concurrency, rates, or barriers.
 
 ## Deterministic expansion
 
@@ -71,12 +76,15 @@ rejected during whole-schedule preflight instead of partially running with packe
 `RetainedRelaySubject` maps each scenario process to its declared relay set. Accepted engine emissions fan out into a
 durable history per relay; the underlying packet-bus copy is discarded before delivery. `deliver_all` performs a
 default incremental query for every online participant. `sync_relay_history` selects incremental cursor, explicit
-timestamp floor, full history, or set-reconciliation comparison. Each query records queried relays, EOSE relays,
+timestamp floor, full history, or set-reconciliation comparison. A `since.timestamp` floor is compared with retained
+message wall-clock timestamps in whole seconds; virtual time does not rewrite those timestamps. A `since` query does
+not consume the independent incremental cursor. Each query records queried relays, EOSE relays,
 returned/unique/injected counts, whether the result was quiet, and one of these deliberately distinct claims:
 `relay_eose_only`, `full_history_queried`, `relevant_set_mismatch`, or `relevant_set_equality_verified`.
 
 Relay-control actions configure deterministic natural/reverse order and duplicate copies, change per-client event
-visibility through semantic selectors, and equalize selected relay event sets. A hidden event still advances an
+visibility through semantic selectors, and equalize selected relay event sets. Reconciliation copies missing events
+as newly visible on the repaired relay, clearing any source-relay `hidden_from` exclusions. A hidden event still advances an
 incremental cursor after EOSE, so making it visible later does not magically replay it; an explicit full-history or set
 reconciliation path is required. This is the quiet-group/silent-absence sentinel. The packet bus remains the fast unit
 adapter and is not used as evidence of offline recovery.

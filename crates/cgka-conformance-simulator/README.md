@@ -44,7 +44,7 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
   step logs, recoveries, and expectation failures.
-- `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded virtual-time schedule, exact
+- `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded declared-time schedule, exact
   policy/constants, report/ledgers/state commitments, a bounded transport-evidence tail with truncation counters, and a
   stable failure fingerprint. Explicitly requested byte-exact replay is written to a separately named sensitive sibling
   capsule so the logical campaign capsule remains portable.

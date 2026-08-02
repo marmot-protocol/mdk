@@ -21,8 +21,11 @@ pub struct ScenarioActionScheduleV2 {
     pub action_id: String,
     pub source_step_index: usize,
     pub action_type: String,
-    /// Virtual monotonic time immediately before the action executes.
-    pub virtual_time_ms: u64,
+    /// Sum of explicit `advance_time` deltas preceding this action.
+    ///
+    /// Assertions and quiescence may advance an adapter's observed clock while
+    /// executing, so this compiler schedule is intentionally not that clock.
+    pub declared_virtual_time_ms: u64,
     pub required_capabilities: BTreeSet<SubjectCapability>,
 }
 
@@ -88,24 +91,17 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
 
     let mut virtual_time_ms = 0_u64;
     let topology = spec.topology.resolve_for_clients(&spec.clients)?;
-    let mut action_ids = BTreeSet::new();
     let mut actions = Vec::with_capacity(spec.steps.len());
     for (source_step_index, step) in spec.steps.iter().enumerate() {
         validate_step(source_step_index, step, &clients, &topology)?;
         let action_id = stable_action_id(source_step_index, step);
-        if !action_ids.insert(action_id.clone()) {
-            return Err(compile_error(
-                Some(source_step_index),
-                format!("duplicate compiled action id {action_id}"),
-            ));
-        }
         let required_capabilities = required_capabilities(step).into_iter().collect();
         actions.push(CompiledScenarioActionV2 {
             schedule: ScenarioActionScheduleV2 {
                 action_id,
                 source_step_index,
                 action_type: step.kind().into(),
-                virtual_time_ms,
+                declared_virtual_time_ms: virtual_time_ms,
                 required_capabilities,
             },
             step: step.clone(),
@@ -157,13 +153,61 @@ fn validate_step(
                 validate_semantic_selector(step_index, selector)?;
             }
         }
-        ScenarioStep::SetClientOffline { client } | ScenarioStep::ReconnectClient { client } => {
-            if !clients.contains(client) {
-                return Err(compile_error(
-                    Some(step_index),
-                    format!("connectivity action references unknown client {client}"),
-                ));
+        ScenarioStep::CreateGroup {
+            creator,
+            invitees,
+            initial_admins,
+            ..
+        } => {
+            validate_client(step_index, creator, clients, "group creation")?;
+            validate_clients(step_index, invitees, clients, "group creation invitees")?;
+            if let Some(initial_admins) = initial_admins {
+                validate_clients(
+                    step_index,
+                    initial_admins,
+                    clients,
+                    "group creation administrators",
+                )?;
             }
+        }
+        ScenarioStep::InviteMembers {
+            inviter, invitees, ..
+        } => {
+            validate_client(step_index, inviter, clients, "member invitation")?;
+            validate_clients(step_index, invitees, clients, "member invitation")?;
+        }
+        ScenarioStep::RemoveMembers {
+            remover, members, ..
+        } => {
+            validate_client(step_index, remover, clients, "member removal")?;
+            validate_clients(step_index, members, clients, "member removal")?;
+        }
+        ScenarioStep::SelfUpdate { client, .. }
+        | ScenarioStep::UpdateGroupData { client, .. }
+        | ScenarioStep::Leave { client }
+        | ScenarioStep::RestartClient { client }
+        | ScenarioStep::SetClientOffline { client }
+        | ScenarioStep::ReconnectClient { client } => {
+            validate_client(step_index, client, clients, step.kind())?;
+        }
+        ScenarioStep::UpdateAdminPolicy { client, admins, .. }
+        | ScenarioStep::ExpectUpdateAdminPolicyError { client, admins, .. } => {
+            validate_client(step_index, client, clients, step.kind())?;
+            validate_clients(step_index, admins, clients, step.kind())?;
+        }
+        ScenarioStep::AcknowledgeOutbound { client, .. } => {
+            validate_client(step_index, client, clients, "outbound acknowledgement")?;
+        }
+        ScenarioStep::SendAppMessage { sender, .. } => {
+            validate_client(step_index, sender, clients, "application send")?;
+        }
+        ScenarioStep::Tick { clients: labels }
+        | ScenarioStep::Observe { clients: labels }
+        | ScenarioStep::ObserveExact { clients: labels }
+        | ScenarioStep::ProbeBidirectionalDecryptability { clients: labels }
+        | ScenarioStep::ObserveAdminPolicy { clients: labels }
+        | ScenarioStep::ClearEvents { clients: labels } => {
+            validate_clients(step_index, labels, clients, step.kind())?;
         }
         ScenarioStep::SyncRelayHistory {
             clients: sync_clients,
@@ -242,28 +286,13 @@ fn validate_step(
         ScenarioStep::Assert { assertion } => {
             validate_assertion(step_index, assertion, clients)?;
         }
-        ScenarioStep::CreateGroup { .. }
-        | ScenarioStep::InviteMembers { .. }
-        | ScenarioStep::RemoveMembers { .. }
-        | ScenarioStep::SelfUpdate { .. }
-        | ScenarioStep::UpdateGroupData { .. }
-        | ScenarioStep::UpdateAdminPolicy { .. }
-        | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
-        | ScenarioStep::AcknowledgeOutbound { .. }
-        | ScenarioStep::SendAppMessage { .. }
-        | ScenarioStep::Leave { .. }
-        | ScenarioStep::DeliverAll
-        | ScenarioStep::Tick { .. }
+        ScenarioStep::SetPartition { allow } => {
+            validate_clients(step_index, allow, clients, "partition")?;
+        }
+        ScenarioStep::DeliverAll
         | ScenarioStep::AdvanceTime { .. }
         | ScenarioStep::AwaitQuiescence { .. }
-        | ScenarioStep::Observe { .. }
-        | ScenarioStep::ObserveExact { .. }
-        | ScenarioStep::ProbeBidirectionalDecryptability { .. }
-        | ScenarioStep::ObserveAdminPolicy { .. }
-        | ScenarioStep::ClearEvents { .. }
-        | ScenarioStep::SetPartition { .. }
         | ScenarioStep::ClearPartition
-        | ScenarioStep::RestartClient { .. }
         | ScenarioStep::Barrier { .. } => {}
     }
     Ok(())
@@ -306,15 +335,35 @@ fn validate_nonempty_clients(
             format!("{operation} requires at least one client"),
         ));
     }
+    validate_clients(step_index, labels, clients, operation)
+}
+
+fn validate_clients(
+    step_index: usize,
+    labels: &[String],
+    clients: &BTreeSet<&String>,
+    operation: &str,
+) -> Result<(), ScenarioRunError> {
     for client in labels {
-        if !clients.contains(client) {
-            return Err(compile_error(
-                Some(step_index),
-                format!("{operation} references unknown client {client}"),
-            ));
-        }
+        validate_client(step_index, client, clients, operation)?;
     }
     Ok(())
+}
+
+fn validate_client(
+    step_index: usize,
+    client: &String,
+    clients: &BTreeSet<&String>,
+    operation: &str,
+) -> Result<(), ScenarioRunError> {
+    if clients.contains(client) {
+        Ok(())
+    } else {
+        Err(compile_error(
+            Some(step_index),
+            format!("{operation} references unknown client {client}"),
+        ))
+    }
 }
 
 fn validate_assertion(
@@ -478,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn compilation_assigns_stable_ids_and_virtual_time_before_actions() {
+    fn compilation_assigns_stable_ids_and_declared_time_before_actions() {
         let spec = ScenarioSpec {
             name: "compile/v2".into(),
             spec_version: "2".into(),
@@ -498,10 +547,10 @@ mod tests {
             compiled.actions[0].schedule.action_id,
             "step-0:advance_time"
         );
-        assert_eq!(compiled.actions[0].schedule.virtual_time_ms, 0);
+        assert_eq!(compiled.actions[0].schedule.declared_virtual_time_ms, 0);
         assert_eq!(compiled.actions[1].schedule.action_id, "step-1:tick");
-        assert_eq!(compiled.actions[1].schedule.virtual_time_ms, 25);
-        assert_eq!(compiled.actions[2].schedule.virtual_time_ms, 25);
+        assert_eq!(compiled.actions[1].schedule.declared_virtual_time_ms, 25);
+        assert_eq!(compiled.actions[2].schedule.declared_virtual_time_ms, 25);
     }
 
     #[test]
@@ -544,6 +593,126 @@ mod tests {
             },
             "unknown client bob",
         );
+    }
+
+    #[test]
+    fn every_client_bearing_step_rejects_unknown_labels_before_execution() {
+        let unknown = "bob".to_owned();
+        let steps = vec![
+            ScenarioStep::CreateGroup {
+                creator: unknown.clone(),
+                name: "group".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "group".into(),
+                invitees: vec![unknown.clone()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "group".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: Some(vec![unknown.clone()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::InviteMembers {
+                inviter: unknown.clone(),
+                invitees: vec![],
+                pending: "invite".into(),
+            },
+            ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: vec![unknown.clone()],
+                pending: "invite".into(),
+            },
+            ScenarioStep::RemoveMembers {
+                remover: unknown.clone(),
+                members: vec![],
+                pending: "remove".into(),
+            },
+            ScenarioStep::RemoveMembers {
+                remover: "alice".into(),
+                members: vec![unknown.clone()],
+                pending: "remove".into(),
+            },
+            ScenarioStep::SelfUpdate {
+                client: unknown.clone(),
+                pending: "self".into(),
+            },
+            ScenarioStep::UpdateGroupData {
+                client: unknown.clone(),
+                name: "next".into(),
+                pending: "data".into(),
+            },
+            ScenarioStep::UpdateAdminPolicy {
+                client: unknown.clone(),
+                admins: vec![],
+                pending: "admins".into(),
+            },
+            ScenarioStep::UpdateAdminPolicy {
+                client: "alice".into(),
+                admins: vec![unknown.clone()],
+                pending: "admins".into(),
+            },
+            ScenarioStep::ExpectUpdateAdminPolicyError {
+                client: unknown.clone(),
+                admins: vec![],
+                error: "not_authorized".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: unknown.clone(),
+                publication: None,
+                selection: Default::default(),
+                outcome: crate::SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::SendAppMessage {
+                sender: unknown.clone(),
+                payload: "payload".into(),
+            },
+            ScenarioStep::Leave {
+                client: unknown.clone(),
+            },
+            ScenarioStep::Tick {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::Observe {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::ProbeBidirectionalDecryptability {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::ObserveAdminPolicy {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::ClearEvents {
+                clients: vec![unknown.clone()],
+            },
+            ScenarioStep::SetPartition {
+                allow: vec![unknown.clone()],
+            },
+            ScenarioStep::RestartClient {
+                client: unknown.clone(),
+            },
+            ScenarioStep::SetClientOffline {
+                client: unknown.clone(),
+            },
+            ScenarioStep::ReconnectClient { client: unknown },
+        ];
+
+        for step in steps {
+            assert_step_compile_error(step, "unknown client bob");
+        }
     }
 
     #[test]

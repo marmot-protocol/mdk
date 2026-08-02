@@ -90,6 +90,7 @@ struct Inner {
     delayed: HashMap<String, Vec<InFlight>>,
     scenario_input_by_transport_id: HashMap<MessageId, ScenarioInputMetadata>,
     scenario_input_by_content_id: HashMap<MessageId, ScenarioInputMetadata>,
+    scenario_action_by_transport_id: HashMap<MessageId, String>,
     exposed_recipient_counts: HashMap<MessageId, usize>,
 }
 
@@ -118,6 +119,7 @@ impl TransportBus {
                 delayed: HashMap::new(),
                 scenario_input_by_transport_id: HashMap::new(),
                 scenario_input_by_content_id: HashMap::new(),
+                scenario_action_by_transport_id: HashMap::new(),
                 exposed_recipient_counts: HashMap::new(),
             })),
         }
@@ -277,6 +279,18 @@ impl TransportBus {
         inner
             .scenario_input_by_content_id
             .insert(content_id, metadata);
+    }
+
+    pub(crate) fn register_scenario_action(
+        &self,
+        transport_id: MessageId,
+        action_id: impl Into<String>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .scenario_action_by_transport_id
+            .insert(transport_id, action_id.into());
     }
 
     pub(crate) fn scenario_input_for_transport(
@@ -482,9 +496,13 @@ impl TransportBus {
                         .is_none_or(|message_ids| message_ids.contains(&in_flight.msg.id))
                     && selector.action_id.as_ref().is_none_or(|action_id| {
                         inner
-                            .scenario_input_by_transport_id
+                            .scenario_action_by_transport_id
                             .get(&in_flight.msg.id)
-                            .is_some_and(|metadata| metadata.scenario_id == *action_id)
+                            .is_some_and(|registered| registered == action_id)
+                            || inner
+                                .scenario_input_by_transport_id
+                                .get(&in_flight.msg.id)
+                                .is_some_and(|metadata| metadata.scenario_id == *action_id)
                     })
                     && selector.class.is_none_or(|class| {
                         transport_class_matches(

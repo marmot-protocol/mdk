@@ -330,7 +330,8 @@ pub struct ScenarioReport {
     /// legacy client-only vectors.
     #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
     pub resolved_topology: crate::ScenarioTopologyV2,
-    /// Authoritative compiler output executed by the selected adapter.
+    /// Authoritative compiler output executed by the selected adapter. Its
+    /// declared time excludes clock movement inside assertions/quiescence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -700,6 +701,7 @@ async fn execute_scenario_step(
                 .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
             subject
                 .create_group(SubjectCreateGroup {
+                    action_id: &action_id,
                     creator,
                     name,
                     invitees,

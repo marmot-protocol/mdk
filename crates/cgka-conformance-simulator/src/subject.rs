@@ -166,6 +166,7 @@ impl fmt::Display for SubjectError {
 impl std::error::Error for SubjectError {}
 
 pub struct SubjectCreateGroup<'a> {
+    pub action_id: &'a str,
     pub creator: &'a str,
     pub name: &'a str,
     pub invitees: &'a [String],
@@ -1064,6 +1065,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let key_packages = self.fresh_key_packages(action.invitees).await?;
         let required_features = required_features_from_names(action.required_features)?;
         let creator = self.client_mut(action.creator)?;
+        creator.name_next_scenario_input(action.action_id);
         let (_, pending_ref) = creator
             .create_group_with_admins_maybe_pending(
                 action.name,
@@ -1906,6 +1908,7 @@ mod tests {
     ) {
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-outbound-contract",
                 creator,
                 name: "outbound-contract",
                 invitees,
@@ -2085,6 +2088,7 @@ mod tests {
         for label in &labels {
             subject
                 .create_group(SubjectCreateGroup {
+                    action_id: "create-independent-group",
                     creator: label,
                     name: "independent-group",
                     invitees: &[],
@@ -2497,6 +2501,7 @@ mod tests {
         .expect("engine subject constructs");
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-exposed-welcome",
                 creator: "alice",
                 name: "exposed-welcome",
                 invitees: &labels[1..],
@@ -2541,6 +2546,7 @@ mod tests {
 
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-empty-group",
                 creator: "alice",
                 name: "empty-group",
                 invitees: &[],
@@ -2579,6 +2585,7 @@ mod tests {
         .expect("engine subject constructs");
         subject
             .create_group(SubjectCreateGroup {
+                action_id: "create-explicit",
                 creator: "alice",
                 name: "explicit-create",
                 invitees: &labels[1..],
@@ -2817,6 +2824,7 @@ mod tests {
         for label in &labels {
             subject
                 .create_group(SubjectCreateGroup {
+                    action_id: "create-virtual-time",
                     creator: label,
                     name: "virtual-time",
                     invitees: &[],

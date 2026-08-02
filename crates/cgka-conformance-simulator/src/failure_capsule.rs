@@ -92,7 +92,9 @@ pub struct ExpandedScenarioActionV1 {
     pub action_id: String,
     pub step_index: usize,
     pub action_type: String,
-    /// Virtual monotonic time immediately before this action executes.
+    /// Sum of explicit `advance_time` deltas preceding this planned action.
+    ///
+    /// The legacy field name remains part of the version-1 capsule contract.
     pub virtual_time_ms: u64,
     /// `None` means execution stopped before this planned action.
     pub status: Option<ScenarioStepStatus>,
@@ -265,7 +267,7 @@ impl FailureCapsuleV1 {
                 action_id: scheduled.action_id.clone(),
                 step_index: scheduled.source_step_index,
                 action_type: scheduled.action_type.clone(),
-                virtual_time_ms: scheduled.virtual_time_ms,
+                virtual_time_ms: scheduled.declared_virtual_time_ms,
                 status: report
                     .step_log
                     .iter()
