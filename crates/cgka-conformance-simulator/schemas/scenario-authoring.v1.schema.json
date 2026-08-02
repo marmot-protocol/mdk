@@ -13,6 +13,7 @@
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     },
+    "topology": { "$ref": "scenario-ir.v2.schema.json#/$defs/topology" },
     "steps": {
       "type": "array",
       "items": { "$ref": "#/$defs/flow" }

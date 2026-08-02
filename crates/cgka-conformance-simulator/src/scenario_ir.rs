@@ -37,6 +37,7 @@ pub struct CompiledScenarioV2 {
     pub name: String,
     pub spec_version: String,
     pub clients: Vec<String>,
+    pub topology: crate::ScenarioTopologyV2,
     pub actions: Vec<CompiledScenarioActionV2>,
 }
 
@@ -86,6 +87,7 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
     }
 
     let mut virtual_time_ms = 0_u64;
+    let topology = spec.topology.resolve_for_clients(&spec.clients)?;
     let mut action_ids = BTreeSet::new();
     let mut actions = Vec::with_capacity(spec.steps.len());
     for (source_step_index, step) in spec.steps.iter().enumerate() {
@@ -121,6 +123,7 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
         name: spec.name.clone(),
         spec_version: spec.spec_version.clone(),
         clients: spec.clients.clone(),
+        topology,
         actions,
     })
 }
@@ -166,6 +169,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "compile/v2".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into()],
             steps: vec![
                 ScenarioStep::AdvanceTime { delta_ms: 25 },
@@ -192,6 +196,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "preflight/v2".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into()],
             steps: vec![ScenarioStep::RestartClient {
                 client: "alice".into(),

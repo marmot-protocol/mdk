@@ -37,6 +37,7 @@ mod scenario_authoring;
 mod scenario_input_ledger;
 mod scenario_ir;
 pub mod subject;
+mod topology;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
@@ -113,8 +114,12 @@ pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
-    engine_harness_feature_registry, required_capabilities,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
+    SubjectUpdateGroupData, engine_harness_feature_registry, required_capabilities,
+};
+pub use topology::{
+    ScenarioAccountV2, ScenarioDeviceV2, ScenarioGroupV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioTopologyV2,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

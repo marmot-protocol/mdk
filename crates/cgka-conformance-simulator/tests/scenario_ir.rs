@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    ScenarioSpec, ScenarioStep, VectorFixture, compile_scenario, run_scenario_report,
+    ScenarioSpec, ScenarioStep, SubjectOutboundOutcome, VectorFixture, compile_scenario,
+    run_scenario_report,
 };
 
 #[test]
@@ -24,6 +25,81 @@ fn schema_declares_every_executable_step_kind() {
         .collect::<BTreeSet<_>>();
     let executable_kinds = ScenarioStep::KINDS.iter().copied().collect::<BTreeSet<_>>();
     assert_eq!(schema_kinds, executable_kinds);
+}
+
+#[tokio::test]
+async fn self_update_and_remove_members_use_the_common_adapter_contract() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/membership-operations".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "membership".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("create".into()),
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "alice".into()],
+            },
+            ScenarioStep::SelfUpdate {
+                client: "alice".into(),
+                pending: "rotate".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("rotate".into()),
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "alice".into()],
+            },
+            ScenarioStep::RemoveMembers {
+                remover: "alice".into(),
+                members: vec!["bob".into()],
+                pending: "remove".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("remove".into()),
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "alice".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("scenario report");
+    assert!(
+        report.step_log.iter().all(|step| matches!(
+            step.status,
+            cgka_conformance_simulator::ScenarioStepStatus::Completed
+        )),
+        "membership scenario failed: {:?}",
+        report.step_log
+    );
+    assert_eq!(report.resolved_topology.devices.len(), 2);
 }
 
 #[test]
@@ -57,6 +133,7 @@ async fn report_records_the_exact_schedule_consumed_by_execution() {
     let scenario = ScenarioSpec {
         name: "compiled-report/v2".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into()],
         steps: vec![
             ScenarioStep::AdvanceTime { delta_ms: 10 },

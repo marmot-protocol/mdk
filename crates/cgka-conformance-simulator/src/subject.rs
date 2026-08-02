@@ -171,6 +171,19 @@ pub struct SubjectInviteMembers<'a> {
     pub pending: &'a str,
 }
 
+pub struct SubjectRemoveMembers<'a> {
+    pub action_id: &'a str,
+    pub remover: &'a str,
+    pub members: &'a [String],
+    pub pending: &'a str,
+}
+
+pub struct SubjectSelfUpdate<'a> {
+    pub action_id: &'a str,
+    pub client: &'a str,
+    pub pending: &'a str,
+}
+
 pub struct SubjectUpdateGroupData<'a> {
     pub action_id: &'a str,
     pub client: &'a str,
@@ -253,6 +266,17 @@ pub trait ConvergenceSubject: Send {
         &mut self,
         _action: SubjectUpdateGroupData<'_>,
     ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
+    }
+
+    async fn remove_members(
+        &mut self,
+        _action: SubjectRemoveMembers<'_>,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
+    }
+
+    async fn self_update(&mut self, _action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
     }
 
@@ -408,6 +432,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         vec![match step {
             ScenarioStep::CreateGroup { .. }
             | ScenarioStep::InviteMembers { .. }
+            | ScenarioStep::RemoveMembers { .. }
+            | ScenarioStep::SelfUpdate { .. }
             | ScenarioStep::UpdateGroupData { .. }
             | ScenarioStep::UpdateAdminPolicy { .. }
             | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
@@ -856,6 +882,24 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let client = self.client_mut(action.client)?;
         client.name_next_scenario_input(action.action_id);
         let pending_ref = client.update_group_data(action.name.to_owned()).await;
+        self.insert_pending(action.pending, action.client, pending_ref)
+    }
+
+    async fn remove_members(
+        &mut self,
+        action: SubjectRemoveMembers<'_>,
+    ) -> Result<(), SubjectError> {
+        let member_ids = self.member_ids(action.members)?;
+        let remover = self.client_mut(action.remover)?;
+        remover.name_next_scenario_input(action.action_id);
+        let pending_ref = remover.remove_members(member_ids).await;
+        self.insert_pending(action.pending, action.remover, pending_ref)
+    }
+
+    async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
+        let client = self.client_mut(action.client)?;
+        client.name_next_scenario_input(action.action_id);
+        let pending_ref = client.self_update().await;
         self.insert_pending(action.pending, action.client, pending_ref)
     }
 

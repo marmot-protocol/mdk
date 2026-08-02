@@ -8,6 +8,13 @@ The simulator has two deliberately separate inputs:
   to an adapter. The repository compiler deterministically lowers it to canonical JSON first. Its schema is
   `schemas/scenario-authoring.v1.schema.json`.
 
+The canonical document declares accounts, devices, processes, initial groups, relays, account roles, process
+binary/policy versions, and relay implementation/policy versions in `topology`. Each action-facing client label maps to
+exactly one device, and every device references one account and process. Process relay sets may differ. The compiler
+rejects duplicate or dangling labels and group admins that are not initial members. Existing repository vectors that
+omit topology resolve deterministically to one account/device/process per client with explicitly `unspecified`
+versions; new cross-adapter and retained-relay scenarios should declare topology rather than relying on that projection.
+
 An executor accepts only canonical `ScenarioSpec` JSON. It compiles the entire document, assigns stable action ids,
 derives the virtual time before every action, and preflights all adapter capabilities before executing action zero. A
 run report records that exact compiled schedule. Adapters do not interpret loops, concurrency, rates, or barriers.

@@ -20,6 +20,8 @@ pub struct ScenarioAuthoringSpec {
     pub name: String,
     pub authoring_version: String,
     pub clients: Vec<String>,
+    #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
+    pub topology: crate::ScenarioTopologyV2,
     pub steps: Vec<ScenarioFlow>,
 }
 
@@ -91,6 +93,7 @@ pub fn compile_authoring_scenario(
         name: authored.name.clone(),
         spec_version: SCENARIO_IR_VERSION.into(),
         clients: authored.clients.clone(),
+        topology: authored.topology.clone(),
         steps: expanded
             .into_iter()
             .map(|flow| match flow {
@@ -455,6 +458,7 @@ mod tests {
             name: "authoring/round-trip".into(),
             authoring_version: SCENARIO_AUTHORING_VERSION.into(),
             clients: vec!["alice".into()],
+            topology: Default::default(),
             steps: vec![ScenarioFlow::Repeat {
                 count: 2,
                 steps: vec![send("alice", "hello")],

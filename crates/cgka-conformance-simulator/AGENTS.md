@@ -85,11 +85,16 @@ the property-test registry. This file is the agent-facing model.
     app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
     into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
     `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
+    Membership operations include invite, admin removal, leave, and leaf self-update through the same subject contract.
 
 - **Module:** `src/scenario_ir.rs`
   - **Role:** Canonical ScenarioSpec v2 compiler. It validates input, assigns stable action ids, records the deterministic
     virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
     selected subject executes anything. The JSON contract is `schemas/scenario-ir.v2.schema.json`.
+
+- **Module:** `src/topology.rs`
+  - **Role:** Adapter-neutral accounts, devices, processes, groups, relays, roles, and binary/policy versions. The
+    compiler validates all cross-references and resolves old client-only vectors to an explicit deterministic topology.
 
 - **Module:** `src/scenario_authoring.rs`
   - **Role:** Authoring-only repeat, deterministic parallel, rate, burst, and barrier expansion. It lowers into canonical

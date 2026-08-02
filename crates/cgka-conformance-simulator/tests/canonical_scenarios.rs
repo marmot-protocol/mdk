@@ -251,6 +251,7 @@ async fn bidirectional_decryptability_probe_passes_for_settled_members() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/settled".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -311,6 +312,7 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/asymmetric-epoch".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -387,6 +389,7 @@ async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/nonmember".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -910,6 +913,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
     let spec = ScenarioSpec {
         name: "three-client-message-exchange/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -957,6 +961,7 @@ async fn scenario_spec_supports_publish_fail() {
     let spec = ScenarioSpec {
         name: "publish-fail/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -995,6 +1000,7 @@ async fn definite_publish_failure_retracts_commit_before_local_rollback() {
     let spec = ScenarioSpec {
         name: "transported-commit-after-local-rollback/minimal/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1156,6 +1162,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
     let spec = ScenarioSpec {
         name: "leave-and-clear-partition/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1221,6 +1228,7 @@ async fn scenario_spec_can_drop_queued_message() {
     let spec = ScenarioSpec {
         name: "drop-queued/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1264,6 +1272,7 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
     let spec = ScenarioSpec {
         name: "queue-faults/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1333,6 +1342,7 @@ async fn exact_observation_ledgers_commit_proposal_and_application_dispositions(
     let spec = ScenarioSpec {
         name: "generalized-scenario-input-ledger/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1859,6 +1869,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
     let mut scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2056,6 +2067,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "group-data-fork-recovery/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2101,6 +2113,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2147,6 +2160,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
     let spec = ScenarioSpec {
         name: "report-mismatch/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2674,6 +2688,7 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "convergence-e2e-group-events/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec![
             "alice".into(),
             "bob".into(),

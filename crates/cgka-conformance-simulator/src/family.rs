@@ -268,6 +268,7 @@ fn convergence_chaos_invite_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExp
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob", "david", "eve"]),
         steps: vec![
             create_group(
@@ -308,6 +309,7 @@ fn convergence_chaos_group_data_fork(case_index: u64) -> (ScenarioSpec, Vec<Trac
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob"]),
         steps: vec![
             create_group(
@@ -414,6 +416,7 @@ fn convergence_chaos_rollback_queue_faults(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob"]),
         steps,
     };
@@ -433,6 +436,7 @@ fn convergence_chaos_stable_queue_faults(case_index: u64) -> (ScenarioSpec, Vec<
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob", "carol"]),
         steps: vec![
             create_group(
@@ -481,6 +485,7 @@ fn convergence_chaos_partition_leave(case_index: u64) -> (ScenarioSpec, Vec<Trac
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob"]),
         steps: vec![
             create_group(
@@ -541,6 +546,7 @@ fn convergence_chaos_delayed_past_epoch_app(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob", "carol", "david"]),
         steps: vec![
             create_group(
@@ -630,6 +636,7 @@ fn convergence_chaos_large_message_storm(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients,
         steps,
     };
@@ -683,6 +690,7 @@ fn convergence_chaos_large_partitioned_storm(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients,
         steps,
     };
@@ -733,6 +741,7 @@ fn convergence_chaos_large_commit_storm(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients,
         steps,
     };
@@ -811,6 +820,7 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients,
         steps,
     };
@@ -843,6 +853,7 @@ fn convergence_chaos_restart_delivery_faults(
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: labels(["alice", "bob", "carol"]),
         steps: vec![
             create_group(
@@ -1157,6 +1168,7 @@ fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioS
     ScenarioSpec {
         name: format!("convergence-e2e-delivery/v1/case-{case_index}"),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients,
         steps,
     }
@@ -1334,6 +1346,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
         ScenarioSpec {
             name: format!("send-leave/v1/case-{case_index}"),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients,
             steps,
         },
@@ -1411,6 +1424,7 @@ mod tests {
         let mut scenario = ScenarioSpec {
             name: "missing-outbound-coverage".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into()],
             steps: vec![],
         };

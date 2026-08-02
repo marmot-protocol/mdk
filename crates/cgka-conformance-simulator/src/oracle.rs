@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 pub enum ScenarioStimulus {
     CreateGroup,
     InviteMembers,
+    RemoveMembers,
+    SelfUpdate,
     GroupDataUpdate,
     AdminPolicyUpdate,
     PublishConfirm,
@@ -292,6 +294,14 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::InviteMembers { .. } => {
                 stimuli.insert(ScenarioStimulus::InviteMembers);
+            }
+            ScenarioStep::RemoveMembers { .. } => {
+                stimuli.insert(ScenarioStimulus::RemoveMembers);
+                commits += 1;
+            }
+            ScenarioStep::SelfUpdate { .. } => {
+                stimuli.insert(ScenarioStimulus::SelfUpdate);
+                commits += 1;
             }
             ScenarioStep::UpdateGroupData { .. } => {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
@@ -650,6 +660,17 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::MemberAdded,
             OracleBehavior::ClientConvergence,
             OracleBehavior::ClientState,
+        ],
+        ScenarioStimulus::RemoveMembers => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::MemberRemoved,
+            OracleBehavior::ClientConvergence,
+            OracleBehavior::ClientState,
+        ],
+        ScenarioStimulus::SelfUpdate => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::EpochChanged,
+            OracleBehavior::ClientConvergence,
         ],
         ScenarioStimulus::GroupDataUpdate => vec![
             OracleBehavior::PendingConfirmed,

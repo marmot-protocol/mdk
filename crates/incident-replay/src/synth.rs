@@ -91,6 +91,7 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec![winner.to_owned(), loser.to_owned()],
             steps,
         },
@@ -199,6 +200,7 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients,
             steps,
         },
@@ -323,6 +325,7 @@ fn convergence_fixture(
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: [COMMITTER_A, COMMITTER_B, OBSERVER, INVITEE_A, INVITEE_B]
                 .into_iter()
                 .map(str::to_owned)

@@ -13,12 +13,75 @@
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     },
+    "topology": { "$ref": "#/$defs/topology" },
     "steps": {
       "type": "array",
       "items": { "$ref": "#/$defs/step" }
     }
   },
   "$defs": {
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accounts": { "type": "array", "items": { "$ref": "#/$defs/account" } },
+        "devices": { "type": "array", "items": { "$ref": "#/$defs/device" } },
+        "processes": { "type": "array", "items": { "$ref": "#/$defs/process" } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group" } },
+        "relays": { "type": "array", "items": { "$ref": "#/$defs/relay" } }
+      }
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "roles": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "account", "process", "client"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "account": { "type": "string", "minLength": 1 },
+        "process": { "type": "string", "minLength": 1 },
+        "client": { "type": "string", "minLength": 1 }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "binary_version", "policy_version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "binary_version": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "relays": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "members": { "$ref": "#/$defs/string_array" },
+        "admins": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "implementation_version", "policy_version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "implementation_version": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 }
+      }
+    },
     "string_array": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
@@ -47,6 +110,27 @@
             "type": { "const": "invite_members" },
             "inviter": { "type": "string", "minLength": 1 },
             "invitees": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "remover", "members", "pending"],
+          "properties": {
+            "type": { "const": "remove_members" },
+            "remover": { "type": "string", "minLength": 1 },
+            "members": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "pending"],
+          "properties": {
+            "type": { "const": "self_update" },
+            "client": { "type": "string", "minLength": 1 },
             "pending": { "type": "string", "minLength": 1 }
           }
         },

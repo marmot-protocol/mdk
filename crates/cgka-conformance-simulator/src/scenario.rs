@@ -11,9 +11,10 @@ use crate::{
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
-    VectorFixture, build_scenario_oracle_report, compare_trace_expectations, compile_scenario,
-    drive_subject_to_quiescence, preflight_compiled_scenario, stable_action_id,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
+    SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
+    compare_trace_expectations, compile_scenario, drive_subject_to_quiescence,
+    preflight_compiled_scenario, stable_action_id,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ pub struct ScenarioSpec {
     pub name: String,
     pub spec_version: String,
     pub clients: Vec<String>,
+    #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
+    pub topology: crate::ScenarioTopologyV2,
     pub steps: Vec<ScenarioStep>,
 }
 
@@ -66,6 +69,15 @@ pub enum ScenarioStep {
     InviteMembers {
         inviter: String,
         invitees: Vec<String>,
+        pending: String,
+    },
+    RemoveMembers {
+        remover: String,
+        members: Vec<String>,
+        pending: String,
+    },
+    SelfUpdate {
+        client: String,
         pending: String,
     },
     UpdateGroupData {
@@ -166,6 +178,8 @@ impl ScenarioStep {
     pub const KINDS: &'static [&'static str] = &[
         "create_group",
         "invite_members",
+        "remove_members",
+        "self_update",
         "update_group_data",
         "update_admin_policy",
         "expect_update_admin_policy_error",
@@ -214,6 +228,8 @@ impl ScenarioStep {
         match self {
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
+            ScenarioStep::RemoveMembers { .. } => "remove_members",
+            ScenarioStep::SelfUpdate { .. } => "self_update",
             ScenarioStep::UpdateGroupData { .. } => "update_group_data",
             ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
@@ -248,6 +264,10 @@ impl ScenarioStep {
 pub struct ScenarioReport {
     pub metadata: ScenarioReportMetadata,
     pub scenario: ScenarioSpec,
+    /// Validated explicit topology, including deterministic projection for
+    /// legacy client-only vectors.
+    #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
+    pub resolved_topology: crate::ScenarioTopologyV2,
     /// Authoritative compiler output executed by the selected adapter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
@@ -637,6 +657,31 @@ async fn execute_scenario_step(
                 .await
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
+        ScenarioStep::RemoveMembers {
+            remover,
+            members,
+            pending,
+        } => {
+            subject
+                .remove_members(SubjectRemoveMembers {
+                    action_id: &action_id,
+                    remover,
+                    members,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::SelfUpdate { client, pending } => {
+            subject
+                .self_update(SubjectSelfUpdate {
+                    action_id: &action_id,
+                    client,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
         ScenarioStep::UpdateGroupData {
             client,
             name,
@@ -997,6 +1042,7 @@ async fn run_scenario_report_inner(
             fixture,
         },
         scenario: spec.clone(),
+        resolved_topology: compiled.topology.clone(),
         expanded_schedule: compiled.expanded_schedule(),
         expected_trace,
         expected_outcomes,
@@ -1178,6 +1224,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "admin policy fallback".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1207,6 +1254,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "unsupported-subject-capability/v1".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned()],
             steps: vec![
                 ScenarioStep::SendAppMessage {
@@ -1243,6 +1291,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "subject-virtual-time/v1".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![ScenarioStep::AdvanceTime { delta_ms: 750 }],
         };
@@ -1316,6 +1365,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "await-quiescence-smoke/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into(), "bob".into()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1362,6 +1412,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "await-quiescence-blocked/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into(), "bob".into()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1420,6 +1471,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "step-failure-artifact/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into()],
             steps: vec![ScenarioStep::AcknowledgeOutbound {
                 client: "alice".into(),
@@ -1530,6 +1582,7 @@ mod tests {
                     "same-horizon-batch/v1".into()
                 },
                 spec_version: "2".into(),
+                topology: Default::default(),
                 clients,
                 steps,
             }
@@ -1634,6 +1687,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "removed-v1".to_owned(),
             spec_version: "1".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned()],
             steps: Vec::new(),
         };
@@ -1656,6 +1710,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "replay-target".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![
                 ScenarioStep::Tick {
@@ -1676,6 +1731,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "subject-boundary-smoke/v2".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {

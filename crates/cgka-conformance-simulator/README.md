@@ -26,7 +26,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `ScenarioSpec` — the canonical JSON v2 input contract for deterministic scripted scenarios, including explicit
   outbound acknowledgement, queue faults, and partitions. The runner compiles the whole document into a stable action
   schedule and preflights every required adapter capability before executing the first action; the schema is
-  `schemas/scenario-ir.v2.schema.json`.
+  `schemas/scenario-ir.v2.schema.json`. New scenarios can declare accounts, devices, processes, groups, relays, roles,
+  and binary/policy versions explicitly; old vectors receive a visible deterministic topology projection in reports.
 - `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
   burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
