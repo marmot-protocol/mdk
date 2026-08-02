@@ -647,9 +647,10 @@ mixed convergence policies but permits mixed binary versions when their policy a
 future incompatible policy revision must introduce an authenticated required capability or GroupContext application
 component atomically with the new behavior; a diagnostic binary version is never protocol evidence.
 
-The losing-branch invite campaign records a current protocol limit: a device admitted only by the losing commit remains
-on a non-equivalent local state after the canonical group re-invites that account. The named outcome requires an
-explicit local rejoin/reset; v1 does not claim automatic repair for that stranded device.
+The losing-branch invite campaign records a current protocol limit: the devices admitted by competing commits remain
+non-equivalent after the canonical members settle. Reusing either already-consumed device signature key is not a valid
+repair (`DuplicateSignatureKey`), so the named outcome requires an explicit local reset/rejoin with fresh device
+state; v1 does not claim automatic repair for the stranded device.
 
 ### 3.2 Resource and sensitivity measurements
 
@@ -709,6 +710,13 @@ the separately tested resource-refused/redelivery repair contract. Report measur
 action and resource-category limiting cause. Incident tests cover both a reproducing exact normalized history and the
 ordinary legacy-export archetype whose evidence envelope explicitly names why exact action and byte replay are
 unavailable.
+
+Final integration verification also pins the topology compatibility boundary: resolving a legacy client-only
+scenario may add explicit deployment records to its report, but does not change its historical client-derived member
+identities. Explicitly authored account/device topology alone opts into account-derived credentials, including shared
+credentials for two modeled devices of one account. The complete 41-case canonical scenario suite passes with this
+boundary, including exact fixtures, bidirectional decryptability, generated chaos/delivery families, and strict
+pre-join resource retirement.
 
 ## Milestone 4: Independent Verification And Adequacy
 
@@ -945,3 +953,4 @@ incorrect result.
 | 2026-08-02 | 3.2 campaign measurements and policy sweeps | Embedded stable latency/blocking, pass/reorg, disposition/outcome, queue/replay/database measurements in scenario reports; added an isolated child-process runner for CPU/RSS/write accounting; and added fixed-input test-policy curves with named boundary failures and no production auto-tuning | `offline_retained_history_flood_runs_as_a_small_regression`; `policy_sweeps`; child-process smoke campaign; default and feature-enabled compile gates |
 | 2026-08-02 | 3.3 exact/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed exact normalized Scenario IR import with per-step and contested-incident source mappings, semantic acceptance, explicit confidence, no embedded sensitive state, and owner-only vector/evidence output | Full `incident-replay` suite; `exact_normalized_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
+| 2026-08-02 | Milestone 3 integration verification | Preserved legacy client identities while limiting account-scoped credential sharing to explicitly authored topology; all canonical semantic oracles and active decryptability probes remain compatible with the new deployment model | `implicit_topology_preserves_legacy_client_identity_seeds`; `explicit_topology_shares_account_identity_across_devices`; `cargo test -p cgka-conformance-simulator --test canonical_scenarios` (41 passed) |

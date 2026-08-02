@@ -758,6 +758,12 @@ impl EngineHarnessSubject {
     ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
+        // Resolving an old client-only scenario makes its deployment topology
+        // explicit in reports, but it must not change the scenario's existing
+        // member identities. Only an explicitly authored account mapping opts
+        // into account-scoped credentials (and therefore shared credentials
+        // for multiple devices of one account).
+        let explicit_account_topology = !topology.is_empty();
         let resolved = topology
             .resolve_for_clients(clients)
             .map_err(|error| SubjectError::new(error.kind, error.message))?;
@@ -775,11 +781,15 @@ impl EngineHarnessSubject {
                     format!("duplicate client label {label}"),
                 ));
             }
-            let account = account_by_device
-                .get(label.as_str())
-                .copied()
-                .unwrap_or(label.as_str());
-            let identity_seed = pad32(account.as_bytes());
+            let identity_label = if explicit_account_topology {
+                account_by_device
+                    .get(label.as_str())
+                    .copied()
+                    .unwrap_or(label.as_str())
+            } else {
+                label.as_str()
+            };
+            let identity_seed = pad32(identity_label.as_bytes());
             let builder = ClientBuilder::new(identity_seed.clone())
                 .registry(engine_harness_feature_registry())
                 .protocol_profile(protocol_profile)
@@ -2124,6 +2134,68 @@ mod tests {
             classify_engine_error(&EngineError::Serialize("malformed internal state".into()));
         assert_eq!(category, SubjectFailureCategory::Protocol);
         assert_eq!(code, "invalid_admin_policy");
+    }
+
+    #[test]
+    fn implicit_topology_preserves_legacy_client_identity_seeds() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let subject = EngineHarnessSubject::new_with_topology(
+            &labels,
+            &crate::ScenarioTopologyV2::default(),
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+
+        assert_eq!(subject.identity_seeds["alice"], pad32(b"alice"));
+        assert_eq!(subject.identity_seeds["bob"], pad32(b"bob"));
+    }
+
+    #[test]
+    fn explicit_topology_shares_account_identity_across_devices() {
+        let labels = vec!["alice-phone".to_owned(), "alice-laptop".to_owned()];
+        let topology = crate::ScenarioTopologyV2 {
+            accounts: vec![crate::ScenarioAccountV2 {
+                id: "account:alice".into(),
+                roles: vec!["member".into()],
+            }],
+            devices: labels
+                .iter()
+                .map(|client| crate::ScenarioDeviceV2 {
+                    id: format!("device:{client}"),
+                    account: "account:alice".into(),
+                    process: format!("process:{client}"),
+                    client: client.clone(),
+                })
+                .collect(),
+            processes: labels
+                .iter()
+                .map(|client| crate::ScenarioProcessV2 {
+                    id: format!("process:{client}"),
+                    binary_version: "mdk-test".into(),
+                    policy_version: "marmot-convergence-v1".into(),
+                    relays: vec![],
+                })
+                .collect(),
+            groups: vec![],
+            relays: vec![],
+        };
+        let subject = EngineHarnessSubject::new_with_topology(
+            &labels,
+            &topology,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+
+        assert_eq!(
+            subject.identity_seeds["alice-phone"],
+            subject.identity_seeds["alice-laptop"]
+        );
+        assert_eq!(
+            subject.identity_seeds["alice-phone"],
+            pad32(b"account:alice")
+        );
     }
 
     #[tokio::test]

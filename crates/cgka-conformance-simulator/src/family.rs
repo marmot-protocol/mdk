@@ -1151,7 +1151,7 @@ fn milestone3_case(
         0 => milestone3_offline_retained_flood(case_index),
         1 => milestone3_sustained_mixed_traffic(rng, case_index),
         2 => milestone3_self_update_adversary(case_index),
-        3 => milestone3_losing_invite_repair(case_index),
+        3 => milestone3_losing_invite_outcome(case_index),
         4 => milestone3_unequal_relay_reconciliation(case_index),
         5 => milestone3_restart_boundaries(case_index),
         6 => milestone3_multi_group_noisy_neighbor(case_index),
@@ -1413,7 +1413,7 @@ fn milestone3_self_update_adversary_with_rounds(
     )
 }
 
-fn milestone3_losing_invite_repair(
+fn milestone3_losing_invite_outcome(
     case_index: u64,
 ) -> (
     String,
@@ -1456,16 +1456,17 @@ fn milestone3_losing_invite_repair(
         },
         ScenarioStep::DeliverAll,
         tick(["alice", "bob"]),
-        invite("alice", ["eve"], "repair-eve"),
-        confirmed_step("alice", "repair-eve"),
-        ScenarioStep::DeliverAll,
-        tick(["bob", "david", "eve"]),
+        // A same-device re-invite is not a valid repair here: both branch-only
+        // devices have already consumed key packages with their signature
+        // keys, and OpenMLS rejects reusing either key. Characterize the
+        // current named outcome directly; repair requires an explicit local
+        // reset/rejoin with fresh device state.
         ScenarioStep::AdvanceTime {
             delta_ms: 30 * 24 * 60 * 60 * 1_000 + 1,
         },
         tick(["alice", "bob", "david", "eve"]),
         ScenarioStep::ObserveExact {
-            clients: labels(["alice", "eve"]),
+            clients: labels(["david", "eve"]),
         },
     ];
     (
@@ -1479,11 +1480,10 @@ fn milestone3_losing_invite_repair(
             steps,
         },
         vec![
-            clients_converged(["alice", "bob", "david"], Some(3), Some(4)),
+            clients_converged(["alice", "bob"], Some(2), Some(3)),
             TraceExpectation::ClientsNotEquivalent {
-                clients: labels(["alice", "eve"]),
-                reason: "a member that joined only a losing branch requires explicit local rejoin"
-                    .into(),
+                clients: labels(["david", "eve"]),
+                reason: "branch-only devices remain non-equivalent; the losing device requires explicit local reset/rejoin with fresh state".into(),
             },
         ],
     )
