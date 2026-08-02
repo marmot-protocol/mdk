@@ -5,8 +5,10 @@ In-process multi-client simulator for the CGKA engine.
 The engine crate proves local engine rules. This crate asks the bigger question: if several clients run that engine and
 the network behaves badly, do they still end up with the same group state?
 
-The simulator does not use real relays. It runs `Engine<SqliteAccountStorage>` clients against a deterministic in-memory
-`TransportBus`, using in-memory SQLite by default. Report runs select storage explicitly with
+The simulator does not open real relay connections. Its fast engine adapter runs `Engine<SqliteAccountStorage>` clients
+against a deterministic in-memory `TransportBus`; its retained-relay adapter persists independent per-relay histories
+and drives engine mailboxes through explicit queries, cursors, EOSE, full backfill, and set reconciliation. In-memory
+SQLite remains the default. Report runs select storage explicitly with
 `--storage memory|file`; the flag overrides `MDK_CONFORMANCE_SQLITE_STORAGE` when both are present. File mode uses
 temporary encrypted SQLite databases and a restart fully closes and reopens each client database before hydration.
 Transport wrapping still goes through the real Nostr peeler, so group messages use the Marmot kind-445 envelope and
@@ -46,6 +48,10 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   policy/constants, report/ledgers/state commitments, a bounded transport-evidence tail with truncation counters, and a
   stable failure fingerprint. Explicitly requested byte-exact replay is written to a separately named sensitive sibling
   capsule so the logical campaign capsule remains portable.
+- `RetainedRelaySubject` — wraps the real engine subject but removes captured emissions from the packet bus and stores
+  them per configured relay. It models publish fanout, unequal subscriptions, incremental/since/full/set queries, EOSE,
+  reconnect, visibility omission, deterministic duplicate/order policy, and explicit history equalization. Every query
+  records its completeness claim; quiet EOSE is never reported as proof of complete relevant history.
 - `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
   and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
   domain-separated exporter commitment. Raw exporter material is never serialized.

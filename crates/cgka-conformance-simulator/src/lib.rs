@@ -33,6 +33,7 @@ pub mod proptest_support;
 mod quiescence;
 mod reference_subject;
 pub mod report;
+mod retained_relay;
 pub mod scenario;
 mod scenario_assertions;
 mod scenario_authoring;
@@ -91,6 +92,10 @@ pub use reference_subject::ReferenceModelSubject;
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,
+};
+pub use retained_relay::{
+    RelayHistoryCompletenessClaimV2, RelaySyncObservationV2, RetainedRelaySubject,
+    ScenarioRelayOrderV2, ScenarioRelaySyncModeV2,
 };
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,

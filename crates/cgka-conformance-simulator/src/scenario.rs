@@ -190,6 +190,25 @@ pub enum ScenarioStep {
     ReconnectClient {
         client: String,
     },
+    SyncRelayHistory {
+        clients: Vec<String>,
+        sync: crate::ScenarioRelaySyncModeV2,
+    },
+    ConfigureRelay {
+        relay: String,
+        order: crate::ScenarioRelayOrderV2,
+        /// Total copies returned for each matching retained event.
+        duplicate_copies: usize,
+    },
+    SetRelayEventVisibility {
+        relay: String,
+        selector: crate::ScenarioMessageSelectorV2,
+        clients: Vec<String>,
+        visible: bool,
+    },
+    ReconcileRelayHistories {
+        relays: Vec<String>,
+    },
     CrashProcess {
         process: String,
     },
@@ -247,6 +266,10 @@ impl ScenarioStep {
         "restart_client",
         "set_client_offline",
         "reconnect_client",
+        "sync_relay_history",
+        "configure_relay",
+        "set_relay_event_visibility",
+        "reconcile_relay_histories",
         "crash_process",
         "restart_process",
         "inject_storage_fault",
@@ -311,6 +334,10 @@ impl ScenarioStep {
             ScenarioStep::RestartClient { .. } => "restart_client",
             ScenarioStep::SetClientOffline { .. } => "set_client_offline",
             ScenarioStep::ReconnectClient { .. } => "reconnect_client",
+            ScenarioStep::SyncRelayHistory { .. } => "sync_relay_history",
+            ScenarioStep::ConfigureRelay { .. } => "configure_relay",
+            ScenarioStep::SetRelayEventVisibility { .. } => "set_relay_event_visibility",
+            ScenarioStep::ReconcileRelayHistories { .. } => "reconcile_relay_histories",
             ScenarioStep::CrashProcess { .. } => "crash_process",
             ScenarioStep::RestartProcess { .. } => "restart_process",
             ScenarioStep::InjectStorageFault { .. } => "inject_storage_fault",
@@ -334,6 +361,8 @@ pub struct ScenarioReport {
     pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_sync_observations: Vec<crate::RelaySyncObservationV2>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -1009,6 +1038,27 @@ async fn execute_scenario_step(
         ScenarioStep::ReconnectClient { client } => subject
             .set_client_online(client, true)
             .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::SyncRelayHistory { clients, sync } => subject
+            .sync_relay_history(clients, sync)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ConfigureRelay {
+            relay,
+            order,
+            duplicate_copies,
+        } => subject
+            .configure_relay(relay, *order, *duplicate_copies)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::SetRelayEventVisibility {
+            relay,
+            selector,
+            clients,
+            visible,
+        } => subject
+            .set_relay_event_visibility(relay, selector, clients, *visible)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ReconcileRelayHistories { relays } => subject
+            .reconcile_relay_histories(relays)
+            .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::CrashProcess { process } => subject
             .crash_process(process)
             .map_err(|error| subject_step_error(step_index, error))?,
@@ -1197,6 +1247,7 @@ async fn run_scenario_report_inner(
         quiescence_observations,
         assertion_observations,
     } = outputs;
+    let relay_sync_observations = subject.relay_sync_observations();
 
     let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
@@ -1279,6 +1330,7 @@ async fn run_scenario_report_inner(
         resolved_topology: compiled.topology.clone(),
         expanded_schedule: compiled.expanded_schedule(),
         assertion_observations,
+        relay_sync_observations,
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),

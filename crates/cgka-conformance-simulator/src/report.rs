@@ -620,6 +620,7 @@ mod tests {
             resolved_topology: Default::default(),
             expanded_schedule: Vec::new(),
             assertion_observations: Vec::new(),
+            relay_sync_observations: Vec::new(),
             expected_trace: None,
             expected_outcomes: Vec::new(),
             observed_trace: None,

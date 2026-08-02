@@ -66,6 +66,21 @@ write failure, capacity exceeded, or torn write). Adapters advertise these indep
 engine adapter deliberately does not advertise offline history or process/storage fault support; such a scenario is
 rejected during whole-schedule preflight instead of partially running with packet-loss semantics.
 
+## Retained relay execution
+
+`RetainedRelaySubject` maps each scenario process to its declared relay set. Accepted engine emissions fan out into a
+durable history per relay; the underlying packet-bus copy is discarded before delivery. `deliver_all` performs a
+default incremental query for every online participant. `sync_relay_history` selects incremental cursor, explicit
+timestamp floor, full history, or set-reconciliation comparison. Each query records queried relays, EOSE relays,
+returned/unique/injected counts, whether the result was quiet, and one of these deliberately distinct claims:
+`relay_eose_only`, `full_history_queried`, `relevant_set_mismatch`, or `relevant_set_equality_verified`.
+
+Relay-control actions configure deterministic natural/reverse order and duplicate copies, change per-client event
+visibility through semantic selectors, and equalize selected relay event sets. A hidden event still advances an
+incremental cursor after EOSE, so making it visible later does not magically replay it; an explicit full-history or set
+reconciliation path is required. This is the quiet-group/silent-absence sentinel. The packet bus remains the fast unit
+adapter and is not used as evidence of offline recovery.
+
 ## Assertions
 
 `assert` actions are executable and write samples to the common report/capsule schema:

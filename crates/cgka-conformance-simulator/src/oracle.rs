@@ -33,6 +33,9 @@ pub enum ScenarioStimulus {
     OfflineReconnect,
     ProcessCrash,
     StorageFault,
+    RetainedRelaySync,
+    RelayHistoryControl,
+    RelayHistoryReconciliation,
     VirtualTimeAdvance,
     LargeGroup,
     MessageStorm,
@@ -366,6 +369,15 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 stimuli.insert(ScenarioStimulus::OfflineReconnect);
+            }
+            ScenarioStep::SyncRelayHistory { .. } => {
+                stimuli.insert(ScenarioStimulus::RetainedRelaySync);
+            }
+            ScenarioStep::ConfigureRelay { .. } | ScenarioStep::SetRelayEventVisibility { .. } => {
+                stimuli.insert(ScenarioStimulus::RelayHistoryControl);
+            }
+            ScenarioStep::ReconcileRelayHistories { .. } => {
+                stimuli.insert(ScenarioStimulus::RelayHistoryReconciliation);
             }
             ScenarioStep::CrashProcess { .. } | ScenarioStep::RestartProcess { .. } => {
                 stimuli.insert(ScenarioStimulus::ProcessCrash);
@@ -731,7 +743,10 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
         | ScenarioStimulus::Restart
         | ScenarioStimulus::OfflineReconnect
         | ScenarioStimulus::ProcessCrash
-        | ScenarioStimulus::StorageFault => vec![
+        | ScenarioStimulus::StorageFault
+        | ScenarioStimulus::RetainedRelaySync
+        | ScenarioStimulus::RelayHistoryControl
+        | ScenarioStimulus::RelayHistoryReconciliation => vec![
             OracleBehavior::ClientConvergence,
             OracleBehavior::ClientState,
             OracleBehavior::DeliveredPayload,

@@ -405,6 +405,15 @@ impl TransportBus {
         self.inner.lock().unwrap().queue.len()
     }
 
+    /// Remove every packet-bus copy after a higher-level retained transport
+    /// adapter has durably captured the same engine emissions.
+    pub(crate) fn clear_queued(&self) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let cleared = inner.queue.len();
+        inner.queue.clear();
+        cleared
+    }
+
     pub(crate) fn pending_work_snapshot(&self, client: ClientId) -> BusPendingWorkSnapshot {
         let inner = self.inner.lock().unwrap();
         let identity = inner

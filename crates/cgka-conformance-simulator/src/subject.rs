@@ -52,6 +52,8 @@ pub enum SubjectCapability {
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
+    RetainedRelayHistory,
+    RetainedRelayControl,
 }
 
 impl SubjectCapability {
@@ -76,6 +78,8 @@ impl SubjectCapability {
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
+            Self::RetainedRelayHistory => "retained_relay_history",
+            Self::RetainedRelayControl => "retained_relay_control",
         }
     }
 
@@ -404,6 +408,49 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    fn sync_relay_history(
+        &mut self,
+        _clients: &[String],
+        _mode: &crate::ScenarioRelaySyncModeV2,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RetainedRelayHistory,
+        ))
+    }
+
+    fn configure_relay(
+        &mut self,
+        _relay: &str,
+        _order: crate::ScenarioRelayOrderV2,
+        _duplicate_copies: usize,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RetainedRelayControl,
+        ))
+    }
+
+    fn set_relay_event_visibility(
+        &mut self,
+        _relay: &str,
+        _selector: &crate::ScenarioMessageSelectorV2,
+        _clients: &[String],
+        _visible: bool,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RetainedRelayControl,
+        ))
+    }
+
+    fn reconcile_relay_histories(&mut self, _relays: &[String]) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RetainedRelayControl,
+        ))
+    }
+
+    fn relay_sync_observations(&self) -> Vec<crate::RelaySyncObservationV2> {
+        Vec::new()
+    }
+
     fn clear_events(&mut self, _clients: &[String]) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::EventObservation,
@@ -562,6 +609,12 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 SubjectCapability::ParticipantConnectivity
+            }
+            ScenarioStep::SyncRelayHistory { .. } => SubjectCapability::RetainedRelayHistory,
+            ScenarioStep::ConfigureRelay { .. }
+            | ScenarioStep::SetRelayEventVisibility { .. }
+            | ScenarioStep::ReconcileRelayHistories { .. } => {
+                SubjectCapability::RetainedRelayControl
             }
             ScenarioStep::CrashProcess { .. } | ScenarioStep::RestartProcess { .. } => {
                 SubjectCapability::ProcessLifecycle
@@ -728,6 +781,19 @@ impl EngineHarnessSubject {
 
     pub fn byte_replay_capture(&self) -> Option<EngineByteReplayV1> {
         self.last_byte_replay.clone()
+    }
+
+    pub(crate) fn discard_packet_bus_queue(&self) -> usize {
+        self.bus.clear_queued()
+    }
+
+    pub(crate) fn inject_transport_for_client(
+        &self,
+        client: &str,
+        message: TransportMessage,
+    ) -> Result<(), SubjectError> {
+        self.bus.inject(self.client(client)?.bus_id, message);
+        Ok(())
     }
 
     /// Capture one explicitly selected recipient tick. Campaign callers choose

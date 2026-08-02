@@ -128,6 +128,12 @@ the property-test registry. This file is the agent-facing model.
     adversarial transport capabilities. Use whole-schedule capability preflight to keep unsupported reference scenarios
     from partially executing.
 
+- **Module:** `src/retained_relay.rs`
+  - **Role:** Real-engine subject with deterministic per-relay durable histories. It captures and removes packet-bus
+    emissions, models fanout/subscription/query/EOSE/cursors/full backfill/set reconciliation plus relay-local
+    visibility/order/duplicates, and records an explicit completeness claim for every query. Offline recovery tests
+    must use this adapter rather than clearing a packet-bus partition.
+
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,

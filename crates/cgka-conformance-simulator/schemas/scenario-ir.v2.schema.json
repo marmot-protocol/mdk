@@ -216,6 +216,37 @@
         }
       ]
     },
+    "relay_sync_mode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "incremental" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "timestamp"],
+          "properties": {
+            "mode": { "const": "since" },
+            "timestamp": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "full_history" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "set_reconciliation" } }
+        }
+      ]
+    },
     "nonempty_string_array": {
       "type": "array",
       "minItems": 1,
@@ -351,6 +382,53 @@
           "properties": {
             "type": { "const": "reconnect_client" },
             "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients", "sync"],
+          "properties": {
+            "type": { "const": "sync_relay_history" },
+            "clients": { "$ref": "#/$defs/string_array" },
+            "sync": { "$ref": "#/$defs/relay_sync_mode" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relay", "order", "duplicate_copies"],
+          "properties": {
+            "type": { "const": "configure_relay" },
+            "relay": { "type": "string", "minLength": 1 },
+            "order": { "enum": ["natural", "reverse"] },
+            "duplicate_copies": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relay", "selector", "clients", "visible"],
+          "properties": {
+            "type": { "const": "set_relay_event_visibility" },
+            "relay": { "type": "string", "minLength": 1 },
+            "selector": { "$ref": "#/$defs/message_selector" },
+            "clients": { "$ref": "#/$defs/string_array" },
+            "visible": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "relays"],
+          "properties": {
+            "type": { "const": "reconcile_relay_histories" },
+            "relays": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
           }
         },
         {

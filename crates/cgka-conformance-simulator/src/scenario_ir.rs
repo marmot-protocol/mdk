@@ -170,6 +170,80 @@ fn validate_step(
             format!("connectivity action references unknown client {client}"),
         ));
     }
+    if let ScenarioStep::SyncRelayHistory {
+        clients: sync_clients,
+        ..
+    } = step
+    {
+        if sync_clients.is_empty() {
+            return Err(compile_error(
+                Some(step_index),
+                "relay sync requires at least one client".into(),
+            ));
+        }
+        for client in sync_clients {
+            if !clients.contains(client) {
+                return Err(compile_error(
+                    Some(step_index),
+                    format!("relay sync references unknown client {client}"),
+                ));
+            }
+        }
+    }
+    if let ScenarioStep::ConfigureRelay {
+        relay,
+        duplicate_copies,
+        ..
+    } = step
+    {
+        validate_relay(step_index, relay, topology)?;
+        if *duplicate_copies == 0 {
+            return Err(compile_error(
+                Some(step_index),
+                "relay duplicate_copies must be non-zero".into(),
+            ));
+        }
+    }
+    if let ScenarioStep::SetRelayEventVisibility {
+        relay,
+        selector,
+        clients: visibility_clients,
+        ..
+    } = step
+    {
+        validate_relay(step_index, relay, topology)?;
+        if !selector.is_semantic() {
+            return Err(compile_error(
+                Some(step_index),
+                "relay visibility selector must be semantic".into(),
+            ));
+        }
+        if visibility_clients.is_empty() {
+            return Err(compile_error(
+                Some(step_index),
+                "relay visibility requires at least one client".into(),
+            ));
+        }
+        for client in visibility_clients {
+            if !clients.contains(client) {
+                return Err(compile_error(
+                    Some(step_index),
+                    format!("relay visibility references unknown client {client}"),
+                ));
+            }
+        }
+    }
+    if let ScenarioStep::ReconcileRelayHistories { relays } = step {
+        if relays.len() < 2 {
+            return Err(compile_error(
+                Some(step_index),
+                "relay reconciliation requires at least two relays".into(),
+            ));
+        }
+        for relay in relays {
+            validate_relay(step_index, relay, topology)?;
+        }
+    }
     if let ScenarioStep::CrashProcess { process } | ScenarioStep::RestartProcess { process } = step
         && !topology.processes.iter().any(|item| item.id == *process)
     {
@@ -229,6 +303,25 @@ fn validate_step(
         }
     }
     Ok(())
+}
+
+fn validate_relay(
+    step_index: usize,
+    relay: &str,
+    topology: &crate::ScenarioTopologyV2,
+) -> Result<(), ScenarioRunError> {
+    if topology
+        .relays
+        .iter()
+        .any(|candidate| candidate.id == relay)
+    {
+        Ok(())
+    } else {
+        Err(compile_error(
+            Some(step_index),
+            format!("relay action references unknown relay {relay}"),
+        ))
+    }
 }
 
 fn validate_predicate(

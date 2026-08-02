@@ -569,15 +569,15 @@ resource-exhaustion and recovery campaigns for those error sources.
 - [x] Land a minimal vertical slice first: versioned action/assertion IR, deterministic executor, stable action ids, and
   one engine-adapter scenario that round-trips through JSON.
 - [ ] Define the complete adapter-neutral JSON IR and JSON Schema.
-- [ ] Specify deterministic expansion and rate semantics (`repeat`, `parallel`, `rate`, `burst`, barriers, and virtual
+- [x] Specify deterministic expansion and rate semantics (`repeat`, `parallel`, `rate`, `burst`, barriers, and virtual
   time) before adding authoring sugar.
-- [ ] Add human YAML authoring only after the canonical JSON IR/executor is stable; execute only canonical JSON.
-- [ ] Model accounts, devices, processes, roles, groups, relays, and policy/binary versions explicitly.
-- [ ] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time with a recorded expanded schedule.
-- [ ] Add create, invite, remove, leave, self-update, group/admin state update, and application send.
-- [ ] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
+- [x] Add human YAML authoring only after the canonical JSON IR/executor is stable; execute only canonical JSON.
+- [x] Model accounts, devices, processes, roles, groups, relays, and policy/binary versions explicitly.
+- [x] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time with a recorded expanded schedule.
+- [x] Add create, invite, remove, leave, self-update, group/admin state update, and application send.
+- [x] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
 - [ ] Replace queue indices with semantic action/message selectors.
-- [ ] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
+- [x] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
 - [x] Make a repository-owned clean cutover from `ScenarioSpec` v1 to v2 rather than retaining a runtime compatibility
   compiler; migrate fixed vectors, generated families, tests, and incident-replay synthesis together.
 - [x] Add portable outbound poll/acknowledgement operations, migrate built-in runners to the explicit lifecycle, and
@@ -593,24 +593,24 @@ resource-exhaustion and recovery campaigns for those error sources.
 
 ### 2.3 Retained multi-relay model
 
-- [ ] Maintain a durable event history per relay.
-- [ ] Model publish fanout, subscriptions, query filters, EOSE, reconnect, since floors, and full backfill.
-- [ ] Make query completion explicit: distinguish relay EOSE from proven relevant-history completeness and record the
+- [x] Maintain a durable event history per relay.
+- [x] Model publish fanout, subscriptions, query filters, EOSE, reconnect, since floors, and full backfill.
+- [x] Make query completion explicit: distinguish relay EOSE from proven relevant-history completeness and record the
   completeness claim in every run.
-- [ ] Model relay-specific duplicate/order/visibility/omission behavior.
-- [ ] Model unequal client relay sets and later history reconciliation.
-- [ ] Add a set/full-history reconciliation backstop for the case where no qualifying live event arms the existing
+- [x] Model relay-specific duplicate/order/visibility/omission behavior.
+- [x] Model unequal client relay sets and later history reconciliation.
+- [x] Add a set/full-history reconciliation backstop for the case where no qualifying live event arms the existing
   epoch-stall recovery path; evaluate NIP-77-like set reconciliation without making it a prerequisite.
-- [ ] Make quiet-group diagnosis explicit: a lack of new traffic must not be mistaken for complete history or healthy
+- [x] Make quiet-group diagnosis explicit: a lack of new traffic must not be mistaken for complete history or healthy
   convergence, and reports must identify which reconciliation path was or was not attempted.
-- [ ] Keep the existing in-memory packet bus as a fast unit-test adapter, not offline-sync evidence.
+- [x] Keep the existing in-memory packet bus as a fast unit-test adapter, not offline-sync evidence.
 
 ### Milestone 2 Exit Gate
 
-- [ ] One compiled scenario runs unchanged against the reference, engine, and retained-relay adapters.
-- [ ] Offline participants recover from relay history rather than healed packet loss.
-- [ ] Relay disagreement followed by equalized history reaches exact state equivalence.
-- [ ] Unsupported adapter behavior fails before a partial run.
+- [x] One compiled scenario runs unchanged against the reference, engine, and retained-relay adapters.
+- [x] Offline participants recover from relay history rather than healed packet loss.
+- [x] Relay disagreement followed by equalized history reaches exact state equivalence.
+- [x] Unsupported adapter behavior fails before a partial run.
 
 ## Milestone 3: Adversarial Workload Campaigns
 
@@ -888,3 +888,4 @@ incorrect result.
 | 2026-08-01 | 1.3 full-system quiescence | Added privacy-safe structural progress with runnable work, exact virtual deadlines, pass phase/generation, retry/deferred/publication/transport work, and terminal blockers; added runner-owned bounded fixed-point settling with explicit healthy-path publication/delivery policy and serializable blocked/timeout artifacts; added same-horizon batch-partition metamorphic coverage | [MDK #1216](https://github.com/marmot-protocol/mdk/pull/1216); focused real-engine deadline, lost-ack, withheld-transport, watchdog, serialization/privacy, and metamorphic tests; full simulator suite; `just fast-ci` |
 | 2026-08-02 | 1.4 deterministic failure capsules and Milestone 1 exit | Added versioned restrictive failure capsules, semantic-identity minimization, typed protocol/resource/environment failure provenance, bounded transport evidence with truncation accounting, campaign-produced recipient checkpoints, exact recipient-state plus captured-transport and CLI replay, portable checkpoint-free vector promotion, failed-step report retention, a constant snapshot, and mixed-storm application assertions; completed the named mutation-sentinel and durable-outcome inventories | `failure_capsules`; `report_runner`; `failed_campaign_capsule_contains_a_replayable_tick_witness`; `failing_generated_case_records_a_minimized_reproducer`; `subject_step_failure_is_a_report_artifact_and_a_spec_run_error`; `convergence_chaos_family_generates_specs_with_semantic_expectations`; storage snapshot round-trip; full simulator/storage suites; `just fast-ci` |
 | 2026-08-02 | 2.2 initial independent reference adapter | Added a capability-limited symbolic-memory subject that executes the common group/publication/application lifecycle without production selector or canonicalizer calls; one compiled scenario now runs unchanged on reference and engine adapters with equal semantic observations, exact-only predicates add their true preflight capability, and assertion sampling no longer consumes later report evidence | `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters`; `unsupported_exact_assertion_fails_before_reference_model_executes`; scenario IR suite |
+| 2026-08-02 | 2.3 retained multi-relay model and exit scenarios | Added real-engine delivery through durable per-relay histories with topology fanout/subscriptions, cursor/since/full/set queries, EOSE-versus-completeness observations, offline reconnect, visibility omission, duplicate/order policy, history equalization, and quiet-query diagnosis; the same compiled scenario runs on all three initial adapters, offline delivery comes from history, and unequal histories reach exact state equality only after reconciliation | `one_compiled_scenario_runs_unchanged_on_all_initial_adapters`; `offline_client_recovers_from_retained_history`; `unequal_relay_histories_converge_after_set_equalization`; `eose_does_not_heal_hidden_cursor_history_but_full_backfill_does`; `relay_reverse_order_and_duplicates_are_explicit_and_deduplicated` |
