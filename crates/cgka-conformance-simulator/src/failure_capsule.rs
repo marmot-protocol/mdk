@@ -4,7 +4,7 @@
 //! cryptographic checkpoint required for byte-exact MLS replay. Checkpoints are
 //! always sensitive local evidence and must be written with owner-only modes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -584,8 +584,7 @@ pub async fn replay_engine_bytes(
     }
     let outcomes = client.tick().await;
     let actual_error = outcomes.iter().find_map(|outcome| outcome.as_ref().err());
-    let canonical_state = client.canonical_state_snapshot();
-    let normalized_state_digest = digest_json(&canonical_state)?;
+    let normalized_state_digest = replay_state_digest(&client)?;
     let (classification, failure_kind) = actual_error.map_or(
         (
             TerminalOutcomeClassification::Converged,
@@ -617,6 +616,13 @@ pub async fn replay_engine_bytes(
         normalized_state_digest,
         fingerprint,
     })
+}
+
+fn replay_state_digest(client: &crate::HarnessClient) -> Result<String, FailureCapsuleError> {
+    let canonical_state = client
+        .try_canonical_state_snapshot()
+        .map_err(|error| FailureCapsuleError::Replay(error.to_string()))?;
+    digest_json(&canonical_state)
 }
 
 pub fn build_fingerprint(
@@ -728,24 +734,30 @@ fn transport_messages_json_bytes(messages: &[TransportMessage]) -> u64 {
 
 fn bound_transport_capture(mut capture: CapturedTransportWindowV1) -> CapturedTransportWindowV1 {
     capture.artifacts.sort_by_key(|artifact| artifact.sequence);
-    let mut retained_bytes = 0_u64;
-    let mut retained = capture
-        .artifacts
-        .into_iter()
-        .rev()
-        .filter(|artifact| {
-            let bytes = serde_json::to_vec(&artifact.message).map_or(0, |bytes| bytes.len() as u64);
-            if retained_bytes.saturating_add(bytes) > MAX_CAPTURED_TRANSPORT_JSON_BYTES {
-                return false;
-            }
-            retained_bytes = retained_bytes.saturating_add(bytes);
-            true
-        })
-        .take(MAX_CAPTURED_TRANSPORT_OBJECTS)
-        .collect::<Vec<_>>();
-    retained.sort_by_key(|artifact| artifact.sequence);
-    capture.artifacts = retained;
+    // The bus already enforces these limits while recording emissions. This
+    // defensive pass handles externally assembled captures with the identical
+    // policy: evict from the front until the retained evidence is one
+    // contiguous newest tail under both limits.
+    let mut retained = VecDeque::from(capture.artifacts);
+    let mut retained_bytes = retained
+        .iter()
+        .map(|artifact| transport_message_json_bytes(&artifact.message))
+        .sum::<u64>();
+    while retained.len() > MAX_CAPTURED_TRANSPORT_OBJECTS
+        || retained_bytes > MAX_CAPTURED_TRANSPORT_JSON_BYTES
+    {
+        let Some(dropped) = retained.pop_front() else {
+            break;
+        };
+        retained_bytes =
+            retained_bytes.saturating_sub(transport_message_json_bytes(&dropped.message));
+    }
+    capture.artifacts = retained.into();
     capture
+}
+
+fn transport_message_json_bytes(message: &TransportMessage) -> u64 {
+    serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64)
 }
 
 pub(crate) fn terminal_classification(
@@ -756,5 +768,23 @@ pub(crate) fn terminal_classification(
         SubjectFailureCategory::Protocol => TerminalOutcomeClassification::TerminalProtocolFailure,
         SubjectFailureCategory::Resource => TerminalOutcomeClassification::ResourceFailure,
         SubjectFailureCategory::Environment => TerminalOutcomeClassification::EnvironmentFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_state_digest_returns_an_error_when_no_group_can_be_snapshotted() {
+        let bus = TransportBus::ordered();
+        let client = ClientBuilder::new(vec![7; 32])
+            .registry(crate::subject::engine_harness_feature_registry())
+            .attach(&bus);
+
+        assert!(matches!(
+            replay_state_digest(&client),
+            Err(FailureCapsuleError::Replay(_))
+        ));
     }
 }

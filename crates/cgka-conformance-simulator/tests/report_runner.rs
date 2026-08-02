@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
     FailureCapsuleSensitivity, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
-    ReportInput, ScenarioStimulus, parse_report_command, property_test_coverage_entries,
-    read_failure_capsule, replay_engine_bytes, run_report,
+    ReportInput, ScenarioStimulus, parse_report_command, promote_failure_capsule_to_vector,
+    property_test_coverage_entries, read_failure_capsule, replay_engine_bytes, run_report,
 };
 
 #[test]
@@ -21,6 +21,7 @@ fn parse_defaults_to_send_leave_family() {
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -50,6 +51,7 @@ fn parse_custom_report_args() {
             out: PathBuf::from("target/custom"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -62,6 +64,16 @@ fn explicit_storage_flag_overrides_environment_default() {
         panic!("expected run command");
     };
     assert_eq!(args.storage_mode, HarnessStorageMode::TempFileBackedSqlite);
+}
+
+#[test]
+fn sensitive_replay_capture_requires_an_explicit_flag() {
+    let ReportCommand::Run(args) =
+        parse_report_command(["--capture-sensitive-replay".into()]).expect("capture flag parses")
+    else {
+        panic!("expected run command");
+    };
+    assert!(args.capture_sensitive_replay);
 }
 
 #[test]
@@ -83,6 +95,7 @@ fn parse_vector_fixture_report_args() {
             out: PathBuf::from("target/vector-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -107,6 +120,7 @@ fn parse_strict_oracle_report_args() {
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -223,6 +237,7 @@ async fn report_runner_writes_send_leave_json_reports() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes reports");
@@ -291,6 +306,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
         out: out_dir.clone(),
         strict_oracle: true,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("strict runner writes reports");
@@ -315,6 +331,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
     assert_eq!(capsule["failure"]["classification"], "oracle_violation");
     assert!(capsule.get("captured_transport_artifacts").is_none());
     assert!(capsule.get("byte_replay").is_none());
+    assert!(summary.scenarios[0].replay_capsule.is_none());
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }
@@ -338,6 +355,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes convergence delivery reports");
@@ -390,6 +408,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes convergence chaos reports");
@@ -481,6 +500,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes vector reports");
@@ -542,6 +562,7 @@ async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
         out: out_dir,
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: true,
     })
     .await
     .expect("failing campaign reports");
@@ -553,9 +574,29 @@ async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
     let capsule = read_failure_capsule(capsule_path).expect("campaign capsule reads");
     assert_eq!(
         capsule.sensitivity,
+        FailureCapsuleSensitivity::SyntheticShareable
+    );
+    assert!(capsule.byte_replay.is_none());
+    promote_failure_capsule_to_vector(&capsule, "test")
+        .expect("the logical campaign capsule remains portable");
+
+    let replay_capsule_path = summary.scenarios[0]
+        .replay_capsule
+        .as_ref()
+        .expect("explicit replay capture writes a separate sibling");
+    assert!(
+        replay_capsule_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("sensitive-replay-capsule"))
+    );
+    let replay_capsule =
+        read_failure_capsule(replay_capsule_path).expect("sensitive replay capsule reads");
+    assert_eq!(
+        replay_capsule.sensitivity,
         FailureCapsuleSensitivity::SensitiveLocal
     );
-    let replay = capsule
+    let replay = replay_capsule
         .byte_replay
         .as_ref()
         .expect("campaign exports its last real recipient tick");
@@ -564,7 +605,10 @@ async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
         .expect("campaign-produced tick witness replays exactly");
 
     let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-simulator-report"))
-        .args(["--replay-capsule", &capsule_path.display().to_string()])
+        .args([
+            "--replay-capsule",
+            &replay_capsule_path.display().to_string(),
+        ])
         .output()
         .expect("replay CLI runs");
     assert!(

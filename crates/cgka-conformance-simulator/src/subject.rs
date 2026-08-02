@@ -446,7 +446,8 @@ pub struct EngineHarnessSubject {
     convergence_clock: ManualConvergenceClock,
     outbound_cursors: HashMap<String, u64>,
     outbound_records: BTreeMap<u64, EngineSubjectOutboundRecord>,
-    replay_capture_enabled: bool,
+    replay_capture_target_tick: Option<usize>,
+    observed_recipient_ticks: usize,
     last_byte_replay: Option<EngineByteReplayV1>,
 }
 
@@ -528,7 +529,8 @@ impl EngineHarnessSubject {
             convergence_clock,
             outbound_cursors: HashMap::new(),
             outbound_records: BTreeMap::new(),
-            replay_capture_enabled: false,
+            replay_capture_target_tick: None,
+            observed_recipient_ticks: 0,
             last_byte_replay: None,
         })
     }
@@ -574,14 +576,14 @@ impl EngineHarnessSubject {
         self.last_byte_replay.clone()
     }
 
-    pub fn enable_failure_replay_capture(&mut self) {
-        self.replay_capture_enabled = true;
+    /// Capture one explicitly selected recipient tick. Campaign callers choose
+    /// the final planned tick so checkpoint export is paid at most once rather
+    /// than once per client on every tick step.
+    pub fn capture_failure_replay_at_tick(&mut self, recipient_tick: usize) {
+        self.replay_capture_target_tick = Some(recipient_tick);
     }
 
     fn prepare_byte_replay(&self, label: &str) -> Option<PendingByteReplay> {
-        if !self.replay_capture_enabled {
-            return None;
-        }
         let client = self.clients.get(label)?;
         let group_id = client.replay_group_id()?.clone();
         let sensitive_checkpoint = client
@@ -896,7 +898,11 @@ impl ConvergenceSubject for EngineHarnessSubject {
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
-            let pending_replay = self.prepare_byte_replay(label);
+            let recipient_tick = self.observed_recipient_ticks;
+            self.observed_recipient_ticks = self.observed_recipient_ticks.saturating_add(1);
+            let pending_replay = (self.replay_capture_target_tick == Some(recipient_tick))
+                .then(|| self.prepare_byte_replay(label))
+                .flatten();
             let outcomes = self.client_mut(label)?.tick().await;
             if let Some(pending_replay) = pending_replay
                 && let Some(replay) = self.complete_byte_replay(pending_replay, &outcomes)
@@ -1438,12 +1444,12 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::Other(_)
         | EngineError::Peeler(_)
         | EngineError::ForkedEpoch { .. }
-        | EngineError::UnknownPending => SubjectFailureCategory::Protocol,
+        | EngineError::UnknownPending
+        | EngineError::Serialize(_) => SubjectFailureCategory::Protocol,
         EngineError::NotGroupAdmin { .. }
         | EngineError::AdminCannotSelfRemove { .. }
         | EngineError::AdminDepletion { .. }
         | EngineError::LeaveAlreadyRequested { .. }
-        | EngineError::Serialize(_)
         | EngineError::InvalidWelcome
         | EngineError::WelcomeAlreadyProcessed
         | EngineError::UnknownGroup(_)
@@ -1577,6 +1583,14 @@ mod tests {
         assert_eq!(error.code, "backend");
         assert_eq!(error.category, SubjectFailureCategory::Resource);
         assert!(error.message.contains("converge buffered group"));
+    }
+
+    #[test]
+    fn serialization_failures_are_not_classified_as_expected_refusals() {
+        let (category, code) =
+            classify_engine_error(&EngineError::Serialize("malformed internal state".into()));
+        assert_eq!(category, SubjectFailureCategory::Protocol);
+        assert_eq!(code, "invalid_admin_policy");
     }
 
     #[tokio::test]

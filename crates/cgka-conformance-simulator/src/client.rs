@@ -1570,7 +1570,10 @@ impl HarnessClient {
         &self,
     ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError>
     {
-        let group_id = self.default_group.clone().expect("group");
+        let group_id = self
+            .default_group
+            .clone()
+            .ok_or_else(|| EngineError::Other("no default group to snapshot".into()))?;
         self.engine()
             .conformance_canonical_state_snapshot(&group_id)
     }

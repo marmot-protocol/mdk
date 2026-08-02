@@ -135,12 +135,14 @@ pub async fn run_generated_case_report_with_capture(
     case: &GeneratedScenarioCase,
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let (mut report, failure_capture) = run_scenario_report_with_outcomes_and_capture(
         &case.scenario,
         expected_trace.clone(),
         case.expected_outcomes.clone(),
         storage_mode,
+        capture_sensitive_replay,
     )
     .await?;
     add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;

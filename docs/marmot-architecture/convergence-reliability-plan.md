@@ -499,25 +499,27 @@ Status: `complete`
 - [x] Promote minimized synthetic failures into portable vectors when they define durable behavior.
 
 Capsule v1 is the local `failure_capsule.rs` data contract plus
-`schemas/failure-capsule.v1.schema.json`. Report campaigns automatically emit a capsule for failed steps, oracle
-violations, weak-oracle failures, and quiescence failures. A capsule records the complete report (including exact state,
+`schemas/failure-capsule.v1.schema.json`. Report campaigns automatically emit a portable logical capsule for failed
+steps, oracle violations, weak-oracle failures, and quiescence failures. A capsule records the complete report (including exact state,
 input ledgers, and output observations), generated seed metadata, a virtual-time-expanded action schedule, exact
 quiescence policies, the engine constant snapshot, adapter/binary versions, and bounded resource counters. Failure
 evidence retains at most the newest 256 transport objects and 1 MiB of serialized transport data while recording
 observed, retained, and dropped object/byte counts. A warning-only strict-oracle capsule retains no wire bytes or key
-material. Byte replay uses the same delivery limits and a 16 MiB checkpoint ceiling; an oversized tick is skipped while
-the previous bounded witness remains available. Stable full fingerprints combine a normalized terminal classification, first failing action, failure kind,
+material. Byte replay uses the same delivery limits and a 16 MiB checkpoint ceiling; an oversized selected tick is
+skipped. Stable full fingerprints combine a normalized terminal classification, first failing action, failure kind,
 and observed-state digest. The reducer instead preserves semantic failure identity (classification, action type, and
 failure kind), so removing irrelevant steps is not defeated by shifted action indices or a changed trace digest.
 
-The optional engine byte-replay payload is deliberately separate from logical scenario replay. During a real report
-campaign, the engine adapter records the most recent recipient tick (or the tick that fails): its pre-input
-SQLite/OpenMLS checkpoint, including any active durable convergence pass, the exact mailbox `TransportMessage`
-objects, and the resulting typed engine fingerprint. Replay therefore never asks OpenMLS to regenerate a commit.
-Ordinary epoch rollback snapshots intentionally do not rewind pass scheduling; only this replay envelope carries that
-additional state. The checkpoint contains key material: validation rejects it unless the capsule is
-`sensitive_local`, and the writer creates directories/files with owner-only modes. The report CLI accepts
-`--replay-capsule FILE` and verifies the captured engine fingerprint. `promote_failure_capsule_to_vector` accepts only
+The optional engine byte-replay payload is deliberately separate from logical scenario replay. Sensitive capture is
+off by default and requires `--capture-sensitive-replay`. The engine adapter then exports at most one checkpoint, for
+the final planned recipient tick, rather than serializing every client database before every tick. Its pre-input
+SQLite/OpenMLS checkpoint includes any active durable convergence pass, the exact mailbox `TransportMessage` objects,
+and the resulting typed engine fingerprint. The report runner keeps the logical capsule `synthetic_shareable` and
+writes the checkpoint to a separately named `sensitive_local` sibling; if execution stops before the selected tick, no
+replay sibling is emitted. Replay therefore never asks OpenMLS to regenerate a commit. Ordinary epoch rollback
+snapshots intentionally do not rewind pass scheduling; only this replay envelope carries that additional state. The
+checkpoint contains key material, and the writer creates directories/files with owner-only modes. The report CLI
+accepts `--replay-capsule FILE` and verifies the captured engine fingerprint. `promote_failure_capsule_to_vector` accepts only
 `synthetic_shareable` capsules, preserves the intended exact or semantic expectation rather than the buggy observed
 trace, and uses the fingerprint-preserving minimized scenario when present. It refuses capsules without a portable
 expectation.

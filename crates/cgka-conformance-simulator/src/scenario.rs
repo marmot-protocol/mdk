@@ -397,19 +397,22 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
-/// Run the in-process engine subject and retain a bounded exact-transport tail
-/// plus the latest bounded recipient-tick checkpoint. Callers must treat the
-/// checkpoint as sensitive even when campaigns use synthetic keys.
+/// Run the in-process engine subject and retain a bounded exact-transport tail.
+/// When explicitly requested, also capture the final planned recipient tick;
+/// callers must treat that checkpoint as sensitive even with synthetic keys.
 pub async fn run_scenario_report_with_outcomes_and_capture(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
     storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let mut subject =
         EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
             .map_err(subject_setup_error)?;
-    subject.enable_failure_replay_capture();
+    if capture_sensitive_replay && let Some(recipient_tick) = final_planned_recipient_tick(spec) {
+        subject.capture_failure_replay_at_tick(recipient_tick);
+    }
     let report =
         run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject)
             .await?;
@@ -464,16 +467,21 @@ pub async fn run_vector_fixture_report_with_storage_mode(
 }
 
 /// Vector runner variant used by the report CLI when it must emit exact wire
-/// evidence alongside a failing report.
+/// evidence and, by explicit opt-in, a final recipient-tick checkpoint.
 pub async fn run_vector_fixture_report_with_capture(
     fixture: &VectorFixture,
     storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let protocol_profile = fixture_protocol_profile(fixture)?;
     let mut subject =
         EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
             .map_err(subject_setup_error)?;
-    subject.enable_failure_replay_capture();
+    if capture_sensitive_replay
+        && let Some(recipient_tick) = final_planned_recipient_tick(&fixture.scenario)
+    {
+        subject.capture_failure_replay_at_tick(recipient_tick);
+    }
     let report = run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),
@@ -494,6 +502,17 @@ pub async fn run_vector_fixture_report_with_capture(
             byte_replay: subject.byte_replay_capture(),
         },
     ))
+}
+
+fn final_planned_recipient_tick(spec: &ScenarioSpec) -> Option<usize> {
+    spec.steps
+        .iter()
+        .filter_map(|step| match step {
+            ScenarioStep::Tick { clients } => Some(clients.len()),
+            _ => None,
+        })
+        .sum::<usize>()
+        .checked_sub(1)
 }
 
 fn fixture_protocol_profile(fixture: &VectorFixture) -> Result<ProtocolProfile, ScenarioRunError> {
@@ -1620,6 +1639,26 @@ mod tests {
 
         assert_eq!(error.step_index, None);
         assert!(error.message.contains("unsupported ScenarioSpec version 1"));
+    }
+
+    #[test]
+    fn sensitive_replay_targets_only_the_final_planned_recipient_tick() {
+        let spec = ScenarioSpec {
+            name: "replay-target".to_owned(),
+            spec_version: "2".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned()],
+            steps: vec![
+                ScenarioStep::Tick {
+                    clients: vec!["alice".to_owned()],
+                },
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["alice".to_owned(), "bob".to_owned()],
+                },
+            ],
+        };
+
+        assert_eq!(final_planned_recipient_tick(&spec), Some(2));
     }
 
     #[tokio::test]

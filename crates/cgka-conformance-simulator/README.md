@@ -35,7 +35,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   step logs, recoveries, and expectation failures.
 - `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded virtual-time schedule, exact
   policy/constants, report/ledgers/state commitments, a bounded transport-evidence tail with truncation counters, and a
-  stable failure fingerprint. An optional bounded sensitive recipient checkpoint enables byte-exact engine replay.
+  stable failure fingerprint. Explicitly requested byte-exact replay is written to a separately named sensitive sibling
+  capsule so the logical campaign capsule remains portable.
 - `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
   and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
   domain-separated exporter commitment. Raw exporter material is never serialized.
@@ -102,10 +103,11 @@ selected subject adapter, declared capabilities, storage backend, observed trace
 observations, and the mismatched expected/actual JSON. A subject that lacks any capability required by a scenario is
 rejected before the first scenario action executes.
 
-Failed report runs also write `*-failure-capsule.v1.json`. The capsule writer uses owner-only directories and files.
-Synthetic capsules without checkpoints may be reviewed and promoted into portable vectors; real incident material and
-any capsule containing an SQLite/OpenMLS checkpoint must remain `sensitive_local` because the checkpoint contains key
-material. Replay a checkpoint-bearing capsule without regenerating MLS bytes with:
+Failed report runs also write a portable `*-failure-capsule.v1.json`. The capsule writer uses owner-only directories and
+files. Sensitive SQLite/OpenMLS checkpoint capture is off by default because it contains key material and incurs a
+checkpoint export. Pass `--capture-sensitive-replay` to capture only the final planned recipient tick and write a
+separate `*-sensitive-replay-capsule.v1.json`; the portable logical capsule remains eligible for vector promotion.
+Replay the sensitive sibling without regenerating MLS bytes with:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \

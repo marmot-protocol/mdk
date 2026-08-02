@@ -4,10 +4,10 @@ use cgka_conformance_simulator::TraceExpectation;
 use cgka_conformance_simulator::VectorMismatch;
 use cgka_conformance_simulator::{
     CapturedTransportArtifactV1, ClientBuilder, EngineByteReplayV1, FailureCapsuleError,
-    FailureCapsuleSensitivity, FailureCapsuleV1, TerminalOutcomeClassification, TransportBus,
-    build_fingerprint, digest_json, engine_harness_feature_registry, fingerprint_report_failure,
-    promote_failure_capsule_to_vector, read_failure_capsule, replay_engine_bytes,
-    run_scenario_report, write_failure_capsule,
+    FailureCapsuleSensitivity, FailureCapsuleV1, MAX_CAPTURED_TRANSPORT_JSON_BYTES,
+    TerminalOutcomeClassification, TransportBus, build_fingerprint, digest_json,
+    engine_harness_feature_registry, fingerprint_report_failure, promote_failure_capsule_to_vector,
+    read_failure_capsule, replay_engine_bytes, run_scenario_report, write_failure_capsule,
 };
 use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep};
 use cgka_traits::group::ProtocolProfile;
@@ -325,6 +325,28 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
         300
     );
     assert_eq!(bounded.resources.counters["transport_objects_dropped"], 44);
+    assert_eq!(bounded.captured_transport_artifacts[0].sequence, 44);
+    assert_eq!(bounded.captured_transport_artifacts[255].sequence, 299);
+
+    let mut too_large = template.clone();
+    too_large.sequence = 1;
+    too_large.message.payload = vec![0; MAX_CAPTURED_TRANSPORT_JSON_BYTES as usize + 1];
+    let contiguous_tail = FailureCapsuleV1::from_report(
+        first_failed_report.clone(),
+        FailureCapsuleSensitivity::SyntheticShareable,
+        vec![
+            template.clone(),
+            too_large,
+            CapturedTransportArtifactV1 {
+                sequence: 2,
+                ..template.clone()
+            },
+        ],
+        None,
+    )
+    .expect("oversized middle artifact is evicted with the older prefix");
+    assert_eq!(contiguous_tail.captured_transport_artifacts.len(), 1);
+    assert_eq!(contiguous_tail.captured_transport_artifacts[0].sequence, 2);
 
     let dir = tempfile::tempdir().expect("temporary capsule directory");
     let path = dir
