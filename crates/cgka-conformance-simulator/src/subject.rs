@@ -391,6 +391,9 @@ pub trait ConvergenceFaultSubject {
 /// capability; fixed-point settling composes progress, time, delivery, and
 /// optionally outbound acknowledgement without moving policy into the subject.
 pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
+    if matches!(step, ScenarioStep::Barrier { .. }) {
+        return Vec::new();
+    }
     if let ScenarioStep::AwaitQuiescence { policy } = step {
         let mut capabilities = vec![
             SubjectCapability::StructuralProgress,
@@ -432,6 +435,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
                 SubjectCapability::WhiteBoxTransportPartition
             }
+            ScenarioStep::Barrier { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
         }]
     }

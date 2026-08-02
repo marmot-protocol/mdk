@@ -354,7 +354,8 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             | ScenarioStep::Observe { .. }
             | ScenarioStep::ObserveExact { .. }
             | ScenarioStep::ObserveAdminPolicy { .. }
-            | ScenarioStep::ClearEvents { .. } => {}
+            | ScenarioStep::ClearEvents { .. }
+            | ScenarioStep::Barrier { .. } => {}
         }
     }
 

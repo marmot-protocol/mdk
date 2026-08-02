@@ -1,7 +1,8 @@
 # AGENTS.md — cgka-conformance-simulator
 
-Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and
-[`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the property-test registry. This file is the agent-facing model.
+Read [`README.md`](README.md) for the human framing, [`SCENARIO_IR.md`](SCENARIO_IR.md) for canonical and authoring
+semantics, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for
+the property-test registry. This file is the agent-facing model.
 
 ## Pieces
 
@@ -89,6 +90,11 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
   - **Role:** Canonical ScenarioSpec v2 compiler. It validates input, assigns stable action ids, records the deterministic
     virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
     selected subject executes anything. The JSON contract is `schemas/scenario-ir.v2.schema.json`.
+
+- **Module:** `src/scenario_authoring.rs`
+  - **Role:** Authoring-only repeat, deterministic parallel, rate, burst, and barrier expansion. It lowers into canonical
+    ScenarioSpec v2 before execution; adapters never interpret authoring control flow. The contract and exact timing
+    rules are in `SCENARIO_IR.md` and `schemas/scenario-authoring.v1.schema.json`.
 
 - **Module:** `src/subject.rs`
   - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The

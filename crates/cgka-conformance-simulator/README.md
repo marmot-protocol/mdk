@@ -27,6 +27,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   outbound acknowledgement, queue faults, and partitions. The runner compiles the whole document into a stable action
   schedule and preflights every required adapter capability before executing the first action; the schema is
   `schemas/scenario-ir.v2.schema.json`.
+- `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
+  burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
   virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
   exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.

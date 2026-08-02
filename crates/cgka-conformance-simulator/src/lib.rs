@@ -33,6 +33,7 @@ pub mod proptest_support;
 mod quiescence;
 pub mod report;
 pub mod scenario;
+mod scenario_authoring;
 mod scenario_input_ledger;
 mod scenario_ir;
 pub mod subject;
@@ -96,6 +97,10 @@ pub use scenario::{
     run_scenario_report_with_subject, run_scenario_spec, run_scenario_spec_with_subject,
     run_vector_fixture_report, run_vector_fixture_report_with_capture,
     run_vector_fixture_report_with_storage_mode, validate_scenario_for_subject,
+};
+pub use scenario_authoring::{
+    MAX_EXPANDED_SCENARIO_ACTIONS, SCENARIO_AUTHORING_VERSION, ScenarioAuthoringSpec, ScenarioFlow,
+    ScenarioParallelLane, compile_authoring_scenario, compile_authoring_yaml,
 };
 pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,

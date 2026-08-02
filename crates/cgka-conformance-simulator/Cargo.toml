@@ -25,6 +25,7 @@ openmls_traits.workspace = true
 tls_codec.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing.workspace = true

@@ -156,6 +156,10 @@ pub enum ScenarioStep {
     RestartClient {
         client: String,
     },
+    /// Compiler-recorded synchronization point. It is a no-op for subjects.
+    Barrier {
+        name: String,
+    },
 }
 
 impl ScenarioStep {
@@ -185,6 +189,7 @@ impl ScenarioStep {
         "set_partition",
         "clear_partition",
         "restart_client",
+        "barrier",
     ];
 
     pub fn accept_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
@@ -234,6 +239,7 @@ impl ScenarioStep {
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
             ScenarioStep::RestartClient { .. } => "restart_client",
+            ScenarioStep::Barrier { .. } => "barrier",
         }
     }
 }
@@ -862,6 +868,7 @@ async fn execute_scenario_step(
                 .restart(client)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
+        ScenarioStep::Barrier { .. } => {}
     }
     Ok::<(), ScenarioRunError>(())
 }

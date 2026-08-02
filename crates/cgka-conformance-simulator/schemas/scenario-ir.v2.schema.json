@@ -266,6 +266,15 @@
             "type": { "const": "restart_client" },
             "client": { "type": "string", "minLength": 1 }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "name"],
+          "properties": {
+            "type": { "const": "barrier" },
+            "name": { "type": "string", "minLength": 1 }
+          }
         }
       ]
     }
