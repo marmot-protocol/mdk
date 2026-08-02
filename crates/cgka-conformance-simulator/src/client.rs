@@ -508,6 +508,18 @@ impl HarnessClient {
         self.bus.inject(self.bus_id, message);
     }
 
+    pub(crate) fn replay_group_id(&self) -> Option<&GroupId> {
+        self.default_group.as_ref()
+    }
+
+    pub(crate) fn replay_protocol_profile(&self) -> ProtocolProfile {
+        self.protocol_profile
+    }
+
+    pub(crate) fn replay_uses_virtual_time(&self) -> bool {
+        self.virtual_time_tick_enabled
+    }
+
     pub(crate) fn enable_virtual_time_tick(&mut self) {
         self.virtual_time_tick_enabled = true;
     }
@@ -1550,10 +1562,17 @@ impl HarnessClient {
     pub fn canonical_state_snapshot(
         &self,
     ) -> cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot {
+        self.try_canonical_state_snapshot()
+            .expect("capture canonical state snapshot")
+    }
+
+    pub(crate) fn try_canonical_state_snapshot(
+        &self,
+    ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError>
+    {
         let group_id = self.default_group.clone().expect("group");
         self.engine()
             .conformance_canonical_state_snapshot(&group_id)
-            .expect("capture canonical state snapshot")
     }
 
     pub fn scenario_input_ledger(&mut self) -> Vec<ScenarioInputLedgerEntry> {

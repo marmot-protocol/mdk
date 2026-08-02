@@ -488,8 +488,11 @@ These tests keep the simulator machinery honest.
   after an artifact reached a recipient mailbox;
   `exposed_welcome_prevents_partial_commit_retraction_and_rollback` applies the same rule to the complete
   commit/Welcome publication so a failed rollback cannot partially mutate transport state.
-- `failing_generated_case_records_a_minimized_reproducer` checks that a failing generated case records a smaller
-  reproducer when removable delivery noise is enough to keep the same failure.
+- `failing_generated_case_records_a_minimized_reproducer` checks that semantic failure identity lets a failing
+  generated case remove an entire irrelevant application-message storm even though action indices and the full state
+  digest change.
+- `failed_campaign_capsule_contains_a_replayable_tick_witness` checks that a real report campaign exports a sensitive
+  recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across
   candidate orderings.
 

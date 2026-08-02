@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioStimulus,
-    parse_report_command, property_test_coverage_entries, run_report,
+    FailureCapsuleSensitivity, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
+    ReportInput, ScenarioStimulus, parse_report_command, property_test_coverage_entries,
+    read_failure_capsule, replay_engine_bytes, run_report,
 };
 
 #[test]
@@ -312,11 +313,8 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
             .expect("capsule JSON parses");
     assert_eq!(capsule["schema_version"], "1");
     assert_eq!(capsule["failure"]["classification"], "oracle_violation");
-    assert!(
-        capsule["captured_transport_artifacts"]
-            .as_array()
-            .is_some_and(|artifacts| !artifacts.is_empty())
-    );
+    assert!(capsule.get("captured_transport_artifacts").is_none());
+    assert!(capsule.get("byte_replay").is_none());
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }
@@ -516,4 +514,62 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
     );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
+}
+
+#[tokio::test]
+async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
+    let temp = tempfile::tempdir().expect("campaign temp directory");
+    let fixture_path = temp.path().join("failing-message-exchange.v1.json");
+    let out_dir = temp.path().join("reports");
+    let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../vectors/three-client-message-exchange.v1.json"
+    ))
+    .expect("fixture parses");
+    fixture["scenario_name"] = "campaign-byte-replay/v1".into();
+    fixture["scenario"]["name"] = "campaign-byte-replay/v1".into();
+    fixture["expected_trace"]["name"] = "campaign-byte-replay/v1".into();
+    fixture["expected_trace"]["observations"][0]["member_count"] = 99.into();
+    fs::write(
+        &fixture_path,
+        serde_json::to_vec_pretty(&fixture).expect("fixture serializes"),
+    )
+    .expect("fixture writes");
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::VectorFixtures {
+            paths: vec![fixture_path],
+        },
+        out: out_dir,
+        strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
+    })
+    .await
+    .expect("failing campaign reports");
+    assert_eq!(summary.failed(), 1);
+    let capsule_path = summary.scenarios[0]
+        .failure_capsule
+        .as_ref()
+        .expect("failure capsule path");
+    let capsule = read_failure_capsule(capsule_path).expect("campaign capsule reads");
+    assert_eq!(
+        capsule.sensitivity,
+        FailureCapsuleSensitivity::SensitiveLocal
+    );
+    let replay = capsule
+        .byte_replay
+        .as_ref()
+        .expect("campaign exports its last real recipient tick");
+    replay_engine_bytes(replay)
+        .await
+        .expect("campaign-produced tick witness replays exactly");
+
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-simulator-report"))
+        .args(["--replay-capsule", &capsule_path.display().to_string()])
+        .output()
+        .expect("replay CLI runs");
+    assert!(
+        cli.status.success(),
+        "replay CLI failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
 }

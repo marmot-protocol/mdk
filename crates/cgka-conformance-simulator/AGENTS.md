@@ -267,8 +267,8 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
   use `create_group_with_admins` explicitly for competing admin commits.
 - **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy
-  step-removal reducer when removable app/delivery noise can be dropped without changing the complete stable failure
-  fingerprint. There is no
+  step-removal reducer when removable app/delivery noise can be dropped without changing the semantic failure identity
+  (classification, action type, and failure kind). Complete state-digest fingerprints remain diagnostic evidence. There is no
   domain-specific shrinker yet.
 
 ## Conventions

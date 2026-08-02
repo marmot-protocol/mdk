@@ -123,7 +123,7 @@ fn scenario_report_failures(
         .iter()
         .filter_map(|step| match &step.status {
             crate::ScenarioStepStatus::Completed => None,
-            crate::ScenarioStepStatus::Failed { kind, message } => Some(ReportFailureSummary {
+            crate::ScenarioStepStatus::Failed { kind, message, .. } => Some(ReportFailureSummary {
                 kind: format!("scenario_step_failed:{kind}"),
                 message: format!("step {} ({}): {message}", step.step_index, step.step_type),
             }),
@@ -228,7 +228,7 @@ async fn run_generated_family_reports(
 
     let mut summaries = Vec::with_capacity(cases.len());
     for case in cases {
-        let (report, captured_transport_artifacts) =
+        let (report, failure_capture) =
             run_generated_case_report_with_capture(&case, None, storage_mode).await?;
         let output = out.join(format!(
             "{}-seed-{}-case-{}.json",
@@ -258,9 +258,9 @@ async fn run_generated_family_reports(
                 case.seed,
                 case.case_index
             ));
-            Some(write_synthetic_failure_capsule(
+            Some(write_report_failure_capsule(
                 &report,
-                captured_transport_artifacts,
+                failure_capture_for(&failures, failure_capture),
                 path,
             )?)
         };
@@ -312,7 +312,7 @@ async fn run_vector_fixture_reports(
     let mut summaries = Vec::with_capacity(fixture_paths.len());
     for path in fixture_paths {
         let fixture: VectorFixture = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        let (report, captured_transport_artifacts) =
+        let (report, failure_capture) =
             run_vector_fixture_report_with_capture(&fixture, storage_mode).await?;
         let output = out.join(format!(
             "{}-report.json",
@@ -330,9 +330,9 @@ async fn run_vector_fixture_reports(
                 "{}-failure-capsule.v1.json",
                 fixture.scenario_name.replace('/', "-")
             ));
-            Some(write_synthetic_failure_capsule(
+            Some(write_report_failure_capsule(
                 &report,
-                captured_transport_artifacts,
+                failure_capture_for(&failures, failure_capture),
                 path,
             )?)
         };
@@ -351,16 +351,35 @@ async fn run_vector_fixture_reports(
     Ok(summaries)
 }
 
-fn write_synthetic_failure_capsule(
+fn failure_capture_for(
+    failures: &[ReportFailureSummary],
+    capture: crate::ScenarioFailureCaptureV1,
+) -> crate::ScenarioFailureCaptureV1 {
+    if failures
+        .iter()
+        .all(|failure| failure.kind == "weak_oracle_warning")
+    {
+        crate::ScenarioFailureCaptureV1::default()
+    } else {
+        capture
+    }
+}
+
+fn write_report_failure_capsule(
     report: &ScenarioReport,
-    captured_transport_artifacts: Vec<crate::CapturedTransportArtifactV1>,
+    capture: crate::ScenarioFailureCaptureV1,
     path: PathBuf,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let capsule = FailureCapsuleV1::from_report(
+    let sensitivity = if capture.byte_replay.is_some() {
+        FailureCapsuleSensitivity::SensitiveLocal
+    } else {
+        FailureCapsuleSensitivity::SyntheticShareable
+    };
+    let capsule = FailureCapsuleV1::from_report_capture(
         report.clone(),
-        FailureCapsuleSensitivity::SyntheticShareable,
-        captured_transport_artifacts,
-        None,
+        sensitivity,
+        capture.transport,
+        capture.byte_replay,
     )?;
     write_failure_capsule(&path, &capsule)?;
     Ok(path)
@@ -601,6 +620,7 @@ mod tests {
             step_type: "tick".into(),
             status: crate::ScenarioStepStatus::Failed {
                 kind: "backend".into(),
+                category: crate::SubjectFailureCategory::Resource,
                 message: "convergence replay budget exceeded".into(),
             },
         });

@@ -7,8 +7,6 @@
   "required": [
     "schema_version",
     "sensitivity",
-    "original_scenario",
-    "canonical_scenario",
     "seeds",
     "expanded_schedule",
     "binary_version",
@@ -22,8 +20,6 @@
     "sensitivity": {
       "enum": ["synthetic_shareable", "sensitive_local"]
     },
-    "original_scenario": { "$ref": "#/$defs/scenario" },
-    "canonical_scenario": { "$ref": "#/$defs/scenario" },
     "seeds": {
       "type": "object",
       "additionalProperties": { "type": "integer", "minimum": 0 }
@@ -63,6 +59,7 @@
     },
     "captured_transport_artifacts": {
       "type": "array",
+      "maxItems": 256,
       "items": {
         "type": "object",
         "required": ["sequence", "sender", "message"],
@@ -145,8 +142,6 @@
         "checkpoint_monotonic_ms",
         "checkpoint_wall_ms",
         "virtual_time_tick_enabled",
-        "failure_kind",
-        "failing_action_id",
         "expected_fingerprint"
       ],
       "properties": {
@@ -154,13 +149,11 @@
         "identity_seed": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
         "protocol_profile": {},
         "group_id": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
-        "sensitive_checkpoint": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
-        "captured_deliveries": { "type": "array", "items": { "type": "object" } },
+        "sensitive_checkpoint": { "type": "array", "maxItems": 16777216, "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "captured_deliveries": { "type": "array", "maxItems": 256, "items": { "type": "object" } },
         "checkpoint_monotonic_ms": { "type": "integer", "minimum": 0 },
         "checkpoint_wall_ms": { "type": "integer", "minimum": 0 },
         "virtual_time_tick_enabled": { "type": "boolean" },
-        "failure_kind": { "type": "string" },
-        "failing_action_id": { "type": "string" },
         "expected_fingerprint": { "$ref": "#/$defs/fingerprint" }
       }
     }

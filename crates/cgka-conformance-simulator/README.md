@@ -34,8 +34,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
   step logs, recoveries, and expectation failures.
 - `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded virtual-time schedule, exact
-  policy/constants, report/ledgers/state commitments, captured transport objects, resource counters, and a stable
-  failure fingerprint. An optional sensitive recipient checkpoint enables byte-exact engine replay.
+  policy/constants, report/ledgers/state commitments, a bounded transport-evidence tail with truncation counters, and a
+  stable failure fingerprint. An optional bounded sensitive recipient checkpoint enables byte-exact engine replay.
 - `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
   and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
   domain-separated exporter commitment. Raw exporter material is never serialized.
@@ -343,7 +343,9 @@ the conformance contract clearer.
 
 `run_generated_case_report(case, expected_trace)` adds generated-family metadata: family name, generator version, seed,
 case index, and an optional `minimized_case` field. Failing generated cases run a conservative greedy minimizer that
-removes removable delivery/app steps only when the complete stable failure fingerprint still reproduces. Generated report runs also write
+removes removable delivery/app steps only when the semantic failure identity (classification, action type, and failure
+kind) still reproduces. The complete fingerprint, including the state digest, remains in the capsule for diagnosis.
+Generated report runs also write
 a sibling `*-fixture.v1.json` candidate. Cases with semantic expectations keep those expectations; cases without them
 use the observed trace as an exact expected trace in the candidate. When a failing generated case has a minimized
 reproducer, the fixture candidate uses that minimized scenario.

@@ -21,11 +21,14 @@ use sha2::{Digest, Sha256};
 use crate::{
     ClientBuilder, ConformanceConstantSnapshot, HarnessStorageMode, QuiescencePolicy,
     QuiescenceStatus, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioStepStatus,
-    SubjectDescriptor, TransportBus, conformance_constant_snapshot,
+    SubjectDescriptor, SubjectFailureCategory, TransportBus, conformance_constant_snapshot,
 };
 
 pub const FAILURE_CAPSULE_SCHEMA_VERSION: &str = "1";
 pub const FAILURE_FINGERPRINT_VERSION: &str = "1";
+pub const MAX_CAPTURED_TRANSPORT_OBJECTS: usize = 256;
+pub const MAX_CAPTURED_TRANSPORT_JSON_BYTES: u64 = 1_048_576;
+pub const MAX_CAPTURED_REPLAY_CHECKPOINT_BYTES: usize = 16 * 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +61,32 @@ pub struct FailureFingerprintV1 {
     pub normalized_state_digest: String,
 }
 
+/// Stable semantic identity used by reducers. Unlike the full fingerprint,
+/// this deliberately excludes action indices and observed-state digests that
+/// are expected to change when irrelevant scenario steps are removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureIdentityV1 {
+    pub classification: TerminalOutcomeClassification,
+    pub failing_action_type: String,
+    pub failure_kind: String,
+}
+
+impl FailureFingerprintV1 {
+    pub fn semantic_identity(&self) -> FailureIdentityV1 {
+        let failing_action_type = self
+            .first_failing_action_id
+            .as_deref()
+            .and_then(|action_id| action_id.split_once(':').map(|(_, kind)| kind))
+            .unwrap_or_else(|| self.first_failing_action_id.as_deref().unwrap_or("unknown"))
+            .to_owned();
+        FailureIdentityV1 {
+            classification: self.classification,
+            failing_action_type,
+            failure_kind: self.failure_kind.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpandedScenarioActionV1 {
     pub action_id: String,
@@ -74,6 +103,19 @@ pub struct CapturedTransportArtifactV1 {
     pub sequence: u64,
     pub sender: String,
     pub message: TransportMessage,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapturedTransportWindowV1 {
+    pub artifacts: Vec<CapturedTransportArtifactV1>,
+    pub observed_objects: u64,
+    pub observed_json_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScenarioFailureCaptureV1 {
+    pub transport: CapturedTransportWindowV1,
+    pub byte_replay: Option<EngineByteReplayV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,8 +147,6 @@ pub struct EngineByteReplayV1 {
     /// Whether the original harness tick used the injected clock rather than
     /// the legacy far-future settlement shortcut.
     pub virtual_time_tick_enabled: bool,
-    pub failure_kind: String,
-    pub failing_action_id: String,
     pub expected_fingerprint: FailureFingerprintV1,
 }
 
@@ -122,8 +162,6 @@ pub struct EngineByteReplayObservationV1 {
 pub struct FailureCapsuleV1 {
     pub schema_version: String,
     pub sensitivity: FailureCapsuleSensitivity,
-    pub original_scenario: ScenarioSpec,
-    pub canonical_scenario: ScenarioSpec,
     /// Stable named seeds/indices needed to reconstruct generated schedules.
     pub seeds: BTreeMap<String, u64>,
     pub expanded_schedule: Vec<ExpandedScenarioActionV1>,
@@ -198,6 +236,27 @@ impl FailureCapsuleV1 {
         captured_transport_artifacts: Vec<CapturedTransportArtifactV1>,
         byte_replay: Option<EngineByteReplayV1>,
     ) -> Result<Self, FailureCapsuleError> {
+        let observed_objects = captured_transport_artifacts.len() as u64;
+        let observed_json_bytes = transport_json_bytes(&captured_transport_artifacts);
+        Self::from_report_capture(
+            report,
+            sensitivity,
+            CapturedTransportWindowV1 {
+                artifacts: captured_transport_artifacts,
+                observed_objects,
+                observed_json_bytes,
+            },
+            byte_replay,
+        )
+    }
+
+    pub fn from_report_capture(
+        report: ScenarioReport,
+        sensitivity: FailureCapsuleSensitivity,
+        captured_transport: CapturedTransportWindowV1,
+        byte_replay: Option<EngineByteReplayV1>,
+    ) -> Result<Self, FailureCapsuleError> {
+        let captured_transport = bound_transport_capture(captured_transport);
         let failure = fingerprint_report_failure(&report)?;
         let mut virtual_time_ms = 0_u64;
         let expanded_schedule = report
@@ -254,8 +313,6 @@ impl FailureCapsuleV1 {
         let capsule = Self {
             schema_version: FAILURE_CAPSULE_SCHEMA_VERSION.into(),
             sensitivity,
-            original_scenario: report.scenario.clone(),
-            canonical_scenario: report.scenario.clone(),
             seeds,
             expanded_schedule,
             adapter: report.metadata.subject.clone(),
@@ -265,8 +322,8 @@ impl FailureCapsuleV1 {
                 quiescence_by_action,
                 engine_constants: conformance_constant_snapshot(),
             },
-            resources: resource_observations(&report, &captured_transport_artifacts),
-            captured_transport_artifacts,
+            resources: resource_observations(&report, &captured_transport),
+            captured_transport_artifacts: captured_transport.artifacts,
             report,
             failure,
             byte_replay,
@@ -296,10 +353,19 @@ impl FailureCapsuleV1 {
             ));
         }
         if let Some(replay) = &self.byte_replay {
+            if replay.sensitive_checkpoint.len() > MAX_CAPTURED_REPLAY_CHECKPOINT_BYTES
+                || replay.captured_deliveries.len() > MAX_CAPTURED_TRANSPORT_OBJECTS
+                || transport_messages_json_bytes(&replay.captured_deliveries)
+                    > MAX_CAPTURED_TRANSPORT_JSON_BYTES
+            {
+                return Err(FailureCapsuleError::Replay(
+                    "engine byte-replay evidence exceeds the capsule resource policy".into(),
+                ));
+            }
             let expected = build_fingerprint(
                 replay.expected_fingerprint.classification,
-                Some(replay.failing_action_id.clone()),
-                replay.failure_kind.clone(),
+                replay.expected_fingerprint.first_failing_action_id.clone(),
+                replay.expected_fingerprint.failure_kind.clone(),
                 replay.expected_fingerprint.normalized_state_digest.clone(),
             );
             if expected != replay.expected_fingerprint {
@@ -354,7 +420,7 @@ pub fn promote_failure_capsule_to_vector(
     let scenario = capsule
         .minimized_reproducer
         .clone()
-        .unwrap_or_else(|| capsule.canonical_scenario.clone());
+        .unwrap_or_else(|| capsule.report.scenario.clone());
     if capsule.report.expected_trace.is_none() && capsule.report.expected_outcomes.is_empty() {
         return Err(FailureCapsuleError::MissingPortableExpectation);
     }
@@ -402,8 +468,19 @@ pub fn fingerprint_report_failure(
     ))?;
 
     let failed_step = report.step_log.iter().find_map(|step| match &step.status {
-        ScenarioStepStatus::Failed { kind, .. } => Some((
-            TerminalOutcomeClassification::EnvironmentFailure,
+        ScenarioStepStatus::Failed { kind, category, .. } => Some((
+            match category {
+                SubjectFailureCategory::ExpectedRefusal => {
+                    TerminalOutcomeClassification::ExpectedRefusal
+                }
+                SubjectFailureCategory::Protocol => {
+                    TerminalOutcomeClassification::TerminalProtocolFailure
+                }
+                SubjectFailureCategory::Resource => TerminalOutcomeClassification::ResourceFailure,
+                SubjectFailureCategory::Environment => {
+                    TerminalOutcomeClassification::EnvironmentFailure
+                }
+            },
             format!("step-{}:{}", step.step_index, step.step_type),
             format!("scenario_step_failed:{kind}"),
         )),
@@ -506,15 +583,26 @@ pub async fn replay_engine_bytes(
         client.inject_captured_transport(message.clone());
     }
     let outcomes = client.tick().await;
-    if let Some(error) = outcomes.into_iter().find_map(Result::err) {
-        return Err(FailureCapsuleError::Replay(error.to_string()));
-    }
+    let actual_error = outcomes.iter().find_map(|outcome| outcome.as_ref().err());
     let canonical_state = client.canonical_state_snapshot();
     let normalized_state_digest = digest_json(&canonical_state)?;
+    let (classification, failure_kind) = actual_error.map_or(
+        (
+            TerminalOutcomeClassification::Converged,
+            "campaign_tick_replay".to_string(),
+        ),
+        |error| {
+            let (category, code) = crate::subject::classify_engine_error(error);
+            (
+                terminal_classification(category),
+                format!("scenario_step_failed:{code}"),
+            )
+        },
+    );
     let fingerprint = build_fingerprint(
-        replay.expected_fingerprint.classification,
-        Some(replay.failing_action_id.clone()),
-        replay.failure_kind.clone(),
+        classification,
+        replay.expected_fingerprint.first_failing_action_id.clone(),
+        failure_kind,
         normalized_state_digest.clone(),
     );
     if fingerprint.digest != replay.expected_fingerprint.digest {
@@ -561,7 +649,7 @@ pub fn digest_json(value: &impl Serialize) -> Result<String, FailureCapsuleError
 
 fn resource_observations(
     report: &ScenarioReport,
-    captured_transport_artifacts: &[CapturedTransportArtifactV1],
+    captured_transport: &CapturedTransportWindowV1,
 ) -> ResourceObservationV1 {
     let mut counters = BTreeMap::new();
     counters.insert(
@@ -596,17 +684,77 @@ fn resource_observations(
             .sum(),
     );
     counters.insert(
-        "captured_transport_objects".into(),
-        captured_transport_artifacts.len() as u64,
+        "transport_objects_observed".into(),
+        captured_transport.observed_objects,
     );
     counters.insert(
-        "captured_transport_json_bytes".into(),
-        captured_transport_artifacts
-            .iter()
-            .map(|artifact| {
-                serde_json::to_vec(&artifact.message).map_or(0, |bytes| bytes.len() as u64)
-            })
-            .sum(),
+        "transport_objects_retained".into(),
+        captured_transport.artifacts.len() as u64,
+    );
+    counters.insert(
+        "transport_objects_dropped".into(),
+        captured_transport
+            .observed_objects
+            .saturating_sub(captured_transport.artifacts.len() as u64),
+    );
+    counters.insert(
+        "transport_json_bytes_observed".into(),
+        captured_transport.observed_json_bytes,
+    );
+    let retained_json_bytes = transport_json_bytes(&captured_transport.artifacts);
+    counters.insert("transport_json_bytes_retained".into(), retained_json_bytes);
+    counters.insert(
+        "transport_json_bytes_dropped".into(),
+        captured_transport
+            .observed_json_bytes
+            .saturating_sub(retained_json_bytes),
     );
     ResourceObservationV1 { counters }
+}
+
+fn transport_json_bytes(artifacts: &[CapturedTransportArtifactV1]) -> u64 {
+    artifacts
+        .iter()
+        .map(|artifact| serde_json::to_vec(&artifact.message).map_or(0, |bytes| bytes.len() as u64))
+        .sum()
+}
+
+fn transport_messages_json_bytes(messages: &[TransportMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|message| serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64))
+        .sum()
+}
+
+fn bound_transport_capture(mut capture: CapturedTransportWindowV1) -> CapturedTransportWindowV1 {
+    capture.artifacts.sort_by_key(|artifact| artifact.sequence);
+    let mut retained_bytes = 0_u64;
+    let mut retained = capture
+        .artifacts
+        .into_iter()
+        .rev()
+        .filter(|artifact| {
+            let bytes = serde_json::to_vec(&artifact.message).map_or(0, |bytes| bytes.len() as u64);
+            if retained_bytes.saturating_add(bytes) > MAX_CAPTURED_TRANSPORT_JSON_BYTES {
+                return false;
+            }
+            retained_bytes = retained_bytes.saturating_add(bytes);
+            true
+        })
+        .take(MAX_CAPTURED_TRANSPORT_OBJECTS)
+        .collect::<Vec<_>>();
+    retained.sort_by_key(|artifact| artifact.sequence);
+    capture.artifacts = retained;
+    capture
+}
+
+pub(crate) fn terminal_classification(
+    category: SubjectFailureCategory,
+) -> TerminalOutcomeClassification {
+    match category {
+        SubjectFailureCategory::ExpectedRefusal => TerminalOutcomeClassification::ExpectedRefusal,
+        SubjectFailureCategory::Protocol => TerminalOutcomeClassification::TerminalProtocolFailure,
+        SubjectFailureCategory::Resource => TerminalOutcomeClassification::ResourceFailure,
+        SubjectFailureCategory::Environment => TerminalOutcomeClassification::EnvironmentFailure,
+    }
 }

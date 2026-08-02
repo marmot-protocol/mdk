@@ -51,12 +51,15 @@ pub use decryptability::{
     DirectionalDecryptabilityProbe,
 };
 pub use failure_capsule::{
-    CapsulePolicySnapshotV1, CapturedTransportArtifactV1, EngineByteReplayObservationV1,
-    EngineByteReplayV1, ExpandedScenarioActionV1, FAILURE_CAPSULE_SCHEMA_VERSION,
-    FAILURE_FINGERPRINT_VERSION, FailureCapsuleError, FailureCapsuleSensitivity, FailureCapsuleV1,
-    FailureFingerprintV1, ResourceObservationV1, TerminalOutcomeClassification, build_fingerprint,
-    digest_json, fingerprint_report_failure, promote_failure_capsule_to_vector,
-    read_failure_capsule, replay_engine_bytes, write_failure_capsule,
+    CapsulePolicySnapshotV1, CapturedTransportArtifactV1, CapturedTransportWindowV1,
+    EngineByteReplayObservationV1, EngineByteReplayV1, ExpandedScenarioActionV1,
+    FAILURE_CAPSULE_SCHEMA_VERSION, FAILURE_FINGERPRINT_VERSION, FailureCapsuleError,
+    FailureCapsuleSensitivity, FailureCapsuleV1, FailureFingerprintV1, FailureIdentityV1,
+    MAX_CAPTURED_REPLAY_CHECKPOINT_BYTES, MAX_CAPTURED_TRANSPORT_JSON_BYTES,
+    MAX_CAPTURED_TRANSPORT_OBJECTS, ResourceObservationV1, ScenarioFailureCaptureV1,
+    TerminalOutcomeClassification, build_fingerprint, digest_json, fingerprint_report_failure,
+    promote_failure_capsule_to_vector, read_failure_capsule, replay_engine_bytes,
+    write_failure_capsule,
 };
 pub use family::{
     GeneratedScenarioCase, generate_convergence_chaos_family,
@@ -98,10 +101,10 @@ pub use scenario_input_ledger::{
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
-    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
-    SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, engine_harness_feature_registry,
-    required_capabilities,
+    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
+    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
+    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    engine_harness_feature_registry, required_capabilities,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

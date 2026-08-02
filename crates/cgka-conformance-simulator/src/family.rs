@@ -4,10 +4,10 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    CapturedTransportArtifactV1, FailureFingerprintV1, GeneratedScenarioMetadata,
-    HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport, ScenarioRunError, ScenarioSpec,
-    ScenarioStep, ScenarioTrace, SubjectOutboundOutcome, TraceExpectation, VectorFixture,
-    fingerprint_report_failure, run_scenario_report_with_outcomes_and_capture,
+    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport,
+    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioTrace, SubjectOutboundOutcome,
+    TraceExpectation, VectorFixture, fingerprint_report_failure,
+    run_scenario_report_with_outcomes_and_capture,
     run_scenario_report_with_outcomes_and_storage_mode,
 };
 use rand::rngs::StdRng;
@@ -118,8 +118,14 @@ pub async fn run_generated_case_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let (report, _) =
-        run_generated_case_report_with_capture(case, expected_trace, storage_mode).await?;
+    let mut report = run_scenario_report_with_outcomes_and_storage_mode(
+        &case.scenario,
+        expected_trace.clone(),
+        case.expected_outcomes.clone(),
+        storage_mode,
+    )
+    .await?;
+    add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;
     Ok(report)
 }
 
@@ -129,16 +135,26 @@ pub async fn run_generated_case_report_with_capture(
     case: &GeneratedScenarioCase,
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
-) -> Result<(ScenarioReport, Vec<CapturedTransportArtifactV1>), ScenarioRunError> {
-    let (mut report, captured_transport_artifacts) = run_scenario_report_with_outcomes_and_capture(
+) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
+    let (mut report, failure_capture) = run_scenario_report_with_outcomes_and_capture(
         &case.scenario,
         expected_trace.clone(),
         case.expected_outcomes.clone(),
         storage_mode,
     )
     .await?;
-    let minimized_case = if fingerprint_report_failure(&report).is_ok() {
-        minimize_failing_case(case, expected_trace.as_ref(), &report, storage_mode).await
+    add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;
+    Ok((report, failure_capture))
+}
+
+async fn add_generated_metadata(
+    case: &GeneratedScenarioCase,
+    expected_trace: Option<&ScenarioTrace>,
+    report: &mut ScenarioReport,
+    storage_mode: HarnessStorageMode,
+) {
+    let minimized_case = if fingerprint_report_failure(report).is_ok() {
+        minimize_failing_case(case, expected_trace, report, storage_mode).await
     } else {
         None
     };
@@ -149,7 +165,6 @@ pub async fn run_generated_case_report_with_capture(
         case_index: case.case_index,
         minimized_case,
     });
-    Ok((report, captured_transport_artifacts))
 }
 
 async fn minimize_failing_case(
@@ -158,7 +173,9 @@ async fn minimize_failing_case(
     failing_report: &ScenarioReport,
     storage_mode: HarnessStorageMode,
 ) -> Option<ScenarioSpec> {
-    let target_fingerprint = fingerprint_report_failure(failing_report).ok()?;
+    let target_identity = fingerprint_report_failure(failing_report)
+        .ok()?
+        .semantic_identity();
 
     let mut candidate = case.scenario.clone();
     let mut changed = false;
@@ -175,7 +192,7 @@ async fn minimize_failing_case(
             &trial,
             expected_trace.cloned(),
             case.expected_outcomes.clone(),
-            &target_fingerprint,
+            &target_identity,
             storage_mode,
         )
         .await
@@ -194,7 +211,7 @@ async fn reproduces_failure(
     scenario: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
-    target_fingerprint: &FailureFingerprintV1,
+    target_identity: &crate::FailureIdentityV1,
     storage_mode: HarnessStorageMode,
 ) -> bool {
     match run_scenario_report_with_outcomes_and_storage_mode(
@@ -206,7 +223,7 @@ async fn reproduces_failure(
     .await
     {
         Ok(report) => fingerprint_report_failure(&report)
-            .is_ok_and(|fingerprint| fingerprint == *target_fingerprint),
+            .is_ok_and(|fingerprint| fingerprint.semantic_identity() == *target_identity),
         Err(_) => false,
     }
 }

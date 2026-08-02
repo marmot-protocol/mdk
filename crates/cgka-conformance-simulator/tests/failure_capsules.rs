@@ -11,6 +11,8 @@ use cgka_conformance_simulator::{
 };
 use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep};
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::types::MessageId;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0_u8; 32];
@@ -48,9 +50,9 @@ async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
     let normalized_state_digest =
         digest_json(&bob.canonical_state_snapshot()).expect("digest canonical state");
     let expected_fingerprint = build_fingerprint(
-        TerminalOutcomeClassification::OracleViolation,
-        Some("step-6:tick".into()),
-        "captured_commit_state".into(),
+        TerminalOutcomeClassification::Converged,
+        Some("campaign_tick".into()),
+        "campaign_tick_replay".into(),
         normalized_state_digest,
     );
     let replay = EngineByteReplayV1 {
@@ -63,8 +65,6 @@ async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
         checkpoint_monotonic_ms: 0,
         checkpoint_wall_ms: 0,
         virtual_time_tick_enabled: false,
-        failure_kind: "captured_commit_state".into(),
-        failing_action_id: "step-6:tick".into(),
         expected_fingerprint: expected_fingerprint.clone(),
     };
 
@@ -220,7 +220,7 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
     }
     let promoted = promote_failure_capsule_to_vector(&capsule, "test")
         .expect("synthetic capsule promotes to a vector candidate");
-    assert_eq!(promoted.scenario, capsule.canonical_scenario);
+    assert_eq!(promoted.scenario, capsule.report.scenario);
     assert_eq!(promoted.expected_trace, capsule.report.expected_trace);
     assert_eq!(promoted.expected_outcomes, capsule.report.expected_outcomes);
 
@@ -243,8 +243,6 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
         checkpoint_monotonic_ms: 0,
         checkpoint_wall_ms: 0,
         virtual_time_tick_enabled: false,
-        failure_kind: incorrectly_shareable.failure.failure_kind.clone(),
-        failing_action_id: "oracle".into(),
         expected_fingerprint: incorrectly_shareable.failure.clone(),
     });
     assert!(
@@ -270,6 +268,7 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
             step_type: "tick".into(),
             status: cgka_conformance_simulator::ScenarioStepStatus::Failed {
                 kind: "backend".into(),
+                category: cgka_conformance_simulator::SubjectFailureCategory::Resource,
                 message: "backend error at /tmp/first.sqlite".into(),
             },
         });
@@ -285,6 +284,47 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
         fingerprint_report_failure(&second_failed_report).expect("second fingerprint"),
         "free-form backend text must not affect the stable failure fingerprint"
     );
+    let resource_fingerprint =
+        fingerprint_report_failure(&first_failed_report).expect("resource fingerprint");
+    assert_eq!(
+        resource_fingerprint.classification,
+        TerminalOutcomeClassification::ResourceFailure,
+        "typed subject provenance must not collapse engine/storage failures into environment noise"
+    );
+
+    let template = CapturedTransportArtifactV1 {
+        sequence: 0,
+        sender: "alice".into(),
+        message: TransportMessage {
+            id: MessageId::new(vec![7; 32]),
+            payload: vec![8; 32],
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![9; 32],
+            },
+        },
+    };
+    let oversized_capture = (0..300)
+        .map(|sequence| CapturedTransportArtifactV1 {
+            sequence,
+            ..template.clone()
+        })
+        .collect::<Vec<_>>();
+    let bounded = FailureCapsuleV1::from_report(
+        first_failed_report.clone(),
+        FailureCapsuleSensitivity::SyntheticShareable,
+        oversized_capture,
+        None,
+    )
+    .expect("oversized evidence is bounded during capsule construction");
+    assert_eq!(bounded.captured_transport_artifacts.len(), 256);
+    assert_eq!(
+        bounded.resources.counters["transport_objects_observed"],
+        300
+    );
+    assert_eq!(bounded.resources.counters["transport_objects_dropped"], 44);
 
     let dir = tempfile::tempdir().expect("temporary capsule directory");
     let path = dir
