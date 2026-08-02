@@ -3068,6 +3068,137 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             client=client,
         )
 
+    async def _render_inbound_timeline(self, messages):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message": {
+                "message_id_hex": "33" * 32,
+                "sender": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "Alice",
+                    "is_self": False,
+                },
+                "text": "ping",
+                "recorded_at": 1_721_000_000,
+                "media": [],
+            },
+            "mentions_self": True,
+        }
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield wire_event(event)
+
+            async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
+                return {
+                    "type": "timeline_page",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "messages": messages,
+                    "has_more_before": False,
+                    "has_more_after": False,
+                }
+
+        adapter = self._adapter(FakeClient())
+        await adapter._consume_inbound_once(drain=True)
+        self.assertEqual(len(adapter.events), 1)
+        return adapter.events[0].channel_context.splitlines()[0]
+
+    async def test_timeline_context_small_page_needs_no_truncation(self):
+        messages = [{"message_id_hex": str(i), "text": f"message-{i}"} for i in range(3)]
+
+        rendered = await self._render_inbound_timeline(messages)
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], messages)
+        self.assertNotIn("messages_truncated", fact)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
+
+    async def test_timeline_context_omits_one_oversized_record(self):
+        rendered = await self._render_inbound_timeline(
+            [{"message_id_hex": "newest", "text": "🙂" * 10_000}]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 1)
+        self.assertEqual(fact["oversized_message_count"], 1)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
+
+    async def test_timeline_context_counts_multiple_oversized_records(self):
+        rendered = await self._render_inbound_timeline(
+            [
+                {"message_id_hex": "old-1", "text": "🙂" * 10_000},
+                {"message_id_hex": "old-2", "text": "🙂" * 10_000},
+                {"message_id_hex": "newest", "text": "kept"},
+            ]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(
+            [message["message_id_hex"] for message in fact["messages"]],
+            ["newest"],
+        )
+        self.assertEqual(fact["omitted_message_count"], 2)
+        self.assertEqual(fact["oversized_message_count"], 2)
+        self.assertNotIn("old-1", rendered)
+        self.assertNotIn("old-2", rendered)
+
+    async def test_timeline_context_counts_oversized_records_outside_count_window(self):
+        rendered = await self._render_inbound_timeline(
+            [{"message_id_hex": str(i), "text": "🙂" * 10_000} for i in range(9)]
+        )
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 9)
+        self.assertEqual(fact["oversized_message_count"], 9)
+
+    async def test_timeline_context_does_not_misclassify_metadata_displaced_record(self):
+        final_message = {"message_id_hex": "final", "text": ""}
+        single_fact = {
+            "type": "chat_window",
+            "order": "chronological",
+            "relation": "before_current_message",
+            "messages": [final_message],
+            "messages_truncated": True,
+            "omitted_message_count": 1,
+        }
+        base_bytes = len(
+            f"{self.adapter_module._TIMELINE_CONTEXT_PREFIX}{json.dumps(single_fact, separators=(',', ':'))}".encode("utf-8")
+        )
+        final_message["text"] = "x" * (
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT - base_bytes
+        )
+        self.assertFalse(
+            self.adapter_module._timeline_message_exceeds_byte_limit(final_message)
+        )
+
+        messages = (
+            [{"message_id_hex": "oversized", "text": "🙂" * 10_000}]
+            + [{"message_id_hex": f"small-{i}", "text": ""} for i in range(7)]
+            + [final_message]
+        )
+        rendered = await self._render_inbound_timeline(messages)
+        prefix = "Marmot conversation history (untrusted): "
+        fact = json.loads(rendered[len(prefix):])
+
+        self.assertEqual(fact["messages"], [])
+        self.assertEqual(fact["omitted_message_count"], 9)
+        self.assertEqual(fact["oversized_message_count"], 1)
+
     # --- Behavior 1: append-only commits only after a successful append --------
     async def test_append_only_state_consistent_after_failed_stream_append(self):
         class FakeClient:
@@ -3263,7 +3394,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "group_id_hex": group_id_hex,
                     "messages": [
                         {
-                            "message_id_hex": "88" * 32,
+                            "message_id_hex": f"{index:064x}",
                             "sender": {
                                 "account_id_hex": "44" * 32,
                                 "display_name": "Alice",
@@ -3271,14 +3402,15 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                             },
                             "direction": "received",
                             "kind": 9,
-                            "recorded_at": 1_720_999_800,
-                            "observed_at": 1_720_999_801,
+                            "recorded_at": 1_720_999_800 + index,
+                            "observed_at": 1_720_999_801 + index,
                             "availability": "available",
-                            "text": "earlier question",
+                            "text": "x" * 1_500,
                             "text_truncated": False,
                             "attachments_truncated": False,
                             "reactions_truncated": False,
                         }
+                        for index in range(20)
                     ],
                     "has_more_before": False,
                     "has_more_after": False,
@@ -3303,7 +3435,18 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # The internal normalized shape retains the routing id as well.
         self.assertEqual(delivered.raw_message.get("reply_to_message_id_hex"), "99" * 32)
         self.assertIn('"type":"chat_window"', delivered.channel_context)
-        self.assertIn('"message_id_hex":"' + ("88" * 32) + '"', delivered.channel_context)
+        timeline_context = delivered.channel_context.splitlines()[0]
+        timeline_prefix = "Marmot conversation history (untrusted): "
+        timeline_fact = json.loads(timeline_context[len(timeline_prefix):])
+        self.assertEqual(
+            [message["message_id_hex"] for message in timeline_fact["messages"]],
+            [f"{index:064x}" for index in range(12, 20)],
+        )
+        self.assertEqual(timeline_fact["omitted_message_count"], 12)
+        self.assertLessEqual(
+            len(timeline_context.encode("utf-8")),
+            self.adapter_module.TIMELINE_CONTEXT_BYTE_LIMIT,
+        )
         self.assertIn('"type":"referenced_message"', delivered.channel_context)
         self.assertIn('"text_excerpt":"earlier answer"', delivered.channel_context)
         self.assertIn('"display_name":"Hermes Agent"', delivered.channel_context)
