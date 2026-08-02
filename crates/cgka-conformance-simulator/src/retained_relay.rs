@@ -157,8 +157,7 @@ impl RetainedRelaySubject {
         capabilities.retain(|capability| {
             !matches!(
                 capability,
-                SubjectCapability::WhiteBoxTransportQueueFaults
-                    | SubjectCapability::WhiteBoxTransportPartition
+                SubjectCapability::WhiteBoxTransportPartition
                     | SubjectCapability::SemanticTransportFaults
             )
         });

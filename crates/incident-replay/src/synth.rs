@@ -9,7 +9,10 @@
 //! outcome-equivalence, and the committer identities are synthetic labels the
 //! caller assigns so the designated winner's branch wins.
 
-use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep, TraceExpectation, VectorFixture};
+use cgka_conformance_simulator::{
+    ScenarioMessageSelectorV2, ScenarioSpec, ScenarioStep, ScenarioTransportClass,
+    TraceExpectation, VectorFixture,
+};
 
 use crate::convergence::{ConvergenceDecisionKind, RecoveredConvergence};
 use crate::fork::{ForkCommitKind, RecoveredFork};
@@ -388,16 +391,20 @@ fn synthesize_committer_decided(conv: &RecoveredConvergence, name: &str) -> Vect
 /// Witness-decided: the observer delivers two distinct senders' app messages on
 /// one branch *before* the competing commit arrives, so on the reorg the
 /// app-witness quorum overrides the committer tiebreak. Holding the competing
-/// commit (`DelayQueued`/`ReleaseDelayed`) is what stages the "delivered, then
+/// commit (`WithholdMessage`/`ReleaseWithheld`) is what stages the "delivered, then
 /// contested" ordering; the second observer `Tick` after release is the reorg.
 fn synthesize_witness_decided(conv: &RecoveredConvergence, name: &str) -> VectorFixture {
     let mut steps = convergence_preamble();
     steps.extend([
-        // Hold the competing branch-B commit (queue index 3: welcome-a, commit-a,
-        // welcome-b, commit-b) so only branch A reaches the observer first.
-        ScenarioStep::DelayQueued {
-            index: 3,
-            delayed: "held-b".to_owned(),
+        // Hold the competing branch-B commit by its publication and protocol
+        // class so only branch A reaches the observer first.
+        ScenarioStep::WithholdMessage {
+            selector: ScenarioMessageSelectorV2 {
+                publication: Some("invite-b".to_owned()),
+                class: Some(ScenarioTransportClass::Commit),
+                ..Default::default()
+            },
+            label: "held-b".to_owned(),
         },
         ScenarioStep::DeliverAll,
         // The invitee joins branch A so it can be the second witness sender.
@@ -418,8 +425,8 @@ fn synthesize_witness_decided(conv: &RecoveredConvergence, name: &str) -> Vector
             clients: vec![OBSERVER.to_owned()],
         },
         // The competing branch-B commit now arrives, forcing a reorg.
-        ScenarioStep::ReleaseDelayed {
-            delayed: "held-b".to_owned(),
+        ScenarioStep::ReleaseWithheld {
+            label: "held-b".to_owned(),
         },
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {

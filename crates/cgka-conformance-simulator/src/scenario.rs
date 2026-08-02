@@ -145,22 +145,6 @@ pub enum ScenarioStep {
     ClearEvents {
         clients: Vec<String>,
     },
-    DropQueued {
-        index: usize,
-    },
-    DuplicateQueued {
-        index: usize,
-    },
-    DelayQueued {
-        index: usize,
-        delayed: String,
-    },
-    ReleaseDelayed {
-        delayed: String,
-    },
-    ReorderQueued {
-        order: Vec<usize>,
-    },
     OmitMessage {
         selector: crate::ScenarioMessageSelectorV2,
     },
@@ -251,11 +235,6 @@ impl ScenarioStep {
         "probe_bidirectional_decryptability",
         "observe_admin_policy",
         "clear_events",
-        "drop_queued",
-        "duplicate_queued",
-        "delay_queued",
-        "release_delayed",
-        "reorder_queued",
         "omit_message",
         "duplicate_message",
         "withhold_message",
@@ -319,11 +298,6 @@ impl ScenarioStep {
             }
             ScenarioStep::ObserveAdminPolicy { .. } => "observe_admin_policy",
             ScenarioStep::ClearEvents { .. } => "clear_events",
-            ScenarioStep::DropQueued { .. } => "drop_queued",
-            ScenarioStep::DuplicateQueued { .. } => "duplicate_queued",
-            ScenarioStep::DelayQueued { .. } => "delay_queued",
-            ScenarioStep::ReleaseDelayed { .. } => "release_delayed",
-            ScenarioStep::ReorderQueued { .. } => "reorder_queued",
             ScenarioStep::OmitMessage { .. } => "omit_message",
             ScenarioStep::DuplicateMessage { .. } => "duplicate_message",
             ScenarioStep::WithholdMessage { .. } => "withhold_message",
@@ -967,31 +941,6 @@ async fn execute_scenario_step(
         ScenarioStep::ClearEvents { clients: labels } => {
             subject
                 .clear_events(labels)
-                .map_err(|error| subject_step_error(step_index, error))?;
-        }
-        ScenarioStep::DropQueued { index } => {
-            subject_faults(subject, step_index)?
-                .drop_queued(*index)
-                .map_err(|error| subject_step_error(step_index, error))?;
-        }
-        ScenarioStep::DuplicateQueued { index } => {
-            subject_faults(subject, step_index)?
-                .duplicate_queued(*index)
-                .map_err(|error| subject_step_error(step_index, error))?;
-        }
-        ScenarioStep::DelayQueued { index, delayed } => {
-            subject_faults(subject, step_index)?
-                .delay_queued(*index, delayed)
-                .map_err(|error| subject_step_error(step_index, error))?;
-        }
-        ScenarioStep::ReleaseDelayed { delayed } => {
-            subject_faults(subject, step_index)?
-                .release_delayed(delayed)
-                .map_err(|error| subject_step_error(step_index, error))?;
-        }
-        ScenarioStep::ReorderQueued { order } => {
-            subject_faults(subject, step_index)?
-                .reorder_queued(order)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
         ScenarioStep::OmitMessage { selector } => {
@@ -1723,9 +1672,13 @@ mod tests {
                     selection: ScenarioOutboundSelection::All,
                     outcome: SubjectOutboundOutcome::Accepted,
                 },
-                ScenarioStep::DelayQueued {
-                    index: 0,
-                    delayed: "withheld".into(),
+                ScenarioStep::WithholdMessage {
+                    selector: crate::ScenarioMessageSelectorV2 {
+                        sender: Some("alice".into()),
+                        class: Some(crate::ScenarioTransportClass::Application),
+                        ..Default::default()
+                    },
+                    label: "withheld".into(),
                 },
                 ScenarioStep::AwaitQuiescence {
                     policy: QuiescencePolicy::default(),
@@ -1833,9 +1786,13 @@ mod tests {
             ];
             if split_delivery {
                 steps.extend([
-                    ScenarioStep::DelayQueued {
-                        index: 1,
-                        delayed: "second-branch".into(),
+                    ScenarioStep::WithholdMessage {
+                        selector: crate::ScenarioMessageSelectorV2 {
+                            sender: Some("bob".into()),
+                            class: Some(crate::ScenarioTransportClass::Commit),
+                            ..Default::default()
+                        },
+                        label: "second-branch".into(),
                     },
                     ScenarioStep::DeliverAll,
                     ScenarioStep::Tick {
@@ -1845,8 +1802,8 @@ mod tests {
                     ScenarioStep::Tick {
                         clients: clients.clone(),
                     },
-                    ScenarioStep::ReleaseDelayed {
-                        delayed: "second-branch".into(),
+                    ScenarioStep::ReleaseWithheld {
+                        label: "second-branch".into(),
                     },
                 ]);
             }
@@ -1959,14 +1916,19 @@ mod tests {
     }
 
     #[test]
-    fn queue_fault_steps_require_explicit_white_box_capability() {
-        let capabilities = required_capabilities(&ScenarioStep::DropQueued { index: 0 });
+    fn semantic_fault_steps_require_adapter_neutral_capability() {
+        let capabilities = required_capabilities(&ScenarioStep::OmitMessage {
+            selector: crate::ScenarioMessageSelectorV2 {
+                sender: Some("alice".into()),
+                ..Default::default()
+            },
+        });
 
         assert_eq!(
             capabilities,
-            vec![SubjectCapability::WhiteBoxTransportQueueFaults]
+            vec![SubjectCapability::SemanticTransportFaults]
         );
-        assert!(capabilities[0].is_white_box());
+        assert!(!capabilities[0].is_white_box());
     }
 
     #[test]

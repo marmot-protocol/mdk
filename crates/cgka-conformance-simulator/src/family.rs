@@ -4,11 +4,11 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport,
-    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioTrace, SubjectOutboundOutcome,
-    TraceExpectation, VectorFixture, fingerprint_report_failure,
-    run_scenario_report_with_outcomes_and_capture,
-    run_scenario_report_with_outcomes_and_storage_mode,
+    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioMessageSelectorV2,
+    ScenarioOutboundSelection, ScenarioReport, ScenarioRunError, ScenarioSpec, ScenarioStep,
+    ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, VectorFixture,
+    fingerprint_report_failure, run_scenario_report_with_outcomes_and_capture,
+    run_scenario_report_with_outcomes_and_storage_mode, stable_action_id,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -235,11 +235,11 @@ fn is_minimizer_removable(step: &ScenarioStep) -> bool {
         step,
         ScenarioStep::SendAppMessage { .. }
             | ScenarioStep::ClearEvents { .. }
-            | ScenarioStep::DropQueued { .. }
-            | ScenarioStep::DuplicateQueued { .. }
-            | ScenarioStep::DelayQueued { .. }
-            | ScenarioStep::ReleaseDelayed { .. }
-            | ScenarioStep::ReorderQueued { .. }
+            | ScenarioStep::OmitMessage { .. }
+            | ScenarioStep::DuplicateMessage { .. }
+            | ScenarioStep::WithholdMessage { .. }
+            | ScenarioStep::ReleaseWithheld { .. }
+            | ScenarioStep::ReorderMessages { .. }
             | ScenarioStep::SetPartition { .. }
             | ScenarioStep::ClearPartition
     )
@@ -388,26 +388,37 @@ fn convergence_chaos_rollback_queue_faults(
         },
         acknowledged_step("alice", "update", SubjectOutboundOutcome::ReachedNoEndpoint),
     ];
+    let mut app_selectors = Vec::with_capacity(payloads.len());
     for payload in &payloads {
-        steps.push(ScenarioStep::SendAppMessage {
+        let step = ScenarioStep::SendAppMessage {
             sender: "bob".into(),
             payload: payload.clone(),
-        });
+        };
+        app_selectors.push(action_selector(
+            steps.len(),
+            &step,
+            ScenarioTransportClass::Application,
+        ));
+        steps.push(step);
     }
     // Seed-driven delivery schedule for the post-rollback messages.
-    steps.push(ScenarioStep::ReorderQueued { order });
+    let reordered = reorder_selectors(&app_selectors, &order);
+    let duplicated = reordered[0].clone();
+    steps.push(ScenarioStep::ReorderMessages { order: reordered });
     // The original reaches alice in the first delivery pass; the delayed copy
     // is released and ticked separately, so this shape exercises duplicate
     // app-message handling after a definite publish rollback.
-    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
-    steps.push(ScenarioStep::DelayQueued {
-        index: 1,
-        delayed: "duplicate-app".into(),
+    steps.push(ScenarioStep::DuplicateMessage {
+        selector: duplicated.clone(),
+    });
+    steps.push(ScenarioStep::WithholdMessage {
+        selector: with_occurrence(duplicated, 1),
+        label: "duplicate-app".into(),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick(["alice"]));
-    steps.push(ScenarioStep::ReleaseDelayed {
-        delayed: "duplicate-app".into(),
+    steps.push(ScenarioStep::ReleaseWithheld {
+        label: "duplicate-app".into(),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick(["alice"]));
@@ -457,16 +468,20 @@ fn convergence_chaos_stable_queue_faults(case_index: u64) -> (ScenarioSpec, Vec<
                 sender: "carol".into(),
                 payload: carol_payload.clone(),
             },
-            ScenarioStep::DuplicateQueued { index: 0 },
-            ScenarioStep::DelayQueued {
-                index: 1,
-                delayed: "delayed-copy".into(),
+            ScenarioStep::DuplicateMessage {
+                selector: application_selector("bob"),
             },
-            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::WithholdMessage {
+                selector: with_occurrence(application_selector("bob"), 1),
+                label: "delayed-copy".into(),
+            },
+            ScenarioStep::ReorderMessages {
+                order: vec![application_selector("carol"), application_selector("bob")],
+            },
             ScenarioStep::DeliverAll,
             tick(["alice"]),
-            ScenarioStep::ReleaseDelayed {
-                delayed: "delayed-copy".into(),
+            ScenarioStep::ReleaseWithheld {
+                label: "delayed-copy".into(),
             },
             ScenarioStep::DeliverAll,
             tick(["alice"]),
@@ -563,16 +578,16 @@ fn convergence_chaos_delayed_past_epoch_app(
                 sender: "bob".into(),
                 payload: payload.clone(),
             },
-            ScenarioStep::DelayQueued {
-                index: 0,
-                delayed: "old-app".into(),
+            ScenarioStep::WithholdMessage {
+                selector: application_selector("bob"),
+                label: "old-app".into(),
             },
             invite("alice", ["david"], "invite-david"),
             confirmed_step("alice", "invite-david"),
             ScenarioStep::DeliverAll,
             tick(["carol", "david"]),
-            ScenarioStep::ReleaseDelayed {
-                delayed: "old-app".into(),
+            ScenarioStep::ReleaseWithheld {
+                label: "old-app".into(),
             },
             ScenarioStep::DeliverAll,
             tick(["carol", "david"]),
@@ -628,7 +643,12 @@ fn convergence_chaos_large_message_storm(
             payload: payload.clone(),
         });
     }
-    steps.push(ScenarioStep::ReorderQueued { order });
+    steps.push(ScenarioStep::ReorderMessages {
+        order: order
+            .iter()
+            .map(|index| application_selector(&senders[*index]))
+            .collect(),
+    });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(vec!["alice".into()]));
     steps.push(observe_vec(vec!["alice".into()]));
@@ -681,7 +701,12 @@ fn convergence_chaos_large_partitioned_storm(
         .iter()
         .map(|index| payloads[*index].clone())
         .collect::<Vec<_>>();
-    steps.push(ScenarioStep::ReorderQueued { order });
+    steps.push(ScenarioStep::ReorderMessages {
+        order: order
+            .iter()
+            .map(|index| application_selector(&senders[*index]))
+            .collect(),
+    });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(vec!["alice".into()]));
     steps.push(ScenarioStep::ClearPartition);
@@ -728,11 +753,18 @@ fn convergence_chaos_large_commit_storm(
     // from the seed. Convergence and per-committer confirmation are invariant
     // under delivery schedule, so the expectations stay fixed while distinct
     // seeds drive distinct adversarial commit-delivery orders.
-    steps.push(ScenarioStep::DuplicateQueued {
-        index: rng.gen_range(0..committers.len()),
+    let duplicate_index = rng.gen_range(0..committers.len());
+    let duplicate_selector = commit_selector(&committers[duplicate_index]);
+    steps.push(ScenarioStep::DuplicateMessage {
+        selector: duplicate_selector.clone(),
     });
-    steps.push(ScenarioStep::ReorderQueued {
-        order: shuffled_order(rng, committers.len() + 1),
+    let mut queued = committers
+        .iter()
+        .map(|committer| commit_selector(committer))
+        .collect::<Vec<_>>();
+    queued.insert(duplicate_index + 1, with_occurrence(duplicate_selector, 1));
+    steps.push(ScenarioStep::ReorderMessages {
+        order: reorder_selectors(&queued, &shuffled_order(rng, queued.len())),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(committers.clone()));
@@ -786,8 +818,11 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     // Vary the message-phase schedule from the seed and preserve those events
     // through the commit storm so the oracle checks both workload phases.
     let message_order = shuffled_order(rng, senders.len());
-    steps.push(ScenarioStep::ReorderQueued {
-        order: message_order.clone(),
+    steps.push(ScenarioStep::ReorderMessages {
+        order: message_order
+            .iter()
+            .map(|index| application_selector(&senders[*index]))
+            .collect(),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(clients.clone()));
@@ -807,11 +842,18 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     }
     // Vary the commit-storm duplicate target and reorder from the seed.
     // Convergence and per-committer confirmation are schedule-invariant.
-    steps.push(ScenarioStep::DuplicateQueued {
-        index: rng.gen_range(0..committers.len()),
+    let duplicate_index = rng.gen_range(0..committers.len());
+    let duplicate_selector = commit_selector(&committers[duplicate_index]);
+    steps.push(ScenarioStep::DuplicateMessage {
+        selector: duplicate_selector.clone(),
     });
-    steps.push(ScenarioStep::ReorderQueued {
-        order: shuffled_order(rng, committers.len() + 1),
+    let mut queued = committers
+        .iter()
+        .map(|committer| commit_selector(committer))
+        .collect::<Vec<_>>();
+    queued.insert(duplicate_index + 1, with_occurrence(duplicate_selector, 1));
+    steps.push(ScenarioStep::ReorderMessages {
+        order: reorder_selectors(&queued, &shuffled_order(rng, queued.len())),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(committers.clone()));
@@ -870,18 +912,25 @@ fn convergence_chaos_restart_delivery_faults(
                 sender: "bob".into(),
                 payload: payload.clone(),
             },
-            ScenarioStep::DelayQueued {
-                index: 0,
-                delayed: "restart-delayed".into(),
+            ScenarioStep::WithholdMessage {
+                selector: application_selector("bob"),
+                label: "restart-delayed".into(),
             },
             ScenarioStep::RestartClient {
                 client: "alice".into(),
             },
-            ScenarioStep::ReleaseDelayed {
-                delayed: "restart-delayed".into(),
+            ScenarioStep::ReleaseWithheld {
+                label: "restart-delayed".into(),
             },
-            ScenarioStep::DuplicateQueued { index: 0 },
-            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::DuplicateMessage {
+                selector: application_selector("bob"),
+            },
+            ScenarioStep::ReorderMessages {
+                order: vec![
+                    with_occurrence(application_selector("bob"), 1),
+                    application_selector("bob"),
+                ],
+            },
             ScenarioStep::DeliverAll,
             tick(["alice"]),
             observe(["alice"]),
@@ -896,6 +945,63 @@ fn convergence_chaos_restart_delivery_faults(
 
 fn labels<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(String::from).collect()
+}
+
+fn application_selector(sender: &str) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        sender: Some(sender.into()),
+        class: Some(ScenarioTransportClass::Application),
+        ..Default::default()
+    }
+}
+
+fn commit_selector(sender: &str) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        sender: Some(sender.into()),
+        class: Some(ScenarioTransportClass::Commit),
+        ..Default::default()
+    }
+}
+
+fn action_selector(
+    step_index: usize,
+    step: &ScenarioStep,
+    class: ScenarioTransportClass,
+) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        action_id: Some(stable_action_id(step_index, step)),
+        class: Some(class),
+        ..Default::default()
+    }
+}
+
+fn publication_selector(
+    publication: &str,
+    class: ScenarioTransportClass,
+) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        publication: Some(publication.into()),
+        class: Some(class),
+        ..Default::default()
+    }
+}
+
+fn with_occurrence(
+    mut selector: ScenarioMessageSelectorV2,
+    occurrence: usize,
+) -> ScenarioMessageSelectorV2 {
+    selector.occurrence = occurrence;
+    selector
+}
+
+fn reorder_selectors(
+    selectors: &[ScenarioMessageSelectorV2],
+    order: &[usize],
+) -> Vec<ScenarioMessageSelectorV2> {
+    order
+        .iter()
+        .map(|index| selectors[*index].clone())
+        .collect()
 }
 
 fn large_clients(count: usize) -> Vec<String> {
@@ -1099,51 +1205,67 @@ fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioS
         "grace".to_string(),
     ];
     let mut steps = convergence_e2e_prefix_steps(case_index);
-    let mut queue_len = 8usize;
+    let mut queue = convergence_e2e_queue_selectors(&steps);
     let split_delivery = match rng.gen_range(0..=6) {
         0 => false,
         1 => {
-            steps.push(ScenarioStep::ReorderQueued {
-                order: reversed_order(queue_len),
+            let order = reversed_order(queue.len());
+            queue = reorder_selectors(&queue, &order);
+            steps.push(ScenarioStep::ReorderMessages {
+                order: queue.clone(),
             });
             false
         }
         2 => {
-            steps.push(ScenarioStep::DuplicateQueued {
-                index: relevant_queue_index(rng, queue_len),
+            let index = relevant_queue_index(rng, queue.len());
+            let selector = queue[index].clone();
+            steps.push(ScenarioStep::DuplicateMessage {
+                selector: selector.clone(),
             });
+            queue.insert(index + 1, with_occurrence(selector, 1));
             false
         }
         3 => {
-            steps.push(ScenarioStep::DelayQueued {
-                index: relevant_queue_index(rng, queue_len),
-                delayed: "delayed-input".into(),
+            let index = relevant_queue_index(rng, queue.len());
+            let selector = queue.remove(index);
+            steps.push(ScenarioStep::WithholdMessage {
+                selector: selector.clone(),
+                label: "delayed-input".into(),
             });
-            steps.push(ScenarioStep::ReleaseDelayed {
-                delayed: "delayed-input".into(),
+            steps.push(ScenarioStep::ReleaseWithheld {
+                label: "delayed-input".into(),
             });
+            queue.push(with_occurrence(selector, 0));
             false
         }
         4 => {
-            steps.push(ScenarioStep::DelayQueued {
-                index: relevant_queue_index(rng, queue_len),
-                delayed: "delayed-input".into(),
+            let index = relevant_queue_index(rng, queue.len());
+            let selector = queue.remove(index);
+            steps.push(ScenarioStep::WithholdMessage {
+                selector,
+                label: "delayed-input".into(),
             });
             true
         }
         5 => {
-            steps.push(ScenarioStep::ReorderQueued {
-                order: rotated_order(queue_len, rng.gen_range(1..queue_len)),
+            let order = rotated_order(queue.len(), rng.gen_range(1..queue.len()));
+            queue = reorder_selectors(&queue, &order);
+            steps.push(ScenarioStep::ReorderMessages {
+                order: queue.clone(),
             });
             false
         }
         _ => {
-            steps.push(ScenarioStep::DuplicateQueued {
-                index: relevant_queue_index(rng, queue_len),
+            let index = relevant_queue_index(rng, queue.len());
+            let selector = queue[index].clone();
+            steps.push(ScenarioStep::DuplicateMessage {
+                selector: selector.clone(),
             });
-            queue_len += 1;
-            steps.push(ScenarioStep::ReorderQueued {
-                order: reversed_order(queue_len),
+            queue.insert(index + 1, with_occurrence(selector, 1));
+            let order = reversed_order(queue.len());
+            queue = reorder_selectors(&queue, &order);
+            steps.push(ScenarioStep::ReorderMessages {
+                order: queue.clone(),
             });
             false
         }
@@ -1151,8 +1273,8 @@ fn convergence_e2e_delivery_case(rng: &mut StdRng, case_index: u64) -> ScenarioS
 
     if split_delivery {
         steps.push(ScenarioStep::DeliverAll);
-        steps.push(ScenarioStep::ReleaseDelayed {
-            delayed: "delayed-input".into(),
+        steps.push(ScenarioStep::ReleaseWithheld {
+            label: "delayed-input".into(),
         });
         steps.push(ScenarioStep::DeliverAll);
     } else {
@@ -1221,6 +1343,28 @@ fn convergence_e2e_prefix_steps(case_index: u64) -> Vec<ScenarioStep> {
     ]
 }
 
+fn convergence_e2e_queue_selectors(steps: &[ScenarioStep]) -> Vec<ScenarioMessageSelectorV2> {
+    let mut selectors = Vec::with_capacity(8);
+    for publication in ["alice-invite-david", "alice-invite-grace", "bob-invite-eve"] {
+        selectors.push(publication_selector(
+            publication,
+            ScenarioTransportClass::Welcome,
+        ));
+        selectors.push(publication_selector(
+            publication,
+            ScenarioTransportClass::Commit,
+        ));
+    }
+    for index in [11, 12] {
+        selectors.push(action_selector(
+            index,
+            &steps[index],
+            ScenarioTransportClass::Application,
+        ));
+    }
+    selectors
+}
+
 fn relevant_queue_index(rng: &mut StdRng, queue_len: usize) -> usize {
     const RELEVANT_BASE_INDICES: [usize; 5] = [1, 3, 5, 6, 7];
     let usable: Vec<usize> = RELEVANT_BASE_INDICES
@@ -1241,7 +1385,7 @@ fn rotated_order(len: usize, left_by: usize) -> Vec<usize> {
 /// Seed-driven permutation of `0..len`. Distinct seeds produce distinct
 /// delivery schedules, so the chaos family's queue-fault shapes vary real
 /// behavior with the seed instead of re-running one fixed order. The result is
-/// always a valid permutation, so `ScenarioStep::ReorderQueued` accepts it.
+/// always a valid permutation consumed by semantic selector reordering.
 fn shuffled_order(rng: &mut StdRng, len: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..len).collect();
     // Fisher-Yates: deterministic for a fixed rng state.
@@ -1272,20 +1416,27 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
 
     let send_count = 2 + rng.gen_range(0..=2);
     let mut sends = Vec::with_capacity(send_count);
+    let mut send_selectors = Vec::with_capacity(send_count);
     for send_index in 0..send_count {
         let sender = clients[rng.gen_range(0..clients.len())].clone();
         let marker: u16 = rng.r#gen();
         let payload = format!("case-{case_index}:send-{send_index}:{sender}:{marker}");
-        steps.push(ScenarioStep::SendAppMessage {
+        let step = ScenarioStep::SendAppMessage {
             sender: sender.clone(),
             payload: payload.clone(),
-        });
+        };
+        send_selectors.push(action_selector(
+            steps.len(),
+            &step,
+            ScenarioTransportClass::Application,
+        ));
+        steps.push(step);
         sends.push((sender, payload));
     }
 
     if send_count > 1 && rng.gen_bool(0.5) {
-        steps.push(ScenarioStep::ReorderQueued {
-            order: (0..send_count).rev().collect(),
+        steps.push(ScenarioStep::ReorderMessages {
+            order: send_selectors.into_iter().rev().collect(),
         });
         sends.reverse();
     }

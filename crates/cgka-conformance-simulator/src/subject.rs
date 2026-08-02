@@ -44,7 +44,6 @@ pub enum SubjectCapability {
     VirtualTime,
     OutboundPublication,
     StructuralProgress,
-    WhiteBoxTransportQueueFaults,
     WhiteBoxTransportPartition,
     WhiteBoxStorageFaults,
     SemanticTransportFaults,
@@ -70,7 +69,6 @@ impl SubjectCapability {
             Self::VirtualTime => "virtual_time",
             Self::OutboundPublication => "outbound_publication",
             Self::StructuralProgress => "structural_progress",
-            Self::WhiteBoxTransportQueueFaults => "white_box_transport_queue_faults",
             Self::WhiteBoxTransportPartition => "white_box_transport_partition",
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
             Self::SemanticTransportFaults => "semantic_transport_faults",
@@ -86,9 +84,7 @@ impl SubjectCapability {
     pub const fn is_white_box(self) -> bool {
         matches!(
             self,
-            Self::WhiteBoxTransportQueueFaults
-                | Self::WhiteBoxTransportPartition
-                | Self::WhiteBoxStorageFaults
+            Self::WhiteBoxTransportPartition | Self::WhiteBoxStorageFaults
         )
     }
 }
@@ -501,11 +497,6 @@ pub trait ConvergenceSubject: Send {
 
 /// Explicit harness-only transport mutation. Normal subjects need not expose it.
 pub trait ConvergenceFaultSubject {
-    fn drop_queued(&mut self, index: usize) -> Result<(), SubjectError>;
-    fn duplicate_queued(&mut self, index: usize) -> Result<(), SubjectError>;
-    fn delay_queued(&mut self, index: usize, delayed: &str) -> Result<(), SubjectError>;
-    fn release_delayed(&mut self, delayed: &str) -> Result<(), SubjectError>;
-    fn reorder_queued(&mut self, order: &[usize]) -> Result<(), SubjectError>;
     fn set_partition(&mut self, allow: &[String]) -> Result<(), SubjectError>;
     fn clear_partition(&mut self) -> Result<(), SubjectError>;
     fn omit_message(
@@ -622,11 +613,6 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::InjectStorageFault { .. } | ScenarioStep::ClearStorageFault { .. } => {
                 SubjectCapability::StorageFaultInjection
             }
-            ScenarioStep::DropQueued { .. }
-            | ScenarioStep::DuplicateQueued { .. }
-            | ScenarioStep::DelayQueued { .. }
-            | ScenarioStep::ReleaseDelayed { .. }
-            | ScenarioStep::ReorderQueued { .. } => SubjectCapability::WhiteBoxTransportQueueFaults,
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
                 SubjectCapability::WhiteBoxTransportPartition
             }
@@ -718,7 +704,6 @@ impl EngineHarnessSubject {
             SubjectCapability::VirtualTime,
             SubjectCapability::OutboundPublication,
             SubjectCapability::StructuralProgress,
-            SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
             SubjectCapability::SemanticTransportFaults,
             SubjectCapability::AssertionEvaluation,
@@ -1677,61 +1662,6 @@ impl ConvergenceSubject for EngineHarnessSubject {
 }
 
 impl ConvergenceFaultSubject for EngineHarnessSubject {
-    fn drop_queued(&mut self, index: usize) -> Result<(), SubjectError> {
-        if self.bus.drop_queued(index) {
-            Ok(())
-        } else {
-            Err(SubjectError::new(
-                "unknown_queued_message",
-                format!("queued message index {index} does not exist"),
-            ))
-        }
-    }
-
-    fn duplicate_queued(&mut self, index: usize) -> Result<(), SubjectError> {
-        if self.bus.duplicate_queued(index) {
-            Ok(())
-        } else {
-            Err(SubjectError::new(
-                "unknown_queued_message",
-                format!("queued message index {index} does not exist"),
-            ))
-        }
-    }
-
-    fn delay_queued(&mut self, index: usize, delayed: &str) -> Result<(), SubjectError> {
-        if self.bus.delay_queued(index, delayed.to_owned()) {
-            Ok(())
-        } else {
-            Err(SubjectError::new(
-                "unknown_queued_message",
-                format!("queued message index {index} does not exist"),
-            ))
-        }
-    }
-
-    fn release_delayed(&mut self, delayed: &str) -> Result<(), SubjectError> {
-        if self.bus.release_delayed(delayed) {
-            Ok(())
-        } else {
-            Err(SubjectError::new(
-                "unknown_delayed_queue",
-                format!("delayed queue label {delayed} does not exist"),
-            ))
-        }
-    }
-
-    fn reorder_queued(&mut self, order: &[usize]) -> Result<(), SubjectError> {
-        if self.bus.reorder_queued(order) {
-            Ok(())
-        } else {
-            Err(SubjectError::new(
-                "invalid_queue_order",
-                format!("invalid queue reorder permutation {order:?}"),
-            ))
-        }
-    }
-
     fn set_partition(&mut self, allow: &[String]) -> Result<(), SubjectError> {
         let allowed = allow
             .iter()
@@ -1793,7 +1723,14 @@ impl ConvergenceFaultSubject for EngineHarnessSubject {
     }
 
     fn release_withheld(&mut self, label: &str) -> Result<(), SubjectError> {
-        self.release_delayed(label)
+        if self.bus.release_delayed(label) {
+            Ok(())
+        } else {
+            Err(SubjectError::new(
+                "unknown_withheld_messages",
+                format!("withheld-message label {label} does not exist"),
+            ))
+        }
     }
 
     fn reorder_messages(
@@ -3207,8 +3144,15 @@ mod tests {
                 .expect("transport accepted the application");
         }
         subject
-            .delay_queued(0, "withheld")
-            .expect("delay queued application");
+            .withhold_message(
+                &crate::ScenarioMessageSelectorV2 {
+                    action_id: Some("withheld-app".into()),
+                    class: Some(crate::ScenarioTransportClass::Application),
+                    ..Default::default()
+                },
+                "withheld",
+            )
+            .expect("withhold application");
 
         let blocked =
             drive_subject_to_quiescence(&mut subject, &labels, &QuiescencePolicy::default(), 10)

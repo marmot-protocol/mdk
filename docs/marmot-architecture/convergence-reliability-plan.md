@@ -75,12 +75,15 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 
 - legacy portable `ClientsConverged` remains an epoch/member-count check, although strict reliability scenarios now use
   exact canonical state, ledgers, pending-work sentinels, and active decryptability;
-- the engine subject is black-box by default, but app-runtime, retained-relay, and process adapters do not exist yet;
-- a partition drops messages instead of retaining relay history for reconnect;
+- the engine, independent reference, and retained-relay subjects share one compiled scenario contract, but app-runtime
+  and process adapters do not exist yet;
+- the retained-relay adapter covers deterministic offline/history behavior, but sustained relay campaigns and
+  production runtime synchronization are future milestones;
 - queue emptiness does not prove all client, pass, publication, retry, deferred, or projection work is quiescent;
 - generated storms are structural tests rather than sustained rate/volume campaigns;
 - scenario seeds do not reproduce randomized MLS bytes;
-- the executable policy model used by several tests is production code, not an independent oracle;
+- the initial independent reference adapter covers common symbolic lifecycle behavior, but not the complete production
+  selector, persistence, or liveness state space;
 - Tamarin abstracts clocks, crash/restart, durable generations, resource bounds, fairness, and sustained self-updates.
 
 ## Program Principles
@@ -116,7 +119,7 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 | --- | --- | --- | --- |
 | 0. Assurance foundation | Guarantees, assumptions, constants, and formal gate are explicit | complete | Every constant is classified; formal warnings fail CI; protocol decisions are named |
 | 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | complete | Known semantic mutations fail and captured failures replay |
-| 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | not-started | One compiled case runs against reference, engine, and retained-relay adapters |
+| 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | complete | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | not-started | Headline workload families produce bounded, diagnosable results |
 | 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | not-started | Model and tests detect seeded policy/lifecycle defects |
 | 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | not-started | The same case agrees in-process and across N processes |
@@ -144,9 +147,9 @@ The initial assurance matrix is below. “Required verification” names the min
 | S6 | Clients are exactly equivalent only when the canonical conformance projection, including its domain-separated exporter commitment, matches | Synthetic/local conformance execution; raw exporter secret never leaves the test process | M1.1 exact snapshot comparison; mismatched-member, component, disposition, output, and commitment sentinels | specified |
 | S7 | Shared protocol state, exact scenario-input/application-output dispositions, and local operational diagnostics remain distinct comparison layers | Every scenario input has a stable action id; adapters declare observable capabilities | M1.1 disposition ledger; M2 adapter schema; M5 projection comparison | partially-covered |
 | R1 | Crash/reopen from any durable convergence phase is equivalent to uninterrupted execution | Database and required WAL/sidecars remain intact; no storage corruption unless scenario declares it | File-backed crash matrix and process-kill replay | partially-covered |
-| R2 | Clients with unequal relay histories converge after the histories reconcile | Relevant events remain retained and are eventually fetched; same policy/version | Retained multi-relay scenarios with EOSE, backfill, and set equality | unverified |
-| R3 | A runtime can determine the completeness claim it is making for acquired relay history and can invoke a stronger reconciliation path when incremental cursors are insufficient | Relay EOSE and query completion are observable; at least one full-history/set-reconciliation mechanism is available | Since-floor/EOSE matrix; full-history backstop tests; retained-relay adapter | unverified |
-| D1 | Every observed failure is attributable to a stable action, policy, state transition, or resource bound and can be replayed; silent input absence requires the separate R3 completeness signal | Failure manifests in an observable layer; failure artifact completes successfully; sensitive evidence remains local | Failure-capsule self-replay and schema tests; R3 absence detection | unverified |
+| R2 | Clients with unequal relay histories converge after the histories reconcile | Relevant events remain retained and are eventually fetched; same policy/version | Retained multi-relay scenarios with EOSE, backfill, and set equality | partially-covered |
+| R3 | A runtime can determine the completeness claim it is making for acquired relay history and can invoke a stronger reconciliation path when incremental cursors are insufficient | Relay EOSE and query completion are observable; at least one full-history/set-reconciliation mechanism is available | Since-floor/EOSE matrix; full-history backstop tests; retained-relay adapter | partially-covered |
+| D1 | Every observed failure is attributable to a stable action, policy, state transition, or resource bound and can be replayed; silent input absence requires the separate R3 completeness signal | Failure manifests in an observable layer; failure artifact completes successfully; sensitive evidence remains local | Failure-capsule self-replay and schema tests; R3 absence detection | partially-covered |
 
 #### Assurance verification ownership
 
@@ -164,11 +167,11 @@ test is evidence for only the behavior in its name; it does not establish the la
 | L2 | Protocol outbound gating; local queued-intent lifecycle | Tamarin queued-outbound lemmas; `engine_queues_app_send_until_convergence_is_settled`; `trait_advance_convergence_drains_queued_outbound_intent`; scheduler tests | M1.3 complete quiescence; M3.1 crash/failure workload |
 | L3 | Protocol same-epoch priority and depth rules; no sustained-progress guarantee currently stated | `convergence_privileged_remove_beats_grinding_ordinary_self_update`; `continuous_inbound_cannot_starve_admin_attempt` | M3.1 sustained self-update family; M4.2 fairness model; protocol decision PDR-2 below |
 | S6 | Protocol `foundation/conformance.md`, adopted by [marmot#410](https://github.com/marmot-protocol/marmot/pull/410) | Domain separation and 33-byte commitment prefix checked in the protocol PR | M1.1 public snapshot API and exact-equivalence sentinels |
-| S7 | Protocol conformance projection and input-disposition requirements | M1.1 exact canonical snapshot plus commit/proposal/application disposition ledger | M2.2 common adapter observation schema; M5.1 app projection layer |
+| S7 | Protocol conformance projection and input-disposition requirements | M1.1 exact canonical snapshot plus commit/proposal/application disposition ledger; M2.2 common adapter observation schema | M5.1 app projection layer |
 | R1 | Protocol durable pass wall/monotonic deadline rules; local storage/restart contract | Injectable paired convergence clocks from [MDK #1195](https://github.com/marmot-protocol/mdk/pull/1195); `collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed`; `h5_kill_before_historical_apply_commit_preserves_live_inputs`; `h6_kill_after_retained_anchor_rewind_recovers_live_snapshot` | M3.1 every-phase crash matrix; M5.3 process kill/reopen |
-| R2 | Relay telemetry EOSE/backfill/reconciliation architecture; protocol requires equalized relevant history for equivalent selection | `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed`; `next_event_returns_when_a_live_delivery_arms_the_epoch_backfill` | M2.3 retained multi-relay model; M3.1 unequal-history family |
-| R3 | Relay sync/backfill architecture; incremental cursors do not establish full offline history | Existing since-floor regressions expose the blind spot; epoch-stall backfill is armed only after qualifying live evidence | M2.3 EOSE/completeness policy and full-history/set-reconciliation backstop; M5.1 production runtime adapter |
-| D1 | Local forensic audit/report contracts and privacy rules | Generated reports, oracle coverage, conservative minimizer, incident archetype synthesis | M1.4 failure capsule and self-replay; M3.3 exact incident import; R3 silent-absence detection |
+| R2 | Relay telemetry EOSE/backfill/reconciliation architecture; protocol requires equalized relevant history for equivalent selection | `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed`; `next_event_returns_when_a_live_delivery_arms_the_epoch_backfill`; retained-relay unequal-history reconciliation | M3.1 sustained unequal-history family |
+| R3 | Relay sync/backfill architecture; incremental cursors do not establish full offline history | Since-floor regressions plus retained-relay EOSE, quiet-history, full-backfill, and set-reconciliation scenarios | M5.1 production runtime adapter |
+| D1 | Local forensic audit/report contracts and privacy rules | Failure-capsule self-replay, generated reports, oracle coverage, conservative minimizer, incident synthesis, and explicit relay-completeness observations | M3.3 exact incident import; production R3 absence detection |
 
 Milestone 0 work:
 
@@ -564,11 +567,13 @@ resource-exhaustion and recovery campaigns for those error sources.
 
 ## Milestone 2: Scenario IR And Retained Relays
 
+Status: `complete`
+
 ### 2.1 Scenario IR v2 and authoring DSL
 
 - [x] Land a minimal vertical slice first: versioned action/assertion IR, deterministic executor, stable action ids, and
   one engine-adapter scenario that round-trips through JSON.
-- [ ] Define the complete adapter-neutral JSON IR and JSON Schema.
+- [x] Define the complete adapter-neutral JSON IR and JSON Schema.
 - [x] Specify deterministic expansion and rate semantics (`repeat`, `parallel`, `rate`, `burst`, barriers, and virtual
   time) before adding authoring sugar.
 - [x] Add human YAML authoring only after the canonical JSON IR/executor is stable; execute only canonical JSON.
@@ -576,7 +581,7 @@ resource-exhaustion and recovery campaigns for those error sources.
 - [x] Add `repeat`, `parallel`, `rate`, `burst`, barriers, and virtual time with a recorded expanded schedule.
 - [x] Add create, invite, remove, leave, self-update, group/admin state update, and application send.
 - [x] Add offline/reconnect, delay, duplicate, omit, withhold/release, crash/restart, and declared storage faults.
-- [ ] Replace queue indices with semantic action/message selectors.
+- [x] Replace queue indices with semantic action/message selectors.
 - [x] Add `exactly`, `eventually`, `within`, `never`, and resource assertions.
 - [x] Make a repository-owned clean cutover from `ScenarioSpec` v1 to v2 rather than retaining a runtime compatibility
   compiler; migrate fixed vectors, generated families, tests, and incident-replay synthesis together.
@@ -887,5 +892,7 @@ incorrect result.
 | 2026-08-01 | 1.2d public outbound lifecycle and Scenario IR v2 cutover | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues. Migrated every repository-owned scenario producer to v2 `acknowledge_outbound` operations and removed the compatibility constructor, direct subject pending controls, client lifecycle flag, and silent auto-confirm branches ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)) | Focused subject/runner contract tests; fixed vectors; generated families; incident replay; full simulator suite; `just fast-ci` |
 | 2026-08-01 | 1.3 full-system quiescence | Added privacy-safe structural progress with runnable work, exact virtual deadlines, pass phase/generation, retry/deferred/publication/transport work, and terminal blockers; added runner-owned bounded fixed-point settling with explicit healthy-path publication/delivery policy and serializable blocked/timeout artifacts; added same-horizon batch-partition metamorphic coverage | [MDK #1216](https://github.com/marmot-protocol/mdk/pull/1216); focused real-engine deadline, lost-ack, withheld-transport, watchdog, serialization/privacy, and metamorphic tests; full simulator suite; `just fast-ci` |
 | 2026-08-02 | 1.4 deterministic failure capsules and Milestone 1 exit | Added versioned restrictive failure capsules, semantic-identity minimization, typed protocol/resource/environment failure provenance, bounded transport evidence with truncation accounting, campaign-produced recipient checkpoints, exact recipient-state plus captured-transport and CLI replay, portable checkpoint-free vector promotion, failed-step report retention, a constant snapshot, and mixed-storm application assertions; completed the named mutation-sentinel and durable-outcome inventories | `failure_capsules`; `report_runner`; `failed_campaign_capsule_contains_a_replayable_tick_witness`; `failing_generated_case_records_a_minimized_reproducer`; `subject_step_failure_is_a_report_artifact_and_a_spec_run_error`; `convergence_chaos_family_generates_specs_with_semantic_expectations`; storage snapshot round-trip; full simulator/storage suites; `just fast-ci` |
+| 2026-08-02 | 2.1 canonical Scenario IR v2 and authoring | Added deterministic repeat/parallel/rate/burst/barrier expansion, explicit topology and lifecycle actions, executable temporal/resource assertions, a repository-owned JSON Schema, YAML-to-canonical-JSON authoring, and a clean semantic-selector-only transport fault contract. Queue positions now remain private to low-level bus tests; fixed vectors, generated families, and incident synthesis select by action, publication, sender, protocol class, and occurrence | `schema_declares_every_executable_step_kind`; `every_repository_vector_compiles_to_stable_actions`; `semantic_transport_selectors_survive_queue_shape_changes`; generated delivery and chaos families; incident-replay witness acceptance |
 | 2026-08-02 | 2.2 initial independent reference adapter | Added a capability-limited symbolic-memory subject that executes the common group/publication/application lifecycle without production selector or canonicalizer calls; one compiled scenario now runs unchanged on reference and engine adapters with equal semantic observations, exact-only predicates add their true preflight capability, and assertion sampling no longer consumes later report evidence | `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters`; `unsupported_exact_assertion_fails_before_reference_model_executes`; scenario IR suite |
 | 2026-08-02 | 2.3 retained multi-relay model and exit scenarios | Added real-engine delivery through durable per-relay histories with topology fanout/subscriptions, cursor/since/full/set queries, EOSE-versus-completeness observations, offline reconnect, visibility omission, duplicate/order policy, history equalization, and quiet-query diagnosis; the same compiled scenario runs on all three initial adapters, offline delivery comes from history, and unequal histories reach exact state equality only after reconciliation | `one_compiled_scenario_runs_unchanged_on_all_initial_adapters`; `offline_client_recovers_from_retained_history`; `unequal_relay_histories_converge_after_set_equalization`; `eose_does_not_heal_hidden_cursor_history_but_full_backfill_does`; `relay_reverse_order_and_duplicates_are_explicit_and_deduplicated` |
+| 2026-08-02 | Milestone 2 completion verification | Completed every 2.1-2.3 work item and exit scenario; the canonical IR no longer exposes mutable queue positions, all repository vectors compile, and retained-history behavior is distinct from healed packet loss | `cargo test -p cgka-conformance-simulator`; `cargo test -p incident-replay`; `just fast-ci` |

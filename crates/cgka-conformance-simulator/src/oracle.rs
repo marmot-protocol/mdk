@@ -340,25 +340,16 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::Leave { .. } => {
                 stimuli.insert(ScenarioStimulus::Leave);
             }
-            ScenarioStep::DropQueued { .. } => {
-                stimuli.insert(ScenarioStimulus::QueueDrop);
-            }
             ScenarioStep::OmitMessage { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDrop);
-            }
-            ScenarioStep::DuplicateQueued { .. } => {
-                stimuli.insert(ScenarioStimulus::QueueDuplicate);
             }
             ScenarioStep::DuplicateMessage { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDuplicate);
             }
-            ScenarioStep::DelayQueued { .. }
-            | ScenarioStep::ReleaseDelayed { .. }
-            | ScenarioStep::WithholdMessage { .. }
-            | ScenarioStep::ReleaseWithheld { .. } => {
+            ScenarioStep::WithholdMessage { .. } | ScenarioStep::ReleaseWithheld { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDelay);
             }
-            ScenarioStep::ReorderQueued { .. } | ScenarioStep::ReorderMessages { .. } => {
+            ScenarioStep::ReorderMessages { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueReorder);
             }
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {

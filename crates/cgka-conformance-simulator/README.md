@@ -273,11 +273,11 @@ recovery without pinning which invite branch wins.
 - `observe_exact`
 - `probe_bidirectional_decryptability`
 - `clear_events`
-- `drop_queued`
-- `duplicate_queued`
-- `delay_queued`
-- `release_delayed`
-- `reorder_queued`
+- `omit_message`
+- `duplicate_message`
+- `withhold_message`
+- `release_withheld`
+- `reorder_messages`
 - `set_partition`
 - `clear_partition`
 - `restart_client`
@@ -294,10 +294,10 @@ logical names;
 the Rust harness maps them to deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the same
 identity shape as production. `reached_no_endpoint` represents a definite publication failure: it retracts all matching
 undelivered commit/Welcome artifacts before local rollback and fails the scenario if any matching artifact has already
-reached a recipient mailbox. Queue fault steps select messages by the current zero-based queue index at that step.
-`reorder_queued.order` is a full permutation of current queue indices; each entry names which old queue slot moves into
-the next position. `delay_queued` stores selected messages under a string label, and `release_delayed` returns that
-label's messages to the end of the queue.
+reached a recipient mailbox. Transport fault steps use conjunctive semantic selectors over stable action id,
+publication label, sender, protocol class, and occurrence. `reorder_messages.order` selects every current message in
+the desired order. `withhold_message` stores one selected message under a label, and `release_withheld` returns that
+label's messages to the end of the transport schedule.
 
 ## Generated scenario families
 

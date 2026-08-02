@@ -559,55 +559,6 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "index"],
-          "properties": {
-            "type": { "const": "drop_queued" },
-            "index": { "type": "integer", "minimum": 0 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "index"],
-          "properties": {
-            "type": { "const": "duplicate_queued" },
-            "index": { "type": "integer", "minimum": 0 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "index", "delayed"],
-          "properties": {
-            "type": { "const": "delay_queued" },
-            "index": { "type": "integer", "minimum": 0 },
-            "delayed": { "type": "string", "minLength": 1 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "delayed"],
-          "properties": {
-            "type": { "const": "release_delayed" },
-            "delayed": { "type": "string", "minLength": 1 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "order"],
-          "properties": {
-            "type": { "const": "reorder_queued" },
-            "order": {
-              "type": "array",
-              "items": { "type": "integer", "minimum": 0 }
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
           "required": ["type", "selector"],
           "properties": {
             "type": { "const": "omit_message" },

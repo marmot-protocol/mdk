@@ -180,9 +180,10 @@ delivery to the allowed client set (messages to clients outside it are dropped) 
 The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it
 to be a group member yet.
 
-`ScenarioSpec` queue faults are explicit steps. They mutate the bus queue before delivery by zero-based queue index:
-`drop_queued`, `duplicate_queued`, `delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
-`clear_partition` remain the partition/heal operations.
+`ScenarioSpec` transport faults are explicit adapter-neutral steps. They select messages by stable scenario meaning
+(action id, publication, sender, protocol class, and occurrence): `omit_message`, `duplicate_message`,
+`withhold_message`, `release_withheld`, and `reorder_messages`. Queue positions remain an internal bus-test detail.
+`set_partition` and `clear_partition` remain the partition/heal operations.
 
 `reached_no_endpoint` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
 undelivered commit and Welcome from the queue and delayed sets. It returns a scenario error instead of rolling back if
