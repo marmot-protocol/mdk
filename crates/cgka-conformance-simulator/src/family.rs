@@ -4,9 +4,11 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport,
-    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioTrace, SubjectOutboundOutcome,
-    TraceExpectation, VectorFixture, run_scenario_report_with_outcomes_and_storage_mode,
+    CapturedTransportArtifactV1, FailureFingerprintV1, GeneratedScenarioMetadata,
+    HarnessStorageMode, ScenarioOutboundSelection, ScenarioReport, ScenarioRunError, ScenarioSpec,
+    ScenarioStep, ScenarioTrace, SubjectOutboundOutcome, TraceExpectation, VectorFixture,
+    fingerprint_report_failure, run_scenario_report_with_outcomes_and_capture,
+    run_scenario_report_with_outcomes_and_storage_mode,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -89,7 +91,7 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
         add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-chaos/v1".into(),
-            generator_version: "5".into(),
+            generator_version: "6".into(),
             seed,
             case_index: case_index as u64,
             scenario,
@@ -116,17 +118,29 @@ pub async fn run_generated_case_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut report = run_scenario_report_with_outcomes_and_storage_mode(
+    let (report, _) =
+        run_generated_case_report_with_capture(case, expected_trace, storage_mode).await?;
+    Ok(report)
+}
+
+/// Generated-case runner that retains exact wire artifacts for a failure
+/// capsule while keeping the ordinary report API unchanged.
+pub async fn run_generated_case_report_with_capture(
+    case: &GeneratedScenarioCase,
+    expected_trace: Option<ScenarioTrace>,
+    storage_mode: HarnessStorageMode,
+) -> Result<(ScenarioReport, Vec<CapturedTransportArtifactV1>), ScenarioRunError> {
+    let (mut report, captured_transport_artifacts) = run_scenario_report_with_outcomes_and_capture(
         &case.scenario,
         expected_trace.clone(),
         case.expected_outcomes.clone(),
         storage_mode,
     )
     .await?;
-    let minimized_case = if report.expectation_failures.is_empty() {
-        None
-    } else {
+    let minimized_case = if fingerprint_report_failure(&report).is_ok() {
         minimize_failing_case(case, expected_trace.as_ref(), &report, storage_mode).await
+    } else {
+        None
     };
     report.metadata.generated = Some(GeneratedScenarioMetadata {
         family_name: case.family_name.clone(),
@@ -135,7 +149,7 @@ pub async fn run_generated_case_report_with_storage_mode(
         case_index: case.case_index,
         minimized_case,
     });
-    Ok(report)
+    Ok((report, captured_transport_artifacts))
 }
 
 async fn minimize_failing_case(
@@ -144,10 +158,7 @@ async fn minimize_failing_case(
     failing_report: &ScenarioReport,
     storage_mode: HarnessStorageMode,
 ) -> Option<ScenarioSpec> {
-    let target_failures = failure_kinds(failing_report);
-    if target_failures.is_empty() {
-        return None;
-    }
+    let target_fingerprint = fingerprint_report_failure(failing_report).ok()?;
 
     let mut candidate = case.scenario.clone();
     let mut changed = false;
@@ -164,7 +175,7 @@ async fn minimize_failing_case(
             &trial,
             expected_trace.cloned(),
             case.expected_outcomes.clone(),
-            &target_failures,
+            &target_fingerprint,
             storage_mode,
         )
         .await
@@ -183,7 +194,7 @@ async fn reproduces_failure(
     scenario: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
-    target_failures: &BTreeSet<String>,
+    target_fingerprint: &FailureFingerprintV1,
     storage_mode: HarnessStorageMode,
 ) -> bool {
     match run_scenario_report_with_outcomes_and_storage_mode(
@@ -194,17 +205,10 @@ async fn reproduces_failure(
     )
     .await
     {
-        Ok(report) => target_failures.is_subset(&failure_kinds(&report)),
+        Ok(report) => fingerprint_report_failure(&report)
+            .is_ok_and(|fingerprint| fingerprint == *target_fingerprint),
         Err(_) => false,
     }
-}
-
-fn failure_kinds(report: &ScenarioReport) -> BTreeSet<String> {
-    report
-        .expectation_failures
-        .iter()
-        .map(|failure| failure.kind.clone())
-        .collect()
 }
 
 fn is_minimizer_removable(step: &ScenarioStep) -> bool {
@@ -735,27 +739,30 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     let invitees = clients[1..].to_vec();
     let senders = clients[1..].to_vec();
     let committers = clients[..8].to_vec();
+    let sender_payloads = senders
+        .iter()
+        .map(|sender| (sender.clone(), format!("{sender}:mixed-storm:{case_index}")))
+        .collect::<Vec<_>>();
     let mut steps = large_group_setup(
         format!("large-mixed-message-commit-storm-{case_index}"),
         clients.clone(),
         invitees,
     );
 
-    for sender in &senders {
+    for (sender, payload) in &sender_payloads {
         steps.push(ScenarioStep::SendAppMessage {
             sender: sender.clone(),
-            payload: format!("{sender}:mixed-storm:{case_index}"),
+            payload: payload.clone(),
         });
     }
-    // Vary the message-phase schedule from the seed. These events are cleared
-    // before the observed commit storm, so the schedule changes engine input
-    // ordering without affecting the pinned expectations.
+    // Vary the message-phase schedule from the seed and preserve those events
+    // through the commit storm so the oracle checks both workload phases.
+    let message_order = shuffled_order(rng, senders.len());
     steps.push(ScenarioStep::ReorderQueued {
-        order: shuffled_order(rng, senders.len()),
+        order: message_order.clone(),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(clients.clone()));
-    steps.push(clear_vec(clients.clone()));
 
     for committer in &committers {
         steps.push(ScenarioStep::UpdateGroupData {
@@ -794,10 +801,18 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     ];
     for (offset, committer) in committers.iter().enumerate() {
         expected.push(confirmed(
-            37 + offset,
+            36 + offset,
             committer,
             &format!("{committer}-mixed-update"),
         ));
+        let received_payloads = message_order
+            .iter()
+            .filter_map(|index| {
+                let (sender, payload) = &sender_payloads[*index];
+                (sender != committer).then(|| payload.clone())
+            })
+            .collect();
+        expected.push(client_state(committer, 2, 21, received_payloads));
     }
     (scenario, expected)
 }

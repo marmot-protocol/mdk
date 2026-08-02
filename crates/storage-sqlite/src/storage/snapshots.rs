@@ -35,6 +35,23 @@ pub(super) fn release(
     lifecycle::release(store, group_id, name)
 }
 
+#[cfg(feature = "test-conformance-replay")]
+pub(crate) fn export_replay(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> StorageResult<Vec<u8>> {
+    capture::export(store, group_id)
+}
+
+#[cfg(feature = "test-conformance-replay")]
+pub(crate) fn import_replay(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    snapshot: &[u8],
+) -> StorageResult<()> {
+    restore::import(store, group_id, snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::SqliteAccountStorage;
@@ -245,6 +262,79 @@ mod tests {
         assert!(matches!(
             store.rollback_group_to_snapshot(&g1.id, "a-before"),
             Err(StorageError::SnapshotMissing(_))
+        ));
+    }
+
+    #[cfg(feature = "test-conformance-replay")]
+    #[test]
+    fn conformance_replay_snapshot_round_trips_into_a_fresh_database() {
+        use cgka_traits::convergence_pass::{
+            ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole,
+            ConvergencePassPhase, DurableConvergencePass,
+        };
+        use cgka_traits::storage::ConvergencePassStorage;
+
+        let source = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 3, 2);
+        source.put_group(&group).unwrap();
+        source
+            .put_message(&sample_message(mid(7), group.id.clone(), 3))
+            .unwrap();
+        let mls_group_id = openmls::group::GroupId::from_slice(group.id.as_slice());
+        source
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"captured-state".to_vec()))
+            .unwrap();
+        let pass = DurableConvergencePass {
+            group_id: group.id.clone(),
+            generation: 9,
+            phase: ConvergencePassPhase::Frozen,
+            base_epoch: EpochId(3),
+            clock_instance_id: 42,
+            opened_monotonic_ms: 100,
+            quiescence_deadline_monotonic_ms: 1_100,
+            absolute_deadline_monotonic_ms: 5_100,
+            opened_wall_ms: 200,
+            quiescence_deadline_wall_ms: 1_200,
+            absolute_deadline_wall_ms: 5_200,
+            members: vec![ConvergencePassMember {
+                message_id: mid(7),
+                payload_digest: [8; 32],
+                role: ConvergencePassMemberRole::CommitEdge,
+                source_epoch: 3,
+            }],
+            frozen_at_wall_ms: Some(1_200),
+            cutoff_cause: Some(ConvergenceCutoffCause::Quiescence),
+            fairness_slot_available: false,
+        };
+        source.put_convergence_pass(&pass).unwrap();
+
+        let snapshot = source
+            .export_conformance_replay_snapshot(&group.id)
+            .unwrap();
+        let restored = SqliteAccountStorage::in_memory().unwrap();
+        restored
+            .import_conformance_replay_snapshot(&group.id, &snapshot)
+            .unwrap();
+
+        assert_eq!(restored.get_group(&group.id).unwrap(), group);
+        assert_eq!(
+            restored
+                .list_messages(&group.id, cgka_traits::types::EpochId(0))
+                .unwrap(),
+            source
+                .list_messages(&group.id, cgka_traits::types::EpochId(0))
+                .unwrap()
+        );
+        let state: Option<TestGroupState> =
+            restored.mls_storage().group_state(&mls_group_id).unwrap();
+        assert_eq!(state, Some(TestGroupState(b"captured-state".to_vec())));
+        assert_eq!(restored.convergence_pass(&group.id).unwrap(), Some(pass));
+
+        assert!(matches!(
+            restored.import_conformance_replay_snapshot(&gid(2), &snapshot),
+            Err(StorageError::Serialization(message))
+                if message == "conformance replay snapshot group id mismatch"
         ));
     }
 }

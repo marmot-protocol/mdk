@@ -15,7 +15,8 @@ conformance-slow = []
 cgka-traits.workspace = true
 cgka-engine = { workspace = true, features = ["test-conformance-snapshot"] }
 marmot-forensics.workspace = true
-storage-sqlite.workspace = true
+storage-sqlite = { workspace = true, features = ["test-conformance-replay"] }
+fs-private.workspace = true
 transport-nostr-peeler.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true

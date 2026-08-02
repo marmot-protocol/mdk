@@ -478,6 +478,36 @@ impl HarnessClient {
         self.storage_backing.database_path()
     }
 
+    /// Export the sensitive engine/OpenMLS state needed to replay captured
+    /// transport bytes without regenerating MLS messages.
+    pub fn export_conformance_replay_checkpoint(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, EngineError> {
+        self.storage()
+            .export_conformance_replay_snapshot(group_id)
+            .map_err(EngineError::Storage)
+    }
+
+    /// Restore a sensitive replay checkpoint and rebuild the engine over it.
+    pub fn restore_conformance_replay_checkpoint(
+        &mut self,
+        group_id: &GroupId,
+        checkpoint: &[u8],
+    ) -> Result<(), EngineError> {
+        self.storage()
+            .import_conformance_replay_snapshot(group_id, checkpoint)
+            .map_err(EngineError::Storage)?;
+        self.default_group = Some(group_id.clone());
+        self.restart();
+        Ok(())
+    }
+
+    /// Deliver one exact captured transport object directly to this client.
+    pub fn inject_captured_transport(&self, message: TransportMessage) {
+        self.bus.inject(self.bus_id, message);
+    }
+
     pub(crate) fn enable_virtual_time_tick(&mut self) {
         self.virtual_time_tick_enabled = true;
     }

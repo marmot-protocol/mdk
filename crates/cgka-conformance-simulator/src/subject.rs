@@ -498,6 +498,27 @@ impl EngineHarnessSubject {
             .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {label}")))
     }
 
+    /// Exact transport artifacts emitted during this subject run. Payloads are
+    /// retained only for explicit failure-capsule capture.
+    pub fn captured_transport_artifacts(&self) -> Vec<crate::CapturedTransportArtifactV1> {
+        let mut artifacts = self
+            .clients
+            .iter()
+            .flat_map(|(label, client)| {
+                self.bus
+                    .outbound_since(client.bus_id, None)
+                    .into_iter()
+                    .map(|emission| crate::CapturedTransportArtifactV1 {
+                        sequence: emission.sequence,
+                        sender: label.clone(),
+                        message: emission.msg,
+                    })
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by_key(|artifact| artifact.sequence);
+        artifacts
+    }
+
     fn client_mut(&mut self, label: &str) -> Result<&mut HarnessClient, SubjectError> {
         self.clients
             .get_mut(label)
@@ -736,7 +757,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
-            self.client_mut(label)?.tick().await;
+            ensure_tick_succeeded(self.client_mut(label)?.tick().await)?;
         }
         Ok(())
     }
@@ -1228,7 +1249,7 @@ fn required_features_from_names(names: &[String]) -> Result<Vec<Feature>, Subjec
         .collect()
 }
 
-fn scenario_registry() -> FeatureRegistry {
+pub(crate) fn scenario_registry() -> FeatureRegistry {
     let mut registry = FeatureRegistry::new();
     registry.register(
         Feature("self-remove"),
@@ -1262,6 +1283,15 @@ fn outbound_sequence(outbound_id: &str) -> Result<u64, SubjectError> {
 
 fn subject_engine_error(error: EngineError) -> SubjectError {
     SubjectError::new(observe_engine_error(&error), error.to_string())
+}
+
+fn ensure_tick_succeeded(
+    outcomes: Vec<Result<cgka_traits::ingest::IngestOutcome, EngineError>>,
+) -> Result<(), SubjectError> {
+    match outcomes.into_iter().find_map(Result::err) {
+        Some(error) => Err(subject_engine_error(error)),
+        None => Ok(()),
+    }
 }
 
 fn subject_publication_error(error: HarnessPublicationError) -> SubjectError {
@@ -1355,6 +1385,16 @@ mod tests {
             .tick(invitees)
             .await
             .expect("invitees ingest founding welcomes");
+    }
+
+    #[test]
+    fn engine_subject_tick_surfaces_engine_failures() {
+        let error = ensure_tick_succeeded(vec![Err(EngineError::Backend(
+            "converge buffered group: injected failure".into(),
+        ))])
+        .expect_err("tick must not discard the engine failure");
+        assert_eq!(error.code, "backend");
+        assert!(error.message.contains("converge buffered group"));
     }
 
     #[tokio::test]

@@ -132,6 +132,19 @@ fn parse_help_returns_help_command() {
 }
 
 #[test]
+fn parse_replay_capsule_command() {
+    let command = parse_report_command([
+        "--replay-capsule".into(),
+        "target/failure-capsule.v1.json".into(),
+    ])
+    .expect("replay capsule args parse");
+    assert_eq!(
+        command,
+        ReportCommand::ReplayCapsule(PathBuf::from("target/failure-capsule.v1.json"))
+    );
+}
+
+#[test]
 fn parse_rejects_unknown_argument() {
     let err = parse_report_command(["--wat".into()]).expect_err("unknown arg errors");
     assert!(err.to_string().contains("unknown argument --wat"));
@@ -276,6 +289,21 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
             .failures
             .iter()
             .any(|failure| failure.kind == "weak_oracle_warning")
+    );
+    let capsule_path = summary.scenarios[0]
+        .failure_capsule
+        .as_ref()
+        .expect("strict failure emits a capsule");
+    assert!(capsule_path.exists());
+    let capsule: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(capsule_path).expect("read capsule"))
+            .expect("capsule JSON parses");
+    assert_eq!(capsule["schema_version"], "1");
+    assert_eq!(capsule["failure"]["classification"], "oracle_violation");
+    assert!(
+        capsule["captured_transport_artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| !artifacts.is_empty())
     );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");

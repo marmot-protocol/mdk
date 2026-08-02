@@ -38,6 +38,12 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     transport is delivered; the driver activates controlled time, runs immediate work, advances exactly to the earliest
     wake, and records quiescent, blocked, or watchdog-timeout evidence. Limits never define success.
 
+- **Module:** `src/failure_capsule.rs`
+  - **Role:** Versioned failure fingerprints and capsules, restrictive artifact I/O, synthetic-vector promotion, and
+    exact engine byte replay from a sensitive recipient SQLite/OpenMLS checkpoint. Never put a checkpoint into a
+    `synthetic_shareable` capsule; it contains key material. The wire/schema contract is
+    `schemas/failure-capsule.v1.schema.json`.
+
 - **Module:** `src/decryptability.rs`
   - **Role:** Serializable active application-message probe results. A
     `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
@@ -107,12 +113,13 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
 
 - **Module:** `src/report.rs`
   - **Role:** Report command parsing and run-summary types (`ReportArgs`, `ReportCommand`, `ReportRunSummary`,
-    `ScenarioReportSummary`, `ReportFailureSummary`) used by the report CLI.
+    `ScenarioReportSummary`, `ReportFailureSummary`) used by the report CLI. Failed reports retain subject-step errors
+    and emit restrictive failure capsules with captured transport artifacts.
 
 - **Module:** `src/bin/cgka-conformance-simulator-report.rs`
   - **Role:** Report writer CLI. Runs generated families or vector fixture files/directories, writes one JSON
-    `ScenarioReport` per scenario plus fixture candidates for generated cases, prints a pass/fail summary, and exits
-    non-zero on expectation failures.
+    `ScenarioReport` per scenario plus fixture candidates and failure capsules, replays checkpoint-bearing capsules,
+    prints a pass/fail summary, and exits non-zero on expectation failures.
 
 - **Module:** `src/bin/cgka-policy-casegen.rs`
   - **Role:** Policy-case generator CLI; reads `formal/tamarin/policy_cases.json` and parses/reasons over the bounded
@@ -164,7 +171,7 @@ group-data fork recovery, rollback plus delayed duplicate app delivery, partitio
 delivery, stable duplicate/delay/reorder queue faults, 20+ client message storms, partitioned large-group delivery
 storms, multi-committer group-data storms, mixed large message/commit storms, and restart plus duplicate delivery
 faults. These cases carry semantic `expected_outcomes`, so report failures point at the broken convergence invariant
-instead of only writing an observation dump. Generator version `3` draws the delivery schedule of the rollback and storm
+instead of only writing an observation dump. Generator version `6` draws the delivery schedule of the rollback and storm
 shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct adversarial orderings; the
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
 without re-pinning vectors.
@@ -260,7 +267,8 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
   use `create_group_with_admins` explicitly for competing admin commits.
 - **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy
-  step-removal reducer when removable app/delivery noise can be dropped without changing the failure kinds. There is no
+  step-removal reducer when removable app/delivery noise can be dropped without changing the complete stable failure
+  fingerprint. There is no
   domain-specific shrinker yet.
 
 ## Conventions

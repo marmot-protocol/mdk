@@ -32,9 +32,9 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 
-const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
-const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
-const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
+pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
+pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
+pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 
 /// Retry budget for a `PeelDeferred` row (mdk#339). Each unit is one
 /// actual re-peel attempt under a *changed* peel context (the fingerprint

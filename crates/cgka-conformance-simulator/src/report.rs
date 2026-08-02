@@ -2,10 +2,11 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    CoverageMatrixEntry, GeneratedScenarioCase, HarnessStorageMode, ScenarioReport, VectorFixture,
-    coverage_matrix_entry, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report_with_storage_mode, run_vector_fixture_report_with_storage_mode,
+    CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
+    HarnessStorageMode, ScenarioReport, VectorFixture, coverage_matrix_entry,
+    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, run_generated_case_report_with_capture,
+    run_vector_fixture_report_with_capture, write_failure_capsule,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub enum ReportInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReportCommand {
     Run(ReportArgs),
+    ReplayCapsule(PathBuf),
     Help,
 }
 
@@ -85,6 +87,9 @@ impl ReportRunSummary {
             for failure in &scenario.failures {
                 lines.push(format!("  - {}: {}", failure.kind, failure.message));
             }
+            if let Some(capsule) = &scenario.failure_capsule {
+                lines.push(format!("  capsule: {}", capsule.display()));
+            }
         }
         lines.push(format!("Reports: {}", self.out.display()));
         lines.join("\n")
@@ -96,6 +101,7 @@ pub struct ScenarioReportSummary {
     pub scenario_name: String,
     pub source: String,
     pub output: PathBuf,
+    pub failure_capsule: Option<PathBuf>,
     pub expectation_count: usize,
     pub failure_count: usize,
     pub failures: Vec<ReportFailureSummary>,
@@ -113,12 +119,24 @@ fn scenario_report_failures(
     strict_oracle: bool,
 ) -> Vec<ReportFailureSummary> {
     let mut failures = report
-        .expectation_failures
+        .step_log
         .iter()
-        .map(|failure| ReportFailureSummary {
-            kind: failure.kind.clone(),
-            message: failure.message.clone(),
+        .filter_map(|step| match &step.status {
+            crate::ScenarioStepStatus::Completed => None,
+            crate::ScenarioStepStatus::Failed { kind, message } => Some(ReportFailureSummary {
+                kind: format!("scenario_step_failed:{kind}"),
+                message: format!("step {} ({}): {message}", step.step_index, step.step_type),
+            }),
         })
+        .chain(
+            report
+                .expectation_failures
+                .iter()
+                .map(|failure| ReportFailureSummary {
+                    kind: failure.kind.clone(),
+                    message: failure.message.clone(),
+                }),
+        )
         .collect::<Vec<_>>();
 
     if !strict_oracle {
@@ -150,7 +168,14 @@ fn scenario_report_failures(
 }
 
 pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn Error>> {
-    std::fs::create_dir_all(&args.out)?;
+    #[cfg(unix)]
+    let _output_dir_guard = fs_private::prepare_directory_path(
+        &args.out,
+        fs_private::PRIVATE_DIR_MODE,
+        fs_private::ExistingDirectoryMode::Preserve,
+    )?;
+    #[cfg(not(unix))]
+    fs_private::create_dir_all_private(&args.out)?;
 
     let scenarios = match &args.input {
         ReportInput::GeneratedFamily {
@@ -203,7 +228,8 @@ async fn run_generated_family_reports(
 
     let mut summaries = Vec::with_capacity(cases.len());
     for case in cases {
-        let report = run_generated_case_report_with_storage_mode(&case, None, storage_mode).await?;
+        let (report, captured_transport_artifacts) =
+            run_generated_case_report_with_capture(&case, None, storage_mode).await?;
         let output = out.join(format!(
             "{}-seed-{}-case-{}.json",
             case.family_name.replace('/', "-"),
@@ -223,10 +249,29 @@ async fn run_generated_family_reports(
         let coverage = coverage_matrix_entry(source.clone(), &report);
         let failures = scenario_report_failures(&report, strict_oracle);
         let failure_count = failures.len();
+        let failure_capsule = if failures.is_empty() {
+            None
+        } else {
+            let path = out.join(format!(
+                "{}-seed-{}-case-{}-failure-capsule.v1.json",
+                case.family_name.replace('/', "-"),
+                case.seed,
+                case.case_index
+            ));
+            let capsule = FailureCapsuleV1::from_report(
+                report.clone(),
+                FailureCapsuleSensitivity::SyntheticShareable,
+                captured_transport_artifacts,
+                None,
+            )?;
+            write_failure_capsule(&path, &capsule)?;
+            Some(path)
+        };
         summaries.push(ScenarioReportSummary {
             scenario_name: report.metadata.scenario_name.clone(),
             source,
             output,
+            failure_capsule,
             expectation_count: report.expected_trace.iter().count()
                 + report.expected_outcomes.len(),
             failure_count,
@@ -270,7 +315,8 @@ async fn run_vector_fixture_reports(
     let mut summaries = Vec::with_capacity(fixture_paths.len());
     for path in fixture_paths {
         let fixture: VectorFixture = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        let report = run_vector_fixture_report_with_storage_mode(&fixture, storage_mode).await?;
+        let (report, captured_transport_artifacts) =
+            run_vector_fixture_report_with_capture(&fixture, storage_mode).await?;
         let output = out.join(format!(
             "{}-report.json",
             fixture.scenario_name.replace('/', "-")
@@ -280,10 +326,27 @@ async fn run_vector_fixture_reports(
         let coverage = coverage_matrix_entry(source.clone(), &report);
         let failures = scenario_report_failures(&report, strict_oracle);
         let failure_count = failures.len();
+        let failure_capsule = if failures.is_empty() {
+            None
+        } else {
+            let path = out.join(format!(
+                "{}-failure-capsule.v1.json",
+                fixture.scenario_name.replace('/', "-")
+            ));
+            let capsule = FailureCapsuleV1::from_report(
+                report.clone(),
+                FailureCapsuleSensitivity::SyntheticShareable,
+                captured_transport_artifacts,
+                None,
+            )?;
+            write_failure_capsule(&path, &capsule)?;
+            Some(path)
+        };
         summaries.push(ScenarioReportSummary {
             scenario_name: fixture.scenario_name.clone(),
             source,
             output,
+            failure_capsule,
             expectation_count: fixture.expected_trace.iter().count()
                 + fixture.expected_outcomes.len(),
             failure_count,
@@ -362,14 +425,31 @@ pub fn parse_report_command(
     let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
     let mut strict_oracle = true;
     let mut storage_mode = None;
+    let mut replay_capsule = None;
+    let mut scenario_input_selected = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--family" => family = next_value(&mut args, "--family")?,
-            "--seed" => seed = next_value(&mut args, "--seed")?.parse()?,
-            "--cases" => cases = next_value(&mut args, "--cases")?.parse()?,
-            "--vectors" => vectors.push(PathBuf::from(next_value(&mut args, "--vectors")?)),
+            "--family" => {
+                scenario_input_selected = true;
+                family = next_value(&mut args, "--family")?;
+            }
+            "--seed" => {
+                scenario_input_selected = true;
+                seed = next_value(&mut args, "--seed")?.parse()?;
+            }
+            "--cases" => {
+                scenario_input_selected = true;
+                cases = next_value(&mut args, "--cases")?.parse()?;
+            }
+            "--vectors" => {
+                scenario_input_selected = true;
+                vectors.push(PathBuf::from(next_value(&mut args, "--vectors")?));
+            }
+            "--replay-capsule" => {
+                replay_capsule = Some(PathBuf::from(next_value(&mut args, "--replay-capsule")?));
+            }
             "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
             "--storage" => {
                 storage_mode = Some(HarnessStorageMode::parse(&next_value(
@@ -382,6 +462,13 @@ pub fn parse_report_command(
             "--help" | "-h" => return Ok(ReportCommand::Help),
             other => return Err(format!("unknown argument {other}").into()),
         }
+    }
+
+    if let Some(path) = replay_capsule {
+        if scenario_input_selected {
+            return Err("--replay-capsule cannot be combined with family/vector inputs".into());
+        }
+        return Ok(ReportCommand::ReplayCapsule(path));
     }
 
     let input = if vectors.is_empty() {
@@ -411,7 +498,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle]"
 }
 
 #[cfg(test)]
@@ -488,5 +575,31 @@ mod tests {
                 .iter()
                 .any(|failure| failure.kind == "missing_observed_behavior")
         );
+    }
+
+    #[test]
+    fn scenario_report_failures_include_subject_step_failures() {
+        let mut report = report_with_oracle(ScenarioOracleReport {
+            stimuli: Vec::new(),
+            oracle_behaviors: Vec::new(),
+            observed_behaviors: Vec::new(),
+            missing_observed_behaviors: Vec::new(),
+            evidence: BehaviorEvidenceSummary::default(),
+            weak_oracle_warnings: Vec::new(),
+        });
+        report.step_log.push(crate::ScenarioStepLogEntry {
+            step_index: 4,
+            step_type: "tick".into(),
+            status: crate::ScenarioStepStatus::Failed {
+                kind: "backend".into(),
+                message: "convergence replay budget exceeded".into(),
+            },
+        });
+
+        let failures = scenario_report_failures(&report, false);
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "scenario_step_failed:backend");
+        assert!(failures[0].message.contains("replay budget exceeded"));
     }
 }

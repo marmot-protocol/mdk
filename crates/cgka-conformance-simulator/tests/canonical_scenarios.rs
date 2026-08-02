@@ -1681,7 +1681,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "5");
+        assert_eq!(case.generator_version, "6");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
     }

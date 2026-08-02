@@ -33,11 +33,14 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
   step logs, recoveries, and expectation failures.
+- `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded virtual-time schedule, exact
+  policy/constants, report/ledgers/state commitments, captured transport objects, resource counters, and a stable
+  failure fingerprint. An optional sensitive recipient checkpoint enables byte-exact engine replay.
 - `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
   and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
   domain-separated exporter commitment. Raw exporter material is never serialized.
-- `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families, writes JSON reports, and
-  emits fixture candidates for generated cases.
+- `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families, writes JSON reports and
+  failure capsules, emits fixture candidates for generated cases, and replays capsules that contain byte checkpoints.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
 
 ## Testing layers
@@ -98,6 +101,19 @@ The report command exits non-zero when any fixture expectation fails. Each repor
 selected subject adapter, declared capabilities, storage backend, observed trace, flattened recovery and epoch
 observations, and the mismatched expected/actual JSON. A subject that lacks any capability required by a scenario is
 rejected before the first scenario action executes.
+
+Failed report runs also write `*-failure-capsule.v1.json`. The capsule writer uses owner-only directories and files.
+Synthetic capsules without checkpoints may be reviewed and promoted into portable vectors; real incident material and
+any capsule containing an SQLite/OpenMLS checkpoint must remain `sensitive_local` because the checkpoint contains key
+material. Replay a checkpoint-bearing capsule without regenerating MLS bytes with:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --replay-capsule /private/path/failure-capsule.v1.json
+```
+
+The replay succeeds only when the exact stored recipient state plus captured transport objects reproduce the recorded
+engine fingerprint. Capsule v1's JSON Schema is `schemas/failure-capsule.v1.schema.json`.
 
 ## Exact state oracle
 
@@ -299,7 +315,7 @@ trace includes exactly the selected branch application payload.
 semantic expectations. The generator rotates through invite forks, group-data forks, publish rollback plus delayed app
 duplicates, partition/heal/leave, delayed past-epoch app delivery, stable duplicate/delay/reorder queue faults, 20+
 client message storms, partitioned large-group delivery storms, multi-committer group-data storms, mixed large
-message/commit storms, and restart plus duplicate delivery faults. Generator version `4` draws the delivery schedule of
+message/commit storms, and restart plus duplicate delivery faults. Generator version `6` draws the delivery schedule of
 the rollback and storm shapes from the seed, so distinct seeds exercise distinct adversarial orderings while the
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed. These cases are ordinary
 `ScenarioSpec`s, so the same runner and report path can turn selected generated cases into fixed vectors when that makes
@@ -316,7 +332,8 @@ the conformance contract clearer.
 - `observed_trace` — the trace produced by the scenario runner.
 - `oracle` — scenario stimuli, expected behavior classes, observed behavior classes, evidence counts, and weak-oracle
   warnings.
-- `step_log` — one entry per completed scenario step.
+- `step_log` — one entry per attempted scenario step, including the first typed failure; later planned steps remain
+  visible in a failure capsule's expanded schedule with no status.
 - `pending_resolution_observations` — flattened publish confirmations and rollbacks.
 - `recovery_observations` — flattened fork-recovery events from all client observations.
 - `epoch_change_observations` — flattened `EpochChanged` events from all client observations.
@@ -326,7 +343,7 @@ the conformance contract clearer.
 
 `run_generated_case_report(case, expected_trace)` adds generated-family metadata: family name, generator version, seed,
 case index, and an optional `minimized_case` field. Failing generated cases run a conservative greedy minimizer that
-removes removable delivery/app steps only when the same failure kinds still reproduce. Generated report runs also write
+removes removable delivery/app steps only when the complete stable failure fingerprint still reproduces. Generated report runs also write
 a sibling `*-fixture.v1.json` candidate. Cases with semantic expectations keep those expectations; cases without them
 use the observed trace as an exact expected trace in the candidate. When a failing generated case has a minimized
 reproducer, the fixture candidate uses that minimized scenario.

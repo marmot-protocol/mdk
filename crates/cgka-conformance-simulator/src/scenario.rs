@@ -286,7 +286,15 @@ pub struct ScenarioStepLogEntry {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ScenarioStepStatus {
     Completed,
-    Failed { message: String },
+    Failed {
+        #[serde(default = "default_step_failure_kind")]
+        kind: String,
+        message: String,
+    },
+}
+
+fn default_step_failure_kind() -> String {
+    "scenario_step_failed".into()
 }
 
 impl ScenarioStepStatus {
@@ -304,6 +312,7 @@ pub struct InvariantFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScenarioRunError {
     pub step_index: Option<usize>,
+    pub kind: String,
     pub message: String,
 }
 
@@ -320,7 +329,7 @@ impl std::error::Error for ScenarioRunError {}
 
 pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report(spec, None).await?;
-    ensure_quiescence_steps_succeeded(&report)?;
+    ensure_execution_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -332,7 +341,7 @@ pub async fn run_scenario_spec_with_subject(
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report_with_subject(spec, None, Vec::new(), subject).await?;
-    ensure_quiescence_steps_succeeded(&report)?;
+    ensure_execution_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -383,6 +392,24 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
+/// Run the in-process engine subject and retain the exact transport artifacts
+/// needed for a failure capsule. Callers must treat the returned artifacts as
+/// potentially sensitive even though synthetic campaigns use synthetic keys.
+pub async fn run_scenario_report_with_outcomes_and_capture(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    storage_mode: HarnessStorageMode,
+) -> Result<(ScenarioReport, Vec<crate::CapturedTransportArtifactV1>), ScenarioRunError> {
+    let mut subject =
+        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
+            .map_err(subject_setup_error)?;
+    let report =
+        run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject)
+            .await?;
+    Ok((report, subject.captured_transport_artifacts()))
+}
+
 /// Build a complete report using an explicitly supplied adapter.
 ///
 /// Capability validation runs before the subject receives any action.
@@ -415,6 +442,7 @@ pub async fn run_vector_fixture_report_with_storage_mode(
         Some(name) => {
             return Err(ScenarioRunError {
                 step_index: None,
+                kind: "unsupported_application_profile".into(),
                 message: format!("unsupported application profile {name}"),
             });
         }
@@ -437,6 +465,46 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     .await
 }
 
+/// Vector runner variant used by the report CLI when it must emit exact wire
+/// evidence alongside a failing report.
+pub async fn run_vector_fixture_report_with_capture(
+    fixture: &VectorFixture,
+    storage_mode: HarnessStorageMode,
+) -> Result<(ScenarioReport, Vec<crate::CapturedTransportArtifactV1>), ScenarioRunError> {
+    let protocol_profile = match fixture
+        .application_profile
+        .as_ref()
+        .map(|profile| profile.name.as_str())
+    {
+        None | Some("legacy") => ProtocolProfile::Legacy,
+        Some("current") => ProtocolProfile::Current,
+        Some(name) => {
+            return Err(ScenarioRunError {
+                step_index: None,
+                kind: "unsupported_application_profile".into(),
+                message: format!("unsupported application profile {name}"),
+            });
+        }
+    };
+    let mut subject =
+        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
+            .map_err(subject_setup_error)?;
+    let report = run_scenario_report_inner(
+        &fixture.scenario,
+        fixture.expected_trace.clone(),
+        fixture.expected_outcomes.clone(),
+        Some(VectorFixtureMetadata {
+            scenario_name: fixture.scenario_name.clone(),
+            vector_version: fixture.vector_version.clone(),
+            conformance_version: fixture.conformance_version.clone(),
+            seed: fixture.seed,
+        }),
+        &mut subject,
+    )
+    .await?;
+    Ok((report, subject.captured_transport_artifacts()))
+}
+
 async fn run_scenario_report_inner(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
@@ -456,7 +524,8 @@ async fn run_scenario_report_inner(
 
     for (step_index, step) in spec.steps.iter().enumerate() {
         let action_id = scenario_input_id(step_index, step);
-        match step {
+        let step_result = async {
+            match step {
             ScenarioStep::CreateGroup {
                 creator,
                 name,
@@ -719,11 +788,25 @@ async fn run_scenario_report_inner(
             ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
                 .clear_partition()
                 .map_err(|error| subject_step_error(step_index, error))?,
-            ScenarioStep::RestartClient { client } => {
-                subject
-                    .restart(client)
-                    .map_err(|error| subject_step_error(step_index, error))?;
+                ScenarioStep::RestartClient { client } => {
+                    subject
+                        .restart(client)
+                        .map_err(|error| subject_step_error(step_index, error))?;
+                }
             }
+            Ok::<(), ScenarioRunError>(())
+        }
+        .await;
+        if let Err(error) = step_result {
+            step_log.push(ScenarioStepLogEntry {
+                step_index,
+                step_type: step.kind().into(),
+                status: ScenarioStepStatus::Failed {
+                    kind: error.kind,
+                    message: error.message,
+                },
+            });
+            break;
         }
         step_log.push(ScenarioStepLogEntry {
             step_index,
@@ -837,6 +920,7 @@ pub fn validate_scenario_for_subject(
     if spec.spec_version != "2" {
         return Err(ScenarioRunError {
             step_index: None,
+            kind: "unsupported_scenario_version".into(),
             message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
         });
     }
@@ -845,6 +929,7 @@ pub fn validate_scenario_for_subject(
         if !clients.insert(label) {
             return Err(ScenarioRunError {
                 step_index: None,
+                kind: "duplicate_client".into(),
                 message: format!("duplicate client label {label}"),
             });
         }
@@ -908,19 +993,26 @@ fn subject_faults(
 fn err(step_index: usize, message: String) -> ScenarioRunError {
     ScenarioRunError {
         step_index: Some(step_index),
+        kind: "scenario_error".into(),
         message,
     }
 }
 
 fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
+    let message = error.to_string();
     ScenarioRunError {
         step_index: None,
-        message: error.to_string(),
+        kind: error.code,
+        message,
     }
 }
 
 fn subject_step_error(step_index: usize, error: SubjectError) -> ScenarioRunError {
-    err(step_index, error.to_string())
+    ScenarioRunError {
+        step_index: Some(step_index),
+        kind: error.code,
+        message: error.message,
+    }
 }
 
 fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<InvariantFailure> {
@@ -933,7 +1025,21 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
         .collect()
 }
 
-fn ensure_quiescence_steps_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRunError> {
+fn ensure_execution_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRunError> {
+    if let Some(step) = report
+        .step_log
+        .iter()
+        .find(|step| !step.status.is_completed())
+    {
+        let ScenarioStepStatus::Failed { kind, message } = &step.status else {
+            unreachable!("non-completed step must be failed")
+        };
+        return Err(ScenarioRunError {
+            step_index: Some(step.step_index),
+            kind: kind.clone(),
+            message: message.clone(),
+        });
+    }
     let Some(observation) = report
         .quiescence_observations
         .iter()
@@ -944,6 +1050,7 @@ fn ensure_quiescence_steps_succeeded(report: &ScenarioReport) -> Result<(), Scen
     let artifact = serde_json::to_string(observation).unwrap_or_else(|_| "unserializable".into());
     Err(ScenarioRunError {
         step_index: Some(observation.step_index),
+        kind: "quiescence_not_reached".into(),
         message: format!("quiescence was not reached: {artifact}"),
     })
 }
@@ -1220,6 +1327,53 @@ mod tests {
         assert_eq!(error.step_index, Some(5));
         assert!(error.message.contains("transport_delayed"));
         assert!(error.message.contains("\"status\":\"blocked\""));
+    }
+
+    #[tokio::test]
+    async fn subject_step_failure_is_a_report_artifact_and_a_spec_run_error() {
+        let spec = ScenarioSpec {
+            name: "step-failure-artifact/v1".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            steps: vec![ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("missing-publication".into()),
+                selection: ScenarioOutboundSelection::All,
+                outcome: SubjectOutboundOutcome::Accepted,
+            }],
+        };
+
+        let report = run_scenario_report(&spec, None)
+            .await
+            .expect("execution failures remain reportable");
+        assert!(matches!(
+            &report.step_log[0].status,
+            ScenarioStepStatus::Failed { message, .. } if message.contains("no unresolved outbound")
+        ));
+        assert!(report.observed_trace.is_some());
+
+        let error = run_scenario_spec(&spec)
+            .await
+            .expect_err("trace-only execution still reports the failed step");
+        assert_eq!(error.step_index, Some(0));
+        assert!(error.message.contains("no unresolved outbound"));
+    }
+
+    #[test]
+    fn legacy_failed_step_status_defaults_its_failure_kind() {
+        let status: ScenarioStepStatus = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "message": "legacy report"
+        }))
+        .expect("legacy failed status remains readable");
+
+        assert_eq!(
+            status,
+            ScenarioStepStatus::Failed {
+                kind: "scenario_step_failed".into(),
+                message: "legacy report".into(),
+            }
+        );
     }
 
     #[tokio::test]
