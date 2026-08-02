@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/marmot-protocol/mdk/cgka-conformance-simulator/scenario-ir.v2.schema.json",
+  "$id": "https://marmot-protocol.org/schemas/scenario-ir.v2.schema.json",
   "title": "MDK adapter-neutral scenario IR v2",
   "type": "object",
   "additionalProperties": false,

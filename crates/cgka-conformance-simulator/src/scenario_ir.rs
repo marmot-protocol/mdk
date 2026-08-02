@@ -135,172 +135,228 @@ fn validate_step(
     clients: &BTreeSet<&String>,
     topology: &crate::ScenarioTopologyV2,
 ) -> Result<(), ScenarioRunError> {
-    let selectors = match step {
-        ScenarioStep::OmitMessage { selector }
-        | ScenarioStep::DuplicateMessage { selector }
-        | ScenarioStep::WithholdMessage { selector, .. } => std::slice::from_ref(selector),
-        ScenarioStep::ReorderMessages { order } => order.as_slice(),
-        _ => &[],
-    };
-    if matches!(step, ScenarioStep::ReorderMessages { order } if order.is_empty()) {
-        return Err(compile_error(
-            Some(step_index),
-            "semantic reorder requires at least one selector".into(),
-        ));
+    match step {
+        ScenarioStep::OmitMessage { selector } | ScenarioStep::DuplicateMessage { selector } => {
+            validate_semantic_selector(step_index, selector)?;
+        }
+        ScenarioStep::WithholdMessage { selector, label } => {
+            validate_semantic_selector(step_index, selector)?;
+            validate_withheld_label(step_index, label)?;
+        }
+        ScenarioStep::ReleaseWithheld { label } => {
+            validate_withheld_label(step_index, label)?;
+        }
+        ScenarioStep::ReorderMessages { order } => {
+            if order.is_empty() {
+                return Err(compile_error(
+                    Some(step_index),
+                    "semantic reorder requires at least one selector".into(),
+                ));
+            }
+            for selector in order {
+                validate_semantic_selector(step_index, selector)?;
+            }
+        }
+        ScenarioStep::SetClientOffline { client } | ScenarioStep::ReconnectClient { client } => {
+            if !clients.contains(client) {
+                return Err(compile_error(
+                    Some(step_index),
+                    format!("connectivity action references unknown client {client}"),
+                ));
+            }
+        }
+        ScenarioStep::SyncRelayHistory {
+            clients: sync_clients,
+            ..
+        } => {
+            validate_nonempty_clients(step_index, sync_clients, clients, "relay sync")?;
+        }
+        ScenarioStep::ConfigureRelay {
+            relay,
+            duplicate_copies,
+            ..
+        } => {
+            validate_relay(step_index, relay, topology)?;
+            if *duplicate_copies == 0 {
+                return Err(compile_error(
+                    Some(step_index),
+                    "relay duplicate_copies must be non-zero".into(),
+                ));
+            }
+        }
+        ScenarioStep::SetRelayEventVisibility {
+            relay,
+            selector,
+            clients: visibility_clients,
+            ..
+        } => {
+            validate_relay(step_index, relay, topology)?;
+            if !selector.is_semantic() {
+                return Err(compile_error(
+                    Some(step_index),
+                    "relay visibility selector must be semantic".into(),
+                ));
+            }
+            validate_nonempty_clients(step_index, visibility_clients, clients, "relay visibility")?;
+        }
+        ScenarioStep::ReconcileRelayHistories { relays } => {
+            if relays.len() < 2 {
+                return Err(compile_error(
+                    Some(step_index),
+                    "relay reconciliation requires at least two relays".into(),
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for relay in relays {
+                if !seen.insert(relay.as_str()) {
+                    return Err(compile_error(
+                        Some(step_index),
+                        format!("relay reconciliation repeats relay {relay}"),
+                    ));
+                }
+            }
+            for relay in relays {
+                validate_relay(step_index, relay, topology)?;
+            }
+        }
+        ScenarioStep::CrashProcess { process } | ScenarioStep::RestartProcess { process } => {
+            if !topology.processes.iter().any(|item| item.id == *process) {
+                return Err(compile_error(
+                    Some(step_index),
+                    format!("process lifecycle action references unknown process {process}"),
+                ));
+            }
+        }
+        ScenarioStep::InjectStorageFault { fault } => {
+            if fault.operations == 0 {
+                return Err(compile_error(
+                    Some(step_index),
+                    "storage fault operations must be non-zero".into(),
+                ));
+            }
+            validate_storage_target(step_index, &fault.target, topology)?;
+        }
+        ScenarioStep::ClearStorageFault { target } => {
+            validate_storage_target(step_index, target, topology)?;
+        }
+        ScenarioStep::Assert { assertion } => {
+            validate_assertion(step_index, assertion, clients)?;
+        }
+        ScenarioStep::CreateGroup { .. }
+        | ScenarioStep::InviteMembers { .. }
+        | ScenarioStep::RemoveMembers { .. }
+        | ScenarioStep::SelfUpdate { .. }
+        | ScenarioStep::UpdateGroupData { .. }
+        | ScenarioStep::UpdateAdminPolicy { .. }
+        | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
+        | ScenarioStep::AcknowledgeOutbound { .. }
+        | ScenarioStep::SendAppMessage { .. }
+        | ScenarioStep::Leave { .. }
+        | ScenarioStep::DeliverAll
+        | ScenarioStep::Tick { .. }
+        | ScenarioStep::AdvanceTime { .. }
+        | ScenarioStep::AwaitQuiescence { .. }
+        | ScenarioStep::Observe { .. }
+        | ScenarioStep::ObserveExact { .. }
+        | ScenarioStep::ProbeBidirectionalDecryptability { .. }
+        | ScenarioStep::ObserveAdminPolicy { .. }
+        | ScenarioStep::ClearEvents { .. }
+        | ScenarioStep::SetPartition { .. }
+        | ScenarioStep::ClearPartition
+        | ScenarioStep::RestartClient { .. }
+        | ScenarioStep::Barrier { .. } => {}
     }
-    if selectors.iter().any(|selector| !selector.is_semantic()) {
-        return Err(compile_error(
+    Ok(())
+}
+
+fn validate_semantic_selector(
+    step_index: usize,
+    selector: &crate::ScenarioMessageSelectorV2,
+) -> Result<(), ScenarioRunError> {
+    if selector.is_semantic() {
+        Ok(())
+    } else {
+        Err(compile_error(
             Some(step_index),
             "message selector must constrain action_id, publication, sender, or class".into(),
-        ));
+        ))
     }
-    if matches!(step, ScenarioStep::WithholdMessage { label, .. } | ScenarioStep::ReleaseWithheld { label } if label.trim().is_empty())
-    {
-        return Err(compile_error(
+}
+
+fn validate_withheld_label(step_index: usize, label: &str) -> Result<(), ScenarioRunError> {
+    if label.trim().is_empty() {
+        Err(compile_error(
             Some(step_index),
             "withheld message label must not be empty".into(),
-        ));
+        ))
+    } else {
+        Ok(())
     }
-    if let ScenarioStep::SetClientOffline { client } | ScenarioStep::ReconnectClient { client } =
-        step
-        && !clients.contains(client)
-    {
+}
+
+fn validate_nonempty_clients(
+    step_index: usize,
+    labels: &[String],
+    clients: &BTreeSet<&String>,
+    operation: &str,
+) -> Result<(), ScenarioRunError> {
+    if labels.is_empty() {
         return Err(compile_error(
             Some(step_index),
-            format!("connectivity action references unknown client {client}"),
+            format!("{operation} requires at least one client"),
         ));
     }
-    if let ScenarioStep::SyncRelayHistory {
-        clients: sync_clients,
-        ..
-    } = step
-    {
-        if sync_clients.is_empty() {
+    for client in labels {
+        if !clients.contains(client) {
             return Err(compile_error(
                 Some(step_index),
-                "relay sync requires at least one client".into(),
+                format!("{operation} references unknown client {client}"),
             ));
         }
-        for client in sync_clients {
-            if !clients.contains(client) {
+    }
+    Ok(())
+}
+
+fn validate_assertion(
+    step_index: usize,
+    assertion: &crate::ScenarioAssertionV2,
+    clients: &BTreeSet<&String>,
+) -> Result<(), ScenarioRunError> {
+    match assertion {
+        crate::ScenarioAssertionV2::Exactly { predicate } => {
+            validate_predicate(step_index, predicate, clients)?;
+        }
+        crate::ScenarioAssertionV2::Eventually {
+            predicate,
+            max_iterations,
+        } => {
+            validate_predicate(step_index, predicate, clients)?;
+            if *max_iterations == 0 {
                 return Err(compile_error(
                     Some(step_index),
-                    format!("relay sync references unknown client {client}"),
+                    "eventually max_iterations must be non-zero".into(),
                 ));
             }
         }
-    }
-    if let ScenarioStep::ConfigureRelay {
-        relay,
-        duplicate_copies,
-        ..
-    } = step
-    {
-        validate_relay(step_index, relay, topology)?;
-        if *duplicate_copies == 0 {
-            return Err(compile_error(
-                Some(step_index),
-                "relay duplicate_copies must be non-zero".into(),
-            ));
+        crate::ScenarioAssertionV2::Within {
+            predicate,
+            poll_interval_ms,
+            ..
         }
-    }
-    if let ScenarioStep::SetRelayEventVisibility {
-        relay,
-        selector,
-        clients: visibility_clients,
-        ..
-    } = step
-    {
-        validate_relay(step_index, relay, topology)?;
-        if !selector.is_semantic() {
-            return Err(compile_error(
-                Some(step_index),
-                "relay visibility selector must be semantic".into(),
-            ));
-        }
-        if visibility_clients.is_empty() {
-            return Err(compile_error(
-                Some(step_index),
-                "relay visibility requires at least one client".into(),
-            ));
-        }
-        for client in visibility_clients {
-            if !clients.contains(client) {
+        | crate::ScenarioAssertionV2::Never {
+            predicate,
+            poll_interval_ms,
+            ..
+        } => {
+            validate_predicate(step_index, predicate, clients)?;
+            if *poll_interval_ms == 0 {
                 return Err(compile_error(
                     Some(step_index),
-                    format!("relay visibility references unknown client {client}"),
+                    "temporal assertion poll_interval_ms must be non-zero".into(),
                 ));
             }
         }
-    }
-    if let ScenarioStep::ReconcileRelayHistories { relays } = step {
-        if relays.len() < 2 {
-            return Err(compile_error(
-                Some(step_index),
-                "relay reconciliation requires at least two relays".into(),
-            ));
-        }
-        for relay in relays {
-            validate_relay(step_index, relay, topology)?;
-        }
-    }
-    if let ScenarioStep::CrashProcess { process } | ScenarioStep::RestartProcess { process } = step
-        && !topology.processes.iter().any(|item| item.id == *process)
-    {
-        return Err(compile_error(
-            Some(step_index),
-            format!("process lifecycle action references unknown process {process}"),
-        ));
-    }
-    if let ScenarioStep::InjectStorageFault { fault } = step {
-        if fault.operations == 0 {
-            return Err(compile_error(
-                Some(step_index),
-                "storage fault operations must be non-zero".into(),
-            ));
-        }
-        validate_storage_target(step_index, &fault.target, topology)?;
-    }
-    if let ScenarioStep::ClearStorageFault { target } = step {
-        validate_storage_target(step_index, target, topology)?;
-    }
-    if let ScenarioStep::Assert { assertion } = step {
-        match assertion {
-            crate::ScenarioAssertionV2::Exactly { predicate } => {
-                validate_predicate(step_index, predicate, clients)?;
-            }
-            crate::ScenarioAssertionV2::Eventually {
-                predicate,
-                max_iterations,
-            } => {
-                validate_predicate(step_index, predicate, clients)?;
-                if *max_iterations == 0 {
-                    return Err(compile_error(
-                        Some(step_index),
-                        "eventually max_iterations must be non-zero".into(),
-                    ));
-                }
-            }
-            crate::ScenarioAssertionV2::Within {
-                predicate,
-                poll_interval_ms,
-                ..
-            }
-            | crate::ScenarioAssertionV2::Never {
-                predicate,
-                poll_interval_ms,
-                ..
-            } => {
-                validate_predicate(step_index, predicate, clients)?;
-                if *poll_interval_ms == 0 {
-                    return Err(compile_error(
-                        Some(step_index),
-                        "temporal assertion poll_interval_ms must be non-zero".into(),
-                    ));
-                }
-            }
-            crate::ScenarioAssertionV2::Resource { .. } => {}
-        }
+        crate::ScenarioAssertionV2::Resource { .. } => {}
     }
     Ok(())
 }
@@ -404,6 +460,23 @@ fn compile_error(step_index: Option<usize>, message: String) -> ScenarioRunError
 mod tests {
     use super::*;
 
+    fn assert_step_compile_error(step: ScenarioStep, expected_message: &str) {
+        let spec = ScenarioSpec {
+            name: "compile/rejection".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![step],
+        };
+        let error = compile_scenario(&spec).expect_err("step must be rejected");
+        assert_eq!(error.kind, "scenario_compile_error");
+        assert_eq!(error.step_index, Some(0));
+        assert!(
+            error.message.contains(expected_message),
+            "unexpected compile error: {error:?}"
+        );
+    }
+
     #[test]
     fn compilation_assigns_stable_ids_and_virtual_time_before_actions() {
         let spec = ScenarioSpec {
@@ -429,6 +502,58 @@ mod tests {
         assert_eq!(compiled.actions[1].schedule.action_id, "step-1:tick");
         assert_eq!(compiled.actions[1].schedule.virtual_time_ms, 25);
         assert_eq!(compiled.actions[2].schedule.virtual_time_ms, 25);
+    }
+
+    #[test]
+    fn step_validation_rejects_invalid_cross_references_and_selectors() {
+        assert_step_compile_error(
+            ScenarioStep::OmitMessage {
+                selector: Default::default(),
+            },
+            "message selector must constrain",
+        );
+        assert_step_compile_error(
+            ScenarioStep::ConfigureRelay {
+                relay: "relay:missing".into(),
+                order: Default::default(),
+                duplicate_copies: 1,
+            },
+            "unknown relay",
+        );
+        assert_step_compile_error(
+            ScenarioStep::CrashProcess {
+                process: "process:missing".into(),
+            },
+            "unknown process",
+        );
+        assert_step_compile_error(
+            ScenarioStep::ClearStorageFault {
+                target: "device:missing".into(),
+            },
+            "unknown device or process",
+        );
+        assert_step_compile_error(
+            ScenarioStep::Assert {
+                assertion: crate::ScenarioAssertionV2::Exactly {
+                    predicate: crate::ScenarioPredicateV2::ClientState {
+                        client: "bob".into(),
+                        epoch: None,
+                        member_count: None,
+                    },
+                },
+            },
+            "unknown client bob",
+        );
+    }
+
+    #[test]
+    fn relay_reconciliation_rejects_duplicate_ids_before_lookup() {
+        assert_step_compile_error(
+            ScenarioStep::ReconcileRelayHistories {
+                relays: vec!["relay:same".into(), "relay:same".into()],
+            },
+            "repeats relay relay:same",
+        );
     }
 
     #[test]

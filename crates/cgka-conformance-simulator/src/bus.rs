@@ -405,13 +405,22 @@ impl TransportBus {
         self.inner.lock().unwrap().queue.len()
     }
 
-    /// Remove every packet-bus copy after a higher-level retained transport
-    /// adapter has durably captured the same engine emissions.
-    pub(crate) fn clear_queued(&self) -> usize {
+    /// Remove packet-bus copies after a higher-level retained transport adapter
+    /// has durably captured the same accepted engine emissions.
+    pub(crate) fn discard_queued_messages(&self, message_ids: &[MessageId]) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let cleared = inner.queue.len();
-        inner.queue.clear();
-        cleared
+        let queued_before = inner.queue.len();
+        inner
+            .queue
+            .retain(|in_flight| !message_ids.contains(&in_flight.msg.id));
+        let mut discarded = queued_before - inner.queue.len();
+        for delayed in inner.delayed.values_mut() {
+            let delayed_before = delayed.len();
+            delayed.retain(|in_flight| !message_ids.contains(&in_flight.msg.id));
+            discarded += delayed_before - delayed.len();
+        }
+        inner.delayed.retain(|_, messages| !messages.is_empty());
+        discarded
     }
 
     pub(crate) fn pending_work_snapshot(&self, client: ClientId) -> BusPendingWorkSnapshot {

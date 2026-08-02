@@ -768,8 +768,8 @@ impl EngineHarnessSubject {
         self.last_byte_replay.clone()
     }
 
-    pub(crate) fn discard_packet_bus_queue(&self) -> usize {
-        self.bus.clear_queued()
+    pub(crate) fn discard_packet_bus_artifact(&self, message_id: MessageId) -> usize {
+        self.bus.discard_queued_messages(&[message_id])
     }
 
     pub(crate) fn inject_transport_for_client(

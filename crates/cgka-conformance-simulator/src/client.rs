@@ -937,25 +937,8 @@ impl HarnessClient {
             })
             .await
             .expect("update group data");
-        match res {
-            SendResult::GroupEvolution {
-                msg,
-                welcomes,
-                pending,
-            } => {
-                assert!(
-                    welcomes.is_empty(),
-                    "group-data update should not create welcomes"
-                );
-                let routed = route(msg, &gid);
-                self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
-                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
-                self.publish_commit_scenario_input(&routed, pending).await;
-                self.bus.send(self.bus_id, routed);
-                pending
-            }
-            other => panic!("expected GroupEvolution from update_group_data, got {other:?}"),
-        }
+        self.publish_group_evolution(res, &gid, "update_group_data")
+            .await
     }
 
     pub async fn remove_members(&mut self, members: Vec<MemberId>) -> PendingStateRef {

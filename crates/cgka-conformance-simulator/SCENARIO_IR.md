@@ -25,7 +25,7 @@ Expansion is pure and does not read wall time, thread scheduling, randomness, or
 The compiler rejects expansion beyond 1,000,000 canonical actions before allocating the repeated output.
 
 - `action` appends its nested canonical action.
-- `repeat` expands its body once, then appends exact copies `count` times. A count of zero appends nothing.
+- `repeat` expands its body exactly `count` times. A count of zero appends nothing.
 - `parallel` is deterministic logical concurrency, not host-thread concurrency. Each declared lane contributes at most
   one next action per round, in lane declaration order. A lane at a barrier waits while other lanes continue toward it.
 - Every lane in a `parallel` block must reach the same named barriers in the same order. The compiler rejects a lane

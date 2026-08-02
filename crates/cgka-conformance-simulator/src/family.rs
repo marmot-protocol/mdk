@@ -1355,12 +1355,14 @@ fn convergence_e2e_queue_selectors(steps: &[ScenarioStep]) -> Vec<ScenarioMessag
             ScenarioTransportClass::Commit,
         ));
     }
-    for index in [11, 12] {
-        selectors.push(action_selector(
-            index,
-            &steps[index],
-            ScenarioTransportClass::Application,
-        ));
+    for (index, step) in steps.iter().enumerate() {
+        if matches!(step, ScenarioStep::SendAppMessage { .. }) {
+            selectors.push(action_selector(
+                index,
+                step,
+                ScenarioTransportClass::Application,
+            ));
+        }
     }
     selectors
 }

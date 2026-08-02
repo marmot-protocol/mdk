@@ -258,6 +258,8 @@ recovery without pinning which invite branch wins.
 
 - `create_group`
 - `invite_members`
+- `remove_members`
+- `self_update`
 - `update_group_data`
 - `update_admin_policy`
 - `expect_update_admin_policy_error`
@@ -281,6 +283,18 @@ recovery without pinning which invite branch wins.
 - `set_partition`
 - `clear_partition`
 - `restart_client`
+- `set_client_offline`
+- `reconnect_client`
+- `sync_relay_history`
+- `configure_relay`
+- `set_relay_event_visibility`
+- `reconcile_relay_histories`
+- `crash_process`
+- `restart_process`
+- `inject_storage_fault`
+- `clear_storage_fault`
+- `barrier`
+- `assert`
 
 Staged publications are referenced by string labels chosen inside the scenario. `acknowledge_outbound.publication`
 selects artifacts emitted by that operation; omitting it selects all currently unresolved artifacts for the client.

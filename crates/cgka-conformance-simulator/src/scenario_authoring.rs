@@ -250,7 +250,12 @@ fn expand_rate(
     let body = expand_sequence(steps)?;
     reject_timed_or_barrier_body("rate", &body)?;
 
-    let mut result = Vec::with_capacity(body.len().saturating_mul(2));
+    let capacity = body
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| authoring_error("rate expansion is too large"))?;
+    ensure_expansion_bound(capacity)?;
+    let mut result = Vec::with_capacity(capacity);
     let mut previous_offset = 0_u64;
     for (index, item) in body.into_iter().enumerate() {
         let numerator = (index as u128)
@@ -259,7 +264,8 @@ fn expand_rate(
         let offset = numerator / u128::from(actions_per_second);
         let offset =
             u64::try_from(offset).map_err(|_| authoring_error("rate schedule overflows"))?;
-        append_time_delta(&mut result, offset - previous_offset);
+        // The floor schedule is non-decreasing as `index` increases.
+        append_time_delta(&mut result, offset.saturating_sub(previous_offset));
         result.push(item);
         ensure_expansion_bound(result.len())?;
         previous_offset = offset;
@@ -297,7 +303,10 @@ fn reject_timed_or_barrier_body(
     if body.iter().any(|flow| {
         matches!(
             flow,
-            ExpandedFlow::Barrier(_) | ExpandedFlow::Action(ScenarioStep::AdvanceTime { .. })
+            ExpandedFlow::Barrier(_)
+                | ExpandedFlow::Action(
+                    ScenarioStep::Barrier { .. } | ScenarioStep::AdvanceTime { .. }
+                )
         )
     }) {
         return Err(authoring_error(format!(
@@ -450,6 +459,80 @@ mod tests {
         })
         .expect_err("different barriers must fail");
         assert_eq!(error.kind, "scenario_authoring_error");
+    }
+
+    #[test]
+    fn canonical_barrier_action_is_rejected() {
+        let error = expand_flow(&action(ScenarioStep::Barrier { name: "bad".into() }))
+            .expect_err("canonical barriers are compiler-owned");
+        assert!(error.message.contains("flow=barrier"));
+    }
+
+    #[test]
+    fn timed_blocks_reject_time_and_direct_or_nested_barriers() {
+        let advance = action(ScenarioStep::AdvanceTime { delta_ms: 1 });
+        for flow in [
+            ScenarioFlow::Rate {
+                actions_per_second: 1,
+                steps: vec![advance.clone()],
+            },
+            ScenarioFlow::Burst {
+                count: 1,
+                every_ms: 1,
+                steps: vec![ScenarioFlow::Barrier {
+                    name: "direct".into(),
+                }],
+            },
+            ScenarioFlow::Rate {
+                actions_per_second: 1,
+                steps: vec![ScenarioFlow::Parallel {
+                    lanes: vec![
+                        ScenarioParallelLane {
+                            name: "one".into(),
+                            steps: vec![ScenarioFlow::Barrier {
+                                name: "nested".into(),
+                            }],
+                        },
+                        ScenarioParallelLane {
+                            name: "two".into(),
+                            steps: vec![ScenarioFlow::Barrier {
+                                name: "nested".into(),
+                            }],
+                        },
+                    ],
+                }],
+            },
+        ] {
+            let error = expand_flow(&flow).expect_err("timed body must reject clock owners");
+            assert!(error.message.contains("barriers or advance_time"));
+        }
+    }
+
+    #[test]
+    fn rate_rejects_zero_actions_per_second() {
+        let error =
+            expand_rate(0, &[send("alice", "one")]).expect_err("zero rate must be rejected");
+        assert!(error.message.contains("non-zero"));
+    }
+
+    #[test]
+    fn zero_repeat_and_zero_interval_burst_have_exact_semantics() {
+        let repeated = expand_flow(&ScenarioFlow::Repeat {
+            count: 0,
+            steps: vec![send("alice", "none")],
+        })
+        .expect("zero repeat expands");
+        assert!(repeated.is_empty());
+
+        let burst =
+            expand_burst(3, 0, &[send("alice", "immediate")]).expect("zero interval burst expands");
+        assert_eq!(burst.len(), 3);
+        assert!(
+            burst.iter().all(|item| !matches!(
+                item,
+                ExpandedFlow::Action(ScenarioStep::AdvanceTime { .. })
+            ))
+        );
     }
 
     #[test]

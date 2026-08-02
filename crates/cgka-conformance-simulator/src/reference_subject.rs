@@ -71,6 +71,7 @@ pub struct ReferenceModelSubject {
     outbound: BTreeMap<u64, ReferenceOutboundRecord>,
     queued: Vec<ReferenceDelivery>,
     mailboxes: BTreeMap<String, Vec<ReferenceDeliveryEffect>>,
+    exposed_outbound: BTreeSet<String>,
     next_outbound_sequence: u64,
     current_monotonic_ms: u64,
 }
@@ -110,6 +111,7 @@ impl ReferenceModelSubject {
             outbound: BTreeMap::new(),
             queued: Vec::new(),
             mailboxes: BTreeMap::new(),
+            exposed_outbound: BTreeSet::new(),
             next_outbound_sequence: 0,
             current_monotonic_ms: 0,
         })
@@ -365,7 +367,9 @@ impl ConvergenceSubject for ReferenceModelSubject {
             epoch: u64::from(!action.invitees.is_empty()),
             name: action.name.into(),
             members,
-            admins: action.initial_admins.iter().cloned().collect(),
+            admins: std::iter::once(action.creator.to_owned())
+                .chain(action.initial_admins.iter().cloned())
+                .collect(),
         };
         self.stage_state_change(action.creator, action.pending, state, action.invitees);
         Ok(())
@@ -430,7 +434,7 @@ impl ConvergenceSubject for ReferenceModelSubject {
         }
         let pending = action.pending.ok_or_else(|| {
             SubjectError::new(
-                "not_authorized",
+                "missing_publication_label",
                 "reference model requires a successful policy update to name its publication",
             )
         })?;
@@ -501,11 +505,13 @@ impl ConvergenceSubject for ReferenceModelSubject {
         for delivery in self.queued.drain(..) {
             match resolutions.get(&delivery.outbound_id) {
                 Some(Some(SubjectOutboundOutcome::ReachedNoEndpoint)) => {}
-                Some(None | Some(SubjectOutboundOutcome::Accepted)) => self
-                    .mailboxes
-                    .entry(delivery.recipient)
-                    .or_default()
-                    .push(delivery.effect),
+                Some(None | Some(SubjectOutboundOutcome::Accepted)) => {
+                    self.exposed_outbound.insert(delivery.outbound_id);
+                    self.mailboxes
+                        .entry(delivery.recipient)
+                        .or_default()
+                        .push(delivery.effect);
+                }
                 _ => retained.push(delivery),
             }
         }
@@ -591,6 +597,14 @@ impl ConvergenceSubject for ReferenceModelSubject {
             };
         }
 
+        if outcome == SubjectOutboundOutcome::ReachedNoEndpoint
+            && self.exposed_outbound.contains(outbound_id)
+        {
+            return Err(SubjectError::new(
+                "outbound_already_exposed",
+                format!("outbound artifact {outbound_id} already reached a recipient"),
+            ));
+        }
         if outcome == SubjectOutboundOutcome::Accepted
             && record.artifact.state_confirmation_required
             && let Some(state) = record.local_state
@@ -814,5 +828,95 @@ mod tests {
         assert_eq!(error.step_index, Some(1));
         assert!(error.message.contains("exact_conformance_observation"));
         assert!(reference.poll_outbound("alice").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn creator_is_implicit_admin_and_missing_publication_label_is_distinct() {
+        let clients = vec!["alice".into()];
+        let mut subject = ReferenceModelSubject::new(&clients).unwrap();
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "implicit-admin",
+                invitees: &[],
+                required_features: &[],
+                initial_admins: &[],
+                pending: "create",
+            })
+            .await
+            .unwrap();
+        let outbound = subject.poll_outbound("alice").unwrap();
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &outbound[0].outbound_id,
+                SubjectOutboundOutcome::Accepted,
+            )
+            .await
+            .unwrap();
+
+        let admins = vec!["alice".into()];
+        let error = subject
+            .update_admin_policy(SubjectUpdateAdminPolicy {
+                action_id: None,
+                client: "alice",
+                admins: &admins,
+                pending: None,
+            })
+            .await
+            .expect_err("missing publication label must fail distinctly");
+        assert_eq!(error.code, "missing_publication_label");
+    }
+
+    #[tokio::test]
+    async fn definite_nonpublication_is_rejected_after_recipient_exposure() {
+        let clients = vec!["alice".into(), "bob".into()];
+        let invitees = vec!["bob".into()];
+        let mut subject = ReferenceModelSubject::new(&clients).unwrap();
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "exposure",
+                invitees: &invitees,
+                required_features: &[],
+                initial_admins: &[],
+                pending: "create",
+            })
+            .await
+            .unwrap();
+        for artifact in subject.poll_outbound("alice").unwrap() {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .unwrap();
+        }
+        subject.deliver_all().unwrap();
+        subject.tick(&clients).await.unwrap();
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "send",
+                sender: "alice",
+                payload: "hello",
+            })
+            .await
+            .unwrap();
+        let outbound_id = subject.poll_outbound("alice").unwrap()[0]
+            .outbound_id
+            .clone();
+        subject.deliver_all().unwrap();
+
+        let error = subject
+            .acknowledge_outbound(
+                "alice",
+                &outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .expect_err("exposed outbound cannot be definitely unpublished");
+        assert_eq!(error.code, "outbound_already_exposed");
     }
 }

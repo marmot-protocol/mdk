@@ -223,17 +223,16 @@ impl RetainedRelaySubject {
         }
     }
 
-    fn publish_artifact(&mut self, artifact: SubjectOutboundArtifact) -> Result<(), SubjectError> {
-        if !self.published_outbound.insert(artifact.outbound_id.clone()) {
-            return Ok(());
-        }
+    fn validate_publish_destination(
+        &self,
+        artifact: &SubjectOutboundArtifact,
+    ) -> Result<(), SubjectError> {
         let relay_ids = self
             .client_relays
             .get(&artifact.client)
             .cloned()
             .unwrap_or_default();
         if relay_ids.is_empty() {
-            self.published_outbound.remove(&artifact.outbound_id);
             return Err(SubjectError::new(
                 "no_publish_relays",
                 format!(
@@ -242,12 +241,33 @@ impl RetainedRelaySubject {
                 ),
             ));
         }
+        for relay_id in relay_ids {
+            if !self.relays.contains_key(&relay_id) {
+                return Err(SubjectError::new(
+                    "unknown_relay",
+                    format!("unknown relay {relay_id}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_artifact(&mut self, artifact: SubjectOutboundArtifact) {
+        if !self.published_outbound.insert(artifact.outbound_id.clone()) {
+            return;
+        }
+        let relay_ids = self
+            .client_relays
+            .get(&artifact.client)
+            .cloned()
+            .expect("publish destination validated before acknowledgement");
         let action_id = self.action_ids.get(&artifact.outbound_id).cloned();
         let class = self.class_for(&artifact);
         for relay_id in relay_ids {
-            let relay = self.relays.get_mut(&relay_id).ok_or_else(|| {
-                SubjectError::new("unknown_relay", format!("unknown relay {relay_id}"))
-            })?;
+            let relay = self
+                .relays
+                .get_mut(&relay_id)
+                .expect("publish relay validated before acknowledgement");
             let sequence = relay.next_sequence;
             relay.next_sequence = relay.next_sequence.saturating_add(1);
             relay.history.push(RetainedRelayEvent {
@@ -258,19 +278,6 @@ impl RetainedRelaySubject {
                 hidden_from: BTreeSet::new(),
             });
         }
-        Ok(())
-    }
-
-    fn publish_unresolved(&mut self) -> Result<(), SubjectError> {
-        let clients = self.clients.clone();
-        for client in clients {
-            for artifact in self.engine.poll_outbound(&client)? {
-                if !self.published_outbound.contains(&artifact.outbound_id) {
-                    self.publish_artifact(artifact)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     fn sync_one(
@@ -366,12 +373,6 @@ impl RetainedRelaySubject {
             quiet: events_returned == 0,
             completeness,
         });
-        Ok(())
-    }
-
-    fn prepare_relay_query(&mut self) -> Result<(), SubjectError> {
-        self.publish_unresolved()?;
-        self.engine.discard_packet_bus_queue();
         Ok(())
     }
 
@@ -511,7 +512,6 @@ impl ConvergenceSubject for RetainedRelaySubject {
     }
 
     fn deliver_all(&mut self) -> Result<(), SubjectError> {
-        self.prepare_relay_query()?;
         let online = self.online.iter().cloned().collect::<Vec<_>>();
         for client in online {
             self.sync_one(&client, &ScenarioRelaySyncModeV2::Incremental)?;
@@ -549,7 +549,15 @@ impl ConvergenceSubject for RetainedRelaySubject {
         outbound_id: &str,
         outcome: SubjectOutboundOutcome,
     ) -> Result<(), SubjectError> {
-        if outcome == SubjectOutboundOutcome::Accepted {
+        if outcome == SubjectOutboundOutcome::ReachedNoEndpoint
+            && self.published_outbound.contains(outbound_id)
+        {
+            return Err(SubjectError::new(
+                "outbound_already_exposed",
+                format!("outbound artifact {outbound_id} is retained by a relay"),
+            ));
+        }
+        let accepted_artifact = if outcome == SubjectOutboundOutcome::Accepted {
             let artifact = self
                 .engine
                 .poll_outbound(client)?
@@ -561,11 +569,19 @@ impl ConvergenceSubject for RetainedRelaySubject {
                         format!("unknown outbound artifact {outbound_id}"),
                     )
                 })?;
-            self.publish_artifact(artifact)?;
-        }
+            self.validate_publish_destination(&artifact)?;
+            Some(artifact)
+        } else {
+            None
+        };
         self.engine
             .acknowledge_outbound(client, outbound_id, outcome)
-            .await
+            .await?;
+        if let Some(artifact) = accepted_artifact {
+            self.publish_artifact(artifact.clone());
+            self.engine.discard_packet_bus_artifact(artifact.message.id);
+        }
+        Ok(())
     }
 
     fn structural_progress(&mut self) -> Result<SubjectProgressSnapshot, SubjectError> {
@@ -635,7 +651,6 @@ impl ConvergenceSubject for RetainedRelaySubject {
         clients: &[String],
         mode: &ScenarioRelaySyncModeV2,
     ) -> Result<(), SubjectError> {
-        self.prepare_relay_query()?;
         for client in clients {
             self.sync_one(client, mode)?;
         }
@@ -853,6 +868,12 @@ mod tests {
                     sender: "alice".into(),
                     payload: "while-offline".into(),
                 },
+                ScenarioStep::AcknowledgeOutbound {
+                    client: "alice".into(),
+                    publication: None,
+                    selection: Default::default(),
+                    outcome: SubjectOutboundOutcome::Accepted,
+                },
                 ScenarioStep::DeliverAll,
                 ScenarioStep::ReconnectClient {
                     client: "bob".into(),
@@ -998,6 +1019,12 @@ mod tests {
                 ScenarioStep::SendAppMessage {
                     sender: "alice".into(),
                     payload: "hello".into(),
+                },
+                ScenarioStep::AcknowledgeOutbound {
+                    client: "alice".into(),
+                    publication: None,
+                    selection: Default::default(),
+                    outcome: SubjectOutboundOutcome::Accepted,
                 },
                 ScenarioStep::DeliverAll,
                 ScenarioStep::Tick {
@@ -1236,5 +1263,83 @@ mod tests {
         assert!(report.relay_sync_observations.iter().any(|observation| {
             observation.events_returned > observation.unique_events_returned
         }));
+    }
+
+    #[tokio::test]
+    async fn relay_history_contains_only_accepted_publications() {
+        let clients = vec!["alice".into()];
+        let topology = ScenarioTopologyV2::default();
+        let mut subject = RetainedRelaySubject::new(
+            &clients,
+            &topology,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        subject
+            .create_group(SubjectCreateGroup {
+                creator: "alice",
+                name: "publication-lifecycle",
+                invitees: &[],
+                required_features: &[],
+                initial_admins: &[],
+                pending: "create",
+            })
+            .await
+            .unwrap();
+        let create = subject.poll_outbound("alice").unwrap();
+        for artifact in create {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .unwrap();
+        }
+        let retained_before = subject
+            .relays
+            .values()
+            .map(|relay| relay.history.len())
+            .sum::<usize>();
+
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "unaccepted-app",
+                sender: "alice",
+                payload: "not-published",
+            })
+            .await
+            .unwrap();
+        let app = subject.poll_outbound("alice").unwrap();
+        assert_eq!(app.len(), 1);
+        subject.deliver_all().unwrap();
+        assert_eq!(
+            subject
+                .relays
+                .values()
+                .map(|relay| relay.history.len())
+                .sum::<usize>(),
+            retained_before,
+            "querying relays must not publish unresolved artifacts"
+        );
+        subject
+            .acknowledge_outbound(
+                "alice",
+                &app[0].outbound_id,
+                SubjectOutboundOutcome::ReachedNoEndpoint,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            subject
+                .relays
+                .values()
+                .map(|relay| relay.history.len())
+                .sum::<usize>(),
+            retained_before,
+            "definite nonpublication must leave no retained event"
+        );
     }
 }

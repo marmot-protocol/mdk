@@ -28,6 +28,56 @@ fn schema_declares_every_executable_step_kind() {
     assert_eq!(schema_kinds, executable_kinds);
 }
 
+#[test]
+fn authoring_schema_references_resolve_against_the_ir_schema_id() {
+    let authoring: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-authoring.v1.schema.json"))
+            .expect("authoring schema parses");
+    let ir: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
+            .expect("scenario IR schema parses");
+    let authoring_id = authoring["$id"].as_str().expect("authoring schema id");
+    let ir_id = ir["$id"].as_str().expect("IR schema id");
+    let base = authoring_id
+        .rsplit_once('/')
+        .map(|(base, _)| format!("{base}/"))
+        .expect("schema id has a base");
+    let mut refs = Vec::new();
+    collect_external_refs(&authoring, &mut refs);
+    assert!(!refs.is_empty());
+    for reference in refs {
+        let (resource, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+        assert_eq!(format!("{base}{resource}"), ir_id);
+        if !fragment.is_empty() {
+            assert!(
+                ir.pointer(fragment).is_some(),
+                "schema reference fragment does not resolve: {reference}"
+            );
+        }
+    }
+}
+
+fn collect_external_refs<'a>(value: &'a serde_json::Value, refs: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str)
+                && !reference.starts_with('#')
+            {
+                refs.push(reference);
+            }
+            for child in object.values() {
+                collect_external_refs(child, refs);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_external_refs(child, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tokio::test]
 async fn self_update_and_remove_members_use_the_common_adapter_contract() {
     let scenario = ScenarioSpec {
