@@ -263,6 +263,12 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    /// Select controlled virtual-time behavior without advancing either clock
+    /// domain. This makes the clock-mode transition explicit for adapters.
+    fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
+    }
+
     /// Advance the subject's paired convergence clock without waking a
     /// participant runtime. A later `tick` selects which participants observe
     /// the elapsed deadline.
@@ -356,42 +362,6 @@ pub trait ConvergenceFaultSubject {
     fn clear_partition(&mut self) -> Result<(), SubjectError>;
 }
 
-/// Capability required for one ScenarioSpec v2 step.
-pub fn required_capability(step: &ScenarioStep) -> SubjectCapability {
-    match step {
-        ScenarioStep::CreateGroup { .. }
-        | ScenarioStep::InviteMembers { .. }
-        | ScenarioStep::UpdateGroupData { .. }
-        | ScenarioStep::UpdateAdminPolicy { .. }
-        | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
-        | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
-        ScenarioStep::AcknowledgeOutbound { .. } => SubjectCapability::OutboundPublication,
-        ScenarioStep::SendAppMessage { .. } => SubjectCapability::ApplicationMessaging,
-        ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
-            SubjectCapability::TransportDelivery
-        }
-        ScenarioStep::AdvanceTime { .. } => SubjectCapability::VirtualTime,
-        ScenarioStep::AwaitQuiescence { .. } => SubjectCapability::StructuralProgress,
-        ScenarioStep::Observe { .. } | ScenarioStep::ClearEvents { .. } => {
-            SubjectCapability::EventObservation
-        }
-        ScenarioStep::ObserveExact { .. } => SubjectCapability::ExactConformanceObservation,
-        ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
-            SubjectCapability::ActiveDecryptabilityProbe
-        }
-        ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
-        ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
-        ScenarioStep::DropQueued { .. }
-        | ScenarioStep::DuplicateQueued { .. }
-        | ScenarioStep::DelayQueued { .. }
-        | ScenarioStep::ReleaseDelayed { .. }
-        | ScenarioStep::ReorderQueued { .. } => SubjectCapability::WhiteBoxTransportQueueFaults,
-        ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
-            SubjectCapability::WhiteBoxTransportPartition
-        }
-    }
-}
-
 /// Complete capability set used by a scenario step. Most operations need one
 /// capability; fixed-point settling composes progress, time, delivery, and
 /// optionally outbound acknowledgement without moving policy into the subject.
@@ -407,7 +377,38 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         }
         capabilities
     } else {
-        vec![required_capability(step)]
+        vec![match step {
+            ScenarioStep::CreateGroup { .. }
+            | ScenarioStep::InviteMembers { .. }
+            | ScenarioStep::UpdateGroupData { .. }
+            | ScenarioStep::UpdateAdminPolicy { .. }
+            | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
+            | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
+            ScenarioStep::AcknowledgeOutbound { .. } => SubjectCapability::OutboundPublication,
+            ScenarioStep::SendAppMessage { .. } => SubjectCapability::ApplicationMessaging,
+            ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
+                SubjectCapability::TransportDelivery
+            }
+            ScenarioStep::AdvanceTime { .. } => SubjectCapability::VirtualTime,
+            ScenarioStep::Observe { .. } | ScenarioStep::ClearEvents { .. } => {
+                SubjectCapability::EventObservation
+            }
+            ScenarioStep::ObserveExact { .. } => SubjectCapability::ExactConformanceObservation,
+            ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
+                SubjectCapability::ActiveDecryptabilityProbe
+            }
+            ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
+            ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
+            ScenarioStep::DropQueued { .. }
+            | ScenarioStep::DuplicateQueued { .. }
+            | ScenarioStep::DelayQueued { .. }
+            | ScenarioStep::ReleaseDelayed { .. }
+            | ScenarioStep::ReorderQueued { .. } => SubjectCapability::WhiteBoxTransportQueueFaults,
+            ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
+                SubjectCapability::WhiteBoxTransportPartition
+            }
+            ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
+        }]
     }
 }
 
@@ -740,12 +741,16 @@ impl ConvergenceSubject for EngineHarnessSubject {
         Ok(())
     }
 
-    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
-        self.convergence_clock.advance_ms(delta_ms);
+    fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
         for client in self.clients.values_mut() {
             client.enable_virtual_time_tick();
         }
         Ok(())
+    }
+
+    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
+        self.convergence_clock.advance_ms(delta_ms);
+        self.activate_virtual_time()
     }
 
     fn poll_outbound(
@@ -911,6 +916,8 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let labels = self.clients.keys().cloned().collect::<Vec<_>>();
         for label in &labels {
             self.sync_client_outbound(label)?;
+            // Refresh durable message dispositions before counting scenario
+            // inputs that still lack a current or terminal outcome.
             let _ = self.client_mut(label)?.scenario_input_ledger();
         }
 
@@ -976,6 +983,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
             schema_version: "1".into(),
             structural_token: String::new(),
             current_monotonic_ms,
+            runnable_engine_work,
             runnable_work: runnable_engine_work
                 .saturating_add(bus.queued_messages)
                 .saturating_add(bus.mailbox_messages),

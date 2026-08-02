@@ -143,11 +143,13 @@ auto-confirmation mode, or second subject publication capability. `ProtocolProfi
 removed lifecycle: it selects the engine's legacy application-profile compatibility through
 `legacy_compatibility_profile()`, but it uses the same explicit outbound contract as `ProtocolProfile::Current`.
 ScenarioSpec v1 is intentionally unsupported after the repository-owned v2 cutover and is rejected before any subject
-action runs. `await_quiescence` composes the subject's structural-progress, virtual-time, delivery, and outbound
-capabilities. Its progress token is diagnostic only: success requires no runnable work, future wake, deferred/retry
-work, publication acknowledgement, transport backlog, scenario-input work, or terminal engine blocker. A zero-delta
-clock activation prevents the legacy far-future harness tick from bypassing virtual deadlines. Iteration, virtual-time,
-and work budgets produce serializable timeout evidence and never redefine unfinished work as quiescent.
+action runs. `await_quiescence` composes structural-progress, virtual-time, and delivery capabilities. It additionally
+requires outbound-publication capability when `policy.outbound` is `accept_all`; manual-publication scenarios retain
+that work as a named blocker without requiring the capability. Its progress token is diagnostic only: success requires
+no runnable work, future wake, deferred/retry work, publication acknowledgement, transport backlog, scenario-input
+work, or terminal engine blocker. Explicit virtual-time activation prevents the legacy far-future harness tick from
+bypassing virtual deadlines. Iteration, virtual-time, and work budgets produce serializable timeout evidence and never
+redefine unfinished work as quiescent.
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one
 uniquely identified application event through the normal engine and transport path; the runner delivers the resulting

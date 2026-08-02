@@ -13,6 +13,53 @@ use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
+/// Return the effective deferred-peel lifecycle for the current clock domain.
+///
+/// This is the single source of truth for legacy-row initialization and
+/// restart rebasing. Runtime maintenance persists the returned value when
+/// `changed` is true; conformance diagnostics use the same normalized copy
+/// without mutating storage.
+pub(crate) fn normalized_deferred_peel_lifecycle(
+    lifecycle: Option<&DeferredPeelLifecycle>,
+    now: crate::convergence_clock::ConvergenceTime,
+    convergence_clock_instance_id: u64,
+    deferred_peel_residence_ms: u64,
+) -> (DeferredPeelLifecycle, bool) {
+    let Some(lifecycle) = lifecycle else {
+        return (
+            DeferredPeelLifecycle {
+                first_observed_wall_ms: now.wall_ms,
+                wall_high_water_ms: now.wall_ms,
+                clock_instance_id: convergence_clock_instance_id,
+                residence_deadline_monotonic_ms: now
+                    .monotonic_ms
+                    .saturating_add(deferred_peel_residence_ms),
+                residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
+                distinct_context_attempts: 0,
+                last_context_fingerprint: None,
+            },
+            true,
+        );
+    };
+
+    let mut normalized = lifecycle.clone();
+    if normalized.clock_instance_id == convergence_clock_instance_id {
+        return (normalized, false);
+    }
+
+    // Monotonic values do not survive restart. Preserve elapsed wall
+    // residence through a high-water mark. If wall time moved backwards,
+    // using the prior high water prevents premature expiry.
+    let observed_wall = normalized.wall_high_water_ms.max(now.wall_ms);
+    let remaining = normalized
+        .residence_deadline_wall_ms
+        .saturating_sub(observed_wall);
+    normalized.clock_instance_id = convergence_clock_instance_id;
+    normalized.residence_deadline_monotonic_ms = now.monotonic_ms.saturating_add(remaining);
+    normalized.wall_high_water_ms = observed_wall;
+    (normalized, true)
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn recorded_message_outcome(
         &self,
@@ -413,38 +460,13 @@ impl<S: StorageProvider> Engine<S> {
         let mut persisted = 0usize;
         let mut normalization_pending = false;
         for record in records {
-            let mut changed = false;
-            let lifecycle = record.deferred_peel.get_or_insert_with(|| {
-                changed = true;
-                DeferredPeelLifecycle {
-                    first_observed_wall_ms: now.wall_ms,
-                    wall_high_water_ms: now.wall_ms,
-                    clock_instance_id: self.convergence_clock_instance_id,
-                    residence_deadline_monotonic_ms: now
-                        .monotonic_ms
-                        .saturating_add(self.deferred_peel_residence_ms),
-                    residence_deadline_wall_ms: now
-                        .wall_ms
-                        .saturating_add(self.deferred_peel_residence_ms),
-                    distinct_context_attempts: 0,
-                    last_context_fingerprint: None,
-                }
-            });
-            if lifecycle.clock_instance_id != self.convergence_clock_instance_id {
-                // Monotonic values do not survive restart. Preserve elapsed
-                // wall residence through a high-water mark. If wall time moved
-                // backwards, using the prior high water prevents premature
-                // expiry.
-                let observed_wall = lifecycle.wall_high_water_ms.max(now.wall_ms);
-                let remaining = lifecycle
-                    .residence_deadline_wall_ms
-                    .saturating_sub(observed_wall);
-                lifecycle.clock_instance_id = self.convergence_clock_instance_id;
-                lifecycle.residence_deadline_monotonic_ms =
-                    now.monotonic_ms.saturating_add(remaining);
-                lifecycle.wall_high_water_ms = observed_wall;
-                changed = true;
-            }
+            let (lifecycle, changed) = normalized_deferred_peel_lifecycle(
+                record.deferred_peel.as_ref(),
+                now,
+                self.convergence_clock_instance_id,
+                self.deferred_peel_residence_ms,
+            );
+            record.deferred_peel = Some(lifecycle);
             if changed {
                 if persisted < MAX_DEFERRED_ROWS_PER_SWEEP {
                     self.storage.put_message(record)?;

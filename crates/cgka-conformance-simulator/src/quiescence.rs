@@ -107,10 +107,10 @@ pub async fn drive_subject_to_quiescence(
     policy: &QuiescencePolicy,
     step_index: usize,
 ) -> Result<QuiescenceObservation, SubjectError> {
-    // Select the subject's controlled clock before the first participant wake.
-    // A zero delta is semantically inert but prevents legacy harness adapters
-    // from substituting their historical far-future one-shot drain shortcut.
-    subject.advance_time(0).await?;
+    // Select controlled-time behavior before the first participant wake. This
+    // prevents legacy harness adapters from substituting their historical
+    // far-future one-shot drain shortcut without relying on a magic time delta.
+    subject.activate_virtual_time()?;
     let initial = subject.structural_progress()?;
     let started_at = initial.current_monotonic_ms;
     let mut snapshot = initial;
@@ -136,7 +136,7 @@ pub async fn drive_subject_to_quiescence(
         }
         if (snapshot.outbound_awaiting_acknowledgement > 0
             && policy.outbound == QuiescenceOutboundPolicy::Manual)
-            || ((snapshot.transport_queued_messages > 0 || snapshot.transport_mailbox_messages > 0)
+            || (snapshot.transport_queued_messages > 0
                 && policy.transport == QuiescenceTransportPolicy::Manual)
         {
             return Ok(blocked_observation(
@@ -155,16 +155,13 @@ pub async fn drive_subject_to_quiescence(
             ));
         }
 
-        let engine_runnable = snapshot.runnable_work.saturating_sub(
-            snapshot
-                .transport_queued_messages
-                .saturating_add(snapshot.transport_mailbox_messages),
-        );
-        let will_ack = policy.outbound == QuiescenceOutboundPolicy::AcceptAll;
-        let will_deliver = policy.transport == QuiescenceTransportPolicy::DeliverAll;
-        let will_tick = engine_runnable > 0
+        let will_ack = snapshot.outbound_awaiting_acknowledgement > 0
+            && policy.outbound == QuiescenceOutboundPolicy::AcceptAll;
+        let will_deliver = snapshot.transport_queued_messages > 0
+            && policy.transport == QuiescenceTransportPolicy::DeliverAll;
+        let will_tick = snapshot.runnable_engine_work > 0
             || snapshot.transport_mailbox_messages > 0
-            || (snapshot.transport_queued_messages > 0 && will_deliver);
+            || will_deliver;
         let planned_work = (if will_ack {
             snapshot.outbound_awaiting_acknowledgement as u64
         } else {
@@ -176,7 +173,8 @@ pub async fn drive_subject_to_quiescence(
             0
         })
         .saturating_add(if will_tick {
-            engine_runnable
+            snapshot
+                .runnable_engine_work
                 .saturating_add(snapshot.transport_mailbox_messages)
                 .max(1) as u64
         } else {
@@ -193,11 +191,7 @@ pub async fn drive_subject_to_quiescence(
                 snapshot,
             ));
         }
-        let mut attempted_work = 0u64;
-
-        if snapshot.outbound_awaiting_acknowledgement > 0
-            && policy.outbound == QuiescenceOutboundPolicy::AcceptAll
-        {
+        if will_ack {
             for client in clients {
                 for artifact in subject.poll_outbound(client)? {
                     subject
@@ -207,34 +201,20 @@ pub async fn drive_subject_to_quiescence(
                             SubjectOutboundOutcome::Accepted,
                         )
                         .await?;
-                    attempted_work = attempted_work.saturating_add(1);
                 }
             }
         }
 
-        if snapshot.transport_queued_messages > 0
-            && policy.transport == QuiescenceTransportPolicy::DeliverAll
-        {
+        if will_deliver {
             subject.deliver_all()?;
-            attempted_work =
-                attempted_work.saturating_add(snapshot.transport_queued_messages as u64);
         }
 
-        if engine_runnable > 0
-            || snapshot.transport_mailbox_messages > 0
-            || (snapshot.transport_queued_messages > 0
-                && policy.transport == QuiescenceTransportPolicy::DeliverAll)
-        {
+        if will_tick {
             subject.tick(clients).await?;
-            attempted_work = attempted_work.saturating_add(
-                engine_runnable
-                    .saturating_add(snapshot.transport_mailbox_messages)
-                    .max(1) as u64,
-            );
         }
 
-        if attempted_work > 0 {
-            work_units = work_units.saturating_add(attempted_work);
+        if planned_work > 0 {
+            work_units = work_units.saturating_add(planned_work);
             iterations = iterations.saturating_add(1);
             snapshot = subject.structural_progress()?;
             continue;
@@ -386,6 +366,17 @@ mod tests {
 
         async fn tick(&mut self, _clients: &[String]) -> Result<(), SubjectError> {
             self.ticks += 1;
+            if self.snapshot.transport_mailbox_messages > 0 {
+                self.snapshot.runnable_work = self
+                    .snapshot
+                    .runnable_work
+                    .saturating_sub(self.snapshot.transport_mailbox_messages);
+                self.snapshot.transport_mailbox_messages = 0;
+            }
+            Ok(())
+        }
+
+        fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
             Ok(())
         }
 
@@ -401,6 +392,7 @@ mod tests {
             schema_version: "1".into(),
             structural_token: "unchanged".into(),
             current_monotonic_ms: 0,
+            runnable_engine_work: 1,
             runnable_work: 1,
             earliest_next_wake_monotonic_ms: None,
             deferred_retry_work: 0,
@@ -447,6 +439,7 @@ mod tests {
     #[tokio::test]
     async fn virtual_time_budget_is_a_watchdog_not_a_quiescence_definition() {
         let mut pending = progress();
+        pending.runnable_engine_work = 0;
         pending.runnable_work = 0;
         pending.earliest_next_wake_monotonic_ms = Some(100);
         let mut subject = StuckSubject {
@@ -477,5 +470,84 @@ mod tests {
             Some(100)
         );
         assert!(!result.final_progress.is_quiescent());
+    }
+
+    #[tokio::test]
+    async fn work_unit_budget_covers_immediate_and_scheduled_actions() {
+        let policy = QuiescencePolicy {
+            max_work_units: 0,
+            ..QuiescencePolicy::default()
+        };
+        let mut immediate = StuckSubject {
+            snapshot: progress(),
+            ticks: 0,
+        };
+        let immediate_result =
+            drive_subject_to_quiescence(&mut immediate, &["alice".into()], &policy, 5)
+                .await
+                .expect("immediate work budget produces an artifact");
+        assert!(matches!(
+            immediate_result.status,
+            QuiescenceStatus::TimedOut {
+                watchdog: QuiescenceWatchdog::WorkUnits,
+                ..
+            }
+        ));
+        assert_eq!(immediate.ticks, 0);
+
+        let mut scheduled_progress = progress();
+        scheduled_progress.runnable_engine_work = 0;
+        scheduled_progress.runnable_work = 0;
+        scheduled_progress.earliest_next_wake_monotonic_ms = Some(100);
+        let mut scheduled = StuckSubject {
+            snapshot: scheduled_progress,
+            ticks: 0,
+        };
+        let scheduled_result =
+            drive_subject_to_quiescence(&mut scheduled, &["alice".into()], &policy, 6)
+                .await
+                .expect("scheduled work budget produces an artifact");
+        assert!(matches!(
+            scheduled_result.status,
+            QuiescenceStatus::TimedOut {
+                watchdog: QuiescenceWatchdog::WorkUnits,
+                ..
+            }
+        ));
+        assert_eq!(scheduled.snapshot.current_monotonic_ms, 0);
+        assert_eq!(scheduled.ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_transport_drains_mailboxes_but_blocks_undelivered_queue() {
+        let policy = QuiescencePolicy {
+            transport: QuiescenceTransportPolicy::Manual,
+            ..QuiescencePolicy::default()
+        };
+        let mut mailbox_progress = progress();
+        mailbox_progress.runnable_engine_work = 0;
+        mailbox_progress.transport_mailbox_messages = 1;
+        let mut mailbox = StuckSubject {
+            snapshot: mailbox_progress,
+            ticks: 0,
+        };
+        let settled = drive_subject_to_quiescence(&mut mailbox, &["alice".into()], &policy, 7)
+            .await
+            .expect("post-delivery mailbox can drain under manual transport");
+        assert_eq!(settled.status, QuiescenceStatus::Quiescent);
+        assert_eq!(mailbox.ticks, 1);
+
+        let mut queued_progress = progress();
+        queued_progress.runnable_engine_work = 0;
+        queued_progress.transport_queued_messages = 1;
+        let mut queued = StuckSubject {
+            snapshot: queued_progress,
+            ticks: 0,
+        };
+        let blocked = drive_subject_to_quiescence(&mut queued, &["alice".into()], &policy, 8)
+            .await
+            .expect("undelivered queue is a manual transport blocker");
+        assert!(matches!(blocked.status, QuiescenceStatus::Blocked { .. }));
+        assert_eq!(queued.ticks, 0);
     }
 }

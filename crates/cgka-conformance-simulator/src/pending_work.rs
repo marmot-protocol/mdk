@@ -81,13 +81,17 @@ pub enum SubjectTerminalBlocker {
 }
 
 /// Adapter-neutral structural state consumed by the virtual-time fixed-point
-/// driver. The token is diagnostic and cycle-detection evidence; quiescence is
-/// defined by the explicit work/deadline fields, never token equality alone.
+/// driver. The token is diagnostic only; quiescence is defined by the explicit
+/// work/deadline fields, never token equality.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubjectProgressSnapshot {
     pub schema_version: String,
     pub structural_token: String,
     pub current_monotonic_ms: u64,
+    /// Engine work runnable on the next participant tick.
+    #[serde(default)]
+    pub runnable_engine_work: usize,
+    /// Aggregate runnable work across the engine and subject-owned transport.
     pub runnable_work: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest_next_wake_monotonic_ms: Option<u64>,

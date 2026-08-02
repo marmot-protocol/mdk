@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-02
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---

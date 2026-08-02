@@ -4888,6 +4888,88 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
     );
 }
 
+#[cfg(all(
+    feature = "test-conformance-snapshot",
+    feature = "test-policy-overrides"
+))]
+#[tokio::test]
+async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+    let mut david = build_client(b"david").0;
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "conformance-effective-deadline".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _) = evolution(invite);
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit, &group_id))
+        .unwrap();
+
+    let persisted = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("collecting pass persisted with the original policy");
+    assert_eq!(persisted.cutoff_monotonic_ms(), 2_000);
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("test policy override accepted");
+
+    let snapshot = carol
+        .conformance_structural_progress_snapshot(&group_id)
+        .expect("read-only conformance progress");
+    assert_eq!(snapshot.current_monotonic_ms, 1_000);
+    assert_eq!(snapshot.earliest_next_wake_monotonic_ms, None);
+    assert!(snapshot.runnable_work > 0);
+    assert_eq!(
+        carol_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .expect("snapshot does not rewrite storage")
+            .cutoff_monotonic_ms(),
+        2_000
+    );
+    assert_eq!(
+        carol
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .expect("production scheduler prepares the same pass"),
+        Some(0)
+    );
+}
+
 #[tokio::test]
 async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");

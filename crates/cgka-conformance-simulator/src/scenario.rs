@@ -1379,10 +1379,13 @@ mod tests {
 
     #[test]
     fn queue_fault_steps_require_explicit_white_box_capability() {
-        let capability = crate::required_capability(&ScenarioStep::DropQueued { index: 0 });
+        let capabilities = required_capabilities(&ScenarioStep::DropQueued { index: 0 });
 
-        assert_eq!(capability, SubjectCapability::WhiteBoxTransportQueueFaults);
-        assert!(capability.is_white_box());
+        assert_eq!(
+            capabilities,
+            vec![SubjectCapability::WhiteBoxTransportQueueFaults]
+        );
+        assert!(capabilities[0].is_white_box());
     }
 
     #[test]
