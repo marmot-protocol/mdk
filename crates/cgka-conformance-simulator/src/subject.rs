@@ -489,7 +489,14 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         return Vec::new();
     }
     if let ScenarioStep::Assert { assertion } = step {
-        return match assertion {
+        let predicate = match assertion {
+            crate::ScenarioAssertionV2::Exactly { predicate }
+            | crate::ScenarioAssertionV2::Eventually { predicate, .. }
+            | crate::ScenarioAssertionV2::Within { predicate, .. }
+            | crate::ScenarioAssertionV2::Never { predicate, .. } => Some(predicate),
+            crate::ScenarioAssertionV2::Resource { .. } => None,
+        };
+        let mut capabilities = match assertion {
             crate::ScenarioAssertionV2::Exactly { .. } => {
                 vec![SubjectCapability::AssertionEvaluation]
             }
@@ -507,6 +514,16 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
                 vec![SubjectCapability::StructuralProgress]
             }
         };
+        if matches!(
+            predicate,
+            Some(
+                crate::ScenarioPredicateV2::ClientsExactlyEquivalent { .. }
+                    | crate::ScenarioPredicateV2::NoPendingWork { .. }
+            )
+        ) {
+            capabilities.push(SubjectCapability::ExactConformanceObservation);
+        }
+        return capabilities;
     }
     if let ScenarioStep::AwaitQuiescence { policy } = step {
         let mut capabilities = vec![
@@ -1512,18 +1529,17 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 epoch,
                 member_count,
             } => {
-                let observations = self.observe(&[client.clone()])?;
-                let observation = observations.first().ok_or_else(|| {
-                    SubjectError::new(
-                        "missing_observation",
-                        format!("no observation for {client}"),
-                    )
-                })?;
+                let client_state = self.client(client)?;
+                let actual_epoch = client_state.epoch().0;
+                let actual_member_count = client_state.members().len();
                 (
-                    epoch.is_none_or(|epoch| observation.epoch == epoch)
-                        && member_count
-                            .is_none_or(|member_count| observation.member_count == member_count),
-                    serde_json::json!(observation),
+                    epoch.is_none_or(|epoch| actual_epoch == epoch)
+                        && member_count.is_none_or(|count| actual_member_count == count),
+                    serde_json::json!({
+                        "client": client,
+                        "epoch": actual_epoch,
+                        "member_count": actual_member_count,
+                    }),
                 )
             }
             ScenarioPredicateV2::PayloadCount {
@@ -1531,42 +1547,44 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 payload,
                 count,
             } => {
-                let observations = self.observe(&[client.clone()])?;
-                let observation = observations.first().ok_or_else(|| {
-                    SubjectError::new(
-                        "missing_observation",
-                        format!("no observation for {client}"),
-                    )
-                })?;
-                let actual_count = observation
-                    .received_payloads
-                    .iter()
-                    .filter(|candidate| *candidate == payload)
-                    .count();
+                let actual_count = self.client_mut(client)?.pending_payload_count(payload);
                 (
                     actual_count == *count,
                     serde_json::json!({"count": actual_count}),
                 )
             }
             ScenarioPredicateV2::ClientsExactlyEquivalent { clients } => {
-                let observations = self.observe_exact(clients)?;
-                let states = observations
+                let states = clients
                     .iter()
-                    .map(|observation| observation.canonical_state.as_ref())
-                    .collect::<Vec<_>>();
-                let matched = states.first().is_some_and(|first| {
-                    first.is_some() && states.iter().all(|state| state == first)
-                });
-                (matched, serde_json::json!(observations))
+                    .map(|client| {
+                        self.client(client)?
+                            .try_canonical_state_snapshot()
+                            .map_err(|error| {
+                                SubjectError::new(
+                                    "exact_observation_failed",
+                                    observe_engine_error(&error),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, SubjectError>>()?;
+                let matched = states
+                    .first()
+                    .is_some_and(|first| states.iter().all(|state| state == first));
+                (matched, serde_json::json!(states))
             }
             ScenarioPredicateV2::NoPendingWork { clients } => {
-                let observations = self.observe_exact(clients)?;
-                let matched = observations.iter().all(|observation| {
-                    observation
-                        .pending_work
-                        .as_ref()
-                        .is_some_and(crate::PendingWorkObservation::is_empty)
-                });
+                let observations = clients
+                    .iter()
+                    .map(|client| {
+                        Ok((
+                            client.clone(),
+                            self.client(client)?.pending_work_observation(),
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, SubjectError>>()?;
+                let matched = observations
+                    .values()
+                    .all(crate::PendingWorkObservation::is_empty);
                 (matched, serde_json::json!(observations))
             }
         };

@@ -78,7 +78,19 @@ rejected during whole-schedule preflight instead of partially running with packe
 
 Current predicates cover client epoch/member state, exact payload multiplicity, exact canonical equivalence, and no
 pending work. Temporal poll intervals must be non-zero, client references are compile-checked, and iteration/time bounds
-are watchdogs rather than a redefinition of success.
+are watchdogs rather than a redefinition of success. Predicate samples are non-destructive: evaluating an assertion
+does not drain the event window that a later `observe` action records. Predicates that require exact canonical state add
+the exact-observation capability during compilation, so a semantic-only adapter rejects the complete schedule before
+action zero.
+
+## Initial adapters
+
+`EngineHarnessSubject` executes the IR against the real in-process OpenMLS/SQLite/Nostr-peeler stack.
+`ReferenceModelSubject` is a separate logical state machine for the common creation, membership, policy, publication,
+delivery, and application-message surface. It never calls the production selector or canonicalization code and does not
+claim an MLS exact-state oracle. Both adapters emit the same `ScenarioReport`, observation, assertion, and failure-capsule
+schemas; capability preflight defines which scenarios each may run. A repository test executes one compiled scenario
+unchanged through both adapters and compares their shared semantic observations.
 
 ## Compatibility contract
 

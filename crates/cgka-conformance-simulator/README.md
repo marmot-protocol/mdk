@@ -18,7 +18,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   delivery for welcomes, and replay hooks.
 - `HarnessClient` — wraps `Engine<SqliteAccountStorage>` and the real Nostr transport peeler while keeping delivery in memory.
 - `ConvergenceSubject` — a capability-declared semantic boundary between scenario execution and the implementation
-  under test. `EngineHarnessSubject` is the in-process adapter; queue and partition mutation live on a separate,
+  under test. `EngineHarnessSubject` is the in-process OpenMLS adapter. `ReferenceModelSubject` is an independent,
+  symbolic-memory adapter for the common logical group/publication/application lifecycle; it deliberately does not
+  advertise exact MLS projection or adversarial transport capabilities. Queue and partition mutation live on a separate,
   explicitly white-box fault interface. Its `virtual_time` capability advances one shared paired convergence clock;
   subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
   `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
@@ -31,7 +33,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
   burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
 - Semantic fault and assertion actions — select transport by stable meaning instead of queue position, declare
-  offline/process/storage failures, and record bounded exactly/eventually/within/never/resource samples.
+  offline/process/storage failures, and record bounded exactly/eventually/within/never/resource samples. Predicate
+  sampling is passive and does not consume the event window retained for later report observations.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
   virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
   exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.

@@ -122,6 +122,12 @@ the property-test registry. This file is the agent-facing model.
     clock/delivery/publication operations. Queue/partition mutation is available only through the separately named
     `ConvergenceFaultSubject` white-box interface.
 
+- **Module:** `src/reference_subject.rs`
+  - **Role:** Independent symbolic-memory `ConvergenceSubject` for the common logical group, publication, delivery, and
+    application lifecycle. It does not call the production selector/canonicalizer and deliberately omits exact MLS and
+    adversarial transport capabilities. Use whole-schedule capability preflight to keep unsupported reference scenarios
+    from partially executing.
+
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,

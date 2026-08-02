@@ -31,6 +31,7 @@ mod pending_work;
 pub mod policy_cases;
 pub mod proptest_support;
 mod quiescence;
+mod reference_subject;
 pub mod report;
 pub mod scenario;
 mod scenario_assertions;
@@ -86,6 +87,7 @@ pub use quiescence::{
     QuiescenceObservation, QuiescenceOutboundPolicy, QuiescencePolicy, QuiescenceStatus,
     QuiescenceTransportPolicy, QuiescenceWatchdog, drive_subject_to_quiescence,
 };
+pub use reference_subject::ReferenceModelSubject;
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,

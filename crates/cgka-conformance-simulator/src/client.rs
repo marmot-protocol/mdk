@@ -1563,6 +1563,22 @@ impl HarnessClient {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// Count matching application payloads in the current observation window
+    /// without consuming the events that a later report observation must see.
+    pub(crate) fn pending_payload_count(&mut self, expected: &str) -> usize {
+        self.capture_engine_events();
+        self.pending_events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => {
+                    Some(decode_harness_app_payload(payload))
+                }
+                _ => None,
+            })
+            .filter(|payload| payload.as_slice() == expected.as_bytes())
+            .count()
+    }
+
     pub fn epoch(&self) -> EpochId {
         let gid = self.default_group.clone().expect("group");
         self.engine().epoch(&gid).expect("epoch")
