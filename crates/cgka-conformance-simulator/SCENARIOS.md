@@ -328,7 +328,8 @@ These are real simulator scenarios that are still tied to Rust harness details.
 
 - Setup: Bob is already in Alice's group. Alice invites Carol. Carol receives the welcome and the group-message echo
   together.
-- Expected: Carol processes the welcome and treats the pre-join group wrapper as stale peel failure.
+- Expected: Carol processes the welcome and retains the pre-join group wrapper as transport-deferred until it can be
+  peeled or a local resource policy releases it.
 - Reason: the trace format does not yet record stale classifications as portable expectations.
 
 ## Generated Scenario Families
@@ -353,7 +354,7 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `convergence-chaos/v1`
 
-- Generator: `generate_convergence_chaos_family` (generator version `4`).
+- Generator: `generate_convergence_chaos_family` (generator version `6`).
 - Setup: the family rotates through the case classes below.
 - Expected: each case carries semantic expectations for convergence, rollback, payload delivery, or recovery, then
   performs a final global drain with exact-state and pending-work assertions.
@@ -428,8 +429,8 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Setup: Alice creates a 21-member group. Members send app messages, then eight members race group-data commits.
 - Pressure: large app-message load (seed-driven reorder) followed by a commit storm with a seed-driven duplicate and reorder.
 - Expected: the committers converge at epoch 2 with 21 members and the same branch-sensitive group name (see Chaos Class
-  `8`). Strict oracle coverage currently also reports that the cleared application phase lacks a delivery or
-  invalidation expectation; this is a tracked oracle gap, not an engine-state failure.
+  `8`). The application phase is not cleared: every observed committer must retain the exact seed-ordered payload set
+  addressed to it, so the later commit storm cannot hide a dropped, duplicated, or unaccounted application message.
 
 #### Chaos Class `10`: Restart Delivery Faults
 
@@ -444,7 +445,10 @@ These tests keep the simulator machinery honest.
 
 - `canonical_vector_fixtures_match_generated_traces` checks that every top-level JSON scenario vector still matches its
   expected trace or semantic outcomes.
-- `tests/report_runner.rs` checks CLI parsing, report JSON writing, fixture-candidate writing, and pass/fail summaries.
+- `tests/report_runner.rs` checks CLI parsing, report JSON writing, fixture-candidate and restrictive failure-capsule
+  writing, exact transport capture, and pass/fail summaries.
+- `tests/failure_capsules.rs` checks the v1 schema/round trip, owner-only artifact modes, portable synthetic promotion,
+  and exact recipient-checkpoint plus captured-commit replay. Omitting the captured commit must change the fingerprint.
 - `src/oracle.rs` and `tests/report_runner.rs` check that reports name their stimuli, expected behavior classes,
   observed behavior classes, and weak-oracle warnings.
 - `virtual_time_is_capability_gated_serializable_and_dispatched` checks that `advance_time` round-trips through the
@@ -484,8 +488,11 @@ These tests keep the simulator machinery honest.
   after an artifact reached a recipient mailbox;
   `exposed_welcome_prevents_partial_commit_retraction_and_rollback` applies the same rule to the complete
   commit/Welcome publication so a failed rollback cannot partially mutate transport state.
-- `failing_generated_case_records_a_minimized_reproducer` checks that a failing generated case records a smaller
-  reproducer when removable delivery noise is enough to keep the same failure.
+- `failing_generated_case_records_a_minimized_reproducer` checks that semantic failure identity lets a failing
+  generated case remove an entire irrelevant application-message storm even though action indices and the full state
+  digest change.
+- `failed_campaign_capsule_contains_a_replayable_tick_witness` checks that a real report campaign exports a sensitive
+  recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across
   candidate orderings.
 

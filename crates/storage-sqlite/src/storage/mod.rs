@@ -13,7 +13,7 @@ mod maintenance;
 mod member_validation_cache;
 mod messages;
 mod outbound;
-mod snapshots;
+pub(crate) mod snapshots;
 mod welcomes;
 
 #[cfg(test)]

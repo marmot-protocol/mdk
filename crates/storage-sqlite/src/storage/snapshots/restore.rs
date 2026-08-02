@@ -2,6 +2,8 @@ use super::rows::{
     MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
     Snapshot,
 };
+#[cfg(feature = "test-conformance-replay")]
+use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, created_at_to_i64,
@@ -60,15 +62,74 @@ fn rollback_snapshot(
         .storage()?
         .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?;
     let snapshot: Snapshot = deserialize(&snapshot_blob)?;
+    restore_snapshot(conn, group_id, &snapshot, mls_group_key)
+}
 
+#[cfg(feature = "test-conformance-replay")]
+pub(super) fn import(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    snapshot_blob: &[u8],
+) -> StorageResult<()> {
+    let snapshot: ReplaySnapshot = deserialize(snapshot_blob)?;
+    if snapshot.version != REPLAY_SNAPSHOT_VERSION {
+        return Err(StorageError::Serialization(format!(
+            "unsupported conformance replay snapshot version {}",
+            snapshot.version
+        )));
+    }
+    if snapshot.group.group.id != *group_id {
+        return Err(StorageError::Serialization(
+            "conformance replay snapshot group id mismatch".to_string(),
+        ));
+    }
+    retry_on_busy(|| {
+        let mls_group_key = mls_group_key(group_id)?;
+        let mut conn = store.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        restore_snapshot(&tx, group_id, &snapshot.group, &mls_group_key)?;
+        convergence_pass(&tx, group_id, snapshot.convergence_pass.as_ref())?;
+        tx.commit().storage()?;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-conformance-replay")]
+fn convergence_pass(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    pass: Option<&cgka_traits::convergence_pass::DurableConvergencePass>,
+) -> StorageResult<()> {
+    conn.execute(
+        "DELETE FROM cgka_convergence_passes WHERE group_id = ?1",
+        params![group_id.as_slice()],
+    )
+    .storage()?;
+    if let Some(pass) = pass {
+        conn.execute(
+            "INSERT INTO cgka_convergence_passes (group_id, record) VALUES (?1, ?2)",
+            params![group_id.as_slice(), serialize(pass)?],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+fn restore_snapshot(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    snapshot: &Snapshot,
+    mls_group_key: &[u8],
+) -> StorageResult<()> {
     group(conn, group_id, &snapshot.group)?;
     messages(conn, group_id, &snapshot.messages)?;
     queued_outbound(conn, group_id, &snapshot.queued_outbound)?;
     member_capabilities(conn, group_id, &snapshot.member_caps)?;
     convergence_policy(conn, group_id, snapshot.convergence_policy.as_deref())?;
     validated_tree_marker(conn, group_id, snapshot.validated_tree_marker.as_deref())?;
-    openmls_values(conn, mls_group_key, &snapshot.openmls_values)?;
-    Ok(())
+    openmls_values(conn, mls_group_key, &snapshot.openmls_values)
 }
 
 fn group(conn: &rusqlite::Connection, group_id: &GroupId, group: &Group) -> StorageResult<()> {

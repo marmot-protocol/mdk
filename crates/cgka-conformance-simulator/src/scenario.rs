@@ -5,13 +5,15 @@
 //! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, ExpectationFailure,
-    HarnessStorageMode, PendingResolutionObservation, QuiescenceObservation, QuiescencePolicy,
-    ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace, SubjectCreateGroup,
-    SubjectDescriptor, SubjectError, SubjectInviteMembers, SubjectOutboundArtifact,
-    SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication, SubjectUpdateAdminPolicy,
-    SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
-    compare_trace_expectations, drive_subject_to_quiescence, required_capabilities,
+    BidirectionalDecryptabilityObservation, ClientObservation, ConvergenceFaultSubject,
+    ConvergenceSubject, EngineHarnessSubject, ExpectationFailure, HarnessStorageMode,
+    PendingResolutionObservation, QuiescenceObservation, QuiescencePolicy,
+    ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
+    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
+    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
+    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
+    VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
+    drive_subject_to_quiescence, required_capabilities,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -286,7 +288,17 @@ pub struct ScenarioStepLogEntry {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ScenarioStepStatus {
     Completed,
-    Failed { message: String },
+    Failed {
+        #[serde(default = "default_step_failure_kind")]
+        kind: String,
+        #[serde(default)]
+        category: SubjectFailureCategory,
+        message: String,
+    },
+}
+
+fn default_step_failure_kind() -> String {
+    "scenario_step_failed".into()
 }
 
 impl ScenarioStepStatus {
@@ -304,6 +316,8 @@ pub struct InvariantFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScenarioRunError {
     pub step_index: Option<usize>,
+    pub kind: String,
+    pub category: SubjectFailureCategory,
     pub message: String,
 }
 
@@ -320,7 +334,7 @@ impl std::error::Error for ScenarioRunError {}
 
 pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report(spec, None).await?;
-    ensure_quiescence_steps_succeeded(&report)?;
+    ensure_execution_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -332,7 +346,7 @@ pub async fn run_scenario_spec_with_subject(
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioTrace, ScenarioRunError> {
     let report = run_scenario_report_with_subject(spec, None, Vec::new(), subject).await?;
-    ensure_quiescence_steps_succeeded(&report)?;
+    ensure_execution_succeeded(&report)?;
     Ok(report
         .observed_trace
         .expect("successful report always includes an observed trace"))
@@ -383,6 +397,34 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
+/// Run the in-process engine subject and retain a bounded exact-transport tail.
+/// When explicitly requested, also capture the final planned recipient tick;
+/// callers must treat that checkpoint as sensitive even with synthetic keys.
+pub async fn run_scenario_report_with_outcomes_and_capture(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
+    let mut subject =
+        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
+            .map_err(subject_setup_error)?;
+    if capture_sensitive_replay && let Some(recipient_tick) = final_planned_recipient_tick(spec) {
+        subject.capture_failure_replay_at_tick(recipient_tick);
+    }
+    let report =
+        run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject)
+            .await?;
+    Ok((
+        report,
+        crate::ScenarioFailureCaptureV1 {
+            transport: subject.captured_transport_window(),
+            byte_replay: subject.byte_replay_capture(),
+        },
+    ))
+}
+
 /// Build a complete report using an explicitly supplied adapter.
 ///
 /// Capability validation runs before the subject receives any action.
@@ -405,20 +447,7 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     fixture: &VectorFixture,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let protocol_profile = match fixture
-        .application_profile
-        .as_ref()
-        .map(|profile| profile.name.as_str())
-    {
-        None | Some("legacy") => ProtocolProfile::Legacy,
-        Some("current") => ProtocolProfile::Current,
-        Some(name) => {
-            return Err(ScenarioRunError {
-                step_index: None,
-                message: format!("unsupported application profile {name}"),
-            });
-        }
-    };
+    let protocol_profile = fixture_protocol_profile(fixture)?;
     let mut subject =
         EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
             .map_err(subject_setup_error)?;
@@ -437,6 +466,376 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     .await
 }
 
+/// Vector runner variant used by the report CLI when it must emit exact wire
+/// evidence and, by explicit opt-in, a final recipient-tick checkpoint.
+pub async fn run_vector_fixture_report_with_capture(
+    fixture: &VectorFixture,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
+    let protocol_profile = fixture_protocol_profile(fixture)?;
+    let mut subject =
+        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
+            .map_err(subject_setup_error)?;
+    if capture_sensitive_replay
+        && let Some(recipient_tick) = final_planned_recipient_tick(&fixture.scenario)
+    {
+        subject.capture_failure_replay_at_tick(recipient_tick);
+    }
+    let report = run_scenario_report_inner(
+        &fixture.scenario,
+        fixture.expected_trace.clone(),
+        fixture.expected_outcomes.clone(),
+        Some(VectorFixtureMetadata {
+            scenario_name: fixture.scenario_name.clone(),
+            vector_version: fixture.vector_version.clone(),
+            conformance_version: fixture.conformance_version.clone(),
+            seed: fixture.seed,
+        }),
+        &mut subject,
+    )
+    .await?;
+    Ok((
+        report,
+        crate::ScenarioFailureCaptureV1 {
+            transport: subject.captured_transport_window(),
+            byte_replay: subject.byte_replay_capture(),
+        },
+    ))
+}
+
+fn final_planned_recipient_tick(spec: &ScenarioSpec) -> Option<usize> {
+    spec.steps
+        .iter()
+        .filter_map(|step| match step {
+            ScenarioStep::Tick { clients } => Some(clients.len()),
+            _ => None,
+        })
+        .sum::<usize>()
+        .checked_sub(1)
+}
+
+fn fixture_protocol_profile(fixture: &VectorFixture) -> Result<ProtocolProfile, ScenarioRunError> {
+    Ok(
+        match fixture
+            .application_profile
+            .as_ref()
+            .map(|profile| profile.name.as_str())
+        {
+            None | Some("legacy") => ProtocolProfile::Legacy,
+            Some("current") => ProtocolProfile::Current,
+            Some(name) => {
+                return Err(ScenarioRunError {
+                    step_index: None,
+                    kind: "unsupported_application_profile".into(),
+                    category: SubjectFailureCategory::Environment,
+                    message: format!("unsupported application profile {name}"),
+                });
+            }
+        },
+    )
+}
+
+#[derive(Default)]
+struct ScenarioStepOutputs {
+    pending_resolutions: Vec<PendingResolutionObservation>,
+    observations: Vec<ClientObservation>,
+    decryptability_probes: Vec<BidirectionalDecryptabilityObservation>,
+    admin_policy_observations: Vec<ScenarioAdminPolicyObservation>,
+    error_observations: Vec<ScenarioErrorObservation>,
+    quiescence_observations: Vec<QuiescenceObservation>,
+}
+
+async fn execute_scenario_step(
+    spec: &ScenarioSpec,
+    step_index: usize,
+    step: &ScenarioStep,
+    subject: &mut dyn ConvergenceSubject,
+    outputs: &mut ScenarioStepOutputs,
+) -> Result<(), ScenarioRunError> {
+    let action_id = scenario_input_id(step_index, step);
+    let ScenarioStepOutputs {
+        pending_resolutions,
+        observations,
+        decryptability_probes,
+        admin_policy_observations,
+        error_observations,
+        quiescence_observations,
+    } = outputs;
+    match step {
+        ScenarioStep::CreateGroup {
+            creator,
+            name,
+            invitees,
+            required_features,
+            initial_admins,
+            pending,
+        } => {
+            let initial_admin_labels = initial_admins
+                .clone()
+                .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
+            subject
+                .create_group(SubjectCreateGroup {
+                    creator,
+                    name,
+                    invitees,
+                    required_features,
+                    initial_admins: &initial_admin_labels,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::InviteMembers {
+            inviter,
+            invitees,
+            pending,
+        } => {
+            subject
+                .invite_members(SubjectInviteMembers {
+                    action_id: &action_id,
+                    inviter,
+                    invitees,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::UpdateGroupData {
+            client,
+            name,
+            pending,
+        } => {
+            subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id: &action_id,
+                    client,
+                    name,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::UpdateAdminPolicy {
+            client,
+            admins,
+            pending,
+        } => {
+            subject
+                .update_admin_policy(SubjectUpdateAdminPolicy {
+                    action_id: Some(&action_id),
+                    client,
+                    admins,
+                    pending: Some(pending),
+                })
+                .await
+                .map_err(|error| {
+                    let mut failure = subject_step_error(step_index, error);
+                    failure.message = format!(
+                        "update_admin_policy unexpectedly failed: {}",
+                        failure.message
+                    );
+                    failure
+                })?;
+        }
+        ScenarioStep::ExpectUpdateAdminPolicyError {
+            client,
+            admins,
+            error,
+        } => {
+            let client_label = client.clone();
+            match subject
+                .update_admin_policy(SubjectUpdateAdminPolicy {
+                    action_id: None,
+                    client,
+                    admins,
+                    pending: None,
+                })
+                .await
+            {
+                Ok(_) => {
+                    return Err(err(
+                        step_index,
+                        format!("update_admin_policy unexpectedly succeeded; expected {error}"),
+                    ));
+                }
+                Err(actual) => {
+                    if &actual.code != error {
+                        return Err(err(
+                            step_index,
+                            format!(
+                                "update_admin_policy failed with {}; expected {error}",
+                                actual.code
+                            ),
+                        ));
+                    }
+                    error_observations.push(ScenarioErrorObservation {
+                        step_index,
+                        client: client_label,
+                        operation: "update_admin_policy".into(),
+                        error: actual.code,
+                    });
+                }
+            }
+        }
+        ScenarioStep::AcknowledgeOutbound {
+            client,
+            publication,
+            selection,
+            outcome,
+        } => {
+            let client_label = client.clone();
+            let artifacts = subject
+                .poll_outbound(client)
+                .map_err(|error| subject_step_error(step_index, error))?
+                .into_iter()
+                .filter(|artifact| {
+                    publication.as_ref().is_none_or(|publication| {
+                        artifact.publication.as_ref() == Some(publication)
+                    }) && selection.matches(artifact)
+                })
+                .collect::<Vec<_>>();
+            if artifacts.is_empty() && publication.is_some() {
+                return Err(err(
+                    step_index,
+                    format!(
+                        "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
+                    ),
+                ));
+            }
+            for artifact in artifacts {
+                subject
+                    .acknowledge_outbound(client, &artifact.outbound_id, *outcome)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?;
+            }
+            if let Some(publication) = publication {
+                pending_resolutions.push(PendingResolutionObservation {
+                    step_index,
+                    client: client_label,
+                    pending: publication.clone(),
+                    resolution: match outcome {
+                        SubjectOutboundOutcome::Accepted => "confirmed",
+                        SubjectOutboundOutcome::ReachedNoEndpoint => "rolled_back",
+                    }
+                    .into(),
+                });
+            }
+        }
+        ScenarioStep::SendAppMessage { sender, payload } => {
+            subject
+                .send_application(SubjectSendApplication {
+                    action_id: &action_id,
+                    sender,
+                    payload,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::Leave { client } => {
+            subject
+                .leave(&action_id, client)
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::DeliverAll => subject
+            .deliver_all()
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::Tick { clients: labels } => {
+            subject
+                .tick(labels)
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::AdvanceTime { delta_ms } => {
+            subject
+                .advance_time(*delta_ms)
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::AwaitQuiescence { policy } => {
+            quiescence_observations.push(
+                drive_subject_to_quiescence(subject, &spec.clients, policy, step_index)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?,
+            );
+        }
+        ScenarioStep::Observe { clients: labels } => {
+            observations.extend(
+                subject
+                    .observe(labels)
+                    .map_err(|error| subject_step_error(step_index, error))?,
+            );
+        }
+        ScenarioStep::ObserveExact { clients: labels } => {
+            observations.extend(
+                subject
+                    .observe_exact(labels)
+                    .map_err(|error| subject_step_error(step_index, error))?,
+            );
+        }
+        ScenarioStep::ProbeBidirectionalDecryptability { clients: labels } => {
+            decryptability_probes.push(
+                subject
+                    .probe_bidirectional_decryptability(labels, step_index)
+                    .await
+                    .map_err(|error| subject_step_error(step_index, error))?,
+            );
+        }
+        ScenarioStep::ObserveAdminPolicy { clients: labels } => {
+            admin_policy_observations.extend(
+                subject
+                    .observe_admin_policy(labels)
+                    .map_err(|error| subject_step_error(step_index, error))?,
+            );
+        }
+        ScenarioStep::ClearEvents { clients: labels } => {
+            subject
+                .clear_events(labels)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::DropQueued { index } => {
+            subject_faults(subject, step_index)?
+                .drop_queued(*index)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::DuplicateQueued { index } => {
+            subject_faults(subject, step_index)?
+                .duplicate_queued(*index)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::DelayQueued { index, delayed } => {
+            subject_faults(subject, step_index)?
+                .delay_queued(*index, delayed)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ReleaseDelayed { delayed } => {
+            subject_faults(subject, step_index)?
+                .release_delayed(delayed)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ReorderQueued { order } => {
+            subject_faults(subject, step_index)?
+                .reorder_queued(order)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::SetPartition { allow } => {
+            subject_faults(subject, step_index)?
+                .set_partition(allow)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
+            .clear_partition()
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RestartClient { client } => {
+            subject
+                .restart(client)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+    }
+    Ok::<(), ScenarioRunError>(())
+}
+
 async fn run_scenario_report_inner(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
@@ -446,284 +845,23 @@ async fn run_scenario_report_inner(
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let descriptor = subject.descriptor();
     validate_scenario_for_subject(spec, &descriptor)?;
-    let mut pending_resolutions = Vec::new();
-    let mut observations = Vec::new();
-    let mut decryptability_probes = Vec::new();
-    let mut admin_policy_observations = Vec::new();
-    let mut error_observations = Vec::new();
-    let mut quiescence_observations = Vec::new();
+    let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
 
     for (step_index, step) in spec.steps.iter().enumerate() {
-        let action_id = scenario_input_id(step_index, step);
-        match step {
-            ScenarioStep::CreateGroup {
-                creator,
-                name,
-                invitees,
-                required_features,
-                initial_admins,
-                pending,
-            } => {
-                let initial_admin_labels = initial_admins
-                    .clone()
-                    .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
-                subject
-                    .create_group(SubjectCreateGroup {
-                        creator,
-                        name,
-                        invitees,
-                        required_features,
-                        initial_admins: &initial_admin_labels,
-                        pending,
-                    })
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::InviteMembers {
-                inviter,
-                invitees,
-                pending,
-            } => {
-                subject
-                    .invite_members(SubjectInviteMembers {
-                        action_id: &action_id,
-                        inviter,
-                        invitees,
-                        pending,
-                    })
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::UpdateGroupData {
-                client,
-                name,
-                pending,
-            } => {
-                subject
-                    .update_group_data(SubjectUpdateGroupData {
-                        action_id: &action_id,
-                        client,
-                        name,
-                        pending,
-                    })
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::UpdateAdminPolicy {
-                client,
-                admins,
-                pending,
-            } => {
-                subject
-                    .update_admin_policy(SubjectUpdateAdminPolicy {
-                        action_id: Some(&action_id),
-                        client,
-                        admins,
-                        pending: Some(pending),
-                    })
-                    .await
-                    .map_err(|error| {
-                        err(
-                            step_index,
-                            format!("update_admin_policy unexpectedly failed: {error}"),
-                        )
-                    })?;
-            }
-            ScenarioStep::ExpectUpdateAdminPolicyError {
-                client,
-                admins,
-                error,
-            } => {
-                let client_label = client.clone();
-                match subject
-                    .update_admin_policy(SubjectUpdateAdminPolicy {
-                        action_id: None,
-                        client,
-                        admins,
-                        pending: None,
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        return Err(err(
-                            step_index,
-                            format!("update_admin_policy unexpectedly succeeded; expected {error}"),
-                        ));
-                    }
-                    Err(actual) => {
-                        if &actual.code != error {
-                            return Err(err(
-                                step_index,
-                                format!(
-                                    "update_admin_policy failed with {}; expected {error}",
-                                    actual.code
-                                ),
-                            ));
-                        }
-                        error_observations.push(ScenarioErrorObservation {
-                            step_index,
-                            client: client_label,
-                            operation: "update_admin_policy".into(),
-                            error: actual.code,
-                        });
-                    }
-                }
-            }
-            ScenarioStep::AcknowledgeOutbound {
-                client,
-                publication,
-                selection,
-                outcome,
-            } => {
-                let client_label = client.clone();
-                let artifacts = subject
-                    .poll_outbound(client)
-                    .map_err(|error| subject_step_error(step_index, error))?
-                    .into_iter()
-                    .filter(|artifact| {
-                        publication.as_ref().is_none_or(|publication| {
-                            artifact.publication.as_ref() == Some(publication)
-                        }) && selection.matches(artifact)
-                    })
-                    .collect::<Vec<_>>();
-                if artifacts.is_empty() && publication.is_some() {
-                    return Err(err(
-                        step_index,
-                        format!(
-                            "no unresolved outbound artifacts matched client {client}, publication {publication:?}, selection {selection:?}"
-                        ),
-                    ));
-                }
-                for artifact in artifacts {
-                    subject
-                        .acknowledge_outbound(client, &artifact.outbound_id, *outcome)
-                        .await
-                        .map_err(|error| subject_step_error(step_index, error))?;
-                }
-                if let Some(publication) = publication {
-                    pending_resolutions.push(PendingResolutionObservation {
-                        step_index,
-                        client: client_label,
-                        pending: publication.clone(),
-                        resolution: match outcome {
-                            SubjectOutboundOutcome::Accepted => "confirmed",
-                            SubjectOutboundOutcome::ReachedNoEndpoint => "rolled_back",
-                        }
-                        .into(),
-                    });
-                }
-            }
-            ScenarioStep::SendAppMessage { sender, payload } => {
-                subject
-                    .send_application(SubjectSendApplication {
-                        action_id: &action_id,
-                        sender,
-                        payload,
-                    })
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::Leave { client } => {
-                subject
-                    .leave(&action_id, client)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::DeliverAll => subject
-                .deliver_all()
-                .map_err(|error| subject_step_error(step_index, error))?,
-            ScenarioStep::Tick { clients: labels } => {
-                subject
-                    .tick(labels)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::AdvanceTime { delta_ms } => {
-                subject
-                    .advance_time(*delta_ms)
-                    .await
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::AwaitQuiescence { policy } => {
-                quiescence_observations.push(
-                    drive_subject_to_quiescence(subject, &spec.clients, policy, step_index)
-                        .await
-                        .map_err(|error| subject_step_error(step_index, error))?,
-                );
-            }
-            ScenarioStep::Observe { clients: labels } => {
-                observations.extend(
-                    subject
-                        .observe(labels)
-                        .map_err(|error| subject_step_error(step_index, error))?,
-                );
-            }
-            ScenarioStep::ObserveExact { clients: labels } => {
-                observations.extend(
-                    subject
-                        .observe_exact(labels)
-                        .map_err(|error| subject_step_error(step_index, error))?,
-                );
-            }
-            ScenarioStep::ProbeBidirectionalDecryptability { clients: labels } => {
-                decryptability_probes.push(
-                    subject
-                        .probe_bidirectional_decryptability(labels, step_index)
-                        .await
-                        .map_err(|error| subject_step_error(step_index, error))?,
-                );
-            }
-            ScenarioStep::ObserveAdminPolicy { clients: labels } => {
-                admin_policy_observations.extend(
-                    subject
-                        .observe_admin_policy(labels)
-                        .map_err(|error| subject_step_error(step_index, error))?,
-                );
-            }
-            ScenarioStep::ClearEvents { clients: labels } => {
-                subject
-                    .clear_events(labels)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::DropQueued { index } => {
-                subject_faults(subject, step_index)?
-                    .drop_queued(*index)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::DuplicateQueued { index } => {
-                subject_faults(subject, step_index)?
-                    .duplicate_queued(*index)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::DelayQueued { index, delayed } => {
-                subject_faults(subject, step_index)?
-                    .delay_queued(*index, delayed)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::ReleaseDelayed { delayed } => {
-                subject_faults(subject, step_index)?
-                    .release_delayed(delayed)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::ReorderQueued { order } => {
-                subject_faults(subject, step_index)?
-                    .reorder_queued(order)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::SetPartition { allow } => {
-                subject_faults(subject, step_index)?
-                    .set_partition(allow)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
-            ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
-                .clear_partition()
-                .map_err(|error| subject_step_error(step_index, error))?,
-            ScenarioStep::RestartClient { client } => {
-                subject
-                    .restart(client)
-                    .map_err(|error| subject_step_error(step_index, error))?;
-            }
+        let step_result =
+            execute_scenario_step(spec, step_index, step, subject, &mut outputs).await;
+        if let Err(error) = step_result {
+            step_log.push(ScenarioStepLogEntry {
+                step_index,
+                step_type: step.kind().into(),
+                status: ScenarioStepStatus::Failed {
+                    kind: error.kind,
+                    category: error.category,
+                    message: error.message,
+                },
+            });
+            break;
         }
         step_log.push(ScenarioStepLogEntry {
             step_index,
@@ -731,6 +869,15 @@ async fn run_scenario_report_inner(
             status: ScenarioStepStatus::Completed,
         });
     }
+
+    let ScenarioStepOutputs {
+        pending_resolutions,
+        observations,
+        decryptability_probes,
+        admin_policy_observations,
+        error_observations,
+        quiescence_observations,
+    } = outputs;
 
     let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
@@ -837,6 +984,8 @@ pub fn validate_scenario_for_subject(
     if spec.spec_version != "2" {
         return Err(ScenarioRunError {
             step_index: None,
+            kind: "unsupported_scenario_version".into(),
+            category: SubjectFailureCategory::Environment,
             message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
         });
     }
@@ -845,6 +994,8 @@ pub fn validate_scenario_for_subject(
         if !clients.insert(label) {
             return Err(ScenarioRunError {
                 step_index: None,
+                kind: "duplicate_client".into(),
+                category: SubjectFailureCategory::Environment,
                 message: format!("duplicate client label {label}"),
             });
         }
@@ -908,19 +1059,29 @@ fn subject_faults(
 fn err(step_index: usize, message: String) -> ScenarioRunError {
     ScenarioRunError {
         step_index: Some(step_index),
+        kind: "scenario_error".into(),
+        category: SubjectFailureCategory::Environment,
         message,
     }
 }
 
 fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
+    let message = error.to_string();
     ScenarioRunError {
         step_index: None,
-        message: error.to_string(),
+        kind: error.code,
+        category: error.category,
+        message,
     }
 }
 
 fn subject_step_error(step_index: usize, error: SubjectError) -> ScenarioRunError {
-    err(step_index, error.to_string())
+    ScenarioRunError {
+        step_index: Some(step_index),
+        kind: error.code,
+        category: error.category,
+        message: error.message,
+    }
 }
 
 fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<InvariantFailure> {
@@ -933,7 +1094,27 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
         .collect()
 }
 
-fn ensure_quiescence_steps_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRunError> {
+fn ensure_execution_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRunError> {
+    if let Some(step) = report
+        .step_log
+        .iter()
+        .find(|step| !step.status.is_completed())
+    {
+        let ScenarioStepStatus::Failed {
+            kind,
+            category,
+            message,
+        } = &step.status
+        else {
+            unreachable!("non-completed step must be failed")
+        };
+        return Err(ScenarioRunError {
+            step_index: Some(step.step_index),
+            kind: kind.clone(),
+            category: *category,
+            message: message.clone(),
+        });
+    }
     let Some(observation) = report
         .quiescence_observations
         .iter()
@@ -944,6 +1125,8 @@ fn ensure_quiescence_steps_succeeded(report: &ScenarioReport) -> Result<(), Scen
     let artifact = serde_json::to_string(observation).unwrap_or_else(|_| "unserializable".into());
     Err(ScenarioRunError {
         step_index: Some(observation.step_index),
+        kind: "quiescence_not_reached".into(),
+        category: SubjectFailureCategory::Protocol,
         message: format!("quiescence was not reached: {artifact}"),
     })
 }
@@ -1223,6 +1406,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subject_step_failure_is_a_report_artifact_and_a_spec_run_error() {
+        let spec = ScenarioSpec {
+            name: "step-failure-artifact/v1".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            steps: vec![ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("missing-publication".into()),
+                selection: ScenarioOutboundSelection::All,
+                outcome: SubjectOutboundOutcome::Accepted,
+            }],
+        };
+
+        let report = run_scenario_report(&spec, None)
+            .await
+            .expect("execution failures remain reportable");
+        assert!(matches!(
+            &report.step_log[0].status,
+            ScenarioStepStatus::Failed { message, .. } if message.contains("no unresolved outbound")
+        ));
+        assert!(report.observed_trace.is_some());
+
+        let error = run_scenario_spec(&spec)
+            .await
+            .expect_err("trace-only execution still reports the failed step");
+        assert_eq!(error.step_index, Some(0));
+        assert!(error.message.contains("no unresolved outbound"));
+    }
+
+    #[test]
+    fn legacy_failed_step_status_defaults_its_failure_kind() {
+        let status: ScenarioStepStatus = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "message": "legacy report"
+        }))
+        .expect("legacy failed status remains readable");
+
+        assert_eq!(
+            status,
+            ScenarioStepStatus::Failed {
+                kind: "scenario_step_failed".into(),
+                category: SubjectFailureCategory::Environment,
+                message: "legacy report".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn fixed_point_is_invariant_to_same_horizon_batch_partitioning() {
         fn scenario(split_delivery: bool) -> ScenarioSpec {
             let clients = vec!["alice".into(), "bob".into(), "carol".into()];
@@ -1408,6 +1639,26 @@ mod tests {
 
         assert_eq!(error.step_index, None);
         assert!(error.message.contains("unsupported ScenarioSpec version 1"));
+    }
+
+    #[test]
+    fn sensitive_replay_targets_only_the_final_planned_recipient_tick() {
+        let spec = ScenarioSpec {
+            name: "replay-target".to_owned(),
+            spec_version: "2".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned()],
+            steps: vec![
+                ScenarioStep::Tick {
+                    clients: vec!["alice".to_owned()],
+                },
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["alice".to_owned(), "bob".to_owned()],
+                },
+            ],
+        };
+
+        assert_eq!(final_planned_recipient_tick(&spec), Some(2));
     }
 
     #[tokio::test]

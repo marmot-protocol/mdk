@@ -24,7 +24,7 @@ use crate::pending_work::{BusPendingWorkSnapshot, BusStructuralProgressSnapshot}
 use crate::scenario_input_ledger::ScenarioInputMetadata;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{MemberId, MessageId};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Stable id assigned by the bus to every attached client.
@@ -55,6 +55,12 @@ pub(crate) struct OutboundEmission {
     pub msg: TransportMessage,
 }
 
+pub(crate) struct CapturedOutboundWindow {
+    pub observed_objects: u64,
+    pub observed_json_bytes: u64,
+    pub emissions: Vec<(ClientId, OutboundEmission)>,
+}
+
 #[derive(Clone)]
 pub struct TransportBus {
     inner: Arc<Mutex<Inner>>,
@@ -70,6 +76,11 @@ struct Inner {
     /// queue so a black-box subject can expose publication work without
     /// leaking queue indices or fault-injection internals.
     outbound_emissions: HashMap<ClientId, Vec<OutboundEmission>>,
+    /// Bounded forensic evidence, separate from outbound lifecycle state.
+    captured_outbound_tail: VecDeque<(ClientId, OutboundEmission, u64)>,
+    captured_outbound_json_bytes: u64,
+    observed_outbound_objects: u64,
+    observed_outbound_json_bytes: u64,
     policy: DeliveryPolicy,
     /// Per-client pre-delivery buffer.
     mailboxes: HashMap<ClientId, Vec<TransportMessage>>,
@@ -96,6 +107,10 @@ impl TransportBus {
                 next_outbound_sequence: 0,
                 queue: Vec::new(),
                 outbound_emissions: HashMap::new(),
+                captured_outbound_tail: VecDeque::new(),
+                captured_outbound_json_bytes: 0,
+                observed_outbound_objects: 0,
+                observed_outbound_json_bytes: 0,
                 policy,
                 mailboxes: HashMap::new(),
                 partition_allowed: None,
@@ -144,6 +159,32 @@ impl TransportBus {
                     sequence,
                     msg: msg.clone(),
                 });
+            let json_bytes = serde_json::to_vec(&msg).map_or(0, |bytes| bytes.len() as u64);
+            inner.observed_outbound_objects = inner.observed_outbound_objects.saturating_add(1);
+            inner.observed_outbound_json_bytes = inner
+                .observed_outbound_json_bytes
+                .saturating_add(json_bytes);
+            inner.captured_outbound_json_bytes = inner
+                .captured_outbound_json_bytes
+                .saturating_add(json_bytes);
+            inner.captured_outbound_tail.push_back((
+                sender,
+                OutboundEmission {
+                    sequence,
+                    msg: msg.clone(),
+                },
+                json_bytes,
+            ));
+            while inner.captured_outbound_tail.len() > crate::MAX_CAPTURED_TRANSPORT_OBJECTS
+                || inner.captured_outbound_json_bytes > crate::MAX_CAPTURED_TRANSPORT_JSON_BYTES
+            {
+                let Some((_, _, evicted_bytes)) = inner.captured_outbound_tail.pop_front() else {
+                    break;
+                };
+                inner.captured_outbound_json_bytes = inner
+                    .captured_outbound_json_bytes
+                    .saturating_sub(evicted_bytes);
+            }
         }
         inner.queue.push(InFlight { sender, msg });
     }
@@ -162,6 +203,19 @@ impl TransportBus {
             .filter(|emission| after_sequence.is_none_or(|after| emission.sequence > after))
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn captured_outbound_window(&self) -> CapturedOutboundWindow {
+        let inner = self.inner.lock().unwrap();
+        CapturedOutboundWindow {
+            observed_objects: inner.observed_outbound_objects,
+            observed_json_bytes: inner.observed_outbound_json_bytes,
+            emissions: inner
+                .captured_outbound_tail
+                .iter()
+                .map(|(sender, emission, _)| (*sender, emission.clone()))
+                .collect(),
+        }
     }
 
     /// Retract every still-undelivered artifact for one pending publication.
@@ -313,6 +367,16 @@ impl TransportBus {
     pub fn mailbox(&self, client: ClientId) -> Vec<TransportMessage> {
         let mut inner = self.inner.lock().unwrap();
         std::mem::take(inner.mailboxes.get_mut(&client).unwrap())
+    }
+
+    pub(crate) fn mailbox_snapshot(&self, client: ClientId) -> Vec<TransportMessage> {
+        self.inner
+            .lock()
+            .unwrap()
+            .mailboxes
+            .get(&client)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Restrict deliveries to a subset of clients (the others are
@@ -510,5 +574,41 @@ fn take_batch(queue: &mut Vec<InFlight>, policy: &DeliveryPolicy, n: usize) -> V
             }
             taken
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::transport::{Timestamp, TransportSource};
+
+    #[test]
+    fn forensic_outbound_capture_is_bounded_at_emission_time() {
+        let bus = TransportBus::ordered();
+        let sender = bus.attach(MemberId::new(vec![1; 32]));
+        bus.capture_outbound_for(sender);
+        for sequence in 0..300_u64 {
+            bus.send(
+                sender,
+                TransportMessage {
+                    id: MessageId::new(sequence.to_be_bytes().to_vec()),
+                    payload: vec![2; 32],
+                    timestamp: Timestamp(sequence),
+                    causal_deps: Vec::new(),
+                    source: TransportSource("test".into()),
+                    envelope: TransportEnvelope::GroupMessage {
+                        transport_group_id: vec![3; 32],
+                    },
+                },
+            );
+        }
+
+        let capture = bus.captured_outbound_window();
+        assert_eq!(capture.observed_objects, 300);
+        assert_eq!(
+            capture.emissions.len(),
+            crate::MAX_CAPTURED_TRANSPORT_OBJECTS
+        );
+        assert!(capture.observed_json_bytes > 0);
     }
 }

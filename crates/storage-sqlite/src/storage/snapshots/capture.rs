@@ -2,6 +2,8 @@ use super::rows::{
     MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
     Snapshot,
 };
+#[cfg(feature = "test-conformance-replay")]
+use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, deserialize, serialize,
@@ -36,6 +38,17 @@ fn create_on_connection(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    let snapshot = capture_snapshot(conn, group_id)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
+             VALUES (?1, ?2, ?3)",
+        params![group_id.as_slice(), name, serialize(&snapshot)?],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn capture_snapshot(conn: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Snapshot> {
     let mls_group_key = mls_group_key(group_id)?;
     let group_blob: Vec<u8> = conn
         .query_row(
@@ -54,7 +67,7 @@ fn create_on_connection(
     let validated_tree_marker = validated_tree_marker(conn, group_id)?;
     let openmls_values = openmls_values(conn, &mls_group_key)?;
 
-    let snapshot = Snapshot {
+    Ok(Snapshot {
         group,
         messages,
         queued_outbound,
@@ -62,14 +75,27 @@ fn create_on_connection(
         convergence_policy,
         validated_tree_marker,
         openmls_values,
-    };
-    conn.execute(
-        "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
-             VALUES (?1, ?2, ?3)",
-        params![group_id.as_slice(), name, serialize(&snapshot)?],
-    )
-    .storage()?;
-    Ok(())
+    })
+}
+
+#[cfg(feature = "test-conformance-replay")]
+pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<u8>> {
+    let conn = store.lock()?;
+    let convergence_pass = conn
+        .query_row(
+            "SELECT record FROM cgka_convergence_passes WHERE group_id = ?1",
+            params![group_id.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .storage()?
+        .map(|record| deserialize(&record))
+        .transpose()?;
+    serialize(&ReplaySnapshot {
+        version: REPLAY_SNAPSHOT_VERSION,
+        group: capture_snapshot(&conn, group_id)?,
+        convergence_pass,
+    })
 }
 
 fn messages(tx: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Vec<OrderedMessage>> {

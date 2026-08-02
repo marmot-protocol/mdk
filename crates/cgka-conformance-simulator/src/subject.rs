@@ -7,10 +7,11 @@
 
 use crate::client::HarnessPublicationError;
 use crate::{
-    BidirectionalDecryptabilityObservation, ClientBuilder, ClientObservation,
-    DecryptabilityProbeSendStatus, DirectionalDecryptabilityProbe, HarnessClient,
-    HarnessStorageMode, ScenarioAdminPolicyObservation, ScenarioStep, SubjectProgressSnapshot,
-    SubjectTerminalBlocker, TransportBus, observe_client, observe_client_exact,
+    BidirectionalDecryptabilityObservation, CapturedTransportArtifactV1, CapturedTransportWindowV1,
+    ClientBuilder, ClientObservation, DecryptabilityProbeSendStatus,
+    DirectionalDecryptabilityProbe, EngineByteReplayV1, HarnessClient, HarnessStorageMode,
+    ScenarioAdminPolicyObservation, ScenarioStep, SubjectProgressSnapshot, SubjectTerminalBlocker,
+    TransportBus, observe_client, observe_client_exact,
 };
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -100,10 +101,21 @@ impl SubjectDescriptor {
 }
 
 /// Adapter-level failure with a normalized code suitable for expectations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectFailureCategory {
+    ExpectedRefusal,
+    Protocol,
+    Resource,
+    #[default]
+    Environment,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjectError {
     pub code: String,
     pub message: String,
+    pub category: SubjectFailureCategory,
 }
 
 impl SubjectError {
@@ -111,6 +123,19 @@ impl SubjectError {
         Self {
             code: code.into(),
             message: message.into(),
+            category: SubjectFailureCategory::Environment,
+        }
+    }
+
+    pub fn classified(
+        category: SubjectFailureCategory,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            category,
         }
     }
 
@@ -421,6 +446,9 @@ pub struct EngineHarnessSubject {
     convergence_clock: ManualConvergenceClock,
     outbound_cursors: HashMap<String, u64>,
     outbound_records: BTreeMap<u64, EngineSubjectOutboundRecord>,
+    replay_capture_target_tick: Option<usize>,
+    observed_recipient_ticks: usize,
+    last_byte_replay: Option<EngineByteReplayV1>,
 }
 
 #[derive(Clone)]
@@ -435,6 +463,18 @@ struct EngineSubjectOutboundRecord {
     pending: Option<PendingStateRef>,
     queued_intent: Option<(GroupId, MessageId)>,
     resolution: Option<SubjectOutboundOutcome>,
+}
+
+struct PendingByteReplay {
+    client_label: String,
+    identity_seed: Vec<u8>,
+    protocol_profile: ProtocolProfile,
+    group_id: Vec<u8>,
+    sensitive_checkpoint: Vec<u8>,
+    captured_deliveries: Vec<TransportMessage>,
+    checkpoint_monotonic_ms: u64,
+    checkpoint_wall_ms: u64,
+    virtual_time_tick_enabled: bool,
 }
 
 impl EngineHarnessSubject {
@@ -454,7 +494,7 @@ impl EngineHarnessSubject {
                 ));
             }
             let builder = ClientBuilder::new(pad32(label.as_bytes()))
-                .registry(scenario_registry())
+                .registry(engine_harness_feature_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
                 .convergence_clock(Arc::new(convergence_clock.clone()));
@@ -489,6 +529,9 @@ impl EngineHarnessSubject {
             convergence_clock,
             outbound_cursors: HashMap::new(),
             outbound_records: BTreeMap::new(),
+            replay_capture_target_tick: None,
+            observed_recipient_ticks: 0,
+            last_byte_replay: None,
         })
     }
 
@@ -496,6 +539,125 @@ impl EngineHarnessSubject {
         self.clients
             .get(label)
             .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {label}")))
+    }
+
+    /// Bounded tail of exact transport artifacts emitted during this subject
+    /// run, plus totals that make truncation explicit.
+    pub fn captured_transport_window(&self) -> CapturedTransportWindowV1 {
+        let capture = self.bus.captured_outbound_window();
+        let labels_by_bus_id = self
+            .clients
+            .iter()
+            .map(|(label, client)| (client.bus_id, label))
+            .collect::<HashMap<_, _>>();
+        let artifacts = capture
+            .emissions
+            .into_iter()
+            .filter_map(|(sender, emission)| {
+                Some(CapturedTransportArtifactV1 {
+                    sequence: emission.sequence,
+                    sender: labels_by_bus_id.get(&sender)?.to_string(),
+                    message: emission.msg,
+                })
+            })
+            .collect();
+        CapturedTransportWindowV1 {
+            artifacts,
+            observed_objects: capture.observed_objects,
+            observed_json_bytes: capture.observed_json_bytes,
+        }
+    }
+
+    pub fn captured_transport_artifacts(&self) -> Vec<CapturedTransportArtifactV1> {
+        self.captured_transport_window().artifacts
+    }
+
+    pub fn byte_replay_capture(&self) -> Option<EngineByteReplayV1> {
+        self.last_byte_replay.clone()
+    }
+
+    /// Capture one explicitly selected recipient tick. Campaign callers choose
+    /// the final planned tick so checkpoint export is paid at most once rather
+    /// than once per client on every tick step.
+    pub fn capture_failure_replay_at_tick(&mut self, recipient_tick: usize) {
+        self.replay_capture_target_tick = Some(recipient_tick);
+    }
+
+    fn prepare_byte_replay(&self, label: &str) -> Option<PendingByteReplay> {
+        let client = self.clients.get(label)?;
+        let group_id = client.replay_group_id()?.clone();
+        let sensitive_checkpoint = client
+            .export_conformance_replay_checkpoint(&group_id)
+            .ok()?;
+        if sensitive_checkpoint.len() > crate::MAX_CAPTURED_REPLAY_CHECKPOINT_BYTES {
+            return None;
+        }
+        let captured_deliveries = self.bus.mailbox_snapshot(client.bus_id);
+        let captured_delivery_bytes = captured_deliveries
+            .iter()
+            .map(|message| serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64))
+            .sum::<u64>();
+        if captured_deliveries.len() > crate::MAX_CAPTURED_TRANSPORT_OBJECTS
+            || captured_delivery_bytes > crate::MAX_CAPTURED_TRANSPORT_JSON_BYTES
+        {
+            return None;
+        }
+        let now = self.convergence_clock.now();
+        Some(PendingByteReplay {
+            client_label: label.to_owned(),
+            identity_seed: pad32(label.as_bytes()),
+            protocol_profile: client.replay_protocol_profile(),
+            group_id: group_id.as_slice().to_vec(),
+            sensitive_checkpoint,
+            captured_deliveries,
+            checkpoint_monotonic_ms: now.monotonic_ms,
+            checkpoint_wall_ms: now.wall_ms,
+            virtual_time_tick_enabled: client.replay_uses_virtual_time(),
+        })
+    }
+
+    fn complete_byte_replay(
+        &self,
+        pending: PendingByteReplay,
+        outcomes: &[Result<cgka_traits::ingest::IngestOutcome, EngineError>],
+    ) -> Option<EngineByteReplayV1> {
+        let client = self.clients.get(&pending.client_label)?;
+        let canonical_state = client.try_canonical_state_snapshot().ok()?;
+        let normalized_state_digest = crate::digest_json(&canonical_state).ok()?;
+        let (classification, failure_kind) = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .map_or(
+                (
+                    crate::TerminalOutcomeClassification::Converged,
+                    "campaign_tick_replay".to_string(),
+                ),
+                |error| {
+                    let (category, code) = classify_engine_error(error);
+                    (
+                        crate::failure_capsule::terminal_classification(category),
+                        format!("scenario_step_failed:{code}"),
+                    )
+                },
+            );
+        let expected_fingerprint = crate::build_fingerprint(
+            classification,
+            Some("campaign_tick".into()),
+            failure_kind,
+            normalized_state_digest,
+        );
+        Some(EngineByteReplayV1 {
+            client_label: pending.client_label,
+            identity_seed: pending.identity_seed,
+            protocol_profile: pending.protocol_profile,
+            group_id: pending.group_id,
+            sensitive_checkpoint: pending.sensitive_checkpoint,
+            captured_deliveries: pending.captured_deliveries,
+            checkpoint_monotonic_ms: pending.checkpoint_monotonic_ms,
+            checkpoint_wall_ms: pending.checkpoint_wall_ms,
+            virtual_time_tick_enabled: pending.virtual_time_tick_enabled,
+            expected_fingerprint,
+        })
     }
 
     fn client_mut(&mut self, label: &str) -> Result<&mut HarnessClient, SubjectError> {
@@ -736,7 +898,18 @@ impl ConvergenceSubject for EngineHarnessSubject {
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
-            self.client_mut(label)?.tick().await;
+            let recipient_tick = self.observed_recipient_ticks;
+            self.observed_recipient_ticks = self.observed_recipient_ticks.saturating_add(1);
+            let pending_replay = (self.replay_capture_target_tick == Some(recipient_tick))
+                .then(|| self.prepare_byte_replay(label))
+                .flatten();
+            let outcomes = self.client_mut(label)?.tick().await;
+            if let Some(pending_replay) = pending_replay
+                && let Some(replay) = self.complete_byte_replay(pending_replay, &outcomes)
+            {
+                self.last_byte_replay = Some(replay);
+            }
+            ensure_tick_succeeded(outcomes)?;
         }
         Ok(())
     }
@@ -1228,7 +1401,11 @@ fn required_features_from_names(names: &[String]) -> Result<Vec<Feature>, Subjec
         .collect()
 }
 
-fn scenario_registry() -> FeatureRegistry {
+/// Returns the feature registry used by the production-shaped engine harness.
+///
+/// Exact replay tests use this helper so their client capabilities cannot drift
+/// from the clients constructed by [`EngineHarnessSubject`].
+pub fn engine_harness_feature_registry() -> FeatureRegistry {
     let mut registry = FeatureRegistry::new();
     registry.register(
         Feature("self-remove"),
@@ -1260,8 +1437,48 @@ fn outbound_sequence(outbound_id: &str) -> Result<u64, SubjectError> {
         })
 }
 
+pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCategory, String) {
+    let category = match error {
+        EngineError::Backend(_) | EngineError::Storage(_) => SubjectFailureCategory::Resource,
+        EngineError::InvalidTransition(_)
+        | EngineError::Other(_)
+        | EngineError::Peeler(_)
+        | EngineError::ForkedEpoch { .. }
+        | EngineError::UnknownPending
+        | EngineError::Serialize(_) => SubjectFailureCategory::Protocol,
+        EngineError::NotGroupAdmin { .. }
+        | EngineError::AdminCannotSelfRemove { .. }
+        | EngineError::AdminDepletion { .. }
+        | EngineError::LeaveAlreadyRequested { .. }
+        | EngineError::InvalidWelcome
+        | EngineError::WelcomeAlreadyProcessed
+        | EngineError::UnknownGroup(_)
+        | EngineError::UnknownMember { .. }
+        | EngineError::NotAMember { .. }
+        | EngineError::MissingRequiredCapabilities { .. }
+        | EngineError::DisbandingUnsupportedMembers { .. }
+        | EngineError::DisbandingNotEnabled { .. }
+        | EngineError::InvalidCredentialIdentity(_)
+        | EngineError::InvalidAccountIdentityProof(_)
+        | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::UnsupportedCiphersuite { .. }
+        | EngineError::InvalidAppMessagePayload(_) => SubjectFailureCategory::ExpectedRefusal,
+    };
+    (category, observe_engine_error(error))
+}
+
 fn subject_engine_error(error: EngineError) -> SubjectError {
-    SubjectError::new(observe_engine_error(&error), error.to_string())
+    let (category, code) = classify_engine_error(&error);
+    SubjectError::classified(category, code, error.to_string())
+}
+
+fn ensure_tick_succeeded(
+    outcomes: Vec<Result<cgka_traits::ingest::IngestOutcome, EngineError>>,
+) -> Result<(), SubjectError> {
+    match outcomes.into_iter().find_map(Result::err) {
+        Some(error) => Err(subject_engine_error(error)),
+        None => Ok(()),
+    }
 }
 
 fn subject_publication_error(error: HarnessPublicationError) -> SubjectError {
@@ -1355,6 +1572,25 @@ mod tests {
             .tick(invitees)
             .await
             .expect("invitees ingest founding welcomes");
+    }
+
+    #[test]
+    fn engine_subject_tick_surfaces_engine_failures() {
+        let error = ensure_tick_succeeded(vec![Err(EngineError::Backend(
+            "converge buffered group: injected failure".into(),
+        ))])
+        .expect_err("tick must not discard the engine failure");
+        assert_eq!(error.code, "backend");
+        assert_eq!(error.category, SubjectFailureCategory::Resource);
+        assert!(error.message.contains("converge buffered group"));
+    }
+
+    #[test]
+    fn serialization_failures_are_not_classified_as_expected_refusals() {
+        let (category, code) =
+            classify_engine_error(&EngineError::Serialize("malformed internal state".into()));
+        assert_eq!(category, SubjectFailureCategory::Protocol);
+        assert_eq!(code, "invalid_admin_policy");
     }
 
     #[tokio::test]

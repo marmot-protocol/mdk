@@ -478,6 +478,48 @@ impl HarnessClient {
         self.storage_backing.database_path()
     }
 
+    /// Export the sensitive engine/OpenMLS state needed to replay captured
+    /// transport bytes without regenerating MLS messages.
+    pub fn export_conformance_replay_checkpoint(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, EngineError> {
+        self.storage()
+            .export_conformance_replay_snapshot(group_id)
+            .map_err(EngineError::Storage)
+    }
+
+    /// Restore a sensitive replay checkpoint and rebuild the engine over it.
+    pub fn restore_conformance_replay_checkpoint(
+        &mut self,
+        group_id: &GroupId,
+        checkpoint: &[u8],
+    ) -> Result<(), EngineError> {
+        self.storage()
+            .import_conformance_replay_snapshot(group_id, checkpoint)
+            .map_err(EngineError::Storage)?;
+        self.default_group = Some(group_id.clone());
+        self.restart();
+        Ok(())
+    }
+
+    /// Deliver one exact captured transport object directly to this client.
+    pub fn inject_captured_transport(&self, message: TransportMessage) {
+        self.bus.inject(self.bus_id, message);
+    }
+
+    pub(crate) fn replay_group_id(&self) -> Option<&GroupId> {
+        self.default_group.as_ref()
+    }
+
+    pub(crate) fn replay_protocol_profile(&self) -> ProtocolProfile {
+        self.protocol_profile
+    }
+
+    pub(crate) fn replay_uses_virtual_time(&self) -> bool {
+        self.virtual_time_tick_enabled
+    }
+
     pub(crate) fn enable_virtual_time_tick(&mut self) {
         self.virtual_time_tick_enabled = true;
     }
@@ -1520,10 +1562,20 @@ impl HarnessClient {
     pub fn canonical_state_snapshot(
         &self,
     ) -> cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot {
-        let group_id = self.default_group.clone().expect("group");
+        self.try_canonical_state_snapshot()
+            .expect("capture canonical state snapshot")
+    }
+
+    pub(crate) fn try_canonical_state_snapshot(
+        &self,
+    ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, EngineError>
+    {
+        let group_id = self
+            .default_group
+            .clone()
+            .ok_or_else(|| EngineError::Other("no default group to snapshot".into()))?;
         self.engine()
             .conformance_canonical_state_snapshot(&group_id)
-            .expect("capture canonical state snapshot")
     }
 
     pub fn scenario_input_ledger(&mut self) -> Vec<ScenarioInputLedgerEntry> {

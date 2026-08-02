@@ -1681,7 +1681,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "5");
+        assert_eq!(case.generator_version, "6");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
     }
@@ -1856,7 +1856,7 @@ async fn strict_chaos_boundary_retires_pre_join_opaque_resource_work() {
 
 #[tokio::test]
 async fn failing_generated_case_records_a_minimized_reproducer() {
-    let scenario = ScenarioSpec {
+    let mut scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
         spec_version: "2".into(),
         clients: vec!["alice".into(), "bob".into()],
@@ -1877,19 +1877,23 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
             ScenarioStep::ClearEvents {
                 clients: vec!["alice".into(), "bob".into()],
             },
-            ScenarioStep::SendAppMessage {
-                sender: "bob".into(),
-                payload: "irrelevant noise".into(),
-            },
-            ScenarioStep::DeliverAll,
-            ScenarioStep::Tick {
-                clients: vec!["alice".into()],
-            },
-            ScenarioStep::Observe {
-                clients: vec!["alice".into()],
-            },
         ],
     };
+    for index in 0..24 {
+        scenario.steps.push(ScenarioStep::SendAppMessage {
+            sender: "bob".into(),
+            payload: format!("irrelevant storm message {index}"),
+        });
+    }
+    scenario.steps.extend([
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec!["alice".into()],
+        },
+        ScenarioStep::Observe {
+            clients: vec!["alice".into()],
+        },
+    ]);
     let case = GeneratedScenarioCase {
         family_name: "convergence-chaos/v1".into(),
         generator_version: "1".into(),
@@ -1920,6 +1924,13 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
     assert!(
         minimized.steps.len() < case.scenario.steps.len(),
         "minimized case should remove irrelevant delivery noise"
+    );
+    assert!(
+        minimized
+            .steps
+            .iter()
+            .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. })),
+        "semantic failure identity should let the reducer remove the entire application-message storm"
     );
     let minimized_report =
         run_scenario_report_with_outcomes(minimized, None, case.expected_outcomes.clone())

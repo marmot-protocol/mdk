@@ -838,6 +838,7 @@ dependencies = [
  "async-trait",
  "cgka-engine",
  "cgka-traits",
+ "fs-private",
  "hex",
  "marmot-forensics",
  "nostr",

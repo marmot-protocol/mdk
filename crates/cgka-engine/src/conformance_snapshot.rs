@@ -5,6 +5,8 @@
 //! never the exporter secret itself. Production telemetry and application
 //! surfaces must not enable or consume this interface.
 
+use std::collections::BTreeMap;
+
 use cgka_traits::app_components::GroupLifecycleV1;
 use cgka_traits::convergence_pass::{ConvergencePassPhase, DurableConvergencePass};
 use cgka_traits::engine_state::{EpochState, GroupLifecycleState};
@@ -22,6 +24,94 @@ use openmls_traits::types::VerifiableCiphersuite;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tls_codec::Serialize as _;
+
+/// Machine-readable snapshot of the convergence constants owned by the engine
+/// adapter. Keys are the stable ledger identifiers from the reliability plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConformanceConstantSnapshot {
+    pub schema_version: String,
+    pub values: BTreeMap<String, u64>,
+}
+
+/// Capture the exact engine-owned values needed to reproduce and interpret a
+/// conformance failure. App-runtime scheduler constants belong to later
+/// adapters and are deliberately not invented here.
+pub fn conformance_constant_snapshot() -> ConformanceConstantSnapshot {
+    let mut values = BTreeMap::new();
+    values.insert(
+        "P1.max_rewind_commits".into(),
+        crate::convergence::V1_MAX_REWIND_COMMITS,
+    );
+    values.insert(
+        "P2.app_message_past_epoch_limit".into(),
+        crate::canonicalization::V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
+    );
+    values.insert(
+        "P3.max_past_epochs".into(),
+        crate::wire_format::DEFAULT_MAX_PAST_EPOCHS as u64,
+    );
+    values.insert(
+        "P4.settlement_quiescence_ms".into(),
+        crate::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS,
+    );
+    values.insert(
+        "P5.max_convergence_pass_ms".into(),
+        crate::canonicalization::V1_MAX_CONVERGENCE_PASS_MS,
+    );
+    values.insert(
+        "P6.witness_quorum_senders_per_epoch".into(),
+        crate::convergence::V1_WITNESS_QUORUM_SENDERS_PER_EPOCH as u64,
+    );
+    values.insert(
+        "P7.witness_quorum_epochs".into(),
+        crate::convergence::V1_WITNESS_QUORUM_EPOCHS as u64,
+    );
+    values.insert(
+        "P8.max_witness_override_depth".into(),
+        crate::convergence::V1_MAX_WITNESS_OVERRIDE_DEPTH,
+    );
+    values.insert(
+        "E1.max_convergence_reprocessing_passes".into(),
+        crate::message_processor::MAX_CONVERGENCE_REPROCESSING_PASSES as u64,
+    );
+    values.insert(
+        "E2.max_deferred_peel_attempts".into(),
+        crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS as u64,
+    );
+    values.insert(
+        "E3.max_peel_deferred_rows_per_group".into(),
+        crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64,
+    );
+    values.insert(
+        "E4.max_deferred_rows_per_sweep".into(),
+        crate::message_processor::MAX_DEFERRED_ROWS_PER_SWEEP as u64,
+    );
+    values.insert(
+        "E5.candidate_replay_budget_slack".into(),
+        crate::openmls_projection::CANDIDATE_REPLAY_BUDGET_SLACK,
+    );
+    values.insert(
+        "E6.candidate_replay_budget_floor".into(),
+        crate::openmls_projection::CANDIDATE_REPLAY_BUDGET_FLOOR,
+    );
+    values.insert(
+        "E7.self_remove_auto_commit_jitter_min_ms".into(),
+        crate::message_processor::SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS,
+    );
+    values.insert(
+        "E7.self_remove_auto_commit_jitter_max_ms".into(),
+        crate::message_processor::SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS
+            + crate::message_processor::SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS,
+    );
+    values.insert(
+        "E8.max_deferred_peel_residence_ms".into(),
+        crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
+    );
+    ConformanceConstantSnapshot {
+        schema_version: "1".into(),
+        values,
+    }
+}
 
 /// MLS-Exporter label adopted by Marmot's conformance-state contract.
 pub const CONFORMANCE_EXPORTER_LABEL: &str = "marmot";
@@ -698,6 +788,34 @@ mod tests {
             CONFORMANCE_COMMITMENT_DOMAIN,
             b"marmot-convergence-conformance-v1"
         );
+    }
+
+    #[test]
+    fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
+        let snapshot = conformance_constant_snapshot();
+        assert_eq!(snapshot.schema_version, "1");
+        assert_eq!(snapshot.values.len(), 17);
+        for key in [
+            "P1.max_rewind_commits",
+            "P2.app_message_past_epoch_limit",
+            "P3.max_past_epochs",
+            "P4.settlement_quiescence_ms",
+            "P5.max_convergence_pass_ms",
+            "P6.witness_quorum_senders_per_epoch",
+            "P7.witness_quorum_epochs",
+            "P8.max_witness_override_depth",
+            "E1.max_convergence_reprocessing_passes",
+            "E2.max_deferred_peel_attempts",
+            "E3.max_peel_deferred_rows_per_group",
+            "E4.max_deferred_rows_per_sweep",
+            "E5.candidate_replay_budget_slack",
+            "E6.candidate_replay_budget_floor",
+            "E7.self_remove_auto_commit_jitter_min_ms",
+            "E7.self_remove_auto_commit_jitter_max_ms",
+            "E8.max_deferred_peel_residence_ms",
+        ] {
+            assert!(snapshot.values.contains_key(key), "missing {key}");
+        }
     }
 
     #[test]

@@ -115,7 +115,7 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 | Milestone | Outcome | Status | Exit gate |
 | --- | --- | --- | --- |
 | 0. Assurance foundation | Guarantees, assumptions, constants, and formal gate are explicit | complete | Every constant is classified; formal warnings fail CI; protocol decisions are named |
-| 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | in-progress | Known semantic mutations fail and captured failures replay |
+| 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | complete | Known semantic mutations fail and captured failures replay |
 | 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | not-started | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | not-started | Headline workload families produce bounded, diagnosable results |
 | 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | not-started | Model and tests detect seeded policy/lifecycle defects |
@@ -435,9 +435,9 @@ point hid. Two are resolved without weakening the oracle:
 The remaining engine-state failure was closed by durably bounding opaque local transport residence: after controlled
 virtual time, the pre-join object is released as `resource_refused`, exact-ID redelivery remains eligible, and the
 strict scenario-input/pending-work boundary settles without claiming a protocol stale reason. Report campaigns run the
-complete strict expectations by default. Strict coverage still flags the mixed large storm because its application
-phase is cleared before any delivery-or-invalidation expectation accounts for it; that is a separate oracle coverage
-gap.
+complete strict expectations by default. The mixed large storm now retains its application phase through the
+interleaved commit storm and pins each observed recipient's ordered payload set, so commit convergence cannot hide
+dropped or duplicated application traffic.
 
 ### 1.2 Public subject boundary
 
@@ -488,23 +488,79 @@ Status: `complete`
 
 ### 1.4 Deterministic failure capsules
 
-Status: `not-started`
+Status: `complete`
 
-- [ ] Define a versioned capsule schema.
-- [ ] Save original scenario, canonical IR, seeds, expanded schedule, policy/constant snapshot, adapter/binary versions,
-  captured wire bytes, virtual time, scenario-input/output ledger, state commitments, and resource measurements.
-- [ ] Replay a capsule without regenerating MLS bytes.
-- [ ] Keep real incident artifacts local and restrictive-by-construction.
-- [ ] Promote minimized synthetic failures into portable vectors when they define durable behavior.
+- [x] Define a versioned capsule schema.
+- [x] Save the report's single authoritative scenario, seeds, expanded schedule, policy/constant snapshot,
+  adapter/binary versions, a bounded tail of captured wire bytes, virtual time, scenario-input/output ledger, state
+  commitments, and resource measurements.
+- [x] Replay a capsule without regenerating MLS bytes.
+- [x] Keep real incident artifacts local and restrictive-by-construction.
+- [x] Promote minimized synthetic failures into portable vectors when they define durable behavior.
+
+Capsule v1 is the local `failure_capsule.rs` data contract plus
+`schemas/failure-capsule.v1.schema.json`. Report campaigns automatically emit a portable logical capsule for failed
+steps, oracle violations, weak-oracle failures, and quiescence failures. A capsule records the complete report (including exact state,
+input ledgers, and output observations), generated seed metadata, a virtual-time-expanded action schedule, exact
+quiescence policies, the engine constant snapshot, adapter/binary versions, and bounded resource counters. Failure
+evidence retains at most the newest 256 transport objects and 1 MiB of serialized transport data while recording
+observed, retained, and dropped object/byte counts. A warning-only strict-oracle capsule retains no wire bytes or key
+material. Byte replay uses the same delivery limits and a 16 MiB checkpoint ceiling; an oversized selected tick is
+skipped. Stable full fingerprints combine a normalized terminal classification, first failing action, failure kind,
+and observed-state digest. The reducer instead preserves semantic failure identity (classification, action type, and
+failure kind), so removing irrelevant steps is not defeated by shifted action indices or a changed trace digest.
+
+The optional engine byte-replay payload is deliberately separate from logical scenario replay. Sensitive capture is
+off by default and requires `--capture-sensitive-replay`. The engine adapter then exports at most one checkpoint, for
+the final planned recipient tick, rather than serializing every client database before every tick. Its pre-input
+SQLite/OpenMLS checkpoint includes any active durable convergence pass, the exact mailbox `TransportMessage` objects,
+and the resulting typed engine fingerprint. The report runner keeps the logical capsule `synthetic_shareable` and
+writes the checkpoint to a separately named `sensitive_local` sibling; if execution stops before the selected tick, no
+replay sibling is emitted. Replay therefore never asks OpenMLS to regenerate a commit. Ordinary epoch rollback
+snapshots intentionally do not rewind pass scheduling; only this replay envelope carries that additional state. The
+checkpoint contains key material, and the writer creates directories/files with owner-only modes. The report CLI
+accepts `--replay-capsule FILE` and verifies the captured engine fingerprint. `promote_failure_capsule_to_vector` accepts only
+`synthetic_shareable` capsules, preserves the intended exact or semantic expectation rather than the buggy observed
+trace, and uses the fingerprint-preserving minimized scenario when present. It refuses capsules without a portable
+expectation.
 
 ### Milestone 1 Exit Gate
 
 - [x] A wrong exact state cannot pass as converged.
 - [x] A normal scenario cannot access engine/storage internals.
 - [x] Hidden pending work prevents quiescence.
-- [ ] A captured byte-level failure replays with the same outcome.
-- [ ] Targeted semantic mutations are detected.
-- [ ] Every durable fail-closed/non-progress state names a tested repair or terminal user-visible outcome.
+- [x] A captured byte-level failure replays with the same outcome.
+- [x] Targeted semantic mutations are detected.
+- [x] Every durable fail-closed/non-progress state names a tested repair or terminal user-visible outcome.
+
+The Milestone 1 mutation sentinels deliberately alter member identity
+(`exact_equivalence_rejects_same_count_with_different_member_identities`), exporter commitment
+(`exact_equivalence_rejects_different_exporter_commitments`), input-ledger disposition
+(`scenario_input_ledger_expectation_is_exact`), pending-work state
+(`no_pending_work_requires_an_empty_exact_progress_snapshot`), a directed decryptability edge
+(`bidirectional_decryptability_requires_every_directed_edge`), and the captured byte delivery set
+(`exact_captured_commit_replays_from_sensitive_checkpoint`). The campaign producer and CLI path are pinned by
+`failed_campaign_capsule_contains_a_replayable_tick_witness`. This is the minimum oracle-adequacy gate; Milestone 4.3
+still owns a broad implementation mutation campaign.
+
+Durable non-progress/fail-closed outcome inventory:
+
+| Durable state/disposition | Named recovery or terminal outcome | Current test evidence |
+| --- | --- | --- |
+| `PendingPublish` / unresolved outbound | Transport acknowledgement commits it; `ReachedNoEndpoint` atomically retracts artifacts and rolls back; a crash reopens stranded pending state | `definite_publish_failure_retracts_commit_before_local_rollback`; `reopen_after_crash_during_publish_recovers_stranded_pending_commit` |
+| `Merging` / `Recovering` / active pass | Scheduled convergence drains runnable work; inherited stale passes are discarded and reseeded at the current tip | `stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting`; `frozen_stale_pass_base_epoch_reopens_at_the_current_tip_instead_of_halting` |
+| `Retryable` message | Dependency arrival or rollback replays it; an invalid replay retires terminally | `future_epoch_app_message_stays_deferred_until_commit_arrives`; `buffered_retryable_peer_message_is_retired_terminal_after_replay` |
+| `PeelDeferred` transport | Changed peel context retries it; capacity/retry/residence exhaustion emits typed `resource_refused`, releases the row, and preserves exact-ID redelivery | `deferred_peel_retries_after_epoch_advance`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `deferred_peel_residence_survives_restart_and_backward_clock`; `peel_deferred_rows_capped_per_group_under_flood` |
+| `ConvergenceDeferred` input | Later dependency/evidence makes it eligible; falling below retained history terminally expires/invalidates it; it does not itself hold the scheduler open | `commit_with_missing_parent_is_deferred`; `deferred_commit_ages_out_when_it_falls_below_retained_anchor`; `future_epoch_app_message_stays_deferred_until_commit_arrives` |
+| Durable queued outbound intent | The scheduler regenerates and drains it; restart re-arms it; group removal terminally discards it | `trait_advance_convergence_drains_queued_outbound_intent`; `restart_schedules_groups_with_durable_queued_intents`; `drain_on_removed_copy_discards_queued_intents_without_error` |
+| Hydration quarantine | Access/send/convergence are visibly refused; verified retry or authenticated rejoin repairs and replays retained input | `quarantined_group_rejects_valid_inbound_commit_on_do_ingest`; `retry_recovers_a_transiently_quarantined_group`; `rejoin_welcome_replays_and_retires_quarantine_retained_input` |
+| `Unrecoverable` | Structural progress exposes a terminal blocker and the engine emits `GroupUnrecoverable`; verified replacement Welcome repairs it | `unrecoverable_halt_survives_engine_restart_until_verified_repair`; quiescence terminal-blocker tests |
+| `Disbanded`, removed/self-evicted, `Failed`, or `EpochInvalidated` | Terminal state/disposition is explicit and cannot masquerade as pending work; disband retains an authenticated shared tombstone | `exact_oracle_projects_terminal_disband_tombstone_across_restart`; `deferred_peel_self_evicted_row_stays_failed_not_swept_processed`; losing-branch invalidation tests |
+
+Typed operation failures such as `ReplayBudgetExceeded`, invalid policy, serialization, and storage failure remain
+fail-closed and cannot return a partial candidate. They do not add another durable lifecycle/disposition: the capsule
+records the failed step and the durable state already covered by this inventory. Milestone 3.1 still owns end-to-end
+resource-exhaustion and recovery campaigns for those error sources.
 
 ## Milestone 2: Scenario IR And Retained Relays
 
@@ -830,3 +886,4 @@ incorrect result.
 | 2026-07-30 | 1.2c / 1.3b subject virtual time | Added a capability-gated `advance_time` scenario operation backed by one shared paired clock across the engine subject; time advancement is a separate failure-free operation and `Tick` selects which participant runtimes observe it, while standalone clients without an injected clock preserve the legacy far-future shortcut | [MDK #1202](https://github.com/marmot-protocol/mdk/pull/1202), merge `1ccc4065`; focused serialization/preflight/dispatch test; two real disband passes remain live at a 999 ms tick, Alice alone settles at 1,000 ms, and Bob settles on a later tick without another time advance; full simulator suite |
 | 2026-08-01 | 1.2d public outbound lifecycle and Scenario IR v2 cutover | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues. Migrated every repository-owned scenario producer to v2 `acknowledge_outbound` operations and removed the compatibility constructor, direct subject pending controls, client lifecycle flag, and silent auto-confirm branches ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)) | Focused subject/runner contract tests; fixed vectors; generated families; incident replay; full simulator suite; `just fast-ci` |
 | 2026-08-01 | 1.3 full-system quiescence | Added privacy-safe structural progress with runnable work, exact virtual deadlines, pass phase/generation, retry/deferred/publication/transport work, and terminal blockers; added runner-owned bounded fixed-point settling with explicit healthy-path publication/delivery policy and serializable blocked/timeout artifacts; added same-horizon batch-partition metamorphic coverage | [MDK #1216](https://github.com/marmot-protocol/mdk/pull/1216); focused real-engine deadline, lost-ack, withheld-transport, watchdog, serialization/privacy, and metamorphic tests; full simulator suite; `just fast-ci` |
+| 2026-08-02 | 1.4 deterministic failure capsules and Milestone 1 exit | Added versioned restrictive failure capsules, semantic-identity minimization, typed protocol/resource/environment failure provenance, bounded transport evidence with truncation accounting, campaign-produced recipient checkpoints, exact recipient-state plus captured-transport and CLI replay, portable checkpoint-free vector promotion, failed-step report retention, a constant snapshot, and mixed-storm application assertions; completed the named mutation-sentinel and durable-outcome inventories | `failure_capsules`; `report_runner`; `failed_campaign_capsule_contains_a_replayable_tick_witness`; `failing_generated_case_records_a_minimized_reproducer`; `subject_step_failure_is_a_report_artifact_and_a_spec_run_error`; `convergence_chaos_family_generates_specs_with_semantic_expectations`; storage snapshot round-trip; full simulator/storage suites; `just fast-ci` |

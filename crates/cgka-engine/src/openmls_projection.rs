@@ -171,9 +171,9 @@ struct ReplayBudget {
 /// Multiplicative slack over the linear `commits × (max_rewind_commits + 1)` probe estimate.
 /// Generous enough that legitimate forks never trip the budget; small enough that pathological
 /// `B^D` branching fails closed well before it materializes.
-const CANDIDATE_REPLAY_BUDGET_SLACK: u64 = 4;
+pub(crate) const CANDIDATE_REPLAY_BUDGET_SLACK: u64 = 4;
 /// Floor so tiny passes (few commits, shallow rewind) always have headroom.
-const CANDIDATE_REPLAY_BUDGET_FLOOR: u64 = 32;
+pub(crate) const CANDIDATE_REPLAY_BUDGET_FLOOR: u64 = 32;
 
 impl ReplayBudget {
     fn new(limit: u64) -> Self {

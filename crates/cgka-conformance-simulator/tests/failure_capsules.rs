@@ -1,0 +1,379 @@
+use std::fs;
+
+use cgka_conformance_simulator::TraceExpectation;
+use cgka_conformance_simulator::VectorMismatch;
+use cgka_conformance_simulator::{
+    CapturedTransportArtifactV1, ClientBuilder, EngineByteReplayV1, FailureCapsuleError,
+    FailureCapsuleSensitivity, FailureCapsuleV1, MAX_CAPTURED_TRANSPORT_JSON_BYTES,
+    TerminalOutcomeClassification, TransportBus, build_fingerprint, digest_json,
+    engine_harness_feature_registry, fingerprint_report_failure, promote_failure_capsule_to_vector,
+    read_failure_capsule, replay_engine_bytes, run_scenario_report, write_failure_capsule,
+};
+use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::types::MessageId;
+
+fn pad32(name: &[u8]) -> Vec<u8> {
+    let mut out = vec![0_u8; 32];
+    out[..name.len()].copy_from_slice(name);
+    out
+}
+
+#[tokio::test]
+async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(engine_harness_feature_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(engine_harness_feature_registry())
+        .attach(&bus);
+    let bob_key_package = bob.fresh_key_package().await;
+    let (group_id, create) = alice
+        .create_group("byte-replay", vec![bob_key_package], vec![])
+        .await;
+    alice.confirm(create).await;
+    bus.deliver_all();
+    assert!(bob.tick().await.into_iter().all(|outcome| outcome.is_ok()));
+
+    let checkpoint = bob
+        .export_conformance_replay_checkpoint(&group_id)
+        .expect("export recipient checkpoint");
+    let update = alice.update_group_data("captured branch").await;
+    let captured_deliveries = bus.queued_messages();
+    assert_eq!(captured_deliveries.len(), 1);
+    alice.confirm(update).await;
+    bus.deliver_all();
+    assert!(bob.tick().await.into_iter().all(|outcome| outcome.is_ok()));
+
+    let normalized_state_digest =
+        digest_json(&bob.canonical_state_snapshot()).expect("digest canonical state");
+    let expected_fingerprint = build_fingerprint(
+        TerminalOutcomeClassification::Converged,
+        Some("campaign_tick".into()),
+        "campaign_tick_replay".into(),
+        normalized_state_digest,
+    );
+    let replay = EngineByteReplayV1 {
+        client_label: "bob".into(),
+        identity_seed: pad32(b"bob"),
+        protocol_profile: ProtocolProfile::Legacy,
+        group_id: group_id.as_slice().to_vec(),
+        sensitive_checkpoint: checkpoint,
+        captured_deliveries,
+        checkpoint_monotonic_ms: 0,
+        checkpoint_wall_ms: 0,
+        virtual_time_tick_enabled: false,
+        expected_fingerprint: expected_fingerprint.clone(),
+    };
+
+    let debug_bus = TransportBus::ordered();
+    let mut debug_bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(engine_harness_feature_registry())
+        .attach(&debug_bus);
+    debug_bob
+        .restore_conformance_replay_checkpoint(&group_id, &replay.sensitive_checkpoint)
+        .expect("restore debug checkpoint");
+    for message in &replay.captured_deliveries {
+        debug_bob.inject_captured_transport(message.clone());
+    }
+    assert!(
+        debug_bob
+            .tick()
+            .await
+            .into_iter()
+            .all(|outcome| outcome.is_ok())
+    );
+    assert_eq!(
+        debug_bob.canonical_state_snapshot(),
+        bob.canonical_state_snapshot(),
+        "checkpoint plus captured transport must recreate exact state"
+    );
+
+    let mut capsule_report = run_scenario_report(
+        &ScenarioSpec {
+            name: "captured-byte-replay/v1".into(),
+            spec_version: "2".into(),
+            clients: Vec::new(),
+            steps: Vec::new(),
+        },
+        None,
+    )
+    .await
+    .expect("capsule report");
+    capsule_report.expectation_failures.push(VectorMismatch {
+        kind: "captured_commit_state".into(),
+        message: "captured byte-level sentinel".into(),
+        expected: serde_json::json!({"epoch": 1}),
+        actual: serde_json::json!({"epoch": 2}),
+    });
+    let capsule = FailureCapsuleV1::from_report(
+        capsule_report,
+        FailureCapsuleSensitivity::SensitiveLocal,
+        vec![CapturedTransportArtifactV1 {
+            sequence: 0,
+            sender: "alice".into(),
+            message: replay.captured_deliveries[0].clone(),
+        }],
+        Some(replay.clone()),
+    )
+    .expect("build byte replay capsule");
+    let dir = tempfile::tempdir().expect("capsule directory");
+    let capsule_path = dir.path().join("captured-byte-replay.v1.json");
+    write_failure_capsule(&capsule_path, &capsule).expect("write byte replay capsule");
+    let restored_capsule = read_failure_capsule(&capsule_path).expect("read byte replay capsule");
+    let observation = replay_engine_bytes(
+        restored_capsule
+            .byte_replay
+            .as_ref()
+            .expect("capsule contains byte replay"),
+    )
+    .await
+    .expect("exact bytes reproduce the state fingerprint");
+    assert_eq!(observation.epoch, 2);
+    assert_eq!(observation.fingerprint, expected_fingerprint);
+
+    let mut missing_input = replay;
+    missing_input.captured_deliveries.clear();
+    let error = replay_engine_bytes(&missing_input)
+        .await
+        .expect_err("removing captured bytes must change the outcome");
+    assert!(error.to_string().contains("fingerprint mismatch"));
+}
+
+#[tokio::test]
+async fn capsule_round_trip_records_schedule_policy_and_resources() {
+    let scenario = ScenarioSpec {
+        name: "failure-capsule-contract/v1".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "capsule".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: None,
+                pending: "create".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("create".into()),
+                selection: cgka_conformance_simulator::ScenarioOutboundSelection::All,
+                outcome: cgka_conformance_simulator::SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::AdvanceTime { delta_ms: 250 },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+        ],
+    };
+    let mut report = run_scenario_report(&scenario, None)
+        .await
+        .expect("scenario report");
+    report
+        .expected_outcomes
+        .push(TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 999,
+            member_count: 2,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        });
+    report.expectation_failures.push(VectorMismatch {
+        kind: "sentinel_state_mismatch".into(),
+        message: "intentional capsule sentinel".into(),
+        expected: serde_json::json!({"epoch": 999}),
+        actual: serde_json::json!({"epoch": 1}),
+    });
+    let capsule = FailureCapsuleV1::from_report(
+        report,
+        FailureCapsuleSensitivity::SyntheticShareable,
+        Vec::new(),
+        None,
+    )
+    .expect("build capsule");
+
+    assert_eq!(capsule.schema_version, "1");
+    assert_eq!(capsule.expanded_schedule[2].virtual_time_ms, 0);
+    assert_eq!(capsule.expanded_schedule[3].virtual_time_ms, 250);
+    assert_eq!(capsule.failure.failure_kind, "sentinel_state_mismatch");
+    assert_eq!(capsule.resources.counters["planned_scenario_steps"], 6);
+    assert_eq!(capsule.resources.counters["executed_scenario_steps"], 6);
+
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/failure-capsule.v1.schema.json"))
+            .expect("failure capsule schema parses");
+    let encoded = serde_json::to_value(&capsule).expect("capsule serializes");
+    for required in schema["required"].as_array().expect("required fields") {
+        let required = required.as_str().expect("required field is a string");
+        assert!(
+            encoded.get(required).is_some(),
+            "missing required {required}"
+        );
+    }
+    let promoted = promote_failure_capsule_to_vector(&capsule, "test")
+        .expect("synthetic capsule promotes to a vector candidate");
+    assert_eq!(promoted.scenario, capsule.report.scenario);
+    assert_eq!(promoted.expected_trace, capsule.report.expected_trace);
+    assert_eq!(promoted.expected_outcomes, capsule.report.expected_outcomes);
+
+    let mut expectationless = capsule.clone();
+    expectationless.report.expected_trace = None;
+    expectationless.report.expected_outcomes.clear();
+    assert!(matches!(
+        promote_failure_capsule_to_vector(&expectationless, "test"),
+        Err(FailureCapsuleError::MissingPortableExpectation)
+    ));
+
+    let mut incorrectly_shareable = capsule.clone();
+    incorrectly_shareable.byte_replay = Some(EngineByteReplayV1 {
+        client_label: "alice".into(),
+        identity_seed: pad32(b"alice"),
+        protocol_profile: ProtocolProfile::Legacy,
+        group_id: vec![1],
+        sensitive_checkpoint: vec![1],
+        captured_deliveries: Vec::new(),
+        checkpoint_monotonic_ms: 0,
+        checkpoint_wall_ms: 0,
+        virtual_time_tick_enabled: false,
+        expected_fingerprint: incorrectly_shareable.failure.clone(),
+    });
+    assert!(
+        incorrectly_shareable.validate().is_err(),
+        "a capsule containing key material must be sensitive_local"
+    );
+    assert!(
+        FailureCapsuleV1::from_report(
+            capsule.report.clone(),
+            FailureCapsuleSensitivity::SyntheticShareable,
+            Vec::new(),
+            incorrectly_shareable.byte_replay.clone(),
+        )
+        .is_err(),
+        "construction must reject a shareable capsule containing key material"
+    );
+
+    let mut first_failed_report = capsule.report.clone();
+    first_failed_report
+        .step_log
+        .push(cgka_conformance_simulator::ScenarioStepLogEntry {
+            step_index: 7,
+            step_type: "tick".into(),
+            status: cgka_conformance_simulator::ScenarioStepStatus::Failed {
+                kind: "backend".into(),
+                category: cgka_conformance_simulator::SubjectFailureCategory::Resource,
+                message: "backend error at /tmp/first.sqlite".into(),
+            },
+        });
+    let mut second_failed_report = first_failed_report.clone();
+    let cgka_conformance_simulator::ScenarioStepStatus::Failed { message, .. } =
+        &mut second_failed_report.step_log.last_mut().unwrap().status
+    else {
+        unreachable!("the appended step is failed");
+    };
+    *message = "backend error at /different/host/second.sqlite".into();
+    assert_eq!(
+        fingerprint_report_failure(&first_failed_report).expect("first fingerprint"),
+        fingerprint_report_failure(&second_failed_report).expect("second fingerprint"),
+        "free-form backend text must not affect the stable failure fingerprint"
+    );
+    let resource_fingerprint =
+        fingerprint_report_failure(&first_failed_report).expect("resource fingerprint");
+    assert_eq!(
+        resource_fingerprint.classification,
+        TerminalOutcomeClassification::ResourceFailure,
+        "typed subject provenance must not collapse engine/storage failures into environment noise"
+    );
+
+    let template = CapturedTransportArtifactV1 {
+        sequence: 0,
+        sender: "alice".into(),
+        message: TransportMessage {
+            id: MessageId::new(vec![7; 32]),
+            payload: vec![8; 32],
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![9; 32],
+            },
+        },
+    };
+    let oversized_capture = (0..300)
+        .map(|sequence| CapturedTransportArtifactV1 {
+            sequence,
+            ..template.clone()
+        })
+        .collect::<Vec<_>>();
+    let bounded = FailureCapsuleV1::from_report(
+        first_failed_report.clone(),
+        FailureCapsuleSensitivity::SyntheticShareable,
+        oversized_capture,
+        None,
+    )
+    .expect("oversized evidence is bounded during capsule construction");
+    assert_eq!(bounded.captured_transport_artifacts.len(), 256);
+    assert_eq!(
+        bounded.resources.counters["transport_objects_observed"],
+        300
+    );
+    assert_eq!(bounded.resources.counters["transport_objects_dropped"], 44);
+    assert_eq!(bounded.captured_transport_artifacts[0].sequence, 44);
+    assert_eq!(bounded.captured_transport_artifacts[255].sequence, 299);
+
+    let mut too_large = template.clone();
+    too_large.sequence = 1;
+    too_large.message.payload = vec![0; MAX_CAPTURED_TRANSPORT_JSON_BYTES as usize + 1];
+    let contiguous_tail = FailureCapsuleV1::from_report(
+        first_failed_report.clone(),
+        FailureCapsuleSensitivity::SyntheticShareable,
+        vec![
+            template.clone(),
+            too_large,
+            CapturedTransportArtifactV1 {
+                sequence: 2,
+                ..template.clone()
+            },
+        ],
+        None,
+    )
+    .expect("oversized middle artifact is evicted with the older prefix");
+    assert_eq!(contiguous_tail.captured_transport_artifacts.len(), 1);
+    assert_eq!(contiguous_tail.captured_transport_artifacts[0].sequence, 2);
+
+    let dir = tempfile::tempdir().expect("temporary capsule directory");
+    let path = dir
+        .path()
+        .join("sensitive-capsules")
+        .join("failure-capsule.v1.json");
+    write_failure_capsule(&path, &capsule).expect("write private capsule");
+    assert_eq!(read_failure_capsule(&path).expect("read capsule"), capsule);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    let mut unsupported = capsule;
+    unsupported.schema_version = "2".into();
+    assert!(unsupported.validate().is_err());
+}

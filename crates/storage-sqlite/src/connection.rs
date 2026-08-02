@@ -443,6 +443,27 @@ impl SqliteSynchronous {
 }
 
 impl SqliteAccountStorage {
+    /// Export one group's convergence/OpenMLS state, including any durable
+    /// convergence pass, for a sensitive test-only replay capsule.
+    #[cfg(feature = "test-conformance-replay")]
+    pub fn export_conformance_replay_snapshot(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> StorageResult<Vec<u8>> {
+        crate::storage::snapshots::export_replay(self, group_id)
+    }
+
+    /// Restore a sensitive test-only conformance replay snapshot into this
+    /// account-device database.
+    #[cfg(feature = "test-conformance-replay")]
+    pub fn import_conformance_replay_snapshot(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+        snapshot: &[u8],
+    ) -> StorageResult<()> {
+        crate::storage::snapshots::import_replay(self, group_id, snapshot)
+    }
+
     pub fn in_memory() -> StorageResult<Self> {
         Self::in_memory_with_options(SqliteStorageOptions::default())
     }

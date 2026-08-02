@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioStimulus,
-    parse_report_command, property_test_coverage_entries, run_report,
+    FailureCapsuleSensitivity, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
+    ReportInput, ScenarioStimulus, parse_report_command, promote_failure_capsule_to_vector,
+    property_test_coverage_entries, read_failure_capsule, replay_engine_bytes, run_report,
 };
 
 #[test]
@@ -20,6 +21,7 @@ fn parse_defaults_to_send_leave_family() {
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -49,6 +51,7 @@ fn parse_custom_report_args() {
             out: PathBuf::from("target/custom"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -61,6 +64,16 @@ fn explicit_storage_flag_overrides_environment_default() {
         panic!("expected run command");
     };
     assert_eq!(args.storage_mode, HarnessStorageMode::TempFileBackedSqlite);
+}
+
+#[test]
+fn sensitive_replay_capture_requires_an_explicit_flag() {
+    let ReportCommand::Run(args) =
+        parse_report_command(["--capture-sensitive-replay".into()]).expect("capture flag parses")
+    else {
+        panic!("expected run command");
+    };
+    assert!(args.capture_sensitive_replay);
 }
 
 #[test]
@@ -82,6 +95,7 @@ fn parse_vector_fixture_report_args() {
             out: PathBuf::from("target/vector-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -106,6 +120,7 @@ fn parse_strict_oracle_report_args() {
             out: PathBuf::from("target/cgka-conformance-simulator-reports"),
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
         })
     );
 }
@@ -129,6 +144,31 @@ fn parse_allow_weak_oracle_report_args() {
 fn parse_help_returns_help_command() {
     let command = parse_report_command(["--help".into()]).expect("help parses");
     assert_eq!(command, ReportCommand::Help);
+}
+
+#[test]
+fn parse_replay_capsule_command() {
+    let command = parse_report_command([
+        "--replay-capsule".into(),
+        "target/failure-capsule.v1.json".into(),
+    ])
+    .expect("replay capsule args parse");
+    assert_eq!(
+        command,
+        ReportCommand::ReplayCapsule(PathBuf::from("target/failure-capsule.v1.json"))
+    );
+}
+
+#[test]
+fn parse_replay_capsule_rejects_scenario_inputs() {
+    let error = parse_report_command([
+        "--replay-capsule".into(),
+        "target/failure-capsule.v1.json".into(),
+        "--family".into(),
+        "send-leave/v1".into(),
+    ])
+    .expect_err("replay capsule must not combine with family inputs");
+    assert!(error.to_string().contains("--replay-capsule"));
 }
 
 #[test]
@@ -197,6 +237,7 @@ async fn report_runner_writes_send_leave_json_reports() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes reports");
@@ -265,6 +306,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
         out: out_dir.clone(),
         strict_oracle: true,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("strict runner writes reports");
@@ -277,6 +319,19 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
             .iter()
             .any(|failure| failure.kind == "weak_oracle_warning")
     );
+    let capsule_path = summary.scenarios[0]
+        .failure_capsule
+        .as_ref()
+        .expect("strict failure emits a capsule");
+    assert!(capsule_path.exists());
+    let capsule: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(capsule_path).expect("read capsule"))
+            .expect("capsule JSON parses");
+    assert_eq!(capsule["schema_version"], "1");
+    assert_eq!(capsule["failure"]["classification"], "oracle_violation");
+    assert!(capsule.get("captured_transport_artifacts").is_none());
+    assert!(capsule.get("byte_replay").is_none());
+    assert!(summary.scenarios[0].replay_capsule.is_none());
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }
@@ -300,6 +355,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes convergence delivery reports");
@@ -352,6 +408,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes convergence chaos reports");
@@ -443,6 +500,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
         out: out_dir.clone(),
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
     })
     .await
     .expect("runner writes vector reports");
@@ -476,4 +534,86 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
     );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
+}
+
+#[tokio::test]
+async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
+    let temp = tempfile::tempdir().expect("campaign temp directory");
+    let fixture_path = temp.path().join("failing-message-exchange.v1.json");
+    let out_dir = temp.path().join("reports");
+    let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../vectors/three-client-message-exchange.v1.json"
+    ))
+    .expect("fixture parses");
+    fixture["scenario_name"] = "campaign-byte-replay/v1".into();
+    fixture["scenario"]["name"] = "campaign-byte-replay/v1".into();
+    fixture["expected_trace"]["name"] = "campaign-byte-replay/v1".into();
+    fixture["expected_trace"]["observations"][0]["member_count"] = 99.into();
+    fs::write(
+        &fixture_path,
+        serde_json::to_vec_pretty(&fixture).expect("fixture serializes"),
+    )
+    .expect("fixture writes");
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::VectorFixtures {
+            paths: vec![fixture_path],
+        },
+        out: out_dir,
+        strict_oracle: false,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: true,
+    })
+    .await
+    .expect("failing campaign reports");
+    assert_eq!(summary.failed(), 1);
+    let capsule_path = summary.scenarios[0]
+        .failure_capsule
+        .as_ref()
+        .expect("failure capsule path");
+    let capsule = read_failure_capsule(capsule_path).expect("campaign capsule reads");
+    assert_eq!(
+        capsule.sensitivity,
+        FailureCapsuleSensitivity::SyntheticShareable
+    );
+    assert!(capsule.byte_replay.is_none());
+    promote_failure_capsule_to_vector(&capsule, "test")
+        .expect("the logical campaign capsule remains portable");
+
+    let replay_capsule_path = summary.scenarios[0]
+        .replay_capsule
+        .as_ref()
+        .expect("explicit replay capture writes a separate sibling");
+    assert!(
+        replay_capsule_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("sensitive-replay-capsule"))
+    );
+    let replay_capsule =
+        read_failure_capsule(replay_capsule_path).expect("sensitive replay capsule reads");
+    assert_eq!(
+        replay_capsule.sensitivity,
+        FailureCapsuleSensitivity::SensitiveLocal
+    );
+    let replay = replay_capsule
+        .byte_replay
+        .as_ref()
+        .expect("campaign exports its last real recipient tick");
+    replay_engine_bytes(replay)
+        .await
+        .expect("campaign-produced tick witness replays exactly");
+
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-simulator-report"))
+        .args([
+            "--replay-capsule",
+            &replay_capsule_path.display().to_string(),
+        ])
+        .output()
+        .expect("replay CLI runs");
+    assert!(
+        cli.status.success(),
+        "replay CLI failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
 }
