@@ -11,13 +11,13 @@ use crate::{
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
-    VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
-    drive_subject_to_quiescence, required_capabilities,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
+    SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
+    compare_trace_expectations, compile_scenario, drive_subject_to_quiescence,
+    preflight_compiled_scenario, stable_action_id,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,8 @@ pub struct ScenarioSpec {
     pub name: String,
     pub spec_version: String,
     pub clients: Vec<String>,
+    #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
+    pub topology: crate::ScenarioTopologyV2,
     pub steps: Vec<ScenarioStep>,
 }
 
@@ -67,6 +69,15 @@ pub enum ScenarioStep {
     InviteMembers {
         inviter: String,
         invitees: Vec<String>,
+        pending: String,
+    },
+    RemoveMembers {
+        remover: String,
+        members: Vec<String>,
+        pending: String,
+    },
+    SelfUpdate {
+        client: String,
         pending: String,
     },
     UpdateGroupData {
@@ -134,21 +145,21 @@ pub enum ScenarioStep {
     ClearEvents {
         clients: Vec<String>,
     },
-    DropQueued {
-        index: usize,
+    OmitMessage {
+        selector: crate::ScenarioMessageSelectorV2,
     },
-    DuplicateQueued {
-        index: usize,
+    DuplicateMessage {
+        selector: crate::ScenarioMessageSelectorV2,
     },
-    DelayQueued {
-        index: usize,
-        delayed: String,
+    WithholdMessage {
+        selector: crate::ScenarioMessageSelectorV2,
+        label: String,
     },
-    ReleaseDelayed {
-        delayed: String,
+    ReleaseWithheld {
+        label: String,
     },
-    ReorderQueued {
-        order: Vec<usize>,
+    ReorderMessages {
+        order: Vec<crate::ScenarioMessageSelectorV2>,
     },
     SetPartition {
         allow: Vec<String>,
@@ -157,9 +168,95 @@ pub enum ScenarioStep {
     RestartClient {
         client: String,
     },
+    SetClientOffline {
+        client: String,
+    },
+    ReconnectClient {
+        client: String,
+    },
+    SyncRelayHistory {
+        clients: Vec<String>,
+        sync: crate::ScenarioRelaySyncModeV2,
+    },
+    ConfigureRelay {
+        relay: String,
+        order: crate::ScenarioRelayOrderV2,
+        /// Total copies returned for each matching retained event.
+        duplicate_copies: usize,
+    },
+    SetRelayEventVisibility {
+        relay: String,
+        selector: crate::ScenarioMessageSelectorV2,
+        clients: Vec<String>,
+        visible: bool,
+    },
+    ReconcileRelayHistories {
+        relays: Vec<String>,
+    },
+    CrashProcess {
+        process: String,
+    },
+    RestartProcess {
+        process: String,
+    },
+    InjectStorageFault {
+        fault: crate::ScenarioStorageFaultV2,
+    },
+    ClearStorageFault {
+        target: String,
+    },
+    /// Compiler-recorded synchronization point. It is a no-op for subjects.
+    Barrier {
+        name: String,
+    },
+    Assert {
+        assertion: crate::ScenarioAssertionV2,
+    },
 }
 
 impl ScenarioStep {
+    pub const KINDS: &'static [&'static str] = &[
+        "create_group",
+        "invite_members",
+        "remove_members",
+        "self_update",
+        "update_group_data",
+        "update_admin_policy",
+        "expect_update_admin_policy_error",
+        "acknowledge_outbound",
+        "send_app_message",
+        "leave",
+        "deliver_all",
+        "tick",
+        "advance_time",
+        "await_quiescence",
+        "observe",
+        "observe_exact",
+        "probe_bidirectional_decryptability",
+        "observe_admin_policy",
+        "clear_events",
+        "omit_message",
+        "duplicate_message",
+        "withhold_message",
+        "release_withheld",
+        "reorder_messages",
+        "set_partition",
+        "clear_partition",
+        "restart_client",
+        "set_client_offline",
+        "reconnect_client",
+        "sync_relay_history",
+        "configure_relay",
+        "set_relay_event_visibility",
+        "reconcile_relay_histories",
+        "crash_process",
+        "restart_process",
+        "inject_storage_fault",
+        "clear_storage_fault",
+        "barrier",
+        "assert",
+    ];
+
     pub fn accept_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
         Self::AcknowledgeOutbound {
             client: client.into(),
@@ -182,6 +279,8 @@ impl ScenarioStep {
         match self {
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
+            ScenarioStep::RemoveMembers { .. } => "remove_members",
+            ScenarioStep::SelfUpdate { .. } => "self_update",
             ScenarioStep::UpdateGroupData { .. } => "update_group_data",
             ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
@@ -199,14 +298,26 @@ impl ScenarioStep {
             }
             ScenarioStep::ObserveAdminPolicy { .. } => "observe_admin_policy",
             ScenarioStep::ClearEvents { .. } => "clear_events",
-            ScenarioStep::DropQueued { .. } => "drop_queued",
-            ScenarioStep::DuplicateQueued { .. } => "duplicate_queued",
-            ScenarioStep::DelayQueued { .. } => "delay_queued",
-            ScenarioStep::ReleaseDelayed { .. } => "release_delayed",
-            ScenarioStep::ReorderQueued { .. } => "reorder_queued",
+            ScenarioStep::OmitMessage { .. } => "omit_message",
+            ScenarioStep::DuplicateMessage { .. } => "duplicate_message",
+            ScenarioStep::WithholdMessage { .. } => "withhold_message",
+            ScenarioStep::ReleaseWithheld { .. } => "release_withheld",
+            ScenarioStep::ReorderMessages { .. } => "reorder_messages",
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
             ScenarioStep::RestartClient { .. } => "restart_client",
+            ScenarioStep::SetClientOffline { .. } => "set_client_offline",
+            ScenarioStep::ReconnectClient { .. } => "reconnect_client",
+            ScenarioStep::SyncRelayHistory { .. } => "sync_relay_history",
+            ScenarioStep::ConfigureRelay { .. } => "configure_relay",
+            ScenarioStep::SetRelayEventVisibility { .. } => "set_relay_event_visibility",
+            ScenarioStep::ReconcileRelayHistories { .. } => "reconcile_relay_histories",
+            ScenarioStep::CrashProcess { .. } => "crash_process",
+            ScenarioStep::RestartProcess { .. } => "restart_process",
+            ScenarioStep::InjectStorageFault { .. } => "inject_storage_fault",
+            ScenarioStep::ClearStorageFault { .. } => "clear_storage_fault",
+            ScenarioStep::Barrier { .. } => "barrier",
+            ScenarioStep::Assert { .. } => "assert",
         }
     }
 }
@@ -215,6 +326,18 @@ impl ScenarioStep {
 pub struct ScenarioReport {
     pub metadata: ScenarioReportMetadata,
     pub scenario: ScenarioSpec,
+    /// Validated explicit topology, including deterministic projection for
+    /// legacy client-only vectors.
+    #[serde(default, skip_serializing_if = "crate::ScenarioTopologyV2::is_empty")]
+    pub resolved_topology: crate::ScenarioTopologyV2,
+    /// Authoritative compiler output executed by the selected adapter. Its
+    /// declared time excludes clock movement inside assertions/quiescence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_sync_observations: Vec<crate::RelaySyncObservationV2>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -544,6 +667,7 @@ struct ScenarioStepOutputs {
     admin_policy_observations: Vec<ScenarioAdminPolicyObservation>,
     error_observations: Vec<ScenarioErrorObservation>,
     quiescence_observations: Vec<QuiescenceObservation>,
+    assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
 }
 
 async fn execute_scenario_step(
@@ -561,6 +685,7 @@ async fn execute_scenario_step(
         admin_policy_observations,
         error_observations,
         quiescence_observations,
+        assertion_observations,
     } = outputs;
     match step {
         ScenarioStep::CreateGroup {
@@ -576,6 +701,7 @@ async fn execute_scenario_step(
                 .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
             subject
                 .create_group(SubjectCreateGroup {
+                    action_id: &action_id,
                     creator,
                     name,
                     invitees,
@@ -596,6 +722,31 @@ async fn execute_scenario_step(
                     action_id: &action_id,
                     inviter,
                     invitees,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::RemoveMembers {
+            remover,
+            members,
+            pending,
+        } => {
+            subject
+                .remove_members(SubjectRemoveMembers {
+                    action_id: &action_id,
+                    remover,
+                    members,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::SelfUpdate { client, pending } => {
+            subject
+                .self_update(SubjectSelfUpdate {
+                    action_id: &action_id,
+                    client,
                     pending,
                 })
                 .await
@@ -794,29 +945,29 @@ async fn execute_scenario_step(
                 .clear_events(labels)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
-        ScenarioStep::DropQueued { index } => {
+        ScenarioStep::OmitMessage { selector } => {
             subject_faults(subject, step_index)?
-                .drop_queued(*index)
+                .omit_message(selector)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
-        ScenarioStep::DuplicateQueued { index } => {
+        ScenarioStep::DuplicateMessage { selector } => {
             subject_faults(subject, step_index)?
-                .duplicate_queued(*index)
+                .duplicate_message(selector)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
-        ScenarioStep::DelayQueued { index, delayed } => {
+        ScenarioStep::WithholdMessage { selector, label } => {
             subject_faults(subject, step_index)?
-                .delay_queued(*index, delayed)
+                .withhold_message(selector, label)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
-        ScenarioStep::ReleaseDelayed { delayed } => {
+        ScenarioStep::ReleaseWithheld { label } => {
             subject_faults(subject, step_index)?
-                .release_delayed(delayed)
+                .release_withheld(label)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
-        ScenarioStep::ReorderQueued { order } => {
+        ScenarioStep::ReorderMessages { order } => {
             subject_faults(subject, step_index)?
-                .reorder_queued(order)
+                .reorder_messages(order)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
         ScenarioStep::SetPartition { allow } => {
@@ -832,8 +983,173 @@ async fn execute_scenario_step(
                 .restart(client)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
+        ScenarioStep::SetClientOffline { client } => subject
+            .set_client_online(client, false)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ReconnectClient { client } => subject
+            .set_client_online(client, true)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::SyncRelayHistory { clients, sync } => subject
+            .sync_relay_history(clients, sync)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ConfigureRelay {
+            relay,
+            order,
+            duplicate_copies,
+        } => subject
+            .configure_relay(relay, *order, *duplicate_copies)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::SetRelayEventVisibility {
+            relay,
+            selector,
+            clients,
+            visible,
+        } => subject
+            .set_relay_event_visibility(relay, selector, clients, *visible)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ReconcileRelayHistories { relays } => subject
+            .reconcile_relay_histories(relays)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::CrashProcess { process } => subject
+            .crash_process(process)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RestartProcess { process } => subject
+            .restart_process(process)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::InjectStorageFault { fault } => subject
+            .inject_storage_fault(fault)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ClearStorageFault { target } => subject
+            .clear_storage_fault(target)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::Barrier { .. } => {}
+        ScenarioStep::Assert { assertion } => {
+            let observation = execute_assertion(assertion, subject, &spec.clients, step_index)
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+            let passed = observation.passed;
+            let final_actual = observation.final_actual.clone();
+            assertion_observations.push(observation);
+            if !passed {
+                return Err(err(
+                    step_index,
+                    format!("scenario assertion failed; final actual {final_actual}"),
+                ));
+            }
+        }
     }
     Ok::<(), ScenarioRunError>(())
+}
+
+async fn execute_assertion(
+    assertion: &crate::ScenarioAssertionV2,
+    subject: &mut dyn ConvergenceSubject,
+    clients: &[String],
+    step_index: usize,
+) -> Result<crate::ScenarioAssertionObservationV2, SubjectError> {
+    use crate::ScenarioAssertionV2;
+
+    let mut samples = 0_usize;
+    let mut elapsed_virtual_ms = 0_u64;
+    let mut final_actual = serde_json::Value::Null;
+    let passed = match assertion {
+        ScenarioAssertionV2::Exactly { predicate } => {
+            let observation = subject.evaluate_predicate(predicate)?;
+            samples = 1;
+            final_actual = observation.actual;
+            observation.matched
+        }
+        ScenarioAssertionV2::Eventually {
+            predicate,
+            max_iterations,
+        } => {
+            let mut matched = false;
+            for iteration in 0..=*max_iterations {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    matched = true;
+                    break;
+                }
+                if iteration < *max_iterations {
+                    subject.tick(clients).await?;
+                }
+            }
+            matched
+        }
+        ScenarioAssertionV2::Within {
+            predicate,
+            timeout_ms,
+            poll_interval_ms,
+        } => {
+            let mut matched = false;
+            loop {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    matched = true;
+                    break;
+                }
+                if elapsed_virtual_ms == *timeout_ms {
+                    break;
+                }
+                let delta = (*timeout_ms - elapsed_virtual_ms).min(*poll_interval_ms);
+                subject.advance_time(delta).await?;
+                elapsed_virtual_ms += delta;
+                subject.tick(clients).await?;
+            }
+            matched
+        }
+        ScenarioAssertionV2::Never {
+            predicate,
+            duration_ms,
+            poll_interval_ms,
+        } => {
+            let mut never_matched = true;
+            loop {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    never_matched = false;
+                    break;
+                }
+                if elapsed_virtual_ms == *duration_ms {
+                    break;
+                }
+                let delta = (*duration_ms - elapsed_virtual_ms).min(*poll_interval_ms);
+                subject.advance_time(delta).await?;
+                elapsed_virtual_ms += delta;
+                subject.tick(clients).await?;
+            }
+            never_matched
+        }
+        ScenarioAssertionV2::Resource {
+            metric,
+            comparison,
+            value,
+        } => {
+            let snapshot = subject.structural_progress()?;
+            let actual = crate::resource_value(&snapshot, *metric);
+            samples = 1;
+            final_actual = serde_json::json!({
+                "metric": metric,
+                "value": actual,
+                "structural_token": snapshot.structural_token,
+            });
+            comparison.matches(actual, *value)
+        }
+    };
+    Ok(crate::ScenarioAssertionObservationV2 {
+        step_index,
+        assertion: assertion.clone(),
+        passed,
+        samples,
+        elapsed_virtual_ms,
+        final_actual,
+    })
 }
 
 async fn run_scenario_report_inner(
@@ -844,11 +1160,14 @@ async fn run_scenario_report_inner(
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let descriptor = subject.descriptor();
-    validate_scenario_for_subject(spec, &descriptor)?;
+    let compiled = compile_scenario(spec)?;
+    preflight_compiled_scenario(&compiled, &descriptor)?;
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
 
-    for (step_index, step) in spec.steps.iter().enumerate() {
+    for action in &compiled.actions {
+        let step_index = action.schedule.source_step_index;
+        let step = &action.step;
         let step_result =
             execute_scenario_step(spec, step_index, step, subject, &mut outputs).await;
         if let Err(error) = step_result {
@@ -877,7 +1196,9 @@ async fn run_scenario_report_inner(
         admin_policy_observations,
         error_observations,
         quiescence_observations,
+        assertion_observations,
     } = outputs;
+    let relay_sync_observations = subject.relay_sync_observations();
 
     let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
@@ -950,13 +1271,17 @@ async fn run_scenario_report_inner(
         metadata: ScenarioReportMetadata {
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
-            step_count: spec.steps.len(),
+            step_count: compiled.actions.len(),
             storage_backend: descriptor.storage_backend.clone(),
             subject: Some(descriptor),
             generated: None,
             fixture,
         },
         scenario: spec.clone(),
+        resolved_topology: compiled.topology.clone(),
+        expanded_schedule: compiled.expanded_schedule(),
+        assertion_observations,
+        relay_sync_observations,
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),
@@ -973,7 +1298,7 @@ async fn run_scenario_report_inner(
 }
 
 fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
-    format!("step-{step_index}:{}", step.kind())
+    stable_action_id(step_index, step)
 }
 
 /// Validate adapter support before the first scenario action is executed.
@@ -981,41 +1306,8 @@ pub fn validate_scenario_for_subject(
     spec: &ScenarioSpec,
     descriptor: &SubjectDescriptor,
 ) -> Result<(), ScenarioRunError> {
-    if spec.spec_version != "2" {
-        return Err(ScenarioRunError {
-            step_index: None,
-            kind: "unsupported_scenario_version".into(),
-            category: SubjectFailureCategory::Environment,
-            message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
-        });
-    }
-    let mut clients = BTreeSet::new();
-    for label in &spec.clients {
-        if !clients.insert(label) {
-            return Err(ScenarioRunError {
-                step_index: None,
-                kind: "duplicate_client".into(),
-                category: SubjectFailureCategory::Environment,
-                message: format!("duplicate client label {label}"),
-            });
-        }
-    }
-    for (step_index, step) in spec.steps.iter().enumerate() {
-        for capability in required_capabilities(step) {
-            if !descriptor.supports(capability) {
-                return Err(err(
-                    step_index,
-                    format!(
-                        "subject {} does not support capability {} required by {}",
-                        descriptor.adapter,
-                        capability,
-                        step.kind()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
+    let compiled = compile_scenario(spec)?;
+    preflight_compiled_scenario(&compiled, descriptor)
 }
 
 fn scenario_initial_admins(
@@ -1134,8 +1426,10 @@ fn ensure_execution_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRun
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::required_capabilities;
     use crate::{SubjectCapability, SubjectSendApplication};
     use async_trait::async_trait;
+    use std::collections::BTreeSet;
 
     struct RecordingSubject {
         descriptor: SubjectDescriptor,
@@ -1168,6 +1462,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "admin policy fallback".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1197,6 +1492,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "unsupported-subject-capability/v1".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned()],
             steps: vec![
                 ScenarioStep::SendAppMessage {
@@ -1233,6 +1529,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "subject-virtual-time/v1".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![ScenarioStep::AdvanceTime { delta_ms: 750 }],
         };
@@ -1306,6 +1603,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "await-quiescence-smoke/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into(), "bob".into()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1352,6 +1650,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "await-quiescence-blocked/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into(), "bob".into()],
             steps: vec![
                 ScenarioStep::CreateGroup {
@@ -1375,9 +1674,13 @@ mod tests {
                     selection: ScenarioOutboundSelection::All,
                     outcome: SubjectOutboundOutcome::Accepted,
                 },
-                ScenarioStep::DelayQueued {
-                    index: 0,
-                    delayed: "withheld".into(),
+                ScenarioStep::WithholdMessage {
+                    selector: crate::ScenarioMessageSelectorV2 {
+                        sender: Some("alice".into()),
+                        class: Some(crate::ScenarioTransportClass::Application),
+                        ..Default::default()
+                    },
+                    label: "withheld".into(),
                 },
                 ScenarioStep::AwaitQuiescence {
                     policy: QuiescencePolicy::default(),
@@ -1410,6 +1713,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "step-failure-artifact/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: vec!["alice".into()],
             steps: vec![ScenarioStep::AcknowledgeOutbound {
                 client: "alice".into(),
@@ -1484,9 +1788,13 @@ mod tests {
             ];
             if split_delivery {
                 steps.extend([
-                    ScenarioStep::DelayQueued {
-                        index: 1,
-                        delayed: "second-branch".into(),
+                    ScenarioStep::WithholdMessage {
+                        selector: crate::ScenarioMessageSelectorV2 {
+                            sender: Some("bob".into()),
+                            class: Some(crate::ScenarioTransportClass::Commit),
+                            ..Default::default()
+                        },
+                        label: "second-branch".into(),
                     },
                     ScenarioStep::DeliverAll,
                     ScenarioStep::Tick {
@@ -1496,8 +1804,8 @@ mod tests {
                     ScenarioStep::Tick {
                         clients: clients.clone(),
                     },
-                    ScenarioStep::ReleaseDelayed {
-                        delayed: "second-branch".into(),
+                    ScenarioStep::ReleaseWithheld {
+                        label: "second-branch".into(),
                     },
                 ]);
             }
@@ -1520,6 +1828,7 @@ mod tests {
                     "same-horizon-batch/v1".into()
                 },
                 spec_version: "2".into(),
+                topology: Default::default(),
                 clients,
                 steps,
             }
@@ -1609,14 +1918,19 @@ mod tests {
     }
 
     #[test]
-    fn queue_fault_steps_require_explicit_white_box_capability() {
-        let capabilities = required_capabilities(&ScenarioStep::DropQueued { index: 0 });
+    fn semantic_fault_steps_require_adapter_neutral_capability() {
+        let capabilities = required_capabilities(&ScenarioStep::OmitMessage {
+            selector: crate::ScenarioMessageSelectorV2 {
+                sender: Some("alice".into()),
+                ..Default::default()
+            },
+        });
 
         assert_eq!(
             capabilities,
-            vec![SubjectCapability::WhiteBoxTransportQueueFaults]
+            vec![SubjectCapability::SemanticTransportFaults]
         );
-        assert!(capabilities[0].is_white_box());
+        assert!(!capabilities[0].is_white_box());
     }
 
     #[test]
@@ -1624,6 +1938,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "removed-v1".to_owned(),
             spec_version: "1".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned()],
             steps: Vec::new(),
         };
@@ -1646,6 +1961,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "replay-target".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![
                 ScenarioStep::Tick {
@@ -1666,6 +1982,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "subject-boundary-smoke/v2".to_owned(),
             spec_version: "2".to_owned(),
+            topology: Default::default(),
             clients: vec!["alice".to_owned(), "bob".to_owned()],
             steps: vec![
                 ScenarioStep::CreateGroup {

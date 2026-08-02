@@ -31,10 +31,17 @@ mod pending_work;
 pub mod policy_cases;
 pub mod proptest_support;
 mod quiescence;
+mod reference_subject;
 pub mod report;
+mod retained_relay;
 pub mod scenario;
+mod scenario_assertions;
+mod scenario_authoring;
+mod scenario_faults;
 mod scenario_input_ledger;
+mod scenario_ir;
 pub mod subject;
+mod topology;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
@@ -81,9 +88,14 @@ pub use quiescence::{
     QuiescenceObservation, QuiescenceOutboundPolicy, QuiescencePolicy, QuiescenceStatus,
     QuiescenceTransportPolicy, QuiescenceWatchdog, drive_subject_to_quiescence,
 };
+pub use reference_subject::ReferenceModelSubject;
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,
+};
+pub use retained_relay::{
+    RelayHistoryCompletenessClaimV2, RelaySyncObservationV2, RetainedRelaySubject,
+    ScenarioRelayOrderV2, ScenarioRelaySyncModeV2,
 };
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
@@ -96,15 +108,35 @@ pub use scenario::{
     run_vector_fixture_report, run_vector_fixture_report_with_capture,
     run_vector_fixture_report_with_storage_mode, validate_scenario_for_subject,
 };
+pub use scenario_assertions::{
+    ScenarioAssertionObservationV2, ScenarioAssertionV2, ScenarioComparison,
+    ScenarioPredicateObservationV2, ScenarioPredicateV2, ScenarioResourceMetric, resource_value,
+};
+pub use scenario_authoring::{
+    MAX_EXPANDED_SCENARIO_ACTIONS, SCENARIO_AUTHORING_VERSION, ScenarioAuthoringSpec, ScenarioFlow,
+    ScenarioParallelLane, compile_authoring_scenario, compile_authoring_yaml,
+};
+pub use scenario_faults::{
+    ScenarioMessageSelectorV2, ScenarioStorageFaultKind, ScenarioStorageFaultV2,
+    ScenarioTransportClass,
+};
 pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+};
+pub use scenario_ir::{
+    CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_VERSION, ScenarioActionScheduleV2,
+    compile_scenario, preflight_compiled_scenario, stable_action_id,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
-    engine_harness_feature_registry, required_capabilities,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
+    SubjectUpdateGroupData, engine_harness_feature_registry, required_capabilities,
+};
+pub use topology::{
+    ScenarioAccountV2, ScenarioDeviceV2, ScenarioGroupV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioTopologyV2,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

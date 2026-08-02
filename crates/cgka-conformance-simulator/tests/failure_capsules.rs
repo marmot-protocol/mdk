@@ -95,6 +95,7 @@ async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
         &ScenarioSpec {
             name: "captured-byte-replay/v1".into(),
             spec_version: "2".into(),
+            topology: Default::default(),
             clients: Vec::new(),
             steps: Vec::new(),
         },
@@ -147,6 +148,7 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
     let scenario = ScenarioSpec {
         name: "failure-capsule-contract/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {

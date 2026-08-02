@@ -793,6 +793,14 @@ impl HarnessClient {
                 )));
             }
         };
+        if let Some(action_id) = self.next_scenario_input_id.take()
+            && pending.is_some()
+        {
+            for welcome in &welcomes {
+                self.bus
+                    .register_scenario_action(welcome.id.clone(), action_id.clone());
+            }
+        }
         if let Some(pending) = pending {
             self.remember_pending_publication(
                 pending,
@@ -937,7 +945,44 @@ impl HarnessClient {
             })
             .await
             .expect("update group data");
-        match res {
+        self.publish_group_evolution(res, &gid, "update_group_data")
+            .await
+    }
+
+    pub async fn remove_members(&mut self, members: Vec<MemberId>) -> PendingStateRef {
+        let gid = self.default_group.clone().expect("group");
+        let result = self
+            .engine_mut()
+            .send(SendIntent::RemoveMembers {
+                group_id: gid.clone(),
+                members,
+            })
+            .await
+            .expect("remove members");
+        self.publish_group_evolution(result, &gid, "remove_members")
+            .await
+    }
+
+    pub async fn self_update(&mut self) -> PendingStateRef {
+        let gid = self.default_group.clone().expect("group");
+        let result = self
+            .engine_mut()
+            .send(SendIntent::SelfUpdate {
+                group_id: gid.clone(),
+            })
+            .await
+            .expect("self update");
+        self.publish_group_evolution(result, &gid, "self_update")
+            .await
+    }
+
+    async fn publish_group_evolution(
+        &mut self,
+        result: SendResult,
+        group_id: &GroupId,
+        operation: &str,
+    ) -> PendingStateRef {
+        match result {
             SendResult::GroupEvolution {
                 msg,
                 welcomes,
@@ -945,16 +990,16 @@ impl HarnessClient {
             } => {
                 assert!(
                     welcomes.is_empty(),
-                    "group-data update should not create welcomes"
+                    "{operation} should not create welcomes"
                 );
-                let routed = route(msg, &gid);
+                let routed = route(msg, group_id);
                 self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
                 self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
                 pending
             }
-            other => panic!("expected GroupEvolution from update_group_data, got {other:?}"),
+            other => panic!("expected GroupEvolution from {operation}, got {other:?}"),
         }
     }
 
@@ -1507,6 +1552,22 @@ impl HarnessClient {
     pub fn drain_events(&mut self) -> Vec<GroupEvent> {
         self.capture_engine_events();
         std::mem::take(&mut self.pending_events)
+    }
+
+    /// Count matching application payloads in the current observation window
+    /// without consuming the events that a later report observation must see.
+    pub(crate) fn pending_payload_count(&mut self, expected: &str) -> usize {
+        self.capture_engine_events();
+        self.pending_events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => {
+                    Some(decode_harness_app_payload(payload))
+                }
+                _ => None,
+            })
+            .filter(|payload| payload.as_slice() == expected.as_bytes())
+            .count()
     }
 
     pub fn epoch(&self) -> EpochId {

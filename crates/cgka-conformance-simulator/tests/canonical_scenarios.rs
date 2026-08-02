@@ -7,12 +7,13 @@
 use cgka_conformance_simulator::{
     ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
     GeneratedScenarioCase, HarnessClient, PendingResolutionObservation, ScenarioInputDisposition,
-    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioReport, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
-    compare_trace_expectations, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
-    observe_client_exact, run_generated_case_report, run_scenario_report,
-    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
+    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioMessageSelectorV2, ScenarioReport,
+    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
+    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
+    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
+    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_vector_fixture_report,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -34,6 +35,14 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     let n = name.len().min(32);
     out[..n].copy_from_slice(&name[..n]);
     out
+}
+
+fn application_selector(sender: &str) -> ScenarioMessageSelectorV2 {
+    ScenarioMessageSelectorV2 {
+        sender: Some(sender.into()),
+        class: Some(ScenarioTransportClass::Application),
+        ..Default::default()
+    }
 }
 
 fn selfremove_registry() -> FeatureRegistry {
@@ -251,6 +260,7 @@ async fn bidirectional_decryptability_probe_passes_for_settled_members() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/settled".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -311,6 +321,7 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/asymmetric-epoch".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -332,7 +343,13 @@ async fn bidirectional_decryptability_probe_exposes_asymmetric_epoch_reachabilit
                 pending: "advance".into(),
             },
             ScenarioStep::accept_publication("alice", "advance"),
-            ScenarioStep::DropQueued { index: 0 },
+            ScenarioStep::OmitMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    publication: Some("advance".into()),
+                    class: Some(ScenarioTransportClass::Commit),
+                    ..Default::default()
+                },
+            },
             ScenarioStep::ProbeBidirectionalDecryptability {
                 clients: vec!["alice".into(), "bob".into()],
             },
@@ -387,6 +404,7 @@ async fn bidirectional_decryptability_probe_rejects_a_named_nonmember() {
     let spec = ScenarioSpec {
         name: "bidirectional-decryptability/nonmember".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -910,6 +928,7 @@ async fn scenario_spec_runs_three_client_message_exchange() {
     let spec = ScenarioSpec {
         name: "three-client-message-exchange/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -957,6 +976,7 @@ async fn scenario_spec_supports_publish_fail() {
     let spec = ScenarioSpec {
         name: "publish-fail/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -995,6 +1015,7 @@ async fn definite_publish_failure_retracts_commit_before_local_rollback() {
     let spec = ScenarioSpec {
         name: "transported-commit-after-local-rollback/minimal/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1156,6 +1177,7 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
     let spec = ScenarioSpec {
         name: "leave-and-clear-partition/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1217,10 +1239,11 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
 }
 
 #[tokio::test]
-async fn scenario_spec_can_drop_queued_message() {
+async fn scenario_spec_can_omit_semantically_selected_message() {
     let spec = ScenarioSpec {
         name: "drop-queued/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1240,7 +1263,9 @@ async fn scenario_spec_can_drop_queued_message() {
                 sender: "bob".into(),
                 payload: "bob:dropped".into(),
             },
-            ScenarioStep::DropQueued { index: 0 },
+            ScenarioStep::OmitMessage {
+                selector: application_selector("bob"),
+            },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
@@ -1260,10 +1285,11 @@ async fn scenario_spec_can_drop_queued_message() {
 }
 
 #[tokio::test]
-async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
+async fn scenario_spec_can_duplicate_withhold_and_reorder_selected_messages() {
     let spec = ScenarioSpec {
         name: "queue-faults/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "carol".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1287,18 +1313,25 @@ async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
                 sender: "carol".into(),
                 payload: "carol:second".into(),
             },
-            ScenarioStep::DuplicateQueued { index: 0 },
-            ScenarioStep::DelayQueued {
-                index: 1,
-                delayed: "delayed-copy".into(),
+            ScenarioStep::DuplicateMessage {
+                selector: application_selector("bob"),
             },
-            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    occurrence: 1,
+                    ..application_selector("bob")
+                },
+                label: "delayed-copy".into(),
+            },
+            ScenarioStep::ReorderMessages {
+                order: vec![application_selector("carol"), application_selector("bob")],
+            },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
                 clients: vec!["alice".into()],
             },
-            ScenarioStep::ReleaseDelayed {
-                delayed: "delayed-copy".into(),
+            ScenarioStep::ReleaseWithheld {
+                label: "delayed-copy".into(),
             },
             ScenarioStep::DeliverAll,
             ScenarioStep::Tick {
@@ -1333,6 +1366,7 @@ async fn exact_observation_ledgers_commit_proposal_and_application_dispositions(
     let spec = ScenarioSpec {
         name: "generalized-scenario-input-ledger/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -1475,7 +1509,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::DuplicateQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::DuplicateMessage { .. }))),
         "generated cases should include duplicate-delivery variants"
     );
     assert!(
@@ -1483,7 +1517,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::DelayQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::WithholdMessage { .. }))),
         "generated cases should include delayed-delivery variants"
     );
     assert!(
@@ -1491,7 +1525,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .scenario
             .steps
             .iter()
-            .any(|step| matches!(step, ScenarioStep::ReorderQueued { .. }))),
+            .any(|step| matches!(step, ScenarioStep::ReorderMessages { .. }))),
         "generated cases should include reordered-delivery variants"
     );
 
@@ -1506,7 +1540,13 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .expect("generated convergence variant reports");
         assert!(report.invariant_failures.is_empty());
         assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
-        assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
+        assert!(
+            matches!(report.epoch_change_observations.len(), 2 | 4),
+            "case {case_index} produced {} epoch-change observations; steps={:?}; expectations={:?}",
+            report.epoch_change_observations.len(),
+            report.step_log,
+            report.expectation_failures
+        );
         assert!(report.app_invalidation_observations.is_empty());
     }
 }
@@ -1620,9 +1660,9 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
             .iter()
             .any(|case| case.scenario.steps.iter().any(|step| matches!(
                 step,
-                ScenarioStep::DuplicateQueued { .. }
-                    | ScenarioStep::DelayQueued { .. }
-                    | ScenarioStep::ReorderQueued { .. }
+                ScenarioStep::DuplicateMessage { .. }
+                    | ScenarioStep::WithholdMessage { .. }
+                    | ScenarioStep::ReorderMessages { .. }
             ))),
         "chaos cases should include queue schedule faults"
     );
@@ -1728,19 +1768,19 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
     // Arm 2 (rollback queue faults) must vary a real behavioral dimension, not
     // just the app payload string: the seed-driven delivery schedule (the
-    // ReorderQueued permutation) must differ across seeds. This is the
+    // semantic reorder schedule) must differ across seeds. This is the
     // regression guard for mdk#166's blocking review finding — before
     // the fix, arm 2's only rng use was a random u16 appended to a payload, so
     // normalizing the payload made both seeds' scenarios identical.
-    let reorder_order = |case: &GeneratedScenarioCase| -> Vec<usize> {
+    let reorder_order = |case: &GeneratedScenarioCase| -> Vec<ScenarioMessageSelectorV2> {
         case.scenario
             .steps
             .iter()
             .find_map(|step| match step {
-                ScenarioStep::ReorderQueued { order } => Some(order.clone()),
+                ScenarioStep::ReorderMessages { order } => Some(order.clone()),
                 _ => None,
             })
-            .expect("rollback arm should carry a seed-driven ReorderQueued step")
+            .expect("rollback arm should carry a seed-driven semantic reorder step")
     };
     assert_ne!(
         reorder_order(&seed_a[2]),
@@ -1777,27 +1817,33 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
     let cases = generate_convergence_chaos_family(123, 3);
     let case = &cases[2];
 
-    let duplicate_index = case
+    let duplicate_selector = case
         .scenario
         .steps
         .iter()
         .find_map(|step| match step {
-            ScenarioStep::DuplicateQueued { index } => Some(*index),
+            ScenarioStep::DuplicateMessage { selector } => Some(selector),
             _ => None,
         })
         .expect("rollback arm should duplicate a queued message");
-    assert_eq!(duplicate_index, 0);
+    assert_eq!(
+        duplicate_selector.class,
+        Some(ScenarioTransportClass::Application)
+    );
+    assert_eq!(duplicate_selector.occurrence, 0);
 
     let delayed_copy = case
         .scenario
         .steps
         .iter()
         .find_map(|step| match step {
-            ScenarioStep::DelayQueued { index, delayed } => Some((*index, delayed.as_str())),
+            ScenarioStep::WithholdMessage { selector, label } => Some((selector, label.as_str())),
             _ => None,
         })
         .expect("rollback arm should delay the duplicate copy");
-    assert_eq!(delayed_copy, (1, "duplicate-app"));
+    assert_eq!(delayed_copy.0.action_id, duplicate_selector.action_id);
+    assert_eq!(delayed_copy.0.occurrence, 1);
+    assert_eq!(delayed_copy.1, "duplicate-app");
 
     let report = run_generated_case_report(case, None)
         .await
@@ -1859,6 +1905,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
     let mut scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2056,6 +2103,7 @@ fn group_data_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "group-data-fork-recovery/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2101,6 +2149,7 @@ fn deliberate_fork_recovery_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "deliberate-fork-recovery/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into(), "david".into(), "eve".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2147,6 +2196,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
     let spec = ScenarioSpec {
         name: "report-mismatch/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec!["alice".into(), "bob".into()],
         steps: vec![
             ScenarioStep::CreateGroup {
@@ -2674,6 +2724,7 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
     ScenarioSpec {
         name: "convergence-e2e-group-events/v1".into(),
         spec_version: "2".into(),
+        topology: Default::default(),
         clients: vec![
             "alice".into(),
             "bob".into(),

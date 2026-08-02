@@ -5,8 +5,10 @@ In-process multi-client simulator for the CGKA engine.
 The engine crate proves local engine rules. This crate asks the bigger question: if several clients run that engine and
 the network behaves badly, do they still end up with the same group state?
 
-The simulator does not use real relays. It runs `Engine<SqliteAccountStorage>` clients against a deterministic in-memory
-`TransportBus`, using in-memory SQLite by default. Report runs select storage explicitly with
+The simulator does not open real relay connections. Its fast engine adapter runs `Engine<SqliteAccountStorage>` clients
+against a deterministic in-memory `TransportBus`; its retained-relay adapter persists independent per-relay histories
+and drives engine mailboxes through explicit queries, cursors, EOSE, full backfill, and set reconciliation. In-memory
+SQLite remains the default. Report runs select storage explicitly with
 `--storage memory|file`; the flag overrides `MDK_CONFORMANCE_SQLITE_STORAGE` when both are present. File mode uses
 temporary encrypted SQLite databases and a restart fully closes and reopens each client database before hydration.
 Transport wrapping still goes through the real Nostr peeler, so group messages use the Marmot kind-445 envelope and
@@ -18,14 +20,23 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   delivery for welcomes, and replay hooks.
 - `HarnessClient` — wraps `Engine<SqliteAccountStorage>` and the real Nostr transport peeler while keeping delivery in memory.
 - `ConvergenceSubject` — a capability-declared semantic boundary between scenario execution and the implementation
-  under test. `EngineHarnessSubject` is the in-process adapter; queue and partition mutation live on a separate,
+  under test. `EngineHarnessSubject` is the in-process OpenMLS adapter. `ReferenceModelSubject` is an independent,
+  symbolic-memory adapter for the common logical group/publication/application lifecycle; it deliberately does not
+  advertise exact MLS projection or adversarial transport capabilities. Queue and partition mutation live on a separate,
   explicitly white-box fault interface. Its `virtual_time` capability advances one shared paired convergence clock;
   subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
   `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
   typed `accepted` / `reached_no_endpoint` outcomes through opaque adapter-owned acknowledgement handles.
-- `ScenarioSpec` — a serializable v2 input contract for deterministic scripted scenarios, including explicit outbound
-  acknowledgement and queue
-  faults and partitions.
+- `ScenarioSpec` — the canonical JSON v2 input contract for deterministic scripted scenarios, including explicit
+  outbound acknowledgement, queue faults, and partitions. The runner compiles the whole document into a stable action
+  schedule and preflights every required adapter capability before executing the first action; the schema is
+  `schemas/scenario-ir.v2.schema.json`. New scenarios can declare accounts, devices, processes, groups, relays, roles,
+  and binary/policy versions explicitly; old vectors receive a visible deterministic topology projection in reports.
+- `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
+  burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
+- Semantic fault and assertion actions — select transport by stable meaning instead of queue position, declare
+  offline/process/storage failures, and record bounded exactly/eventually/within/never/resource samples. Predicate
+  sampling is passive and does not consume the event window retained for later report observations.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
   virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
   exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.
@@ -33,10 +44,14 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and observed traces, oracle coverage evidence,
   step logs, recoveries, and expectation failures.
-- `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded virtual-time schedule, exact
+- `FailureCapsuleV1` — a versioned failure artifact containing the scenario, expanded declared-time schedule, exact
   policy/constants, report/ledgers/state commitments, a bounded transport-evidence tail with truncation counters, and a
   stable failure fingerprint. Explicitly requested byte-exact replay is written to a separately named sensitive sibling
   capsule so the logical campaign capsule remains portable.
+- `RetainedRelaySubject` — wraps the real engine subject but removes captured emissions from the packet bus and stores
+  them per configured relay. It models publish fanout, unequal subscriptions, incremental/since/full/set queries, EOSE,
+  reconnect, visibility omission, deterministic duplicate/order policy, and explicit history equalization. Every query
+  records its completeness claim; quiet EOSE is never reported as proof of complete relevant history.
 - `ConformanceGroupSnapshot` — a feature-gated synthetic-test projection of exact canonical group state: leaf identities
   and capabilities, required/application state, lifecycle/profile/admin state, a GroupContext hash, and the adopted
   domain-separated exporter commitment. Raw exporter material is never serialized.
@@ -243,6 +258,8 @@ recovery without pinning which invite branch wins.
 
 - `create_group`
 - `invite_members`
+- `remove_members`
+- `self_update`
 - `update_group_data`
 - `update_admin_policy`
 - `expect_update_admin_policy_error`
@@ -258,14 +275,26 @@ recovery without pinning which invite branch wins.
 - `observe_exact`
 - `probe_bidirectional_decryptability`
 - `clear_events`
-- `drop_queued`
-- `duplicate_queued`
-- `delay_queued`
-- `release_delayed`
-- `reorder_queued`
+- `omit_message`
+- `duplicate_message`
+- `withhold_message`
+- `release_withheld`
+- `reorder_messages`
 - `set_partition`
 - `clear_partition`
 - `restart_client`
+- `set_client_offline`
+- `reconnect_client`
+- `sync_relay_history`
+- `configure_relay`
+- `set_relay_event_visibility`
+- `reconcile_relay_histories`
+- `crash_process`
+- `restart_process`
+- `inject_storage_fault`
+- `clear_storage_fault`
+- `barrier`
+- `assert`
 
 Staged publications are referenced by string labels chosen inside the scenario. `acknowledge_outbound.publication`
 selects artifacts emitted by that operation; omitting it selects all currently unresolved artifacts for the client.
@@ -279,10 +308,10 @@ logical names;
 the Rust harness maps them to deterministic Nostr keys so welcome routing and NIP-59 decryption exercise the same
 identity shape as production. `reached_no_endpoint` represents a definite publication failure: it retracts all matching
 undelivered commit/Welcome artifacts before local rollback and fails the scenario if any matching artifact has already
-reached a recipient mailbox. Queue fault steps select messages by the current zero-based queue index at that step.
-`reorder_queued.order` is a full permutation of current queue indices; each entry names which old queue slot moves into
-the next position. `delay_queued` stores selected messages under a string label, and `release_delayed` returns that
-label's messages to the end of the queue.
+reached a recipient mailbox. Transport fault steps use conjunctive semantic selectors over stable action id,
+publication label, sender, protocol class, and occurrence. `reorder_messages.order` selects every current message in
+the desired order. `withhold_message` stores one selected message under a label, and `release_withheld` returns that
+label's messages to the end of the transport schedule.
 
 ## Generated scenario families
 

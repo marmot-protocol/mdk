@@ -55,9 +55,9 @@
         "payload": "epoch-one-delayed"
       },
       {
-        "type": "delay_queued",
-        "index": 0,
-        "delayed": "old-app"
+        "type": "withhold_message",
+        "selector": { "sender": "bob", "class": "application" },
+        "label": "old-app"
       },
       {
         "type": "invite_members",
@@ -84,8 +84,8 @@
         ]
       },
       {
-        "type": "release_delayed",
-        "delayed": "old-app"
+        "type": "release_withheld",
+        "label": "old-app"
       },
       {
         "type": "deliver_all"

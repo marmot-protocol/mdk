@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 pub enum ScenarioStimulus {
     CreateGroup,
     InviteMembers,
+    RemoveMembers,
+    SelfUpdate,
     GroupDataUpdate,
     AdminPolicyUpdate,
     PublishConfirm,
@@ -28,6 +30,12 @@ pub enum ScenarioStimulus {
     QueueReorder,
     Partition,
     Restart,
+    OfflineReconnect,
+    ProcessCrash,
+    StorageFault,
+    RetainedRelaySync,
+    RelayHistoryControl,
+    RelayHistoryReconciliation,
     VirtualTimeAdvance,
     LargeGroup,
     MessageStorm,
@@ -293,6 +301,14 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::InviteMembers { .. } => {
                 stimuli.insert(ScenarioStimulus::InviteMembers);
             }
+            ScenarioStep::RemoveMembers { .. } => {
+                stimuli.insert(ScenarioStimulus::RemoveMembers);
+                commits += 1;
+            }
+            ScenarioStep::SelfUpdate { .. } => {
+                stimuli.insert(ScenarioStimulus::SelfUpdate);
+                commits += 1;
+            }
             ScenarioStep::UpdateGroupData { .. } => {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
                 commits += 1;
@@ -324,16 +340,16 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::Leave { .. } => {
                 stimuli.insert(ScenarioStimulus::Leave);
             }
-            ScenarioStep::DropQueued { .. } => {
+            ScenarioStep::OmitMessage { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDrop);
             }
-            ScenarioStep::DuplicateQueued { .. } => {
+            ScenarioStep::DuplicateMessage { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDuplicate);
             }
-            ScenarioStep::DelayQueued { .. } | ScenarioStep::ReleaseDelayed { .. } => {
+            ScenarioStep::WithholdMessage { .. } | ScenarioStep::ReleaseWithheld { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDelay);
             }
-            ScenarioStep::ReorderQueued { .. } => {
+            ScenarioStep::ReorderMessages { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueReorder);
             }
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
@@ -341,6 +357,24 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::RestartClient { .. } => {
                 stimuli.insert(ScenarioStimulus::Restart);
+            }
+            ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
+                stimuli.insert(ScenarioStimulus::OfflineReconnect);
+            }
+            ScenarioStep::SyncRelayHistory { .. } => {
+                stimuli.insert(ScenarioStimulus::RetainedRelaySync);
+            }
+            ScenarioStep::ConfigureRelay { .. } | ScenarioStep::SetRelayEventVisibility { .. } => {
+                stimuli.insert(ScenarioStimulus::RelayHistoryControl);
+            }
+            ScenarioStep::ReconcileRelayHistories { .. } => {
+                stimuli.insert(ScenarioStimulus::RelayHistoryReconciliation);
+            }
+            ScenarioStep::CrashProcess { .. } | ScenarioStep::RestartProcess { .. } => {
+                stimuli.insert(ScenarioStimulus::ProcessCrash);
+            }
+            ScenarioStep::InjectStorageFault { .. } | ScenarioStep::ClearStorageFault { .. } => {
+                stimuli.insert(ScenarioStimulus::StorageFault);
             }
             ScenarioStep::AdvanceTime { .. } => {
                 stimuli.insert(ScenarioStimulus::VirtualTimeAdvance);
@@ -354,7 +388,9 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             | ScenarioStep::Observe { .. }
             | ScenarioStep::ObserveExact { .. }
             | ScenarioStep::ObserveAdminPolicy { .. }
-            | ScenarioStep::ClearEvents { .. } => {}
+            | ScenarioStep::ClearEvents { .. }
+            | ScenarioStep::Barrier { .. }
+            | ScenarioStep::Assert { .. } => {}
         }
     }
 
@@ -650,6 +686,17 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::ClientConvergence,
             OracleBehavior::ClientState,
         ],
+        ScenarioStimulus::RemoveMembers => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::MemberRemoved,
+            OracleBehavior::ClientConvergence,
+            OracleBehavior::ClientState,
+        ],
+        ScenarioStimulus::SelfUpdate => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::EpochChanged,
+            OracleBehavior::ClientConvergence,
+        ],
         ScenarioStimulus::GroupDataUpdate => vec![
             OracleBehavior::PendingConfirmed,
             OracleBehavior::PendingRolledBack,
@@ -684,7 +731,13 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
         | ScenarioStimulus::QueueDelay
         | ScenarioStimulus::QueueReorder
         | ScenarioStimulus::Partition
-        | ScenarioStimulus::Restart => vec![
+        | ScenarioStimulus::Restart
+        | ScenarioStimulus::OfflineReconnect
+        | ScenarioStimulus::ProcessCrash
+        | ScenarioStimulus::StorageFault
+        | ScenarioStimulus::RetainedRelaySync
+        | ScenarioStimulus::RelayHistoryControl
+        | ScenarioStimulus::RelayHistoryReconciliation => vec![
             OracleBehavior::ClientConvergence,
             OracleBehavior::ClientState,
             OracleBehavior::DeliveredPayload,

@@ -49,8 +49,8 @@
         "payload": "bob:dropped"
       },
       {
-        "type": "drop_queued",
-        "index": 0
+        "type": "omit_message",
+        "selector": { "sender": "bob", "class": "application" }
       },
       {
         "type": "send_app_message",

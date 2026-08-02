@@ -34,7 +34,11 @@
         "outcome": "accepted"
       },
 
-      { "type": "delay_queued", "index": 3, "delayed": "held-b" },
+      {
+        "type": "withhold_message",
+        "selector": { "publication": "invite-b", "class": "commit" },
+        "label": "held-b"
+      },
       { "type": "deliver_all" },
       { "type": "tick", "clients": ["david"] },
 
@@ -43,7 +47,7 @@
       { "type": "deliver_all" },
       { "type": "tick", "clients": ["carol"] },
 
-      { "type": "release_delayed", "delayed": "held-b" },
+      { "type": "release_withheld", "label": "held-b" },
       { "type": "deliver_all" },
       { "type": "tick", "clients": ["carol"] },
       { "type": "observe", "clients": ["carol"] }

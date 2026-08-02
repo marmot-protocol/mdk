@@ -1,7 +1,8 @@
 # AGENTS.md — cgka-conformance-simulator
 
-Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and
-[`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the property-test registry. This file is the agent-facing model.
+Read [`README.md`](README.md) for the human framing, [`SCENARIO_IR.md`](SCENARIO_IR.md) for canonical and authoring
+semantics, [`SCENARIOS.md`](SCENARIOS.md) for the scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for
+the property-test registry. This file is the agent-facing model.
 
 ## Pieces
 
@@ -84,6 +85,26 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
     into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
     `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
+    Membership operations include invite, admin removal, leave, and leaf self-update through the same subject contract.
+
+- **Module:** `src/scenario_ir.rs`
+  - **Role:** Canonical ScenarioSpec v2 compiler. It validates input, assigns stable action ids, records the deterministic
+    virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
+    selected subject executes anything. The JSON contract is `schemas/scenario-ir.v2.schema.json`.
+
+- **Module:** `src/topology.rs`
+  - **Role:** Adapter-neutral accounts, devices, processes, groups, relays, roles, and binary/policy versions. The
+    compiler validates all cross-references and resolves old client-only vectors to an explicit deterministic topology.
+
+- **Module:** `src/scenario_authoring.rs`
+  - **Role:** Authoring-only repeat, deterministic parallel, rate, burst, and barrier expansion. It lowers into canonical
+    ScenarioSpec v2 before execution; adapters never interpret authoring control flow. The contract and exact timing
+    rules are in `SCENARIO_IR.md` and `schemas/scenario-authoring.v1.schema.json`.
+
+- **Modules:** `src/scenario_faults.rs`, `src/scenario_assertions.rs`
+  - **Role:** Semantic message selectors plus declared offline/process/storage faults, and executable exactly/eventually/
+    within/never/resource assertions. Assertions sample through the subject boundary and are recorded in reports and
+    failure capsules; unsupported lifecycle/fault capabilities fail whole-schedule preflight.
 
 - **Module:** `src/subject.rs`
   - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The
@@ -100,6 +121,18 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     deadlines, pass phase/generation, and terminal state; scenario-owned `await_quiescence` composes it with the existing
     clock/delivery/publication operations. Queue/partition mutation is available only through the separately named
     `ConvergenceFaultSubject` white-box interface.
+
+- **Module:** `src/reference_subject.rs`
+  - **Role:** Independent symbolic-memory `ConvergenceSubject` for the common logical group, publication, delivery, and
+    application lifecycle. It does not call the production selector/canonicalizer and deliberately omits exact MLS and
+    adversarial transport capabilities. Use whole-schedule capability preflight to keep unsupported reference scenarios
+    from partially executing.
+
+- **Module:** `src/retained_relay.rs`
+  - **Role:** Real-engine subject with deterministic per-relay durable histories. It captures and removes packet-bus
+    emissions, models fanout/subscription/query/EOSE/cursors/full backfill/set reconciliation plus relay-local
+    visibility/order/duplicates, and records an explicit completeness claim for every query. Offline recovery tests
+    must use this adapter rather than clearing a packet-bus partition.
 
 - **Module:** `src/vector.rs`
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
@@ -147,9 +180,10 @@ delivery to the allowed client set (messages to clients outside it are dropped) 
 The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it
 to be a group member yet.
 
-`ScenarioSpec` queue faults are explicit steps. They mutate the bus queue before delivery by zero-based queue index:
-`drop_queued`, `duplicate_queued`, `delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
-`clear_partition` remain the partition/heal operations.
+`ScenarioSpec` transport faults are explicit adapter-neutral steps. They select messages by stable scenario meaning
+(action id, publication, sender, protocol class, and occurrence): `omit_message`, `duplicate_message`,
+`withhold_message`, `release_withheld`, and `reorder_messages`. Queue positions remain an internal bus-test detail.
+`set_partition` and `clear_partition` remain the partition/heal operations.
 
 `reached_no_endpoint` means definite non-publication. Before invoking the engine rollback, the harness retracts every matching
 undelivered commit and Welcome from the queue and delayed sets. It returns a scenario error instead of rolling back if
