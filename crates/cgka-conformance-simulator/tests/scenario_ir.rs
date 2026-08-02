@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    ScenarioSpec, ScenarioStep, SubjectOutboundOutcome, VectorFixture, compile_scenario,
-    run_scenario_report,
+    ScenarioAssertionV2, ScenarioComparison, ScenarioMessageSelectorV2, ScenarioPredicateV2,
+    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTransportClass,
+    SubjectOutboundOutcome, VectorFixture, compile_scenario, run_scenario_report,
 };
 
 #[test]
@@ -100,6 +101,163 @@ async fn self_update_and_remove_members_use_the_common_adapter_contract() {
         report.step_log
     );
     assert_eq!(report.resolved_topology.devices.len(), 2);
+}
+
+#[tokio::test]
+async fn semantic_transport_selectors_survive_queue_shape_changes() {
+    let publication_selector = |class| ScenarioMessageSelectorV2 {
+        publication: Some("create".into()),
+        class: Some(class),
+        ..Default::default()
+    };
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/semantic-selectors".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "selectors".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::WithholdMessage {
+                selector: publication_selector(ScenarioTransportClass::Welcome),
+                label: "held-welcome".into(),
+            },
+            ScenarioStep::DuplicateMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    sender: Some("alice".into()),
+                    class: Some(ScenarioTransportClass::Welcome),
+                    ..Default::default()
+                },
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("create".into()),
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into(), "carol".into()],
+            },
+            ScenarioStep::ReleaseWithheld {
+                label: "held-welcome".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("scenario report");
+    assert!(
+        report.step_log.iter().all(|step| matches!(
+            step.status,
+            cgka_conformance_simulator::ScenarioStepStatus::Completed
+        )),
+        "semantic selector scenario failed: {:?}",
+        report.step_log
+    );
+    let observations = &report.observed_trace.expect("trace").observations;
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.member_count == 3)
+    );
+}
+
+#[tokio::test]
+async fn temporal_and_resource_assertions_execute_and_record_samples() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/assertions".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "assertions".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: Some("create".into()),
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into(), "bob".into()],
+            },
+            ScenarioStep::Assert {
+                assertion: ScenarioAssertionV2::Exactly {
+                    predicate: ScenarioPredicateV2::ClientsExactlyEquivalent {
+                        clients: vec!["alice".into(), "bob".into()],
+                    },
+                },
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "one".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Assert {
+                assertion: ScenarioAssertionV2::Within {
+                    predicate: ScenarioPredicateV2::PayloadCount {
+                        client: "bob".into(),
+                        payload: "one".into(),
+                        count: 1,
+                    },
+                    timeout_ms: 10,
+                    poll_interval_ms: 5,
+                },
+            },
+            ScenarioStep::Assert {
+                assertion: ScenarioAssertionV2::Never {
+                    predicate: ScenarioPredicateV2::PayloadCount {
+                        client: "bob".into(),
+                        payload: "forbidden".into(),
+                        count: 1,
+                    },
+                    duration_ms: 10,
+                    poll_interval_ms: 5,
+                },
+            },
+            ScenarioStep::Assert {
+                assertion: ScenarioAssertionV2::Resource {
+                    metric: ScenarioResourceMetric::TransportQueuedMessages,
+                    comparison: ScenarioComparison::Equal,
+                    value: 0,
+                },
+            },
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("scenario report");
+    assert!(report.step_log.iter().all(|step| matches!(
+        step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Completed
+    )));
+    assert_eq!(report.assertion_observations.len(), 4);
+    assert!(report.assertion_observations.iter().all(|item| item.passed));
+    assert_eq!(report.assertion_observations[1].elapsed_virtual_ms, 5);
+    assert_eq!(report.assertion_observations[2].samples, 3);
 }
 
 #[test]

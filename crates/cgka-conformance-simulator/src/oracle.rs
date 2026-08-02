@@ -30,6 +30,9 @@ pub enum ScenarioStimulus {
     QueueReorder,
     Partition,
     Restart,
+    OfflineReconnect,
+    ProcessCrash,
+    StorageFault,
     VirtualTimeAdvance,
     LargeGroup,
     MessageStorm,
@@ -337,13 +340,22 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::DropQueued { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDrop);
             }
+            ScenarioStep::OmitMessage { .. } => {
+                stimuli.insert(ScenarioStimulus::QueueDrop);
+            }
             ScenarioStep::DuplicateQueued { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDuplicate);
             }
-            ScenarioStep::DelayQueued { .. } | ScenarioStep::ReleaseDelayed { .. } => {
+            ScenarioStep::DuplicateMessage { .. } => {
+                stimuli.insert(ScenarioStimulus::QueueDuplicate);
+            }
+            ScenarioStep::DelayQueued { .. }
+            | ScenarioStep::ReleaseDelayed { .. }
+            | ScenarioStep::WithholdMessage { .. }
+            | ScenarioStep::ReleaseWithheld { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueDelay);
             }
-            ScenarioStep::ReorderQueued { .. } => {
+            ScenarioStep::ReorderQueued { .. } | ScenarioStep::ReorderMessages { .. } => {
                 stimuli.insert(ScenarioStimulus::QueueReorder);
             }
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
@@ -351,6 +363,15 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::RestartClient { .. } => {
                 stimuli.insert(ScenarioStimulus::Restart);
+            }
+            ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
+                stimuli.insert(ScenarioStimulus::OfflineReconnect);
+            }
+            ScenarioStep::CrashProcess { .. } | ScenarioStep::RestartProcess { .. } => {
+                stimuli.insert(ScenarioStimulus::ProcessCrash);
+            }
+            ScenarioStep::InjectStorageFault { .. } | ScenarioStep::ClearStorageFault { .. } => {
+                stimuli.insert(ScenarioStimulus::StorageFault);
             }
             ScenarioStep::AdvanceTime { .. } => {
                 stimuli.insert(ScenarioStimulus::VirtualTimeAdvance);
@@ -365,7 +386,8 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             | ScenarioStep::ObserveExact { .. }
             | ScenarioStep::ObserveAdminPolicy { .. }
             | ScenarioStep::ClearEvents { .. }
-            | ScenarioStep::Barrier { .. } => {}
+            | ScenarioStep::Barrier { .. }
+            | ScenarioStep::Assert { .. } => {}
         }
     }
 
@@ -706,7 +728,10 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
         | ScenarioStimulus::QueueDelay
         | ScenarioStimulus::QueueReorder
         | ScenarioStimulus::Partition
-        | ScenarioStimulus::Restart => vec![
+        | ScenarioStimulus::Restart
+        | ScenarioStimulus::OfflineReconnect
+        | ScenarioStimulus::ProcessCrash
+        | ScenarioStimulus::StorageFault => vec![
             OracleBehavior::ClientConvergence,
             OracleBehavior::ClientState,
             OracleBehavior::DeliveredPayload,

@@ -101,6 +101,11 @@ the property-test registry. This file is the agent-facing model.
     ScenarioSpec v2 before execution; adapters never interpret authoring control flow. The contract and exact timing
     rules are in `SCENARIO_IR.md` and `schemas/scenario-authoring.v1.schema.json`.
 
+- **Modules:** `src/scenario_faults.rs`, `src/scenario_assertions.rs`
+  - **Role:** Semantic message selectors plus declared offline/process/storage faults, and executable exactly/eventually/
+    within/never/resource assertions. Assertions sample through the subject boundary and are recorded in reports and
+    failure capsules; unsupported lifecycle/fault capabilities fail whole-schedule preflight.
+
 - **Module:** `src/subject.rs`
   - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The
     scenario runner owns step semantics and stable action ids; subjects implement semantic group, publication,

@@ -54,6 +54,32 @@ All generated timing uses integer virtual milliseconds. It inserts canonical `ad
 Virtual time is the only time that affects canonical scheduling. Wall time appears only in execution diagnostics and
 must not affect expansion or action order.
 
+## Faults, lifecycle, and selectors
+
+Portable transport faults select objects by any conjunction of stable scenario action id, publication label, sender,
+and semantic class (`commit`, `proposal`, `application`, `welcome`, or `group_message`). `occurrence` selects among
+otherwise identical matches in deterministic emission order. Omit, duplicate, withhold/release, and reorder operations
+resolve those selectors immediately before mutation. A selector with no semantic constraint is a compile error.
+
+The IR also declares participant offline/reconnect, process crash/restart, and bounded storage faults (`busy`, read or
+write failure, capacity exceeded, or torn write). Adapters advertise these independently. In particular, the packet-bus
+engine adapter deliberately does not advertise offline history or process/storage fault support; such a scenario is
+rejected during whole-schedule preflight instead of partially running with packet-loss semantics.
+
+## Assertions
+
+`assert` actions are executable and write samples to the common report/capsule schema:
+
+- `exactly` samples once at the current action boundary;
+- `eventually` samples now and after at most `max_iterations` deterministic participant tick rounds;
+- `within` samples now, then advances virtual time and ticks participants until the predicate matches or the deadline;
+- `never` requires the predicate to remain false at every sample through the virtual-time window; and
+- `resource` compares a structural-progress metric to an exact, upper, or lower bound.
+
+Current predicates cover client epoch/member state, exact payload multiplicity, exact canonical equivalence, and no
+pending work. Temporal poll intervals must be non-zero, client references are compile-checked, and iteration/time bounds
+are watchdogs rather than a redefinition of success.
+
 ## Compatibility contract
 
 Canonical JSON is the portable artifact stored in vectors, failure capsules, and cross-adapter campaigns. Human YAML is

@@ -91,6 +91,7 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
     let mut action_ids = BTreeSet::new();
     let mut actions = Vec::with_capacity(spec.steps.len());
     for (source_step_index, step) in spec.steps.iter().enumerate() {
+        validate_step(source_step_index, step, &clients, &topology)?;
         let action_id = stable_action_id(source_step_index, step);
         if !action_ids.insert(action_id.clone()) {
             return Err(compile_error(
@@ -126,6 +127,152 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
         topology,
         actions,
     })
+}
+
+fn validate_step(
+    step_index: usize,
+    step: &ScenarioStep,
+    clients: &BTreeSet<&String>,
+    topology: &crate::ScenarioTopologyV2,
+) -> Result<(), ScenarioRunError> {
+    let selectors = match step {
+        ScenarioStep::OmitMessage { selector }
+        | ScenarioStep::DuplicateMessage { selector }
+        | ScenarioStep::WithholdMessage { selector, .. } => std::slice::from_ref(selector),
+        ScenarioStep::ReorderMessages { order } => order.as_slice(),
+        _ => &[],
+    };
+    if matches!(step, ScenarioStep::ReorderMessages { order } if order.is_empty()) {
+        return Err(compile_error(
+            Some(step_index),
+            "semantic reorder requires at least one selector".into(),
+        ));
+    }
+    if selectors.iter().any(|selector| !selector.is_semantic()) {
+        return Err(compile_error(
+            Some(step_index),
+            "message selector must constrain action_id, publication, sender, or class".into(),
+        ));
+    }
+    if matches!(step, ScenarioStep::WithholdMessage { label, .. } | ScenarioStep::ReleaseWithheld { label } if label.trim().is_empty())
+    {
+        return Err(compile_error(
+            Some(step_index),
+            "withheld message label must not be empty".into(),
+        ));
+    }
+    if let ScenarioStep::SetClientOffline { client } | ScenarioStep::ReconnectClient { client } =
+        step
+        && !clients.contains(client)
+    {
+        return Err(compile_error(
+            Some(step_index),
+            format!("connectivity action references unknown client {client}"),
+        ));
+    }
+    if let ScenarioStep::CrashProcess { process } | ScenarioStep::RestartProcess { process } = step
+        && !topology.processes.iter().any(|item| item.id == *process)
+    {
+        return Err(compile_error(
+            Some(step_index),
+            format!("process lifecycle action references unknown process {process}"),
+        ));
+    }
+    if let ScenarioStep::InjectStorageFault { fault } = step {
+        if fault.operations == 0 {
+            return Err(compile_error(
+                Some(step_index),
+                "storage fault operations must be non-zero".into(),
+            ));
+        }
+        validate_storage_target(step_index, &fault.target, topology)?;
+    }
+    if let ScenarioStep::ClearStorageFault { target } = step {
+        validate_storage_target(step_index, target, topology)?;
+    }
+    if let ScenarioStep::Assert { assertion } = step {
+        match assertion {
+            crate::ScenarioAssertionV2::Exactly { predicate } => {
+                validate_predicate(step_index, predicate, clients)?;
+            }
+            crate::ScenarioAssertionV2::Eventually {
+                predicate,
+                max_iterations,
+            } => {
+                validate_predicate(step_index, predicate, clients)?;
+                if *max_iterations == 0 {
+                    return Err(compile_error(
+                        Some(step_index),
+                        "eventually max_iterations must be non-zero".into(),
+                    ));
+                }
+            }
+            crate::ScenarioAssertionV2::Within {
+                predicate,
+                poll_interval_ms,
+                ..
+            }
+            | crate::ScenarioAssertionV2::Never {
+                predicate,
+                poll_interval_ms,
+                ..
+            } => {
+                validate_predicate(step_index, predicate, clients)?;
+                if *poll_interval_ms == 0 {
+                    return Err(compile_error(
+                        Some(step_index),
+                        "temporal assertion poll_interval_ms must be non-zero".into(),
+                    ));
+                }
+            }
+            crate::ScenarioAssertionV2::Resource { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_predicate(
+    step_index: usize,
+    predicate: &crate::ScenarioPredicateV2,
+    clients: &BTreeSet<&String>,
+) -> Result<(), ScenarioRunError> {
+    let labels = match predicate {
+        crate::ScenarioPredicateV2::ClientState { client, .. }
+        | crate::ScenarioPredicateV2::PayloadCount { client, .. } => std::slice::from_ref(client),
+        crate::ScenarioPredicateV2::ClientsExactlyEquivalent { clients }
+        | crate::ScenarioPredicateV2::NoPendingWork { clients } => clients.as_slice(),
+    };
+    if labels.is_empty() {
+        return Err(compile_error(
+            Some(step_index),
+            "assertion predicate requires at least one client".into(),
+        ));
+    }
+    for client in labels {
+        if !clients.contains(client) {
+            return Err(compile_error(
+                Some(step_index),
+                format!("assertion predicate references unknown client {client}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_storage_target(
+    step_index: usize,
+    target: &str,
+    topology: &crate::ScenarioTopologyV2,
+) -> Result<(), ScenarioRunError> {
+    if !topology.devices.iter().any(|item| item.id == target)
+        && !topology.processes.iter().any(|item| item.id == target)
+    {
+        return Err(compile_error(
+            Some(step_index),
+            format!("storage fault references unknown device or process {target}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Reject unsupported behavior before an adapter receives its first action.

@@ -30,6 +30,8 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   and binary/policy versions explicitly; old vectors receive a visible deterministic topology projection in reports.
 - `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
   burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
+- Semantic fault and assertion actions — select transport by stable meaning instead of queue position, declare
+  offline/process/storage failures, and record bounded exactly/eventually/within/never/resource samples.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
   virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
   exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.

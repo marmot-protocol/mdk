@@ -22,6 +22,7 @@
 
 use crate::pending_work::{BusPendingWorkSnapshot, BusStructuralProgressSnapshot};
 use crate::scenario_input_ledger::ScenarioInputMetadata;
+use crate::{ScenarioMessageSelectorV2, ScenarioTransportClass};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{MemberId, MessageId};
 use std::collections::{HashMap, VecDeque};
@@ -446,6 +447,39 @@ impl TransportBus {
             .collect()
     }
 
+    pub(crate) fn semantic_queue_index(
+        &self,
+        selector: &ScenarioMessageSelectorV2,
+        sender: Option<ClientId>,
+        publication_ids: Option<&std::collections::HashSet<MessageId>>,
+    ) -> Option<usize> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, in_flight)| {
+                sender.is_none_or(|sender| in_flight.sender == sender)
+                    && publication_ids
+                        .is_none_or(|message_ids| message_ids.contains(&in_flight.msg.id))
+                    && selector.action_id.as_ref().is_none_or(|action_id| {
+                        inner
+                            .scenario_input_by_transport_id
+                            .get(&in_flight.msg.id)
+                            .is_some_and(|metadata| metadata.scenario_id == *action_id)
+                    })
+                    && selector.class.is_none_or(|class| {
+                        transport_class_matches(
+                            class,
+                            &in_flight.msg.envelope,
+                            inner.scenario_input_by_transport_id.get(&in_flight.msg.id),
+                        )
+                    })
+            })
+            .nth(selector.occurrence)
+            .map(|(index, _)| index)
+    }
+
     /// Drop one queued message by its current queue index.
     pub fn drop_queued(&self, index: usize) -> bool {
         let mut inner = self.inner.lock().unwrap();
@@ -513,6 +547,28 @@ impl TransportBus {
     /// when a test wants to inspect ordering before stepping.
     pub fn peek_policy(&self) -> DeliveryPolicy {
         self.inner.lock().unwrap().policy.clone()
+    }
+}
+
+fn transport_class_matches(
+    class: ScenarioTransportClass,
+    envelope: &TransportEnvelope,
+    metadata: Option<&ScenarioInputMetadata>,
+) -> bool {
+    match class {
+        ScenarioTransportClass::Welcome => matches!(envelope, TransportEnvelope::Welcome { .. }),
+        ScenarioTransportClass::GroupMessage => {
+            matches!(envelope, TransportEnvelope::GroupMessage { .. })
+        }
+        ScenarioTransportClass::Commit => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Commit)
+        }
+        ScenarioTransportClass::Proposal => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Proposal)
+        }
+        ScenarioTransportClass::Application => {
+            metadata.is_some_and(|metadata| metadata.kind == crate::ScenarioInputKind::Application)
+        }
     }
 }
 

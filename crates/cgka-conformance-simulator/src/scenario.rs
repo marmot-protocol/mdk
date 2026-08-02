@@ -161,6 +161,22 @@ pub enum ScenarioStep {
     ReorderQueued {
         order: Vec<usize>,
     },
+    OmitMessage {
+        selector: crate::ScenarioMessageSelectorV2,
+    },
+    DuplicateMessage {
+        selector: crate::ScenarioMessageSelectorV2,
+    },
+    WithholdMessage {
+        selector: crate::ScenarioMessageSelectorV2,
+        label: String,
+    },
+    ReleaseWithheld {
+        label: String,
+    },
+    ReorderMessages {
+        order: Vec<crate::ScenarioMessageSelectorV2>,
+    },
     SetPartition {
         allow: Vec<String>,
     },
@@ -168,9 +184,30 @@ pub enum ScenarioStep {
     RestartClient {
         client: String,
     },
+    SetClientOffline {
+        client: String,
+    },
+    ReconnectClient {
+        client: String,
+    },
+    CrashProcess {
+        process: String,
+    },
+    RestartProcess {
+        process: String,
+    },
+    InjectStorageFault {
+        fault: crate::ScenarioStorageFaultV2,
+    },
+    ClearStorageFault {
+        target: String,
+    },
     /// Compiler-recorded synchronization point. It is a no-op for subjects.
     Barrier {
         name: String,
+    },
+    Assert {
+        assertion: crate::ScenarioAssertionV2,
     },
 }
 
@@ -200,10 +237,22 @@ impl ScenarioStep {
         "delay_queued",
         "release_delayed",
         "reorder_queued",
+        "omit_message",
+        "duplicate_message",
+        "withhold_message",
+        "release_withheld",
+        "reorder_messages",
         "set_partition",
         "clear_partition",
         "restart_client",
+        "set_client_offline",
+        "reconnect_client",
+        "crash_process",
+        "restart_process",
+        "inject_storage_fault",
+        "clear_storage_fault",
         "barrier",
+        "assert",
     ];
 
     pub fn accept_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
@@ -252,10 +301,22 @@ impl ScenarioStep {
             ScenarioStep::DelayQueued { .. } => "delay_queued",
             ScenarioStep::ReleaseDelayed { .. } => "release_delayed",
             ScenarioStep::ReorderQueued { .. } => "reorder_queued",
+            ScenarioStep::OmitMessage { .. } => "omit_message",
+            ScenarioStep::DuplicateMessage { .. } => "duplicate_message",
+            ScenarioStep::WithholdMessage { .. } => "withhold_message",
+            ScenarioStep::ReleaseWithheld { .. } => "release_withheld",
+            ScenarioStep::ReorderMessages { .. } => "reorder_messages",
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
             ScenarioStep::RestartClient { .. } => "restart_client",
+            ScenarioStep::SetClientOffline { .. } => "set_client_offline",
+            ScenarioStep::ReconnectClient { .. } => "reconnect_client",
+            ScenarioStep::CrashProcess { .. } => "crash_process",
+            ScenarioStep::RestartProcess { .. } => "restart_process",
+            ScenarioStep::InjectStorageFault { .. } => "inject_storage_fault",
+            ScenarioStep::ClearStorageFault { .. } => "clear_storage_fault",
             ScenarioStep::Barrier { .. } => "barrier",
+            ScenarioStep::Assert { .. } => "assert",
         }
     }
 }
@@ -271,6 +332,8 @@ pub struct ScenarioReport {
     /// Authoritative compiler output executed by the selected adapter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -600,6 +663,7 @@ struct ScenarioStepOutputs {
     admin_policy_observations: Vec<ScenarioAdminPolicyObservation>,
     error_observations: Vec<ScenarioErrorObservation>,
     quiescence_observations: Vec<QuiescenceObservation>,
+    assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
 }
 
 async fn execute_scenario_step(
@@ -617,6 +681,7 @@ async fn execute_scenario_step(
         admin_policy_observations,
         error_observations,
         quiescence_observations,
+        assertion_observations,
     } = outputs;
     match step {
         ScenarioStep::CreateGroup {
@@ -900,6 +965,31 @@ async fn execute_scenario_step(
                 .reorder_queued(order)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
+        ScenarioStep::OmitMessage { selector } => {
+            subject_faults(subject, step_index)?
+                .omit_message(selector)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::DuplicateMessage { selector } => {
+            subject_faults(subject, step_index)?
+                .duplicate_message(selector)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::WithholdMessage { selector, label } => {
+            subject_faults(subject, step_index)?
+                .withhold_message(selector, label)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ReleaseWithheld { label } => {
+            subject_faults(subject, step_index)?
+                .release_withheld(label)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ReorderMessages { order } => {
+            subject_faults(subject, step_index)?
+                .reorder_messages(order)
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
         ScenarioStep::SetPartition { allow } => {
             subject_faults(subject, step_index)?
                 .set_partition(allow)
@@ -913,9 +1003,152 @@ async fn execute_scenario_step(
                 .restart(client)
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
+        ScenarioStep::SetClientOffline { client } => subject
+            .set_client_online(client, false)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ReconnectClient { client } => subject
+            .set_client_online(client, true)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::CrashProcess { process } => subject
+            .crash_process(process)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RestartProcess { process } => subject
+            .restart_process(process)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::InjectStorageFault { fault } => subject
+            .inject_storage_fault(fault)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::ClearStorageFault { target } => subject
+            .clear_storage_fault(target)
+            .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::Barrier { .. } => {}
+        ScenarioStep::Assert { assertion } => {
+            let observation = execute_assertion(assertion, subject, &spec.clients, step_index)
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+            let passed = observation.passed;
+            let final_actual = observation.final_actual.clone();
+            assertion_observations.push(observation);
+            if !passed {
+                return Err(err(
+                    step_index,
+                    format!("scenario assertion failed; final actual {final_actual}"),
+                ));
+            }
+        }
     }
     Ok::<(), ScenarioRunError>(())
+}
+
+async fn execute_assertion(
+    assertion: &crate::ScenarioAssertionV2,
+    subject: &mut dyn ConvergenceSubject,
+    clients: &[String],
+    step_index: usize,
+) -> Result<crate::ScenarioAssertionObservationV2, SubjectError> {
+    use crate::ScenarioAssertionV2;
+
+    let mut samples = 0_usize;
+    let mut elapsed_virtual_ms = 0_u64;
+    let mut final_actual = serde_json::Value::Null;
+    let passed = match assertion {
+        ScenarioAssertionV2::Exactly { predicate } => {
+            let observation = subject.evaluate_predicate(predicate)?;
+            samples = 1;
+            final_actual = observation.actual;
+            observation.matched
+        }
+        ScenarioAssertionV2::Eventually {
+            predicate,
+            max_iterations,
+        } => {
+            let mut matched = false;
+            for iteration in 0..=*max_iterations {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    matched = true;
+                    break;
+                }
+                if iteration < *max_iterations {
+                    subject.tick(clients).await?;
+                }
+            }
+            matched
+        }
+        ScenarioAssertionV2::Within {
+            predicate,
+            timeout_ms,
+            poll_interval_ms,
+        } => {
+            let mut matched = false;
+            loop {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    matched = true;
+                    break;
+                }
+                if elapsed_virtual_ms == *timeout_ms {
+                    break;
+                }
+                let delta = (*timeout_ms - elapsed_virtual_ms).min(*poll_interval_ms);
+                subject.advance_time(delta).await?;
+                elapsed_virtual_ms += delta;
+                subject.tick(clients).await?;
+            }
+            matched
+        }
+        ScenarioAssertionV2::Never {
+            predicate,
+            duration_ms,
+            poll_interval_ms,
+        } => {
+            let mut never_matched = true;
+            loop {
+                let observation = subject.evaluate_predicate(predicate)?;
+                samples += 1;
+                final_actual = observation.actual;
+                if observation.matched {
+                    never_matched = false;
+                    break;
+                }
+                if elapsed_virtual_ms == *duration_ms {
+                    break;
+                }
+                let delta = (*duration_ms - elapsed_virtual_ms).min(*poll_interval_ms);
+                subject.advance_time(delta).await?;
+                elapsed_virtual_ms += delta;
+                subject.tick(clients).await?;
+            }
+            never_matched
+        }
+        ScenarioAssertionV2::Resource {
+            metric,
+            comparison,
+            value,
+        } => {
+            let snapshot = subject.structural_progress()?;
+            let actual = crate::resource_value(&snapshot, *metric);
+            samples = 1;
+            final_actual = serde_json::json!({
+                "metric": metric,
+                "value": actual,
+                "structural_token": snapshot.structural_token,
+            });
+            comparison.matches(actual, *value)
+        }
+    };
+    Ok(crate::ScenarioAssertionObservationV2 {
+        step_index,
+        assertion: assertion.clone(),
+        passed,
+        samples,
+        elapsed_virtual_ms,
+        final_actual,
+    })
 }
 
 async fn run_scenario_report_inner(
@@ -962,6 +1195,7 @@ async fn run_scenario_report_inner(
         admin_policy_observations,
         error_observations,
         quiescence_observations,
+        assertion_observations,
     } = outputs;
 
     let observed_trace = ScenarioTrace {
@@ -1044,6 +1278,7 @@ async fn run_scenario_report_inner(
         scenario: spec.clone(),
         resolved_topology: compiled.topology.clone(),
         expanded_schedule: compiled.expanded_schedule(),
+        assertion_observations,
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),

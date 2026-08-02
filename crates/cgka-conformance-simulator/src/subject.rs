@@ -25,7 +25,7 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -47,6 +47,11 @@ pub enum SubjectCapability {
     WhiteBoxTransportQueueFaults,
     WhiteBoxTransportPartition,
     WhiteBoxStorageFaults,
+    SemanticTransportFaults,
+    ParticipantConnectivity,
+    ProcessLifecycle,
+    StorageFaultInjection,
+    AssertionEvaluation,
 }
 
 impl SubjectCapability {
@@ -66,6 +71,11 @@ impl SubjectCapability {
             Self::WhiteBoxTransportQueueFaults => "white_box_transport_queue_faults",
             Self::WhiteBoxTransportPartition => "white_box_transport_partition",
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
+            Self::SemanticTransportFaults => "semantic_transport_faults",
+            Self::ParticipantConnectivity => "participant_connectivity",
+            Self::ProcessLifecycle => "process_lifecycle",
+            Self::StorageFaultInjection => "storage_fault_injection",
+            Self::AssertionEvaluation => "assertion_evaluation",
         }
     }
 
@@ -385,6 +395,15 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    fn evaluate_predicate(
+        &mut self,
+        _predicate: &crate::ScenarioPredicateV2,
+    ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::AssertionEvaluation,
+        ))
+    }
+
     fn clear_events(&mut self, _clients: &[String]) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::EventObservation,
@@ -393,6 +412,39 @@ pub trait ConvergenceSubject: Send {
 
     fn restart(&mut self, _client: &str) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::CrashReopen))
+    }
+
+    fn set_client_online(&mut self, _client: &str, _online: bool) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ParticipantConnectivity,
+        ))
+    }
+
+    fn crash_process(&mut self, _process: &str) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ProcessLifecycle,
+        ))
+    }
+
+    fn restart_process(&mut self, _process: &str) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ProcessLifecycle,
+        ))
+    }
+
+    fn inject_storage_fault(
+        &mut self,
+        _fault: &crate::ScenarioStorageFaultV2,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::StorageFaultInjection,
+        ))
+    }
+
+    fn clear_storage_fault(&mut self, _target: &str) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::StorageFaultInjection,
+        ))
     }
 
     fn fault_injection(&mut self) -> Option<&mut dyn ConvergenceFaultSubject> {
@@ -409,6 +461,24 @@ pub trait ConvergenceFaultSubject {
     fn reorder_queued(&mut self, order: &[usize]) -> Result<(), SubjectError>;
     fn set_partition(&mut self, allow: &[String]) -> Result<(), SubjectError>;
     fn clear_partition(&mut self) -> Result<(), SubjectError>;
+    fn omit_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+    ) -> Result<(), SubjectError>;
+    fn duplicate_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+    ) -> Result<(), SubjectError>;
+    fn withhold_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+        label: &str,
+    ) -> Result<(), SubjectError>;
+    fn release_withheld(&mut self, label: &str) -> Result<(), SubjectError>;
+    fn reorder_messages(
+        &mut self,
+        order: &[crate::ScenarioMessageSelectorV2],
+    ) -> Result<(), SubjectError>;
 }
 
 /// Complete capability set used by a scenario step. Most operations need one
@@ -417,6 +487,26 @@ pub trait ConvergenceFaultSubject {
 pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
     if matches!(step, ScenarioStep::Barrier { .. }) {
         return Vec::new();
+    }
+    if let ScenarioStep::Assert { assertion } = step {
+        return match assertion {
+            crate::ScenarioAssertionV2::Exactly { .. } => {
+                vec![SubjectCapability::AssertionEvaluation]
+            }
+            crate::ScenarioAssertionV2::Eventually { .. } => vec![
+                SubjectCapability::AssertionEvaluation,
+                SubjectCapability::TransportDelivery,
+            ],
+            crate::ScenarioAssertionV2::Within { .. }
+            | crate::ScenarioAssertionV2::Never { .. } => vec![
+                SubjectCapability::AssertionEvaluation,
+                SubjectCapability::TransportDelivery,
+                SubjectCapability::VirtualTime,
+            ],
+            crate::ScenarioAssertionV2::Resource { .. } => {
+                vec![SubjectCapability::StructuralProgress]
+            }
+        };
     }
     if let ScenarioStep::AwaitQuiescence { policy } = step {
         let mut capabilities = vec![
@@ -453,6 +543,15 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             }
             ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
+            ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
+                SubjectCapability::ParticipantConnectivity
+            }
+            ScenarioStep::CrashProcess { .. } | ScenarioStep::RestartProcess { .. } => {
+                SubjectCapability::ProcessLifecycle
+            }
+            ScenarioStep::InjectStorageFault { .. } | ScenarioStep::ClearStorageFault { .. } => {
+                SubjectCapability::StorageFaultInjection
+            }
             ScenarioStep::DropQueued { .. }
             | ScenarioStep::DuplicateQueued { .. }
             | ScenarioStep::DelayQueued { .. }
@@ -461,7 +560,13 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
                 SubjectCapability::WhiteBoxTransportPartition
             }
+            ScenarioStep::OmitMessage { .. }
+            | ScenarioStep::DuplicateMessage { .. }
+            | ScenarioStep::WithholdMessage { .. }
+            | ScenarioStep::ReleaseWithheld { .. }
+            | ScenarioStep::ReorderMessages { .. } => SubjectCapability::SemanticTransportFaults,
             ScenarioStep::Barrier { .. } => unreachable!("handled above"),
+            ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
         }]
     }
@@ -545,6 +650,8 @@ impl EngineHarnessSubject {
             SubjectCapability::StructuralProgress,
             SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
+            SubjectCapability::SemanticTransportFaults,
+            SubjectCapability::AssertionEvaluation,
         ]);
         Ok(Self {
             descriptor: SubjectDescriptor {
@@ -694,6 +801,54 @@ impl EngineHarnessSubject {
         self.clients
             .get_mut(label)
             .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {label}")))
+    }
+
+    fn semantic_queue_index(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+    ) -> Result<usize, SubjectError> {
+        if !selector.is_semantic() {
+            return Err(SubjectError::new(
+                "empty_message_selector",
+                "message selector must constrain action, publication, sender, or class",
+            ));
+        }
+        if selector.publication.is_some() {
+            let clients = self.clients.keys().cloned().collect::<Vec<_>>();
+            for client in clients {
+                self.sync_client_outbound(&client)?;
+            }
+        }
+        let sender = selector
+            .sender
+            .as_deref()
+            .map(|sender| self.client(sender).map(|client| client.bus_id))
+            .transpose()?;
+        let publication_ids = selector.publication.as_ref().map(|publication| {
+            self.outbound_records
+                .values()
+                .filter(|record| record.artifact.publication.as_ref() == Some(publication))
+                .map(|record| record.artifact.message.id.clone())
+                .collect::<HashSet<_>>()
+        });
+        if selector.publication.is_some() && publication_ids.as_ref().is_some_and(HashSet::is_empty)
+        {
+            return Err(SubjectError::new(
+                "unknown_publication_selector",
+                format!(
+                    "no emitted transport artifacts match publication {:?}",
+                    selector.publication
+                ),
+            ));
+        }
+        self.bus
+            .semantic_queue_index(selector, sender, publication_ids.as_ref())
+            .ok_or_else(|| {
+                SubjectError::new(
+                    "message_selector_no_match",
+                    format!("no queued transport object matches {selector:?}"),
+                )
+            })
     }
 
     async fn fresh_key_packages(
@@ -1346,6 +1501,78 @@ impl ConvergenceSubject for EngineHarnessSubject {
             .collect()
     }
 
+    fn evaluate_predicate(
+        &mut self,
+        predicate: &crate::ScenarioPredicateV2,
+    ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+        use crate::ScenarioPredicateV2;
+        let (matched, actual) = match predicate {
+            ScenarioPredicateV2::ClientState {
+                client,
+                epoch,
+                member_count,
+            } => {
+                let observations = self.observe(&[client.clone()])?;
+                let observation = observations.first().ok_or_else(|| {
+                    SubjectError::new(
+                        "missing_observation",
+                        format!("no observation for {client}"),
+                    )
+                })?;
+                (
+                    epoch.is_none_or(|epoch| observation.epoch == epoch)
+                        && member_count
+                            .is_none_or(|member_count| observation.member_count == member_count),
+                    serde_json::json!(observation),
+                )
+            }
+            ScenarioPredicateV2::PayloadCount {
+                client,
+                payload,
+                count,
+            } => {
+                let observations = self.observe(&[client.clone()])?;
+                let observation = observations.first().ok_or_else(|| {
+                    SubjectError::new(
+                        "missing_observation",
+                        format!("no observation for {client}"),
+                    )
+                })?;
+                let actual_count = observation
+                    .received_payloads
+                    .iter()
+                    .filter(|candidate| *candidate == payload)
+                    .count();
+                (
+                    actual_count == *count,
+                    serde_json::json!({"count": actual_count}),
+                )
+            }
+            ScenarioPredicateV2::ClientsExactlyEquivalent { clients } => {
+                let observations = self.observe_exact(clients)?;
+                let states = observations
+                    .iter()
+                    .map(|observation| observation.canonical_state.as_ref())
+                    .collect::<Vec<_>>();
+                let matched = states.first().is_some_and(|first| {
+                    first.is_some() && states.iter().all(|state| state == first)
+                });
+                (matched, serde_json::json!(observations))
+            }
+            ScenarioPredicateV2::NoPendingWork { clients } => {
+                let observations = self.observe_exact(clients)?;
+                let matched = observations.iter().all(|observation| {
+                    observation
+                        .pending_work
+                        .as_ref()
+                        .is_some_and(crate::PendingWorkObservation::is_empty)
+                });
+                (matched, serde_json::json!(observations))
+            }
+        };
+        Ok(crate::ScenarioPredicateObservationV2 { matched, actual })
+    }
+
     fn clear_events(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for label in clients {
             let client = self.client_mut(label)?;
@@ -1433,6 +1660,74 @@ impl ConvergenceFaultSubject for EngineHarnessSubject {
     fn clear_partition(&mut self) -> Result<(), SubjectError> {
         self.bus.set_partition(None);
         Ok(())
+    }
+
+    fn omit_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+    ) -> Result<(), SubjectError> {
+        let index = self.semantic_queue_index(selector)?;
+        if self.bus.drop_queued(index) {
+            Ok(())
+        } else {
+            Err(SubjectError::new(
+                "selected_message_disappeared",
+                "selected message disappeared before omission",
+            ))
+        }
+    }
+
+    fn duplicate_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+    ) -> Result<(), SubjectError> {
+        let index = self.semantic_queue_index(selector)?;
+        if self.bus.duplicate_queued(index) {
+            Ok(())
+        } else {
+            Err(SubjectError::new(
+                "selected_message_disappeared",
+                "selected message disappeared before duplication",
+            ))
+        }
+    }
+
+    fn withhold_message(
+        &mut self,
+        selector: &crate::ScenarioMessageSelectorV2,
+        label: &str,
+    ) -> Result<(), SubjectError> {
+        let index = self.semantic_queue_index(selector)?;
+        if self.bus.delay_queued(index, label.to_owned()) {
+            Ok(())
+        } else {
+            Err(SubjectError::new(
+                "selected_message_disappeared",
+                "selected message disappeared before withholding",
+            ))
+        }
+    }
+
+    fn release_withheld(&mut self, label: &str) -> Result<(), SubjectError> {
+        self.release_delayed(label)
+    }
+
+    fn reorder_messages(
+        &mut self,
+        order: &[crate::ScenarioMessageSelectorV2],
+    ) -> Result<(), SubjectError> {
+        let indices = order
+            .iter()
+            .map(|selector| self.semantic_queue_index(selector))
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.bus.reorder_queued(&indices) {
+            Ok(())
+        } else {
+            Err(SubjectError::new(
+                "invalid_semantic_queue_order",
+                "semantic reorder must select every queued message exactly once",
+            ))
+        }
     }
 }
 
