@@ -616,6 +616,7 @@ mod tests {
                 clients: Vec::new(),
                 steps: Vec::new(),
             },
+            expanded_schedule: Vec::new(),
             expected_trace: None,
             expected_outcomes: Vec::new(),
             observed_trace: None,

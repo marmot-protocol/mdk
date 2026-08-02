@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/marmot-protocol/mdk/cgka-conformance-simulator/scenario-ir.v2.schema.json",
+  "title": "MDK adapter-neutral scenario IR v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "spec_version", "clients", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "spec_version": { "const": "2" },
+    "clients": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    }
+  },
+  "$defs": {
+    "string_array": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "creator", "name", "invitees", "pending"],
+          "properties": {
+            "type": { "const": "create_group" },
+            "creator": { "type": "string", "minLength": 1 },
+            "name": { "type": "string" },
+            "invitees": { "$ref": "#/$defs/string_array" },
+            "required_features": { "$ref": "#/$defs/string_array" },
+            "initial_admins": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "inviter", "invitees", "pending"],
+          "properties": {
+            "type": { "const": "invite_members" },
+            "inviter": { "type": "string", "minLength": 1 },
+            "invitees": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "name", "pending"],
+          "properties": {
+            "type": { "const": "update_group_data" },
+            "client": { "type": "string", "minLength": 1 },
+            "name": { "type": "string" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "admins", "pending"],
+          "properties": {
+            "type": { "const": "update_admin_policy" },
+            "client": { "type": "string", "minLength": 1 },
+            "admins": { "$ref": "#/$defs/string_array" },
+            "pending": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "admins", "error"],
+          "properties": {
+            "type": { "const": "expect_update_admin_policy_error" },
+            "client": { "type": "string", "minLength": 1 },
+            "admins": { "$ref": "#/$defs/string_array" },
+            "error": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client", "outcome"],
+          "properties": {
+            "type": { "const": "acknowledge_outbound" },
+            "client": { "type": "string", "minLength": 1 },
+            "publication": { "type": "string", "minLength": 1 },
+            "selection": {
+              "enum": ["all", "state_confirmation", "welcome", "group_message", "regenerated_queued_intent"]
+            },
+            "outcome": { "enum": ["accepted", "reached_no_endpoint"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "sender", "payload"],
+          "properties": {
+            "type": { "const": "send_app_message" },
+            "sender": { "type": "string", "minLength": 1 },
+            "payload": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "leave" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "deliver_all" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "tick" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "delta_ms"],
+          "properties": {
+            "type": { "const": "advance_time" },
+            "delta_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "await_quiescence" },
+            "policy": { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe_exact" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "probe_bidirectional_decryptability" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "observe_admin_policy" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "clients"],
+          "properties": {
+            "type": { "const": "clear_events" },
+            "clients": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "index"],
+          "properties": {
+            "type": { "const": "drop_queued" },
+            "index": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "index"],
+          "properties": {
+            "type": { "const": "duplicate_queued" },
+            "index": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "index", "delayed"],
+          "properties": {
+            "type": { "const": "delay_queued" },
+            "index": { "type": "integer", "minimum": 0 },
+            "delayed": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "delayed"],
+          "properties": {
+            "type": { "const": "release_delayed" },
+            "delayed": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "order"],
+          "properties": {
+            "type": { "const": "reorder_queued" },
+            "order": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "allow"],
+          "properties": {
+            "type": { "const": "set_partition" },
+            "allow": { "$ref": "#/$defs/string_array" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "clear_partition" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "client"],
+          "properties": {
+            "type": { "const": "restart_client" },
+            "client": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

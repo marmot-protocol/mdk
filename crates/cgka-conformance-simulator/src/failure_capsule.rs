@@ -258,28 +258,19 @@ impl FailureCapsuleV1 {
     ) -> Result<Self, FailureCapsuleError> {
         let captured_transport = bound_transport_capture(captured_transport);
         let failure = fingerprint_report_failure(&report)?;
-        let mut virtual_time_ms = 0_u64;
         let expanded_schedule = report
-            .scenario
-            .steps
+            .expanded_schedule
             .iter()
-            .enumerate()
-            .map(|(step_index, step)| {
-                let action = ExpandedScenarioActionV1 {
-                    action_id: format!("step-{step_index}:{}", step.kind()),
-                    step_index,
-                    action_type: step.kind().into(),
-                    virtual_time_ms,
-                    status: report
-                        .step_log
-                        .iter()
-                        .find(|entry| entry.step_index == step_index)
-                        .map(|entry| entry.status.clone()),
-                };
-                if let ScenarioStep::AdvanceTime { delta_ms } = step {
-                    virtual_time_ms = virtual_time_ms.saturating_add(*delta_ms);
-                }
-                action
+            .map(|scheduled| ExpandedScenarioActionV1 {
+                action_id: scheduled.action_id.clone(),
+                step_index: scheduled.source_step_index,
+                action_type: scheduled.action_type.clone(),
+                virtual_time_ms: scheduled.virtual_time_ms,
+                status: report
+                    .step_log
+                    .iter()
+                    .find(|entry| entry.step_index == scheduled.source_step_index)
+                    .map(|entry| entry.status.clone()),
             })
             .collect();
         let quiescence_by_action = report
@@ -289,7 +280,7 @@ impl FailureCapsuleV1 {
             .enumerate()
             .filter_map(|(step_index, step)| match step {
                 ScenarioStep::AwaitQuiescence { policy } => {
-                    Some((format!("step-{step_index}:{}", step.kind()), policy.clone()))
+                    Some((crate::stable_action_id(step_index, step), policy.clone()))
                 }
                 _ => None,
             })

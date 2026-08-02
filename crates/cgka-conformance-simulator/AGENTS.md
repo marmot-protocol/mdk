@@ -85,6 +85,11 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
     `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
 
+- **Module:** `src/scenario_ir.rs`
+  - **Role:** Canonical ScenarioSpec v2 compiler. It validates input, assigns stable action ids, records the deterministic
+    virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
+    selected subject executes anything. The JSON contract is `schemas/scenario-ir.v2.schema.json`.
+
 - **Module:** `src/subject.rs`
   - **Role:** Simulator-owned `ConvergenceSubject` boundary and the built-in `EngineHarnessSubject` adapter. The
     scenario runner owns step semantics and stable action ids; subjects implement semantic group, publication,

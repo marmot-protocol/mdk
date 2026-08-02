@@ -34,6 +34,7 @@ mod quiescence;
 pub mod report;
 pub mod scenario;
 mod scenario_input_ledger;
+mod scenario_ir;
 pub mod subject;
 pub mod vector;
 
@@ -98,6 +99,10 @@ pub use scenario::{
 };
 pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+};
+pub use scenario_ir::{
+    CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_VERSION, ScenarioActionScheduleV2,
+    compile_scenario, preflight_compiled_scenario, stable_action_id,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,

@@ -12,12 +12,11 @@ use crate::{
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
     SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation,
-    VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
-    drive_subject_to_quiescence, required_capabilities,
+    VectorFixture, build_scenario_oracle_report, compare_trace_expectations, compile_scenario,
+    drive_subject_to_quiescence, preflight_compiled_scenario, stable_action_id,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +159,34 @@ pub enum ScenarioStep {
 }
 
 impl ScenarioStep {
+    pub const KINDS: &'static [&'static str] = &[
+        "create_group",
+        "invite_members",
+        "update_group_data",
+        "update_admin_policy",
+        "expect_update_admin_policy_error",
+        "acknowledge_outbound",
+        "send_app_message",
+        "leave",
+        "deliver_all",
+        "tick",
+        "advance_time",
+        "await_quiescence",
+        "observe",
+        "observe_exact",
+        "probe_bidirectional_decryptability",
+        "observe_admin_policy",
+        "clear_events",
+        "drop_queued",
+        "duplicate_queued",
+        "delay_queued",
+        "release_delayed",
+        "reorder_queued",
+        "set_partition",
+        "clear_partition",
+        "restart_client",
+    ];
+
     pub fn accept_publication(client: impl Into<String>, publication: impl Into<String>) -> Self {
         Self::AcknowledgeOutbound {
             client: client.into(),
@@ -215,6 +242,9 @@ impl ScenarioStep {
 pub struct ScenarioReport {
     pub metadata: ScenarioReportMetadata,
     pub scenario: ScenarioSpec,
+    /// Authoritative compiler output executed by the selected adapter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_schedule: Vec<crate::ScenarioActionScheduleV2>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -844,11 +874,14 @@ async fn run_scenario_report_inner(
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let descriptor = subject.descriptor();
-    validate_scenario_for_subject(spec, &descriptor)?;
+    let compiled = compile_scenario(spec)?;
+    preflight_compiled_scenario(&compiled, &descriptor)?;
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
 
-    for (step_index, step) in spec.steps.iter().enumerate() {
+    for action in &compiled.actions {
+        let step_index = action.schedule.source_step_index;
+        let step = &action.step;
         let step_result =
             execute_scenario_step(spec, step_index, step, subject, &mut outputs).await;
         if let Err(error) = step_result {
@@ -950,13 +983,14 @@ async fn run_scenario_report_inner(
         metadata: ScenarioReportMetadata {
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
-            step_count: spec.steps.len(),
+            step_count: compiled.actions.len(),
             storage_backend: descriptor.storage_backend.clone(),
             subject: Some(descriptor),
             generated: None,
             fixture,
         },
         scenario: spec.clone(),
+        expanded_schedule: compiled.expanded_schedule(),
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),
@@ -973,7 +1007,7 @@ async fn run_scenario_report_inner(
 }
 
 fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
-    format!("step-{step_index}:{}", step.kind())
+    stable_action_id(step_index, step)
 }
 
 /// Validate adapter support before the first scenario action is executed.
@@ -981,41 +1015,8 @@ pub fn validate_scenario_for_subject(
     spec: &ScenarioSpec,
     descriptor: &SubjectDescriptor,
 ) -> Result<(), ScenarioRunError> {
-    if spec.spec_version != "2" {
-        return Err(ScenarioRunError {
-            step_index: None,
-            kind: "unsupported_scenario_version".into(),
-            category: SubjectFailureCategory::Environment,
-            message: format!("unsupported ScenarioSpec version {}", spec.spec_version),
-        });
-    }
-    let mut clients = BTreeSet::new();
-    for label in &spec.clients {
-        if !clients.insert(label) {
-            return Err(ScenarioRunError {
-                step_index: None,
-                kind: "duplicate_client".into(),
-                category: SubjectFailureCategory::Environment,
-                message: format!("duplicate client label {label}"),
-            });
-        }
-    }
-    for (step_index, step) in spec.steps.iter().enumerate() {
-        for capability in required_capabilities(step) {
-            if !descriptor.supports(capability) {
-                return Err(err(
-                    step_index,
-                    format!(
-                        "subject {} does not support capability {} required by {}",
-                        descriptor.adapter,
-                        capability,
-                        step.kind()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
+    let compiled = compile_scenario(spec)?;
+    preflight_compiled_scenario(&compiled, descriptor)
 }
 
 fn scenario_initial_admins(
@@ -1134,8 +1135,10 @@ fn ensure_execution_succeeded(report: &ScenarioReport) -> Result<(), ScenarioRun
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::required_capabilities;
     use crate::{SubjectCapability, SubjectSendApplication};
     use async_trait::async_trait;
+    use std::collections::BTreeSet;
 
     struct RecordingSubject {
         descriptor: SubjectDescriptor,

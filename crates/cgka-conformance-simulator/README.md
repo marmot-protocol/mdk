@@ -23,9 +23,10 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
   `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
   typed `accepted` / `reached_no_endpoint` outcomes through opaque adapter-owned acknowledgement handles.
-- `ScenarioSpec` — a serializable v2 input contract for deterministic scripted scenarios, including explicit outbound
-  acknowledgement and queue
-  faults and partitions.
+- `ScenarioSpec` — the canonical JSON v2 input contract for deterministic scripted scenarios, including explicit
+  outbound acknowledgement, queue faults, and partitions. The runner compiles the whole document into a stable action
+  schedule and preflights every required adapter capability before executing the first action; the schema is
+  `schemas/scenario-ir.v2.schema.json`.
 - `SubjectProgressSnapshot` and `await_quiescence` — a sanitized structural work/deadline contract plus a bounded
   virtual-time fixed-point driver. It accepts and delivers healthy-path transport according to explicit policy, advances
   exactly to the earliest subject wake, and records quiescent, blocked, or watchdog-timeout artifacts.
