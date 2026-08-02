@@ -168,6 +168,16 @@ fn validate_step(
                     clients,
                     "group creation administrators",
                 )?;
+                for admin in initial_admins {
+                    if admin != creator && !invitees.contains(admin) {
+                        return Err(compile_error(
+                            Some(step_index),
+                            format!(
+                                "group creation administrator {admin} is neither the creator nor an invitee"
+                            ),
+                        ));
+                    }
+                }
             }
         }
         ScenarioStep::InviteMembers {
@@ -713,6 +723,29 @@ mod tests {
         for step in steps {
             assert_step_compile_error(step, "unknown client bob");
         }
+    }
+
+    #[test]
+    fn group_creation_rejects_declared_nonmember_initial_admin() {
+        let spec = ScenarioSpec {
+            name: "compile/nonmember-initial-admin".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "bob".into(), "mallory".into()],
+            steps: vec![ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "group".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["mallory".into()]),
+                pending: "create".into(),
+            }],
+        };
+
+        let error = compile_scenario(&spec).expect_err("nonmember admin must be rejected");
+        assert_eq!(error.kind, "scenario_compile_error");
+        assert_eq!(error.step_index, Some(0));
+        assert!(error.message.contains("neither the creator nor an invitee"));
     }
 
     #[test]
