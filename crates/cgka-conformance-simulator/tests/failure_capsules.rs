@@ -5,13 +5,12 @@ use cgka_conformance_simulator::VectorMismatch;
 use cgka_conformance_simulator::{
     CapturedTransportArtifactV1, ClientBuilder, EngineByteReplayV1, FailureCapsuleError,
     FailureCapsuleSensitivity, FailureCapsuleV1, TerminalOutcomeClassification, TransportBus,
-    build_fingerprint, digest_json, promote_failure_capsule_to_vector, read_failure_capsule,
-    replay_engine_bytes, run_scenario_report, write_failure_capsule,
+    build_fingerprint, digest_json, engine_harness_feature_registry, fingerprint_report_failure,
+    promote_failure_capsule_to_vector, read_failure_capsule, replay_engine_bytes,
+    run_scenario_report, write_failure_capsule,
 };
 use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep};
-use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0_u8; 32];
@@ -19,27 +18,14 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     out
 }
 
-fn scenario_registry() -> FeatureRegistry {
-    let mut registry = FeatureRegistry::new();
-    registry.register(
-        Feature("self-remove"),
-        CapabilityRequirement {
-            requires: Capability::Proposal(10),
-            level: RequirementLevel::Required,
-            description: "MIP-03",
-        },
-    );
-    registry
-}
-
 #[tokio::test]
 async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))
-        .registry(scenario_registry())
+        .registry(engine_harness_feature_registry())
         .attach(&bus);
     let mut bob = ClientBuilder::new(pad32(b"bob"))
-        .registry(scenario_registry())
+        .registry(engine_harness_feature_registry())
         .attach(&bus);
     let bob_key_package = bob.fresh_key_package().await;
     let (group_id, create) = alice
@@ -84,7 +70,7 @@ async fn exact_captured_commit_replays_from_sensitive_checkpoint() {
 
     let debug_bus = TransportBus::ordered();
     let mut debug_bob = ClientBuilder::new(pad32(b"bob"))
-        .registry(scenario_registry())
+        .registry(engine_harness_feature_registry())
         .attach(&debug_bus);
     debug_bob
         .restore_conformance_replay_checkpoint(&group_id, &replay.sensitive_checkpoint)
@@ -264,6 +250,40 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
     assert!(
         incorrectly_shareable.validate().is_err(),
         "a capsule containing key material must be sensitive_local"
+    );
+    assert!(
+        FailureCapsuleV1::from_report(
+            capsule.report.clone(),
+            FailureCapsuleSensitivity::SyntheticShareable,
+            Vec::new(),
+            incorrectly_shareable.byte_replay.clone(),
+        )
+        .is_err(),
+        "construction must reject a shareable capsule containing key material"
+    );
+
+    let mut first_failed_report = capsule.report.clone();
+    first_failed_report
+        .step_log
+        .push(cgka_conformance_simulator::ScenarioStepLogEntry {
+            step_index: 7,
+            step_type: "tick".into(),
+            status: cgka_conformance_simulator::ScenarioStepStatus::Failed {
+                kind: "backend".into(),
+                message: "backend error at /tmp/first.sqlite".into(),
+            },
+        });
+    let mut second_failed_report = first_failed_report.clone();
+    let cgka_conformance_simulator::ScenarioStepStatus::Failed { message, .. } =
+        &mut second_failed_report.step_log.last_mut().unwrap().status
+    else {
+        unreachable!("the appended step is failed");
+    };
+    *message = "backend error at /different/host/second.sqlite".into();
+    assert_eq!(
+        fingerprint_report_failure(&first_failed_report).expect("first fingerprint"),
+        fingerprint_report_failure(&second_failed_report).expect("second fingerprint"),
+        "free-form backend text must not affect the stable failure fingerprint"
     );
 
     let dir = tempfile::tempdir().expect("temporary capsule directory");

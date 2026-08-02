@@ -1,9 +1,9 @@
-#[cfg(feature = "test-conformance-replay")]
-use super::rows::ReplaySnapshot;
 use super::rows::{
     MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
     Snapshot,
 };
+#[cfg(feature = "test-conformance-replay")]
+use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, created_at_to_i64,
@@ -72,7 +72,7 @@ pub(super) fn import(
     snapshot_blob: &[u8],
 ) -> StorageResult<()> {
     let snapshot: ReplaySnapshot = deserialize(snapshot_blob)?;
-    if snapshot.version != 1 {
+    if snapshot.version != REPLAY_SNAPSHOT_VERSION {
         return Err(StorageError::Serialization(format!(
             "unsupported conformance replay snapshot version {}",
             snapshot.version

@@ -454,7 +454,7 @@ impl EngineHarnessSubject {
                 ));
             }
             let builder = ClientBuilder::new(pad32(label.as_bytes()))
-                .registry(scenario_registry())
+                .registry(engine_harness_feature_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
                 .convergence_clock(Arc::new(convergence_clock.clone()));
@@ -1249,7 +1249,11 @@ fn required_features_from_names(names: &[String]) -> Result<Vec<Feature>, Subjec
         .collect()
 }
 
-pub(crate) fn scenario_registry() -> FeatureRegistry {
+/// Returns the feature registry used by the production-shaped engine harness.
+///
+/// Exact replay tests use this helper so their client capabilities cannot drift
+/// from the clients constructed by [`EngineHarnessSubject`].
+pub fn engine_harness_feature_registry() -> FeatureRegistry {
     let mut registry = FeatureRegistry::new();
     registry.register(
         Feature("self-remove"),

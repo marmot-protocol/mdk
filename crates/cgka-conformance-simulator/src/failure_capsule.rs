@@ -251,7 +251,7 @@ impl FailureCapsuleV1 {
                 ])
             })
             .unwrap_or_default();
-        Ok(Self {
+        let capsule = Self {
             schema_version: FAILURE_CAPSULE_SCHEMA_VERSION.into(),
             sensitivity,
             original_scenario: report.scenario.clone(),
@@ -271,7 +271,9 @@ impl FailureCapsuleV1 {
             failure,
             byte_replay,
             minimized_reproducer,
-        })
+        };
+        capsule.validate()?;
+        Ok(capsule)
     }
 
     pub fn validate(&self) -> Result<(), FailureCapsuleError> {
@@ -385,12 +387,9 @@ pub fn fingerprint_report_failure(
         .iter()
         .filter_map(|step| match &step.status {
             ScenarioStepStatus::Completed => None,
-            ScenarioStepStatus::Failed { kind, message } => Some((
-                step.step_index,
-                step.step_type.as_str(),
-                kind.as_str(),
-                message.as_str(),
-            )),
+            ScenarioStepStatus::Failed { kind, .. } => {
+                Some((step.step_index, step.step_type.as_str(), kind.as_str()))
+            }
         })
         .collect::<Vec<_>>();
     let normalized_state_digest = digest_json(&(
@@ -491,7 +490,7 @@ pub async fn replay_engine_bytes(
     let clock =
         ManualConvergenceClock::new(replay.checkpoint_monotonic_ms, replay.checkpoint_wall_ms);
     let mut client = ClientBuilder::new(replay.identity_seed.clone())
-        .registry(crate::subject::scenario_registry())
+        .registry(crate::subject::engine_harness_feature_registry())
         .protocol_profile(replay.protocol_profile)
         .storage_mode(HarnessStorageMode::InMemorySqlite)
         .convergence_clock(Arc::new(clock))

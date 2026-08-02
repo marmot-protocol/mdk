@@ -1,9 +1,9 @@
-#[cfg(feature = "test-conformance-replay")]
-use super::rows::ReplaySnapshot;
 use super::rows::{
     MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
     Snapshot,
 };
+#[cfg(feature = "test-conformance-replay")]
+use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, deserialize, serialize,
@@ -92,7 +92,7 @@ pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> Storag
         .map(|record| deserialize(&record))
         .transpose()?;
     serialize(&ReplaySnapshot {
-        version: 1,
+        version: REPLAY_SNAPSHOT_VERSION,
         group: capture_snapshot(&conn, group_id)?,
         convergence_pass,
     })

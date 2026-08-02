@@ -432,37 +432,8 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     fixture: &VectorFixture,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let protocol_profile = match fixture
-        .application_profile
-        .as_ref()
-        .map(|profile| profile.name.as_str())
-    {
-        None | Some("legacy") => ProtocolProfile::Legacy,
-        Some("current") => ProtocolProfile::Current,
-        Some(name) => {
-            return Err(ScenarioRunError {
-                step_index: None,
-                kind: "unsupported_application_profile".into(),
-                message: format!("unsupported application profile {name}"),
-            });
-        }
-    };
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
-    run_scenario_report_inner(
-        &fixture.scenario,
-        fixture.expected_trace.clone(),
-        fixture.expected_outcomes.clone(),
-        Some(VectorFixtureMetadata {
-            scenario_name: fixture.scenario_name.clone(),
-            vector_version: fixture.vector_version.clone(),
-            conformance_version: fixture.conformance_version.clone(),
-            seed: fixture.seed,
-        }),
-        &mut subject,
-    )
-    .await
+    let (report, _) = run_vector_fixture_report_with_capture(fixture, storage_mode).await?;
+    Ok(report)
 }
 
 /// Vector runner variant used by the report CLI when it must emit exact wire

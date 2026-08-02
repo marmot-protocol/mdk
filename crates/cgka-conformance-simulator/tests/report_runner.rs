@@ -145,6 +145,18 @@ fn parse_replay_capsule_command() {
 }
 
 #[test]
+fn parse_replay_capsule_rejects_scenario_inputs() {
+    let error = parse_report_command([
+        "--replay-capsule".into(),
+        "target/failure-capsule.v1.json".into(),
+        "--family".into(),
+        "send-leave/v1".into(),
+    ])
+    .expect_err("replay capsule must not combine with family inputs");
+    assert!(error.to_string().contains("--replay-capsule"));
+}
+
+#[test]
 fn parse_rejects_unknown_argument() {
     let err = parse_report_command(["--wat".into()]).expect_err("unknown arg errors");
     assert!(err.to_string().contains("unknown argument --wat"));

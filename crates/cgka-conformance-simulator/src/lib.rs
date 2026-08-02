@@ -100,7 +100,8 @@ pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
     SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capabilities,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, engine_harness_feature_registry,
+    required_capabilities,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

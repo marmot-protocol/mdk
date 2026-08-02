@@ -258,14 +258,11 @@ async fn run_generated_family_reports(
                 case.seed,
                 case.case_index
             ));
-            let capsule = FailureCapsuleV1::from_report(
-                report.clone(),
-                FailureCapsuleSensitivity::SyntheticShareable,
+            Some(write_synthetic_failure_capsule(
+                &report,
                 captured_transport_artifacts,
-                None,
-            )?;
-            write_failure_capsule(&path, &capsule)?;
-            Some(path)
+                path,
+            )?)
         };
         summaries.push(ScenarioReportSummary {
             scenario_name: report.metadata.scenario_name.clone(),
@@ -333,14 +330,11 @@ async fn run_vector_fixture_reports(
                 "{}-failure-capsule.v1.json",
                 fixture.scenario_name.replace('/', "-")
             ));
-            let capsule = FailureCapsuleV1::from_report(
-                report.clone(),
-                FailureCapsuleSensitivity::SyntheticShareable,
+            Some(write_synthetic_failure_capsule(
+                &report,
                 captured_transport_artifacts,
-                None,
-            )?;
-            write_failure_capsule(&path, &capsule)?;
-            Some(path)
+                path,
+            )?)
         };
         summaries.push(ScenarioReportSummary {
             scenario_name: fixture.scenario_name.clone(),
@@ -355,6 +349,21 @@ async fn run_vector_fixture_reports(
         });
     }
     Ok(summaries)
+}
+
+fn write_synthetic_failure_capsule(
+    report: &ScenarioReport,
+    captured_transport_artifacts: Vec<crate::CapturedTransportArtifactV1>,
+    path: PathBuf,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let capsule = FailureCapsuleV1::from_report(
+        report.clone(),
+        FailureCapsuleSensitivity::SyntheticShareable,
+        captured_transport_artifacts,
+        None,
+    )?;
+    write_failure_capsule(&path, &capsule)?;
+    Ok(path)
 }
 
 fn collect_vector_fixture_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn Error>> {

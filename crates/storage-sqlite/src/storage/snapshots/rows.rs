@@ -25,6 +25,9 @@ pub(super) struct Snapshot {
 /// has different semantics and must reconstruct the scheduler state as well as
 /// the group/OpenMLS state that it governs.
 #[cfg(feature = "test-conformance-replay")]
+pub(super) const REPLAY_SNAPSHOT_VERSION: u32 = 1;
+
+#[cfg(feature = "test-conformance-replay")]
 #[derive(Serialize, Deserialize)]
 pub(super) struct ReplaySnapshot {
     pub(super) version: u32,
