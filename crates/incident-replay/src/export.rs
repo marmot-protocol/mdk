@@ -18,6 +18,10 @@ pub struct AgentStateExport {
     pub events: Vec<AuditEvent>,
     #[serde(default)]
     pub derived_projections: DerivedProjections,
+    /// Optional complete, normalized Scenario IR history. Existing Goggles
+    /// exports omit it and remain eligible only for archetype synthesis.
+    #[serde(default)]
+    pub normalized_scenario_history: Option<crate::artifact::NormalizedScenarioHistoryV1>,
 }
 
 /// Server-side projections. Only the pagination cursors are modelled: they carry

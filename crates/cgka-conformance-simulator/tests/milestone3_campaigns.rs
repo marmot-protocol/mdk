@@ -5,6 +5,7 @@ use cgka_conformance_simulator::{
 };
 use cgka_conformance_simulator::{
     SubjectFailureCategory, compile_scenario, generate_milestone3_adversarial_family,
+    generate_milestone3_offline_regression, generate_milestone3_self_update_regression,
     generate_milestone3_sustained_regression, run_generated_case_report,
 };
 #[cfg(feature = "test-policy-overrides")]
@@ -26,7 +27,12 @@ fn milestone3_catalog_covers_every_required_workload_shape() {
 
 async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
     let cases = generate_milestone3_adversarial_family(7, case_index + 1);
-    let case = &cases[case_index];
+    assert_case(&cases[case_index]).await
+}
+
+async fn assert_case(
+    case: &cgka_conformance_simulator::GeneratedScenarioCase,
+) -> cgka_conformance_simulator::ScenarioReport {
     let report = run_generated_case_report(case, None)
         .await
         .unwrap_or_else(|error| panic!("{}: {error}", case.family_name));
@@ -55,7 +61,7 @@ async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator:
 
 #[tokio::test]
 async fn offline_retained_history_flood_runs_as_a_small_regression() {
-    let report = assert_generated_case(0).await;
+    let report = assert_case(&generate_milestone3_offline_regression(7)).await;
     let measurements = &report.campaign_measurements;
     assert_eq!(measurements.schema_version, "1");
     assert!(measurements.total_wall_us > 0);
@@ -76,6 +82,12 @@ async fn offline_retained_history_flood_runs_as_a_small_regression() {
             .iter()
             .any(|field| field == "cpu_time_us")
     );
+}
+
+#[ignore = "multi-round retained-history flood; run explicitly"]
+#[tokio::test]
+async fn offline_retained_history_flood_campaign() {
+    let _ = assert_generated_case(0).await;
 }
 
 #[tokio::test]
@@ -104,6 +116,12 @@ async fn sustained_mixed_traffic_campaign() {
 
 #[tokio::test]
 async fn self_update_admin_race_runs_as_a_small_regression() {
+    let _ = assert_case(&generate_milestone3_self_update_regression(7)).await;
+}
+
+#[ignore = "sustained self-update adversary; run explicitly"]
+#[tokio::test]
+async fn self_update_admin_race_campaign() {
     let _ = assert_generated_case(2).await;
 }
 

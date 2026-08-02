@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marmot-protocol.org/schemas/incident-scenario-artifact.v1.schema.json",
+  "title": "Incident Scenario Artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_format",
+    "replay_fidelity",
+    "evidence_confidence",
+    "source_event_count",
+    "incident_event_indices",
+    "action_evidence",
+    "unavailable_fields",
+    "byte_replay_available",
+    "vector"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "source_format": {
+      "enum": ["agent_state_document", "goggles_group_export_stream"]
+    },
+    "replay_fidelity": {
+      "enum": ["exact_normalized_history", "outcome_equivalent_archetype"]
+    },
+    "evidence_confidence": {
+      "enum": ["exact_normalized_available_evidence", "derived_outcome_equivalent"]
+    },
+    "source_event_count": { "type": "integer", "minimum": 0 },
+    "incident_event_indices": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "action_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step_index", "source_event_indices"],
+        "properties": {
+          "step_index": { "type": "integer", "minimum": 0 },
+          "source_event_indices": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "unavailable_fields": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["field", "reason"],
+        "properties": {
+          "field": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "byte_replay_available": { "const": false },
+    "vector": { "type": "object" }
+  }
+}

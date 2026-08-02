@@ -1231,15 +1231,14 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 initial_admins,
             )
             .await;
-        if let Some(group) = &self.active_scenario_group {
-            if let Some(existing) = self.scenario_groups.insert(group.clone(), group_id.clone())
-                && existing != group_id
-            {
-                return Err(SubjectError::new(
-                    "duplicate_scenario_group",
-                    format!("scenario group {group} was created more than once"),
-                ));
-            }
+        if let Some(group) = &self.active_scenario_group
+            && let Some(existing) = self.scenario_groups.insert(group.clone(), group_id.clone())
+            && existing != group_id
+        {
+            return Err(SubjectError::new(
+                "duplicate_scenario_group",
+                format!("scenario group {group} was created more than once"),
+            ));
         }
         if let Some(pending_ref) = pending_ref {
             self.insert_pending(action.pending, action.creator, pending_ref)?;

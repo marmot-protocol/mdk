@@ -125,11 +125,11 @@ impl CampaignMeasurementsV1 {
             .map(|failure| failure.message.clone())
             .or_else(|| {
                 report.step_log.iter().find_map(|step| match &step.status {
-                    ScenarioStepStatus::Failed { kind, message, .. }
-                        if kind.contains("resource") || message.contains("budget") =>
-                    {
-                        Some(format!("{kind}: {message}"))
-                    }
+                    ScenarioStepStatus::Failed {
+                        kind,
+                        category: crate::SubjectFailureCategory::Resource,
+                        message,
+                    } => Some(format!("{kind}: {message}")),
                     _ => None,
                 })
             });

@@ -697,9 +697,18 @@ mod tests {
         });
 
         let failures = scenario_report_failures(&report, false);
+        let measurements =
+            crate::CampaignMeasurementsV1::from_report(&report, 10, None, 0, None, None);
 
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].kind, "scenario_step_failed:backend");
         assert!(failures[0].message.contains("replay budget exceeded"));
+        assert_eq!(measurements.first_failing_action, Some(4));
+        assert!(
+            measurements
+                .limiting_resource
+                .as_deref()
+                .is_some_and(|resource| resource.contains("replay budget exceeded"))
+        );
     }
 }

@@ -176,6 +176,50 @@ pub fn generate_milestone3_sustained_regression(seed: u64) -> GeneratedScenarioC
     }
 }
 
+/// One-round offline catch-up form for normal regression suites. The catalog
+/// case retains the multi-round retained-history flood.
+pub fn generate_milestone3_offline_regression(seed: u64) -> GeneratedScenarioCase {
+    milestone3_regression_case(seed, 0, |_, case_index| {
+        milestone3_offline_retained_flood_with_rounds(case_index, 1)
+    })
+}
+
+/// Two-update adversary for normal regression suites. The catalog case retains
+/// the sustained self-update stream before the privileged removal race.
+pub fn generate_milestone3_self_update_regression(seed: u64) -> GeneratedScenarioCase {
+    milestone3_regression_case(seed, 2, |_, case_index| {
+        milestone3_self_update_adversary_with_rounds(case_index, 2)
+    })
+}
+
+fn milestone3_regression_case(
+    seed: u64,
+    case_index: u64,
+    build: impl FnOnce(
+        &mut StdRng,
+        u64,
+    ) -> (
+        String,
+        GeneratedSubjectKind,
+        ScenarioSpec,
+        Vec<TraceExpectation>,
+    ),
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
+    let (family_name, subject, mut scenario, mut expected_outcomes) = build(&mut rng, case_index);
+    scenario.name = format!("{family_name}/regression");
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name,
+        generator_version: "1-regression".into(),
+        seed,
+        case_index,
+        subject,
+        scenario,
+        expected_outcomes,
+    }
+}
+
 pub async fn run_generated_case_report(
     case: &GeneratedScenarioCase,
     expected_trace: Option<ScenarioTrace>,
@@ -1136,6 +1180,19 @@ fn milestone3_offline_retained_flood(
     ScenarioSpec,
     Vec<TraceExpectation>,
 ) {
+    let rounds = 3 + usize::try_from((case_index / 12) % 3).unwrap_or(0);
+    milestone3_offline_retained_flood_with_rounds(case_index, rounds)
+}
+
+fn milestone3_offline_retained_flood_with_rounds(
+    case_index: u64,
+    rounds: usize,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
     let clients = labels(["alice", "bob", "carol", "david"]);
     let mut steps = vec![
         ScenarioStep::CreateGroup {
@@ -1153,7 +1210,6 @@ fn milestone3_offline_retained_flood(
             client: "bob".into(),
         },
     ];
-    let rounds = 3 + usize::try_from((case_index / 12) % 3).unwrap_or(0);
     for round in 0..rounds {
         steps.push(ScenarioStep::SendAppMessage {
             sender: "alice".into(),
@@ -1299,13 +1355,25 @@ fn milestone3_self_update_adversary(
     ScenarioSpec,
     Vec<TraceExpectation>,
 ) {
+    milestone3_self_update_adversary_with_rounds(case_index, 12)
+}
+
+fn milestone3_self_update_adversary_with_rounds(
+    case_index: u64,
+    rounds: usize,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
     let clients = labels(["alice", "bob", "carol"]);
     let mut steps = large_group_setup(
         format!("self-update-adversary-{case_index}"),
         clients.clone(),
         labels(["bob", "carol"]),
     );
-    for round in 0..4 {
+    for round in 0..rounds {
         steps.extend([
             ScenarioStep::SelfUpdate {
                 client: "bob".into(),
@@ -1858,10 +1926,14 @@ fn milestone3_account_topology(clients: &[(&str, &str, &str)]) -> crate::Scenari
         accounts: clients
             .iter()
             .filter_map(|(_, account, _)| {
-                accounts.insert(*account).then(|| crate::ScenarioAccountV2 {
-                    id: (*account).into(),
-                    roles: vec!["member".into()],
-                })
+                if accounts.insert(*account) {
+                    Some(crate::ScenarioAccountV2 {
+                        id: (*account).into(),
+                        roles: vec!["member".into()],
+                    })
+                } else {
+                    None
+                }
             })
             .collect(),
         devices: clients

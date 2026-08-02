@@ -346,9 +346,11 @@ impl ClientBuilder {
             &self.registry,
             self.protocol_profile,
             &audit_capture,
-            self.convergence_clock.as_ref(),
-            self.disable_app_witnesses_for_tests,
-            self.replay_probe_budget_override,
+            HarnessEngineOptions {
+                convergence_clock: self.convergence_clock.as_ref(),
+                disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+                replay_probe_budget_override: self.replay_probe_budget_override,
+            },
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         bus.capture_outbound_for(bus_id);
@@ -388,6 +390,12 @@ impl ClientBuilder {
 /// [`CapturingRecorder`] that retains forensic events. `attach` and `restart`
 /// both go through here so a rebuilt engine keeps recording into the same shared
 /// buffer — otherwise a restart would silently drop captured decisions.
+struct HarnessEngineOptions<'a> {
+    convergence_clock: Option<&'a Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
+}
+
 fn build_harness_engine(
     storage: &SqliteAccountStorage,
     identity: &[u8],
@@ -395,9 +403,7 @@ fn build_harness_engine(
     registry: &FeatureRegistry,
     protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
-    convergence_clock: Option<&Arc<dyn ConvergenceClock>>,
-    disable_app_witnesses_for_tests: bool,
-    replay_probe_budget_override: Option<u64>,
+    options: HarnessEngineOptions<'_>,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
@@ -413,21 +419,21 @@ fn build_harness_engine(
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
     }
-    if let Some(clock) = convergence_clock {
+    if let Some(clock) = options.convergence_clock {
         builder = builder.convergence_clock(clock.clone());
     }
     #[cfg(feature = "test-policy-overrides")]
-    if disable_app_witnesses_for_tests {
+    if options.disable_app_witnesses_for_tests {
         builder = builder.without_app_witnesses_for_tests();
     }
     #[cfg(feature = "test-policy-overrides")]
-    if replay_probe_budget_override.is_some() {
-        builder = builder.replay_probe_budget_for_tests(replay_probe_budget_override);
+    if options.replay_probe_budget_override.is_some() {
+        builder = builder.replay_probe_budget_for_tests(options.replay_probe_budget_override);
     }
     #[cfg(not(feature = "test-policy-overrides"))]
     let _ = (
-        disable_app_witnesses_for_tests,
-        replay_probe_budget_override,
+        options.disable_app_witnesses_for_tests,
+        options.replay_probe_budget_override,
     );
     builder.build().expect("engine builds")
 }
@@ -688,9 +694,11 @@ impl HarnessClient {
             &self.registry,
             self.protocol_profile,
             &self.audit_capture,
-            self.convergence_clock.as_ref(),
-            self.disable_app_witnesses_for_tests,
-            self.replay_probe_budget_override,
+            HarnessEngineOptions {
+                convergence_clock: self.convergence_clock.as_ref(),
+                disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+                replay_probe_budget_override: self.replay_probe_budget_override,
+            },
         );
         engine
             .hydrate_stable_groups_from_storage()

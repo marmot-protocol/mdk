@@ -119,6 +119,7 @@ pub fn parse_stream(input: &str) -> Result<AgentStateExport, StreamParseError> {
     Ok(AgentStateExport {
         events,
         derived_projections: Default::default(),
+        normalized_scenario_history: None,
     })
 }
 

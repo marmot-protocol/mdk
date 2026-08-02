@@ -25,8 +25,12 @@
 //! - [`accept`] — [`accept::accept`] / [`accept::accept_convergence`] run the
 //!   synthesized scenario against the simulator and return the vector only if the
 //!   recorded outcome reproduces.
+//! - [`artifact`] — a versioned evidence envelope plus the fail-closed exact
+//!   normalized-history import/accept gate. Archetypes never masquerade as exact
+//!   replay, and byte replay remains unavailable without sensitive local state.
 
 pub mod accept;
+pub mod artifact;
 pub mod classify;
 pub mod convergence;
 pub mod export;
@@ -35,6 +39,12 @@ pub mod ndjson;
 pub mod synth;
 
 pub use accept::{AcceptError, accept, accept_convergence};
+pub use artifact::{
+    EvidenceConfidenceV1, ExactHistoryImportError, IncidentReplayFidelityV1,
+    IncidentScenarioArtifactV1, IncidentSourceFormatV1, NormalizedActionEvidenceV1,
+    NormalizedScenarioHistoryV1, UnavailableEvidenceV1, accept_exact_history, archetype_artifact,
+    import_exact_history,
+};
 pub use classify::{
     BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory,
 };

@@ -101,9 +101,9 @@ cargo test -p cgka-conformance-simulator --features conformance-slow
 # Milestone 3 catalog and small headline regressions.
 cargo test -p cgka-conformance-simulator --test milestone3_campaigns
 
-# Deliberately slow multi-round sustained campaign.
+# Deliberately slow offline, mixed-traffic, and self-update campaigns.
 cargo test -p cgka-conformance-simulator --test milestone3_campaigns \
-  sustained_mixed_traffic_campaign -- --ignored --nocapture
+  -- --ignored --nocapture
 
 # Full generated adversarial catalog with durable report artifacts.
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \

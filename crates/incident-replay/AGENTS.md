@@ -79,6 +79,13 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     single run-and-compare (winner-agnostic
     ⇒ no label search) that returns the vector only when the recorded convergence
     decision reproduces. No reproduction ⇒ `AcceptError` (no vector).
+- **Module:** `src/artifact.rs`
+  - **Role:** Versioned evidence envelope and exact normalized-history gate. Legacy exports produce an explicitly
+    `outcome_equivalent_archetype` artifact with derived confidence and named unavailable fields. Exact import requires
+    a complete Scenario IR history, one source-event mapping per step, explicit source rows establishing the contested
+    incident, semantic expected outcomes, no embedded sensitive state, successful IR compilation, and simulator
+    reproduction. Exact semantic replay still marks raw MLS bytes and the engine checkpoint unavailable; byte replay
+    requires the separate local sensitive capsule path.
 - **Module:** `src/main.rs`
   - **Role:** CLI — classify one export file; for a fork-recovery or convergence
     incident, run the recover → accept → write pipeline. Exits 0 for any
@@ -87,7 +94,9 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     line whenever `liveness_advisory` fires and the primary verdict is not
     already the epoch-divergence quarantine, so an accepted or quarantined
     incident never masks a co-occurring engine left behind (the real e1a04e82
-    export carried both an accepted membership fork and a lag-12 stuck device).
+    export carried both an accepted membership fork and a lag-12 stuck device). When an output directory is supplied,
+    writes both the portable vector and `incident-scenario-artifact.v1` evidence envelope owner-only; it never copies
+    the source export, transport ciphertext, or an MLS checkpoint.
 
 ## Classification rules (verified against real Goggles exports)
 
@@ -170,6 +179,9 @@ Gate designs evaluated against real exports and deliberately **rejected**:
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
   The CLI rejects inputs larger than 64 MiB before JSON/NDJSON parsing.
+- Keep real inputs under ignored `incident-exports/` and generated local output under `target/` or ignored
+  `incident-replay-output/`. The shareable artifact is normalized evidence only. Never add sensitive local replay
+  capsules or raw forensic exports to version control.
 
 ## Verification
 
