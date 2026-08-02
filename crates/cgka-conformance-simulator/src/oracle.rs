@@ -3,7 +3,10 @@
 //! The simulator has two jobs: run scenario inputs and explain what behavior
 //! those inputs actually checked. This module keeps that second job explicit.
 
-use crate::{ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace, TraceExpectation};
+use crate::{
+    QuiescenceObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
+    TraceExpectation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -128,10 +131,28 @@ pub fn build_scenario_oracle_report(
     expected_trace: Option<&ScenarioTrace>,
     expected_outcomes: &[TraceExpectation],
     observed_trace: &ScenarioTrace,
+    quiescence_observations: &[QuiescenceObservation],
 ) -> ScenarioOracleReport {
     let stimuli = scenario_stimuli(spec);
-    let oracle_behaviors = expected_behaviors(expected_trace, expected_outcomes);
-    let observed_behaviors = trace_behaviors(observed_trace);
+    let mut oracle_behaviors = expected_behaviors(expected_trace, expected_outcomes);
+    if spec
+        .steps
+        .iter()
+        .any(|step| matches!(step, ScenarioStep::AwaitQuiescence { .. }))
+        && !oracle_behaviors.contains(&OracleBehavior::QuiescenceState)
+    {
+        oracle_behaviors.push(OracleBehavior::QuiescenceState);
+        oracle_behaviors.sort();
+    }
+    let mut observed_behaviors = trace_behaviors(observed_trace);
+    if quiescence_observations
+        .iter()
+        .any(|observation| observation.status.is_quiescent())
+        && !observed_behaviors.contains(&OracleBehavior::QuiescenceState)
+    {
+        observed_behaviors.push(OracleBehavior::QuiescenceState);
+        observed_behaviors.sort();
+    }
     let evidence = behavior_evidence(observed_trace);
 
     let observed_set = observed_behaviors.iter().copied().collect::<BTreeSet<_>>();
@@ -322,6 +343,10 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
                 stimuli.insert(ScenarioStimulus::Restart);
             }
             ScenarioStep::AdvanceTime { .. } => {
+                stimuli.insert(ScenarioStimulus::VirtualTimeAdvance);
+            }
+            ScenarioStep::AwaitQuiescence { .. } => {
+                stimuli.insert(ScenarioStimulus::QuiescenceGate);
                 stimuli.insert(ScenarioStimulus::VirtualTimeAdvance);
             }
             ScenarioStep::DeliverAll

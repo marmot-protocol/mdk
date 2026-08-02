@@ -5,7 +5,7 @@
 use crate::audit_capture::{AuditCapture, CapturingRecorder};
 use crate::bus::{ClientId, TransportBus};
 use crate::decryptability::DecryptabilityProbeSendStatus;
-use crate::pending_work::PendingWorkObservation;
+use crate::pending_work::{ClientStructuralProgress, PendingWorkObservation};
 use crate::scenario_input_ledger::{
     ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioInputMetadata, ScenarioInputTracker,
 };
@@ -1562,6 +1562,24 @@ impl HarnessClient {
             bus_mailbox_messages: bus.mailbox_messages,
             scenario_inputs_pending: self.scenario_input_tracker.pending_count(),
         }
+    }
+
+    pub(crate) fn structural_progress_observation(
+        &self,
+        client: String,
+    ) -> Result<ClientStructuralProgress, EngineError> {
+        Ok(ClientStructuralProgress {
+            client,
+            engine: self
+                .default_group
+                .as_ref()
+                .map(|group_id| {
+                    self.engine()
+                        .conformance_structural_progress_snapshot(group_id)
+                })
+                .transpose()?,
+            scenario_inputs_pending: self.scenario_input_tracker.pending_count(),
+        })
     }
 
     fn next_app_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {

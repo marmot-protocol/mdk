@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-02
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -467,23 +467,23 @@ rate, topology, assertion, and schema work remains owned by Milestone 2.1.
 
 ### 1.3 Full-system quiescence
 
-Status: `in-progress`
+Status: `complete`
 
 - [x] Add an injectable paired monotonic/wall convergence clock and use it for pass deadlines, cutoff decisions, restart
   rebasing, and deterministic engine/harness tests.
 - [x] Expose that clock through the subject-level `virtual_time` capability and portable `advance_time` scenario step;
   route subject `Tick` through the same clock so global time can advance while participant runtimes remain paused.
 
-- [ ] Expose a sanitized structural progress token, runnable work, earliest next wake-up, deferred/retry work, outbound
+- [x] Expose a sanitized structural progress token, runnable work, earliest next wake-up, deferred/retry work, outbound
   work awaiting acknowledgement, and terminal blockers; include inbox, delayed messages, pass phase, and durable
   transitions.
-- [ ] Drive subject operations and scheduled wakes from the shared advancing monotonic/controlled wall clock; do not
+- [x] Drive subject operations and scheduled wakes from the shared advancing monotonic/controlled wall clock; do not
   infer time progress from repeated calls at one synthetic timestamp or wait on real wall time.
-- [ ] Compute a bounded virtual-time fixed point from structural work and the earliest next wake-up. Treat step, time,
+- [x] Compute a bounded virtual-time fixed point from structural work and the earliest next wake-up. Treat step, time,
   and work limits only as watchdog/performance evidence, not as the definition of quiescence.
-- [ ] Report which subsystem prevents quiescence.
-- [ ] Bound quiescence waiting by scenario policy and emit a terminal timeout artifact.
-- [ ] Add controlled metamorphic runs that preserve retained input and horizon eligibility while varying delivery across
+- [x] Report which subsystem prevents quiescence.
+- [x] Bound quiescence waiting by scenario policy and emit a terminal timeout artifact.
+- [x] Add controlled metamorphic runs that preserve retained input and horizon eligibility while varying delivery across
   one frozen batch versus multiple convergence passes; report retention/anchor assumption violations separately.
 
 ### 1.4 Deterministic failure capsules
@@ -501,7 +501,7 @@ Status: `not-started`
 
 - [x] A wrong exact state cannot pass as converged.
 - [x] A normal scenario cannot access engine/storage internals.
-- [ ] Hidden pending work prevents quiescence.
+- [x] Hidden pending work prevents quiescence.
 - [ ] A captured byte-level failure replays with the same outcome.
 - [ ] Targeted semantic mutations are detected.
 - [ ] Every durable fail-closed/non-progress state names a tested repair or terminal user-visible outcome.
@@ -829,3 +829,4 @@ incorrect result.
 | 2026-07-30 | M5 account-device modeling input | Documented a non-normative multi-device design space while deliberately leaving admission, synchronization, and repair choices unresolved; future scenarios must model account-device instances without assuming those candidate semantics | [MDK #1199](https://github.com/marmot-protocol/mdk/pull/1199), merge `aac777f3`; documentation-only |
 | 2026-07-30 | 1.2c / 1.3b subject virtual time | Added a capability-gated `advance_time` scenario operation backed by one shared paired clock across the engine subject; time advancement is a separate failure-free operation and `Tick` selects which participant runtimes observe it, while standalone clients without an injected clock preserve the legacy far-future shortcut | [MDK #1202](https://github.com/marmot-protocol/mdk/pull/1202), merge `1ccc4065`; focused serialization/preflight/dispatch test; two real disband passes remain live at a 999 ms tick, Alice alone settles at 1,000 ms, and Bob settles on a later tick without another time advance; full simulator suite |
 | 2026-08-01 | 1.2d public outbound lifecycle and Scenario IR v2 cutover | Added non-destructive polling of exact transport-ready subject artifacts and typed accepted/no-endpoint acknowledgement; client-scoped pending identities, state-bearing commits, independent Welcomes, definite rollback, regenerated queued intents, scheduled evolution work, duplicate acknowledgement, and exposure refusal retain their distinct semantics without exposing mutable bus queues. Migrated every repository-owned scenario producer to v2 `acknowledge_outbound` operations and removed the compatibility constructor, direct subject pending controls, client lifecycle flag, and silent auto-confirm branches ([MDK #1207](https://github.com/marmot-protocol/mdk/issues/1207)) | Focused subject/runner contract tests; fixed vectors; generated families; incident replay; full simulator suite; `just fast-ci` |
+| 2026-08-01 | 1.3 full-system quiescence | Added privacy-safe structural progress with runnable work, exact virtual deadlines, pass phase/generation, retry/deferred/publication/transport work, and terminal blockers; added runner-owned bounded fixed-point settling with explicit healthy-path publication/delivery policy and serializable blocked/timeout artifacts; added same-horizon batch-partition metamorphic coverage | [MDK #1216](https://github.com/marmot-protocol/mdk/pull/1216); focused real-engine deadline, lost-ack, withheld-transport, watchdog, serialization/privacy, and metamorphic tests; full simulator suite; `just fast-ci` |

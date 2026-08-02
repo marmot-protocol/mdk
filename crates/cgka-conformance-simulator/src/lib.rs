@@ -29,6 +29,7 @@ pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
 pub mod proptest_support;
+mod quiescence;
 pub mod report;
 pub mod scenario;
 mod scenario_input_ledger;
@@ -40,6 +41,7 @@ pub use cgka_engine::conformance_snapshot::{
     ConformanceAppComponent, ConformanceCanonicalStateSnapshot, ConformanceDisbandedGroupSnapshot,
     ConformanceGroupSnapshot, ConformanceLeafCapabilities, ConformanceLeafSnapshot,
     ConformancePendingWorkSnapshot, ConformanceRequiredCapabilities,
+    ConformanceStructuralProgressSnapshot,
 };
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
@@ -58,7 +60,14 @@ pub use oracle::{
     coverage_matrix_entry, expected_behaviors, property_test_coverage_entries, scenario_stimuli,
     trace_behaviors,
 };
-pub use pending_work::PendingWorkObservation;
+pub use pending_work::{
+    ClientStructuralProgress, PendingWorkObservation, SubjectProgressSnapshot,
+    SubjectTerminalBlocker,
+};
+pub use quiescence::{
+    QuiescenceObservation, QuiescenceOutboundPolicy, QuiescencePolicy, QuiescenceStatus,
+    QuiescenceTransportPolicy, QuiescenceWatchdog, drive_subject_to_quiescence,
+};
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,
@@ -80,7 +89,7 @@ pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
     SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capability,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, required_capabilities,
 };
 pub use vector::{
     AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,

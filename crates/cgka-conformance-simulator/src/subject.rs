@@ -9,12 +9,12 @@ use crate::client::HarnessPublicationError;
 use crate::{
     BidirectionalDecryptabilityObservation, ClientBuilder, ClientObservation,
     DecryptabilityProbeSendStatus, DirectionalDecryptabilityProbe, HarnessClient,
-    HarnessStorageMode, ScenarioAdminPolicyObservation, ScenarioStep, TransportBus, observe_client,
-    observe_client_exact,
+    HarnessStorageMode, ScenarioAdminPolicyObservation, ScenarioStep, SubjectProgressSnapshot,
+    SubjectTerminalBlocker, TransportBus, observe_client, observe_client_exact,
 };
 use async_trait::async_trait;
-use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::KeyPackage;
@@ -23,6 +23,7 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ pub enum SubjectCapability {
     CrashReopen,
     VirtualTime,
     OutboundPublication,
+    StructuralProgress,
     WhiteBoxTransportQueueFaults,
     WhiteBoxTransportPartition,
     WhiteBoxStorageFaults,
@@ -59,6 +61,7 @@ impl SubjectCapability {
             Self::CrashReopen => "crash_reopen",
             Self::VirtualTime => "virtual_time",
             Self::OutboundPublication => "outbound_publication",
+            Self::StructuralProgress => "structural_progress",
             Self::WhiteBoxTransportQueueFaults => "white_box_transport_queue_faults",
             Self::WhiteBoxTransportPartition => "white_box_transport_partition",
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
@@ -260,6 +263,12 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    /// Select controlled virtual-time behavior without advancing either clock
+    /// domain. This makes the clock-mode transition explicit for adapters.
+    fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::VirtualTime))
+    }
+
     /// Advance the subject's paired convergence clock without waking a
     /// participant runtime. A later `tick` selects which participants observe
     /// the elapsed deadline.
@@ -284,6 +293,12 @@ pub trait ConvergenceSubject: Send {
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::OutboundPublication,
+        ))
+    }
+
+    fn structural_progress(&mut self) -> Result<SubjectProgressSnapshot, SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::StructuralProgress,
         ))
     }
 
@@ -347,38 +362,53 @@ pub trait ConvergenceFaultSubject {
     fn clear_partition(&mut self) -> Result<(), SubjectError>;
 }
 
-/// Capability required for one ScenarioSpec v2 step.
-pub fn required_capability(step: &ScenarioStep) -> SubjectCapability {
-    match step {
-        ScenarioStep::CreateGroup { .. }
-        | ScenarioStep::InviteMembers { .. }
-        | ScenarioStep::UpdateGroupData { .. }
-        | ScenarioStep::UpdateAdminPolicy { .. }
-        | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
-        | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
-        ScenarioStep::AcknowledgeOutbound { .. } => SubjectCapability::OutboundPublication,
-        ScenarioStep::SendAppMessage { .. } => SubjectCapability::ApplicationMessaging,
-        ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
-            SubjectCapability::TransportDelivery
+/// Complete capability set used by a scenario step. Most operations need one
+/// capability; fixed-point settling composes progress, time, delivery, and
+/// optionally outbound acknowledgement without moving policy into the subject.
+pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
+    if let ScenarioStep::AwaitQuiescence { policy } = step {
+        let mut capabilities = vec![
+            SubjectCapability::StructuralProgress,
+            SubjectCapability::VirtualTime,
+            SubjectCapability::TransportDelivery,
+        ];
+        if policy.outbound == crate::QuiescenceOutboundPolicy::AcceptAll {
+            capabilities.push(SubjectCapability::OutboundPublication);
         }
-        ScenarioStep::AdvanceTime { .. } => SubjectCapability::VirtualTime,
-        ScenarioStep::Observe { .. } | ScenarioStep::ClearEvents { .. } => {
-            SubjectCapability::EventObservation
-        }
-        ScenarioStep::ObserveExact { .. } => SubjectCapability::ExactConformanceObservation,
-        ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
-            SubjectCapability::ActiveDecryptabilityProbe
-        }
-        ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
-        ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
-        ScenarioStep::DropQueued { .. }
-        | ScenarioStep::DuplicateQueued { .. }
-        | ScenarioStep::DelayQueued { .. }
-        | ScenarioStep::ReleaseDelayed { .. }
-        | ScenarioStep::ReorderQueued { .. } => SubjectCapability::WhiteBoxTransportQueueFaults,
-        ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
-            SubjectCapability::WhiteBoxTransportPartition
-        }
+        capabilities
+    } else {
+        vec![match step {
+            ScenarioStep::CreateGroup { .. }
+            | ScenarioStep::InviteMembers { .. }
+            | ScenarioStep::UpdateGroupData { .. }
+            | ScenarioStep::UpdateAdminPolicy { .. }
+            | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
+            | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
+            ScenarioStep::AcknowledgeOutbound { .. } => SubjectCapability::OutboundPublication,
+            ScenarioStep::SendAppMessage { .. } => SubjectCapability::ApplicationMessaging,
+            ScenarioStep::DeliverAll | ScenarioStep::Tick { .. } => {
+                SubjectCapability::TransportDelivery
+            }
+            ScenarioStep::AdvanceTime { .. } => SubjectCapability::VirtualTime,
+            ScenarioStep::Observe { .. } | ScenarioStep::ClearEvents { .. } => {
+                SubjectCapability::EventObservation
+            }
+            ScenarioStep::ObserveExact { .. } => SubjectCapability::ExactConformanceObservation,
+            ScenarioStep::ProbeBidirectionalDecryptability { .. } => {
+                SubjectCapability::ActiveDecryptabilityProbe
+            }
+            ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
+            ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
+            ScenarioStep::DropQueued { .. }
+            | ScenarioStep::DuplicateQueued { .. }
+            | ScenarioStep::DelayQueued { .. }
+            | ScenarioStep::ReleaseDelayed { .. }
+            | ScenarioStep::ReorderQueued { .. } => SubjectCapability::WhiteBoxTransportQueueFaults,
+            ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
+                SubjectCapability::WhiteBoxTransportPartition
+            }
+            ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
+        }]
     }
 }
 
@@ -442,6 +472,7 @@ impl EngineHarnessSubject {
             SubjectCapability::CrashReopen,
             SubjectCapability::VirtualTime,
             SubjectCapability::OutboundPublication,
+            SubjectCapability::StructuralProgress,
             SubjectCapability::WhiteBoxTransportQueueFaults,
             SubjectCapability::WhiteBoxTransportPartition,
         ]);
@@ -710,12 +741,16 @@ impl ConvergenceSubject for EngineHarnessSubject {
         Ok(())
     }
 
-    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
-        self.convergence_clock.advance_ms(delta_ms);
+    fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
         for client in self.clients.values_mut() {
             client.enable_virtual_time_tick();
         }
         Ok(())
+    }
+
+    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
+        self.convergence_clock.advance_ms(delta_ms);
+        self.activate_virtual_time()
     }
 
     fn poll_outbound(
@@ -875,6 +910,101 @@ impl ConvergenceSubject for EngineHarnessSubject {
             }
         }
         Ok(())
+    }
+
+    fn structural_progress(&mut self) -> Result<SubjectProgressSnapshot, SubjectError> {
+        let labels = self.clients.keys().cloned().collect::<Vec<_>>();
+        for label in &labels {
+            self.sync_client_outbound(label)?;
+            // Refresh durable message dispositions before counting scenario
+            // inputs that still lack a current or terminal outcome.
+            let _ = self.client_mut(label)?.scenario_input_ledger();
+        }
+
+        let clients = labels
+            .iter()
+            .map(|label| {
+                self.client(label)?
+                    .structural_progress_observation(label.clone())
+                    .map_err(|error| {
+                        SubjectError::new("progress_snapshot_failed", observe_engine_error(&error))
+                    })
+            })
+            .collect::<Result<Vec<_>, SubjectError>>()?;
+        let bus = self.bus.structural_progress_snapshot();
+        let current_monotonic_ms = self.convergence_clock.now().monotonic_ms;
+        let outbound_awaiting_acknowledgement = self
+            .outbound_records
+            .values()
+            .filter(|record| record.resolution.is_none())
+            .count();
+        let runnable_engine_work = clients
+            .iter()
+            .filter_map(|client| client.engine.as_ref())
+            .map(|engine| engine.runnable_work)
+            .sum::<usize>();
+        let earliest_next_wake_monotonic_ms = clients
+            .iter()
+            .filter_map(|client| {
+                client
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.earliest_next_wake_monotonic_ms)
+            })
+            .min();
+        let deferred_retry_work = clients
+            .iter()
+            .filter_map(|client| client.engine.as_ref())
+            .map(|engine| {
+                engine
+                    .pending_work
+                    .stored_retryable_messages
+                    .saturating_add(engine.pending_work.stored_transport_deferred_messages)
+            })
+            .sum();
+        let scenario_inputs_pending = clients
+            .iter()
+            .map(|client| client.scenario_inputs_pending)
+            .sum();
+        let terminal_blockers = clients
+            .iter()
+            .filter(|client| {
+                client
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.terminal_unrecoverable)
+            })
+            .map(|client| SubjectTerminalBlocker::EngineUnrecoverable {
+                client: client.client.clone(),
+            })
+            .collect();
+
+        let mut snapshot = SubjectProgressSnapshot {
+            schema_version: "1".into(),
+            structural_token: String::new(),
+            current_monotonic_ms,
+            runnable_engine_work,
+            runnable_work: runnable_engine_work
+                .saturating_add(bus.queued_messages)
+                .saturating_add(bus.mailbox_messages),
+            earliest_next_wake_monotonic_ms,
+            deferred_retry_work,
+            outbound_awaiting_acknowledgement,
+            transport_queued_messages: bus.queued_messages,
+            transport_delayed_messages: bus.delayed_messages,
+            transport_mailbox_messages: bus.mailbox_messages,
+            scenario_inputs_pending,
+            terminal_blockers,
+            clients,
+        };
+        let encoded = serde_json::to_vec(&snapshot).map_err(|error| {
+            SubjectError::new(
+                "progress_serialization_failed",
+                format!("serialize structural progress: {error}"),
+            )
+        })?;
+        snapshot.structural_token = hex::encode(Sha256::digest(encoded));
+        Ok(snapshot)
     }
 
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
@@ -1183,7 +1313,10 @@ fn observe_engine_error(error: &EngineError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConformanceCanonicalStateSnapshot;
+    use crate::{
+        ConformanceCanonicalStateSnapshot, QuiescenceOutboundPolicy, QuiescencePolicy,
+        QuiescenceStatus, drive_subject_to_quiescence,
+    };
 
     async fn create_current_group_and_join(
         subject: &mut EngineHarnessSubject,
@@ -2170,5 +2303,261 @@ mod tests {
                 .canonical_state_snapshot(),
             ConformanceCanonicalStateSnapshot::Disbanded(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn structural_progress_is_stable_sanitized_and_names_publication_work() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+
+        let settled = subject.structural_progress().expect("progress snapshot");
+        assert!(settled.is_quiescent(), "settled snapshot: {settled:#?}");
+        assert_eq!(
+            settled.structural_token,
+            subject
+                .structural_progress()
+                .expect("repeat progress snapshot")
+                .structural_token,
+            "unchanged structure must have a stable token"
+        );
+
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "structural-app",
+                sender: "alice",
+                payload: "pending publication",
+            })
+            .await
+            .expect("application emits outbound work");
+        let pending = subject.structural_progress().expect("pending progress");
+        assert_ne!(pending.structural_token, settled.structural_token);
+        assert_eq!(pending.outbound_awaiting_acknowledgement, 1);
+        assert_eq!(pending.transport_queued_messages, 1);
+
+        let encoded = serde_json::to_string(&pending).expect("progress serializes");
+        for forbidden in [
+            "group_id",
+            "message_id",
+            "account_id",
+            "payload",
+            "ciphertext",
+            "pubkey",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "progress leaked forbidden field name {forbidden}: {encoded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_point_reports_manual_ack_blocker_then_settles() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "manual-ack-app",
+                sender: "alice",
+                payload: "manual ack",
+            })
+            .await
+            .expect("application emits outbound work");
+
+        let blocked = drive_subject_to_quiescence(
+            &mut subject,
+            &labels,
+            &QuiescencePolicy {
+                outbound: QuiescenceOutboundPolicy::Manual,
+                ..QuiescencePolicy::default()
+            },
+            7,
+        )
+        .await
+        .expect("manual fixed point reports a terminal observation");
+        assert!(matches!(blocked.status, QuiescenceStatus::Blocked { .. }));
+        assert!(
+            blocked
+                .final_progress
+                .blocking_subsystems()
+                .contains(&"outbound_acknowledgement")
+        );
+
+        let settled =
+            drive_subject_to_quiescence(&mut subject, &labels, &QuiescencePolicy::default(), 8)
+                .await
+                .expect("automatic publication and delivery settle");
+        assert_eq!(settled.status, QuiescenceStatus::Quiescent);
+        assert!(settled.final_progress.is_quiescent());
+    }
+
+    #[tokio::test]
+    async fn fixed_point_advances_exactly_to_engine_wake() {
+        let labels = vec!["alice".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &[]).await;
+        let alice = subject.client_mut("alice").expect("alice exists");
+        alice.request_disband().await.expect("request disband");
+        alice
+            .advance_convergence()
+            .await
+            .expect("prepare disband commit");
+        for artifact in subject
+            .poll_outbound("alice")
+            .expect("disband publication is pollable")
+        {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("accept disband publication");
+        }
+        subject
+            .client_mut("alice")
+            .expect("alice exists")
+            .advance_convergence()
+            .await
+            .expect("open collecting pass");
+
+        let before = subject.structural_progress().expect("scheduled progress");
+        assert_eq!(before.earliest_next_wake_monotonic_ms, Some(1_000));
+        let settled =
+            drive_subject_to_quiescence(&mut subject, &labels, &QuiescencePolicy::default(), 9)
+                .await
+                .expect("fixed point settles disband");
+        assert_eq!(settled.status, QuiescenceStatus::Quiescent);
+        assert_eq!(
+            settled.virtual_time_advanced_ms, 1_000,
+            "before={before:#?}; settled={settled:#?}"
+        );
+        assert!(matches!(
+            subject
+                .client("alice")
+                .expect("alice exists")
+                .canonical_state_snapshot(),
+            ConformanceCanonicalStateSnapshot::Disbanded(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn structural_wake_rebases_across_restart_without_granting_fresh_time() {
+        let labels = vec!["alice".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::TempFileBackedSqlite,
+        )
+        .expect("file-backed engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &[]).await;
+        let alice = subject.client_mut("alice").expect("alice exists");
+        alice.request_disband().await.expect("request disband");
+        alice
+            .advance_convergence()
+            .await
+            .expect("prepare disband commit");
+        for artifact in subject
+            .poll_outbound("alice")
+            .expect("disband publication is pollable")
+        {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("accept disband publication");
+        }
+        subject
+            .client_mut("alice")
+            .expect("alice exists")
+            .advance_convergence()
+            .await
+            .expect("open collecting pass");
+        subject
+            .advance_time(400)
+            .await
+            .expect("advance partway to cutoff");
+        subject
+            .restart("alice")
+            .expect("restart file-backed client");
+
+        let restarted = subject.structural_progress().expect("restarted progress");
+        assert_eq!(restarted.current_monotonic_ms, 400);
+        assert_eq!(restarted.earliest_next_wake_monotonic_ms, Some(1_000));
+        let settled =
+            drive_subject_to_quiescence(&mut subject, &labels, &QuiescencePolicy::default(), 10)
+                .await
+                .expect("restarted fixed point settles");
+        assert_eq!(settled.status, QuiescenceStatus::Quiescent);
+        assert_eq!(settled.virtual_time_advanced_ms, 600);
+    }
+
+    #[tokio::test]
+    async fn fixed_point_names_withheld_transport_without_spinning() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+        subject
+            .send_application(SubjectSendApplication {
+                action_id: "withheld-app",
+                sender: "alice",
+                payload: "withheld",
+            })
+            .await
+            .expect("application emits outbound work");
+        for artifact in subject
+            .poll_outbound("alice")
+            .expect("application is pollable")
+        {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("transport accepted the application");
+        }
+        subject
+            .delay_queued(0, "withheld")
+            .expect("delay queued application");
+
+        let blocked =
+            drive_subject_to_quiescence(&mut subject, &labels, &QuiescencePolicy::default(), 10)
+                .await
+                .expect("withheld transport produces an observation");
+        assert_eq!(blocked.iterations, 0);
+        assert!(matches!(blocked.status, QuiescenceStatus::Blocked { .. }));
+        assert!(
+            blocked
+                .final_progress
+                .blocking_subsystems()
+                .contains(&"transport_delayed")
+        );
     }
 }

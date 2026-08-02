@@ -29,9 +29,14 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     pending state without adding production engine hooks.
 
 - **Module:** `src/pending_work.rs`
-  - **Role:** Instantaneous strict local-progress observation combining a group-scoped conformance engine snapshot,
-    client-addressed bus queue/delay/mailbox counts, and per-client logical pending entries. It reports blockers for
-    `NoPendingWork`; it does not claim end-to-end delivery or implement virtual-time quiescence waiting.
+  - **Role:** Instantaneous strict local-progress observation plus the adapter-neutral structural progress schema. The
+    structural form adds an opaque token, runnable work, earliest wake, deferred/retry and acknowledgement work,
+    transport state, pass phase/generation, and terminal blockers without serializing protocol identifiers.
+
+- **Module:** `src/quiescence.rs`
+  - **Role:** Bounded virtual-time fixed-point driver. Runner-owned policy decides whether outbound work is accepted and
+    transport is delivered; the driver activates controlled time, runs immediate work, advances exactly to the earliest
+    wake, and records quiescent, blocked, or watchdog-timeout evidence. Limits never define success.
 
 - **Module:** `src/decryptability.rs`
   - **Role:** Serializable active application-message probe results. A
@@ -85,7 +90,9 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     stream separate from the mutable bus queue: `poll_outbound` returns unresolved transport-ready artifacts
     non-destructively, and `acknowledge_outbound` applies accepted/no-endpoint outcomes to staged commits, independent
     Welcomes, and regenerated queued intents. ScenarioSpec v2 uses the same poll/acknowledgement contract; there is no
-    auto-confirming compatibility lifecycle. Queue/partition mutation is available only through the separately named
+    auto-confirming compatibility lifecycle. The `structural_progress` capability exposes privacy-safe aggregate work,
+    deadlines, pass phase/generation, and terminal state; scenario-owned `await_quiescence` composes it with the existing
+    clock/delivery/publication operations. Queue/partition mutation is available only through the separately named
     `ConvergenceFaultSubject` white-box interface.
 
 - **Module:** `src/vector.rs`

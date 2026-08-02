@@ -445,6 +445,7 @@ mod tests {
             oracle,
             step_log: Vec::new(),
             pending_resolution_observations: Vec::new(),
+            quiescence_observations: Vec::new(),
             recovery_observations: Vec::new(),
             epoch_change_observations: Vec::new(),
             app_invalidation_observations: Vec::new(),

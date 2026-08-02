@@ -452,6 +452,17 @@ These tests keep the simulator machinery honest.
 - `engine_subject_virtual_time_is_shared_while_participant_wakes_are_selected` checks two real durable disband passes:
   a tick at 999 ms settles neither; at 1,000 ms Alice settles while unticked Bob stays live; Bob then settles on a later
   tick without another time advance.
+- `structural_progress_is_stable_sanitized_and_names_publication_work` checks stable tokens for unchanged structure,
+  exact outbound/transport work visibility, and the absence of identifiers and payload fields.
+- `fixed_point_reports_manual_ack_blocker_then_settles`, `fixed_point_advances_exactly_to_engine_wake`, and
+  `fixed_point_names_withheld_transport_without_spinning` check typed publication/withholding blockers and exact
+  virtual-time advancement against real OpenMLS/SQLite subjects.
+- `fixed_point_is_invariant_to_same_horizon_batch_partitioning` delivers the same competing commits in one frozen batch
+  or two completed convergence passes, requires the same semantic canonical result, and diagnoses retention/anchor
+  assumption violations separately from a result mismatch.
+- `unchanged_runnable_work_times_out_without_becoming_quiescent` and
+  `virtual_time_budget_is_a_watchdog_not_a_quiescence_definition` pin terminal timeout artifacts and ensure watchdogs
+  cannot manufacture success.
 - `outbound_poll_is_non_destructive_and_acknowledgement_is_idempotent` checks exact application artifacts, repeatable
   polling, same-outcome acknowledgement replay, transport delivery, and disappearance after resolution;
   `outbound_poll_preserves_emission_order_past_single_digit_handles` guards deterministic ordering under a burst.

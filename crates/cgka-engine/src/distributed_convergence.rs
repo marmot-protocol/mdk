@@ -86,6 +86,78 @@ fn storage_projection_error(error: StorageError) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Storage(format!("{error:?}"))
 }
 
+#[cfg(feature = "test-policy-overrides")]
+fn apply_test_settlement_override(
+    pass: &mut DurableConvergencePass,
+    policy: &CanonicalizationPolicy,
+) {
+    if policy.settlement_quiescence_ms != 0 {
+        return;
+    }
+
+    // Test harnesses intentionally mutate the otherwise pinned process policy
+    // to make settlement immediate.
+    pass.quiescence_deadline_monotonic_ms = pass
+        .opened_monotonic_ms
+        .saturating_add(policy.settlement_quiescence_ms);
+    pass.absolute_deadline_monotonic_ms = pass
+        .opened_monotonic_ms
+        .saturating_add(policy.max_convergence_pass_ms);
+    pass.quiescence_deadline_wall_ms = pass
+        .opened_wall_ms
+        .saturating_add(policy.settlement_quiescence_ms);
+    pass.absolute_deadline_wall_ms = pass
+        .opened_wall_ms
+        .saturating_add(policy.max_convergence_pass_ms);
+}
+
+/// Apply the effective process policy and restart rebase used by convergence
+/// scheduling to an already-loaded durable pass.
+///
+/// The policy-override rewrite does not independently request a storage write.
+/// The returned flag names only a restart rebase that the production loader
+/// must persist (including the whole normalized pass); read-only conformance
+/// views consume the same normalized copy without writing it.
+pub(crate) fn normalize_convergence_pass_for_runtime(
+    pass: &mut DurableConvergencePass,
+    policy: &CanonicalizationPolicy,
+    now: ConvergenceTime,
+    convergence_clock_instance_id: u64,
+) -> bool {
+    #[cfg(feature = "test-policy-overrides")]
+    apply_test_settlement_override(pass, policy);
+    #[cfg(not(feature = "test-policy-overrides"))]
+    let _ = policy;
+
+    if pass.phase != ConvergencePassPhase::Collecting
+        || pass.clock_instance_id == convergence_clock_instance_id
+    {
+        return false;
+    }
+
+    // A process-local monotonic deadline cannot survive restart. Rebase every
+    // build from the durable millisecond wall deadlines. A backwards wall jump
+    // fails closed by making the cutoff due immediately.
+    let backwards = now.wall_ms < pass.opened_wall_ms;
+    let quiescence_remaining = if backwards {
+        0
+    } else {
+        pass.quiescence_deadline_wall_ms.saturating_sub(now.wall_ms)
+    };
+    let absolute_remaining = if backwards {
+        0
+    } else {
+        pass.absolute_deadline_wall_ms.saturating_sub(now.wall_ms)
+    };
+    pass.clock_instance_id = convergence_clock_instance_id;
+    pass.opened_monotonic_ms = now
+        .monotonic_ms
+        .saturating_sub(now.wall_ms.saturating_sub(pass.opened_wall_ms));
+    pass.quiescence_deadline_monotonic_ms = now.monotonic_ms.saturating_add(quiescence_remaining);
+    pass.absolute_deadline_monotonic_ms = now.monotonic_ms.saturating_add(absolute_remaining);
+    true
+}
+
 /// Admin pubkeys, avatar component bytes, and message retention snapshotted on
 /// either side of a convergence apply, for unattributed group-state-change diffs.
 type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
@@ -582,49 +654,12 @@ impl<S: StorageProvider> Engine<S> {
         } else if let Some(mut pass) = previous.clone()
             && pass.is_active()
         {
-            #[cfg(feature = "test-policy-overrides")]
-            if policy.settlement_quiescence_ms == 0 {
-                // Test harnesses intentionally mutate the otherwise pinned
-                // process policy to make settlement immediate.
-                pass.quiescence_deadline_monotonic_ms = pass
-                    .opened_monotonic_ms
-                    .saturating_add(policy.settlement_quiescence_ms);
-                pass.absolute_deadline_monotonic_ms = pass
-                    .opened_monotonic_ms
-                    .saturating_add(policy.max_convergence_pass_ms);
-                pass.quiescence_deadline_wall_ms = pass
-                    .opened_wall_ms
-                    .saturating_add(policy.settlement_quiescence_ms);
-                pass.absolute_deadline_wall_ms = pass
-                    .opened_wall_ms
-                    .saturating_add(policy.max_convergence_pass_ms);
-            }
-            if pass.phase == ConvergencePassPhase::Collecting
-                && pass.clock_instance_id != self.convergence_clock_instance_id
-            {
-                // A process-local monotonic deadline cannot survive restart.
-                // Rebase every build, including policy-override tests, from the
-                // same persisted millisecond wall deadlines. A backwards wall
-                // jump fails closed by making the cutoff due immediately.
-                let backwards = now.wall_ms < pass.opened_wall_ms;
-                let quiescence_remaining = if backwards {
-                    0
-                } else {
-                    pass.quiescence_deadline_wall_ms.saturating_sub(now.wall_ms)
-                };
-                let absolute_remaining = if backwards {
-                    0
-                } else {
-                    pass.absolute_deadline_wall_ms.saturating_sub(now.wall_ms)
-                };
-                pass.clock_instance_id = self.convergence_clock_instance_id;
-                pass.opened_monotonic_ms = now
-                    .monotonic_ms
-                    .saturating_sub(now.wall_ms.saturating_sub(pass.opened_wall_ms));
-                pass.quiescence_deadline_monotonic_ms =
-                    now.monotonic_ms.saturating_add(quiescence_remaining);
-                pass.absolute_deadline_monotonic_ms =
-                    now.monotonic_ms.saturating_add(absolute_remaining);
+            if normalize_convergence_pass_for_runtime(
+                &mut pass,
+                policy,
+                now,
+                self.convergence_clock_instance_id,
+            ) {
                 self.storage
                     .put_convergence_pass(&pass)
                     .map_err(storage_projection_error)?;
