@@ -86,6 +86,31 @@ fn storage_projection_error(error: StorageError) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Storage(format!("{error:?}"))
 }
 
+#[cfg(feature = "test-policy-overrides")]
+fn apply_test_settlement_override(
+    pass: &mut DurableConvergencePass,
+    policy: &CanonicalizationPolicy,
+) {
+    if policy.settlement_quiescence_ms != 0 {
+        return;
+    }
+
+    // Test harnesses intentionally mutate the otherwise pinned process policy
+    // to make settlement immediate.
+    pass.quiescence_deadline_monotonic_ms = pass
+        .opened_monotonic_ms
+        .saturating_add(policy.settlement_quiescence_ms);
+    pass.absolute_deadline_monotonic_ms = pass
+        .opened_monotonic_ms
+        .saturating_add(policy.max_convergence_pass_ms);
+    pass.quiescence_deadline_wall_ms = pass
+        .opened_wall_ms
+        .saturating_add(policy.settlement_quiescence_ms);
+    pass.absolute_deadline_wall_ms = pass
+        .opened_wall_ms
+        .saturating_add(policy.max_convergence_pass_ms);
+}
+
 /// Apply the effective process policy and restart rebase used by convergence
 /// scheduling to an already-loaded durable pass.
 ///
@@ -100,22 +125,7 @@ pub(crate) fn normalize_convergence_pass_for_runtime(
     convergence_clock_instance_id: u64,
 ) -> bool {
     #[cfg(feature = "test-policy-overrides")]
-    if policy.settlement_quiescence_ms == 0 {
-        // Test harnesses intentionally mutate the otherwise pinned process
-        // policy to make settlement immediate.
-        pass.quiescence_deadline_monotonic_ms = pass
-            .opened_monotonic_ms
-            .saturating_add(policy.settlement_quiescence_ms);
-        pass.absolute_deadline_monotonic_ms = pass
-            .opened_monotonic_ms
-            .saturating_add(policy.max_convergence_pass_ms);
-        pass.quiescence_deadline_wall_ms = pass
-            .opened_wall_ms
-            .saturating_add(policy.settlement_quiescence_ms);
-        pass.absolute_deadline_wall_ms = pass
-            .opened_wall_ms
-            .saturating_add(policy.max_convergence_pass_ms);
-    }
+    apply_test_settlement_override(pass, policy);
     #[cfg(not(feature = "test-policy-overrides"))]
     let _ = policy;
 

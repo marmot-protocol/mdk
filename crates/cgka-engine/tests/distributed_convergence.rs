@@ -4941,14 +4941,20 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
         .unwrap()
         .expect("collecting pass persisted with the original policy");
     assert_eq!(persisted.cutoff_monotonic_ms(), 2_000);
-    carol
+    drop(carol);
+    clock.set_wall_ms(10_400);
+    let mut restarted = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("restart hydrates the persisted group");
+    restarted
         .set_convergence_policy(CanonicalizationPolicy {
             settlement_quiescence_ms: 0,
             ..CanonicalizationPolicy::default()
         })
         .expect("test policy override accepted");
 
-    let snapshot = carol
+    let snapshot = restarted
         .conformance_structural_progress_snapshot(&group_id)
         .expect("read-only conformance progress");
     assert_eq!(snapshot.current_monotonic_ms, 1_000);
@@ -4963,11 +4969,28 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
         2_000
     );
     assert_eq!(
-        carol
+        restarted
             .prepare_convergence_cutoff_delay_ms(&group_id)
             .expect("production scheduler prepares the same pass"),
         Some(0)
     );
+    let normalized = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("restart rebase persists the normalized pass");
+    assert_eq!(normalized.opened_monotonic_ms, 600);
+    assert_eq!(
+        normalized.quiescence_deadline_wall_ms,
+        normalized.opened_wall_ms
+    );
+    assert_eq!(normalized.quiescence_deadline_monotonic_ms, 1_000);
+    assert_eq!(
+        normalized.absolute_deadline_wall_ms,
+        normalized
+            .opened_wall_ms
+            .saturating_add(V1_MAX_CONVERGENCE_PASS_MS)
+    );
+    assert_eq!(normalized.absolute_deadline_monotonic_ms, 5_600);
 }
 
 #[tokio::test]

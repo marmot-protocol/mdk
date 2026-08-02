@@ -13,6 +13,24 @@ use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
+fn fresh_deferred_peel_lifecycle(
+    now: crate::convergence_clock::ConvergenceTime,
+    convergence_clock_instance_id: u64,
+    deferred_peel_residence_ms: u64,
+) -> DeferredPeelLifecycle {
+    DeferredPeelLifecycle {
+        first_observed_wall_ms: now.wall_ms,
+        wall_high_water_ms: now.wall_ms,
+        clock_instance_id: convergence_clock_instance_id,
+        residence_deadline_monotonic_ms: now
+            .monotonic_ms
+            .saturating_add(deferred_peel_residence_ms),
+        residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
+        distinct_context_attempts: 0,
+        last_context_fingerprint: None,
+    }
+}
+
 /// Return the effective deferred-peel lifecycle for the current clock domain.
 ///
 /// This is the single source of truth for legacy-row initialization and
@@ -27,17 +45,11 @@ pub(crate) fn normalized_deferred_peel_lifecycle(
 ) -> (DeferredPeelLifecycle, bool) {
     let Some(lifecycle) = lifecycle else {
         return (
-            DeferredPeelLifecycle {
-                first_observed_wall_ms: now.wall_ms,
-                wall_high_water_ms: now.wall_ms,
-                clock_instance_id: convergence_clock_instance_id,
-                residence_deadline_monotonic_ms: now
-                    .monotonic_ms
-                    .saturating_add(deferred_peel_residence_ms),
-                residence_deadline_wall_ms: now.wall_ms.saturating_add(deferred_peel_residence_ms),
-                distinct_context_attempts: 0,
-                last_context_fingerprint: None,
-            },
+            fresh_deferred_peel_lifecycle(
+                now,
+                convergence_clock_instance_id,
+                deferred_peel_residence_ms,
+            ),
             true,
         );
     };
@@ -372,19 +384,11 @@ impl<S: StorageProvider> Engine<S> {
                 .and_then(|record| record.deferred_peel.clone())
                 .or_else(|| {
                     let now = self.convergence_now();
-                    Some(DeferredPeelLifecycle {
-                        first_observed_wall_ms: now.wall_ms,
-                        wall_high_water_ms: now.wall_ms,
-                        clock_instance_id: self.convergence_clock_instance_id,
-                        residence_deadline_monotonic_ms: now
-                            .monotonic_ms
-                            .saturating_add(self.deferred_peel_residence_ms),
-                        residence_deadline_wall_ms: now
-                            .wall_ms
-                            .saturating_add(self.deferred_peel_residence_ms),
-                        distinct_context_attempts: 0,
-                        last_context_fingerprint: None,
-                    })
+                    Some(fresh_deferred_peel_lifecycle(
+                        now,
+                        self.convergence_clock_instance_id,
+                        self.deferred_peel_residence_ms,
+                    ))
                 })
         } else {
             None
