@@ -623,24 +623,33 @@ Status: `complete`
 
 ### 3.1 Required workload families
 
-- [ ] Offline retained-history flood with application traffic spanning many membership/state commits.
-- [ ] Sustained application traffic interspersed with proposals and commits.
-- [ ] Sequential self-update adversary racing privileged administrative changes.
-- [ ] Losing-branch joiner/invite/device-add, including an explicit successful repair, re-invite, or named unrecoverable
+- [x] Offline retained-history flood with application traffic spanning many membership/state commits.
+- [x] Sustained application traffic interspersed with proposals and commits.
+- [x] Sequential self-update adversary racing privileged administrative changes.
+- [x] Losing-branch joiner/invite/device-add, including an explicit successful repair, re-invite, or named unrecoverable
   user-visible outcome.
-- [ ] Unequal relay histories followed by reconciliation.
-- [ ] Crash/restart at every durable convergence transition.
-- [ ] Multi-group noisy-neighbor and per-group fairness.
-- [ ] Candidate graph/replay budget/resource exhaustion.
-- [ ] Multi-device account identity and witness deduplication.
-- [ ] App-message witness value: compare selection with/without witnesses, include proposal expiry and multi-parent
+- [x] Unequal relay histories followed by reconciliation.
+- [x] Crash/restart at every durable convergence transition.
+- [x] Multi-group noisy-neighbor and per-group fairness.
+- [x] Candidate graph/replay budget/resource exhaustion.
+- [x] Multi-device account identity and witness deduplication.
+- [x] App-message witness value: compare selection with/without witnesses, include proposal expiry and multi-parent
   commit cases, and decide whether the speculative mechanism earns its complexity.
-- [ ] Mixed binary and policy versions as controlled negative/compatibility tests. Do not require a production policy
+- [x] Mixed binary and policy versions as controlled negative/compatibility tests. Do not require a production policy
   stamp before Scenario IR v2 can carry explicit policy versions.
-- [ ] Clock movement, scheduler delay, and timestamp/cursor attacks.
+- [x] Clock movement, scheduler delay, and timestamp/cursor attacks.
 
 Each family varies schedule, storage mode, participant count, rates, restart placement, relay topology, and applicable
 test-only constants while preserving a stable semantic oracle.
+
+Policy compatibility decision: v1 does not add a policy-version wire field or app component. Scenario preflight rejects
+mixed convergence policies but permits mixed binary versions when their policy and capabilities are equivalent. A
+future incompatible policy revision must introduce an authenticated required capability or GroupContext application
+component atomically with the new behavior; a diagnostic binary version is never protocol evidence.
+
+The losing-branch invite campaign records a current protocol limit: a device admitted only by the losing commit remains
+on a non-equivalent local state after the canonical group re-invites that account. The named outcome requires an
+explicit local rejoin/reset; v1 does not claim automatic repair for that stranded device.
 
 ### 3.2 Resource and sensitivity measurements
 

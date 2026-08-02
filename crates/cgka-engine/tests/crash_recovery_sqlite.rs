@@ -46,10 +46,17 @@ use support::proof_signer;
 const CHILD_ENV: &str = "MDK_CGKA_CRASH_CHILD";
 const DATABASE_ENV: &str = "MDK_CGKA_CRASH_DATABASE";
 const CRASH_POINT_ENV: &str = "MDK_CGKA_TEST_CRASH_POINT";
+const CRASH_OCCURRENCE_ENV: &str = "MDK_CGKA_TEST_CRASH_OCCURRENCE";
 const DATABASE_KEY: &str = "cgka convergence crash recovery key";
 const READY_PREFIX: &str = "MDK_CGKA_TEST_CRASH_READY:";
 const H5_POINT: &str = "historical-apply-before-commit";
 const H6_POINT: &str = "retained-anchor-after-rewind";
+const DURABLE_TRANSITION_POINTS: &[&str] = &[
+    "convergence-pass-collecting-durable",
+    "convergence-pass-frozen-durable",
+    "convergence-pass-resolving-durable",
+    "convergence-pass-completed-durable",
+];
 const CAROL_SEED: &[u8] = b"carol-crash";
 const QUEUED_INTENT_ID: &[u8] = b"crash-queued-intent";
 
@@ -128,6 +135,13 @@ fn h5_kill_before_historical_apply_commit_preserves_live_inputs() {
 #[test]
 fn h6_kill_after_retained_anchor_rewind_recovers_live_snapshot() {
     run_parent_case(H6_POINT, EpochId(1), "openmls-retained-probe-");
+}
+
+#[test]
+fn kill_at_every_durable_convergence_phase_reopens_and_finishes() {
+    for point in DURABLE_TRANSITION_POINTS {
+        run_transition_parent_case(point);
+    }
 }
 
 #[tokio::test]
@@ -309,6 +323,115 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
             .iter()
             .any(|record| record.state == MessageState::Created),
         "the late convergence input must remain durable for replay"
+    );
+}
+
+fn run_transition_parent_case(point: &str) {
+    let dir = tempfile::tempdir().expect("transition temp directory");
+    let database = dir.path().join("carol.sqlite3");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "crash_child_runs_late_commit_convergence",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(DATABASE_ENV, &database)
+        .env(CRASH_POINT_ENV, point)
+        // The incumbent pass exercises each phase once while building the
+        // durable fixture. Kill the second occurrence, in the late competing
+        // pass whose state must survive restart.
+        .env(CRASH_OCCURRENCE_ENV, "2")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn transition crash child");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let (line_tx, line_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let expected_ready = format!("{READY_PREFIX}{point}");
+    let mut child_output = Vec::new();
+    let ready = loop {
+        match line_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(line)) => {
+                let is_ready = line == expected_ready;
+                child_output.push(line);
+                if is_ready {
+                    break true;
+                }
+            }
+            Ok(Err(error)) => {
+                child_output.push(format!("stdout error: {error}"));
+                break false;
+            }
+            Err(_) => break false,
+        }
+    };
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(line_rx);
+        let _ = reader.join();
+        panic!(
+            "child did not reach durable transition {point}; stdout:\n{}",
+            child_output.join("\n")
+        );
+    }
+    child.kill().expect("kill child at durable transition");
+    assert!(
+        !child.wait().expect("wait for transition child").success(),
+        "killed transition child must not exit successfully"
+    );
+    drop(line_rx);
+    reader.join().expect("transition stdout reader exits");
+
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("transition child stderr")
+        .read_to_string(&mut stderr)
+        .expect("read transition child stderr");
+    assert!(
+        database.exists(),
+        "database missing after kill at {point}; stderr:\n{stderr}"
+    );
+
+    let key = SqlCipherKey::new(DATABASE_KEY).expect("transition SQLCipher key");
+    let storage =
+        SqliteAccountStorage::open_encrypted(&database, &key).expect("reopen transition database");
+    let group_ids = storage.list_groups().expect("list transition groups");
+    assert_eq!(group_ids.len(), 1, "transition fixture owns one group");
+    let group_id = group_ids[0].clone();
+    let mut reopened = build_client_with_storage(CAROL_SEED, storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .unwrap_or_else(|error| panic!("hydrate after {point}: {error}"));
+    reopened
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+        .unwrap_or_else(|error| panic!("resume after {point}: {error}"));
+    assert_eq!(
+        reopened
+            .epoch(&group_id)
+            .expect("epoch after transition repair"),
+        EpochId(2),
+        "kill at {point} must reopen to a complete epoch"
+    );
+    assert!(
+        !storage
+            .get_group(&group_id)
+            .expect("group after transition repair")
+            .members
+            .is_empty(),
+        "kill at {point} must not expose partial group state"
     );
 }
 

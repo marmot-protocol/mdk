@@ -319,19 +319,35 @@ pub enum CanonicalizationError {
 }
 
 pub fn canonicalize(input: CanonicalizationInput) -> CanonicalizationResult {
-    canonicalize_internal(input, &[])
+    canonicalize_internal(input, &[], true)
 }
 
 pub fn canonicalize_with_materialized_candidates(
     input: CanonicalizationInput,
     materialized_candidates: Vec<MaterializedCandidate>,
 ) -> CanonicalizationResult {
-    canonicalize_internal(input, &materialized_candidates)
+    canonicalize_internal(input, &materialized_candidates, true)
+}
+
+/// Canonicalize with an explicit application-witness admission switch.
+///
+/// This is an engine-internal test seam used by the conformance simulator to
+/// compare the complete stored-message engine path with and without the
+/// speculative app-witness ranking term. Production callers always use
+/// [`canonicalize_with_materialized_candidates`].
+#[cfg(feature = "test-policy-overrides")]
+pub(crate) fn canonicalize_with_materialized_candidates_for_test(
+    input: CanonicalizationInput,
+    materialized_candidates: Vec<MaterializedCandidate>,
+    admit_app_witnesses: bool,
+) -> CanonicalizationResult {
+    canonicalize_internal(input, &materialized_candidates, admit_app_witnesses)
 }
 
 fn canonicalize_internal(
     input: CanonicalizationInput,
     materialized_candidates: &[MaterializedCandidate],
+    admit_app_witnesses: bool,
 ) -> CanonicalizationResult {
     let mut already_seen = Vec::new();
     let mut observed_ids = input.state.seen_message_ids.clone();
@@ -362,7 +378,9 @@ fn canonicalize_internal(
 
     let mut materialized_graph =
         materialize_candidate_graph(&input, &unique_messages, materialized_candidates);
-    attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
+    if admit_app_witnesses {
+        attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
+    }
     let selected_branch = select_canonical_branch(
         input.state.current_tip_epoch,
         &materialized_graph.candidates,

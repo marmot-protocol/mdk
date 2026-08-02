@@ -152,7 +152,12 @@ impl RetainedRelaySubject {
             .iter()
             .map(|relay| (relay.id.clone(), RetainedRelay::default()))
             .collect::<BTreeMap<_, _>>();
-        let engine = EngineHarnessSubject::new(clients, protocol_profile, storage_mode)?;
+        let engine = EngineHarnessSubject::new_with_topology(
+            clients,
+            &resolved,
+            protocol_profile,
+            storage_mode,
+        )?;
         let mut capabilities = engine.descriptor().capabilities;
         capabilities.retain(|capability| {
             !matches!(
@@ -184,6 +189,13 @@ impl RetainedRelaySubject {
             semantic_classes: BTreeMap::new(),
             sync_observations: Vec::new(),
         })
+    }
+
+    /// Bounded append-only transport evidence captured by the wrapped engine
+    /// subject. Generated retained-history campaigns use this for the same
+    /// failure-capsule diagnostics as packet-bus campaigns.
+    pub fn captured_transport_window(&self) -> crate::CapturedTransportWindowV1 {
+        self.engine.captured_transport_window()
     }
 
     fn unresolved_ids(&mut self, client: &str) -> Result<BTreeSet<String>, SubjectError> {
@@ -424,6 +436,10 @@ fn relay_history_sets_equal(
 impl ConvergenceSubject for RetainedRelaySubject {
     fn descriptor(&self) -> SubjectDescriptor {
         self.descriptor.clone()
+    }
+
+    fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {
+        self.engine.select_scenario_group(group)
     }
 
     async fn create_group(&mut self, action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {

@@ -3,10 +3,48 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    ScenarioAssertionV2, ScenarioComparison, ScenarioMessageSelectorV2, ScenarioPredicateV2,
-    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTransportClass,
-    SubjectOutboundOutcome, VectorFixture, compile_scenario, run_scenario_report,
+    ScenarioAccountV2, ScenarioAssertionV2, ScenarioComparison, ScenarioDeviceV2,
+    ScenarioMessageSelectorV2, ScenarioPredicateV2, ScenarioProcessV2, ScenarioResourceMetric,
+    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, ScenarioTransportClass, SubjectOutboundOutcome,
+    VectorFixture, compile_scenario, run_scenario_report,
 };
+
+fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
+    let mut accounts = entries
+        .iter()
+        .map(|(_, account)| *account)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|account| ScenarioAccountV2 {
+            id: account.into(),
+            roles: vec!["member".into()],
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|a, b| a.id.cmp(&b.id));
+    ScenarioTopologyV2 {
+        accounts,
+        devices: entries
+            .iter()
+            .map(|(client, account)| ScenarioDeviceV2 {
+                id: format!("device:{client}"),
+                account: (*account).into(),
+                process: format!("process:{client}"),
+                client: (*client).into(),
+            })
+            .collect(),
+        processes: entries
+            .iter()
+            .map(|(client, _)| ScenarioProcessV2 {
+                id: format!("process:{client}"),
+                binary_version: "mdk-test".into(),
+                policy_version: "marmot-convergence-v1".into(),
+                relays: vec![],
+            })
+            .collect(),
+        groups: vec![],
+        relays: vec![],
+    }
+}
 
 #[test]
 fn schema_declares_every_executable_step_kind() {
@@ -379,4 +417,184 @@ fn collect_vector_paths(directory: &Path, paths: &mut Vec<PathBuf>) {
             paths.push(path);
         }
     }
+}
+
+#[tokio::test]
+async fn explicit_group_targets_keep_two_live_groups_independent() {
+    fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
+        ScenarioStep::InGroup {
+            group: group.into(),
+            action: Box::new(action),
+        }
+    }
+    fn create(group: &str) -> ScenarioStep {
+        in_group(
+            group,
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: group.into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: format!("{group}-create"),
+            },
+        )
+    }
+    fn accept(publication: &str) -> ScenarioStep {
+        ScenarioStep::AcknowledgeOutbound {
+            client: "alice".into(),
+            publication: Some(publication.into()),
+            selection: Default::default(),
+            outcome: SubjectOutboundOutcome::Accepted,
+        }
+    }
+
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/two-independent-groups".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            create("red"),
+            accept("red-create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            create("blue"),
+            accept("blue-create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "red",
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "red-only".into(),
+                },
+            ),
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "red",
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ),
+            in_group(
+                "blue",
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "blue-only".into(),
+                },
+            ),
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "blue",
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ),
+        ],
+    };
+
+    let compiled = compile_scenario(&scenario).expect("compile multi-group scenario");
+    assert_eq!(compiled.actions[0].scenario_group.as_deref(), Some("red"));
+    assert_eq!(compiled.actions[4].scenario_group.as_deref(), Some("blue"));
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("run multi-group scenario");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].received_payloads, vec!["red-only"]);
+    assert_eq!(observations[1].received_payloads, vec!["blue-only"]);
+    assert_eq!(observations[0].epoch, 1);
+    assert_eq!(observations[1].epoch, 1);
+}
+
+#[test]
+fn incompatible_explicit_policy_versions_fail_before_action_zero() {
+    let mut topology = topology_for_accounts(&[("alice", "account:alice"), ("bob", "account:bob")]);
+    topology.processes[1].policy_version = "marmot-convergence-v2".into();
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/incompatible-policies".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology,
+        steps: vec![],
+    };
+
+    let error = compile_scenario(&scenario).expect_err("mixed policies must not execute");
+    assert_eq!(error.kind, "incompatible_convergence_policy");
+    assert!(error.message.contains("incompatible convergence policies"));
+    assert!(error.message.contains("marmot-convergence-v1"));
+    assert!(error.message.contains("marmot-convergence-v2"));
+}
+
+#[tokio::test]
+async fn topology_can_join_two_device_leaves_for_one_account() {
+    let clients = vec!["alice-phone".into(), "alice-laptop".into(), "bob".into()];
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/shared-account-devices".into(),
+        spec_version: "2".into(),
+        topology: topology_for_accounts(&[
+            ("alice-phone", "account:alice"),
+            ("alice-laptop", "account:alice"),
+            ("bob", "account:bob"),
+        ]),
+        clients: clients.clone(),
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice-phone".into(),
+                name: "multi-device".into(),
+                invitees: vec!["alice-laptop".into(), "bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice-phone".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice-phone", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice-laptop".into(), "bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: clients.clone(),
+            },
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("shared-account device scenario");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.epoch == 1)
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.member_count == 3)
+    );
+    assert!(report.expectation_failures.is_empty());
 }

@@ -56,6 +56,12 @@ impl ScenarioOutboundSelection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScenarioStep {
+    /// Execute one ordinary group-scoped action against a stable scenario
+    /// group label. The compiler lowers this wrapper before adapter execution.
+    InGroup {
+        group: String,
+        action: Box<ScenarioStep>,
+    },
     CreateGroup {
         creator: String,
         name: String,
@@ -216,6 +222,7 @@ pub enum ScenarioStep {
 
 impl ScenarioStep {
     pub const KINDS: &'static [&'static str] = &[
+        "in_group",
         "create_group",
         "invite_members",
         "remove_members",
@@ -277,6 +284,7 @@ impl ScenarioStep {
 
     pub fn kind(&self) -> &'static str {
         match self {
+            ScenarioStep::InGroup { action, .. } => action.kind(),
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
             ScenarioStep::RemoveMembers { .. } => "remove_members",
@@ -488,9 +496,13 @@ pub async fn run_scenario_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, vec![], None, &mut subject).await
 }
 
@@ -514,9 +526,13 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     expected_outcomes: Vec<TraceExpectation>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
@@ -530,9 +546,13 @@ pub async fn run_scenario_report_with_outcomes_and_capture(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     if capture_sensitive_replay && let Some(recipient_tick) = final_planned_recipient_tick(spec) {
         subject.capture_failure_replay_at_tick(recipient_tick);
     }
@@ -571,9 +591,13 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let protocol_profile = fixture_protocol_profile(fixture)?;
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &fixture.scenario.clients,
+        &fixture.scenario.topology,
+        protocol_profile,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),
@@ -688,6 +712,9 @@ async fn execute_scenario_step(
         assertion_observations,
     } = outputs;
     match step {
+        ScenarioStep::InGroup { .. } => {
+            unreachable!("in_group is lowered by the Scenario IR compiler")
+        }
         ScenarioStep::CreateGroup {
             creator,
             name,
@@ -1168,8 +1195,17 @@ async fn run_scenario_report_inner(
     for action in &compiled.actions {
         let step_index = action.schedule.source_step_index;
         let step = &action.step;
-        let step_result =
-            execute_scenario_step(spec, step_index, step, subject, &mut outputs).await;
+        let step_result = if let Some(group) = action.scenario_group.as_deref() {
+            subject
+                .select_scenario_group(group)
+                .map_err(|error| subject_step_error(step_index, error))
+        } else {
+            Ok(())
+        };
+        let step_result = match step_result {
+            Ok(()) => execute_scenario_step(spec, step_index, step, subject, &mut outputs).await,
+            Err(error) => Err(error),
+        };
         if let Err(error) = step_result {
             step_log.push(ScenarioStepLogEntry {
                 step_index,

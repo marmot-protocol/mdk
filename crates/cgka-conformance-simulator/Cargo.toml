@@ -10,6 +10,10 @@ description = "In-process multi-client simulator and fixtures for the CGKA engin
 # Long-running property-based tests (1000+ iterations). Quick CI runs the
 # default profile; nightly CI runs with this feature enabled.
 conformance-slow = []
+# Full-engine A/B campaigns that disable only application-message witness
+# admission. This is a simulator experiment, not a supported wire policy.
+test-policy-overrides = ["cgka-engine/test-policy-overrides"]
+test-witness-comparison = ["test-policy-overrides"]
 
 [dependencies]
 cgka-traits.workspace = true

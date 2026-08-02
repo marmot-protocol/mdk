@@ -4,12 +4,15 @@
 //! to replay or promote a generated case into a fixed vector.
 
 use crate::{
-    GeneratedScenarioMetadata, HarnessStorageMode, ScenarioMessageSelectorV2,
-    ScenarioOutboundSelection, ScenarioReport, ScenarioRunError, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, VectorFixture,
-    fingerprint_report_failure, run_scenario_report_with_outcomes_and_capture,
-    run_scenario_report_with_outcomes_and_storage_mode, stable_action_id,
+    GeneratedScenarioMetadata, HarnessStorageMode, RetainedRelaySubject, ScenarioFailureCaptureV1,
+    ScenarioMessageSelectorV2, ScenarioOutboundSelection, ScenarioReport, ScenarioRunError,
+    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
+    TraceExpectation, VectorFixture, fingerprint_report_failure,
+    run_scenario_report_with_outcomes_and_capture,
+    run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_subject,
+    stable_action_id,
 };
+use cgka_traits::group::ProtocolProfile;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -21,9 +24,30 @@ pub struct GeneratedScenarioCase {
     pub generator_version: String,
     pub seed: u64,
     pub case_index: u64,
+    #[serde(default, skip_serializing_if = "GeneratedSubjectKind::is_engine")]
+    pub subject: GeneratedSubjectKind,
     pub scenario: ScenarioSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
+}
+
+/// Adapter selected by a generated campaign case.
+///
+/// Keeping this in generated metadata prevents retained-history workloads from
+/// silently running against the fast packet bus, where reconnect would merely
+/// heal transient delivery rather than query durable relay history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedSubjectKind {
+    #[default]
+    Engine,
+    RetainedRelay,
+}
+
+impl GeneratedSubjectKind {
+    fn is_engine(&self) -> bool {
+        *self == Self::Engine
+    }
 }
 
 impl GeneratedScenarioCase {
@@ -56,6 +80,7 @@ pub fn generate_send_leave_family(seed: u64, cases: usize) -> Vec<GeneratedScena
             generator_version: "2".into(),
             seed,
             case_index: case_index as u64,
+            subject: GeneratedSubjectKind::Engine,
             scenario,
             expected_outcomes,
         });
@@ -75,6 +100,7 @@ pub fn generate_convergence_e2e_delivery_family(
             generator_version: "1".into(),
             seed,
             case_index: case_index as u64,
+            subject: GeneratedSubjectKind::Engine,
             scenario: convergence_e2e_delivery_case(&mut rng, case_index as u64),
             expected_outcomes: vec![],
         });
@@ -94,11 +120,60 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
             generator_version: "6".into(),
             seed,
             case_index: case_index as u64,
+            subject: GeneratedSubjectKind::Engine,
             scenario,
             expected_outcomes,
         });
     }
     out
+}
+
+/// Generate the Milestone 3 adversarial catalog. Case indices rotate through
+/// every required workload family; requesting more than twelve cases repeats
+/// the catalog with a new deterministic case id and schedule seed.
+pub fn generate_milestone3_adversarial_family(
+    seed: u64,
+    cases: usize,
+) -> Vec<GeneratedScenarioCase> {
+    (0..cases)
+        .map(|case_index| {
+            let case_index = case_index as u64;
+            let mut rng =
+                StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
+            let (family_name, subject, mut scenario, mut expected_outcomes) =
+                milestone3_case(&mut rng, case_index);
+            add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+            GeneratedScenarioCase {
+                family_name,
+                generator_version: "1".into(),
+                seed,
+                case_index,
+                subject,
+                scenario,
+                expected_outcomes,
+            }
+        })
+        .collect()
+}
+
+/// One-round form of the sustained mixed-traffic workload for normal
+/// regression suites. The adversarial family retains the multi-round campaign.
+pub fn generate_milestone3_sustained_regression(seed: u64) -> GeneratedScenarioCase {
+    let case_index = 1_u64;
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
+    let (family_name, subject, mut scenario, mut expected_outcomes) =
+        milestone3_sustained_mixed_traffic_with_rounds(&mut rng, case_index, 1);
+    scenario.name = "milestone3/sustained-mixed-traffic/regression".into();
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name,
+        generator_version: "1-regression".into(),
+        seed,
+        case_index,
+        subject,
+        scenario,
+        expected_outcomes,
+    }
 }
 
 pub async fn run_generated_case_report(
@@ -118,7 +193,8 @@ pub async fn run_generated_case_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut report = run_scenario_report_with_outcomes_and_storage_mode(
+    let mut report = run_generated_scenario(
+        case.subject,
         &case.scenario,
         expected_trace.clone(),
         case.expected_outcomes.clone(),
@@ -137,14 +213,41 @@ pub async fn run_generated_case_report_with_capture(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
-    let (mut report, failure_capture) = run_scenario_report_with_outcomes_and_capture(
-        &case.scenario,
-        expected_trace.clone(),
-        case.expected_outcomes.clone(),
-        storage_mode,
-        capture_sensitive_replay,
-    )
-    .await?;
+    let (mut report, failure_capture) = match case.subject {
+        GeneratedSubjectKind::Engine => {
+            run_scenario_report_with_outcomes_and_capture(
+                &case.scenario,
+                expected_trace.clone(),
+                case.expected_outcomes.clone(),
+                storage_mode,
+                capture_sensitive_replay,
+            )
+            .await?
+        }
+        GeneratedSubjectKind::RetainedRelay => {
+            let mut subject = RetainedRelaySubject::new(
+                &case.scenario.clients,
+                &case.scenario.topology,
+                ProtocolProfile::Legacy,
+                storage_mode,
+            )
+            .map_err(subject_setup_error)?;
+            let report = run_scenario_report_with_subject(
+                &case.scenario,
+                expected_trace.clone(),
+                case.expected_outcomes.clone(),
+                &mut subject,
+            )
+            .await?;
+            (
+                report,
+                ScenarioFailureCaptureV1 {
+                    transport: subject.captured_transport_window(),
+                    byte_replay: None,
+                },
+            )
+        }
+    };
     add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;
     Ok((report, failure_capture))
 }
@@ -196,6 +299,7 @@ async fn minimize_failing_case(
             case.expected_outcomes.clone(),
             &target_identity,
             storage_mode,
+            case.subject,
         )
         .await
         {
@@ -215,8 +319,10 @@ async fn reproduces_failure(
     expected_outcomes: Vec<TraceExpectation>,
     target_identity: &crate::FailureIdentityV1,
     storage_mode: HarnessStorageMode,
+    subject: GeneratedSubjectKind,
 ) -> bool {
-    match run_scenario_report_with_outcomes_and_storage_mode(
+    match run_generated_scenario(
+        subject,
         scenario,
         expected_trace,
         expected_outcomes,
@@ -227,6 +333,51 @@ async fn reproduces_failure(
         Ok(report) => fingerprint_report_failure(&report)
             .is_ok_and(|fingerprint| fingerprint.semantic_identity() == *target_identity),
         Err(_) => false,
+    }
+}
+
+async fn run_generated_scenario(
+    subject: GeneratedSubjectKind,
+    scenario: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+    expected_outcomes: Vec<TraceExpectation>,
+    storage_mode: HarnessStorageMode,
+) -> Result<ScenarioReport, ScenarioRunError> {
+    match subject {
+        GeneratedSubjectKind::Engine => {
+            run_scenario_report_with_outcomes_and_storage_mode(
+                scenario,
+                expected_trace,
+                expected_outcomes,
+                storage_mode,
+            )
+            .await
+        }
+        GeneratedSubjectKind::RetainedRelay => {
+            let mut retained = RetainedRelaySubject::new(
+                &scenario.clients,
+                &scenario.topology,
+                ProtocolProfile::Legacy,
+                storage_mode,
+            )
+            .map_err(subject_setup_error)?;
+            run_scenario_report_with_subject(
+                scenario,
+                expected_trace,
+                expected_outcomes,
+                &mut retained,
+            )
+            .await
+        }
+    }
+}
+
+fn subject_setup_error(error: crate::SubjectError) -> ScenarioRunError {
+    ScenarioRunError {
+        step_index: None,
+        kind: error.code,
+        category: error.category,
+        message: error.message,
     }
 }
 
@@ -941,6 +1092,841 @@ fn convergence_chaos_restart_delivery_faults(
         client_state("alice", 1, 3, vec![payload]),
     ];
     (scenario, expected)
+}
+
+fn milestone3_case(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    match case_index % 12 {
+        0 => milestone3_offline_retained_flood(case_index),
+        1 => milestone3_sustained_mixed_traffic(rng, case_index),
+        2 => milestone3_self_update_adversary(case_index),
+        3 => milestone3_losing_invite_repair(case_index),
+        4 => milestone3_unequal_relay_reconciliation(case_index),
+        5 => milestone3_restart_boundaries(case_index),
+        6 => milestone3_multi_group_noisy_neighbor(case_index),
+        7 => {
+            let (mut scenario, expected) = convergence_chaos_large_commit_storm(rng, case_index);
+            scenario.name = format!("milestone3/candidate-replay-exhaustion/case-{case_index}");
+            (
+                "milestone3/candidate-replay-exhaustion/v1".into(),
+                GeneratedSubjectKind::Engine,
+                scenario,
+                expected,
+            )
+        }
+        8 => milestone3_multi_device_account(case_index),
+        9 => milestone3_app_witness_value(case_index),
+        10 => milestone3_mixed_binary_compatibility(case_index),
+        _ => milestone3_clock_cursor_attack(case_index),
+    }
+}
+
+fn milestone3_offline_retained_flood(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "carol", "david"]);
+    let mut steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice".into(),
+            name: format!("offline-retained-{case_index}"),
+            invitees: labels(["bob", "carol"]),
+            required_features: vec![],
+            initial_admins: Some(vec!["alice".into()]),
+            pending: "create".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob", "carol"]),
+        ScenarioStep::SetClientOffline {
+            client: "bob".into(),
+        },
+    ];
+    let rounds = 3 + usize::try_from((case_index / 12) % 3).unwrap_or(0);
+    for round in 0..rounds {
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: "alice".into(),
+            payload: format!("offline-flood-{case_index}-{round}"),
+        });
+        steps.push(accept_all_outbound("alice"));
+        steps.push(ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: format!("offline-state-{case_index}-{round}"),
+            pending: format!("state-{round}"),
+        });
+        steps.push(confirmed_step("alice", &format!("state-{round}")));
+        steps.push(ScenarioStep::DeliverAll);
+        steps.push(tick(["carol"]));
+    }
+    steps.extend([
+        invite("alice", ["david"], "invite-david"),
+        confirmed_step("alice", "invite-david"),
+        ScenarioStep::DeliverAll,
+        tick(["carol", "david"]),
+        ScenarioStep::SendAppMessage {
+            sender: "david".into(),
+            payload: format!("membership-window-{case_index}"),
+        },
+        accept_all_outbound("david"),
+        ScenarioStep::DeliverAll,
+        tick(["alice", "carol"]),
+        ScenarioStep::RemoveMembers {
+            remover: "alice".into(),
+            members: vec!["david".into()],
+            pending: "remove-david".into(),
+        },
+        confirmed_step("alice", "remove-david"),
+        ScenarioStep::DeliverAll,
+        tick(["carol", "david"]),
+        ScenarioStep::ReconnectClient {
+            client: "bob".into(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::FullHistory,
+        },
+        tick(["bob"]),
+    ]);
+    let expected = vec![clients_converged(["alice", "bob", "carol"], None, Some(3))];
+    (
+        "milestone3/offline-retained-history-flood/v1".into(),
+        GeneratedSubjectKind::RetainedRelay,
+        ScenarioSpec {
+            name: format!("milestone3/offline-retained-history-flood/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology: milestone3_single_relay_topology(&labels(["alice", "bob", "carol", "david"])),
+            steps,
+        },
+        expected,
+    )
+}
+
+fn milestone3_sustained_mixed_traffic(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let rounds = 4 + usize::try_from((case_index / 12) % 4).unwrap_or(0);
+    milestone3_sustained_mixed_traffic_with_rounds(rng, case_index, rounds)
+}
+
+fn milestone3_sustained_mixed_traffic_with_rounds(
+    rng: &mut StdRng,
+    case_index: u64,
+    rounds: usize,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "carol", "david"]);
+    let active = labels(["alice", "bob", "carol", "david"]);
+    let mut steps = large_group_setup(
+        format!("sustained-mixed-{case_index}"),
+        clients.clone(),
+        labels(["bob", "carol", "david"]),
+    );
+    for round in 0..rounds {
+        let mut senders = labels(["alice", "bob", "carol", "david"]);
+        let sender_count = senders.len();
+        senders.rotate_left(rng.gen_range(0..sender_count));
+        for sender in &senders {
+            steps.push(ScenarioStep::SendAppMessage {
+                sender: sender.clone(),
+                payload: format!("mixed-{case_index}-{round}-{sender}"),
+            });
+            steps.push(accept_all_outbound(sender));
+        }
+        let committer = if round % 2 == 0 { "alice" } else { "bob" };
+        steps.push(ScenarioStep::SelfUpdate {
+            client: committer.into(),
+            pending: format!("self-{round}"),
+        });
+        steps.push(confirmed_step(committer, &format!("self-{round}")));
+        steps.push(ScenarioStep::DeliverAll);
+        steps.push(tick_vec(active.clone()));
+    }
+    steps.extend([
+        ScenarioStep::Leave {
+            client: "david".into(),
+        },
+        ScenarioStep::DeliverAll,
+        // Let the privileged admin produce the single auto-commit before the
+        // remaining members observe the proposal. Ticking every member here
+        // intentionally creates a separate multi-auto-committer adversary and
+        // obscures this workload's sustained-traffic signal.
+        tick(["alice"]),
+        accept_all_outbound("alice"),
+        ScenarioStep::DeliverAll,
+        tick(["bob", "carol", "david"]),
+    ]);
+    (
+        "milestone3/sustained-mixed-traffic/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/sustained-mixed-traffic/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology: Default::default(),
+            steps,
+        },
+        vec![clients_converged(["alice", "bob", "carol"], None, Some(3))],
+    )
+}
+
+fn milestone3_self_update_adversary(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "carol"]);
+    let mut steps = large_group_setup(
+        format!("self-update-adversary-{case_index}"),
+        clients.clone(),
+        labels(["bob", "carol"]),
+    );
+    for round in 0..4 {
+        steps.extend([
+            ScenarioStep::SelfUpdate {
+                client: "bob".into(),
+                pending: format!("grind-{round}"),
+            },
+            confirmed_step("bob", &format!("grind-{round}")),
+            ScenarioStep::DeliverAll,
+            tick(["alice", "carol"]),
+        ]);
+    }
+    steps.extend([
+        ScenarioStep::SelfUpdate {
+            client: "bob".into(),
+            pending: "racing-self-update".into(),
+        },
+        ScenarioStep::RemoveMembers {
+            remover: "alice".into(),
+            members: vec!["bob".into()],
+            pending: "privileged-remove".into(),
+        },
+        confirmed_step("bob", "racing-self-update"),
+        confirmed_step("alice", "privileged-remove"),
+        ScenarioStep::DeliverAll,
+        tick(["alice", "bob", "carol"]),
+    ]);
+    (
+        "milestone3/self-update-admin-race/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/self-update-admin-race/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology: Default::default(),
+            steps,
+        },
+        vec![clients_converged(["alice", "carol"], None, Some(2))],
+    )
+}
+
+fn milestone3_losing_invite_repair(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "david", "eve"]);
+    let steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice".into(),
+            name: format!("losing-invite-repair-{case_index}"),
+            invitees: vec!["bob".into()],
+            required_features: vec![],
+            initial_admins: Some(labels(["alice", "bob"])),
+            pending: "create".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob"]),
+        invite("alice", ["david"], "winning-invite"),
+        invite("bob", ["eve"], "losing-invite"),
+        confirmed_step("alice", "winning-invite"),
+        confirmed_step("bob", "losing-invite"),
+        ScenarioStep::WithholdMessage {
+            selector: commit_selector("alice"),
+            label: "alice-commit".into(),
+        },
+        ScenarioStep::WithholdMessage {
+            selector: commit_selector("bob"),
+            label: "bob-commit".into(),
+        },
+        ScenarioStep::DeliverAll,
+        tick(["david", "eve"]),
+        ScenarioStep::ReleaseWithheld {
+            label: "alice-commit".into(),
+        },
+        ScenarioStep::ReleaseWithheld {
+            label: "bob-commit".into(),
+        },
+        ScenarioStep::DeliverAll,
+        tick(["alice", "bob"]),
+        invite("alice", ["eve"], "repair-eve"),
+        confirmed_step("alice", "repair-eve"),
+        ScenarioStep::DeliverAll,
+        tick(["bob", "david", "eve"]),
+        ScenarioStep::AdvanceTime {
+            delta_ms: 30 * 24 * 60 * 60 * 1_000 + 1,
+        },
+        tick(["alice", "bob", "david", "eve"]),
+        ScenarioStep::ObserveExact {
+            clients: labels(["alice", "eve"]),
+        },
+    ];
+    (
+        "milestone3/losing-invite-unrecoverable/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/losing-invite-unrecoverable/case-{case_index}"),
+            spec_version: "2".into(),
+            clients: clients.clone(),
+            topology: Default::default(),
+            steps,
+        },
+        vec![
+            clients_converged(["alice", "bob", "david"], Some(3), Some(4)),
+            TraceExpectation::ClientsNotEquivalent {
+                clients: labels(["alice", "eve"]),
+                reason: "a member that joined only a losing branch requires explicit local rejoin"
+                    .into(),
+            },
+        ],
+    )
+}
+
+fn milestone3_unequal_relay_reconciliation(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob"]);
+    let steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice".into(),
+            name: format!("unequal-relays-{case_index}"),
+            invitees: vec!["bob".into()],
+            required_features: vec![],
+            initial_admins: Some(vec!["alice".into()]),
+            pending: "create".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::ReconcileRelayHistories {
+            relays: labels(["relay:a", "relay:b"]),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::SetReconciliation,
+        },
+        tick(["bob"]),
+        ScenarioStep::SetClientOffline {
+            client: "bob".into(),
+        },
+        ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: format!("unequal-relays-after-{case_index}"),
+            pending: "rename".into(),
+        },
+        confirmed_step("alice", "rename"),
+        ScenarioStep::ReconnectClient {
+            client: "bob".into(),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::Incremental,
+        },
+        tick(["bob"]),
+        ScenarioStep::ReconcileRelayHistories {
+            relays: labels(["relay:a", "relay:b"]),
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::SetReconciliation,
+        },
+        tick(["bob"]),
+    ];
+    (
+        "milestone3/unequal-relay-reconciliation/v1".into(),
+        GeneratedSubjectKind::RetainedRelay,
+        ScenarioSpec {
+            name: format!("milestone3/unequal-relay-reconciliation/case-{case_index}"),
+            spec_version: "2".into(),
+            clients: clients.clone(),
+            topology: milestone3_split_relay_topology(&clients),
+            steps,
+        },
+        vec![clients_converged(["alice", "bob"], None, Some(2))],
+    )
+}
+
+fn milestone3_restart_boundaries(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "carol"]);
+    let steps = vec![
+        create_group(
+            "alice",
+            format!("restart-boundaries-{case_index}"),
+            ["bob", "carol"],
+            "create",
+        ),
+        ScenarioStep::RestartClient {
+            client: "alice".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob", "carol"]),
+        ScenarioStep::RestartClient {
+            client: "bob".into(),
+        },
+        ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: format!("restart-boundaries-after-{case_index}"),
+            pending: "update".into(),
+        },
+        confirmed_step("alice", "update"),
+        ScenarioStep::RestartClient {
+            client: "carol".into(),
+        },
+        ScenarioStep::DeliverAll,
+        tick(["bob", "carol"]),
+    ];
+    (
+        "milestone3/restart-boundaries/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/restart-boundaries/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology: Default::default(),
+            steps,
+        },
+        vec![clients_converged(["alice", "bob", "carol"], None, Some(3))],
+    )
+}
+
+fn milestone3_multi_group_noisy_neighbor(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob", "carol"]);
+    let in_group = |group: &str, action: ScenarioStep| ScenarioStep::InGroup {
+        group: group.into(),
+        action: Box::new(action),
+    };
+    let mut steps = vec![
+        in_group(
+            "quiet",
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "quiet".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "quiet-create".into(),
+            },
+        ),
+        confirmed_step("alice", "quiet-create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob"]),
+        in_group(
+            "noisy",
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "noisy".into(),
+                invitees: vec!["carol".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "noisy-create".into(),
+            },
+        ),
+        confirmed_step("alice", "noisy-create"),
+        ScenarioStep::DeliverAll,
+        tick(["carol"]),
+    ];
+    for index in 0..10 {
+        steps.push(in_group(
+            "noisy",
+            ScenarioStep::SendAppMessage {
+                sender: "carol".into(),
+                payload: format!("noise-{case_index}-{index}"),
+            },
+        ));
+        steps.push(accept_all_outbound("carol"));
+    }
+    steps.extend([
+        in_group(
+            "quiet",
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: format!("quiet-progress-{case_index}"),
+            },
+        ),
+        accept_all_outbound("alice"),
+        ScenarioStep::DeliverAll,
+        tick(["alice", "bob", "carol"]),
+        in_group(
+            "quiet",
+            ScenarioStep::Observe {
+                clients: labels(["alice", "bob"]),
+            },
+        ),
+    ]);
+    (
+        "milestone3/multi-group-noisy-neighbor/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/multi-group-noisy-neighbor/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology: Default::default(),
+            steps,
+        },
+        vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
+    )
+}
+
+fn milestone3_multi_device_account(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice-phone", "alice-laptop", "bob"]);
+    let topology = milestone3_account_topology(&[
+        ("alice-phone", "account:alice", "build-a"),
+        ("alice-laptop", "account:alice", "build-a"),
+        ("bob", "account:bob", "build-a"),
+    ]);
+    let steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice-phone".into(),
+            name: format!("multi-device-{case_index}"),
+            invitees: labels(["alice-laptop", "bob"]),
+            required_features: vec![],
+            initial_admins: Some(vec!["alice-phone".into()]),
+            pending: "create".into(),
+        },
+        confirmed_step("alice-phone", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["alice-laptop", "bob"]),
+        ScenarioStep::SendAppMessage {
+            sender: "alice-phone".into(),
+            payload: format!("phone-{case_index}"),
+        },
+        accept_all_outbound("alice-phone"),
+        ScenarioStep::SendAppMessage {
+            sender: "alice-laptop".into(),
+            payload: format!("laptop-{case_index}"),
+        },
+        accept_all_outbound("alice-laptop"),
+        ScenarioStep::DeliverAll,
+        tick(["alice-phone", "alice-laptop", "bob"]),
+    ];
+    (
+        "milestone3/multi-device-account/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/multi-device-account/case-{case_index}"),
+            spec_version: "2".into(),
+            clients: clients.clone(),
+            topology,
+            steps,
+        },
+        vec![clients_converged_vec(clients, Some(1), Some(3))],
+    )
+}
+
+fn milestone3_app_witness_value(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let scenario = ScenarioSpec {
+        name: format!("milestone3/app-witness-value/case-{case_index}"),
+        spec_version: "2".into(),
+        topology: Default::default(),
+        clients: labels(["alice", "bob", "carol", "david", "eve", "frank"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("witness-value-{case_index}"),
+                ["bob", "carol"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob", "carol"]),
+            invite("alice", ["david"], "alice-branch"),
+            invite("bob", ["eve", "frank"], "bob-branch"),
+            confirmed_step("alice", "alice-branch"),
+            confirmed_step("bob", "bob-branch"),
+            ScenarioStep::WithholdMessage {
+                selector: commit_selector("alice"),
+                label: "alice-branch-commit".into(),
+            },
+            ScenarioStep::WithholdMessage {
+                selector: commit_selector("bob"),
+                label: "bob-branch-commit".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["david", "eve", "frank"]),
+            ScenarioStep::SendAppMessage {
+                sender: "david".into(),
+                payload: format!("david-witness-{case_index}"),
+            },
+            accept_all_outbound("david"),
+            ScenarioStep::SendAppMessage {
+                sender: "eve".into(),
+                payload: format!("eve-witness-{case_index}"),
+            },
+            accept_all_outbound("eve"),
+            ScenarioStep::SendAppMessage {
+                sender: "frank".into(),
+                payload: format!("frank-witness-{case_index}"),
+            },
+            accept_all_outbound("frank"),
+            ScenarioStep::ReleaseWithheld {
+                label: "alice-branch-commit".into(),
+            },
+            ScenarioStep::ReleaseWithheld {
+                label: "bob-branch-commit".into(),
+            },
+            ScenarioStep::DeliverAll,
+            tick(["alice", "bob", "carol"]),
+            ScenarioStep::AdvanceTime {
+                delta_ms: 30 * 24 * 60 * 60 * 1_000 + 1,
+            },
+            tick(["alice", "bob", "carol", "david", "eve", "frank"]),
+        ],
+    };
+    (
+        "milestone3/app-witness-value/v1".into(),
+        GeneratedSubjectKind::Engine,
+        scenario,
+        vec![clients_converged(["alice", "bob", "carol"], None, None)],
+    )
+}
+
+fn milestone3_mixed_binary_compatibility(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob"]);
+    let topology = milestone3_account_topology(&[
+        ("alice", "account:alice", "mdk-previous"),
+        ("bob", "account:bob", "mdk-current"),
+    ]);
+    (
+        "milestone3/mixed-binary-policy/v1".into(),
+        GeneratedSubjectKind::Engine,
+        ScenarioSpec {
+            name: format!("milestone3/mixed-binary-policy/case-{case_index}"),
+            spec_version: "2".into(),
+            clients,
+            topology,
+            steps: vec![
+                create_group(
+                    "alice",
+                    format!("mixed-binary-{case_index}"),
+                    ["bob"],
+                    "create",
+                ),
+                confirmed_step("alice", "create"),
+                ScenarioStep::DeliverAll,
+                tick(["bob"]),
+            ],
+        },
+        vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
+    )
+}
+
+fn milestone3_clock_cursor_attack(
+    case_index: u64,
+) -> (
+    String,
+    GeneratedSubjectKind,
+    ScenarioSpec,
+    Vec<TraceExpectation>,
+) {
+    let clients = labels(["alice", "bob"]);
+    let steps = vec![
+        ScenarioStep::CreateGroup {
+            creator: "alice".into(),
+            name: format!("clock-cursor-{case_index}"),
+            invitees: vec!["bob".into()],
+            required_features: vec![],
+            initial_admins: Some(vec!["alice".into()]),
+            pending: "create".into(),
+        },
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob"]),
+        ScenarioStep::SetClientOffline {
+            client: "bob".into(),
+        },
+        ScenarioStep::SendAppMessage {
+            sender: "alice".into(),
+            payload: format!("before-clock-jump-{case_index}"),
+        },
+        accept_all_outbound("alice"),
+        ScenarioStep::AdvanceTime {
+            delta_ms: 365 * 24 * 60 * 60 * 1_000,
+        },
+        ScenarioStep::ReconnectClient {
+            client: "bob".into(),
+        },
+        ScenarioStep::ConfigureRelay {
+            relay: "relay:default".into(),
+            order: crate::ScenarioRelayOrderV2::Reverse,
+            duplicate_copies: 2,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::Incremental,
+        },
+        ScenarioStep::SyncRelayHistory {
+            clients: vec!["bob".into()],
+            sync: crate::ScenarioRelaySyncModeV2::FullHistory,
+        },
+        tick(["bob"]),
+    ];
+    (
+        "milestone3/clock-scheduler-cursor/v1".into(),
+        GeneratedSubjectKind::RetainedRelay,
+        ScenarioSpec {
+            name: format!("milestone3/clock-scheduler-cursor/case-{case_index}"),
+            spec_version: "2".into(),
+            clients: clients.clone(),
+            topology: milestone3_single_relay_topology(&clients),
+            steps,
+        },
+        vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
+    )
+}
+
+fn milestone3_account_topology(clients: &[(&str, &str, &str)]) -> crate::ScenarioTopologyV2 {
+    let mut accounts = BTreeSet::new();
+    crate::ScenarioTopologyV2 {
+        accounts: clients
+            .iter()
+            .filter_map(|(_, account, _)| {
+                accounts.insert(*account).then(|| crate::ScenarioAccountV2 {
+                    id: (*account).into(),
+                    roles: vec!["member".into()],
+                })
+            })
+            .collect(),
+        devices: clients
+            .iter()
+            .map(|(client, account, _)| crate::ScenarioDeviceV2 {
+                id: format!("device:{client}"),
+                account: (*account).into(),
+                process: format!("process:{client}"),
+                client: (*client).into(),
+            })
+            .collect(),
+        processes: clients
+            .iter()
+            .map(|(client, _, binary)| crate::ScenarioProcessV2 {
+                id: format!("process:{client}"),
+                binary_version: (*binary).into(),
+                policy_version: "marmot-convergence-v1".into(),
+                relays: vec![],
+            })
+            .collect(),
+        groups: vec![],
+        relays: vec![],
+    }
+}
+
+fn milestone3_single_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
+    let mut topology = milestone3_account_topology(
+        &clients
+            .iter()
+            .map(|client| (client.as_str(), client.as_str(), "mdk-current"))
+            .collect::<Vec<_>>(),
+    );
+    topology.relays = vec![crate::ScenarioRelayV2 {
+        id: "relay:default".into(),
+        implementation_version: "memory/v1".into(),
+        policy_version: "retain-all/v1".into(),
+    }];
+    for process in &mut topology.processes {
+        process.relays = vec!["relay:default".into()];
+    }
+    topology
+}
+
+fn milestone3_split_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
+    let mut topology = milestone3_single_relay_topology(clients);
+    topology.relays = vec![
+        crate::ScenarioRelayV2 {
+            id: "relay:a".into(),
+            implementation_version: "memory/v1".into(),
+            policy_version: "retain-all/v1".into(),
+        },
+        crate::ScenarioRelayV2 {
+            id: "relay:b".into(),
+            implementation_version: "memory/v1".into(),
+            policy_version: "retain-all/v1".into(),
+        },
+    ];
+    for (index, process) in topology.processes.iter_mut().enumerate() {
+        process.relays = vec![if index % 2 == 0 {
+            "relay:a".into()
+        } else {
+            "relay:b".into()
+        }];
+    }
+    topology
 }
 
 fn labels<const N: usize>(items: [&str; N]) -> Vec<String> {

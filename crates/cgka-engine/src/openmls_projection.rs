@@ -228,10 +228,23 @@ pub(crate) struct ReplayProfilePolicy {
     pub(crate) reject_legacy_group_additions: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StoredCanonicalizationOptions<'a> {
     pub(crate) replay_profile: ReplayProfilePolicy,
     pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
+    pub(crate) admit_app_witnesses: bool,
+    pub(crate) replay_probe_budget_override: Option<u64>,
+}
+
+impl Default for StoredCanonicalizationOptions<'_> {
+    fn default() -> Self {
+        Self {
+            replay_profile: ReplayProfilePolicy::default(),
+            admitted_message_ids: None,
+            admit_app_witnesses: true,
+            replay_probe_budget_override: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +261,8 @@ struct StoredOpenMlsCanonicalizationWork {
     replay_start_epoch: u64,
     own_commits: PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
+    admit_app_witnesses: bool,
+    replay_probe_budget_override: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -772,6 +787,7 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
         batch,
         &PrevalidatedOwnCommits::default(),
         ReplayProfilePolicy::default(),
+        true,
     )
 }
 
@@ -781,6 +797,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     batch: OpenMlsCanonicalizationBatch,
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
+    admit_app_witnesses: bool,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let candidate_paths = candidate_paths_with_pending_replay_messages(
         &batch.candidate_paths,
@@ -794,7 +811,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
         &mut ReplayBudget::unlimited(),
         profile_policy,
     )?;
-    canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)
+    canonicalize_openmls_batch_with_materialized(group_id, batch, materialized, admit_app_witnesses)
 }
 
 /// Canonicalization core over already-materialized candidates. Split out of
@@ -807,6 +824,7 @@ fn canonicalize_openmls_batch_with_materialized(
     group_id: &GroupId,
     batch: OpenMlsCanonicalizationBatch,
     materialized: Vec<OpenMlsMaterializedCandidate>,
+    admit_app_witnesses: bool,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let proposal_id_by_ref = proposal_id_by_ref(&materialized);
     let materialized_candidates: Vec<_> = materialized
@@ -825,15 +843,27 @@ fn canonicalize_openmls_batch_with_materialized(
         &app_messages_by_id,
     )?;
 
+    let input = CanonicalizationInput {
+        state: batch.state,
+        pending_messages,
+        outbound_intents: batch.outbound_intents,
+        candidate_branches: vec![],
+        policy: batch.policy,
+        now_ms: batch.now_ms,
+    };
+    #[cfg(feature = "test-policy-overrides")]
+    if !admit_app_witnesses {
+        return Ok(
+            crate::canonicalization::canonicalize_with_materialized_candidates_for_test(
+                input,
+                materialized_candidates,
+                false,
+            ),
+        );
+    }
+    let _ = admit_app_witnesses;
     Ok(canonicalize_with_materialized_candidates(
-        CanonicalizationInput {
-            state: batch.state,
-            pending_messages,
-            outbound_intents: batch.outbound_intents,
-            candidate_branches: vec![],
-            policy: batch.policy,
-            now_ms: batch.now_ms,
-        },
+        input,
         materialized_candidates,
     ))
 }
@@ -985,6 +1015,8 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 replay_start_epoch,
                 own_commits,
                 profile_policy,
+                admit_app_witnesses: options.admit_app_witnesses,
+                replay_probe_budget_override: options.replay_probe_budget_override,
             },
         )?;
         append_dropped_messages(&mut result, stale_commit_drops);
@@ -1005,6 +1037,8 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
             replay_start_epoch,
             own_commits,
             profile_policy,
+            admit_app_witnesses: options.admit_app_witnesses,
+            replay_probe_budget_override: options.replay_probe_budget_override,
         },
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
@@ -1167,6 +1201,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         work.policy.convergence.max_rewind_commits,
         &work.own_commits,
         work.profile_policy,
+        work.replay_probe_budget_override,
     )?;
 
     let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
@@ -1188,7 +1223,12 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     let mut result = if can_reuse_materialized {
         let mut materialized = path_result.materialized;
         materialized.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
-        canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)?
+        canonicalize_openmls_batch_with_materialized(
+            group_id,
+            batch,
+            materialized,
+            work.admit_app_witnesses,
+        )?
     } else {
         canonicalize_openmls_batch_prevalidated(
             storage,
@@ -1196,6 +1236,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
             batch,
             &work.own_commits,
             work.profile_policy,
+            work.admit_app_witnesses,
         )?
     };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
@@ -1262,6 +1303,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     max_rewind_commits: u64,
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
+    replay_budget_override: Option<u64>,
 ) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
@@ -1275,7 +1317,10 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         .map(|commit| commit.message.id.to_string())
         .collect::<BTreeSet<_>>();
 
-    let mut budget = ReplayBudget::for_pass(commits.len(), max_rewind_commits);
+    let mut budget = replay_budget_override.map_or_else(
+        || ReplayBudget::for_pass(commits.len(), max_rewind_commits),
+        ReplayBudget::new,
+    );
     let pending_proposals = pending_proposal_messages(pending_messages)?;
     let mut frontier = vec![CandidatePathProbe {
         messages: Vec::new(),

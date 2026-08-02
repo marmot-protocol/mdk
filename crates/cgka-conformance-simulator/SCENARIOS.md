@@ -441,6 +441,23 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ## Tooling And Report Checks
 
+### Milestone 3 Adversarial Catalog
+
+`milestone3-adversarial/v1` rotates through twelve deterministic workload shapes: retained-history offline floods;
+sustained app/proposal/commit traffic; self-update versus admin progress; a named unrecoverable losing-branch invite;
+unequal relay reconciliation; restart boundaries plus the engine's real SIGKILL durable-phase matrix; multi-group noisy
+neighbors; replay-budget exhaustion; shared-account multi-device witnesses; full-engine app-witness A/B selection;
+mixed-binary compatibility with mixed-policy preflight rejection; and clock, scheduler, timestamp, and cursor attacks.
+
+The normal test target runs small headline regressions. The multi-round sustained case is ignored by default and is
+invoked explicitly; the report CLI runs any number of seeded cases with either in-memory or encrypted file-backed
+SQLite. Test-only feature `test-policy-overrides` exposes the zero replay-budget repair and witness-disabled paired
+engine experiments. Production builds cannot select either override.
+
+The app-witness “multi-parent” sentinel means one MLS commit consuming multiple standalone proposal dependencies
+atomically. MLS still has exactly one prior group-state parent; the campaign does not claim that incompatible MLS state
+branches can be merged.
+
 These tests keep the simulator machinery honest.
 
 - `canonical_vector_fixtures_match_generated_traces` checks that every top-level JSON scenario vector still matches its

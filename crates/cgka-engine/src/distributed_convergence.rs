@@ -706,6 +706,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_pass(&pass)
             .map_err(storage_projection_error)?;
+        crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
         Ok(Some(pass))
     }
 
@@ -1086,6 +1087,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(unrecoverable_result(previous_tip.0));
                 }
             }
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-frozen-durable");
             just_frozen = true;
         }
         if !just_frozen
@@ -1110,6 +1112,7 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_convergence_pass(&pass)
                 .map_err(storage_projection_error)?;
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-resolving-durable");
         }
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
@@ -1164,6 +1167,8 @@ impl<S: StorageProvider> Engine<S> {
             StoredCanonicalizationOptions {
                 replay_profile: replay_profile_policy,
                 admitted_message_ids: Some(&admitted_message_ids),
+                admit_app_witnesses: self.admit_app_witnesses,
+                replay_probe_budget_override: self.replay_probe_budget_override,
             },
         )?;
         let mut result = result;
@@ -1302,6 +1307,7 @@ impl<S: StorageProvider> Engine<S> {
             storage.put_convergence_pass(&completed_pass)?;
             Ok::<_, OpenMlsProjectionError>(observations)
         })?;
+        crate::test_crash_hooks::pause_if_requested("convergence-pass-completed-durable");
         // Diagnostic only: settling-latency telemetry for the remediation
         // plan — pass open → apply, and the gap since the previous completed
         // generation. Never feeds convergence or branch selection.

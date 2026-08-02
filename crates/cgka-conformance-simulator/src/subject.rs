@@ -51,6 +51,7 @@ pub enum SubjectCapability {
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
+    MultiGroup,
     RetainedRelayHistory,
     RetainedRelayControl,
 }
@@ -76,6 +77,7 @@ impl SubjectCapability {
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
+            Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
         }
@@ -261,6 +263,10 @@ pub struct SubjectOutboundArtifact {
 #[async_trait]
 pub trait ConvergenceSubject: Send {
     fn descriptor(&self) -> SubjectDescriptor;
+
+    fn select_scenario_group(&mut self, _group: &str) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::MultiGroup))
+    }
 
     async fn create_group(&mut self, _action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
@@ -524,6 +530,13 @@ pub trait ConvergenceFaultSubject {
 /// capability; fixed-point settling composes progress, time, delivery, and
 /// optionally outbound acknowledgement without moving policy into the subject.
 pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
+    if let ScenarioStep::InGroup { action, .. } = step {
+        let mut capabilities = required_capabilities(action);
+        capabilities.push(SubjectCapability::MultiGroup);
+        capabilities.sort();
+        capabilities.dedup();
+        return capabilities;
+    }
     if matches!(step, ScenarioStep::Barrier { .. }) {
         return Vec::new();
     }
@@ -625,6 +638,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::Barrier { .. } => unreachable!("handled above"),
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
+            ScenarioStep::InGroup { .. } => unreachable!("handled above"),
         }]
     }
 }
@@ -634,6 +648,9 @@ pub struct EngineHarnessSubject {
     descriptor: SubjectDescriptor,
     bus: TransportBus,
     clients: BTreeMap<String, HarnessClient>,
+    identity_seeds: BTreeMap<String, Vec<u8>>,
+    active_scenario_group: Option<String>,
+    scenario_groups: BTreeMap<String, GroupId>,
     pending_refs: HashMap<String, EngineSubjectPendingRef>,
     convergence_clock: ManualConvergenceClock,
     outbound_cursors: HashMap<String, u64>,
@@ -675,9 +692,69 @@ impl EngineHarnessSubject {
         protocol_profile: ProtocolProfile,
         storage_mode: HarnessStorageMode,
     ) -> Result<Self, SubjectError> {
+        Self::new_with_topology(
+            clients,
+            &crate::ScenarioTopologyV2::default(),
+            protocol_profile,
+            storage_mode,
+        )
+    }
+
+    /// Construct clients from the resolved account/device topology. Devices
+    /// mapped to one account deliberately share the credential/account seed
+    /// while retaining separate engine/storage instances and MLS leaf keys.
+    pub fn new_with_topology(
+        clients: &[String],
+        topology: &crate::ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_topology_and_witness_mode(
+            clients,
+            topology,
+            protocol_profile,
+            storage_mode,
+            false,
+        )
+    }
+
+    /// Build the same full engine harness while disabling only app-message
+    /// witness admission. This is an A/B campaign seam, not a wire-policy mode.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn new_without_app_witnesses_for_tests(
+        clients: &[String],
+        topology: &crate::ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_topology_and_witness_mode(
+            clients,
+            topology,
+            protocol_profile,
+            storage_mode,
+            true,
+        )
+    }
+
+    fn new_with_topology_and_witness_mode(
+        clients: &[String],
+        topology: &crate::ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        disable_app_witnesses_for_tests: bool,
+    ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
+        let resolved = topology
+            .resolve_for_clients(clients)
+            .map_err(|error| SubjectError::new(error.kind, error.message))?;
+        let account_by_device = resolved
+            .devices
+            .iter()
+            .map(|device| (device.client.as_str(), device.account.as_str()))
+            .collect::<HashMap<_, _>>();
         let mut attached = BTreeMap::new();
+        let mut identity_seeds = BTreeMap::new();
         for label in clients {
             if attached.contains_key(label) {
                 return Err(SubjectError::new(
@@ -685,13 +762,27 @@ impl EngineHarnessSubject {
                     format!("duplicate client label {label}"),
                 ));
             }
-            let builder = ClientBuilder::new(pad32(label.as_bytes()))
+            let account = account_by_device
+                .get(label.as_str())
+                .copied()
+                .unwrap_or(label.as_str());
+            let identity_seed = pad32(account.as_bytes());
+            let builder = ClientBuilder::new(identity_seed.clone())
                 .registry(engine_harness_feature_registry())
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
                 .convergence_clock(Arc::new(convergence_clock.clone()));
+            #[cfg(feature = "test-policy-overrides")]
+            let builder = if disable_app_witnesses_for_tests {
+                builder.without_app_witnesses_for_tests()
+            } else {
+                builder
+            };
+            #[cfg(not(feature = "test-policy-overrides"))]
+            let _ = disable_app_witnesses_for_tests;
             let client = builder.attach(&bus);
             attached.insert(label.clone(), client);
+            identity_seeds.insert(label.clone(), identity_seed);
         }
         let capabilities = BTreeSet::from([
             SubjectCapability::GroupMutation,
@@ -708,16 +799,24 @@ impl EngineHarnessSubject {
             SubjectCapability::WhiteBoxTransportPartition,
             SubjectCapability::SemanticTransportFaults,
             SubjectCapability::AssertionEvaluation,
+            SubjectCapability::MultiGroup,
         ]);
         Ok(Self {
             descriptor: SubjectDescriptor {
-                adapter: "mdk-engine-harness".into(),
+                adapter: if disable_app_witnesses_for_tests {
+                    "mdk-engine-harness-witness-disabled".into()
+                } else {
+                    "mdk-engine-harness".into()
+                },
                 adapter_version: env!("CARGO_PKG_VERSION").into(),
                 storage_backend: storage_mode.report_label().into(),
                 capabilities,
             },
             bus,
             clients: attached,
+            identity_seeds,
+            active_scenario_group: None,
+            scenario_groups: BTreeMap::new(),
             pending_refs: HashMap::new(),
             convergence_clock,
             outbound_cursors: HashMap::new(),
@@ -811,7 +910,7 @@ impl EngineHarnessSubject {
         let now = self.convergence_clock.now();
         Some(PendingByteReplay {
             client_label: label.to_owned(),
-            identity_seed: pad32(label.as_bytes()),
+            identity_seed: self.identity_seeds.get(label)?.clone(),
             protocol_profile: client.replay_protocol_profile(),
             group_id: group_id.as_slice().to_vec(),
             sensitive_checkpoint,
@@ -1060,13 +1159,23 @@ impl ConvergenceSubject for EngineHarnessSubject {
         self.descriptor.clone()
     }
 
+    fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {
+        self.active_scenario_group = Some(group.to_owned());
+        if let Some(group_id) = self.scenario_groups.get(group).cloned() {
+            for client in self.clients.values_mut() {
+                client.select_default_group(group_id.clone());
+            }
+        }
+        Ok(())
+    }
+
     async fn create_group(&mut self, action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {
         let initial_admins = self.member_ids(action.initial_admins)?;
         let key_packages = self.fresh_key_packages(action.invitees).await?;
         let required_features = required_features_from_names(action.required_features)?;
         let creator = self.client_mut(action.creator)?;
         creator.name_next_scenario_input(action.action_id);
-        let (_, pending_ref) = creator
+        let (group_id, pending_ref) = creator
             .create_group_with_admins_maybe_pending(
                 action.name,
                 key_packages,
@@ -1074,6 +1183,16 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 initial_admins,
             )
             .await;
+        if let Some(group) = &self.active_scenario_group {
+            if let Some(existing) = self.scenario_groups.insert(group.clone(), group_id.clone())
+                && existing != group_id
+            {
+                return Err(SubjectError::new(
+                    "duplicate_scenario_group",
+                    format!("scenario group {group} was created more than once"),
+                ));
+            }
+        }
         if let Some(pending_ref) = pending_ref {
             self.insert_pending(action.pending, action.creator, pending_ref)?;
             self.sync_client_outbound(action.creator)?;

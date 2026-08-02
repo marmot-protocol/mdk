@@ -294,7 +294,12 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
     }
 
     for step in &spec.steps {
+        let step = match step {
+            ScenarioStep::InGroup { action, .. } => action.as_ref(),
+            step => step,
+        };
         match step {
+            ScenarioStep::InGroup { .. } => unreachable!("in_group was unwrapped above"),
             ScenarioStep::CreateGroup { .. } => {
                 stimuli.insert(ScenarioStimulus::CreateGroup);
             }
@@ -612,6 +617,9 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
         }
         TraceExpectation::ClientsExactlyEquivalent { .. } => {
             behaviors.insert(OracleBehavior::ClientConvergence);
+            behaviors.insert(OracleBehavior::ExactStateEquivalence);
+        }
+        TraceExpectation::ClientsNotEquivalent { .. } => {
             behaviors.insert(OracleBehavior::ExactStateEquivalence);
         }
         TraceExpectation::ScenarioInputLedger { entries, .. } => {

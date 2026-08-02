@@ -137,6 +137,13 @@ pub enum TraceExpectation {
     ClientsExactlyEquivalent {
         clients: Vec<String>,
     },
+    /// Require a named set of clients to remain on observably different
+    /// canonical states. This is used for explicitly characterized protocol
+    /// limits where automatic repair is not claimed.
+    ClientsNotEquivalent {
+        clients: Vec<String>,
+        reason: String,
+    },
     /// Require the complete per-client commit/proposal/application input ledger.
     ScenarioInputLedger {
         client: String,
@@ -434,6 +441,46 @@ impl TraceExpectation {
                                 }))
                                 .collect::<Vec<_>>()
                         ),
+                    });
+                }
+            }
+            TraceExpectation::ClientsNotEquivalent { clients, reason } => {
+                let mut snapshots = Vec::with_capacity(clients.len());
+                for client in clients {
+                    let Some(observation) = client_canonical_observation(observed, client) else {
+                        missing_client(client, self, mismatches);
+                        return;
+                    };
+                    snapshots.push((
+                        client,
+                        observation
+                            .canonical_state
+                            .as_ref()
+                            .expect("canonical observation carries canonical state"),
+                    ));
+                }
+                if snapshots.len() < 2 {
+                    mismatches.push(ExpectationFailure {
+                        kind: "insufficient_non_equivalence_clients".into(),
+                        message: "clients_not_equivalent must name at least two clients".into(),
+                        expected: json!(self),
+                        actual: json!(snapshots),
+                    });
+                    return;
+                }
+                let first = snapshots[0].1;
+                if snapshots.iter().all(|(_, snapshot)| *snapshot == first) {
+                    mismatches.push(ExpectationFailure {
+                        kind: "clients_unexpectedly_equivalent".into(),
+                        message: format!(
+                            "clients {clients:?} converged despite named unrecoverable outcome: {reason}"
+                        ),
+                        expected: json!({
+                            "clients": clients,
+                            "reason": reason,
+                            "equivalent": false,
+                        }),
+                        actual: json!(snapshots),
                     });
                 }
             }

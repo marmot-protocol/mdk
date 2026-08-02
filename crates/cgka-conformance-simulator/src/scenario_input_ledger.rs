@@ -337,6 +337,23 @@ impl ScenarioInputTracker {
         }
     }
 
+    /// Reconcile a previously retained opaque transport object whose durable
+    /// row is no longer present. `TransportDeferred` is returned only after the
+    /// engine has persisted a `PeelDeferred` row; the engine's sole deletion
+    /// transition for that lifecycle is a resource-budget release. This keeps
+    /// the ledger aligned even when the release event uses an alias unavailable
+    /// to the synthetic transport registry.
+    pub(crate) fn record_storage_absence(&mut self, scenario_id: &str) {
+        let Some(entry) = self.entries.get_mut(scenario_id) else {
+            return;
+        };
+        if entry.pending && entry.transport_deferred > 0 {
+            entry.resource_refused = entry.resource_refused.max(1);
+            entry.disposition = ScenarioInputDisposition::ResourceRefused;
+            entry.pending = false;
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<ScenarioInputLedgerEntry> {
         self.entries.values().cloned().collect()
     }
@@ -528,6 +545,26 @@ mod tests {
         assert_eq!(entry.transport_deferred, 1);
         assert_eq!(entry.disposition, ScenarioInputDisposition::Pending);
         assert!(entry.pending);
+    }
+
+    #[test]
+    fn released_transport_deferred_row_is_resource_refused() {
+        let mut tracker = ScenarioInputTracker::default();
+        let mut metadata = metadata(ScenarioInputKind::Application);
+        metadata.scenario_id = "opaque".into();
+        tracker.record_ingest(
+            &metadata,
+            Ok(&IngestOutcome::TransportDeferred {
+                group_id: cgka_traits::types::GroupId::new(vec![1]),
+            }),
+        );
+
+        tracker.record_storage_absence("opaque");
+
+        let entry = tracker.entries.get("opaque").expect("ledger entry");
+        assert_eq!(entry.disposition, ScenarioInputDisposition::ResourceRefused);
+        assert_eq!(entry.resource_refused, 1);
+        assert!(!entry.pending);
     }
 
     #[test]

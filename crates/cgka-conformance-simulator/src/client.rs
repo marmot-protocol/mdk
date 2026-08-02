@@ -57,6 +57,8 @@ pub struct HarnessClient {
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
     virtual_time_tick_enabled: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
@@ -85,6 +87,8 @@ pub struct ClientBuilder {
     storage_options: SqliteStorageOptions,
     explicit_file_storage: Option<ExplicitFileStorage>,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
 }
 
 pub(crate) enum HarnessPublicationError {
@@ -223,6 +227,8 @@ impl ClientBuilder {
             storage_options: SqliteStorageOptions::default(),
             explicit_file_storage: None,
             convergence_clock: None,
+            disable_app_witnesses_for_tests: false,
+            replay_probe_budget_override: None,
         }
     }
 
@@ -267,6 +273,18 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn without_app_witnesses_for_tests(mut self) -> Self {
+        self.disable_app_witnesses_for_tests = true;
+        self
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn replay_probe_budget_for_tests(mut self, limit: Option<u64>) -> Self {
+        self.replay_probe_budget_override = limit;
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -283,6 +301,8 @@ impl ClientBuilder {
             self.protocol_profile,
             &audit_capture,
             self.convergence_clock.as_ref(),
+            self.disable_app_witnesses_for_tests,
+            self.replay_probe_budget_override,
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         bus.capture_outbound_for(bus_id);
@@ -297,6 +317,8 @@ impl ClientBuilder {
             registry: self.registry,
             protocol_profile: self.protocol_profile,
             convergence_clock: self.convergence_clock,
+            disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+            replay_probe_budget_override: self.replay_probe_budget_override,
             virtual_time_tick_enabled: false,
             pending_events: Vec::new(),
             default_group: None,
@@ -326,6 +348,8 @@ fn build_harness_engine(
     protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
     convergence_clock: Option<&Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
@@ -344,6 +368,19 @@ fn build_harness_engine(
     if let Some(clock) = convergence_clock {
         builder = builder.convergence_clock(clock.clone());
     }
+    #[cfg(feature = "test-policy-overrides")]
+    if disable_app_witnesses_for_tests {
+        builder = builder.without_app_witnesses_for_tests();
+    }
+    #[cfg(feature = "test-policy-overrides")]
+    if replay_probe_budget_override.is_some() {
+        builder = builder.replay_probe_budget_for_tests(replay_probe_budget_override);
+    }
+    #[cfg(not(feature = "test-policy-overrides"))]
+    let _ = (
+        disable_app_witnesses_for_tests,
+        replay_probe_budget_override,
+    );
     builder.build().expect("engine builds")
 }
 
@@ -462,6 +499,9 @@ fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
 }
 
 impl HarnessClient {
+    pub(crate) fn select_default_group(&mut self, group_id: GroupId) {
+        self.default_group = Some(group_id);
+    }
     pub fn engine(&self) -> &Engine<SqliteAccountStorage> {
         self.engine.as_ref().expect("harness engine is available")
     }
@@ -596,6 +636,8 @@ impl HarnessClient {
             self.protocol_profile,
             &self.audit_capture,
             self.convergence_clock.as_ref(),
+            self.disable_app_witnesses_for_tests,
+            self.replay_probe_budget_override,
         );
         engine
             .hydrate_stable_groups_from_storage()
@@ -603,6 +645,15 @@ impl HarnessClient {
         self.storage = Some(storage);
         self.engine = Some(engine);
         self.pending_events.clear();
+    }
+
+    /// Change the full-engine replay ceiling without changing durable state.
+    /// Clearing the override is the repair step after an intentional
+    /// `ReplayBudgetExceeded` campaign result.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
+        self.replay_probe_budget_override = limit;
+        self.engine_mut().set_replay_probe_budget_for_tests(limit);
     }
 
     /// Freeze the current durable pass at its quiescence boundary. This is a
@@ -660,9 +711,18 @@ impl HarnessClient {
         group_id: &GroupId,
         now_ms: u64,
     ) -> CanonicalizationResult {
+        self.try_converge_stored_at(group_id, now_ms)
+            .expect("stored convergence succeeds")
+    }
+
+    pub fn try_converge_stored_at(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> Result<CanonicalizationResult, cgka_engine::openmls_projection::OpenMlsProjectionError>
+    {
         self.engine_mut()
             .converge_stored_openmls_messages_at(group_id, now_ms)
-            .expect("stored convergence succeeds")
     }
 
     /// Drain the `convergence_decision` events the engine has emitted since the
@@ -1653,9 +1713,14 @@ impl HarnessClient {
             })
             .collect::<Vec<_>>();
         for (scenario_id, kind, state) in observed_states {
-            if let Some(state) = state {
-                self.scenario_input_tracker
-                    .record_storage_state(&scenario_id, kind, state);
+            match state {
+                Some(state) => {
+                    self.scenario_input_tracker
+                        .record_storage_state(&scenario_id, kind, state)
+                }
+                None => self
+                    .scenario_input_tracker
+                    .record_storage_absence(&scenario_id),
             }
         }
         self.scenario_input_tracker.snapshot()
@@ -1851,7 +1916,15 @@ impl HarnessClient {
             }
             match &event {
                 GroupEvent::TransportObjectResourceRefused { message_id, .. } => {
-                    if let Some(scenario_input) = self.bus.scenario_input_for_transport(message_id)
+                    // Deferred-peel storage is keyed by the raw transport id,
+                    // but alternate peelers and migrated rows may report the
+                    // content-derived alias. Treat both durable aliases as the
+                    // same scenario input so a released row cannot remain
+                    // falsely pending in the black-box ledger.
+                    if let Some(scenario_input) = self
+                        .bus
+                        .scenario_input_for_transport(message_id)
+                        .or_else(|| self.bus.scenario_input_for_content(message_id))
                     {
                         self.scenario_input_tracker
                             .record_resource_refused(&scenario_input);

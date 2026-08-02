@@ -97,6 +97,18 @@ cargo test -p cgka-conformance-simulator
 
 # Slower validation: raises property-test case counts according to test cost.
 cargo test -p cgka-conformance-simulator --features conformance-slow
+
+# Milestone 3 catalog and small headline regressions.
+cargo test -p cgka-conformance-simulator --test milestone3_campaigns
+
+# Deliberately slow multi-round sustained campaign.
+cargo test -p cgka-conformance-simulator --test milestone3_campaigns \
+  sustained_mixed_traffic_campaign -- --ignored --nocapture
+
+# Full generated adversarial catalog with durable report artifacts.
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --family milestone3-adversarial/v1 --seed 7 --cases 12 \
+  --out target/cgka-milestone3-reports --storage file --strict-oracle
 ```
 
 To run every portable vector fixture and write a report for each one:

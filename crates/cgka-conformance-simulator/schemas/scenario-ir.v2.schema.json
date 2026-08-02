@@ -257,6 +257,16 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "group", "action"],
+          "properties": {
+            "type": { "const": "in_group" },
+            "group": { "type": "string", "minLength": 1 },
+            "action": { "$ref": "#/$defs/step" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "creator", "name", "invitees", "pending"],
           "properties": {
             "type": { "const": "create_group" },
