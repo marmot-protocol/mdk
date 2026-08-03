@@ -148,6 +148,9 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
 # Test-only one-variable policy curves around fixed retained inputs/horizons.
 cargo test -p cgka-conformance-simulator --features test-policy-overrides \
   --test policy_sweeps
+
+# Milestone 4 independent model, liveness, mutation, and protocol-decision gate.
+just milestone4-ci
 ```
 
 Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latency is the measured wall time of the

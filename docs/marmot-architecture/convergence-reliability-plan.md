@@ -798,10 +798,28 @@ no surviving targeted mutations or tracked adequacy gaps at this checkpoint.
 
 ### 4.4 Protocol decision gate
 
-- [ ] Prove bounded administrative progress under stated assumptions, add explicit fairness/admission policy, or
+- [x] Prove bounded administrative progress under stated assumptions, add explicit fairness/admission policy, or
   document the non-guarantee.
-- [ ] Confirm which constants are truly semantic and version them through protocol capabilities.
-- [ ] Confirm scheduler/resource constants cannot silently change a settled result after input closure.
+- [x] Confirm which constants are truly semantic and version them through protocol capabilities.
+- [x] Confirm scheduler/resource constants cannot silently change a settled result after input closure.
+
+The live canonical Marmot `master` was reverified at adopted commit
+`4ad4ae21479c3f3fa9950c6fc4556a76941a62e1` (marmot#410). It already states the bounded post-settlement admin
+preparation opportunity, the non-guarantee under unbounded valid self-updates, the closed-input liveness assumptions,
+pass-partition invariance, the mandatory implicit v1 values, and the rule that any future behavior-changing policy
+ships as a new required app component/capability. No additional protocol PR is needed for Milestone 4.
+
+`policy_contract::CONSTANT_DECISIONS` classifies every P/E/A ledger id exactly once. P1/P2/P6/P7/P8 directly affect
+selected state; P4/P5 affect the bounded-pass lifecycle; P3 is coupled security-retention implementation of P2. All
+remain mandatory implicit v1 and any change requires the future required component. No component is allocated merely
+to re-encode the only valid v1 choice. E/A constants remain local only under operational non-interference: exhaustion
+is visible and fail-closed, retained work can retry, and equal closed input reaches the same settled result.
+
+The protocol decision gate pins all eight P values, checks the 24-id ledger/classification bijection, enforces the
+future-component decision, and varies batch width, wake delay, and a temporary resource refusal over one closed
+witness-sensitive input set. Intermediate pass histories differ while the settled winner remains equal; the resource
+failure never produces a partial settled result. Production coverage remains the same-horizon pass-partition
+metamorphic test and replay-budget fail-closed/repair campaign.
 
 ### Milestone 4 Exit Gate
 

@@ -258,6 +258,16 @@ milestone3-ci:
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
 
+# Independent model, lifecycle/fairness, mutation adequacy, and protocol
+# decision gates. Kept as an explicit hardening lane until CI budgets are set.
+milestone4-ci:
+    cargo test -p cgka-conformance-simulator --test independent_reference_model --locked
+    cargo test -p cgka-conformance-simulator --test lifecycle_model --locked
+    cargo test -p cgka-conformance-simulator --test mutation_adequacy --locked
+    cargo test -p cgka-conformance-simulator --test protocol_decision_gate --locked
+    just tla-liveness
+    just tla-liveness-counterexample
+
 tracing-audit:
     cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 

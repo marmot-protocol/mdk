@@ -33,6 +33,10 @@ Map for simulator tests.
   - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
     verification-layer matrix.
 
+- **File:** `protocol_decision_gate.rs`
+  - **Owns:** Adopted protocol commit/value pin, exhaustive constant versioning classification, future required
+    component rule, and closed-input scheduler/resource non-interference.
+
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 
