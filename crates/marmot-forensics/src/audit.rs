@@ -864,6 +864,18 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invalidated_msg_id: Option<MessageRefHex>,
     },
+    /// Fork-resolution routing state (`committed_from` and the fork-recovery
+    /// incumbents) was rebuilt from durable evidence during group hydration.
+    /// Distinguishes post-restart reconstruction from an in-flight
+    /// `fork_resolution`: an incumbent whose epoch is listed here was
+    /// recovered from a retained snapshot and a stored commit row, not
+    /// freshly applied.
+    ForkRoutingRebuilt {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rebuilt_source_epochs: Vec<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restored_committed_from_epochs: Vec<u64>,
+    },
     /// A distributed-convergence run changed lifecycle phase. Correlated with
     /// its `convergence_decision` via the `convergence.run_id` context.
     ConvergenceRunState {
@@ -1105,6 +1117,7 @@ impl AuditEventKind {
             AuditEventKind::GroupHydrationRecovered { .. } => "group_hydration_recovered",
             AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
             AuditEventKind::ForkResolution { .. } => "fork_resolution",
+            AuditEventKind::ForkRoutingRebuilt { .. } => "fork_routing_rebuilt",
             AuditEventKind::ConvergenceRunState { .. } => "convergence_run_state",
             AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",
             AuditEventKind::PeelerOutcome { .. } => "peeler_outcome",

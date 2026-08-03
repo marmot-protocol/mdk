@@ -59,8 +59,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   pairwise as it would have before the restart. The engine now rebuilds both
   maps during group hydration from evidence that is already durable: retained
   `fork-*` snapshots, stored commit rows, and their confirm-time convergence
-  stamps. No storage schema change; pruning bounds and the
-  `committed_from => incumbent` invariant carry over.
+  stamps, and records a `fork_routing_rebuilt` audit row so forensics can
+  tell post-restart reconstruction from in-flight fork resolution. No storage
+  schema change; pruning bounds and the `committed_from => incumbent`
+  invariant carry over.
   ([#1241](https://github.com/marmot-protocol/mdk/pull/1241))
 
 - Same-epoch commit races now converge every member onto the same branch. A

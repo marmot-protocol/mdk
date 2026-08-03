@@ -752,6 +752,10 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             winner: ForkWinner::Candidate,
             invalidated_msg_id: Some("m".into()),
         },
+        AuditEventKind::ForkRoutingRebuilt {
+            rebuilt_source_epochs: vec![2, 5],
+            restored_committed_from_epochs: vec![2],
+        },
         AuditEventKind::ConvergenceRunState {
             phase: ConvergencePhase::Evaluating,
             current_tip_epoch: Some(3),

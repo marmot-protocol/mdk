@@ -1433,6 +1433,28 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "const": "fork_routing_rebuilt"
+            },
+            "rebuilt_source_epochs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/u64"
+              }
+            },
+            "restored_committed_from_epochs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "phase"],
           "properties": {
             "type": {

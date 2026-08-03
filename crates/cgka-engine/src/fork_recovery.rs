@@ -654,6 +654,8 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
+        let mut rebuilt_source_epochs: Vec<u64> = Vec::new();
+        let mut restored_committed_from_epochs: Vec<u64> = Vec::new();
         for (source_epoch_raw, (_, snapshot_name)) in newest_by_epoch {
             let source_epoch = EpochId(source_epoch_raw);
             if source_epoch < oldest_retained_epoch {
@@ -717,10 +719,24 @@ impl<S: StorageProvider> Engine<S> {
                 storage_id,
                 snapshot_name,
             });
+            rebuilt_source_epochs.push(source_epoch.0);
             if own_commit_epochs.contains(&source_epoch_raw) {
                 self.epoch_manager
                     .restore_committed_from(group_id.clone(), source_epoch);
+                restored_committed_from_epochs.push(source_epoch.0);
             }
+        }
+        // Forensics: distinguish post-restart reconstruction from in-flight
+        // fork resolution — an incumbent whose epoch appears here was
+        // recovered from durable evidence, not freshly applied.
+        if !rebuilt_source_epochs.is_empty() {
+            self.audit_group(
+                group_id,
+                AuditEventKind::ForkRoutingRebuilt {
+                    rebuilt_source_epochs,
+                    restored_committed_from_epochs,
+                },
+            );
         }
         Ok(())
     }
