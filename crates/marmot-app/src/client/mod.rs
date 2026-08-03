@@ -50,7 +50,7 @@ use crate::{
 };
 
 mod audit;
-mod epoch_stall;
+pub(crate) mod epoch_stall;
 mod projection;
 mod push;
 mod retention;
@@ -87,6 +87,16 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// Epoch-stall escalations the detector has raised but no caller has been
+    /// handed yet.
+    ///
+    /// The detector latches `escalated` one-shot per unrecovered run, so an
+    /// escalation dropped by a later `?` on the recording pass is never raised
+    /// again — the run keeps arming in silence. Escalations therefore land here
+    /// rather than on whatever `SyncSummary` the recording pass happened to be
+    /// building, and move onto a summary only at a seam that is returning `Ok`
+    /// (see `Self::drain_epoch_stall_escalations`).
+    pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a

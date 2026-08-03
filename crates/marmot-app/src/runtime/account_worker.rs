@@ -2209,7 +2209,14 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
 }
 
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
-    !summary.joined_groups.is_empty() || !summary.messages.is_empty() || !summary.events.is_empty()
+    !summary.joined_groups.is_empty()
+        || !summary.messages.is_empty()
+        || !summary.events.is_empty()
+        // An escalation is the highest-value evidence this crate produces and it
+        // can ride a summary that carries no other visible activity (the arming
+        // pass often ingests only undecryptable traffic), so it must trip the
+        // gate on its own.
+        || !summary.epoch_stall_escalations.is_empty()
 }
 
 /// Run any pending epoch-gap backfill and push its arm evidence to the audit

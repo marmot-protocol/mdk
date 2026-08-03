@@ -41,6 +41,7 @@ struct ScriptedPushRelayClient {
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
+    fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
@@ -80,6 +81,14 @@ impl ScriptedPushRelayClient {
         self.block_next_subscribe();
     }
 
+    /// Fail the next `subscribe` immediately instead of parking it first, for
+    /// tests that need a transport activation to error inside a straight-line
+    /// call (no second task to release the block).
+    fn fail_next_subscribe(&self) {
+        self.fail_next_subscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn wait_for_blocked_subscribe(&self) {
         self.subscribe_started.notified().await;
     }
@@ -108,6 +117,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         _subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self
+            .fail_next_subscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".to_owned(),
+            ));
+        }
         let blocked = self
             .block_next_subscribe
             .swap(false, std::sync::atomic::Ordering::SeqCst);
@@ -5006,4 +5023,100 @@ fn account_routing_skips_malformed_groups_without_discarding_valid_routes() {
 
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].transport_group_id, vec![0x22; 32]);
+}
+
+/// An escalation the detector raised during a sync pass that then fails must
+/// still reach app subscribers, exactly once, on the next pass that succeeds.
+///
+/// The detector latches `escalated` one-shot per unrecovered run, so no later
+/// arm in that run raises the decision again: an escalation dropped with the
+/// failing pass's summary is lost for good, which is the 2026-07-29 field
+/// failure going unreported a second time. Recording the escalation directly is
+/// the pub(crate) stand-in for "the detector escalated inside a pass whose
+/// later fallible step errored" — driving three real arms needs three real
+/// epoch advances, and the loss does not depend on how the run got there.
+#[tokio::test]
+async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://escalation.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("escalation redelivery", &[])
+        .await
+        .unwrap();
+
+    let escalated = client
+        .sync()
+        .await
+        .expect("baseline sync before the escalation");
+    assert!(escalated.epoch_stall_escalations.is_empty());
+
+    // The detector escalates mid-pass...
+    client.apply_backfill_decision(
+        &group_id,
+        7,
+        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
+    );
+    // ...and a later fallible step in that same pass errors, so the summary the
+    // pass was building never reaches a caller.
+    relay.fail_next_subscribe();
+    let failed = client.sync().await;
+    assert!(
+        failed.is_err(),
+        "the injected transport failure must fail this sync pass"
+    );
+
+    // Forensics are written before the failing step, so the durable evidence
+    // survives the pass that lost the app-visible event.
+    let escalated_rows = app
+        .audit_log_files()
+        .unwrap()
+        .iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_escalated")
+        .count();
+    assert_eq!(
+        escalated_rows, 1,
+        "the failing pass still leaves exactly one durable escalation row"
+    );
+
+    let recovered = client.sync().await.expect("the next sync pass succeeds");
+    assert_eq!(
+        recovered
+            .epoch_stall_escalations
+            .iter()
+            .map(|escalation| (
+                escalation.group_id.clone(),
+                escalation.stalled_epoch,
+                escalation.arms
+            ))
+            .collect::<Vec<_>>(),
+        vec![(group_id.clone(), 7, 3)],
+        "the escalation recorded before the failing pass must be reported once"
+    );
+
+    let after = client
+        .sync()
+        .await
+        .expect("a further sync pass still succeeds");
+    assert!(
+        after.epoch_stall_escalations.is_empty(),
+        "a delivered escalation must not be reported twice"
+    );
 }

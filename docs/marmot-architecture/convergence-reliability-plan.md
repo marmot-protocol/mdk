@@ -293,7 +293,7 @@ future inventory revision should encode machine-checked expected values where th
 | A6 | `epoch_stall.rs`; threshold/debounce/reset tests; next-event and audit backfill tests | M3.1 retained-relay threshold sweep; additional production cohorts |
 | A7 | `marmot-app/lib.rs`; `cold_restart_since_floor_permanently_drops_backlog_below_it`; `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed` | M2.3 long-offline retained-relay matrix |
 | A8 | `marmot-app/lib.rs`; since-floor malicious/future timestamp coverage | M3.1 explicit skew/cursor-reset Scenario IR family |
-| A9 | `epoch_stall.rs`; `escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch`; `an_epoch_the_device_passes_through_cleanly_ends_the_arm_run`; `an_escalated_run_reports_once_however_long_it_keeps_arming`; `storm_collapse_suppression_is_not_an_arm`; `repeated_arming_without_recovery_escalates_exactly_once`; `an_epoch_passed_cleanly_between_arms_never_escalates` | M3.1 retained-relay arm-run sweep; production cohorts confirming the run length that warrants the stronger repair |
+| A9 | `epoch_stall.rs`; `escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch`; `an_epoch_the_device_passes_through_cleanly_ends_the_arm_run`; `an_escalated_run_reports_once_however_long_it_keeps_arming`; `storm_collapse_suppression_is_not_an_arm`; `repeated_arming_without_recovery_escalates_exactly_once`; `an_epoch_passed_cleanly_between_arms_never_escalates`; `an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sync` | M3.1 retained-relay arm-run sweep; production cohorts confirming the run length that warrants the stronger repair |
 
 Ledger work:
 

@@ -1352,6 +1352,7 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
+            pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
