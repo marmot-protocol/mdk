@@ -887,12 +887,24 @@ startup remains cursor-based. Scenario IR `FullHistory` and set-reconciliation s
 
 ### 5.2 Simulator node process
 
-- [ ] Add a small test binary wrapping `MarmotAppRuntime`.
-- [ ] Define a versioned JSONL control and observation protocol.
-- [ ] Keep engine/storage internals unavailable through the process protocol.
-- [ ] Emit privacy-safe structured diagnostics and failure capsules.
-- [ ] Define process-adapter quiescence from observable inbox/outbox, relay-query completion, retry timers, projection
+- [x] Add a small test binary wrapping `MarmotAppRuntime`.
+- [x] Define a versioned JSONL control and observation protocol.
+- [x] Keep engine/storage internals unavailable through the process protocol.
+- [x] Emit privacy-safe structured diagnostics and failure capsules.
+- [x] Define process-adapter quiescence from observable inbox/outbox, relay-query completion, retry timers, projection
   checkpoints, and stable state commitments; do not reuse engine-private counters as the contract.
+
+`cgka-conformance-node` owns exactly one `MarmotAppRuntime` and speaks
+`marmot-convergence-node-v1` JSONL over stdin/stdout. Commands cover initialization, peer aliases, group selection,
+the public group/message/admin lifecycle, incremental and full-history catch-up, observation, barriers, and graceful
+shutdown. The response schema exposes only normalized errors and public projection/aggregate relay facts. Account ids
+appear only in ephemeral orchestration responses and peer-addressing commands; shareable observations normalize them
+to scenario labels (or a one-way opaque fallback), and failure capsules exclude them entirely.
+
+Process quiescence requires two identical projection checkpoints plus an empty observable command/outbox boundary, no
+relay query or directory fetch in flight, and no retry timer armed. Relay delivery/publish counters and the stable
+protocol/application commitments remain diagnostic evidence, but engine work queues and storage rows are not part of
+the process contract.
 
 ### 5.3 Process orchestrator
 

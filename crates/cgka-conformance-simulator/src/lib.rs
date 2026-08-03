@@ -30,6 +30,7 @@ mod failure_capsule;
 pub mod family;
 pub mod lifecycle_model;
 pub mod mutation_adequacy;
+pub mod node_protocol;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
