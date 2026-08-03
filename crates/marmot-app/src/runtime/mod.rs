@@ -712,7 +712,7 @@ pub struct AccountSetupRequest {
 impl std::fmt::Debug for AccountSetupRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountSetupRequest")
-            .field("identity", &self.identity)
+            .field("identity", &debug_identity_field(&self.identity))
             .field(
                 "import_nsec",
                 &self
@@ -3162,6 +3162,7 @@ impl MarmotAppRuntime {
         &self,
         mut request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
+        validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
         self.accounts.create_or_import_account(request).await
     }
@@ -3176,6 +3177,7 @@ impl MarmotAppRuntime {
             return Err(AppError::InvalidPublicKey);
         }
         request.identity = Some(identity);
+        validate_account_setup_request(&request, AccountSetupOperation::Login)?;
         self.accounts.create_or_import_account(request).await
     }
 
@@ -3751,6 +3753,7 @@ impl AccountManager {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
+        validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
         let imports_private_key = request.import_nsec.is_some();
         let creates_new_private_key = request.identity.is_none() && request.import_nsec.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
@@ -4346,7 +4349,57 @@ impl AccountManager {
 }
 
 fn is_nostr_secret(value: &str) -> bool {
-    value.starts_with("nsec")
+    value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("nsec"))
+}
+
+fn debug_identity_field(identity: &Option<String>) -> Option<&str> {
+    identity.as_ref().map(|value| {
+        if is_nostr_secret(value) {
+            "**redacted**"
+        } else {
+            value.as_str()
+        }
+    })
+}
+
+enum AccountSetupOperation {
+    CreateOrImport,
+    CreateIdentityOnly,
+    Login,
+}
+
+fn validate_account_setup_request(
+    request: &AccountSetupRequest,
+    operation: AccountSetupOperation,
+) -> Result<(), AppError> {
+    if let Some(identity) = request.identity.as_deref()
+        && is_nostr_secret(identity)
+    {
+        return Err(AppError::InvalidPublicKey);
+    }
+
+    match operation {
+        AccountSetupOperation::CreateIdentityOnly | AccountSetupOperation::Login => {
+            if request.import_nsec.is_some() {
+                return Err(AppError::InvalidPublicKey);
+            }
+        }
+        AccountSetupOperation::CreateOrImport => {}
+    }
+
+    if let (Some(identity), Some(nsec)) =
+        (request.identity.as_deref(), request.import_nsec.as_deref())
+    {
+        let from_identity = AccountHome::account_id_for_public_key(identity)?;
+        let from_secret = AccountHome::account_id_for_secret(nsec)?;
+        if from_identity != from_secret {
+            return Err(AppError::InvalidPublicKey);
+        }
+    }
+
+    Ok(())
 }
 
 fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<TransportEndpoint> {

@@ -1514,17 +1514,129 @@ mod co_member_eligibility {
         frozen.unrecoverable = true;
         assert!(!group_contributes_co_members(&frozen));
     }
+}
 
-    #[test]
-    fn account_setup_request_debug_redacts_import_nsec() {
-        let request = AccountSetupRequest {
-            import_nsec: Some(Zeroizing::new(
-                "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
-            )),
-            ..AccountSetupRequest::default()
-        };
-        let debug = format!("{request:?}");
-        assert!(!debug.contains("nsec1j4"));
-        assert!(debug.contains("redacted"));
-    }
+#[test]
+fn account_setup_request_debug_redacts_import_nsec() {
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("nsec1j4"));
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+fn account_setup_request_debug_redacts_nsec_shaped_identity() {
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let request = AccountSetupRequest {
+        identity: Some(nsec.to_owned()),
+        ..AccountSetupRequest::default()
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("nsec1j4"));
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+fn account_setup_request_rejects_and_redacts_uppercase_nsec_identity() {
+    let nsec = "NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99";
+    let request = AccountSetupRequest {
+        identity: Some(nsec.to_owned()),
+        ..AccountSetupRequest::default()
+    };
+
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("NSEC1J4"));
+    assert!(debug.contains("redacted"));
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("uppercase nsec-shaped identity must be rejected");
+    assert!(matches!(err, AppError::InvalidPublicKey));
+}
+
+#[test]
+fn account_setup_validation_rejects_nsec_in_identity_field() {
+    let request = AccountSetupRequest {
+        identity: Some(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        ),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("nsec-shaped identity must be rejected");
+    assert!(matches!(err, AppError::InvalidPublicKey));
+}
+
+#[tokio::test]
+async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutation() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = nostr::Keys::generate();
+    let other = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .create_or_import_account(request)
+        .await
+        .expect_err("mismatched identity and import_nsec must be rejected");
+    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(
+        app.account_home().accounts().unwrap().is_empty(),
+        "validation must run before account creation or import"
+    );
+}
+
+#[test]
+fn account_setup_validation_accepts_matching_identity_and_import_nsec() {
+    use nostr::prelude::ToBech32;
+    let keys = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect("matching keys");
+}
+
+#[tokio::test]
+async fn account_setup_login_rejects_import_nsec_sidecar() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let keys = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .login(keys.public_key().to_bech32().unwrap(), request)
+        .await
+        .expect_err("login must not accept import_nsec");
+    assert!(matches!(err, AppError::InvalidPublicKey));
+}
+
+#[tokio::test]
+async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let err = runtime
+        .create_identity(request)
+        .await
+        .expect_err("create_identity must not accept import_nsec");
+    assert!(matches!(err, AppError::InvalidPublicKey));
 }

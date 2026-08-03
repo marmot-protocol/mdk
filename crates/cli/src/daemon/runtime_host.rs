@@ -334,6 +334,9 @@ pub(crate) fn app_runtime_account_setup_request(
 ) -> Result<Option<marmot_app::AccountSetupRequest>, crate::WnError> {
     match &cli.command {
         crate::Command::CreateIdentity => {
+            if import_nsec.is_some() {
+                return Err(crate::WnError::InvalidPublicKey);
+            }
             if cli.daemon_default_account_relays.is_empty() {
                 return Err(crate::WnError::MissingRelay);
             }

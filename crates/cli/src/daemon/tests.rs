@@ -956,6 +956,19 @@ async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
     );
 }
 
+#[test]
+fn hosted_create_identity_rejects_import_nsec_sidecar() {
+    let mut cli = daemon_test_cli(crate::Command::CreateIdentity);
+    cli.daemon_default_account_relays = vec!["wss://relay.example".to_owned()];
+    let import_nsec = crate::ImportNsec::new(zeroize::Zeroizing::new(
+        "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+    ));
+
+    let err = app_runtime_account_setup_request(&cli, Some(&import_nsec))
+        .expect_err("create-identity must reject an import sidecar");
+    assert!(matches!(err, crate::WnError::InvalidPublicKey));
+}
+
 #[tokio::test]
 async fn daemon_request_reader_within_returns_request_before_timeout() {
     let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
@@ -998,7 +1011,8 @@ fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
     let decoded: DaemonRequest = serde_json::from_slice(payload).expect("decode execute request");
     match decoded {
         DaemonRequest::Execute { cli, import_nsec } => {
-            assert!(import_nsec.is_some());
+            let import_nsec = import_nsec.expect("import_nsec sidecar");
+            assert_eq!(import_nsec.into_inner().as_str(), nsec);
             match cli.command {
                 crate::Command::Login { identity: None, .. } => {}
                 other => panic!("expected login without identity, got {other:?}"),
