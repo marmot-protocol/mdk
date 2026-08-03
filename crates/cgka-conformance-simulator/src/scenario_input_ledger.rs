@@ -12,6 +12,7 @@ use cgka_traits::message::MessageState;
 use cgka_traits::types::MessageId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +79,12 @@ pub struct ScenarioInputLedgerEntry {
     pub send_attempts: usize,
     pub send_accepted: usize,
     pub send_queued: usize,
+    /// Wall-clock time spent accepted but blocked behind convergence before
+    /// publication (or a terminal refusal/rollback).
+    // Kept in the in-memory report so campaign aggregation can consume it,
+    // but excluded from deterministic traces and promoted fixtures.
+    #[serde(default, skip_serializing)]
+    pub blocked_send_duration_us: u64,
     pub published: usize,
     pub ingest_attempts: usize,
     pub ingest_accepted: usize,
@@ -101,6 +108,7 @@ pub(crate) struct ScenarioInputTracker {
     entries: BTreeMap<String, ScenarioInputLedgerEntry>,
     metadata: BTreeMap<String, ScenarioInputMetadata>,
     scenario_by_logical_id: BTreeMap<String, String>,
+    blocked_send_started: BTreeMap<String, Instant>,
 }
 
 impl ScenarioInputTracker {
@@ -114,6 +122,11 @@ impl ScenarioInputTracker {
 
     pub(crate) fn record_send_accepted(&mut self, metadata: &ScenarioInputMetadata, queued: bool) {
         self.remember_metadata(metadata);
+        if queued {
+            self.blocked_send_started
+                .entry(metadata.scenario_id.clone())
+                .or_insert_with(Instant::now);
+        }
         let entry = self.entry(metadata);
         entry.send_accepted += 1;
         if queued {
@@ -125,6 +138,7 @@ impl ScenarioInputTracker {
 
     pub(crate) fn record_published(&mut self, metadata: &ScenarioInputMetadata) {
         self.remember_metadata(metadata);
+        self.finish_blocked_interval(&metadata.scenario_id);
         let entry = self.entry(metadata);
         entry.published += 1;
         if metadata.kind == ScenarioInputKind::Application {
@@ -141,6 +155,7 @@ impl ScenarioInputTracker {
     }
 
     pub(crate) fn record_rolled_back(&mut self, scenario_id: &str) {
+        self.finish_blocked_interval(scenario_id);
         if let Some(entry) = self.entries.get_mut(scenario_id) {
             entry.disposition = ScenarioInputDisposition::RolledBack;
             push_unique(&mut entry.invalidated, "publish_rolled_back");
@@ -150,6 +165,7 @@ impl ScenarioInputTracker {
 
     pub(crate) fn record_resource_refused(&mut self, metadata: &ScenarioInputMetadata) {
         self.remember_metadata(metadata);
+        self.finish_blocked_interval(&metadata.scenario_id);
         let entry = self.entry(metadata);
         entry.resource_refused += 1;
         entry.disposition = ScenarioInputDisposition::ResourceRefused;
@@ -337,6 +353,23 @@ impl ScenarioInputTracker {
         }
     }
 
+    /// Reconcile a previously retained opaque transport object whose durable
+    /// row is no longer present. `TransportDeferred` is returned only after the
+    /// engine has persisted a `PeelDeferred` row; the engine's sole deletion
+    /// transition for that lifecycle is a resource-budget release. This keeps
+    /// the ledger aligned even when the release event uses an alias unavailable
+    /// to the synthetic transport registry.
+    pub(crate) fn record_storage_absence(&mut self, scenario_id: &str) {
+        let Some(entry) = self.entries.get_mut(scenario_id) else {
+            return;
+        };
+        if entry.pending && entry.transport_deferred > 0 {
+            entry.resource_refused = entry.resource_refused.max(1);
+            entry.disposition = ScenarioInputDisposition::ResourceRefused;
+            entry.pending = false;
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<ScenarioInputLedgerEntry> {
         self.entries.values().cloned().collect()
     }
@@ -382,6 +415,22 @@ impl ScenarioInputTracker {
                 ..Default::default()
             })
     }
+
+    fn finish_blocked_interval(&mut self, scenario_id: &str) {
+        let Some(started) = self.blocked_send_started.remove(scenario_id) else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(scenario_id) else {
+            return;
+        };
+        entry.blocked_send_duration_us = entry
+            .blocked_send_duration_us
+            .saturating_add(elapsed_us(started.elapsed()));
+    }
+}
+
+fn elapsed_us(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn is_terminal(disposition: &ScenarioInputDisposition) -> bool {
@@ -479,6 +528,37 @@ mod tests {
     }
 
     #[test]
+    fn blocked_send_duration_only_covers_queued_publication_interval() {
+        let mut tracker = ScenarioInputTracker::default();
+        let metadata = metadata(ScenarioInputKind::Application);
+        tracker.record_send_attempt(&metadata);
+        tracker.record_send_accepted(&metadata, true);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        tracker.record_published(&metadata);
+
+        let entry = &tracker.snapshot()[0];
+        assert!(entry.blocked_send_duration_us >= 1_000);
+        assert_eq!(entry.published, 1);
+        assert!(tracker.blocked_send_started.is_empty());
+
+        let mut immediate = ScenarioInputTracker::default();
+        immediate.record_send_attempt(&metadata);
+        immediate.record_send_accepted(&metadata, false);
+        immediate.record_published(&metadata);
+        assert_eq!(immediate.snapshot()[0].blocked_send_duration_us, 0);
+    }
+
+    #[test]
+    fn blocked_send_duration_is_not_serialized_into_deterministic_traces() {
+        let entry = ScenarioInputLedgerEntry {
+            blocked_send_duration_us: 42,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(entry).expect("ledger serializes");
+        assert!(encoded.get("blocked_send_duration_us").is_none());
+    }
+
+    #[test]
     fn buffered_commit_and_proposal_are_pending_until_storage_accepts_them() {
         let mut tracker = ScenarioInputTracker::default();
         for kind in [ScenarioInputKind::Commit, ScenarioInputKind::Proposal] {
@@ -528,6 +608,26 @@ mod tests {
         assert_eq!(entry.transport_deferred, 1);
         assert_eq!(entry.disposition, ScenarioInputDisposition::Pending);
         assert!(entry.pending);
+    }
+
+    #[test]
+    fn released_transport_deferred_row_is_resource_refused() {
+        let mut tracker = ScenarioInputTracker::default();
+        let mut metadata = metadata(ScenarioInputKind::Application);
+        metadata.scenario_id = "opaque".into();
+        tracker.record_ingest(
+            &metadata,
+            Ok(&IngestOutcome::TransportDeferred {
+                group_id: cgka_traits::types::GroupId::new(vec![1]),
+            }),
+        );
+
+        tracker.record_storage_absence("opaque");
+
+        let entry = tracker.entries.get("opaque").expect("ledger entry");
+        assert_eq!(entry.disposition, ScenarioInputDisposition::ResourceRefused);
+        assert_eq!(entry.resource_refused, 1);
+        assert!(!entry.pending);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::{
     QuiescenceObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
-    TraceExpectation,
+    TraceExpectation, compare_trace_expectations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -61,6 +61,7 @@ pub enum OracleBehavior {
     ClientState,
     ClientConvergence,
     ExactStateEquivalence,
+    ExactStateNonEquivalence,
     ScenarioInputDisposition,
     NoPendingWorkObserved,
     BidirectionalDecryptabilityObserved,
@@ -153,6 +154,15 @@ pub fn build_scenario_oracle_report(
         oracle_behaviors.sort();
     }
     let mut observed_behaviors = trace_behaviors(observed_trace);
+    if expected_outcomes.iter().any(|expectation| {
+        matches!(expectation, TraceExpectation::ClientsNotEquivalent { .. })
+            && compare_trace_expectations(None, std::slice::from_ref(expectation), observed_trace)
+                .is_empty()
+    }) && !observed_behaviors.contains(&OracleBehavior::ExactStateNonEquivalence)
+    {
+        observed_behaviors.push(OracleBehavior::ExactStateNonEquivalence);
+        observed_behaviors.sort();
+    }
     if quiescence_observations
         .iter()
         .any(|observation| observation.status.is_quiescent())
@@ -294,7 +304,12 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
     }
 
     for step in &spec.steps {
+        let mut step = step;
+        while let ScenarioStep::InGroup { action, .. } = step {
+            step = action.as_ref();
+        }
         match step {
+            ScenarioStep::InGroup { .. } => unreachable!("all group wrappers were unwrapped"),
             ScenarioStep::CreateGroup { .. } => {
                 stimuli.insert(ScenarioStimulus::CreateGroup);
             }
@@ -614,6 +629,9 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
             behaviors.insert(OracleBehavior::ClientConvergence);
             behaviors.insert(OracleBehavior::ExactStateEquivalence);
         }
+        TraceExpectation::ClientsNotEquivalent { .. } => {
+            behaviors.insert(OracleBehavior::ExactStateNonEquivalence);
+        }
         TraceExpectation::ScenarioInputLedger { entries, .. } => {
             behaviors.insert(OracleBehavior::ScenarioInputDisposition);
             if entries.iter().any(|entry| entry.delivered > 0) {
@@ -863,5 +881,42 @@ mod tests {
             trace_behaviors(&observed).contains(&OracleBehavior::ExactStateEquivalence),
             "legacy observations must not hide a later equivalent exact sample"
         );
+    }
+
+    #[test]
+    fn strict_oracle_records_satisfied_exact_non_equivalence() {
+        let mut david = observation("david", 2, 3, "winner");
+        david.canonical_state = Some(ConformanceCanonicalStateSnapshot::Live(Box::default()));
+        let mut eve = observation("eve", 2, 3, "loser");
+        let mut eve_state =
+            Box::<cgka_engine::conformance_snapshot::ConformanceGroupSnapshot>::default();
+        eve_state.epoch = 9;
+        eve.canonical_state = Some(ConformanceCanonicalStateSnapshot::Live(eve_state));
+        let expectation = TraceExpectation::ClientsNotEquivalent {
+            clients: vec!["david".into(), "eve".into()],
+            reason: "named branch split".into(),
+        };
+        let spec = ScenarioSpec {
+            name: "oracle/non-equivalence".into(),
+            spec_version: "2".into(),
+            clients: vec!["david".into(), "eve".into()],
+            topology: Default::default(),
+            steps: Vec::new(),
+        };
+
+        let report = build_scenario_oracle_report(
+            &spec,
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![david, eve]),
+            &[],
+        );
+
+        assert!(
+            report
+                .observed_behaviors
+                .contains(&OracleBehavior::ExactStateNonEquivalence)
+        );
+        assert!(report.missing_observed_behaviors.is_empty());
     }
 }

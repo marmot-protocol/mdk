@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ScenarioRunError, SubjectFailureCategory};
 
+const UNSPECIFIED_VERSION: &str = "unspecified";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioTopologyV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,8 +61,8 @@ impl ScenarioTopologyV2 {
                     .iter()
                     .map(|client| ScenarioProcessV2 {
                         id: format!("process:{client}"),
-                        binary_version: "unspecified".into(),
-                        policy_version: "unspecified".into(),
+                        binary_version: UNSPECIFIED_VERSION.into(),
+                        policy_version: UNSPECIFIED_VERSION.into(),
                         relays: Vec::new(),
                     })
                     .collect(),
@@ -149,6 +151,24 @@ impl ScenarioTopologyV2 {
                     )));
                 }
             }
+        }
+        let explicit_policy_versions = self
+            .processes
+            .iter()
+            .map(|process| process.policy_version.as_str())
+            .filter(|version| *version != UNSPECIFIED_VERSION)
+            .collect::<BTreeSet<_>>();
+        if explicit_policy_versions.len() > 1 {
+            return Err(topology_error_with_kind(
+                "incompatible_convergence_policy",
+                format!(
+                    "incompatible convergence policies in one scenario: {}",
+                    explicit_policy_versions
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
         }
         for relay in &self.relays {
             require_label("relay id", &relay.id)?;
@@ -252,9 +272,16 @@ fn require_label(field: &str, value: &str) -> Result<(), ScenarioRunError> {
 }
 
 fn topology_error(message: impl Into<String>) -> ScenarioRunError {
+    topology_error_with_kind("scenario_topology_error", message)
+}
+
+fn topology_error_with_kind(
+    kind: impl Into<String>,
+    message: impl Into<String>,
+) -> ScenarioRunError {
     ScenarioRunError {
         step_index: None,
-        kind: "scenario_topology_error".into(),
+        kind: kind.into(),
         category: SubjectFailureCategory::Environment,
         message: message.into(),
     }

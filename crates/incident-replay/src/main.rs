@@ -13,10 +13,12 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cgka_conformance_simulator::VectorFixture;
 use incident_replay::{
-    AgentStateExport, ForkCommitKind, QuarantineReason, Verdict, accept, accept_convergence,
-    classify, is_stream, liveness_advisory, parse, parse_stream, recover_convergence, recover_fork,
+    AgentStateExport, ForkCommitKind, IncidentReplayFidelityV1, IncidentReproductionStatusV1,
+    IncidentScenarioArtifactV1, IncidentSourceFormatV1, NormalizedHistoryImportError,
+    QuarantineReason, Verdict, accept, accept_attested_history, accept_convergence,
+    archetype_artifact, classify, import_attested_history, is_stream, liveness_advisory, parse,
+    parse_stream, recover_convergence, recover_fork,
 };
 
 /// Vector name for a group-metadata fork-recovery incident.
@@ -45,7 +47,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let export = if is_stream(&json) {
+    let stream = is_stream(&json);
+    let source_format = if stream {
+        IncidentSourceFormatV1::GogglesGroupExportStream
+    } else {
+        IncidentSourceFormatV1::AgentStateDocument
+    };
+    let export = if stream {
         match parse_stream(&json) {
             Ok(export) => export,
             Err(err) => {
@@ -74,12 +82,12 @@ fn main() -> ExitCode {
         }
     );
     let code = match verdict {
-        Verdict::ForkRecovery => run_fork_recovery(&export, out_dir.as_deref()),
+        Verdict::ForkRecovery => run_fork_recovery(&export, source_format, out_dir.as_deref()),
         Verdict::Healthy => {
             println!("healthy: 0 vectors");
             ExitCode::SUCCESS
         }
-        Verdict::ConvergenceSelected => run_convergence(&export, out_dir.as_deref()),
+        Verdict::ConvergenceSelected => run_convergence(&export, source_format, out_dir.as_deref()),
         Verdict::Quarantine { reason } => quarantine(&reason),
     };
     if !liveness_is_primary && let Some(reason) = liveness_advisory(&export) {
@@ -106,7 +114,21 @@ fn read_utf8_limited(reader: impl Read, max_bytes: u64) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
+fn run_fork_recovery(
+    export: &AgentStateExport,
+    source_format: IncidentSourceFormatV1,
+    out_dir: Option<&Path>,
+) -> ExitCode {
+    match import_attested_history(export, source_format) {
+        Ok(Some(artifact)) => {
+            return match accept_attested_history(artifact) {
+                Ok(artifact) => persist_or_report(&artifact, out_dir),
+                Err(error) => normalized_history_failure(&error),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return normalized_history_failure(&error),
+    }
     let fork = match recover_fork(export) {
         Ok(fork) => fork,
         Err(err) => return quarantine(&err),
@@ -116,18 +138,38 @@ fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitC
         ForkCommitKind::Membership => MEMBERSHIP_INCIDENT_NAME,
     };
     match accept(&fork, name) {
-        Ok(vector) => persist_or_report(&vector, out_dir),
+        Ok(vector) => match archetype_artifact(export, source_format, vector) {
+            Ok(artifact) => persist_or_report(&artifact, out_dir),
+            Err(error) => quarantine(&error),
+        },
         Err(err) => quarantine(&err),
     }
 }
 
-fn run_convergence(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
+fn run_convergence(
+    export: &AgentStateExport,
+    source_format: IncidentSourceFormatV1,
+    out_dir: Option<&Path>,
+) -> ExitCode {
+    match import_attested_history(export, source_format) {
+        Ok(Some(artifact)) => {
+            return match accept_attested_history(artifact) {
+                Ok(artifact) => persist_or_report(&artifact, out_dir),
+                Err(error) => normalized_history_failure(&error),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return normalized_history_failure(&error),
+    }
     let conv = match recover_convergence(export) {
         Ok(conv) => conv,
         Err(err) => return quarantine(&err),
     };
     match accept_convergence(&conv, CONVERGENCE_NAME) {
-        Ok(vector) => persist_or_report(&vector, out_dir),
+        Ok(vector) => match archetype_artifact(export, source_format, vector) {
+            Ok(artifact) => persist_or_report(&artifact, out_dir),
+            Err(error) => quarantine(&error),
+        },
         Err(err) => quarantine(&err),
     }
 }
@@ -139,40 +181,100 @@ fn quarantine(reason: &dyn std::fmt::Display) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write the accepted vector to `out_dir`, or print it when no dir was given.
-fn persist_or_report(vector: &VectorFixture, out_dir: Option<&Path>) -> ExitCode {
+fn normalized_history_failure(error: &NormalizedHistoryImportError) -> ExitCode {
+    if matches!(
+        error,
+        NormalizedHistoryImportError::Run(_) | NormalizedHistoryImportError::RunTimedOut
+    ) {
+        eprintln!("error: normalized-history simulator infrastructure failed");
+        ExitCode::from(2)
+    } else {
+        quarantine(error)
+    }
+}
+
+/// Write the accepted vector plus evidence artifact to `out_dir`, or describe
+/// its fidelity when no directory was given.
+fn persist_or_report(artifact: &IncidentScenarioArtifactV1, out_dir: Option<&Path>) -> ExitCode {
+    if artifact.replay_fidelity == IncidentReplayFidelityV1::ProducerAttestedNormalizedHistory
+        && artifact.reproduction_status != IncidentReproductionStatusV1::Reproduced
+    {
+        eprintln!("error: refusing to persist an unreproduced normalized-history artifact");
+        return ExitCode::from(2);
+    }
     match out_dir {
-        Some(dir) => match write_vector(vector, dir) {
-            Ok(path) => {
-                println!("accepted: wrote {}", path.display());
+        Some(dir) => match write_artifact(artifact, dir) {
+            Ok((vector_path, artifact_path)) => {
+                println!(
+                    "accepted ({:?}, {:?}): wrote {} and {}",
+                    artifact.replay_fidelity,
+                    artifact.sensitivity,
+                    vector_path.display(),
+                    artifact_path.display()
+                );
                 ExitCode::SUCCESS
             }
             Err(err) => {
-                eprintln!("error: cannot write vector: {err}");
+                eprintln!("error: cannot write incident artifacts: {err}");
                 ExitCode::from(2)
             }
         },
         None => {
             println!(
-                "accepted: {} (pass an out-dir to persist)",
-                vector.scenario_name
+                "accepted ({:?}, {:?}); byte replay unavailable without sensitive local state; unavailable fields: {} (pass an out-dir to persist)",
+                artifact.replay_fidelity,
+                artifact.sensitivity,
+                artifact
+                    .unavailable_fields
+                    .iter()
+                    .map(|field| field.field.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             ExitCode::SUCCESS
         }
     }
 }
 
-/// Write a vector as `<dir>/<name>.v1.json` (creating `dir`), returning the path.
-fn write_vector(vector: &VectorFixture, dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let stem = vector
-        .scenario_name
+/// Write a vector and evidence envelope owner-only. Producer-attested Scenario
+/// IR may contain unredacted labels and payloads and remains confidential.
+fn write_artifact(
+    artifact: &IncidentScenarioArtifactV1,
+    dir: &Path,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    fs_private::create_dir_all_private(dir)?;
+    let stem = if artifact.sensitivity
+        == incident_replay::IncidentArtifactSensitivityV1::ConfidentialUnredactedScenario
+    {
+        "confidential-normalized-incident".to_owned()
+    } else {
+        artifact_stem(&artifact.vector.scenario_name)
+    };
+    let vector_path = dir.join(format!("{stem}.v1.json"));
+    let artifact_path = dir.join(format!("{stem}.incident.v1.json"));
+    let vector_json = serde_json::to_string_pretty(&artifact.vector).expect("vector serializes");
+    let artifact_json = serde_json::to_string_pretty(artifact).expect("artifact serializes");
+    fs_private::write_private(&vector_path, format!("{vector_json}\n").as_bytes())?;
+    fs_private::write_private(&artifact_path, format!("{artifact_json}\n").as_bytes())?;
+    Ok((vector_path, artifact_path))
+}
+
+fn artifact_stem(scenario_name: &str) -> String {
+    let raw_stem = scenario_name
         .rsplit_once('/')
-        .map_or(vector.scenario_name.as_str(), |(stem, _version)| stem);
-    let path = dir.join(format!("{stem}.v1.json"));
-    let json = serde_json::to_string_pretty(vector).expect("vector serializes");
-    std::fs::write(&path, format!("{json}\n"))?;
-    Ok(path)
+        .map_or(scenario_name, |(stem, _version)| stem);
+    let mut stem = raw_stem
+        .chars()
+        .take(96)
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '-',
+        })
+        .collect::<String>();
+    if stem.is_empty() || stem == "." || stem == ".." {
+        stem = "incident".into();
+    }
+    stem
 }
 
 #[cfg(test)]
@@ -192,5 +294,14 @@ mod tests {
             read_utf8_limited(io::Cursor::new("ciao".as_bytes()), 4).unwrap(),
             "ciao"
         );
+    }
+
+    #[test]
+    fn artifact_stem_is_one_safe_path_component() {
+        let stem = artifact_stem("../../outside/incident/v1");
+        assert!(!stem.contains('/'));
+        assert!(!stem.contains('\\'));
+        assert_ne!(stem, ".");
+        assert_ne!(stem, "..");
     }
 }

@@ -242,6 +242,16 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
+    /// Test-only selection experiment switch. It is always true in production;
+    /// only the feature-gated builder method can disable witness admission.
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) admit_app_witnesses: bool,
+    /// Optional hard replay-probe ceiling for explicit exhaustion campaigns.
+    /// Production construction cannot set it.
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) replay_probe_budget_override: Option<u64>,
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub(crate) conformance_replay_probe_count: u64,
     pub(crate) convergence_clock: Arc<dyn ConvergenceClock>,
     /// Identifies the process-local monotonic clock domain persisted in active
     /// convergence passes. A mismatch on hydration forces deadline rebasing
@@ -338,6 +348,10 @@ pub struct EngineBuilder<S: StorageProvider> {
     wall_clock: Arc<dyn WallClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
     convergence_clock: Arc<dyn ConvergenceClock>,
+    #[cfg(feature = "test-policy-overrides")]
+    admit_app_witnesses: bool,
+    #[cfg(feature = "test-policy-overrides")]
+    replay_probe_budget_override: Option<u64>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
@@ -357,6 +371,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
             wall_clock: Arc::new(SystemWallClock),
             maintenance_random: Arc::new(OsMaintenanceRandom),
             convergence_clock: Arc::new(SystemConvergenceClock::default()),
+            #[cfg(feature = "test-policy-overrides")]
+            admit_app_witnesses: true,
+            #[cfg(feature = "test-policy-overrides")]
+            replay_probe_budget_override: None,
             recorder: None,
         }
     }
@@ -437,6 +455,26 @@ impl<S: StorageProvider> EngineBuilder<S> {
     /// maintenance timestamps.
     pub fn convergence_clock(mut self, clock: Arc<dyn ConvergenceClock>) -> Self {
         self.convergence_clock = clock;
+        self
+    }
+
+    /// Disable application-message witnesses for a full-engine comparison.
+    ///
+    /// This does not define or negotiate another Marmot convergence policy.
+    /// It exists only in explicit test-policy builds so campaigns can measure
+    /// whether the v1 witness term changes outcomes enough to justify itself.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn without_app_witnesses_for_tests(mut self) -> Self {
+        self.admit_app_witnesses = false;
+        self
+    }
+
+    /// Override the per-pass OpenMLS replay-probe ceiling for fail-closed
+    /// resource campaigns. A zero limit deterministically fails the first
+    /// probe; `None` restores the production-derived budget.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn replay_probe_budget_for_tests(mut self, limit: Option<u64>) -> Self {
+        self.replay_probe_budget_override = limit;
         self
     }
 
@@ -527,6 +565,12 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 app_message_past_epoch_limit: self.max_past_epochs as u64,
                 ..crate::canonicalization::CanonicalizationPolicy::default()
             },
+            #[cfg(feature = "test-policy-overrides")]
+            admit_app_witnesses: self.admit_app_witnesses,
+            #[cfg(feature = "test-policy-overrides")]
+            replay_probe_budget_override: self.replay_probe_budget_override,
+            #[cfg(feature = "test-conformance-snapshot")]
+            conformance_replay_probe_count: 0,
             convergence_clock: self.convergence_clock,
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
@@ -544,6 +588,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Change the explicit replay-probe ceiling for a running exhaustion
+    /// campaign. Production builds do not expose this method.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
+        self.replay_probe_budget_override = limit;
+    }
+
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
         if self.ensure_group_live(group_id).is_err() {
             return None;
@@ -638,6 +689,12 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(None)
+    }
+
+    /// Cumulative candidate replay probes since this engine process opened.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_replay_probe_count(&self) -> u64 {
+        self.conformance_replay_probe_count
     }
 
     /// Return the transport and content-derived ids for a durable synthetic

@@ -10,6 +10,9 @@ description = "In-process multi-client simulator and fixtures for the CGKA engin
 # Long-running property-based tests (1000+ iterations). Quick CI runs the
 # default profile; nightly CI runs with this feature enabled.
 conformance-slow = []
+# Full-engine A/B campaigns that disable only application-message witness
+# admission. This is a simulator experiment, not a supported wire policy.
+test-policy-overrides = ["cgka-engine/test-policy-overrides"]
 
 [dependencies]
 cgka-traits.workspace = true
@@ -35,6 +38,7 @@ proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 # Byte-level conformance vectors for the agent text stream QUIC feature pin

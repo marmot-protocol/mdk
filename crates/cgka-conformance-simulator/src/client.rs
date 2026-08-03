@@ -13,6 +13,7 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationResult};
+use cgka_engine::engine_metrics::{EngineMetricsSnapshot, HistogramSnapshot};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -57,6 +58,10 @@ pub struct HarnessClient {
     registry: FeatureRegistry,
     protocol_profile: ProtocolProfile,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
+    completed_replay_probe_count: u64,
+    completed_engine_metrics: EngineMetricsSnapshot,
     virtual_time_tick_enabled: bool,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
@@ -76,6 +81,49 @@ pub struct HarnessClient {
     convergence_checkpoints: HashMap<String, (GroupId, DurableConvergencePass)>,
 }
 
+pub(crate) fn merge_engine_metrics(
+    target: &mut EngineMetricsSnapshot,
+    source: &EngineMetricsSnapshot,
+) {
+    target.settles = target.settles.saturating_add(source.settles);
+    target.post_settle_reorgs = target
+        .post_settle_reorgs
+        .saturating_add(source.post_settle_reorgs);
+    merge_histogram(&mut target.reorg_rewind_depth, &source.reorg_rewind_depth);
+    merge_histogram(&mut target.reorg_lateness_ms, &source.reorg_lateness_ms);
+    merge_histogram(
+        &mut target.pass_apply_latency_ms,
+        &source.pass_apply_latency_ms,
+    );
+    merge_histogram(&mut target.generation_gap_ms, &source.generation_gap_ms);
+    merge_histogram(&mut target.freeze_overdue_ms, &source.freeze_overdue_ms);
+    target.admin_reservation_hold_observations = target
+        .admin_reservation_hold_observations
+        .saturating_add(source.admin_reservation_hold_observations);
+    target.admin_reservation_prepared = target
+        .admin_reservation_prepared
+        .saturating_add(source.admin_reservation_prepared);
+    target.admin_reservation_failed = target
+        .admin_reservation_failed
+        .saturating_add(source.admin_reservation_failed);
+}
+
+fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
+    for source_bucket in &source.buckets {
+        if let Some(target_bucket) = target
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.upper_bound == source_bucket.upper_bound)
+        {
+            target_bucket.count = target_bucket.count.saturating_add(source_bucket.count);
+        } else {
+            target.buckets.push(source_bucket.clone());
+        }
+    }
+    target.buckets.sort_by_key(|bucket| bucket.upper_bound);
+    target.overflow_count = target.overflow_count.saturating_add(source.overflow_count);
+}
+
 pub struct ClientBuilder {
     identity: Vec<u8>,
     signer: nostr::Keys,
@@ -85,6 +133,8 @@ pub struct ClientBuilder {
     storage_options: SqliteStorageOptions,
     explicit_file_storage: Option<ExplicitFileStorage>,
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
 }
 
 pub(crate) enum HarnessPublicationError {
@@ -223,6 +273,8 @@ impl ClientBuilder {
             storage_options: SqliteStorageOptions::default(),
             explicit_file_storage: None,
             convergence_clock: None,
+            disable_app_witnesses_for_tests: false,
+            replay_probe_budget_override: None,
         }
     }
 
@@ -267,6 +319,18 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn without_app_witnesses_for_tests(mut self) -> Self {
+        self.disable_app_witnesses_for_tests = true;
+        self
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn replay_probe_budget_for_tests(mut self, limit: Option<u64>) -> Self {
+        self.replay_probe_budget_override = limit;
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -282,7 +346,11 @@ impl ClientBuilder {
             &self.registry,
             self.protocol_profile,
             &audit_capture,
-            self.convergence_clock.as_ref(),
+            HarnessEngineOptions {
+                convergence_clock: self.convergence_clock.as_ref(),
+                disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+                replay_probe_budget_override: self.replay_probe_budget_override,
+            },
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         bus.capture_outbound_for(bus_id);
@@ -297,6 +365,10 @@ impl ClientBuilder {
             registry: self.registry,
             protocol_profile: self.protocol_profile,
             convergence_clock: self.convergence_clock,
+            disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+            replay_probe_budget_override: self.replay_probe_budget_override,
+            completed_replay_probe_count: 0,
+            completed_engine_metrics: EngineMetricsSnapshot::default(),
             virtual_time_tick_enabled: false,
             pending_events: Vec::new(),
             default_group: None,
@@ -318,6 +390,12 @@ impl ClientBuilder {
 /// [`CapturingRecorder`] that retains forensic events. `attach` and `restart`
 /// both go through here so a rebuilt engine keeps recording into the same shared
 /// buffer — otherwise a restart would silently drop captured decisions.
+struct HarnessEngineOptions<'a> {
+    convergence_clock: Option<&'a Arc<dyn ConvergenceClock>>,
+    disable_app_witnesses_for_tests: bool,
+    replay_probe_budget_override: Option<u64>,
+}
+
 fn build_harness_engine(
     storage: &SqliteAccountStorage,
     identity: &[u8],
@@ -325,7 +403,7 @@ fn build_harness_engine(
     registry: &FeatureRegistry,
     protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
-    convergence_clock: Option<&Arc<dyn ConvergenceClock>>,
+    options: HarnessEngineOptions<'_>,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
@@ -341,9 +419,22 @@ fn build_harness_engine(
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
     }
-    if let Some(clock) = convergence_clock {
+    if let Some(clock) = options.convergence_clock {
         builder = builder.convergence_clock(clock.clone());
     }
+    #[cfg(feature = "test-policy-overrides")]
+    if options.disable_app_witnesses_for_tests {
+        builder = builder.without_app_witnesses_for_tests();
+    }
+    #[cfg(feature = "test-policy-overrides")]
+    if options.replay_probe_budget_override.is_some() {
+        builder = builder.replay_probe_budget_for_tests(options.replay_probe_budget_override);
+    }
+    #[cfg(not(feature = "test-policy-overrides"))]
+    let _ = (
+        options.disable_app_witnesses_for_tests,
+        options.replay_probe_budget_override,
+    );
     builder.build().expect("engine builds")
 }
 
@@ -462,6 +553,9 @@ fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
 }
 
 impl HarnessClient {
+    pub(crate) fn select_default_group(&mut self, group_id: GroupId) {
+        self.default_group = Some(group_id);
+    }
     pub fn engine(&self) -> &Engine<SqliteAccountStorage> {
         self.engine.as_ref().expect("harness engine is available")
     }
@@ -581,6 +675,11 @@ impl HarnessClient {
     }
 
     pub fn restart(&mut self) {
+        self.completed_replay_probe_count = self
+            .completed_replay_probe_count
+            .saturating_add(self.engine().conformance_replay_probe_count());
+        let completed_metrics = self.engine().engine_metrics();
+        merge_engine_metrics(&mut self.completed_engine_metrics, &completed_metrics);
         drop(self.engine.take());
         let storage = if self.storage_backing.is_file_backed() {
             drop(self.storage.take());
@@ -595,7 +694,11 @@ impl HarnessClient {
             &self.registry,
             self.protocol_profile,
             &self.audit_capture,
-            self.convergence_clock.as_ref(),
+            HarnessEngineOptions {
+                convergence_clock: self.convergence_clock.as_ref(),
+                disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
+                replay_probe_budget_override: self.replay_probe_budget_override,
+            },
         );
         engine
             .hydrate_stable_groups_from_storage()
@@ -603,6 +706,26 @@ impl HarnessClient {
         self.storage = Some(storage);
         self.engine = Some(engine);
         self.pending_events.clear();
+    }
+
+    pub fn replay_probe_count(&self) -> u64 {
+        self.completed_replay_probe_count
+            .saturating_add(self.engine().conformance_replay_probe_count())
+    }
+
+    pub fn engine_metrics(&self) -> EngineMetricsSnapshot {
+        let mut metrics = self.completed_engine_metrics.clone();
+        merge_engine_metrics(&mut metrics, &self.engine().engine_metrics());
+        metrics
+    }
+
+    /// Change the full-engine replay ceiling without changing durable state.
+    /// Clearing the override is the repair step after an intentional
+    /// `ReplayBudgetExceeded` campaign result.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
+        self.replay_probe_budget_override = limit;
+        self.engine_mut().set_replay_probe_budget_for_tests(limit);
     }
 
     /// Freeze the current durable pass at its quiescence boundary. This is a
@@ -660,9 +783,18 @@ impl HarnessClient {
         group_id: &GroupId,
         now_ms: u64,
     ) -> CanonicalizationResult {
+        self.try_converge_stored_at(group_id, now_ms)
+            .expect("stored convergence succeeds")
+    }
+
+    pub fn try_converge_stored_at(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> Result<CanonicalizationResult, cgka_engine::openmls_projection::OpenMlsProjectionError>
+    {
         self.engine_mut()
             .converge_stored_openmls_messages_at(group_id, now_ms)
-            .expect("stored convergence succeeds")
     }
 
     /// Drain the `convergence_decision` events the engine has emitted since the
@@ -1575,6 +1707,12 @@ impl HarnessClient {
         self.engine().epoch(&gid).expect("epoch")
     }
 
+    pub(crate) fn has_active_group(&self) -> bool {
+        self.default_group
+            .as_ref()
+            .is_some_and(|group_id| self.engine().epoch(group_id).is_ok())
+    }
+
     pub fn members(&self) -> Vec<cgka_traits::group::Member> {
         let gid = self.default_group.clone().expect("group");
         match self.engine().members(&gid) {
@@ -1653,9 +1791,14 @@ impl HarnessClient {
             })
             .collect::<Vec<_>>();
         for (scenario_id, kind, state) in observed_states {
-            if let Some(state) = state {
-                self.scenario_input_tracker
-                    .record_storage_state(&scenario_id, kind, state);
+            match state {
+                Some(state) => {
+                    self.scenario_input_tracker
+                        .record_storage_state(&scenario_id, kind, state)
+                }
+                None => self
+                    .scenario_input_tracker
+                    .record_storage_absence(&scenario_id),
             }
         }
         self.scenario_input_tracker.snapshot()
@@ -1851,7 +1994,15 @@ impl HarnessClient {
             }
             match &event {
                 GroupEvent::TransportObjectResourceRefused { message_id, .. } => {
-                    if let Some(scenario_input) = self.bus.scenario_input_for_transport(message_id)
+                    // Deferred-peel storage is keyed by the raw transport id,
+                    // but alternate peelers and migrated rows may report the
+                    // content-derived alias. Treat both durable aliases as the
+                    // same scenario input so a released row cannot remain
+                    // falsely pending in the black-box ledger.
+                    if let Some(scenario_input) = self
+                        .bus
+                        .scenario_input_for_transport(message_id)
+                        .or_else(|| self.bus.scenario_input_for_content(message_id))
                     {
                         self.scenario_input_tracker
                             .record_resource_refused(&scenario_input);

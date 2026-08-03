@@ -5,8 +5,9 @@ use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
     HarnessStorageMode, ScenarioReport, VectorFixture, coverage_matrix_entry,
     generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, run_generated_case_report_with_capture,
-    run_vector_fixture_report_with_capture, write_failure_capsule,
+    generate_milestone3_adversarial_family, generate_send_leave_family,
+    run_generated_case_report_with_capture, run_vector_fixture_report_with_capture,
+    write_failure_capsule,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +238,7 @@ async fn run_generated_family_reports(
         "send-leave/v1" => generate_send_leave_family(seed, cases),
         "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_family(seed, cases),
         "convergence-chaos/v1" => generate_convergence_chaos_family(seed, cases),
+        "milestone3-adversarial/v1" => generate_milestone3_adversarial_family(seed, cases),
         other => return Err(format!("unsupported family {other}").into()),
     };
 
@@ -588,7 +590,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|milestone3-adversarial/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
 }
 
 #[cfg(test)]
@@ -633,6 +635,7 @@ mod tests {
             app_invalidation_observations: Vec::new(),
             expectation_failures: Vec::new(),
             invariant_failures: Vec::new(),
+            campaign_measurements: Default::default(),
         }
     }
 
@@ -690,12 +693,29 @@ mod tests {
                 category: crate::SubjectFailureCategory::Resource,
                 message: "convergence replay budget exceeded".into(),
             },
+            wall_us: 0,
         });
 
         let failures = scenario_report_failures(&report, false);
+        let measurements =
+            crate::CampaignMeasurementsV1::from_report(&report, 10, None, 0, None, None);
 
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].kind, "scenario_step_failed:backend");
         assert!(failures[0].message.contains("replay budget exceeded"));
+        assert_eq!(measurements.first_failing_action, Some(4));
+        assert_eq!(measurements.convergence_latency_us, None);
+        assert!(
+            measurements
+                .unavailable_process_fields
+                .iter()
+                .any(|field| field == "convergence_latency_us")
+        );
+        assert!(
+            measurements
+                .limiting_resource
+                .as_deref()
+                .is_some_and(|resource| resource.contains("replay budget exceeded"))
+        );
     }
 }

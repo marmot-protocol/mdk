@@ -21,6 +21,8 @@ pub struct ScenarioActionScheduleV2 {
     pub action_id: String,
     pub source_step_index: usize,
     pub action_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_group: Option<String>,
     /// Sum of explicit `advance_time` deltas preceding this action.
     ///
     /// Assertions and quiescence may advance an adapter's observed clock while
@@ -33,6 +35,7 @@ pub struct ScenarioActionScheduleV2 {
 pub struct CompiledScenarioActionV2 {
     pub schedule: ScenarioActionScheduleV2,
     pub step: ScenarioStep,
+    pub scenario_group: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +57,12 @@ impl CompiledScenarioV2 {
 }
 
 pub fn stable_action_id(source_step_index: usize, step: &ScenarioStep) -> String {
-    format!("step-{source_step_index}:{}", step.kind())
+    match step {
+        ScenarioStep::InGroup { group, action } => {
+            format!("step-{source_step_index}:{}@{group}", action.kind())
+        }
+        _ => format!("step-{source_step_index}:{}", step.kind()),
+    }
 }
 
 /// Compile canonical JSON input into the only schedule adapters may execute.
@@ -91,22 +99,44 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
 
     let mut virtual_time_ms = 0_u64;
     let topology = spec.topology.resolve_for_clients(&spec.clients)?;
+    let uses_explicit_group_targets = spec
+        .steps
+        .iter()
+        .any(|step| matches!(step, ScenarioStep::InGroup { .. }));
     let mut actions = Vec::with_capacity(spec.steps.len());
     for (source_step_index, step) in spec.steps.iter().enumerate() {
-        validate_step(source_step_index, step, &clients, &topology)?;
+        if uses_explicit_group_targets
+            && !matches!(step, ScenarioStep::InGroup { .. })
+            && is_group_scoped(step)
+        {
+            return Err(compile_error(
+                Some(source_step_index),
+                format!(
+                    "{} must use in_group when the scenario targets multiple groups",
+                    step.kind()
+                ),
+            ));
+        }
+        let (scenario_group, executable_step) =
+            lower_group_action(source_step_index, step, &topology)?;
+        validate_step(source_step_index, executable_step, &clients, &topology)?;
         let action_id = stable_action_id(source_step_index, step);
-        let required_capabilities = required_capabilities(step).into_iter().collect();
+        let required_capabilities = required_capabilities(step)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         actions.push(CompiledScenarioActionV2 {
             schedule: ScenarioActionScheduleV2 {
                 action_id,
                 source_step_index,
-                action_type: step.kind().into(),
+                action_type: executable_step.kind().into(),
+                scenario_group: scenario_group.clone(),
                 declared_virtual_time_ms: virtual_time_ms,
                 required_capabilities,
             },
-            step: step.clone(),
+            step: executable_step.clone(),
+            scenario_group,
         });
-        if let ScenarioStep::AdvanceTime { delta_ms } = step {
+        if let ScenarioStep::AdvanceTime { delta_ms } = executable_step {
             virtual_time_ms = virtual_time_ms.checked_add(*delta_ms).ok_or_else(|| {
                 compile_error(
                     Some(source_step_index),
@@ -125,6 +155,61 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
     })
 }
 
+fn lower_group_action<'a>(
+    step_index: usize,
+    step: &'a ScenarioStep,
+    topology: &crate::ScenarioTopologyV2,
+) -> Result<(Option<String>, &'a ScenarioStep), ScenarioRunError> {
+    let ScenarioStep::InGroup { group, action } = step else {
+        return Ok((None, step));
+    };
+    if group.trim().is_empty() {
+        return Err(compile_error(
+            Some(step_index),
+            "scenario group label must not be empty".into(),
+        ));
+    }
+    if matches!(action.as_ref(), ScenarioStep::InGroup { .. }) {
+        return Err(compile_error(
+            Some(step_index),
+            "nested in_group actions are not allowed".into(),
+        ));
+    }
+    if !is_group_scoped(action) {
+        return Err(compile_error(
+            Some(step_index),
+            format!("{} is not a group-scoped action", action.kind()),
+        ));
+    }
+    if !topology.groups.is_empty() && !topology.groups.iter().any(|item| item.id == *group) {
+        return Err(compile_error(
+            Some(step_index),
+            format!("in_group references unknown scenario group {group}"),
+        ));
+    }
+    Ok((Some(group.clone()), action))
+}
+
+fn is_group_scoped(step: &ScenarioStep) -> bool {
+    matches!(
+        step,
+        ScenarioStep::CreateGroup { .. }
+            | ScenarioStep::InviteMembers { .. }
+            | ScenarioStep::RemoveMembers { .. }
+            | ScenarioStep::SelfUpdate { .. }
+            | ScenarioStep::UpdateGroupData { .. }
+            | ScenarioStep::UpdateAdminPolicy { .. }
+            | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
+            | ScenarioStep::SendAppMessage { .. }
+            | ScenarioStep::Leave { .. }
+            | ScenarioStep::ProbeBidirectionalDecryptability { .. }
+            | ScenarioStep::ObserveAdminPolicy { .. }
+            | ScenarioStep::Observe { .. }
+            | ScenarioStep::ObserveExact { .. }
+            | ScenarioStep::ClearEvents { .. }
+    )
+}
+
 fn validate_step(
     step_index: usize,
     step: &ScenarioStep,
@@ -132,6 +217,7 @@ fn validate_step(
     topology: &crate::ScenarioTopologyV2,
 ) -> Result<(), ScenarioRunError> {
     match step {
+        ScenarioStep::InGroup { .. } => unreachable!("group wrapper is lowered before validation"),
         ScenarioStep::OmitMessage { selector } | ScenarioStep::DuplicateMessage { selector } => {
             validate_semantic_selector(step_index, selector)?;
         }

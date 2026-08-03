@@ -430,6 +430,64 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
 }
 
 #[test]
+fn proposal_below_retained_anchor_expires_instead_of_witnessing_selection() {
+    let mut expired = proposal("expired-proposal", "live");
+    expired.source_epoch = 2;
+    let mut canonicalization = input(vec![expired], vec![branch("live", 3, 4, 0x00)]);
+    canonicalization.state = state(4, 3);
+
+    let result = canonicalize(canonicalization);
+
+    assert!(result.accepted_proposals.is_empty());
+    assert_eq!(
+        result.dropped_messages,
+        vec![DroppedMessage {
+            message_id: "expired-proposal".into(),
+            kind: MessageKind::Proposal,
+            reason: DroppedMessageReason::BeyondAnchor,
+            rejection_category: None,
+        }]
+    );
+}
+
+#[test]
+fn canonical_commit_can_close_multiple_proposal_dependencies_atomically() {
+    // MLS has exactly one prior group-state parent per commit. The
+    // "multi-parent" campaign dimension therefore means multiple standalone
+    // proposal dependencies consumed by one commit, not a DAG merge of two
+    // incompatible MLS states.
+    let result = canonicalize(input(
+        vec![
+            proposal("proposal-a", "live-parent"),
+            proposal("proposal-b", "live-parent"),
+            child_commit_edge_with_proposals(
+                "multi-dependency-commit",
+                ChildCommitEdge {
+                    branch_id: "live-tip",
+                    parent_branch_id: "live-parent",
+                    fork_epoch: 1,
+                    source_epoch: 3,
+                    resulting_epoch: 4,
+                    tip_digest: 0x00,
+                },
+                &["proposal-a", "proposal-b"],
+            ),
+        ],
+        vec![branch("live-parent", 1, 3, 0x00)],
+    ));
+
+    assert_eq!(
+        result.accepted_proposals,
+        vec!["proposal-a".to_string(), "proposal-b".to_string()]
+    );
+    assert_eq!(
+        result.accepted_commits,
+        vec!["multi-dependency-commit".to_string()]
+    );
+    assert!(result.dropped_messages.is_empty());
+}
+
+#[test]
 fn materialized_candidates_drive_commit_and_proposal_dispositions() {
     let result = canonicalize_with_materialized_candidates(
         input(

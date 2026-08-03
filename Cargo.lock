@@ -840,6 +840,7 @@ dependencies = [
  "cgka-traits",
  "fs-private",
  "hex",
+ "libc",
  "marmot-forensics",
  "nostr",
  "openmls",
@@ -2539,6 +2540,7 @@ name = "incident-replay"
 version = "0.9.10"
 dependencies = [
  "cgka-conformance-simulator",
+ "fs-private",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

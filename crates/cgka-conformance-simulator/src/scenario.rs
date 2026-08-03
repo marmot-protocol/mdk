@@ -14,7 +14,7 @@ use crate::{
     SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
     SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
     compare_trace_expectations, compile_scenario, drive_subject_to_quiescence,
-    preflight_compiled_scenario, stable_action_id,
+    preflight_compiled_scenario,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,12 @@ impl ScenarioOutboundSelection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScenarioStep {
+    /// Execute one ordinary group-scoped action against a stable scenario
+    /// group label. The compiler lowers this wrapper before adapter execution.
+    InGroup {
+        group: String,
+        action: Box<ScenarioStep>,
+    },
     CreateGroup {
         creator: String,
         name: String,
@@ -216,6 +222,7 @@ pub enum ScenarioStep {
 
 impl ScenarioStep {
     pub const KINDS: &'static [&'static str] = &[
+        "in_group",
         "create_group",
         "invite_members",
         "remove_members",
@@ -277,6 +284,7 @@ impl ScenarioStep {
 
     pub fn kind(&self) -> &'static str {
         match self {
+            ScenarioStep::InGroup { action, .. } => action.kind(),
             ScenarioStep::CreateGroup { .. } => "create_group",
             ScenarioStep::InviteMembers { .. } => "invite_members",
             ScenarioStep::RemoveMembers { .. } => "remove_members",
@@ -354,6 +362,8 @@ pub struct ScenarioReport {
     #[serde(default)]
     pub expectation_failures: Vec<ExpectationFailure>,
     pub invariant_failures: Vec<InvariantFailure>,
+    #[serde(default)]
+    pub campaign_measurements: crate::CampaignMeasurementsV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +415,8 @@ pub struct ScenarioStepLogEntry {
     pub step_index: usize,
     pub step_type: String,
     pub status: ScenarioStepStatus,
+    #[serde(default)]
+    pub wall_us: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,9 +500,13 @@ pub async fn run_scenario_report_with_storage_mode(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, vec![], None, &mut subject).await
 }
 
@@ -514,9 +530,13 @@ pub async fn run_scenario_report_with_outcomes_and_storage_mode(
     expected_outcomes: Vec<TraceExpectation>,
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(spec, expected_trace, expected_outcomes, None, &mut subject).await
 }
 
@@ -530,9 +550,13 @@ pub async fn run_scenario_report_with_outcomes_and_capture(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
-    let mut subject =
-        EngineHarnessSubject::new(&spec.clients, ProtocolProfile::Legacy, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &spec.clients,
+        &spec.topology,
+        ProtocolProfile::Legacy,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     if capture_sensitive_replay && let Some(recipient_tick) = final_planned_recipient_tick(spec) {
         subject.capture_failure_replay_at_tick(recipient_tick);
     }
@@ -571,9 +595,13 @@ pub async fn run_vector_fixture_report_with_storage_mode(
     storage_mode: HarnessStorageMode,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     let protocol_profile = fixture_protocol_profile(fixture)?;
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &fixture.scenario.clients,
+        &fixture.scenario.topology,
+        protocol_profile,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),
@@ -597,9 +625,13 @@ pub async fn run_vector_fixture_report_with_capture(
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let protocol_profile = fixture_protocol_profile(fixture)?;
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &fixture.scenario.clients,
+        &fixture.scenario.topology,
+        protocol_profile,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     if capture_sensitive_replay
         && let Some(recipient_tick) = final_planned_recipient_tick(&fixture.scenario)
     {
@@ -673,11 +705,11 @@ struct ScenarioStepOutputs {
 async fn execute_scenario_step(
     spec: &ScenarioSpec,
     step_index: usize,
+    action_id: &str,
     step: &ScenarioStep,
     subject: &mut dyn ConvergenceSubject,
     outputs: &mut ScenarioStepOutputs,
 ) -> Result<(), ScenarioRunError> {
-    let action_id = scenario_input_id(step_index, step);
     let ScenarioStepOutputs {
         pending_resolutions,
         observations,
@@ -688,6 +720,9 @@ async fn execute_scenario_step(
         assertion_observations,
     } = outputs;
     match step {
+        ScenarioStep::InGroup { .. } => {
+            unreachable!("in_group is lowered by the Scenario IR compiler")
+        }
         ScenarioStep::CreateGroup {
             creator,
             name,
@@ -701,7 +736,7 @@ async fn execute_scenario_step(
                 .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
             subject
                 .create_group(SubjectCreateGroup {
-                    action_id: &action_id,
+                    action_id,
                     creator,
                     name,
                     invitees,
@@ -719,7 +754,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .invite_members(SubjectInviteMembers {
-                    action_id: &action_id,
+                    action_id,
                     inviter,
                     invitees,
                     pending,
@@ -734,7 +769,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .remove_members(SubjectRemoveMembers {
-                    action_id: &action_id,
+                    action_id,
                     remover,
                     members,
                     pending,
@@ -745,7 +780,7 @@ async fn execute_scenario_step(
         ScenarioStep::SelfUpdate { client, pending } => {
             subject
                 .self_update(SubjectSelfUpdate {
-                    action_id: &action_id,
+                    action_id,
                     client,
                     pending,
                 })
@@ -759,7 +794,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .update_group_data(SubjectUpdateGroupData {
-                    action_id: &action_id,
+                    action_id,
                     client,
                     name,
                     pending,
@@ -774,7 +809,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .update_admin_policy(SubjectUpdateAdminPolicy {
-                    action_id: Some(&action_id),
+                    action_id: Some(action_id),
                     client,
                     admins,
                     pending: Some(pending),
@@ -876,7 +911,7 @@ async fn execute_scenario_step(
         ScenarioStep::SendAppMessage { sender, payload } => {
             subject
                 .send_application(SubjectSendApplication {
-                    action_id: &action_id,
+                    action_id,
                     sender,
                     payload,
                 })
@@ -885,7 +920,7 @@ async fn execute_scenario_step(
         }
         ScenarioStep::Leave { client } => {
             subject
-                .leave(&action_id, client)
+                .leave(action_id, client)
                 .await
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
@@ -1159,17 +1194,49 @@ async fn run_scenario_report_inner(
     fixture: Option<VectorFixtureMetadata>,
     subject: &mut dyn ConvergenceSubject,
 ) -> Result<ScenarioReport, ScenarioRunError> {
+    let scenario_started = std::time::Instant::now();
     let descriptor = subject.descriptor();
     let compiled = compile_scenario(spec)?;
     preflight_compiled_scenario(&compiled, &descriptor)?;
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
+    let mut sampled_max_queue_depth = 0_usize;
 
     for action in &compiled.actions {
+        let step_started = std::time::Instant::now();
         let step_index = action.schedule.source_step_index;
         let step = &action.step;
-        let step_result =
-            execute_scenario_step(spec, step_index, step, subject, &mut outputs).await;
+        let step_result = if let Some(group) = action.scenario_group.as_deref() {
+            subject
+                .select_scenario_group(group, matches!(step, ScenarioStep::CreateGroup { .. }))
+                .map_err(|error| subject_step_error(step_index, error))
+        } else {
+            Ok(())
+        };
+        let step_result = match step_result {
+            Ok(()) => {
+                execute_scenario_step(
+                    spec,
+                    step_index,
+                    &action.schedule.action_id,
+                    step,
+                    subject,
+                    &mut outputs,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if descriptor.supports(crate::SubjectCapability::StructuralProgress)
+            && let Ok(progress) = subject.structural_progress()
+        {
+            sampled_max_queue_depth = sampled_max_queue_depth.max(
+                progress
+                    .transport_queued_messages
+                    .saturating_add(progress.transport_delayed_messages)
+                    .saturating_add(progress.transport_mailbox_messages),
+            );
+        }
         if let Err(error) = step_result {
             step_log.push(ScenarioStepLogEntry {
                 step_index,
@@ -1179,6 +1246,7 @@ async fn run_scenario_report_inner(
                     category: error.category,
                     message: error.message,
                 },
+                wall_us: elapsed_us(step_started.elapsed()),
             });
             break;
         }
@@ -1186,6 +1254,7 @@ async fn run_scenario_report_inner(
             step_index,
             step_type: step.kind().into(),
             status: ScenarioStepStatus::Completed,
+            wall_us: elapsed_us(step_started.elapsed()),
         });
     }
 
@@ -1267,7 +1336,10 @@ async fn run_scenario_report_inner(
         &quiescence_observations,
     );
 
-    Ok(ScenarioReport {
+    let database_bytes = subject.database_bytes();
+    let replay_probe_count = subject.replay_probe_count();
+    let engine_metrics = subject.engine_metrics();
+    let mut report = ScenarioReport {
         metadata: ScenarioReportMetadata {
             scenario_name: spec.name.clone(),
             spec_version: spec.spec_version.clone(),
@@ -1294,11 +1366,21 @@ async fn run_scenario_report_inner(
         app_invalidation_observations,
         expectation_failures,
         invariant_failures,
-    })
+        campaign_measurements: crate::CampaignMeasurementsV1::default(),
+    };
+    report.campaign_measurements = crate::CampaignMeasurementsV1::from_report(
+        &report,
+        elapsed_us(scenario_started.elapsed()),
+        database_bytes,
+        sampled_max_queue_depth,
+        replay_probe_count,
+        engine_metrics.as_ref(),
+    );
+    Ok(report)
 }
 
-fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
-    stable_action_id(step_index, step)
+fn elapsed_us(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Validate adapter support before the first scenario action is executed.
@@ -1357,7 +1439,7 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
     }
 }
 
-fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
+pub(crate) fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
     let message = error.to_string();
     ScenarioRunError {
         step_index: None,

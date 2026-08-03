@@ -22,6 +22,7 @@
 
 mod audit_capture;
 pub mod bus;
+mod campaign_metrics;
 pub mod client;
 mod decryptability;
 mod failure_capsule;
@@ -29,6 +30,8 @@ pub mod family;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
+#[cfg(feature = "test-policy-overrides")]
+mod policy_sweep;
 pub mod proptest_support;
 mod quiescence;
 mod reference_subject;
@@ -45,6 +48,10 @@ mod topology;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
+pub use campaign_metrics::{
+    CampaignHistogramBucketV1, CampaignHistogramV1, CampaignMeasurementsV1,
+    CampaignStepMeasurementV1,
+};
 pub use cgka_engine::conformance_snapshot::{
     ConformanceAppComponent, ConformanceCanonicalStateSnapshot, ConformanceConstantSnapshot,
     ConformanceDisbandedGroupSnapshot, ConformanceGroupSnapshot, ConformanceLeafCapabilities,
@@ -69,9 +76,11 @@ pub use failure_capsule::{
     write_failure_capsule,
 };
 pub use family::{
-    GeneratedScenarioCase, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report, run_generated_case_report_with_capture,
+    GeneratedScenarioCase, GeneratedSubjectKind, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_milestone3_adversarial_case,
+    generate_milestone3_adversarial_family, generate_milestone3_offline_regression,
+    generate_milestone3_self_update_regression, generate_milestone3_sustained_regression,
+    generate_send_leave_family, run_generated_case_report, run_generated_case_report_with_capture,
     run_generated_case_report_with_storage_mode,
 };
 pub use oracle::{
@@ -83,6 +92,10 @@ pub use oracle::{
 pub use pending_work::{
     ClientStructuralProgress, PendingWorkObservation, SubjectProgressSnapshot,
     SubjectTerminalBlocker,
+};
+#[cfg(feature = "test-policy-overrides")]
+pub use policy_sweep::{
+    PolicySweepConstantV1, PolicySweepCurveV1, PolicySweepPointV1, sweep_canonicalization_policy,
 };
 pub use quiescence::{
     QuiescenceObservation, QuiescenceOutboundPolicy, QuiescencePolicy, QuiescenceStatus,

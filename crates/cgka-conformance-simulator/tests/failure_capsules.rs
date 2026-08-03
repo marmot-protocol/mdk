@@ -273,6 +273,7 @@ async fn capsule_round_trip_records_schedule_policy_and_resources() {
                 category: cgka_conformance_simulator::SubjectFailureCategory::Resource,
                 message: "backend error at /tmp/first.sqlite".into(),
             },
+            wall_us: 0,
         });
     let mut second_failed_report = first_failed_report.clone();
     let cgka_conformance_simulator::ScenarioStepStatus::Failed { message, .. } =

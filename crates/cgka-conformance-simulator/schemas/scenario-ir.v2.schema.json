@@ -257,6 +257,44 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "group", "action"],
+          "properties": {
+            "type": { "const": "in_group" },
+            "group": { "type": "string", "minLength": 1 },
+            "action": {
+              "allOf": [
+                { "$ref": "#/$defs/step" },
+                {
+                  "type": "object",
+                  "required": ["type"],
+                  "properties": {
+                    "type": {
+                      "enum": [
+                        "create_group",
+                        "invite_members",
+                        "remove_members",
+                        "self_update",
+                        "update_group_data",
+                        "update_admin_policy",
+                        "expect_update_admin_policy_error",
+                        "send_app_message",
+                        "leave",
+                        "probe_bidirectional_decryptability",
+                        "observe_admin_policy",
+                        "observe",
+                        "observe_exact",
+                        "clear_events"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "creator", "name", "invitees", "pending"],
           "properties": {
             "type": { "const": "create_group" },

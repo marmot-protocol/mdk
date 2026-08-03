@@ -72,7 +72,7 @@ pub fn compare_trace_expectations(
 ) -> Vec<ExpectationFailure> {
     let mut failures = Vec::new();
     if let Some(expected) = expected_trace
-        && expected != observed
+        && !fixture_trace_eq(expected, observed)
     {
         failures.push(ExpectationFailure {
             kind: "trace_mismatch".into(),
@@ -136,6 +136,13 @@ pub enum TraceExpectation {
     /// `ScenarioInputLedger`.
     ClientsExactlyEquivalent {
         clients: Vec<String>,
+    },
+    /// Require a named set of clients to remain on observably different
+    /// canonical states. This is used for explicitly characterized protocol
+    /// limits where automatic repair is not claimed.
+    ClientsNotEquivalent {
+        clients: Vec<String>,
+        reason: String,
     },
     /// Require the complete per-client commit/proposal/application input ledger.
     ScenarioInputLedger {
@@ -437,11 +444,57 @@ impl TraceExpectation {
                     });
                 }
             }
+            TraceExpectation::ClientsNotEquivalent { clients, reason } => {
+                let mut snapshots = Vec::with_capacity(clients.len());
+                for client in clients {
+                    let Some(observation) = client_canonical_observation(observed, client) else {
+                        missing_client(client, self, mismatches);
+                        return;
+                    };
+                    snapshots.push((
+                        client,
+                        observation
+                            .canonical_state
+                            .as_ref()
+                            .expect("canonical observation carries canonical state"),
+                    ));
+                }
+                if snapshots.len() < 2 {
+                    mismatches.push(ExpectationFailure {
+                        kind: "insufficient_non_equivalence_clients".into(),
+                        message: "clients_not_equivalent must name at least two clients".into(),
+                        expected: json!(self),
+                        actual: json!(snapshots),
+                    });
+                    return;
+                }
+                let duplicate_pair = snapshots.iter().enumerate().find_map(|(left, item)| {
+                    snapshots[(left + 1)..]
+                        .iter()
+                        .find(|other| item.1 == other.1)
+                        .map(|other| (item.0, other.0))
+                });
+                if let Some((left, right)) = duplicate_pair {
+                    mismatches.push(ExpectationFailure {
+                        kind: "clients_unexpectedly_equivalent".into(),
+                        message: format!(
+                            "clients {left} and {right} were equivalent despite named pairwise non-equivalence: {reason}"
+                        ),
+                        expected: json!({
+                            "clients": clients,
+                            "reason": reason,
+                            "equivalent": false,
+                        }),
+                        actual: json!(snapshots),
+                    });
+                }
+            }
             TraceExpectation::ScenarioInputLedger { client, entries } => {
                 match client_canonical_observation(observed, client)
                     .or_else(|| client_observation(observed, client))
                 {
-                    Some(observation) if &observation.scenario_input_ledger == entries => {}
+                    Some(observation)
+                        if fixture_ledger_eq(&observation.scenario_input_ledger, entries) => {}
                     Some(observation) => mismatches.push(ExpectationFailure {
                         kind: "scenario_input_ledger_mismatch".into(),
                         message: format!(
@@ -630,6 +683,46 @@ impl TraceExpectation {
                     observed,
                     mismatches,
                 );
+            }
+        }
+    }
+}
+
+fn fixture_trace_eq(expected: &ScenarioTrace, observed: &ScenarioTrace) -> bool {
+    let mut expected = expected.clone();
+    let mut observed = observed.clone();
+    clear_wall_clock_ledger_measurements(&mut expected);
+    clear_wall_clock_ledger_measurements(&mut observed);
+    expected == observed
+}
+
+fn fixture_ledger_eq(
+    expected: &[ScenarioInputLedgerEntry],
+    observed: &[ScenarioInputLedgerEntry],
+) -> bool {
+    let normalize = |entries: &[ScenarioInputLedgerEntry]| {
+        entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.blocked_send_duration_us = 0;
+                entry
+            })
+            .collect::<Vec<_>>()
+    };
+    normalize(expected) == normalize(observed)
+}
+
+fn clear_wall_clock_ledger_measurements(trace: &mut ScenarioTrace) {
+    for observation in &mut trace.observations {
+        for entry in &mut observation.scenario_input_ledger {
+            entry.blocked_send_duration_us = 0;
+        }
+    }
+    for observation in &mut trace.decryptability_probes {
+        for probe in &mut observation.probes {
+            if let Some(entry) = &mut probe.recipient_ledger {
+                entry.blocked_send_duration_us = 0;
             }
         }
     }
@@ -1405,6 +1498,29 @@ mod tests {
     }
 
     #[test]
+    fn fixture_comparison_ignores_wall_clock_blocked_send_measurements() {
+        let mut expected = observation("alice", 1, 2);
+        expected.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-4:send_app_message".into(),
+            blocked_send_duration_us: 1,
+            ..Default::default()
+        }];
+        let mut observed = expected.clone();
+        observed.scenario_input_ledger[0].blocked_send_duration_us = 42_000;
+
+        let failures = compare_trace_expectations(
+            Some(&trace(vec![expected.clone()])),
+            &[TraceExpectation::ScenarioInputLedger {
+                client: "alice".into(),
+                entries: expected.scenario_input_ledger,
+            }],
+            &trace(vec![observed]),
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
     fn no_pending_work_requires_an_empty_exact_progress_snapshot() {
         let mut alice = observation("alice", 1, 2);
         alice.pending_work = Some(PendingWorkObservation::default());
@@ -1625,6 +1741,39 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn non_equivalence_requires_every_named_pair_to_differ() {
+        let shared = exact_snapshot("shared-id", "shared-commitment");
+        let mut alice = observation("alice", 7, 1);
+        alice.canonical_state = Some(shared.clone());
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(shared);
+        let mut carol = observation("carol", 7, 1);
+        carol.canonical_state = Some(exact_snapshot("carol-id", "carol-commitment"));
+        let expectation = TraceExpectation::ClientsNotEquivalent {
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            reason: "named split".into(),
+        };
+
+        let failures = compare_trace_expectations(
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![alice.clone(), bob, carol.clone()]),
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "clients_unexpectedly_equivalent");
+
+        alice.canonical_state = Some(exact_snapshot("alice-id", "alice-commitment"));
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(exact_snapshot("bob-id", "bob-commitment"));
+        let failures =
+            compare_trace_expectations(None, &[expectation], &trace(vec![alice, bob, carol]));
+        assert!(
+            failures.is_empty(),
+            "all three snapshots differ: {failures:#?}"
+        );
     }
 
     #[test]

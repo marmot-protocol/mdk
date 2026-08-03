@@ -204,7 +204,10 @@ impl<S: StorageProvider> Engine<S> {
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let now = self.convergence_now();
-        let pass = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?;
+        let (pass, opened) = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?;
+        if opened {
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
+        }
         Ok(match pass {
             Some(pass) if pass.phase == ConvergencePassPhase::Collecting => {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
@@ -433,17 +436,20 @@ impl<S: StorageProvider> Engine<S> {
         // The retained row and its pass membership are one durability
         // boundary. A crash may leave an unassigned row only when admission is
         // intentionally blocked by an unstable local mutation owner.
-        let admission = self.storage.with_transaction(|storage| {
+        let (admission, opened) = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
-            let admission =
+            let (admission, opened) =
                 self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
                 let mut group = storage.get_group(group_id)?;
                 group.unrecoverable = true;
                 storage.put_group(&group)?;
             }
-            Ok::<ConvergenceAdmissionOutcome, OpenMlsProjectionError>(admission)
+            Ok::<(ConvergenceAdmissionOutcome, bool), OpenMlsProjectionError>((admission, opened))
         })?;
+        if opened {
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
+        }
         if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
             let epoch = self
                 .storage
@@ -460,30 +466,30 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message_id: &MessageId,
         now: ConvergenceTime,
-    ) -> Result<ConvergenceAdmissionOutcome, OpenMlsProjectionError> {
+    ) -> Result<(ConvergenceAdmissionOutcome, bool), OpenMlsProjectionError> {
         let epoch_state = self.epoch_manager.state(group_id);
         let admission_allowed = matches!(epoch_state, Some(EpochState::Stable { .. }))
             || cfg!(feature = "test-policy-overrides") && epoch_state.is_none();
         if !admission_allowed {
             // PendingPublish/Merging retain the row but do not admit it. The
             // first stable scheduler run opens a pass and seeds retained work.
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+            return Ok((ConvergenceAdmissionOutcome::Retained, false));
         }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
-        let Some(mut pass) = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?
-        else {
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+        let (pass, opened) = self.load_or_open_convergence_pass(group_id, tip, &policy, now)?;
+        let Some(mut pass) = pass else {
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         };
         if pass.phase != ConvergencePassPhase::Collecting {
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         if pass
             .members
             .iter()
             .any(|member| &member.message_id == message_id)
         {
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         if now.monotonic_ms >= pass.cutoff_monotonic_ms() {
             self.freeze_collecting_convergence_pass(&mut pass, now)?;
@@ -499,11 +505,11 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_convergence_pass(&pass)
                 .map_err(storage_projection_error)?;
-            return Ok(outcome);
+            return Ok((outcome, opened));
         }
 
         let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         };
         let floor = pass
             .base_epoch
@@ -516,7 +522,7 @@ impl<S: StorageProvider> Engine<S> {
         if candidate.input.source_epoch < floor || candidate.input.source_epoch > ceiling {
             // Retain out-of-horizon input for a later base epoch, but never let
             // it enter (or enlarge) the immutable batch for this pass.
-            return Ok(ConvergenceAdmissionOutcome::Retained);
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         let admitted_input = candidate.input;
         pass.members.push(candidate.member);
@@ -535,7 +541,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_pass(&pass)
             .map_err(storage_projection_error)?;
-        Ok(ConvergenceAdmissionOutcome::Admitted)
+        Ok((ConvergenceAdmissionOutcome::Admitted, opened))
     }
 
     fn freeze_collecting_convergence_pass(
@@ -615,7 +621,7 @@ impl<S: StorageProvider> Engine<S> {
         base_epoch: EpochId,
         policy: &CanonicalizationPolicy,
         now: ConvergenceTime,
-    ) -> Result<Option<DurableConvergencePass>, OpenMlsProjectionError> {
+    ) -> Result<(Option<DurableConvergencePass>, bool), OpenMlsProjectionError> {
         let previous = self
             .storage
             .convergence_pass(group_id)
@@ -637,7 +643,7 @@ impl<S: StorageProvider> Engine<S> {
                 .iter()
                 .any(|record| crate::message_processor::is_admin_group_state_intent(&record.intent))
             {
-                return Ok(Some(pass.clone()));
+                return Ok((Some(pass.clone()), false));
             }
             let mut consumed = pass.clone();
             consumed.fairness_slot_available = false;
@@ -664,19 +670,19 @@ impl<S: StorageProvider> Engine<S> {
                     .put_convergence_pass(&pass)
                     .map_err(storage_projection_error)?;
             }
-            return Ok(Some(pass));
+            return Ok((Some(pass), false));
         }
 
         let epoch_state = self.epoch_manager.state(group_id);
         let admission_allowed = matches!(epoch_state, Some(EpochState::Stable { .. }))
             || cfg!(feature = "test-policy-overrides") && epoch_state.is_none();
         if !admission_allowed {
-            return Ok(None);
+            return Ok((None, false));
         }
         let (members, has_trigger) =
             self.seed_convergence_pass_members(group_id, base_epoch, policy)?;
         if members.is_empty() || !has_trigger {
-            return Ok(None);
+            return Ok((None, false));
         }
         let generation = previous
             .as_ref()
@@ -706,7 +712,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_pass(&pass)
             .map_err(storage_projection_error)?;
-        Ok(Some(pass))
+        Ok((Some(pass), true))
     }
 
     fn seed_convergence_pass_members(
@@ -1026,9 +1032,12 @@ impl<S: StorageProvider> Engine<S> {
         let previous_name = previous_group.name.clone();
         let previous_tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
-        let Some(mut pass) =
-            self.load_or_open_convergence_pass(group_id, previous_tip, &policy, now)?
-        else {
+        let (pass, opened) =
+            self.load_or_open_convergence_pass(group_id, previous_tip, &policy, now)?;
+        if opened {
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
+        }
+        let Some(mut pass) = pass else {
             // Preserve the observable no-op convergence run used by diagnostics
             // and manual repair tooling. With no eligible input there is no
             // mutable candidate set to freeze.
@@ -1086,6 +1095,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(unrecoverable_result(previous_tip.0));
                 }
             }
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-frozen-durable");
             just_frozen = true;
         }
         if !just_frozen
@@ -1110,6 +1120,7 @@ impl<S: StorageProvider> Engine<S> {
             self.storage
                 .put_convergence_pass(&pass)
                 .map_err(storage_projection_error)?;
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-resolving-durable");
         }
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
@@ -1164,9 +1175,35 @@ impl<S: StorageProvider> Engine<S> {
             StoredCanonicalizationOptions {
                 replay_profile: replay_profile_policy,
                 admitted_message_ids: Some(&admitted_message_ids),
+                admit_app_witnesses: {
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        self.admit_app_witnesses
+                    }
+                    #[cfg(not(feature = "test-policy-overrides"))]
+                    {
+                        true
+                    }
+                },
+                replay_probe_budget_override: {
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        self.replay_probe_budget_override
+                    }
+                    #[cfg(not(feature = "test-policy-overrides"))]
+                    {
+                        None
+                    }
+                },
             },
         )?;
         let mut result = result;
+        #[cfg(feature = "test-conformance-snapshot")]
+        {
+            self.conformance_replay_probe_count = self
+                .conformance_replay_probe_count
+                .saturating_add(result.replay_probe_count);
+        }
         let evaluated_status = result.convergence_status;
         // Missing dependencies stay retained for the next generation. Once a
         // pass is frozen, later arrivals cannot extend or alter this batch.
@@ -1302,6 +1339,7 @@ impl<S: StorageProvider> Engine<S> {
             storage.put_convergence_pass(&completed_pass)?;
             Ok::<_, OpenMlsProjectionError>(observations)
         })?;
+        crate::test_crash_hooks::pause_if_requested("convergence-pass-completed-durable");
         // Diagnostic only: settling-latency telemetry for the remediation
         // plan — pass open → apply, and the gap since the previous completed
         // generation. Never feeds convergence or branch selection.
@@ -1992,6 +2030,8 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }
@@ -2017,6 +2057,8 @@ fn waiting_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }
@@ -2049,6 +2091,8 @@ fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
         selection_trace: None,
     }
 }

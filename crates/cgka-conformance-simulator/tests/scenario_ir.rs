@@ -3,10 +3,49 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    ScenarioAssertionV2, ScenarioComparison, ScenarioMessageSelectorV2, ScenarioPredicateV2,
-    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTransportClass,
+    HarnessStorageMode, ScenarioAccountV2, ScenarioAssertionV2, ScenarioComparison,
+    ScenarioDeviceV2, ScenarioMessageSelectorV2, ScenarioPredicateV2, ScenarioProcessV2,
+    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTopologyV2, ScenarioTransportClass,
     SubjectOutboundOutcome, VectorFixture, compile_scenario, run_scenario_report,
+    run_vector_fixture_report_with_capture,
 };
+
+fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
+    let mut accounts = entries
+        .iter()
+        .map(|(_, account)| *account)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|account| ScenarioAccountV2 {
+            id: account.into(),
+            roles: vec!["member".into()],
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|a, b| a.id.cmp(&b.id));
+    ScenarioTopologyV2 {
+        accounts,
+        devices: entries
+            .iter()
+            .map(|(client, account)| ScenarioDeviceV2 {
+                id: format!("device:{client}"),
+                account: (*account).into(),
+                process: format!("process:{client}"),
+                client: (*client).into(),
+            })
+            .collect(),
+        processes: entries
+            .iter()
+            .map(|(client, _)| ScenarioProcessV2 {
+                id: format!("process:{client}"),
+                binary_version: "mdk-test".into(),
+                policy_version: "marmot-convergence-v1".into(),
+                relays: vec![],
+            })
+            .collect(),
+        groups: vec![],
+        relays: vec![],
+    }
+}
 
 #[test]
 fn schema_declares_every_executable_step_kind() {
@@ -55,6 +94,227 @@ fn authoring_schema_references_resolve_against_the_ir_schema_id() {
             );
         }
     }
+}
+
+#[test]
+fn nested_and_non_group_actions_fail_ir_preflight() {
+    let base = ScenarioSpec {
+        name: "scenario-ir/invalid-group-wrapper".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![],
+    };
+    let mut nested = base.clone();
+    nested.steps.push(ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(ScenarioStep::InGroup {
+            group: "blue".into(),
+            action: Box::new(ScenarioStep::ClearEvents {
+                clients: vec!["alice".into()],
+            }),
+        }),
+    });
+    assert!(
+        compile_scenario(&nested)
+            .expect_err("nested wrapper fails")
+            .message
+            .contains("nested")
+    );
+
+    let mut nongroup = base;
+    nongroup.steps.push(ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(ScenarioStep::DeliverAll),
+    });
+    assert!(
+        compile_scenario(&nongroup)
+            .expect_err("transport action is not group scoped")
+            .message
+            .contains("not a group-scoped action")
+    );
+}
+
+#[tokio::test]
+async fn typoed_group_label_fails_closed_at_execution() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/unknown-group".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "red".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "red-create".into(),
+                }),
+            },
+            ScenarioStep::InGroup {
+                group: "reed".into(),
+                action: Box::new(ScenarioStep::Observe {
+                    clients: vec!["alice".into()],
+                }),
+            },
+        ],
+    };
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("execution failures are reported structurally");
+    assert!(report.step_log.iter().any(|step| matches!(
+        &step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. }
+            if kind == "unknown_scenario_group"
+    )));
+}
+
+#[tokio::test]
+async fn wrapped_action_id_is_used_by_fault_selectors_and_the_runtime_ledger() {
+    let in_group = |action| ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(action),
+    };
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/wrapped-action-id".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "red".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            }),
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "held".into(),
+            }),
+            ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    action_id: Some("step-4:send_app_message@red".into()),
+                    class: Some(ScenarioTransportClass::Application),
+                    ..Default::default()
+                },
+                label: "held-red-app".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::Observe {
+                clients: vec!["bob".into()],
+            }),
+            ScenarioStep::ReleaseWithheld {
+                label: "held-red-app".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::ObserveExact {
+                clients: vec!["bob".into()],
+            }),
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("wrapped action scenario runs");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert!(observations[0].received_payloads.is_empty());
+    assert_eq!(observations[1].received_payloads, vec!["held"]);
+    assert!(observations[1].scenario_input_ledger.iter().any(|entry| {
+        entry.scenario_id == "step-4:send_app_message@red" && entry.delivered == 1
+    }));
+}
+
+#[test]
+fn grouped_scenarios_reject_unwrapped_group_scoped_actions() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/ambiguous-unwrapped-group-action".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "red".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                }),
+            },
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "ambiguous".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "ambiguous".into(),
+            },
+        ],
+    };
+
+    let error = compile_scenario(&scenario).expect_err("ambiguous action must fail preflight");
+    assert_eq!(error.step_index, Some(1));
+    assert!(error.message.contains("must use in_group"));
+}
+
+#[tokio::test]
+async fn grouped_observe_of_non_member_is_a_structured_failure() {
+    let in_group = |action| ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(action),
+    };
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/non-member-observe".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "red".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            }),
+            in_group(ScenarioStep::ObserveExact {
+                clients: vec!["bob".into()],
+            }),
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("subject failures are reported structurally");
+    assert!(report.step_log.iter().any(|step| matches!(
+        &step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. }
+            if kind == "client_not_in_scenario_group"
+    )));
 }
 
 fn collect_external_refs<'a>(value: &'a serde_json::Value, refs: &mut Vec<&'a str>) {
@@ -379,4 +639,215 @@ fn collect_vector_paths(directory: &Path, paths: &mut Vec<PathBuf>) {
             paths.push(path);
         }
     }
+}
+
+#[tokio::test]
+async fn explicit_group_targets_keep_two_live_groups_independent() {
+    fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
+        ScenarioStep::InGroup {
+            group: group.into(),
+            action: Box::new(action),
+        }
+    }
+    fn create(group: &str) -> ScenarioStep {
+        in_group(
+            group,
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: group.into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: format!("{group}-create"),
+            },
+        )
+    }
+    fn accept(publication: &str) -> ScenarioStep {
+        ScenarioStep::AcknowledgeOutbound {
+            client: "alice".into(),
+            publication: Some(publication.into()),
+            selection: Default::default(),
+            outcome: SubjectOutboundOutcome::Accepted,
+        }
+    }
+
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/two-independent-groups".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            create("red"),
+            accept("red-create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            create("blue"),
+            accept("blue-create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "red",
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "red-only".into(),
+                },
+            ),
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "red",
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ),
+            in_group(
+                "blue",
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "blue-only".into(),
+                },
+            ),
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(
+                "blue",
+                ScenarioStep::Observe {
+                    clients: vec!["bob".into()],
+                },
+            ),
+        ],
+    };
+
+    let compiled = compile_scenario(&scenario).expect("compile multi-group scenario");
+    assert_eq!(compiled.actions[0].scenario_group.as_deref(), Some("red"));
+    assert_eq!(compiled.actions[4].scenario_group.as_deref(), Some("blue"));
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("run multi-group scenario");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].received_payloads, vec!["red-only"]);
+    assert_eq!(observations[1].received_payloads, vec!["blue-only"]);
+    assert_eq!(observations[0].epoch, 1);
+    assert_eq!(observations[1].epoch, 1);
+}
+
+#[test]
+fn incompatible_explicit_policy_versions_fail_before_action_zero() {
+    let mut topology = topology_for_accounts(&[("alice", "account:alice"), ("bob", "account:bob")]);
+    topology.processes[1].policy_version = "marmot-convergence-v2".into();
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/incompatible-policies".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology,
+        steps: vec![],
+    };
+
+    let error = compile_scenario(&scenario).expect_err("mixed policies must not execute");
+    assert_eq!(error.kind, "incompatible_convergence_policy");
+    assert!(error.message.contains("incompatible convergence policies"));
+    assert!(error.message.contains("marmot-convergence-v1"));
+    assert!(error.message.contains("marmot-convergence-v2"));
+}
+
+#[tokio::test]
+async fn topology_can_join_two_device_leaves_for_one_account() {
+    let clients = vec!["alice-phone".into(), "alice-laptop".into(), "bob".into()];
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/shared-account-devices".into(),
+        spec_version: "2".into(),
+        topology: topology_for_accounts(&[
+            ("alice-phone", "account:alice"),
+            ("alice-laptop", "account:alice"),
+            ("bob", "account:bob"),
+        ]),
+        clients: clients.clone(),
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice-phone".into(),
+                name: "multi-device".into(),
+                invitees: vec!["alice-laptop".into(), "bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice-phone".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::accept_publication("alice-phone", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice-laptop".into(), "bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: clients.clone(),
+            },
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("shared-account device scenario");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.epoch == 1)
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.member_count == 3)
+    );
+    assert!(report.expectation_failures.is_empty());
+
+    let fixture = VectorFixture {
+        scenario_name: scenario.name.clone(),
+        vector_version: "1".into(),
+        conformance_version: env!("CARGO_PKG_VERSION").into(),
+        seed: None,
+        application_profile: None,
+        scenario,
+        expected_trace: None,
+        expected_outcomes: vec![],
+    };
+    let (captured_report, _) =
+        run_vector_fixture_report_with_capture(&fixture, HarnessStorageMode::InMemorySqlite, false)
+            .await
+            .expect("capture runner preserves explicit topology");
+    let captured_state = captured_report
+        .observed_trace
+        .as_ref()
+        .and_then(|trace| trace.observations.first())
+        .and_then(|observation| observation.canonical_state.as_ref())
+        .map(|state| serde_json::to_value(state).expect("canonical state serializes"))
+        .expect("capture runner observes exact state");
+    let identities = captured_state
+        .pointer("/snapshot/sorted_member_identities_hex")
+        .and_then(serde_json::Value::as_array)
+        .expect("live snapshot carries sorted identities");
+    assert_eq!(identities.len(), 3);
+    assert!(
+        identities.windows(2).any(|pair| pair[0] == pair[1]),
+        "capture runner must preserve the shared account identity of both devices"
+    );
 }
