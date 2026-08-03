@@ -1,6 +1,6 @@
 # wn-opencode
 
-`wn-opencode` is the first terminal-harness backend for Marmot. It runs
+`wn-opencode` is a terminal-harness backend for Marmot. It runs
 [OpenCode](https://opencode.ai/) through the local `wn-agent` connector and
 sends every message from an allowed sender to `opencode run --format json`.
 

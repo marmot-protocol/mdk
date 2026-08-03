@@ -10,6 +10,13 @@ profile onboarding, live previews, MLS, or relay logic.
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-pi`, checksums, and a
 same-user service installer for Linux and macOS:
 
+Prerequisites:
+
+- Pi installed, authenticated, and runnable on `PATH`, or an executable path
+  set with `WN_PI_BIN` / `--pi-bin`
+- White Noise phone app pointed at the same public relay set
+- Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+
 ```sh
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | bash
 ```
@@ -23,6 +30,18 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-la
 
 The default install uses its own `~/.marmot-agents/pi` identity and services,
 so it does not share prompts or replies with an installed OpenCode harness.
+It installs `wn-agent` and `wn-pi` in `~/.local/bin`, writes a private
+`~/.marmot-agents/pi/dev/wn-pi.env`, and starts `wn-agent-pi` and `wn-pi`
+same-user services where supported.
+
+Use a versioned `wn-agent-v<version>` release URL for a pinned install. Report
+all installed versions when filing a connector bug:
+
+```sh
+wn-agent --version
+wn-pi --version
+pi --version
+```
 
 ## Manual setup
 
@@ -73,10 +92,41 @@ Pi's global credentials, model, tools, extensions, settings, and normal
 noninteractive project-trust policy remain authoritative. Prompts are written
 to Pi over stdin; only completed assistant text is returned to Marmot.
 
+The optional bearer token grants the complete `wn-agent` control API for every
+account in its home; the sender allowlist does not narrow that authority. Use a
+separate connector home, socket, token, and account for a separate trust
+boundary.
+
+## Security Notes
+
+- The same configured sender list controls prompt execution and is mirrored
+  additively into the `wn-agent` welcomer allowlist. To revoke access, remove the
+  sender from `WN_PI_ALLOWED_SENDERS_HEX`, restart `wn-pi`, and remove it from
+  `wn-agent` separately if invite acceptance must also be revoked.
+- Prompts are passed to Pi over stdin rather than process arguments.
+- Only completed assistant text is returned. Thinking, tool calls, tool output,
+  and other Pi event types are not sent to Marmot.
+- Logs exclude identifiers, paths, prompts, Pi output, relay URLs, pubkeys,
+  ciphertext, plaintext, and key material.
+- Connector state and Pi session directories are created with owner-only
+  permissions.
+
 ## Development
 
 ```sh
 cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
+just pi-dev-e2e-connector
+just pi-installer-test
 cargo run -p wn-pi
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
 ```
+
+The real Pi `0.79.6` contract test is ignored by default because it requires an
+installed, authenticated Pi and makes a model request:
+
+```sh
+cargo test -p wn-pi real_pi_0_79_6_contract -- --ignored --nocapture
+```
+
+The crate is a workspace member at `integrations/pi/marmot`.

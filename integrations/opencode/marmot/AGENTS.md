@@ -1,7 +1,7 @@
 # AGENTS.md - integrations/opencode/marmot
 
 Rust opencode harness for Marmot through the local `wn-agent` control socket.
-Read `README.md` first.
+Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` first.
 
 ## Scope
 
@@ -19,18 +19,17 @@ Read `README.md` first.
 ## Key Files
 
 - `src/main.rs` - binary entrypoint, CLI help, tracing setup.
-- `src/bridge.rs` - startup, inbound subscription/reconnect, allowlist mirroring, per-group queueing, durable replies.
-- `src/control.rs` - agent-control request/response client and inbound subscription stream.
 - `src/opencode.rs` - `opencode run --format json` process execution and event parsing.
-- `src/chunking.rs` - UTF-8 byte-budgeted reply chunking.
-- `src/store.rs` - private session mapping persistence.
-- `src/config.rs` - environment configuration.
-- `scripts/install-opencode-marmot.sh` - release installer.
+- `src/config.rs` - OpenCode-specific environment configuration and shared runtime wiring.
+- `tests/e2e_connector.rs` - ignored process-level test using real `wn-agent` and a fake OpenCode executable.
+- `tests/test_installer.sh` - OpenCode entrypoint for the shared terminal-harness installer test suite.
+- `scripts/install-opencode-marmot.sh` - release-installer wrapper over the shared terminal-harness installer.
 
 ## Rules
 
 - Do not add gateway behaviors here unless the product direction changes; Hermes/OpenClaw own gateway integrations.
-- Keep request/response validation strict: protocol tag, response id, response type, and non-empty `FinalSent` ids.
+- Keep shared control, queueing, chunking, workdir, session-map, and process lifecycle behavior in
+  `integrations/terminal-harness`; keep only OpenCode command/event behavior here.
 - Keep state files restrictive-by-construction through `fs-private` or an equivalent mode-tested path.
 - Keep opencode prompts after a `--` delimiter so prompt text cannot be parsed as `opencode run` flags.
 
@@ -40,6 +39,7 @@ Read `README.md` first.
 cargo test -p wn-opencode
 cargo fmt --check -p wn-opencode
 cargo clippy -p wn-opencode --all-targets -- -D warnings
-bash -n scripts/install-opencode-marmot.sh
-integrations/opencode/marmot/tests/test_installer.sh
+bash -n scripts/install-opencode-marmot.sh scripts/install-terminal-harness-marmot.sh
+just opencode-dev-e2e-connector
+just opencode-installer-test
 ```

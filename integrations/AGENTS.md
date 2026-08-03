@@ -27,7 +27,7 @@ deletes, invite policy, and local storage.
 - Treat `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN_FILE`,
   `MARMOT_AGENT_AUTH_TOKEN`, and `MARMOT_ACCOUNT_ID_HEX` as the common connector
   vocabulary. Use integration-specific prefixes only for integration-specific
-  behavior, for example `WN_OPENCODE_*`.
+  behavior, for example `WN_OPENCODE_*` and `WN_PI_*`.
 - Prefer explicit account ids in production configuration. Auto-select only the
   sole local-signing account; fail closed when multiple local-signing accounts
   are available.
@@ -120,9 +120,11 @@ Installer expectations:
 The default Hermes, OpenClaw, and terminal-harness service names are
 connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`,
-`wn-agent-harnesses.service`, `org.marmot.wn-agent.hermes`,
-`org.marmot.wn-agent.openclaw`, and `org.marmot.wn-agent.harnesses`). If you
-add a new production installer, choose names that can coexist with the existing
+`wn-agent-harnesses.service`, `wn-agent-pi.service`,
+`org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
+`org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
+are also connector-specific (`wn-opencode` and `wn-pi`). If you add a new
+production installer, choose names that can coexist with the existing
 integrations on the same login.
 
 ## Tests And Validation
@@ -164,5 +166,5 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, and OpenCode before landing
+- document coexistence with Hermes, OpenClaw, OpenCode, and Pi before landing
   production install support.
