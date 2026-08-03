@@ -82,9 +82,12 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 - queue emptiness does not prove all client, pass, publication, retry, deferred, or projection work is quiescent;
 - generated storms are structural tests rather than sustained rate/volume campaigns;
 - scenario seeds do not reproduce randomized MLS bytes;
-- the initial independent reference adapter covers common symbolic lifecycle behavior, but not the complete production
-  selector, persistence, or liveness state space;
-- Tamarin abstracts clocks, crash/restart, durable generations, resource bounds, fairness, and sustained self-updates.
+- the independent selector/canonicalization model covers bounded authenticated input, dependency, witness, selection,
+  and disposition behavior, while production persistence remains exercised by engine and retained-relay subjects;
+- TLA+/TLC and Stateright now cover a bounded lifecycle/fairness state space, while real process/VM scheduling and
+  production app-runtime lifecycle behavior remain future milestones;
+- Tamarin remains focused on symbolic safety/security and executable bounded policy cases rather than wall-clock or
+  process scheduling.
 
 ## Program Principles
 
@@ -121,7 +124,7 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 | 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | complete | Known semantic mutations fail and captured failures replay |
 | 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | complete | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | complete | Headline workload families produce bounded, diagnosable results |
-| 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | not-started | Model and tests detect seeded policy/lifecycle defects |
+| 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | complete | Model and tests detect seeded policy/lifecycle defects |
 | 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | not-started | The same case agrees in-process and across N processes |
 | 6. Distributed campaigns | Container/VM/network/disk/version hardening and campaign operations | not-started | Repeatable soak and release campaigns retain actionable artifacts |
 
@@ -136,12 +139,12 @@ The initial assurance matrix is below. “Required verification” names the min
 
 | ID | Claim | Required assumptions | Required verification | Status |
 | --- | --- | --- | --- | --- |
-| S1 | Same retained anchor, authenticated input closure, policy version, and engine version produce the same canonical branch and exact state | Finite relevant input set; every compared client possesses the same validated dependency closure | Independent reference comparison; schedule/restart metamorphic tests; bounded model | specified |
+| S1 | Same retained anchor, authenticated input closure, policy version, and engine version produce the same canonical branch and exact state | Finite relevant input set; every compared client possesses the same validated dependency closure | Independent reference comparison; schedule/restart metamorphic tests; bounded model | partially-covered |
 | S2 | Application output after settlement is exactly the payload/state-change projection of the selected branch | MLS and Marmot payload authentication succeeds; invalidations reach projection | Exact scenario-input/output ledger; losing-branch and superseded-state scenarios; Tamarin output lemmas | partially-covered |
 | S3 | Missing retained state, invalid policy, corrupt frozen input, and exhausted replay budget never apply a partial candidate result | Storage reports failures accurately; fail-closed errors are durable or retryable by contract | Engine tests, crash matrix, resource campaigns, seeded mutations | partially-covered |
 | S4 | Publish-before-apply and convergence lifecycle changes are torn-write-free | Storage transaction contract holds; external publication results are accurately reported | Storage/engine lifecycle tests; kill/restart at each durable transition | partially-covered |
-| S5 | For one retained authenticated input set and fixed horizon eligibility, changing delivery partitioning across convergence passes or scheduler timing does not change the eventual canonical result | All pending passes are eventually revisited; required retained state remains available; no compared run crosses a semantic retention/eligibility boundary | Controlled pass-partition and virtual-time metamorphic tests; separately classified horizon-assumption violations | unverified |
-| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named durable fail-closed/non-progress state with an explicit repair path | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios; repair-path tests | unverified |
+| S5 | For one retained authenticated input set and fixed horizon eligibility, changing delivery partitioning across convergence passes or scheduler timing does not change the eventual canonical result | All pending passes are eventually revisited; required retained state remains available; no compared run crosses a semantic retention/eligibility boundary | Controlled pass-partition and virtual-time metamorphic tests; separately classified horizon-assumption violations | partially-covered |
+| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named durable fail-closed/non-progress state with an explicit repair path | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios; repair-path tests | partially-covered |
 | L2 | Outbound work blocked by convergence is eventually released, regenerated, or terminated with an explicit outcome | L1 assumptions; publication path eventually returns a result | Scheduler/outbound ledger assertions; crash/restart scenarios | partially-covered |
 | L3 | Marmot does not guarantee that a privileged administrative transition becomes canonical while valid selection-relevant input, including ordinary self-updates, continues without bound | The bounded post-settlement preparation opportunity remains enforced; stronger progress requires eventual relevant-input closure | Adversarial model and sustained simulator family; bounded preparation-opportunity tests | specified |
 | S6 | Clients are exactly equivalent only when the canonical conformance projection, including its domain-separated exporter commitment, matches | Synthetic/local conformance execution; raw exporter secret never leaves the test process | M1.1 exact snapshot comparison; mismatched-member, component, disposition, output, and commitment sentinels | specified |
@@ -739,46 +742,104 @@ is not based on compile-only catalog coverage.
 
 ### 4.1 Independent reference model
 
-- [ ] Implement symbolic authenticated candidates, authorization, dependency closure, witness scoring, selection, and
+- [x] Implement symbolic authenticated candidates, authorization, dependency closure, witness scoring, selection, and
   dispositions without calling production selector/canonicalization code.
-- [ ] Include proposal expiry and multi-parent commit sentinels, and keep an app-message-witness-free reference variant
+- [x] Include proposal expiry and multi-parent commit sentinels, and keep an app-message-witness-free reference variant
   so the witness mechanism's marginal effect is measurable.
-- [ ] Differentially compare reference model, production selector, and full engine.
-- [ ] Keep model inputs small and shrinkable.
+- [x] Differentially compare reference model, production selector, and full engine.
+- [x] Keep model inputs small and shrinkable.
+
+`reference_convergence` is deliberately type-independent of `cgka-engine`; a source guard rejects production selector
+or canonicalizer imports. It models authenticated/authorized candidates and inputs, iterative parent closure,
+multi-proposal commit dependencies, candidate-relative witness retention, selection, and keyed dispositions. The
+committed Tamarin policy corpus and 256-case shrinkable proptest corpus compare its winner to the production selector;
+named dependency/proposal sentinels compare dispositions to the production canonicalizer; and the bounded common
+Scenario IR lifecycle comparison continues through the real OpenMLS engine subject. Authentication/authorization
+negative cases remain reference-only because the engine canonicalizer's public comparison boundary is post-peeling.
+The witness-free variant is an explicit model dimension, not a locally modified convergence policy.
 
 ### 4.2 Liveness and lifecycle model
 
-- [ ] Prototype the self-update/admin-progress case in TLA+/TLC and Stateright, then record the tool decision.
-- [ ] Model unequal histories, eventual input closure, pass freeze/settle, crash/restart, fairness, and resource failure.
-- [ ] Model joiner/invite/device-add state that becomes stranded on a losing branch and its permitted repair transitions.
-- [ ] Emit model traces that preserve enough action identity to compile into Scenario IR regression cases.
-- [ ] Produce minimal counterexample traces consumable by Scenario IR where practical.
-- [ ] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
+- [x] Prototype the self-update/admin-progress case in TLA+/TLC and Stateright, then record the tool decision.
+- [x] Model unequal histories, eventual input closure, pass freeze/settle, crash/restart, fairness, and resource failure.
+- [x] Model joiner/invite/device-add state that becomes stranded on a losing branch and its permitted repair transitions.
+- [x] Emit model traces that preserve enough action identity to compile into Scenario IR regression cases.
+- [x] Produce minimal counterexample traces consumable by Scenario IR where practical.
+- [x] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
+
+TLA+/TLC is the temporal-liveness authority; Stateright is retained as the executable Rust trace bridge. The fair TLC
+model exhausts 720 distinct states (1,821 generated) and checks settlement after closure, administrative progress,
+stranded-joiner repair, frozen-revision durability, and settled-history equality. Its assumptions are explicit:
+input closure plus strong fairness for delivery, restart, resource recovery, freeze, settle, and permitted repair.
+Crash and resource failure are temporary bounded events in the finite model. The unfair configuration is an
+expected-failure gate and produces a temporal counterexample when those scheduling assumptions are absent.
+
+The Stateright mirror checks the same bounded lifecycle, including the durable/volatile frozen-revision split, while
+carrying stable identities such as `model-step-0:self_update`. Its minimized two-action starvation witness names
+`eventual_input_closure_or_fair_admin_scheduling` as the violated assumption. The committed canonical Scenario IR
+counterexample compiles to stable action ids; a drift test derives its self-update/barrier action kinds from the model
+trace instead of pinning magic schedule indices. Losing-branch joiners may become stranded; their only modeled repair
+is reset/rejoin with fresh state. Tamarin's scope is unchanged.
 
 ### 4.3 Mutation adequacy
 
-- [ ] Mutate selector comparison order.
-- [ ] Mutate witness sender/epoch deduplication.
-- [ ] Mutate app-message witness admission/removal to determine which scenarios actually depend on it.
-- [ ] Mutate cutoff admission and frozen-member persistence.
-- [ ] Mutate scheduler deadlines and re-arm classification.
-- [ ] Mutate output invalidation and publication acknowledgement.
-- [ ] Mutate retained-history and expiration boundaries.
-- [ ] Maintain a matrix showing which verification layer kills each mutation.
+- [x] Mutate selector comparison order.
+- [x] Mutate witness sender/epoch deduplication.
+- [x] Mutate app-message witness admission/removal to determine which scenarios actually depend on it.
+- [x] Mutate cutoff admission and frozen-member persistence.
+- [x] Mutate scheduler deadlines and re-arm classification.
+- [x] Mutate output invalidation and publication acknowledgement.
+- [x] Mutate retained-history and expiration boundaries.
+- [x] Maintain a matrix showing which verification layer kills each mutation.
+
+The macro-generated `SemanticMutation::ALL` catalog contains nine one-rule simulator mutants with minimal deterministic
+witnesses. The campaign requires every mutant to change the adopted observation; none is a production compile feature.
+It kills raw-depth-first selection, non-deduplicated witnesses, witness removal, exclusive cutoff, crash-lost durable
+frozen state, suppressed post-settlement re-arm, retained losing output, uncleared accepted publication, and inclusive
+expiration. Frozen-state and scheduler mutants execute alternate transitions through the shared Rust lifecycle model;
+the publication mutant drives a real `ReferenceModelSubject` and compares structural pending work before and after
+acknowledgement. The machine-checked
+[`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) has exactly one row per executable
+mutant and maps each to its primary independent layer plus a production-shaped regression. There are no surviving
+targeted mutations or tracked adequacy gaps at this checkpoint.
 
 ### 4.4 Protocol decision gate
 
-- [ ] Prove bounded administrative progress under stated assumptions, add explicit fairness/admission policy, or
+- [x] Prove bounded administrative progress under stated assumptions, add explicit fairness/admission policy, or
   document the non-guarantee.
-- [ ] Confirm which constants are truly semantic and version them through protocol capabilities.
-- [ ] Confirm scheduler/resource constants cannot silently change a settled result after input closure.
+- [x] Confirm which constants are truly semantic and version them through protocol capabilities.
+- [x] Confirm scheduler/resource constants cannot silently change a settled result after input closure.
+
+The live canonical Marmot `master` was reverified at adopted commit
+`4ad4ae21479c3f3fa9950c6fc4556a76941a62e1` (marmot#410). It already states the bounded post-settlement admin
+preparation opportunity, the non-guarantee under unbounded valid self-updates, the closed-input liveness assumptions,
+pass-partition invariance, the mandatory implicit v1 values, and the rule that any future behavior-changing policy
+ships as a new required app component/capability. No additional protocol PR is needed for Milestone 4.
+
+`policy_contract::CONSTANT_DECISIONS` classifies every P/E/A ledger id exactly once. P1/P2/P6/P7/P8 directly affect
+selected state; P4/P5 affect the bounded-pass lifecycle; P3 is coupled security-retention implementation of P2. All
+remain mandatory implicit v1 and any change requires the future required component. No component is allocated merely
+to re-encode the only valid v1 choice. E/A constants remain local only under operational non-interference: exhaustion
+is visible and fail-closed, retained work can retry, and equal closed input reaches the same settled result.
+
+The protocol decision gate pins all eight P values, checks the 24-id ledger/classification bijection, enforces the
+future-component decision, and varies batch width, wake delay, and a temporary resource refusal over one closed
+witness-sensitive input set. Intermediate pass histories differ while the settled winner remains equal; the resource
+failure never produces a partial settled result. Production coverage remains the same-horizon pass-partition
+metamorphic test and replay-budget fail-closed/repair campaign.
 
 ### Milestone 4 Exit Gate
 
-- [ ] The independent model and production engine agree over the bounded corpus.
-- [ ] Every targeted semantic mutation is killed or becomes a tracked verification gap.
-- [ ] Liveness counterexamples name the violated assumption.
-- [ ] The self-update/adversarial-progress decision is part of the protocol contract.
+- [x] The independent model and production engine agree over the bounded corpus.
+- [x] Every targeted semantic mutation is killed or becomes a tracked verification gap.
+- [x] Liveness counterexamples name the violated assumption.
+- [x] The self-update/adversarial-progress decision is part of the protocol contract.
+
+Milestone 4 is complete. The independent reference and production implementations agree over the committed policy
+corpus, proposal/dependency sentinels, common engine lifecycle case, and 256 generated shrinkable cases. TLC exhausts
+the fair bounded lifecycle and the expected-failure unfair run emits a counterexample tied to a named closure/fairness
+assumption. All nine targeted semantic mutants are killed, and the protocol decision gate covers every P/E/A constant
+while pinning the adopted self-update non-guarantee and future policy-component rule.
 
 ## Milestone 5: Application And Multi-Process Simulation
 
@@ -971,3 +1032,8 @@ incorrect result.
 | 2026-08-02 | 3.3 attested/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed producer-attested normalized Scenario IR import with per-step and contested-incident source mappings, explicit trust/sensitivity status, semantic reproduction, and owner-only vector/evidence output | Full `incident-replay` suite; `producer_attested_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
 | 2026-08-02 | Milestone 3 integration verification | Preserved legacy client identities while limiting account-scoped credential sharing to explicitly authored topology; all canonical semantic oracles and active decryptability probes remain compatible with the new deployment model | `implicit_topology_preserves_legacy_client_identity_seeds`; `explicit_topology_shares_account_identity_across_devices`; `cargo test -p cgka-conformance-simulator --test canonical_scenarios` (41 passed) |
+| 2026-08-03 | 4.1 independent reference model | Added a type-independent authenticated candidate/dependency/proposal/witness selector and disposition model, including witness-free comparison; differentially checked the adopted corpus, production canonicalizer sentinels, common full-engine lifecycle, and 256 shrinkable generated cases | `independent_reference_model` (8 tests); source-coupling guard; `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters` |
+| 2026-08-03 | 4.2 bounded liveness and lifecycle model | Selected TLA+/TLC as temporal authority and Stateright as the Rust trace bridge; checked input closure, strong fairness, freeze/settle, durable/volatile crash recovery, temporary resource failure, unequal histories, and stranded-joiner repair; retained an expected unfair counterexample with drift-checked Scenario IR action kinds | `lifecycle_model` (5 tests); `just tla-liveness` (720 distinct states, 1,821 generated, depth 14); `just tla-liveness-counterexample` |
+| 2026-08-03 | 4.3 semantic mutation adequacy | Added nine simulator-only one-rule mutants spanning selection, witness handling, cutoff/frozen state, scheduling, output, publication, and retention; every mutant is killed and the checked matrix maps it to independent and production-shaped evidence | `mutation_adequacy` (3 tests); [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) |
+| 2026-08-03 | 4.4 protocol decision gate | Reverified adopted Marmot convergence commit `4ad4ae2`, classified every P/E/A ledger id, pinned all v1 policy values and the future required-component rule, and demonstrated operational non-interference across batch, wake-delay, and temporary-resource variants | `protocol_decision_gate` (5 tests); [`PROTOCOL_DECISIONS.md`](../../crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md); `just convergence-ledger-gate` |
+| 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |

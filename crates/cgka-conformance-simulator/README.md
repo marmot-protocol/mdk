@@ -58,6 +58,21 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families, writes JSON reports and
   failure capsules, emits fixture candidates for generated cases, and replays capsules that contain byte checkpoints.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
+- `reference_convergence` — a small serializable convergence oracle with its own policy, candidate, score,
+  dependency, authorization, and disposition types. It has no production engine imports. Bounded corpus and proptest
+  adapters compare it to the production selector/canonicalizer, while the common Scenario IR lifecycle comparison
+  reaches the full OpenMLS engine subject. `WitnessMode::Disabled` measures the app-witness rule's marginal effect
+  without rewriting policy constants.
+- `lifecycle_model` — the bounded Rust/Stateright mirror of the authoritative TLA+ lifecycle specification. It
+  preserves model action identities, explicitly separates durable frozen revision from crash-lost volatile staged
+  revision, exercises unequal histories, freeze/settle, crash/restart, temporary resource failure, administrative
+  progress, and losing-branch joiner repair, and emits a minimal assumption-labeled starvation trace whose projected
+  action kinds are drift-checked against committed Scenario IR.
+- `mutation_adequacy` — nine simulator-only single-rule mutants with minimal deterministic witnesses. The generated
+  catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
+  publication-ack, and retention-boundary mutations without compiling mutation switches into production. Lifecycle
+  mutants run through the shared Rust transition model; publication acknowledgement runs through a real independent
+  reference subject and its structural pending-work observation.
 
 ## Testing layers
 
@@ -89,6 +104,24 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   - **Files:** [`tests/openmls_replay_probe.rs`](tests/openmls_replay_probe.rs)
   - **What it catches:** Byte-first replay behavior and fixture materialization probes.
 
+- **Layer:** Independent reference model
+  - **Files:** [`src/reference_convergence.rs`](src/reference_convergence.rs),
+    [`tests/independent_reference_model.rs`](tests/independent_reference_model.rs)
+  - **What it catches:** Semantic drift in authentication/authorization filtering, candidate dependency closure,
+    branch scoring, proposal/app/commit dispositions, and the production selector's comparison order.
+
+- **Layer:** Lifecycle model checking
+  - **Files:** [`../../formal/liveness/`](../../formal/liveness/),
+    [`src/lifecycle_model.rs`](src/lifecycle_model.rs), [`tests/lifecycle_model.rs`](tests/lifecycle_model.rs)
+  - **What it catches:** Missing input-closure/fairness assumptions, frozen-pass loss across restart, settlement over
+    unequal histories, temporary resource failure without repair, and unsupported losing-branch joiner recovery.
+
+- **Layer:** Mutation adequacy
+  - **Files:** [`src/mutation_adequacy.rs`](src/mutation_adequacy.rs),
+    [`tests/mutation_adequacy.rs`](tests/mutation_adequacy.rs), [`MUTATION_MATRIX.md`](MUTATION_MATRIX.md)
+  - **What it catches:** Verification layers that agree with production only because both omitted or share the same
+    faulty semantic rule.
+
 ## Run the tests
 
 ```sh
@@ -118,6 +151,9 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
 # Test-only one-variable policy curves around fixed retained inputs/horizons.
 cargo test -p cgka-conformance-simulator --features test-policy-overrides \
   --test policy_sweeps
+
+# Milestone 4 independent model, liveness, mutation, and protocol-decision gate.
+just milestone4-ci
 ```
 
 Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latency is the measured wall time of the

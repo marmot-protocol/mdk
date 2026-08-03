@@ -264,6 +264,16 @@ milestone3-ci:
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
 
+# Independent model, lifecycle/fairness, mutation adequacy, and protocol
+# decision gates.
+milestone4-ci:
+    cargo nextest run -p cgka-conformance-simulator --test independent_reference_model --locked
+    cargo nextest run -p cgka-conformance-simulator --test lifecycle_model --locked
+    cargo nextest run -p cgka-conformance-simulator --test mutation_adequacy --locked
+    cargo nextest run -p cgka-conformance-simulator --test protocol_decision_gate --locked
+    just tla-liveness
+    just tla-liveness-counterexample
+
 tracing-audit:
     cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 
@@ -274,6 +284,76 @@ tamarin:
 tamarin-interactive:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
     @make -C formal/tamarin interactive
+
+# TLC v1.7.4 is pinned for reproducible lifecycle-model output. Override the
+# downloaded jar with TLA2TOOLS_JAR=/path/to/tla2tools.jar when working offline;
+# an explicit override is trusted as caller-supplied local tooling.
+_tla-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
+    if [[ -n "${TLA2TOOLS_JAR:-}" ]]; then
+        [[ -f "$jar" ]] || { echo "error: TLA2TOOLS_JAR does not exist: $jar" >&2; exit 1; }
+        exit 0
+    fi
+    expected="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+    checksum() {
+        if command -v sha256sum >/dev/null; then
+            sha256sum "$1" | awk '{print $1}'
+        else
+            shasum -a 256 "$1" | awk '{print $1}'
+        fi
+    }
+    if [[ ! -f "$jar" ]]; then
+        mkdir -p "$(dirname "$jar")"
+        tmp="$(mktemp "${jar}.tmp.XXXXXX")"
+        trap 'rm -f "$tmp"' EXIT
+        curl --fail --location --silent --show-error \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+            --output "$tmp"
+        actual="$(checksum "$tmp")"
+        [[ "$actual" == "$expected" ]] || {
+            echo "error: tla2tools v1.7.4 checksum mismatch: expected $expected, got $actual" >&2
+            exit 1
+        }
+        mv "$tmp" "$jar"
+        trap - EXIT
+    fi
+    actual="$(checksum "$jar")"
+    [[ "$actual" == "$expected" ]] || {
+        echo "error: tla2tools v1.7.4 checksum mismatch: expected $expected, got $actual" >&2
+        exit 1
+    }
+
+tla-liveness: _tla-tools
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
+    mkdir -p target/tla/states
+    # Settled terminal states are legitimate deadlocks; temporal properties
+    # still reject pre-settlement stalls under the declared fairness assumptions.
+    java -XX:+UseParallelGC -jar "$jar" -workers 1 -deadlock \
+        -metadir target/tla/states \
+        -config ConvergenceLifecycle.fair.cfg \
+        formal/liveness/ConvergenceLifecycle.tla
+
+tla-liveness-counterexample: _tla-tools
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
+    output="$(mktemp)"
+    trap 'rm -f "$output"' EXIT
+    mkdir -p target/tla/states
+    if java -XX:+UseParallelGC -jar "$jar" -workers 1 -deadlock \
+        -metadir target/tla/states \
+        -config ConvergenceLifecycle.unfair.cfg \
+        formal/liveness/ConvergenceLifecycle.tla >"$output" 2>&1; then
+        cat "$output"
+        echo "error: unfair lifecycle model unexpectedly satisfied admin progress" >&2
+        exit 1
+    fi
+    cat "$output"
+    rg -q 'Temporal properties were violated' "$output"
 
 policy-casegen:
     @cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json

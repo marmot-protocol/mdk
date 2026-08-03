@@ -3,7 +3,9 @@
 Property tests generate many small cases and check rules that should hold for all of them. When one fails, proptest
 shrinks the input so the failing case is easier to read.
 
-The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src/proptest_support.rs`.
+General simulator properties live in `tests/proptest_invariants.rs`. The independent-reference differential property
+stays in `tests/independent_reference_model.rs` beside the bounded policy corpus and its model/production conversion
+helpers. Shared harness generators live in `src/proptest_support.rs`.
 
 ## Case Counts
 
@@ -24,8 +26,16 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
 | Group-data publish lifecycle | 12 | 200 |
 | Same-id replay | 16 | 500 |
 | Upgrade publish lifecycle | 8 | 200 |
+| Independent reference differential | 256 | 256 |
 
 ## Properties
+
+### `small_shrinkable_selector_inputs_match_independent_model`
+
+- Generates: two bounded selector candidates, witness sets, and a convergence policy from a fixed ChaCha seed.
+- Checks: the type-independent reference selector and production selector choose the same branch.
+- Why: an independently restated policy can detect selector drift without coupling expected behavior to production
+  code.
 
 ### `prop_candidate_graph_selection_is_order_invariant`
 

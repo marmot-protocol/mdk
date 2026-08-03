@@ -108,6 +108,7 @@ tempfile = "3"
 # test
 proptest = "1"
 insta = { version = "1", features = ["json"] }
+stateright = "0.31.0"
 test-log = { version = "0.2", features = ["trace"] }
 
 # workspace-internal
