@@ -1444,8 +1444,16 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
         .unwrap();
     let (winner_commit, loser_root) = match (&winner_invite, &loser_invite) {
         (
-            SendResult::GroupEvolution { msg: w, pending: wp, .. },
-            SendResult::GroupEvolution { msg: l, pending: lp, .. },
+            SendResult::GroupEvolution {
+                msg: w,
+                pending: wp,
+                ..
+            },
+            SendResult::GroupEvolution {
+                msg: l,
+                pending: lp,
+                ..
+            },
         ) => {
             let (w, l, wp, lp) = (w.clone(), l.clone(), *wp, *lp);
             winner.confirm_published(wp).await.unwrap();
