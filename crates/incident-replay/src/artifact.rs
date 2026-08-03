@@ -1,10 +1,11 @@
-//! Versioned incident scenario artifacts and exact normalized-history import.
+//! Versioned incident scenario artifacts and producer-attested history import.
 //!
 //! Existing Goggles audit exports usually support an outcome-equivalent
-//! archetype, not exact action replay. An exact import is accepted only when a
-//! producer supplies a complete normalized Scenario IR history and maps every
-//! scenario step back to source audit-event indices. Raw MLS bytes and state
-//! checkpoints stay outside this shareable artifact.
+//! archetype, not exact action replay. A normalized import records a producer's
+//! complete Scenario IR claim and step-to-event bookkeeping, then verifies only
+//! that the declared scenario reproduces. It cannot independently prove that a
+//! source event semantically corresponds to a declared action. Raw MLS bytes
+//! and state checkpoints stay outside this confidential artifact.
 
 use cgka_conformance_simulator::{
     ScenarioSpec, TraceExpectation, VectorFixture, compile_scenario, run_scenario_spec,
@@ -24,15 +25,30 @@ pub enum IncidentSourceFormatV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncidentReplayFidelityV1 {
-    ExactNormalizedHistory,
+    ProducerAttestedNormalizedHistory,
     OutcomeEquivalentArchetype,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceConfidenceV1 {
-    ExactNormalizedAvailableEvidence,
+    ProducerAttestedAvailableEvidence,
     DerivedOutcomeEquivalent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentArtifactSensitivityV1 {
+    ConfidentialUnredactedScenario,
+    SyntheticScenario,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentReproductionStatusV1 {
+    Unverified,
+    Reproduced,
+    NotApplicable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,8 +81,8 @@ pub struct NormalizedScenarioHistoryV1 {
     pub incident_event_indices: Vec<usize>,
     #[serde(default)]
     pub unavailable_fields: Vec<UnavailableEvidenceV1>,
-    /// Shareable exact-history import never embeds a database/OpenMLS
-    /// checkpoint. Sensitive state belongs in a local failure capsule.
+    /// Producer assertion that no database/OpenMLS checkpoint or raw key state
+    /// is embedded. This does not redact free-form Scenario IR labels/payloads.
     #[serde(default)]
     pub sensitive_state_included: bool,
 }
@@ -77,6 +93,8 @@ pub struct IncidentScenarioArtifactV1 {
     pub source_format: IncidentSourceFormatV1,
     pub replay_fidelity: IncidentReplayFidelityV1,
     pub evidence_confidence: EvidenceConfidenceV1,
+    pub sensitivity: IncidentArtifactSensitivityV1,
+    pub reproduction_status: IncidentReproductionStatusV1,
     pub source_event_count: usize,
     pub incident_event_indices: Vec<usize>,
     pub action_evidence: Vec<NormalizedActionEvidenceV1>,
@@ -86,8 +104,8 @@ pub struct IncidentScenarioArtifactV1 {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ExactHistoryImportError {
-    #[error("normalized scenario history uses unsupported schema `{0}`")]
+pub enum NormalizedHistoryImportError {
+    #[error("normalized scenario history uses an unsupported schema")]
     UnsupportedSchema(String),
     #[error("normalized scenario history is marked incomplete")]
     Incomplete,
@@ -97,57 +115,67 @@ pub enum ExactHistoryImportError {
     MissingExpectedOutcomes,
     #[error("normalized scenario history has no Scenario IR actions")]
     EmptyScenario,
+    #[error("normalized scenario history exceeds the portable artifact size limit")]
+    HistoryTooLarge,
     #[error("normalized scenario history does not identify a contested incident source event")]
     MissingIncidentEvidence,
     #[error("normalized scenario history does not map every Scenario IR step exactly once")]
     IncompleteActionEvidence,
     #[error("normalized scenario history references source event {index}, but only {count} exist")]
     SourceEventOutOfRange { index: usize, count: usize },
-    #[error("normalized Scenario IR failed validation: {0}")]
+    #[error("normalized Scenario IR failed validation")]
     InvalidScenario(String),
-    #[error("the simulator could not run exact normalized history: {0}")]
+    #[error("the simulator could not run normalized history")]
     Run(String),
-    #[error("exact normalized history did not reproduce its recorded outcomes")]
+    #[error("producer-attested normalized history did not reproduce its recorded outcomes")]
     NotReproduced,
 }
 
-/// Import exact normalized Scenario IR when the export carries sufficient
-/// evidence. `Ok(None)` is the ordinary legacy-export case and should fall
-/// back to archetype synthesis with explicit unavailable fields.
-pub fn import_exact_history(
+const MAX_NORMALIZED_HISTORY_BYTES: usize = 1024 * 1024;
+
+/// Import producer-attested normalized Scenario IR. `Ok(None)` is the ordinary
+/// legacy-export case and should fall back to archetype synthesis with explicit
+/// unavailable fields.
+pub fn import_attested_history(
     export: &AgentStateExport,
     source_format: IncidentSourceFormatV1,
-) -> Result<Option<IncidentScenarioArtifactV1>, ExactHistoryImportError> {
+) -> Result<Option<IncidentScenarioArtifactV1>, NormalizedHistoryImportError> {
     let Some(history) = export.normalized_scenario_history.as_ref() else {
         return Ok(None);
     };
     if history.schema_version != "1" {
-        return Err(ExactHistoryImportError::UnsupportedSchema(
+        return Err(NormalizedHistoryImportError::UnsupportedSchema(
             history.schema_version.clone(),
         ));
     }
     if !history.complete {
-        return Err(ExactHistoryImportError::Incomplete);
+        return Err(NormalizedHistoryImportError::Incomplete);
     }
     if history.sensitive_state_included {
-        return Err(ExactHistoryImportError::SensitiveStateIncluded);
+        return Err(NormalizedHistoryImportError::SensitiveStateIncluded);
     }
     if history.expected_outcomes.is_empty() {
-        return Err(ExactHistoryImportError::MissingExpectedOutcomes);
+        return Err(NormalizedHistoryImportError::MissingExpectedOutcomes);
     }
     if history.scenario.steps.is_empty() {
-        return Err(ExactHistoryImportError::EmptyScenario);
+        return Err(NormalizedHistoryImportError::EmptyScenario);
+    }
+    if serde_json::to_vec(history).is_ok_and(|encoded| encoded.len() > MAX_NORMALIZED_HISTORY_BYTES)
+    {
+        return Err(NormalizedHistoryImportError::HistoryTooLarge);
     }
     validate_action_evidence(history, export)?;
     compile_scenario(&history.scenario)
-        .map_err(|error| ExactHistoryImportError::InvalidScenario(error.to_string()))?;
+        .map_err(|error| NormalizedHistoryImportError::InvalidScenario(error.to_string()))?;
 
     let unavailable_fields = with_byte_replay_unavailable(history.unavailable_fields.clone());
     Ok(Some(IncidentScenarioArtifactV1 {
         schema_version: "1".into(),
         source_format,
-        replay_fidelity: IncidentReplayFidelityV1::ExactNormalizedHistory,
-        evidence_confidence: EvidenceConfidenceV1::ExactNormalizedAvailableEvidence,
+        replay_fidelity: IncidentReplayFidelityV1::ProducerAttestedNormalizedHistory,
+        evidence_confidence: EvidenceConfidenceV1::ProducerAttestedAvailableEvidence,
+        sensitivity: IncidentArtifactSensitivityV1::ConfidentialUnredactedScenario,
+        reproduction_status: IncidentReproductionStatusV1::Unverified,
         source_event_count: export.events.len(),
         incident_event_indices: history.incident_event_indices.clone(),
         action_evidence: history.action_evidence.clone(),
@@ -170,16 +198,18 @@ pub fn archetype_artifact(
     export: &AgentStateExport,
     source_format: IncidentSourceFormatV1,
     vector: VectorFixture,
-) -> Result<IncidentScenarioArtifactV1, ExactHistoryImportError> {
+) -> Result<IncidentScenarioArtifactV1, NormalizedHistoryImportError> {
     let incident_event_indices = incident_event_indices(export);
     if incident_event_indices.is_empty() {
-        return Err(ExactHistoryImportError::MissingIncidentEvidence);
+        return Err(NormalizedHistoryImportError::MissingIncidentEvidence);
     }
     Ok(IncidentScenarioArtifactV1 {
         schema_version: "1".into(),
         source_format,
         replay_fidelity: IncidentReplayFidelityV1::OutcomeEquivalentArchetype,
         evidence_confidence: EvidenceConfidenceV1::DerivedOutcomeEquivalent,
+        sensitivity: IncidentArtifactSensitivityV1::SyntheticScenario,
+        reproduction_status: IncidentReproductionStatusV1::NotApplicable,
         source_event_count: export.events.len(),
         incident_event_indices,
         action_evidence: Vec::new(),
@@ -206,27 +236,28 @@ pub fn archetype_artifact(
     })
 }
 
-pub fn accept_exact_history(
-    artifact: IncidentScenarioArtifactV1,
-) -> Result<IncidentScenarioArtifactV1, ExactHistoryImportError> {
+pub fn accept_attested_history(
+    mut artifact: IncidentScenarioArtifactV1,
+) -> Result<IncidentScenarioArtifactV1, NormalizedHistoryImportError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .map_err(|error| ExactHistoryImportError::Run(error.to_string()))?;
+        .map_err(|error| NormalizedHistoryImportError::Run(error.to_string()))?;
     let trace = runtime
         .block_on(run_scenario_spec(&artifact.vector.scenario))
-        .map_err(|error| ExactHistoryImportError::Run(error.to_string()))?;
+        .map_err(|error| NormalizedHistoryImportError::Run(error.to_string()))?;
     if artifact.vector.compare_observed_trace(&trace).is_empty() {
+        artifact.reproduction_status = IncidentReproductionStatusV1::Reproduced;
         Ok(artifact)
     } else {
-        Err(ExactHistoryImportError::NotReproduced)
+        Err(NormalizedHistoryImportError::NotReproduced)
     }
 }
 
 fn validate_action_evidence(
     history: &NormalizedScenarioHistoryV1,
     export: &AgentStateExport,
-) -> Result<(), ExactHistoryImportError> {
+) -> Result<(), NormalizedHistoryImportError> {
     let source_event_count = export.events.len();
     let mut mapped = history
         .action_evidence
@@ -240,7 +271,7 @@ fn validate_action_evidence(
             .iter()
             .any(|evidence| evidence.source_event_indices.is_empty())
     {
-        return Err(ExactHistoryImportError::IncompleteActionEvidence);
+        return Err(NormalizedHistoryImportError::IncompleteActionEvidence);
     }
     if let Some(index) = history
         .action_evidence
@@ -249,7 +280,7 @@ fn validate_action_evidence(
         .copied()
         .find(|index| *index >= source_event_count)
     {
-        return Err(ExactHistoryImportError::SourceEventOutOfRange {
+        return Err(NormalizedHistoryImportError::SourceEventOutOfRange {
             index,
             count: source_event_count,
         });
@@ -262,7 +293,7 @@ fn validate_action_evidence(
                 .is_none_or(|event| !is_incident_event(&event.kind))
         })
     {
-        return Err(ExactHistoryImportError::MissingIncidentEvidence);
+        return Err(NormalizedHistoryImportError::MissingIncidentEvidence);
     }
     Ok(())
 }
@@ -286,7 +317,7 @@ fn with_byte_replay_unavailable(
     for evidence in [
         unavailable(
             "raw_mls_transport_bytes",
-            "exact normalized action replay is semantic; the shareable artifact contains no MLS ciphertext",
+            "producer-attested normalized replay is semantic; the artifact contains no MLS ciphertext",
         ),
         unavailable(
             "mls_state_checkpoint",

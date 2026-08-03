@@ -131,9 +131,10 @@ the aggregate SQLite, WAL, and SHM footprint for file-backed subjects.
 
 CPU time, peak RSS, and filesystem write blocks require process isolation and are therefore listed as unavailable in
 an in-process report. `cgka-conformance-campaign` adds the fields the host exposes with one deadline-bounded worker
-process per case and explicitly lists unavailable fields. Write bytes are Linux child `rusage` block-write accounting
-and can remain zero when writes are satisfied through cache; Darwin reports the field as unavailable. They are not a
-SQLite logical-write counter. Generated artifacts are private-by-construction and belong under `target/` or another
+process per case and explicitly lists unavailable fields. `filesystem_block_write_lower_bound_bytes` is child
+`rusage` block-write accounting across all files. It is explicitly a page-cache-sensitive lower bound and can remain
+zero when writes are satisfied through cache; Darwin reports the field as unavailable. It is not a SQLite
+logical-write counter. Generated artifacts are private-by-construction and belong under `target/` or another
 ignored private location.
 
 Policy sweeps are experiments, not configuration. They clone one retained symbolic input, hold current tip, anchor,

@@ -253,10 +253,10 @@ conformance-slow:
 # Full Milestone 3 campaign gate: all catalog families, test-policy A/B and
 # resource sweeps, sustained headline workloads, and the isolated process runner.
 milestone3-ci:
-    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns
-    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns -- --ignored
-    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps
-    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked
+    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked -- --ignored
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
+    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
 
 tracing-audit:
     cargo nextest run -p cgka-conformance-simulator --test tracing_audit

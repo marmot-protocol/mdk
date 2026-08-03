@@ -38,7 +38,7 @@ struct ProcessCaseMeasurementV1 {
     system_cpu_us: Option<u64>,
     peak_rss_bytes: Option<u64>,
     database_bytes: Option<u64>,
-    database_write_bytes: Option<u64>,
+    filesystem_block_write_lower_bound_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unavailable_process_fields: Vec<String>,
 }
@@ -92,7 +92,8 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
             system_cpu_us: usage.system_cpu_us,
             peak_rss_bytes: usage.peak_rss_bytes,
             database_bytes,
-            database_write_bytes: usage.database_write_bytes,
+            filesystem_block_write_lower_bound_bytes: usage
+                .filesystem_block_write_lower_bound_bytes,
             unavailable_process_fields: usage.unavailable_process_fields,
         });
     }
@@ -202,7 +203,7 @@ struct ChildUsage {
     user_cpu_us: Option<u64>,
     system_cpu_us: Option<u64>,
     peak_rss_bytes: Option<u64>,
-    database_write_bytes: Option<u64>,
+    filesystem_block_write_lower_bound_bytes: Option<u64>,
     unavailable_process_fields: Vec<String>,
 }
 
@@ -222,15 +223,37 @@ fn wait_with_usage(
         // pointers refer to writable storage for the duration of wait4.
         let waited = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, usage.as_mut_ptr()) };
         if waited < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
         }
         if waited == pid {
             break false;
         }
         if Instant::now() >= deadline {
-            if let Err(error) = child.kill()
-                && error.kind() != std::io::ErrorKind::InvalidInput
-            {
+            // Close the polling race: the worker may have exited successfully
+            // after the check above but before the deadline comparison.
+            let waited =
+                unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, usage.as_mut_ptr()) };
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+            if waited == pid {
+                break false;
+            }
+            if let Err(error) = child.kill() {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
+                    if waited < 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    break false;
+                }
+                let _ = child.wait();
                 return Err(error.into());
             }
             // SAFETY: after killing the same direct child, blocking wait4 reaps
@@ -246,10 +269,14 @@ fn wait_with_usage(
     // SAFETY: either successful wait4 path initialized the complete rusage value.
     let usage = unsafe { usage.assume_init() };
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let (database_write_bytes, unavailable_process_fields) =
-        (None, vec!["database_write_bytes".to_owned()]);
+    let (filesystem_block_write_lower_bound_bytes, unavailable_process_fields) = (
+        None,
+        vec!["filesystem_block_write_lower_bound_bytes".to_owned()],
+    );
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let (database_write_bytes, unavailable_process_fields) = (
+    // `ru_oublock` counts real block-device output, so page-cache absorption
+    // can only make this a lower bound for all child-process filesystem writes.
+    let (filesystem_block_write_lower_bound_bytes, unavailable_process_fields) = (
         Some(
             u64::try_from(usage.ru_oublock)
                 .unwrap_or(0)
@@ -264,7 +291,7 @@ fn wait_with_usage(
         user_cpu_us: Some(timeval_us(usage.ru_utime)),
         system_cpu_us: Some(timeval_us(usage.ru_stime)),
         peak_rss_bytes: Some(peak_rss_bytes(usage.ru_maxrss)),
-        database_write_bytes,
+        filesystem_block_write_lower_bound_bytes,
         unavailable_process_fields,
     })
 }
@@ -316,12 +343,12 @@ fn wait_with_usage(
         user_cpu_us: None,
         system_cpu_us: None,
         peak_rss_bytes: None,
-        database_write_bytes: None,
+        filesystem_block_write_lower_bound_bytes: None,
         unavailable_process_fields: vec![
             "user_cpu_us".to_owned(),
             "system_cpu_us".to_owned(),
             "peak_rss_bytes".to_owned(),
-            "database_write_bytes".to_owned(),
+            "filesystem_block_write_lower_bound_bytes".to_owned(),
         ],
     })
 }

@@ -1160,9 +1160,9 @@ fn milestone3_case(
         6 => milestone3_multi_group_noisy_neighbor(case_index),
         7 => {
             let (mut scenario, expected) = convergence_chaos_large_commit_storm(rng, case_index);
-            scenario.name = format!("milestone3/candidate-replay-exhaustion/case-{case_index}");
+            scenario.name = format!("milestone3/candidate-replay-pressure/case-{case_index}");
             (
-                "milestone3/candidate-replay-exhaustion/v1".into(),
+                "milestone3/candidate-replay-pressure/v1".into(),
                 GeneratedSubjectKind::Engine,
                 scenario,
                 expected,
@@ -1836,10 +1836,10 @@ fn milestone3_mixed_binary_compatibility(
         ("bob", "account:bob", "mdk-current"),
     ]);
     (
-        "milestone3/mixed-binary-policy/v1".into(),
+        "milestone3/mixed-binary-compatibility-preflight/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/mixed-binary-policy/case-{case_index}"),
+            name: format!("milestone3/mixed-binary-compatibility-preflight/case-{case_index}"),
             spec_version: "2".into(),
             clients,
             topology,

@@ -9,6 +9,8 @@
     "source_format",
     "replay_fidelity",
     "evidence_confidence",
+    "sensitivity",
+    "reproduction_status",
     "source_event_count",
     "incident_event_indices",
     "action_evidence",
@@ -22,10 +24,16 @@
       "enum": ["agent_state_document", "goggles_group_export_stream"]
     },
     "replay_fidelity": {
-      "enum": ["exact_normalized_history", "outcome_equivalent_archetype"]
+      "enum": ["producer_attested_normalized_history", "outcome_equivalent_archetype"]
     },
     "evidence_confidence": {
-      "enum": ["exact_normalized_available_evidence", "derived_outcome_equivalent"]
+      "enum": ["producer_attested_available_evidence", "derived_outcome_equivalent"]
+    },
+    "sensitivity": {
+      "enum": ["confidential_unredacted_scenario", "synthetic_scenario"]
+    },
+    "reproduction_status": {
+      "enum": ["unverified", "reproduced", "not_applicable"]
     },
     "source_event_count": { "type": "integer", "minimum": 0 },
     "incident_event_indices": {

@@ -313,6 +313,11 @@ jobs:
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
       - name: Run Milestone 3 adversarial campaign gate
         run: just milestone3-ci
 

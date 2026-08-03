@@ -12,7 +12,8 @@ pub struct CampaignMeasurementsV1 {
     pub convergence_latency_us: Option<u64>,
     pub blocked_send_duration_us: u64,
     pub pass_count: usize,
-    pub reorg_count: usize,
+    pub reorg_count: Option<usize>,
+    pub recovery_observation_count: usize,
     pub reorg_rewind_depth: Option<CampaignHistogramV1>,
     pub reorg_lateness_ms: Option<CampaignHistogramV1>,
     pub unresolved_outcomes: usize,
@@ -151,8 +152,8 @@ impl CampaignMeasurementsV1 {
             blocked_send_duration_us,
             pass_count,
             reorg_count: engine_metrics
-                .and_then(|metrics| usize::try_from(metrics.post_settle_reorgs).ok())
-                .unwrap_or(report.recovery_observations.len()),
+                .and_then(|metrics| usize::try_from(metrics.post_settle_reorgs).ok()),
+            recovery_observation_count: report.recovery_observations.len(),
             reorg_rewind_depth: engine_metrics
                 .map(|metrics| CampaignHistogramV1::from(&metrics.reorg_rewind_depth)),
             reorg_lateness_ms: engine_metrics
@@ -179,7 +180,7 @@ impl CampaignMeasurementsV1 {
             unavailable_process_fields: [
                 "cpu_time_us".to_owned(),
                 "peak_rss_bytes".to_owned(),
-                "database_write_bytes".to_owned(),
+                "filesystem_block_write_lower_bound_bytes".to_owned(),
             ]
             .into_iter()
             .chain(

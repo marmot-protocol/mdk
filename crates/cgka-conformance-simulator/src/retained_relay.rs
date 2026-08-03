@@ -154,7 +154,7 @@ impl RetainedRelaySubject {
             .collect::<BTreeMap<_, _>>();
         let engine = EngineHarnessSubject::new_with_topology(
             clients,
-            &resolved,
+            topology,
             protocol_profile,
             storage_mode,
         )?;
@@ -1112,6 +1112,78 @@ mod tests {
         };
         assert_eq!(semantic(&reference_report), semantic(&engine_report));
         assert_eq!(semantic(&engine_report), semantic(&retained_report));
+    }
+
+    #[tokio::test]
+    async fn implicit_topology_preserves_the_same_identities_on_retained_relays() {
+        let scenario = ScenarioSpec {
+            name: "retained-relay/implicit-identity-compat".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "identity-compat".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+                ScenarioStep::accept_publication("alice", "create"),
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                ScenarioStep::ObserveExact {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+            ],
+        };
+        let mut engine = EngineHarnessSubject::new(
+            &scenario.clients,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        let engine_report = run_scenario_report_with_subject(&scenario, None, vec![], &mut engine)
+            .await
+            .unwrap();
+        let mut retained = RetainedRelaySubject::new(
+            &scenario.clients,
+            &scenario.topology,
+            ProtocolProfile::Legacy,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        let retained_report =
+            run_scenario_report_with_subject(&scenario, None, vec![], &mut retained)
+                .await
+                .unwrap();
+
+        let member_identities = |report: &crate::ScenarioReport| {
+            report
+                .observed_trace
+                .as_ref()
+                .unwrap()
+                .observations
+                .iter()
+                .map(|observation| {
+                    match observation.canonical_state.as_ref().unwrap() {
+                    cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot::Live(
+                        snapshot,
+                    ) => snapshot.sorted_member_identities_hex.clone(),
+                    cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot::Disbanded(
+                        _,
+                    ) => panic!("identity compatibility scenario remains live"),
+                }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            member_identities(&engine_report),
+            member_identities(&retained_report)
+        );
     }
 
     #[tokio::test]

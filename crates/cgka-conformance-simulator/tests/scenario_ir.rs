@@ -172,6 +172,151 @@ async fn typoed_group_label_fails_closed_at_execution() {
     )));
 }
 
+#[tokio::test]
+async fn wrapped_action_id_is_used_by_fault_selectors_and_the_runtime_ledger() {
+    let in_group = |action| ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(action),
+    };
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/wrapped-action-id".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "red".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            }),
+            ScenarioStep::accept_publication("alice", "create"),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "held".into(),
+            }),
+            ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    action_id: Some("step-4:send_app_message@red".into()),
+                    class: Some(ScenarioTransportClass::Application),
+                    ..Default::default()
+                },
+                label: "held-red-app".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::Observe {
+                clients: vec!["bob".into()],
+            }),
+            ScenarioStep::ReleaseWithheld {
+                label: "held-red-app".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            in_group(ScenarioStep::ObserveExact {
+                clients: vec!["bob".into()],
+            }),
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("wrapped action scenario runs");
+    let observations = &report.observed_trace.as_ref().unwrap().observations;
+    assert!(observations[0].received_payloads.is_empty());
+    assert_eq!(observations[1].received_payloads, vec!["held"]);
+    assert!(observations[1].scenario_input_ledger.iter().any(|entry| {
+        entry.scenario_id == "step-4:send_app_message@red" && entry.delivered == 1
+    }));
+}
+
+#[test]
+fn grouped_scenarios_reject_unwrapped_group_scoped_actions() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/ambiguous-unwrapped-group-action".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "red".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                }),
+            },
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "ambiguous".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "ambiguous".into(),
+            },
+        ],
+    };
+
+    let error = compile_scenario(&scenario).expect_err("ambiguous action must fail preflight");
+    assert_eq!(error.step_index, Some(1));
+    assert!(error.message.contains("must use in_group"));
+}
+
+#[tokio::test]
+async fn grouped_observe_of_non_member_is_a_structured_failure() {
+    let in_group = |action| ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(action),
+    };
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/non-member-observe".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "red".into(),
+                invitees: vec![],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            }),
+            in_group(ScenarioStep::ObserveExact {
+                clients: vec!["bob".into()],
+            }),
+        ],
+    };
+
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("subject failures are reported structurally");
+    assert!(report.step_log.iter().any(|step| matches!(
+        &step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. }
+            if kind == "client_not_in_scenario_group"
+    )));
+}
+
 fn collect_external_refs<'a>(value: &'a serde_json::Value, refs: &mut Vec<&'a str>) {
     match value {
         serde_json::Value::Object(object) => {
@@ -701,8 +846,8 @@ async fn topology_can_join_two_device_leaves_for_one_account() {
         .and_then(serde_json::Value::as_array)
         .expect("live snapshot carries sorted identities");
     assert_eq!(identities.len(), 3);
-    assert_eq!(
-        identities[0], identities[1],
+    assert!(
+        identities.windows(2).any(|pair| pair[0] == pair[1]),
         "capture runner must preserve the shared account identity of both devices"
     );
 }

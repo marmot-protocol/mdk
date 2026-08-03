@@ -99,8 +99,24 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
 
     let mut virtual_time_ms = 0_u64;
     let topology = spec.topology.resolve_for_clients(&spec.clients)?;
+    let uses_explicit_group_targets = spec
+        .steps
+        .iter()
+        .any(|step| matches!(step, ScenarioStep::InGroup { .. }));
     let mut actions = Vec::with_capacity(spec.steps.len());
     for (source_step_index, step) in spec.steps.iter().enumerate() {
+        if uses_explicit_group_targets
+            && !matches!(step, ScenarioStep::InGroup { .. })
+            && is_group_scoped(step)
+        {
+            return Err(compile_error(
+                Some(source_step_index),
+                format!(
+                    "{} must use in_group when the scenario targets multiple groups",
+                    step.kind()
+                ),
+            ));
+        }
         let (scenario_group, executable_step) =
             lower_group_action(source_step_index, step, &topology)?;
         validate_step(source_step_index, executable_step, &clients, &topology)?;

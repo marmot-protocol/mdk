@@ -682,20 +682,22 @@ eligibility change cannot masquerade as a scheduler result.
 ### 3.3 Incident replay
 
 - [x] Preserve normalized archetype synthesis for incomplete forensic evidence.
-- [x] Add exact-history IR import when evidence is sufficient.
+- [x] Add producer-attested normalized-history IR import when evidence is sufficient.
 - [x] Carry evidence confidence and unavailable fields into the scenario artifact.
 - [x] Keep sensitive exports and generated exact capsules out of version control.
 
-`IncidentScenarioArtifactV1` makes replay fidelity explicit. Existing Goggles audit exports continue through the proven
-fork/convergence archetype synthesizers and are labeled `outcome_equivalent_archetype` with derived confidence; the
-artifact names unavailable exact action history, participant delivery order, transport bytes, and MLS state. Exact
-normalized import is accepted only when a producer supplies complete Scenario IR, maps every step to source event
-indices, identifies the contested fork/convergence source rows, includes semantic expected outcomes, passes full IR
-validation, contains no sensitive state, and reproduces under the simulator. “Exact” means exact for that declared
-normalized evidence, not byte replay. Raw MLS bytes plus an engine checkpoint remain a separate opt-in sensitive local
-failure capsule.
+`IncidentScenarioArtifactV1` makes replay fidelity and trust boundaries explicit. Existing Goggles audit exports
+continue through the proven fork/convergence archetype synthesizers and are labeled
+`outcome_equivalent_archetype` with derived confidence; the artifact names unavailable action history, participant
+delivery order, transport bytes, and MLS state. Normalized import is `producer_attested_normalized_history`: it checks
+coverage and bounds of the producer's step-to-source mapping, validates the Scenario IR, and requires the declared
+outcomes to reproduce, but it does not independently prove semantic correspondence between arbitrary source events
+and declared actions. Imported free-form labels and application payloads remain
+`confidential_unredacted_scenario`, and the artifact records `unverified` until simulator reproduction changes it to
+`reproduced`. Raw MLS bytes plus an engine checkpoint remain a separate opt-in sensitive local failure capsule.
 
-The CLI writes the vector and evidence envelope owner-only and never copies the source export or checkpoint. Real
+The CLI writes the vector and evidence envelope owner-only and never copies the source export or checkpoint. These
+files are not shareable without separate redaction and review. Real
 exports belong under ignored `incident-exports/`; local generated output belongs under `target/` or ignored
 `incident-replay-output/`; sensitive replay-capsule filenames are ignored repository-wide.
 
@@ -710,9 +712,16 @@ Offline retained-history catch-up, mixed application/commit traffic, and the sel
 small default regression and a separately ignored sustained campaign. Replay-probe exhaustion fails closed while
 retaining the frozen durable inputs, then succeeds after the test-only ceiling is removed; opaque transport limits use
 the separately tested resource-refused/redelivery repair contract. Report measurement tests pin the first failing
-action and resource-category limiting cause. Incident tests cover both a reproducing exact normalized history and the
+action and resource-category limiting cause. Incident tests cover both a reproducing producer-attested history and the
 ordinary legacy-export archetype whose evidence envelope explicitly names why exact action and byte replay are
 unavailable.
+
+Milestone 3 also closes a production amplification loophole: application-bearing candidate re-materialization now
+draws from the same finite per-pass replay budget as the preceding candidate search instead of creating an unlimited
+fallback budget. The v1 numeric constants and branch-selection policy are unchanged, but the fail-closed boundary is
+observable: a near-ceiling pass can now return `ReplayBudgetExceeded` where the old path continued without a limit.
+The shared-budget regression retains the frozen inputs and proves the same durable work succeeds when capacity is
+restored.
 
 Final integration verification also pins the topology compatibility boundary: resolving a legacy client-only
 scenario may add explicit deployment records to its report, but does not change its historical client-derived member
@@ -957,8 +966,8 @@ incorrect result.
 | 2026-08-02 | 2.2 initial independent reference adapter | Added a capability-limited symbolic-memory subject that executes the common group/publication/application lifecycle without production selector or canonicalizer calls; one compiled scenario now runs unchanged on reference and engine adapters with equal semantic observations, exact-only predicates add their true preflight capability, and assertion sampling no longer consumes later report evidence | `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters`; `unsupported_exact_assertion_fails_before_reference_model_executes`; scenario IR suite |
 | 2026-08-02 | 2.3 retained multi-relay model and exit scenarios | Added real-engine delivery through durable per-relay histories with topology fanout/subscriptions, cursor/since/full/set queries, EOSE-versus-completeness observations, offline reconnect, visibility omission, duplicate/order policy, history equalization, and quiet-query diagnosis; the same compiled scenario runs on all three initial adapters, offline delivery comes from history, and unequal histories reach exact state equality only after reconciliation | `one_compiled_scenario_runs_unchanged_on_all_initial_adapters`; `offline_client_recovers_from_retained_history`; `unequal_relay_histories_converge_after_set_equalization`; `eose_does_not_heal_hidden_cursor_history_but_full_backfill_does`; `relay_reverse_order_and_duplicates_are_explicit_and_deduplicated` |
 | 2026-08-02 | Milestone 2 completion verification | Completed every 2.1-2.3 work item and exit scenario; the canonical IR no longer exposes mutable queue positions, all repository vectors compile, and retained-history behavior is distinct from healed packet loss | [MDK #1233](https://github.com/marmot-protocol/mdk/pull/1233); `cargo test -p cgka-conformance-simulator`; `cargo test -p incident-replay`; `just fast-ci` |
-| 2026-08-02 | 3.1 adversarial workload campaigns | Added the twelve-family workload catalog, small and sustained headline campaigns, real durable-phase process kills, resource-exhaustion/repair, multi-group and shared-account-device topologies, retained-relay disagreement, clock/cursor attacks, witness-enabled/disabled full-engine comparison, and mixed binary/policy preflight. Recorded the current losing-branch device repair limit and the future authenticated policy-capability boundary | `milestone3_campaigns`; `actual_process_kill_recovers_at_every_durable_phase`; explicit sustained campaign; proposal-expiry and multi-parent replay tests |
+| 2026-08-02 | 3.1 adversarial workload campaigns | Added the twelve-family workload catalog, small and sustained headline campaigns, real durable-phase process kills, resource-exhaustion/repair, multi-group and shared-account-device topologies, retained-relay disagreement, clock/cursor attacks, witness-enabled/disabled full-engine comparison, and mixed binary/policy preflight. Recorded the current losing-branch device repair limit and the future authenticated policy-capability boundary | `milestone3_campaigns`; `kill_at_every_durable_convergence_phase_reopens_and_finishes`; explicit sustained campaign; proposal-expiry and multi-parent replay tests |
 | 2026-08-02 | 3.2 campaign measurements and policy sweeps | Embedded stable latency/blocking, pass/reorg, disposition/outcome, queue/replay/database measurements in scenario reports; added an isolated child-process runner for CPU/RSS/write accounting; and added fixed-input test-policy curves with named boundary failures and no production auto-tuning | `offline_retained_history_flood_runs_as_a_small_regression`; `policy_sweeps`; child-process smoke campaign; default and feature-enabled compile gates |
-| 2026-08-02 | 3.3 exact/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed exact normalized Scenario IR import with per-step and contested-incident source mappings, semantic acceptance, explicit confidence, no embedded sensitive state, and owner-only vector/evidence output | Full `incident-replay` suite; `exact_normalized_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
+| 2026-08-02 | 3.3 attested/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed producer-attested normalized Scenario IR import with per-step and contested-incident source mappings, explicit trust/sensitivity status, semantic reproduction, and owner-only vector/evidence output | Full `incident-replay` suite; `producer_attested_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
 | 2026-08-02 | Milestone 3 integration verification | Preserved legacy client identities while limiting account-scoped credential sharing to explicitly authored topology; all canonical semantic oracles and active decryptability probes remain compatible with the new deployment model | `implicit_topology_preserves_legacy_client_identity_seeds`; `explicit_topology_shares_account_identity_across_devices`; `cargo test -p cgka-conformance-simulator --test canonical_scenarios` (41 passed) |

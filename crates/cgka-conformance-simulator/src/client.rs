@@ -1707,6 +1707,12 @@ impl HarnessClient {
         self.engine().epoch(&gid).expect("epoch")
     }
 
+    pub(crate) fn has_active_group(&self) -> bool {
+        self.default_group
+            .as_ref()
+            .is_some_and(|group_id| self.engine().epoch(group_id).is_ok())
+    }
+
     pub fn members(&self) -> Vec<cgka_traits::group::Member> {
         let gid = self.default_group.clone().expect("group");
         match self.engine().members(&gid) {

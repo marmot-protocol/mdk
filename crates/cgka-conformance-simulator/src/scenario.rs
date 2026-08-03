@@ -14,7 +14,7 @@ use crate::{
     SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
     SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
     compare_trace_expectations, compile_scenario, drive_subject_to_quiescence,
-    preflight_compiled_scenario, stable_action_id,
+    preflight_compiled_scenario,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -705,11 +705,11 @@ struct ScenarioStepOutputs {
 async fn execute_scenario_step(
     spec: &ScenarioSpec,
     step_index: usize,
+    action_id: &str,
     step: &ScenarioStep,
     subject: &mut dyn ConvergenceSubject,
     outputs: &mut ScenarioStepOutputs,
 ) -> Result<(), ScenarioRunError> {
-    let action_id = scenario_input_id(step_index, step);
     let ScenarioStepOutputs {
         pending_resolutions,
         observations,
@@ -736,7 +736,7 @@ async fn execute_scenario_step(
                 .unwrap_or_else(|| scenario_initial_admins(spec, step_index, invitees));
             subject
                 .create_group(SubjectCreateGroup {
-                    action_id: &action_id,
+                    action_id,
                     creator,
                     name,
                     invitees,
@@ -754,7 +754,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .invite_members(SubjectInviteMembers {
-                    action_id: &action_id,
+                    action_id,
                     inviter,
                     invitees,
                     pending,
@@ -769,7 +769,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .remove_members(SubjectRemoveMembers {
-                    action_id: &action_id,
+                    action_id,
                     remover,
                     members,
                     pending,
@@ -780,7 +780,7 @@ async fn execute_scenario_step(
         ScenarioStep::SelfUpdate { client, pending } => {
             subject
                 .self_update(SubjectSelfUpdate {
-                    action_id: &action_id,
+                    action_id,
                     client,
                     pending,
                 })
@@ -794,7 +794,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .update_group_data(SubjectUpdateGroupData {
-                    action_id: &action_id,
+                    action_id,
                     client,
                     name,
                     pending,
@@ -809,7 +809,7 @@ async fn execute_scenario_step(
         } => {
             subject
                 .update_admin_policy(SubjectUpdateAdminPolicy {
-                    action_id: Some(&action_id),
+                    action_id: Some(action_id),
                     client,
                     admins,
                     pending: Some(pending),
@@ -911,7 +911,7 @@ async fn execute_scenario_step(
         ScenarioStep::SendAppMessage { sender, payload } => {
             subject
                 .send_application(SubjectSendApplication {
-                    action_id: &action_id,
+                    action_id,
                     sender,
                     payload,
                 })
@@ -920,7 +920,7 @@ async fn execute_scenario_step(
         }
         ScenarioStep::Leave { client } => {
             subject
-                .leave(&action_id, client)
+                .leave(action_id, client)
                 .await
                 .map_err(|error| subject_step_error(step_index, error))?;
         }
@@ -1214,7 +1214,17 @@ async fn run_scenario_report_inner(
             Ok(())
         };
         let step_result = match step_result {
-            Ok(()) => execute_scenario_step(spec, step_index, step, subject, &mut outputs).await,
+            Ok(()) => {
+                execute_scenario_step(
+                    spec,
+                    step_index,
+                    &action.schedule.action_id,
+                    step,
+                    subject,
+                    &mut outputs,
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
         if descriptor.supports(crate::SubjectCapability::StructuralProgress)
@@ -1371,10 +1381,6 @@ async fn run_scenario_report_inner(
 
 fn elapsed_us(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn scenario_input_id(step_index: usize, step: &ScenarioStep) -> String {
-    stable_action_id(step_index, step)
 }
 
 /// Validate adapter support before the first scenario action is executed.

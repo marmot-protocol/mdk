@@ -31,7 +31,8 @@ use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    ConvergencePassStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -411,13 +412,35 @@ fn run_transition_parent_case(point: &str) {
     let group_ids = storage.list_groups().expect("list transition groups");
     assert_eq!(group_ids.len(), 1, "transition fixture owns one group");
     let group_id = group_ids[0].clone();
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .expect("queued intents before transition hydration")
+            .len(),
+        1,
+        "kill at {point} must leave the durable queued intent intact"
+    );
     let mut reopened = build_client_with_storage(CAROL_SEED, storage.clone());
     reopened
         .hydrate_stable_groups_from_storage()
         .unwrap_or_else(|error| panic!("hydrate after {point}: {error}"));
-    reopened
-        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
-        .unwrap_or_else(|error| panic!("resume after {point}: {error}"));
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .expect("queued intents after transition hydration")
+            .len(),
+        1,
+        "hydrate after {point} must preserve queued work"
+    );
+    // A collecting pass rebases its process-local monotonic cutoff from the
+    // durable wall deadline on first use after restart. Drive once to perform
+    // that rebase, then beyond the v1 absolute deadline; frozen/resolving
+    // phases finish on the first call and make the second a harmless no-op.
+    for now_ms in [4_000_000, 4_010_000] {
+        reopened
+            .converge_stored_openmls_messages_at(&group_id, now_ms)
+            .unwrap_or_else(|error| panic!("resume after {point} at {now_ms}: {error}"));
+    }
     assert_eq!(
         reopened
             .epoch(&group_id)
@@ -425,14 +448,50 @@ fn run_transition_parent_case(point: &str) {
         EpochId(2),
         "kill at {point} must reopen to a complete epoch"
     );
-    assert!(
-        !storage
-            .get_group(&group_id)
-            .expect("group after transition repair")
-            .members
-            .is_empty(),
-        "kill at {point} must not expose partial group state"
+    let recovered = storage
+        .get_group(&group_id)
+        .expect("group after transition repair");
+    let completed_pass = storage
+        .convergence_pass(&group_id)
+        .expect("pass after transition repair")
+        .expect("transition fixture retains the completed pass");
+    assert_eq!(
+        completed_pass.phase,
+        cgka_traits::ConvergencePassPhase::Completed,
+        "kill at {point} must finish the interrupted durable pass"
     );
+    assert!(
+        recovered
+            .members
+            .iter()
+            .any(|member| member.id == MemberId::new(identity(b"eve-crash"))),
+        "kill at {point} must preserve and finish the interrupted winning branch"
+    );
+    assert!(
+        !recovered
+            .members
+            .iter()
+            .any(|member| member.id == MemberId::new(identity(b"david-crash"))),
+        "kill at {point} must not expose the losing incumbent branch"
+    );
+    assert!(
+        storage
+            .list_messages(&group_id, EpochId(1))
+            .expect("late convergence inputs after transition repair")
+            .iter()
+            .all(|record| {
+                !matches!(
+                    record.state,
+                    MessageState::Created | MessageState::Retryable
+                )
+            }),
+        "kill at {point} must terminalize or defer every input from the interrupted pass"
+    );
+    let queued = storage
+        .list_queued_outbound_intents(&group_id)
+        .expect("queued intents after transition repair");
+    assert_eq!(queued.len(), 1, "kill at {point} must preserve queued work");
+    assert_eq!(queued[0].id, MessageId::new(QUEUED_INTENT_ID.to_vec()));
 }
 
 async fn run_child_case(database: &Path) {
@@ -452,7 +511,7 @@ async fn run_child_case(database: &Path) {
         };
     assert!(
         bob.self_id().as_slice() < alice.self_id().as_slice(),
-        "late challenger must win the deterministic tiebreak"
+        "late challenger must exercise the lower-committer side of the deterministic tiebreak"
     );
     let (mut david, _david_storage) = build_memory_client(b"david-crash");
     let (mut eve, _eve_storage) = build_memory_client(b"eve-crash");
@@ -525,9 +584,6 @@ async fn run_child_case(database: &Path) {
         .await
         .expect("bob invite"),
     );
-    carol
-        .buffer_openmls_convergence_message_at(&group_id, route(bob_commit, &group_id), 2_000)
-        .expect("buffer late winning commit");
     carol_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
             id: MessageId::new(QUEUED_INTENT_ID.to_vec()),
@@ -539,6 +595,13 @@ async fn run_child_case(database: &Path) {
             created_at_ms: 2_100,
         })
         .expect("persist queued work");
+    // Persist the independent outbound obligation before admitting the late
+    // convergence input: the collecting-phase hook fires during admission, so
+    // the opposite order never actually exercised queued-intent durability at
+    // that earliest kill point.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, route(bob_commit, &group_id), 2_000)
+        .expect("buffer late competing commit");
 
     let _ = alice_seed;
     if std::env::var(CRASH_POINT_ENV).as_deref() == Ok(H5_POINT) {

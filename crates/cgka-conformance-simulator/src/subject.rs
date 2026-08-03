@@ -1655,6 +1655,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
             .iter()
             .map(|label| {
                 let client = self.client_mut(label)?;
+                if !client.has_active_group() {
+                    return Err(SubjectError::new(
+                        "client_not_in_scenario_group",
+                        format!("client {label} is not a member of the selected scenario group"),
+                    ));
+                }
                 Ok(observe_client(label.clone(), client))
             })
             .collect()
@@ -1668,6 +1674,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
             .iter()
             .map(|label| {
                 let client = self.client_mut(label)?;
+                if !client.has_active_group() {
+                    return Err(SubjectError::new(
+                        "client_not_in_scenario_group",
+                        format!("client {label} is not a member of the selected scenario group"),
+                    ));
+                }
                 Ok(observe_client_exact(label.clone(), client))
             })
             .collect()

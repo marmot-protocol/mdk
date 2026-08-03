@@ -72,7 +72,7 @@ pub fn compare_trace_expectations(
 ) -> Vec<ExpectationFailure> {
     let mut failures = Vec::new();
     if let Some(expected) = expected_trace
-        && expected != observed
+        && !fixture_trace_eq(expected, observed)
     {
         failures.push(ExpectationFailure {
             kind: "trace_mismatch".into(),
@@ -493,7 +493,8 @@ impl TraceExpectation {
                 match client_canonical_observation(observed, client)
                     .or_else(|| client_observation(observed, client))
                 {
-                    Some(observation) if &observation.scenario_input_ledger == entries => {}
+                    Some(observation)
+                        if fixture_ledger_eq(&observation.scenario_input_ledger, entries) => {}
                     Some(observation) => mismatches.push(ExpectationFailure {
                         kind: "scenario_input_ledger_mismatch".into(),
                         message: format!(
@@ -682,6 +683,46 @@ impl TraceExpectation {
                     observed,
                     mismatches,
                 );
+            }
+        }
+    }
+}
+
+fn fixture_trace_eq(expected: &ScenarioTrace, observed: &ScenarioTrace) -> bool {
+    let mut expected = expected.clone();
+    let mut observed = observed.clone();
+    clear_wall_clock_ledger_measurements(&mut expected);
+    clear_wall_clock_ledger_measurements(&mut observed);
+    expected == observed
+}
+
+fn fixture_ledger_eq(
+    expected: &[ScenarioInputLedgerEntry],
+    observed: &[ScenarioInputLedgerEntry],
+) -> bool {
+    let normalize = |entries: &[ScenarioInputLedgerEntry]| {
+        entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.blocked_send_duration_us = 0;
+                entry
+            })
+            .collect::<Vec<_>>()
+    };
+    normalize(expected) == normalize(observed)
+}
+
+fn clear_wall_clock_ledger_measurements(trace: &mut ScenarioTrace) {
+    for observation in &mut trace.observations {
+        for entry in &mut observation.scenario_input_ledger {
+            entry.blocked_send_duration_us = 0;
+        }
+    }
+    for observation in &mut trace.decryptability_probes {
+        for probe in &mut observation.probes {
+            if let Some(entry) = &mut probe.recipient_ledger {
+                entry.blocked_send_duration_us = 0;
             }
         }
     }
@@ -1454,6 +1495,29 @@ mod tests {
         );
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].kind, "scenario_input_ledger_mismatch");
+    }
+
+    #[test]
+    fn fixture_comparison_ignores_wall_clock_blocked_send_measurements() {
+        let mut expected = observation("alice", 1, 2);
+        expected.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-4:send_app_message".into(),
+            blocked_send_duration_us: 1,
+            ..Default::default()
+        }];
+        let mut observed = expected.clone();
+        observed.scenario_input_ledger[0].blocked_send_duration_us = 42_000;
+
+        let failures = compare_trace_expectations(
+            Some(&trace(vec![expected.clone()])),
+            &[TraceExpectation::ScenarioInputLedger {
+                client: "alice".into(),
+                entries: expected.scenario_input_ledger,
+            }],
+            &trace(vec![observed]),
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
     }
 
     #[test]

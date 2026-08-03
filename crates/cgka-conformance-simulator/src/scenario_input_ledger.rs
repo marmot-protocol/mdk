@@ -81,7 +81,9 @@ pub struct ScenarioInputLedgerEntry {
     pub send_queued: usize,
     /// Wall-clock time spent accepted but blocked behind convergence before
     /// publication (or a terminal refusal/rollback).
-    #[serde(default)]
+    // Kept in the in-memory report so campaign aggregation can consume it,
+    // but excluded from deterministic traces and promoted fixtures.
+    #[serde(default, skip_serializing)]
     pub blocked_send_duration_us: u64,
     pub published: usize,
     pub ingest_attempts: usize,
@@ -544,6 +546,16 @@ mod tests {
         immediate.record_send_accepted(&metadata, false);
         immediate.record_published(&metadata);
         assert_eq!(immediate.snapshot()[0].blocked_send_duration_us, 0);
+    }
+
+    #[test]
+    fn blocked_send_duration_is_not_serialized_into_deterministic_traces() {
+        let entry = ScenarioInputLedgerEntry {
+            blocked_send_duration_us: 42,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(entry).expect("ledger serializes");
+        assert!(encoded.get("blocked_send_duration_us").is_none());
     }
 
     #[test]

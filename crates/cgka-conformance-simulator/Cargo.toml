@@ -13,7 +13,6 @@ conformance-slow = []
 # Full-engine A/B campaigns that disable only application-message witness
 # admission. This is a simulator experiment, not a supported wire policy.
 test-policy-overrides = ["cgka-engine/test-policy-overrides"]
-test-witness-comparison = ["test-policy-overrides"]
 
 [dependencies]
 cgka-traits.workspace = true

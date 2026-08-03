@@ -80,12 +80,13 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     ⇒ no label search) that returns the vector only when the recorded convergence
     decision reproduces. No reproduction ⇒ `AcceptError` (no vector).
 - **Module:** `src/artifact.rs`
-  - **Role:** Versioned evidence envelope and exact normalized-history gate. Legacy exports produce an explicitly
-    `outcome_equivalent_archetype` artifact with derived confidence and named unavailable fields. Exact import requires
-    a complete Scenario IR history, one source-event mapping per step, explicit source rows establishing the contested
-    incident, semantic expected outcomes, no embedded sensitive state, successful IR compilation, and simulator
-    reproduction. Exact semantic replay still marks raw MLS bytes and the engine checkpoint unavailable; byte replay
-    requires the separate local sensitive capsule path.
+  - **Role:** Versioned evidence envelope and producer-attested normalized-history gate. Legacy exports produce an
+    explicitly `outcome_equivalent_archetype` artifact with derived confidence and named unavailable fields. Attested
+    import checks a complete Scenario IR claim, one bounded source-event mapping per step, explicit source rows
+    establishing the contested incident, semantic expected outcomes, successful IR compilation, and simulator
+    reproduction. It does not independently prove action-to-event correspondence and marks unredacted imported
+    Scenario IR confidential. Raw MLS bytes and the engine checkpoint remain unavailable; byte replay requires the
+    separate local sensitive capsule path.
 - **Module:** `src/main.rs`
   - **Role:** CLI — classify one export file; for a fork-recovery or convergence
     incident, run the recover → accept → write pipeline. Exits 0 for any
@@ -180,8 +181,9 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
   The CLI rejects inputs larger than 64 MiB before JSON/NDJSON parsing.
 - Keep real inputs under ignored `incident-exports/` and generated local output under `target/` or ignored
-  `incident-replay-output/`. The shareable artifact is normalized evidence only. Never add sensitive local replay
-  capsules or raw forensic exports to version control.
+  `incident-replay-output/`. Producer-attested artifacts may contain unredacted Scenario IR labels and payloads;
+  treat them as confidential unless separately redacted and reviewed. Never add sensitive local replay capsules or
+  raw forensic exports to version control.
 
 ## Verification
 

@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use incident_replay::{
-    AgentStateExport, ForkCommitKind, IncidentScenarioArtifactV1, IncidentSourceFormatV1,
-    QuarantineReason, Verdict, accept, accept_convergence, accept_exact_history,
-    archetype_artifact, classify, import_exact_history, is_stream, liveness_advisory, parse,
+    AgentStateExport, ForkCommitKind, IncidentReplayFidelityV1, IncidentReproductionStatusV1,
+    IncidentScenarioArtifactV1, IncidentSourceFormatV1, NormalizedHistoryImportError,
+    QuarantineReason, Verdict, accept, accept_attested_history, accept_convergence,
+    archetype_artifact, classify, import_attested_history, is_stream, liveness_advisory, parse,
     parse_stream, recover_convergence, recover_fork,
 };
 
@@ -118,15 +119,15 @@ fn run_fork_recovery(
     source_format: IncidentSourceFormatV1,
     out_dir: Option<&Path>,
 ) -> ExitCode {
-    match import_exact_history(export, source_format) {
+    match import_attested_history(export, source_format) {
         Ok(Some(artifact)) => {
-            return match accept_exact_history(artifact) {
+            return match accept_attested_history(artifact) {
                 Ok(artifact) => persist_or_report(&artifact, out_dir),
-                Err(error) => quarantine(&error),
+                Err(error) => normalized_history_failure(&error),
             };
         }
         Ok(None) => {}
-        Err(error) => return quarantine(&error),
+        Err(error) => return normalized_history_failure(&error),
     }
     let fork = match recover_fork(export) {
         Ok(fork) => fork,
@@ -150,15 +151,15 @@ fn run_convergence(
     source_format: IncidentSourceFormatV1,
     out_dir: Option<&Path>,
 ) -> ExitCode {
-    match import_exact_history(export, source_format) {
+    match import_attested_history(export, source_format) {
         Ok(Some(artifact)) => {
-            return match accept_exact_history(artifact) {
+            return match accept_attested_history(artifact) {
                 Ok(artifact) => persist_or_report(&artifact, out_dir),
-                Err(error) => quarantine(&error),
+                Err(error) => normalized_history_failure(&error),
             };
         }
         Ok(None) => {}
-        Err(error) => return quarantine(&error),
+        Err(error) => return normalized_history_failure(&error),
     }
     let conv = match recover_convergence(export) {
         Ok(conv) => conv,
@@ -180,15 +181,31 @@ fn quarantine(reason: &dyn std::fmt::Display) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn normalized_history_failure(error: &NormalizedHistoryImportError) -> ExitCode {
+    if matches!(error, NormalizedHistoryImportError::Run(_)) {
+        eprintln!("error: normalized-history simulator infrastructure failed");
+        ExitCode::from(2)
+    } else {
+        quarantine(error)
+    }
+}
+
 /// Write the accepted vector plus evidence artifact to `out_dir`, or describe
 /// its fidelity when no directory was given.
 fn persist_or_report(artifact: &IncidentScenarioArtifactV1, out_dir: Option<&Path>) -> ExitCode {
+    if artifact.replay_fidelity == IncidentReplayFidelityV1::ProducerAttestedNormalizedHistory
+        && artifact.reproduction_status != IncidentReproductionStatusV1::Reproduced
+    {
+        eprintln!("error: refusing to persist an unreproduced normalized-history artifact");
+        return ExitCode::from(2);
+    }
     match out_dir {
         Some(dir) => match write_artifact(artifact, dir) {
             Ok((vector_path, artifact_path)) => {
                 println!(
-                    "accepted ({:?}): wrote {} and {}",
+                    "accepted ({:?}, {:?}): wrote {} and {}",
                     artifact.replay_fidelity,
+                    artifact.sensitivity,
                     vector_path.display(),
                     artifact_path.display()
                 );
@@ -201,9 +218,9 @@ fn persist_or_report(artifact: &IncidentScenarioArtifactV1, out_dir: Option<&Pat
         },
         None => {
             println!(
-                "accepted ({:?}): {}; exact byte replay unavailable without sensitive local state; unavailable fields: {} (pass an out-dir to persist)",
+                "accepted ({:?}, {:?}); byte replay unavailable without sensitive local state; unavailable fields: {} (pass an out-dir to persist)",
                 artifact.replay_fidelity,
-                artifact.vector.scenario_name,
+                artifact.sensitivity,
                 artifact
                     .unavailable_fields
                     .iter()
@@ -216,14 +233,20 @@ fn persist_or_report(artifact: &IncidentScenarioArtifactV1, out_dir: Option<&Pat
     }
 }
 
-/// Write a shareable vector and its evidence envelope owner-only. No source
-/// export, transport bytes, or MLS checkpoint is copied into either file.
+/// Write a vector and evidence envelope owner-only. Producer-attested Scenario
+/// IR may contain unredacted labels and payloads and remains confidential.
 fn write_artifact(
     artifact: &IncidentScenarioArtifactV1,
     dir: &Path,
 ) -> std::io::Result<(PathBuf, PathBuf)> {
     fs_private::create_dir_all_private(dir)?;
-    let stem = artifact_stem(&artifact.vector.scenario_name);
+    let stem = if artifact.sensitivity
+        == incident_replay::IncidentArtifactSensitivityV1::ConfidentialUnredactedScenario
+    {
+        "confidential-normalized-incident".to_owned()
+    } else {
+        artifact_stem(&artifact.vector.scenario_name)
+    };
     let vector_path = dir.join(format!("{stem}.v1.json"));
     let artifact_path = dir.join(format!("{stem}.incident.v1.json"));
     let vector_json = serde_json::to_string_pretty(&artifact.vector).expect("vector serializes");

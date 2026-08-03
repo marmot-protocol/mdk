@@ -1,8 +1,10 @@
 use incident_replay::{
-    EvidenceConfidenceV1, ExactHistoryImportError, ForkCommitKind, IncidentReplayFidelityV1,
-    IncidentSourceFormatV1, NormalizedActionEvidenceV1, NormalizedScenarioHistoryV1, RecoveredFork,
-    accept_exact_history, archetype_artifact, import_exact_history, parse, synthesize,
+    EvidenceConfidenceV1, ForkCommitKind, IncidentArtifactSensitivityV1, IncidentReplayFidelityV1,
+    IncidentReproductionStatusV1, IncidentSourceFormatV1, NormalizedActionEvidenceV1,
+    NormalizedHistoryImportError, NormalizedScenarioHistoryV1, RecoveredFork,
+    accept_attested_history, archetype_artifact, import_attested_history, parse, synthesize,
 };
+use std::collections::BTreeSet;
 
 fn export_with_history() -> incident_replay::AgentStateExport {
     let fork = RecoveredFork {
@@ -48,25 +50,38 @@ fn export_with_history() -> incident_replay::AgentStateExport {
 }
 
 #[test]
-fn exact_normalized_history_imports_and_reproduces() {
+fn producer_attested_history_imports_and_reproduces() {
     let export = export_with_history();
-    let artifact = import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument)
-        .expect("valid exact history imports")
+    let artifact = import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument)
+        .expect("valid normalized history imports")
         .expect("history is present");
 
     assert_eq!(
         artifact.replay_fidelity,
-        IncidentReplayFidelityV1::ExactNormalizedHistory
+        IncidentReplayFidelityV1::ProducerAttestedNormalizedHistory
     );
     assert_eq!(
         artifact.evidence_confidence,
-        EvidenceConfidenceV1::ExactNormalizedAvailableEvidence
+        EvidenceConfidenceV1::ProducerAttestedAvailableEvidence
+    );
+    assert_eq!(
+        artifact.sensitivity,
+        IncidentArtifactSensitivityV1::ConfidentialUnredactedScenario
+    );
+    assert_eq!(
+        artifact.reproduction_status,
+        IncidentReproductionStatusV1::Unverified
     );
     assert!(!artifact.byte_replay_available);
     assert!(artifact.unavailable_fields.iter().any(|field| {
         field.field == "mls_state_checkpoint" && field.reason.contains("sensitive")
     }));
-    accept_exact_history(artifact).expect("normalized history reproduces recorded outcomes");
+    let artifact =
+        accept_attested_history(artifact).expect("normalized history reproduces recorded outcomes");
+    assert_eq!(
+        artifact.reproduction_status,
+        IncidentReproductionStatusV1::Reproduced
+    );
 }
 
 #[test]
@@ -79,13 +94,13 @@ fn missing_action_mapping_fails_closed_instead_of_becoming_exact() {
         .action_evidence
         .pop();
     assert!(matches!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
-        Err(ExactHistoryImportError::IncompleteActionEvidence)
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::IncompleteActionEvidence)
     ));
 }
 
 #[test]
-fn exact_history_preconditions_have_typed_fail_closed_errors() {
+fn attested_history_preconditions_have_typed_fail_closed_errors() {
     let mut export = export_with_history();
     export
         .normalized_scenario_history
@@ -93,8 +108,8 @@ fn exact_history_preconditions_have_typed_fail_closed_errors() {
         .unwrap()
         .sensitive_state_included = true;
     assert!(matches!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
-        Err(ExactHistoryImportError::SensitiveStateIncluded)
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::SensitiveStateIncluded)
     ));
 
     let mut export = export_with_history();
@@ -105,8 +120,8 @@ fn exact_history_preconditions_have_typed_fail_closed_errors() {
         .expected_outcomes
         .clear();
     assert!(matches!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
-        Err(ExactHistoryImportError::MissingExpectedOutcomes)
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::MissingExpectedOutcomes)
     ));
 
     let mut export = export_with_history();
@@ -117,8 +132,8 @@ fn exact_history_preconditions_have_typed_fail_closed_errors() {
         .incident_event_indices
         .clear();
     assert!(matches!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
-        Err(ExactHistoryImportError::MissingIncidentEvidence)
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::MissingIncidentEvidence)
     ));
 
     let mut export = export_with_history();
@@ -130,8 +145,8 @@ fn exact_history_preconditions_have_typed_fail_closed_errors() {
         .action_evidence[0]
         .source_event_indices = vec![event_count];
     assert!(matches!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
-        Err(ExactHistoryImportError::SourceEventOutOfRange { .. })
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::SourceEventOutOfRange { .. })
     ));
 }
 
@@ -140,7 +155,7 @@ fn legacy_export_is_an_explicitly_inexact_archetype() {
     let mut export = export_with_history();
     export.normalized_scenario_history = None;
     assert!(
-        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument)
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument)
             .expect("absence is not malformed")
             .is_none()
     );
@@ -184,6 +199,82 @@ fn archetype_without_incident_evidence_fails_closed() {
             IncidentSourceFormatV1::AgentStateDocument,
             synthesize(&fork, "archetype/v1", "alice", "bob"),
         ),
-        Err(ExactHistoryImportError::MissingIncidentEvidence)
+        Err(NormalizedHistoryImportError::MissingIncidentEvidence)
     ));
+}
+
+#[test]
+fn committed_membership_fixture_drives_the_artifact_path() {
+    let export = parse(include_str!("fixtures/replayable-membership-fork.json"))
+        .expect("committed replay fixture parses");
+    let fork = RecoveredFork {
+        source_epoch: 30,
+        commit: ForkCommitKind::Membership,
+    };
+    let artifact = archetype_artifact(
+        &export,
+        IncidentSourceFormatV1::AgentStateDocument,
+        synthesize(&fork, "membership-fixture/v1", "alice", "bob"),
+    )
+    .expect("fixture carries contested incident evidence");
+    assert_eq!(
+        artifact.replay_fidelity,
+        IncidentReplayFidelityV1::OutcomeEquivalentArchetype
+    );
+}
+
+#[test]
+fn artifact_schema_tracks_the_serialized_top_level_contract() {
+    let export = export_with_history();
+    let artifact = import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument)
+        .expect("history imports")
+        .expect("history exists");
+    let artifact = accept_attested_history(artifact).expect("history reproduces");
+    let serialized = serde_json::to_value(&artifact).expect("artifact serializes");
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../schemas/incident-scenario-artifact.v1.schema.json"
+    ))
+    .expect("schema parses");
+
+    let actual = serialized
+        .as_object()
+        .expect("artifact is an object")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let declared = schema["properties"]
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let required = schema["required"]
+        .as_array()
+        .expect("schema required")
+        .iter()
+        .map(|value| value.as_str().expect("required name").to_owned())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        actual, declared,
+        "schema properties drifted from serde output"
+    );
+    assert_eq!(actual, required, "all v1 artifact fields must be required");
+    for field in [
+        "source_format",
+        "replay_fidelity",
+        "evidence_confidence",
+        "sensitivity",
+        "reproduction_status",
+    ] {
+        let value = serialized[field].as_str().expect("serialized enum");
+        assert!(
+            schema["properties"][field]["enum"]
+                .as_array()
+                .expect("schema enum")
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(value)),
+            "schema enum for {field} does not contain {value}"
+        );
+    }
 }

@@ -25,9 +25,10 @@
 //! - [`accept`] — [`accept::accept`] / [`accept::accept_convergence`] run the
 //!   synthesized scenario against the simulator and return the vector only if the
 //!   recorded outcome reproduces.
-//! - [`artifact`] — a versioned evidence envelope plus the fail-closed exact
-//!   normalized-history import/accept gate. Archetypes never masquerade as exact
-//!   replay, and byte replay remains unavailable without sensitive local state.
+//! - [`artifact`] — a versioned evidence envelope plus a fail-closed,
+//!   producer-attested normalized-history import/accept gate. Archetypes never
+//!   masquerade as source-verified replay, and byte replay remains unavailable
+//!   without sensitive local state.
 
 pub mod accept;
 pub mod artifact;
@@ -40,10 +41,10 @@ pub mod synth;
 
 pub use accept::{AcceptError, accept, accept_convergence};
 pub use artifact::{
-    EvidenceConfidenceV1, ExactHistoryImportError, IncidentReplayFidelityV1,
-    IncidentScenarioArtifactV1, IncidentSourceFormatV1, NormalizedActionEvidenceV1,
-    NormalizedScenarioHistoryV1, UnavailableEvidenceV1, accept_exact_history, archetype_artifact,
-    import_exact_history,
+    EvidenceConfidenceV1, IncidentArtifactSensitivityV1, IncidentReplayFidelityV1,
+    IncidentReproductionStatusV1, IncidentScenarioArtifactV1, IncidentSourceFormatV1,
+    NormalizedActionEvidenceV1, NormalizedHistoryImportError, NormalizedScenarioHistoryV1,
+    UnavailableEvidenceV1, accept_attested_history, archetype_artifact, import_attested_history,
 };
 pub use classify::{
     BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory,
