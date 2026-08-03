@@ -31,7 +31,7 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         method = "startup",
         allowed_senders = config.allowed_senders.len(),
         max_reply_bytes = config.max_reply_bytes,
-        harness = config.display_name,
+        harness = config.spec.display_name,
         "terminal harness starting"
     );
 
@@ -40,12 +40,12 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         config.socket.clone(),
         config.auth_token.clone(),
         config.request_timeout,
-        config.reply_prefix,
+        config.spec.reply_prefix,
     );
     let account_ref = resolve_account(
         &client,
         config.account_id_hex.as_deref(),
-        config.account_env_name,
+        config.spec.account_env_name,
     )
     .await?;
     install_allowlist(&client, &account_ref, &config.allowed_senders).await?;
@@ -239,7 +239,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                         &account_id_hex,
                         &group_id_hex,
                         &message.message_id_hex,
-                        &format!("[{}] too many prompts are already queued for this group; try again shortly.", ctx_for_reply.cfg.reply_prefix),
+                        &format!("[{}] too many prompts are already queued for this group; try again shortly.", ctx_for_reply.cfg.spec.reply_prefix),
                         0,
                     )
                     .await
@@ -329,7 +329,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                &format!("[{}] failed to prepare this prompt.", ctx.cfg.reply_prefix),
+                &format!(
+                    "[{}] failed to prepare this prompt.",
+                    ctx.cfg.spec.reply_prefix
+                ),
                 0,
             )
             .await;
@@ -455,7 +458,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 &inbound.message_ref,
                 &format!(
                     "[{}] {} failed while completing this prompt.",
-                    ctx.cfg.reply_prefix, ctx.cfg.display_name
+                    ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
                 ),
                 0,
             )
@@ -515,7 +518,7 @@ async fn finish_success(
             &inbound.message_ref,
             &format!(
                 "[{}] failed to deliver the complete {} response; some chunks may be missing.",
-                ctx.cfg.reply_prefix, ctx.cfg.display_name
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
             ),
             delivery.failure_chunk_index,
         )
@@ -524,11 +527,11 @@ async fn finish_success(
         let mut message = match outcome.error_summary {
             Some(summary) => format!(
                 "[{}] {} reported {summary}",
-                ctx.cfg.reply_prefix, ctx.cfg.display_name
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
             ),
             None => format!(
                 "[{}] {} produced no text output",
-                ctx.cfg.reply_prefix, ctx.cfg.display_name
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
             ),
         };
         if let Some(code) = outcome.exit_code
@@ -584,25 +587,25 @@ async fn handle_backend_run_failure(
     match &failure.error {
         HarnessError::BackendIdle => format!(
             "[{}] {} went silent for {}s without producing output; killing the invocation.",
-            config.reply_prefix,
-            config.display_name,
+            config.spec.reply_prefix,
+            config.spec.display_name,
             idle_timeout.as_secs()
         ),
         HarnessError::BackendTimedOut => {
             format!(
                 "[{}] {} timed out before producing a complete response.",
-                config.reply_prefix, config.display_name
+                config.spec.reply_prefix, config.spec.display_name
             )
         }
         HarnessError::BackendSpawn => {
             format!(
                 "[{}] failed to start {}; check {}.",
-                config.reply_prefix, config.display_name, config.bin_env_name
+                config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
         _ => format!(
             "[{}] {} failed while streaming its response.",
-            config.reply_prefix, config.display_name
+            config.spec.reply_prefix, config.spec.display_name
         ),
     }
 }
@@ -643,7 +646,7 @@ async fn resolve_cwd_and_prompt(
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                &format!("[{}] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.", ctx.cfg.reply_prefix),
+                &format!("[{}] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.", ctx.cfg.spec.reply_prefix),
                 0,
             )
             .await?;
@@ -660,7 +663,7 @@ async fn resolve_cwd_and_prompt(
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                &format!("[{}] {text}", ctx.cfg.reply_prefix),
+                &format!("[{}] {text}", ctx.cfg.spec.reply_prefix),
                 0,
             )
             .await?;
@@ -684,7 +687,7 @@ async fn resolve_cwd_and_prompt(
             &inbound.message_ref,
             &format!(
                 "[{}] Session workdir set to ~/{name}. Send your prompt.",
-                ctx.cfg.reply_prefix
+                ctx.cfg.spec.reply_prefix
             ),
             0,
         )
@@ -885,10 +888,16 @@ mod tests {
             state_path: root.join("sessions.json"),
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
-            display_name: "opencode",
-            reply_prefix: "wn-opencode",
-            bin_env_name: "WN_OPENCODE_BIN",
-            account_env_name: "WN_OPENCODE_ACCOUNT_ID_HEX",
+            spec: crate::ConfigSpec {
+                env_prefix: "WN_OPENCODE",
+                default_home_name: "harnesses",
+                default_bin: "opencode",
+                display_name: "opencode",
+                reply_prefix: "wn-opencode",
+                bin_env_name: "WN_OPENCODE_BIN",
+                account_env_name: "WN_OPENCODE_ACCOUNT_ID_HEX",
+                legacy_allowed_senders_env: Some("WN_OPENCODE_ADMIN_HEX"),
+            },
         }
     }
 

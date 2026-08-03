@@ -119,14 +119,21 @@ async fn run_with_bin(
             idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
         }
 
-        match timeout_at(idle_deadline, &mut writer_task).await {
-            Err(_) => return Err(HarnessError::BackendIdle),
-            Ok(result) => result.map_err(HarnessError::from)??,
-        }
-
         let (status, stderr) = match timeout_at(idle_deadline, async {
-            let status = child.wait().await.map_err(HarnessError::from)?;
-            let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
+            let (writer, status, stderr) =
+                tokio::join!(&mut writer_task, child.wait(), &mut stderr_task,);
+            let status = status.map_err(HarnessError::from)?;
+            let stderr = stderr.map_err(HarnessError::from)?;
+            match writer.map_err(HarnessError::from)? {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => debug!(
+                    target: TRACE_TARGET,
+                    method = "pi_run",
+                    error_kind = "stdin_closed",
+                    "backend closed stdin before draining the prompt"
+                ),
+                Err(_) => return Err(HarnessError::BackendStream),
+            }
             Ok::<_, HarnessError>((status, stderr))
         })
         .await
@@ -402,6 +409,44 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
             rx.recv().await,
             Some(RunnerEvent::Text("received:60000".to_owned()))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_preserves_exit_and_stderr_when_backend_closes_stdin() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("early-exit-pi");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+printf '%s\n' 'authentication required' >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let session_dir = root.path().join("sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            &session_dir,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "p".repeat(60_000),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(64));
+        assert_eq!(outcome.stderr, "authentication required");
     }
 
     #[tokio::test]

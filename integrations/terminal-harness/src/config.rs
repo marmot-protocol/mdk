@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,11 +41,6 @@ pub struct LoadedConfig {
     pub home: PathBuf,
     /// Backend command or absolute binary path.
     pub bin: String,
-}
-
-/// Loads shared connector configuration from the process environment.
-pub fn load_config_from_env(spec: ConfigSpec) -> Result<LoadedConfig> {
-    load_config_with(spec, &mut |name| env::var(name).ok())
 }
 
 /// Loads shared connector configuration from a caller-provided lookup function.
@@ -99,7 +93,12 @@ pub fn load_config_with(
         .transpose()?;
 
     let activation_name = env_name("ACTIVATION");
-    if lookup(&activation_name).as_deref().unwrap_or("always") != "always" {
+    if lookup(&activation_name)
+        .as_deref()
+        .unwrap_or("always")
+        .trim()
+        != "always"
+    {
         return Err(config_error(format!(
             "{activation_name} currently supports only `always`"
         )));
@@ -172,10 +171,7 @@ pub fn load_config_with(
             state_path,
             backend_timeout,
             backend_idle_timeout,
-            display_name: spec.display_name,
-            reply_prefix: spec.reply_prefix,
-            bin_env_name: spec.bin_env_name,
-            account_env_name: spec.account_env_name,
+            spec,
         },
         home,
         bin,
@@ -297,5 +293,16 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("MARMOT_ACCOUNT_ID_HEX"));
+    }
+
+    #[test]
+    fn shared_config_trims_activation_for_compatibility() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ACTIVATION", " always\n"),
+        ])
+        .unwrap();
+        assert_eq!(loaded.harness.spec.env_prefix, "WN_TEST");
     }
 }

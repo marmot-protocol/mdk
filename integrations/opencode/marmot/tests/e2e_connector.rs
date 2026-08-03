@@ -30,10 +30,7 @@ fn spawn_wn_opencode(context: HarnessContext<'_>) -> SpawnedChild {
         .env("WN_OPENCODE_MAX_REPLY_BYTES", MAX_REPLY_BYTES.to_string())
         .env("WN_OPENCODE_TIMEOUT_SECS", "5")
         .env("WN_OPENCODE_REQUEST_TIMEOUT_SECS", "5")
-        .env(
-            "RUST_LOG",
-            "warn,marmot_terminal_harness=info,wn_opencode=info",
-        );
+        .env("RUST_LOG", "warn,marmot_terminal_harness=info");
     SpawnedChild::spawn("wn-opencode", &mut command, context.root)
 }
 

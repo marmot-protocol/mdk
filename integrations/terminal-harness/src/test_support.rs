@@ -15,14 +15,14 @@ use tokio::net::UnixStream;
 use tokio::time::sleep;
 
 /// Stable synthetic group id used by connector e2e tests.
-pub const GROUP_ID_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const GROUP_ID_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 /// Stable synthetic message id used by connector e2e tests.
-pub const MESSAGE_ID_HEX: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+const MESSAGE_ID_HEX: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 /// Stable synthetic sender id permitted by connector e2e tests.
 pub const SENDER_ACCOUNT_ID_HEX: &str =
     "4444444444444444444444444444444444444444444444444444444444444444";
 /// Prompt injected through the debug control socket.
-pub const INBOUND_TEXT: &str = "ping from connector";
+const INBOUND_TEXT: &str = "ping from connector";
 /// Small reply cap that forces chunking in connector e2e tests.
 pub const MAX_REPLY_BYTES: usize = 64;
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(120);

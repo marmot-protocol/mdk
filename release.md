@@ -206,8 +206,13 @@ bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11
 
 Bridge and control logs for both terminal harnesses now use the
 `marmot_terminal_harness` tracing target. Include
-`marmot_terminal_harness=debug` in `RUST_LOG`; the former `wn_opencode` target
-continues to cover only OpenCode-specific command and event parsing.
+`marmot_terminal_harness=debug` in `RUST_LOG`. The former `wn_opencode` target
+no longer emits events, so existing filters that reference it must be updated.
+
+The terminal-harness installer now keeps prompt senders separate from invite
+authorization. Existing OpenCode automation must pass at least one explicit
+`--allow-welcomer`; `WN_OPENCODE_ALLOWED_SENDERS_HEX` configures prompt senders
+only and no longer satisfies the bootstrap welcomer requirement.
 
 Cut the release tag from the current `origin/master` commit:
 

@@ -20,17 +20,11 @@ pub async fn next_stdout_line(
 }
 
 /// Writes and closes backend stdin concurrently with stdout consumption.
-pub fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<Result<()>> {
+pub fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
         let mut stdin = stdin;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|_| HarnessError::BackendStream)?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|_| HarnessError::BackendStream)
+        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.shutdown().await
     })
 }
 
@@ -56,7 +50,7 @@ pub async fn capture_stderr(stderr: ChildStderr) -> String {
 pub async fn cleanup_failed_run(
     child: &mut Child,
     stderr_task: &mut JoinHandle<String>,
-    writer_task: Option<&mut JoinHandle<Result<()>>>,
+    writer_task: Option<&mut JoinHandle<std::io::Result<()>>>,
 ) {
     if let Some(task) = writer_task {
         task.abort();

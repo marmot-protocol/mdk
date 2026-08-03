@@ -35,9 +35,12 @@ max_reply_env="${env_prefix}_MAX_REPLY_BYTES"
 max_pending_env="${env_prefix}_MAX_PENDING_PER_GROUP"
 export "$bin_env=/bin/echo"
 allow_hex="$(printf '11%.0s' {1..32})"
+fixture_version="9.9.9"
+export FIXTURE_VERSION="$fixture_version"
 
 [ -x "$installer" ]
-bash -n "$installer" "$shared_installer"
+bash -n "$installer"
+bash -n "$shared_installer"
 
 assert_log_contains() {
     local log_file="$1"
@@ -75,6 +78,7 @@ run_linux_service_case() {
     local active="$2"
     local log_file="$3"
     local mock_bin="$fixture_root/mock-bin"
+    local output_file="$fixture_root/installer-output.log"
     shift 3
 
     : >"$log_file"
@@ -85,10 +89,11 @@ run_linux_service_case() {
     MARMOT_HOME="$fixture_root/marmot-home" \
     MARMOT_INSTALL_PREFIX="$fixture_root/install" \
     PATH="$mock_bin:/usr/bin:/bin" \
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-        "$installer" --yes --allow-welcomer "$allow_hex" "$@" >/dev/null 2>&1 || {
+    WN_AGENT_SHA="$fixture_version" \
+    MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+        "$installer" --yes --allow-welcomer "$allow_hex" "$@" >"$output_file" 2>&1 || {
         echo "installer failed for systemd scenario (log: $log_file)" >&2
+        cat "$output_file" >&2
         return 1
     }
 }
@@ -144,7 +149,7 @@ case "$archive_name" in
     *) exit 1 ;;
 esac
 platform="${archive_name#"$binary-"}"
-platform="${platform%-9.9.9.tar.gz}"
+platform="${platform%-$FIXTURE_VERSION.tar.gz}"
 if [ "$mode" = -tzf ]; then
     printf '%s\n' "$binary-$platform/$binary"
     if [ "${TEST_UNSAFE_ARCHIVE:-0}" = 1 ]; then
@@ -254,44 +259,49 @@ TEST_UNSAFE_ARCHIVE=1 \
 
 installer_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
     "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex"
 )"
 
 installer_service_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
     "$installer" --dry-run --yes --allow-welcomer "$allow_hex"
 )"
 
 installer_no_start_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
     "$installer" --dry-run --yes "--no-start-$harness_binary" --allow-welcomer "$allow_hex"
 )"
 
 installer_stdin_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
     MARMOT_TERMINAL_HARNESS="$kind" \
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$shared_installer"
 )"
 
+custom_root="$fixture_parent/custom"
 installer_custom_socket_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    "$installer" --dry-run --yes --no-service --socket /tmp/custom-wn-agent.sock --home /tmp/custom-marmot-home --allow-welcomer "$allow_hex"
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+    "$installer" --dry-run --yes --no-service \
+        --socket "$custom_root/wn-agent.sock" \
+        --home "$custom_root/marmot-home" \
+        --allow-welcomer "$allow_hex"
 )"
 
 prompt_sender_hex="$(printf '22%.0s' {1..32})"
 configured_sender_dry_run="$(
     env "$allowed_env=$prompt_sender_hex" \
-        WN_AGENT_SHA="9.9.9" \
-        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
         "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex"
 )"
 bootstrap_line="$(printf '%s\n' "$configured_sender_dry_run" | grep '\[dry-run\] wn-agent bootstrap')"
@@ -302,35 +312,40 @@ case "$bootstrap_line" in
 esac
 
 missing_allowlist_status=0
+missing_allowlist_stderr="$fixture_root/missing-allowlist.err"
 env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    "$installer" --dry-run --yes --no-service >/dev/null 2>&1 || missing_allowlist_status=$?
+    WN_AGENT_SHA="$fixture_version" \
+    MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+    "$installer" --dry-run --yes --no-service >/dev/null 2>"$missing_allowlist_stderr" || missing_allowlist_status=$?
 [ "$missing_allowlist_status" -ne 0 ]
+grep -F "at least one --allow-welcomer/--allow-sender value is required" \
+    "$missing_allowlist_stderr" >/dev/null
 
 bad_allowlist_status=0
+bad_allowlist_stderr="$fixture_root/bad-allowlist.err"
 env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    WN_AGENT_SHA="$fixture_version" \
+    MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
     "$installer" --dry-run --yes --no-service --allow-welcomer not-a-key \
-    >/dev/null 2>&1 || bad_allowlist_status=$?
+    >/dev/null 2>"$bad_allowlist_stderr" || bad_allowlist_status=$?
 [ "$bad_allowlist_status" -ne 0 ]
+grep -F "invalid allowlist value:" "$bad_allowlist_stderr" >/dev/null
 
 case "$installer_dry_run" in
-    *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
-    *) echo "pi installer dry-run did not use WN_AGENT_SHA asset suffix for wn-agent" >&2; exit 1;;
+    *"wn-agent-"*"$fixture_version.tar.gz"* ) ;;
+    *) echo "$kind installer dry-run did not use WN_AGENT_SHA asset suffix for wn-agent" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
-    *"$harness_binary-"*"9.9.9.tar.gz"* ) ;;
+    *"$harness_binary-"*"$fixture_version.tar.gz"* ) ;;
     *) echo "$kind installer dry-run did not use expected $harness_binary asset" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
-    *"wn-agent-v9.9.9-test"* ) ;;
-    *) echo "pi installer dry-run did not use requested release tag" >&2; exit 1;;
+    *"wn-agent-v$fixture_version-test"* ) ;;
+    *) echo "$kind installer dry-run did not use requested release tag" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
     *"bootstrap"*"--allow-welcomer"* ) ;;
-    *) echo "pi installer dry-run did not bootstrap with allowlist" >&2; exit 1;;
+    *) echo "$kind installer dry-run did not bootstrap with allowlist" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
     *"Terminal harness agent:"*"home: $default_home"* ) ;;
@@ -345,7 +360,7 @@ case "$installer_dry_run" in
     *) echo "$kind installer dry-run did not pass the terminal harness bootstrap label" >&2; exit 1;;
 esac
 case "$installer_stdin_dry_run" in
-    *"$harness_binary-"*"9.9.9.tar.gz"* ) ;;
+    *"$harness_binary-"*"$fixture_version.tar.gz"* ) ;;
     *) echo "$kind installer stdin dry-run did not use expected $harness_binary asset" >&2; exit 1;;
 esac
 case "$installer_stdin_dry_run" in
@@ -353,18 +368,18 @@ case "$installer_stdin_dry_run" in
     *) echo "$kind installer stdin dry-run did not use terminal harness Marmot home" >&2; exit 1;;
 esac
 case "$installer_custom_socket_dry_run" in
-    *"--socket /tmp/custom-wn-agent.sock"* ) ;;
-    *) echo "pi installer dry-run did not preserve explicit socket after --home" >&2; exit 1;;
+    *"--socket $custom_root/wn-agent.sock"* ) ;;
+    *) echo "$kind installer dry-run did not preserve explicit socket after --home" >&2; exit 1;;
 esac
 case "$installer_custom_socket_dry_run" in
-    *"/tmp/custom-marmot-home/dev/wn-agent.sock"* )
-        echo "pi installer dry-run overwrote explicit socket when --home followed --socket" >&2
+    *"$custom_root/marmot-home/dev/wn-agent.sock"* )
+        echo "$kind installer dry-run overwrote explicit socket when --home followed --socket" >&2
         exit 1
         ;;
 esac
 case "$installer_service_dry_run" in
     *"would write private env file"* ) ;;
-    *) echo "pi installer service dry-run did not write env file" >&2; exit 1;;
+    *) echo "$kind installer service dry-run did not write env file" >&2; exit 1;;
 esac
 case "$installer_service_dry_run" in
     *"would require $display_name binary: /bin/echo"* ) ;;
@@ -392,29 +407,29 @@ case "$(uname -s)" in
     Darwin)
         case "$installer_service_dry_run" in
             *"would install LaunchAgent"*"$agent_launchd.plist"* ) ;;
-            *) echo "pi installer service dry-run did not plan terminal harness wn-agent LaunchAgent" >&2; exit 1;;
+            *) echo "$kind installer service dry-run did not plan terminal harness wn-agent LaunchAgent" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would install LaunchAgent"*"org.marmot.$harness_binary.plist"* ) ;;
-            *) echo "pi installer service dry-run did not plan wn-pi LaunchAgent" >&2; exit 1;;
+            *) echo "$kind installer service dry-run did not plan $harness_binary LaunchAgent" >&2; exit 1;;
         esac
         ;;
     Linux)
         case "$installer_service_dry_run" in
             *"would install systemd user unit"*"$agent_service"* ) ;;
-            *) echo "pi installer service dry-run did not plan terminal harness wn-agent systemd unit" >&2; exit 1;;
+            *) echo "$kind installer service dry-run did not plan terminal harness wn-agent systemd unit" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would install systemd user unit"*"$harness_service"* ) ;;
-            *) echo "pi installer service dry-run did not plan wn-pi systemd unit" >&2; exit 1;;
+            *) echo "$kind installer service dry-run did not plan $harness_binary systemd unit" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would restart $agent_service when active; otherwise enable --now"* ) ;;
-            *) echo "pi installer did not plan active wn-agent restart" >&2; exit 1;;
+            *) echo "$kind installer did not plan active wn-agent restart" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would restart $harness_service when active; otherwise enable --now"* ) ;;
-            *) echo "pi installer did not plan active wn-pi restart" >&2; exit 1;;
+            *) echo "$kind installer did not plan active $harness_binary restart" >&2; exit 1;;
         esac
         ;;
 esac
@@ -423,12 +438,16 @@ case "$installer_no_start_dry_run" in
     *) echo "$kind installer no-start dry-run did not preserve service installation" >&2; exit 1;;
 esac
 
+# This is a literal source assertion.
+# shellcheck disable=SC2016
 grep -F 'if systemctl --user is-active --quiet "$unit"; then' "$shared_installer" >/dev/null || {
-    echo "pi installer does not distinguish active service upgrades" >&2
+    echo "$kind installer does not distinguish active service upgrades" >&2
     exit 1
 }
+# This is a literal source assertion.
+# shellcheck disable=SC2016
 grep -F 'run systemctl --user restart "$unit"' "$shared_installer" >/dev/null || {
-    echo "pi installer does not restart active services" >&2
+    echo "$kind installer does not restart active services" >&2
     exit 1
 }
 

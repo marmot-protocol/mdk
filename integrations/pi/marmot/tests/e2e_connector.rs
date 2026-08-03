@@ -31,7 +31,7 @@ fn spawn_wn_pi(context: HarnessContext<'_>) -> SpawnedChild {
         .env("WN_PI_MAX_REPLY_BYTES", MAX_REPLY_BYTES.to_string())
         .env("WN_PI_TIMEOUT_SECS", "5")
         .env("WN_PI_REQUEST_TIMEOUT_SECS", "5")
-        .env("RUST_LOG", "warn,marmot_terminal_harness=info,wn_pi=info");
+        .env("RUST_LOG", "warn,marmot_terminal_harness=info");
     SpawnedChild::spawn("wn-pi", &mut command, context.root)
 }
 

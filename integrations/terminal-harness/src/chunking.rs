@@ -1,5 +1,5 @@
 /// Splits a reply into UTF-8-safe chunks no larger than `max_bytes`.
-pub fn split_reply_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
+pub(crate) fn split_reply_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     assert!(max_bytes >= 4, "max_bytes must fit any UTF-8 scalar value");
     if text.len() <= max_bytes {
         return vec![text];

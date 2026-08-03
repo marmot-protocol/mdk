@@ -18,8 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 pub use bridge::run;
-pub use chunking::split_reply_chunks;
-pub use config::{ConfigSpec, LoadedConfig, load_config_from_env, load_config_with};
+pub use config::{ConfigSpec, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
 
 /// Default maximum byte length for one Marmot reply chunk.
@@ -52,14 +51,8 @@ pub struct Config {
     pub backend_timeout: Duration,
     /// Maximum backend stdout silence.
     pub backend_idle_timeout: Duration,
-    /// Lowercase backend name used in user-visible failures.
-    pub display_name: &'static str,
-    /// Harness identity used in replies and request ids.
-    pub reply_prefix: &'static str,
-    /// Backend binary environment variable named in startup failures.
-    pub bin_env_name: &'static str,
-    /// Account environment variable named when account selection is ambiguous.
-    pub account_env_name: &'static str,
+    /// Connector identity and naming.
+    pub spec: ConfigSpec,
 }
 
 /// One backend invocation prepared by the shared bridge.
@@ -120,7 +113,7 @@ pub trait Backend: Send + Sync + 'static {
 }
 
 /// Returns the current user's home directory or fails closed when it is unset.
-pub fn dirs_home() -> Result<PathBuf> {
+pub(crate) fn dirs_home() -> Result<PathBuf> {
     env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| HarnessError::Config("$HOME is not set".to_owned()))
