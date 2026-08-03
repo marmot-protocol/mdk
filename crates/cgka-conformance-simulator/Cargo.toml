@@ -17,6 +17,8 @@ test-policy-overrides = ["cgka-engine/test-policy-overrides"]
 [dependencies]
 cgka-traits.workspace = true
 cgka-engine = { workspace = true, features = ["test-conformance-snapshot"] }
+marmot-app.workspace = true
+marmot-account.workspace = true
 marmot-forensics.workspace = true
 storage-sqlite = { workspace = true, features = ["test-conformance-replay"] }
 fs-private.workspace = true
@@ -30,10 +32,11 @@ serde = { workspace = true }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 rand.workspace = true
 nostr.workspace = true
+nostr-relay-builder.workspace = true
 proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true

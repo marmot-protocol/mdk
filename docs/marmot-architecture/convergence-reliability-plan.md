@@ -861,15 +861,29 @@ Recent runtime/storage hardening constrains this adapter without completing it:
   adopted identity model. Scenario IR and process adapters must identify account-device instances explicitly and must
   not assume that same-account device admission, synchronization, or repair semantics already exist.
 
-- [ ] Give every participant a unique restrictive root and SQLCipher database.
-- [ ] Drive only public app-runtime operations.
-- [ ] Exercise real account/device lifecycle, projections, outbound publication, relay sync/backfill, and retries.
-- [ ] Compare engine state commitments and user-visible chat/member/admin/message projections.
-- [ ] Compare the three equivalence layers independently: shared protocol state, scenario-input/application projection,
+- [x] Give every participant a unique restrictive root and SQLCipher database.
+- [x] Drive only public app-runtime operations.
+- [x] Exercise real account/device lifecycle, projections, outbound publication, relay sync/backfill, and retries.
+- [x] Compare engine state commitments and user-visible chat/member/admin/message projections.
+- [x] Compare the three equivalence layers independently: shared protocol state, scenario-input/application projection,
   and local operational diagnostics.
-- [ ] Crash/reopen the complete runtime.
-- [ ] Exercise long-offline sync where no live message arms epoch-stall backfill, and prove the selected EOSE/full-history
+- [x] Crash/reopen the complete runtime.
+- [x] Exercise long-offline sync where no live message arms epoch-stall backfill, and prove the selected EOSE/full-history
   completeness policy closes the gap.
+
+The app-runtime adapter owns a real loopback relay but treats every account-device as a separate application: a
+private root, account identity, runtime worker set, SQLCipher projection database, event subscription, and lifecycle.
+Its versioned observation keeps three independent layers. The shared layer hashes only public protocol facts (epoch,
+roster, admin set, and signed profile); the application layer records visible chat output, invalidated rows, invite
+projection state, and runtime notifications; the local layer records encrypted-database posture, catch-up/reopen
+counts, and privacy-safe failure classes. It never opens an `AppClient`, engine session, engine storage, or the
+test-only canonical snapshot.
+
+The quiet-offline test exposed the expected blind spot in purely incremental restart: a participant could recover an
+older message and commit yet remain one epoch behind forever when no post-reconnect object existed to arm the
+undecryptable-message detector. `MarmotAppRuntime::repair_full_history` is therefore the explicit public repair seam.
+It performs one account-wide, unfloored relay query through the ordinary ingest/convergence/projection pipeline; normal
+startup remains cursor-based. Scenario IR `FullHistory` and set-reconciliation sync modes select that operation.
 
 ### 5.2 Simulator node process
 

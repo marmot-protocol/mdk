@@ -20,6 +20,7 @@
 //!
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
+pub mod app_runtime;
 mod audit_capture;
 pub mod bus;
 mod campaign_metrics;
@@ -51,6 +52,11 @@ pub mod subject;
 mod topology;
 pub mod vector;
 
+pub use app_runtime::{
+    APP_RUNTIME_OBSERVATION_SCHEMA_VERSION, AppRuntimeApplicationProjectionV1, AppRuntimeHarness,
+    AppRuntimeLocalDiagnosticsV1, AppRuntimeObservationV1, AppRuntimeProtocolProjectionV1,
+    AppRuntimeScenarioResultV1,
+};
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use campaign_metrics::{
     CampaignHistogramBucketV1, CampaignHistogramV1, CampaignMeasurementsV1,

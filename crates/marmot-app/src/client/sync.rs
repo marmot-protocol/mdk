@@ -651,6 +651,18 @@ impl AppClient {
         Ok(())
     }
 
+    /// Explicit account-wide repair for a host that has independent evidence
+    /// its incremental cursor may be incomplete (for example, a long-offline
+    /// participant that has no new traffic capable of arming epoch-stall
+    /// detection). Unlike the automatic detector path, this is a caller-owned
+    /// operation and therefore does not mutate the detector's debounce state.
+    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
+        self.runtime.activate_transport(None).await?;
+        let mut summary = self.sync_sdk_relay().await?;
+        summary.merge(self.drain_pending_session_events().await?);
+        Ok(summary)
+    }
+
     pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,

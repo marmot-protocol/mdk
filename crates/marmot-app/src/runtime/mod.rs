@@ -976,6 +976,16 @@ impl MarmotAppRuntime {
         self.accounts.catch_up_accounts().await
     }
 
+    /// Explicitly repair a potentially incomplete incremental history.
+    ///
+    /// This public application operation performs one account-wide
+    /// full-history relay query and uses the same ingest, convergence, and
+    /// projection path as ordinary catch-up. It is intended for user- or
+    /// diagnostics-directed repair; normal startup remains cursor-based.
+    pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.repair_full_history(account_ref).await
+    }
+
     pub async fn collect_notifications_after_wake(
         &self,
         max_wait_ms: u32,
