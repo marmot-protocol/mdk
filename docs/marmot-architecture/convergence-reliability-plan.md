@@ -82,9 +82,12 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 - queue emptiness does not prove all client, pass, publication, retry, deferred, or projection work is quiescent;
 - generated storms are structural tests rather than sustained rate/volume campaigns;
 - scenario seeds do not reproduce randomized MLS bytes;
-- the initial independent reference adapter covers common symbolic lifecycle behavior, but not the complete production
-  selector, persistence, or liveness state space;
-- Tamarin abstracts clocks, crash/restart, durable generations, resource bounds, fairness, and sustained self-updates.
+- the independent selector/canonicalization model covers bounded authenticated input, dependency, witness, selection,
+  and disposition behavior, while production persistence remains exercised by engine and retained-relay subjects;
+- TLA+/TLC and Stateright now cover a bounded lifecycle/fairness state space, while real process/VM scheduling and
+  production app-runtime lifecycle behavior remain future milestones;
+- Tamarin remains focused on symbolic safety/security and executable bounded policy cases rather than wall-clock or
+  process scheduling.
 
 ## Program Principles
 
@@ -121,7 +124,7 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 | 1. Trustworthy engine black box | Exact oracle, public subject boundary, full quiescence, replay capsules | complete | Known semantic mutations fail and captured failures replay |
 | 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | complete | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | complete | Headline workload families produce bounded, diagnosable results |
-| 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | not-started | Model and tests detect seeded policy/lifecycle defects |
+| 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | complete | Model and tests detect seeded policy/lifecycle defects |
 | 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | not-started | The same case agrees in-process and across N processes |
 | 6. Distributed campaigns | Container/VM/network/disk/version hardening and campaign operations | not-started | Repeatable soak and release campaigns retain actionable artifacts |
 
@@ -136,12 +139,12 @@ The initial assurance matrix is below. “Required verification” names the min
 
 | ID | Claim | Required assumptions | Required verification | Status |
 | --- | --- | --- | --- | --- |
-| S1 | Same retained anchor, authenticated input closure, policy version, and engine version produce the same canonical branch and exact state | Finite relevant input set; every compared client possesses the same validated dependency closure | Independent reference comparison; schedule/restart metamorphic tests; bounded model | specified |
+| S1 | Same retained anchor, authenticated input closure, policy version, and engine version produce the same canonical branch and exact state | Finite relevant input set; every compared client possesses the same validated dependency closure | Independent reference comparison; schedule/restart metamorphic tests; bounded model | partially-covered |
 | S2 | Application output after settlement is exactly the payload/state-change projection of the selected branch | MLS and Marmot payload authentication succeeds; invalidations reach projection | Exact scenario-input/output ledger; losing-branch and superseded-state scenarios; Tamarin output lemmas | partially-covered |
 | S3 | Missing retained state, invalid policy, corrupt frozen input, and exhausted replay budget never apply a partial candidate result | Storage reports failures accurately; fail-closed errors are durable or retryable by contract | Engine tests, crash matrix, resource campaigns, seeded mutations | partially-covered |
 | S4 | Publish-before-apply and convergence lifecycle changes are torn-write-free | Storage transaction contract holds; external publication results are accurately reported | Storage/engine lifecycle tests; kill/restart at each durable transition | partially-covered |
-| S5 | For one retained authenticated input set and fixed horizon eligibility, changing delivery partitioning across convergence passes or scheduler timing does not change the eventual canonical result | All pending passes are eventually revisited; required retained state remains available; no compared run crosses a semantic retention/eligibility boundary | Controlled pass-partition and virtual-time metamorphic tests; separately classified horizon-assumption violations | unverified |
-| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named durable fail-closed/non-progress state with an explicit repair path | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios; repair-path tests | unverified |
+| S5 | For one retained authenticated input set and fixed horizon eligibility, changing delivery partitioning across convergence passes or scheduler timing does not change the eventual canonical result | All pending passes are eventually revisited; required retained state remains available; no compared run crosses a semantic retention/eligibility boundary | Controlled pass-partition and virtual-time metamorphic tests; separately classified horizon-assumption violations | partially-covered |
+| L1 | After relevant input closes and all required history is locally available, convergence reaches `Settled` or a named durable fail-closed/non-progress state with an explicit repair path | Client continues executing; resource policy admits the workload | Bounded state-machine liveness model; engine and retained-relay scenarios; repair-path tests | partially-covered |
 | L2 | Outbound work blocked by convergence is eventually released, regenerated, or terminated with an explicit outcome | L1 assumptions; publication path eventually returns a result | Scheduler/outbound ledger assertions; crash/restart scenarios | partially-covered |
 | L3 | Marmot does not guarantee that a privileged administrative transition becomes canonical while valid selection-relevant input, including ordinary self-updates, continues without bound | The bounded post-settlement preparation opportunity remains enforced; stronger progress requires eventual relevant-input closure | Adversarial model and sustained simulator family; bounded preparation-opportunity tests | specified |
 | S6 | Clients are exactly equivalent only when the canonical conformance projection, including its domain-separated exporter commitment, matches | Synthetic/local conformance execution; raw exporter secret never leaves the test process | M1.1 exact snapshot comparison; mismatched-member, component, disposition, output, and commitment sentinels | specified |
@@ -823,10 +826,16 @@ metamorphic test and replay-budget fail-closed/repair campaign.
 
 ### Milestone 4 Exit Gate
 
-- [ ] The independent model and production engine agree over the bounded corpus.
-- [ ] Every targeted semantic mutation is killed or becomes a tracked verification gap.
-- [ ] Liveness counterexamples name the violated assumption.
-- [ ] The self-update/adversarial-progress decision is part of the protocol contract.
+- [x] The independent model and production engine agree over the bounded corpus.
+- [x] Every targeted semantic mutation is killed or becomes a tracked verification gap.
+- [x] Liveness counterexamples name the violated assumption.
+- [x] The self-update/adversarial-progress decision is part of the protocol contract.
+
+Milestone 4 is complete. The independent reference and production implementations agree over the committed policy
+corpus, proposal/dependency sentinels, common engine lifecycle case, and 256 generated shrinkable cases. TLC exhausts
+the fair bounded lifecycle and the expected-failure unfair run emits a counterexample tied to a named closure/fairness
+assumption. All nine targeted semantic mutants are killed, and the protocol decision gate covers every P/E/A constant
+while pinning the adopted self-update non-guarantee and future policy-component rule.
 
 ## Milestone 5: Application And Multi-Process Simulation
 
@@ -1019,3 +1028,8 @@ incorrect result.
 | 2026-08-02 | 3.3 attested/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed producer-attested normalized Scenario IR import with per-step and contested-incident source mappings, explicit trust/sensitivity status, semantic reproduction, and owner-only vector/evidence output | Full `incident-replay` suite; `producer_attested_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
 | 2026-08-02 | Milestone 3 integration verification | Preserved legacy client identities while limiting account-scoped credential sharing to explicitly authored topology; all canonical semantic oracles and active decryptability probes remain compatible with the new deployment model | `implicit_topology_preserves_legacy_client_identity_seeds`; `explicit_topology_shares_account_identity_across_devices`; `cargo test -p cgka-conformance-simulator --test canonical_scenarios` (41 passed) |
+| 2026-08-03 | 4.1 independent reference model | Added a type-independent authenticated candidate/dependency/proposal/witness selector and disposition model, including witness-free comparison; differentially checked the adopted corpus, production canonicalizer sentinels, common full-engine lifecycle, and 256 shrinkable generated cases | `independent_reference_model` (7 tests); source-coupling guard; `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters` |
+| 2026-08-03 | 4.2 bounded liveness and lifecycle model | Selected TLA+/TLC as temporal authority and Stateright as the Rust trace bridge; checked input closure, strong fairness, freeze/settle, crash/restart, temporary resource failure, unequal histories, and stranded-joiner repair; retained an expected unfair counterexample with stable Scenario IR action identity | `lifecycle_model` (4 tests); `just tla-liveness` (684 distinct states, 1,785 generated, depth 14); `just tla-liveness-counterexample` |
+| 2026-08-03 | 4.3 semantic mutation adequacy | Added nine simulator-only one-rule mutants spanning selection, witness handling, cutoff/frozen state, scheduling, output, publication, and retention; every mutant is killed and the checked matrix maps it to independent and production-shaped evidence | `mutation_adequacy` (2 tests); [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) |
+| 2026-08-03 | 4.4 protocol decision gate | Reverified adopted Marmot convergence commit `4ad4ae2`, classified every P/E/A ledger id, pinned all v1 policy values and the future required-component rule, and demonstrated operational non-interference across batch, wake-delay, and temporary-resource variants | `protocol_decision_gate` (5 tests); [`PROTOCOL_DECISIONS.md`](../../crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md); `just convergence-ledger-gate` |
+| 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
