@@ -908,18 +908,51 @@ the process contract.
 
 ### 5.3 Process orchestrator
 
-- [ ] Allocate one isolated root per participant.
-- [ ] Launch and barrier N participant processes.
-- [ ] Kill, pause, resume, and restart individual participants.
-- [ ] Connect all participants to controlled local relay topologies.
-- [ ] Preserve the canonical Scenario IR action schedule and observation schema.
+- [x] Allocate one isolated root per participant.
+- [x] Launch and barrier N participant processes.
+- [x] Kill, pause, resume, and restart individual participants.
+- [x] Connect all participants to controlled local relay topologies.
+- [x] Preserve the canonical Scenario IR action schedule and observation schema.
+
+`ProcessOrchestrator` compiles the same Scenario IR used by the engine subject, owns one or more local retained relays,
+and launches one `cgka-conformance-node` process for each account-device participant. Participant labels are hashed
+before they become filesystem components; each process gets a private root, private stderr file, and a stable durable
+identity across restart. On Unix each child is its own process-group leader, so crash actions kill and reap the entire
+owned group while offline/reconnect actions use real process suspension and resumption. The parent re-establishes peer
+aliases and scenario-group selections after a restart before continuing the canonical schedule.
+
+The process report retains the compiler's expanded action schedule, records an outcome for every executed action, and
+uses the node's versioned layered observation schema. Explicit topology relay labels become parent-owned local relay
+instances; a process may connect to any declared subset, while client-only legacy scenarios resolve to one shared
+relay. The process adapter defines settlement only from public projection commitments and observable node progress.
+It does not query engine queues or child databases.
 
 ### Milestone 5 Exit Gate
 
-- [ ] The same scenario reaches equivalent results through engine, app-runtime, and process adapters.
-- [ ] Application projections contain no losing/superseded output after settlement.
-- [ ] Process kill/restart agrees with uninterrupted execution.
-- [ ] Failure capsules identify participant, action, layer, and replay instructions without sensitive production logs.
+- [x] The same scenario reaches equivalent results through engine, app-runtime, and process adapters.
+- [x] Application projections contain no losing/superseded output after settlement.
+- [x] Process kill/restart agrees with uninterrupted execution.
+- [x] Failure capsules identify participant, action, layer, and replay instructions without sensitive production logs.
+
+Milestone 5 is complete. `process_orchestrator_milestone5` drives one canonical scenario through the engine,
+`MarmotAppRuntime`, and a real child process and compares epoch, roster size, signed group profile, and the normalized
+public app/process commitment. A two-participant, two-relay scenario proves stable convergence and visible-message
+projection with no invalidated output. Its lifecycle variant performs real pause, resume, process-group kill, durable
+restart, full-history repair, and settlement, then compares the final protocol and application projections with the
+uninterrupted run. The failure path writes an owner-only shareable capsule containing the scenario participant label,
+stable action id, `app_process` layer, normalized error classification, and replay instructions; a controlled marker
+test proves producer error text is not copied into it.
+
+Milestone 5 verification:
+
+```sh
+cargo test -p cgka-conformance-simulator \
+  --test app_runtime_milestone5 \
+  --test node_protocol_milestone5 \
+  --test process_orchestrator_milestone5
+cargo clippy -p cgka-conformance-simulator --all-targets -- -D warnings
+just fast-ci
+```
 
 ## Milestone 6: Distributed Campaigns And Operations
 

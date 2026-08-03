@@ -1,0 +1,427 @@
+use std::collections::BTreeSet;
+
+use cgka_conformance_simulator::process_orchestrator::ProcessOrchestrator;
+use cgka_conformance_simulator::{
+    AppRuntimeHarness, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
+    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, compile_scenario, run_scenario_report,
+    run_scenario_report_with_subject,
+};
+
+fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
+    ScenarioStep::InGroup {
+        group: group.into(),
+        action: Box::new(action),
+    }
+}
+
+fn process_scenario(name: &str, lifecycle: bool) -> ScenarioSpec {
+    let clients = vec!["alice".to_owned(), "bob".to_owned()];
+    let mut steps = vec![
+        in_group(
+            "main",
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "process group".into(),
+                invitees: vec!["bob".into()],
+                required_features: Vec::new(),
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            },
+        ),
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: clients.clone(),
+        },
+    ];
+    if lifecycle {
+        steps.extend([
+            ScenarioStep::SetClientOffline {
+                client: "bob".into(),
+            },
+            ScenarioStep::ReconnectClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::CrashProcess {
+                process: "process:bob".into(),
+            },
+            ScenarioStep::RestartProcess {
+                process: "process:bob".into(),
+            },
+        ]);
+    }
+    steps.extend([
+        in_group(
+            "main",
+            ScenarioStep::UpdateGroupData {
+                client: "alice".into(),
+                name: "settled process group".into(),
+                pending: "rename".into(),
+            },
+        ),
+        in_group(
+            "main",
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "visible after settlement".into(),
+            },
+        ),
+        ScenarioStep::SyncRelayHistory {
+            clients: clients.clone(),
+            sync: cgka_conformance_simulator::ScenarioRelaySyncModeV2::FullHistory,
+        },
+        in_group(
+            "main",
+            ScenarioStep::ClearEvents {
+                clients: clients.clone(),
+            },
+        ),
+        ScenarioStep::AwaitQuiescence {
+            policy: cgka_conformance_simulator::QuiescencePolicy {
+                max_iterations: 100,
+                ..Default::default()
+            },
+        },
+        in_group(
+            "main",
+            ScenarioStep::Observe {
+                clients: clients.clone(),
+            },
+        ),
+    ]);
+    ScenarioSpec {
+        name: name.into(),
+        spec_version: "2".into(),
+        clients,
+        topology: controlled_relay_topology(),
+        steps,
+    }
+}
+
+fn controlled_relay_topology() -> ScenarioTopologyV2 {
+    ScenarioTopologyV2 {
+        accounts: ["alice", "bob"]
+            .into_iter()
+            .map(|client| ScenarioAccountV2 {
+                id: format!("account:{client}"),
+                roles: vec!["member".into()],
+            })
+            .collect(),
+        devices: ["alice", "bob"]
+            .into_iter()
+            .map(|client| ScenarioDeviceV2 {
+                id: format!("device:{client}"),
+                account: format!("account:{client}"),
+                process: format!("process:{client}"),
+                client: client.into(),
+            })
+            .collect(),
+        processes: ["alice", "bob"]
+            .into_iter()
+            .map(|client| ScenarioProcessV2 {
+                id: format!("process:{client}"),
+                binary_version: "current-test-node".into(),
+                policy_version: "marmot-convergence-v1".into(),
+                relays: vec!["relay:a".into(), "relay:b".into()],
+            })
+            .collect(),
+        groups: Vec::new(),
+        relays: ["relay:a", "relay:b"]
+            .into_iter()
+            .map(|id| ScenarioRelayV2 {
+                id: id.into(),
+                implementation_version: "mock-relay-v1".into(),
+                policy_version: "retain-all-v1".into(),
+            })
+            .collect(),
+    }
+}
+
+fn cross_adapter_scenario() -> ScenarioSpec {
+    ScenarioSpec {
+        name: "milestone5-cross-adapter".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            in_group(
+                "main",
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "initial".into(),
+                    invitees: Vec::new(),
+                    required_features: Vec::new(),
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "create".into(),
+                },
+            ),
+            in_group(
+                "main",
+                ScenarioStep::UpdateGroupData {
+                    client: "alice".into(),
+                    name: "equivalent result".into(),
+                    pending: "rename".into(),
+                },
+            ),
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            in_group(
+                "main",
+                ScenarioStep::Observe {
+                    clients: vec!["alice".into()],
+                },
+            ),
+        ],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
+    let spec = process_scenario("milestone5-process", false);
+    let expected_schedule = compile_scenario(&spec).unwrap().expanded_schedule();
+    let mut orchestrator =
+        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
+            .await
+            .unwrap();
+    let roots = orchestrator.participant_roots();
+    assert_eq!(roots.values().collect::<BTreeSet<_>>().len(), 2);
+    #[cfg(unix)]
+    for root in roots.values() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    let report = orchestrator.run(&spec).await.unwrap();
+    assert!(report.completed, "{report:#?}");
+    assert_eq!(report.canonical_schedule, expected_schedule);
+    assert_eq!(report.actions.len(), expected_schedule.len());
+    let final_observations = &report.observations[report.observations.len() - 2..];
+    assert_eq!(
+        final_observations
+            .iter()
+            .map(|item| item.protocol.state_commitment_sha256.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{final_observations:#?}"
+    );
+    for observation in final_observations {
+        assert_eq!(observation.protocol.member_identities, ["alice", "bob"]);
+        assert_eq!(observation.protocol.group_name, "settled process group");
+        assert_eq!(
+            observation.application.visible_plaintexts,
+            ["visible after settlement"]
+        );
+        assert!(observation.application.invalidated_message_ids.is_empty());
+        assert!(observation.progress.observably_quiescent());
+    }
+    orchestrator.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state() {
+    let spec = cross_adapter_scenario();
+    let engine_report = run_scenario_report(&spec, None).await.unwrap();
+    let engine = engine_report
+        .observed_trace
+        .as_ref()
+        .unwrap()
+        .observations
+        .last()
+        .unwrap();
+
+    let mut app = AppRuntimeHarness::new(&spec.clients).await.unwrap();
+    let app_report = run_scenario_report_with_subject(&spec, None, Vec::new(), &mut app)
+        .await
+        .unwrap();
+    assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
+    let app_observation = app.observations(&spec.clients).await.unwrap().remove(0);
+
+    let mut process =
+        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
+            .await
+            .unwrap();
+    let process_report = process.run(&spec).await.unwrap();
+    assert!(process_report.completed, "{process_report:#?}");
+    let process_observation = process_report.observations.last().unwrap();
+
+    assert_eq!(engine.epoch, app_observation.protocol.epoch);
+    assert_eq!(engine.epoch, process_observation.protocol.epoch);
+    assert_eq!(engine.member_count, app_observation.protocol.member_count);
+    assert_eq!(
+        engine.member_count,
+        process_observation.protocol.member_count
+    );
+    assert_eq!(engine.group_name, app_observation.protocol.group_name);
+    assert_eq!(engine.group_name, process_observation.protocol.group_name);
+    assert_eq!(
+        app_observation.protocol.state_commitment_sha256,
+        process_observation.protocol.state_commitment_sha256
+    );
+    assert_eq!(app_observation.protocol.member_identities, ["alice"]);
+    assert_eq!(app_observation.protocol.admin_identities, ["alice"]);
+
+    process.shutdown().await;
+    app.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_kill_pause_resume_and_restart_agree_with_uninterrupted_execution() {
+    let uninterrupted_spec = process_scenario("milestone5-uninterrupted", false);
+    let mut uninterrupted = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &uninterrupted_spec,
+    )
+    .await
+    .unwrap();
+    let uninterrupted_report = uninterrupted.run(&uninterrupted_spec).await.unwrap();
+    assert!(uninterrupted_report.completed, "{uninterrupted_report:#?}");
+    let uninterrupted_final =
+        &uninterrupted_report.observations[uninterrupted_report.observations.len() - 2..];
+    uninterrupted.shutdown().await;
+
+    let recovered_spec = process_scenario("milestone5-recovered", true);
+    let mut recovered =
+        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &recovered_spec)
+            .await
+            .unwrap();
+    let recovered_report = recovered.run(&recovered_spec).await.unwrap();
+    assert!(recovered_report.completed, "{recovered_report:#?}");
+    let recovered_final = &recovered_report.observations[recovered_report.observations.len() - 2..];
+
+    let public_results =
+        |observations: &[cgka_conformance_simulator::node_protocol::NodeObservationV1]| {
+            observations
+                .iter()
+                .map(|item| {
+                    (
+                        item.participant.clone(),
+                        item.protocol.clone(),
+                        item.application.visible_plaintexts.clone(),
+                        item.application.invalidated_message_ids.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+    assert_eq!(
+        public_results(uninterrupted_final),
+        public_results(recovered_final)
+    );
+    assert!(
+        recovered_report
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "paused")
+    );
+    assert!(
+        recovered_report
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "resumed")
+    );
+    assert!(
+        recovered_report
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "killed")
+    );
+    assert!(
+        recovered_report
+            .lifecycle
+            .iter()
+            .any(|event| event.event == "restarted")
+    );
+    recovered.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_failures_write_replayable_privacy_safe_capsules() {
+    let marker = "sensitive-production-log-marker";
+    let mut spec = process_scenario("milestone5-failure-capsule", false);
+    spec.steps.push(in_group(
+        "main",
+        ScenarioStep::ExpectUpdateAdminPolicyError {
+            client: "alice".into(),
+            admins: vec!["alice".into()],
+            error: marker.into(),
+        },
+    ));
+    let mut orchestrator =
+        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
+            .await
+            .unwrap();
+    let report = orchestrator.run(&spec).await.unwrap();
+    assert!(!report.completed);
+    assert_eq!(report.failure_capsules.len(), 1);
+    let capsule_path = &report.failure_capsules[0];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(capsule_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let encoded = std::fs::read_to_string(capsule_path).unwrap();
+    assert!(!encoded.contains(marker));
+    let capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
+        serde_json::from_str(&encoded).unwrap();
+    assert_eq!(capsule.participant, "alice");
+    assert!(
+        capsule
+            .action_id
+            .contains("expect_update_admin_policy_error")
+    );
+    assert_eq!(capsule.layer, "app_process");
+    assert!(!capsule.replay.steps.is_empty());
+    assert!(!capsule.sensitive_data_included);
+    orchestrator.shutdown().await;
+}
+
+#[test]
+fn process_cli_writes_a_private_versioned_report() {
+    let root = tempfile::tempdir().unwrap();
+    let scenario_path = root.path().join("scenario.json");
+    let report_path = root.path().join("report.json");
+    fs_private::write_private(
+        &scenario_path,
+        &serde_json::to_vec_pretty(&cross_adapter_scenario()).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-process"))
+        .arg(&scenario_path)
+        .arg(env!("CARGO_BIN_EXE_cgka-conformance-node"))
+        .arg(&report_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&report_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let report: cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1 =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report.schema_version, "1");
+    assert!(report.completed, "{report:#?}");
+}

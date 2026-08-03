@@ -22,7 +22,7 @@ async fn node_wraps_one_runtime_and_defines_observable_quiescence() {
         NodeCommandV1::Initialize {
             participant: "alice".into(),
             root: root.path().to_path_buf(),
-            relay_url,
+            relay_urls: vec![relay_url],
         },
     )
     .await

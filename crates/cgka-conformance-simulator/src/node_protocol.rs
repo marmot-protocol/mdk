@@ -19,7 +19,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
+use tokio::sync::broadcast;
 
+use crate::app_runtime::public_protocol_projection;
 use crate::{
     AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1, SubjectFailureCategory,
 };
@@ -52,7 +54,7 @@ pub enum NodeCommandV1 {
     Initialize {
         participant: String,
         root: PathBuf,
-        relay_url: String,
+        relay_urls: Vec<String>,
     },
     ConfigurePeers {
         accounts_by_participant: BTreeMap<String, String>,
@@ -101,6 +103,9 @@ pub enum NodeCommandV1 {
     Observe {
         action_id: String,
     },
+    ClearEvents {
+        action_id: String,
+    },
     Barrier {
         action_id: String,
         barrier: String,
@@ -132,7 +137,7 @@ pub enum NodeResponseBodyV1 {
     },
     Observation {
         action_id: String,
-        observation: NodeObservationV1,
+        observation: Box<NodeObservationV1>,
     },
     BarrierReady {
         action_id: String,
@@ -256,6 +261,8 @@ struct NodeRuntimeState {
     previous_checkpoint: Option<String>,
     stable_checkpoint_observations: u32,
     retry_timer_armed: bool,
+    events: broadcast::Receiver<marmot_app::MarmotAppEvent>,
+    runtime_events_observed: usize,
 }
 
 impl Default for NodeServer {
@@ -305,8 +312,8 @@ impl NodeServer {
             NodeCommandV1::Initialize {
                 participant,
                 root,
-                relay_url,
-            } => self.initialize(participant, root, relay_url).await,
+                relay_urls,
+            } => self.initialize(participant, root, relay_urls).await,
             NodeCommandV1::Shutdown => {
                 self.shutdown().await;
                 Ok(NodeResponseBodyV1::Shutdown)
@@ -319,7 +326,7 @@ impl NodeServer {
         &mut self,
         participant: String,
         root: PathBuf,
-        relay_url: String,
+        relay_urls: Vec<String>,
     ) -> Result<NodeResponseBodyV1, NodeErrorV1> {
         if self.state.is_some() {
             return Err(protocol_error(
@@ -328,10 +335,16 @@ impl NodeServer {
             ));
         }
         fs_private::create_dir_all_private(&root).map_err(environment_node_error)?;
+        if relay_urls.is_empty() {
+            return Err(protocol_error(
+                "missing_relay",
+                "node initialization requires at least one relay",
+            ));
+        }
         let home = AccountHome::open(&root);
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             &root,
-            vec![relay_url.clone()],
+            relay_urls.clone(),
             home,
             MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
         )
@@ -347,10 +360,15 @@ impl NodeServer {
         let account_id = if let Some(account) = existing {
             account.account_id_hex
         } else {
+            let endpoints = relay_urls
+                .iter()
+                .cloned()
+                .map(TransportEndpoint::from)
+                .collect::<Vec<_>>();
             runtime
                 .create_identity(AccountSetupRequest {
-                    default_relays: vec![TransportEndpoint::from(relay_url.clone())],
-                    bootstrap_relays: vec![TransportEndpoint::from(relay_url)],
+                    default_relays: endpoints.clone(),
+                    bootstrap_relays: endpoints,
                     publish_missing_relay_lists: true,
                     publish_initial_key_package: true,
                     ..AccountSetupRequest::default()
@@ -360,6 +378,7 @@ impl NodeServer {
                 .account
                 .account_id_hex
         };
+        let events = runtime.subscribe();
         self.state = Some(NodeRuntimeState {
             participant,
             app,
@@ -371,6 +390,8 @@ impl NodeServer {
             previous_checkpoint: None,
             stable_checkpoint_observations: 0,
             retry_timer_armed: false,
+            events,
+            runtime_events_observed: 0,
         });
         Ok(NodeResponseBodyV1::Initialized { account_id })
     }
@@ -521,8 +542,15 @@ impl NodeServer {
                 let observation = observe_node(state).await?;
                 Ok(NodeResponseBodyV1::Observation {
                     action_id,
-                    observation,
+                    observation: Box::new(observation),
                 })
+            }
+            NodeCommandV1::ClearEvents { action_id } => {
+                while state.events.try_recv().is_ok() {}
+                state.runtime_events_observed = 0;
+                state.previous_checkpoint = None;
+                state.stable_checkpoint_observations = 0;
+                Ok(ack(action_id, 0, None))
             }
             NodeCommandV1::Barrier { action_id, barrier } => {
                 Ok(NodeResponseBodyV1::BarrierReady { action_id, barrier })
@@ -616,6 +644,9 @@ async fn accept_active_invite(state: &mut NodeRuntimeState) -> Result<(), NodeEr
 }
 
 async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1, NodeErrorV1> {
+    while state.events.try_recv().is_ok() {
+        state.runtime_events_observed = state.runtime_events_observed.saturating_add(1);
+    }
     let group_id = active_group(state)?;
     let group_id_hex = hex::encode(group_id.as_slice());
     let group = state
@@ -700,7 +731,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
         invalidated_message_ids,
         pending_confirmation: group.pending_confirmation,
         stored_member_count: group.member_count,
-        runtime_events_observed: 0,
+        runtime_events_observed: state.runtime_events_observed,
     };
     let checkpoint = projection_checkpoint(&protocol, &application);
     if state.previous_checkpoint.as_ref() == Some(&checkpoint) {
@@ -796,33 +827,6 @@ fn parse_group_id(value: &str) -> Result<GroupId, NodeErrorV1> {
         ));
     }
     Ok(GroupId::new(bytes))
-}
-
-fn public_protocol_projection(
-    epoch: u64,
-    member_identities: Vec<String>,
-    admin_identities: Vec<String>,
-    group_name: String,
-    member_count: usize,
-) -> AppRuntimeProtocolProjectionV1 {
-    let state_commitment_sha256 = hex::encode(Sha256::digest(
-        serde_json::to_vec(&(
-            epoch,
-            &member_identities,
-            &admin_identities,
-            &group_name,
-            member_count,
-        ))
-        .expect("public node projection is serializable"),
-    ));
-    AppRuntimeProtocolProjectionV1 {
-        epoch,
-        member_identities,
-        admin_identities,
-        group_name,
-        member_count,
-        state_commitment_sha256,
-    }
 }
 
 fn projection_checkpoint(

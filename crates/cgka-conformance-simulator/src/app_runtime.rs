@@ -12,8 +12,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
-    AccountSetupRequest, AppError, AppGroupRecord, AppMessageQuery, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime,
+    AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
+    MarmotAppRuntime,
 };
 use nostr_relay_builder::MockRelay;
 use serde::{Deserialize, Serialize};
@@ -241,10 +241,11 @@ impl AppRuntimeHarness {
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
         let participant = self.participant_mut(client)?;
-        if participant.online && participant.runtime.is_some() {
-            if let Some(runtime) = participant.runtime.take() {
-                runtime.shutdown().await;
-            }
+        if participant.online
+            && participant.runtime.is_some()
+            && let Some(runtime) = participant.runtime.take()
+        {
+            runtime.shutdown().await;
         }
         participant.app = app_for_root(participant.root(), &relay_url);
         let runtime = MarmotAppRuntime::new(participant.app.clone());
@@ -412,6 +413,11 @@ impl AppRuntimeHarness {
             SubjectError::new("scenario_group_missing", "no scenario group is selected")
         })?;
         let group_id = self.active_group()?;
+        let participant_by_account = self
+            .participants
+            .iter()
+            .map(|(label, participant)| (participant.account_id.clone(), label.clone()))
+            .collect::<BTreeMap<_, _>>();
         let participant = self.participant_mut(client)?;
         drain_runtime_events(participant);
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -420,20 +426,45 @@ impl AppRuntimeHarness {
             .group(&participant.account_id, &group_id_hex)
             .map_err(app_error)?
             .ok_or_else(|| SubjectError::new("unknown_group", "group projection is missing"))?;
-        let mut members = participant
+        let members = participant
             .cached_members
             .get(&group_label)
             .cloned()
             .unwrap_or_default();
+        let mut members = members
+            .into_iter()
+            .map(|account| {
+                participant_by_account
+                    .get(&account)
+                    .cloned()
+                    .unwrap_or_else(|| opaque_public_identity(&account))
+            })
+            .collect::<Vec<_>>();
         members.sort();
-        let mut admins = group.admin_policy.admins.clone();
+        let mut admins = group
+            .admin_policy
+            .admins
+            .iter()
+            .map(|account| {
+                participant_by_account
+                    .get(account)
+                    .cloned()
+                    .unwrap_or_else(|| opaque_public_identity(account))
+            })
+            .collect::<Vec<_>>();
         admins.sort();
         let epoch = participant
             .cached_epochs
             .get(&group_label)
             .copied()
             .unwrap_or(group.nostr_routing_last_epoch);
-        let protocol = protocol_projection(epoch, members, admins, &group);
+        let protocol = public_protocol_projection(
+            epoch,
+            members,
+            admins,
+            group.profile.name.clone(),
+            group.member_count.unwrap_or_default() as usize,
+        );
         let messages = participant
             .app
             .messages_with_query(
@@ -843,11 +874,12 @@ fn app_for_root(root: &Path, relay_url: &str) -> MarmotApp {
     )
 }
 
-fn protocol_projection(
+pub(crate) fn public_protocol_projection(
     epoch: u64,
     member_identities: Vec<String>,
     admin_identities: Vec<String>,
-    group: &AppGroupRecord,
+    group_name: String,
+    member_count: usize,
 ) -> AppRuntimeProtocolProjectionV1 {
     #[derive(Serialize)]
     struct Commitment<'a> {
@@ -857,8 +889,11 @@ fn protocol_projection(
         group_name: &'a str,
         member_count: usize,
     }
-    let member_count = group.member_count.unwrap_or(member_identities.len() as u64) as usize;
-    let group_name = group.profile.name.clone();
+    let member_count = if member_count == 0 {
+        member_identities.len()
+    } else {
+        member_count
+    };
     let encoded = serde_json::to_vec(&Commitment {
         epoch,
         member_identities: &member_identities,
@@ -875,6 +910,13 @@ fn protocol_projection(
         member_count,
         state_commitment_sha256: hex::encode(Sha256::digest(encoded)),
     }
+}
+
+fn opaque_public_identity(account: &str) -> String {
+    format!(
+        "opaque:{}",
+        &hex::encode(Sha256::digest(account.as_bytes()))[..16]
+    )
 }
 
 fn drain_runtime_events(participant: &mut Participant) {

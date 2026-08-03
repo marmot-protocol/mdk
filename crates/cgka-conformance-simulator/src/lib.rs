@@ -37,6 +37,7 @@ pub mod policy_cases;
 pub mod policy_contract;
 #[cfg(feature = "test-policy-overrides")]
 mod policy_sweep;
+pub mod process_orchestrator;
 pub mod proptest_support;
 mod quiescence;
 pub mod reference_convergence;
