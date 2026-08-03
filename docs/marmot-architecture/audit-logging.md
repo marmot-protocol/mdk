@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-07-25
+updated: 2026-07-30
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -189,6 +189,13 @@ and retain the raw line for forward-compatible reprocessing.
 | `group` | `convergence_max_rewind_commits` | Group-specific convergence rewind policy when set, otherwise current default context. |
 
 ## Event catalogue
+
+This catalogue is not yet complete. `AuditEventKind` currently has 41 variants, and these twelve have no section here
+yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
+`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_armed`,
+`group_hydration_quarantined`, `group_hydration_recovered`, `message_content_decoded`,
+`pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`, `sync_drain`,
+and `transport_received`.
 
 ### `recorder_started`
 
@@ -578,11 +585,17 @@ Current `new_state` values:
 
 Current `reason` values found in production call sites:
 
+- `founding_create`
 - `hydrate_stable_group`
+- `hydrate_unrecoverable_group`
+- `hydrate_durable_group_evolution`
 - `join_welcome`
+- `join_welcome_repair`
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
+- `auto_commit_stage_failed`
+- `update_group_data_stage_failed`
 - `fork_detected`
 - `missing_retained_anchor`
 
@@ -590,6 +603,13 @@ Metadata notes:
 
 - `epoch_confirmed` and `epoch_rolled_back` remain the detailed publish lifecycle rows. `epoch_state_changed` is the
   state-machine breadcrumb that lets analyzers reconstruct the client's group state without replaying engine internals.
+- `new_state = "unrecoverable"` is a terminal halt: convergence and ingest stay blocked for that group until a verified
+  repair path clears the marker, and `reason = "hydrate_unrecoverable_group"` means the halt was durable and survived a
+  process restart. `crates/incident-replay` treats these rows as one of its two halt surfaces (the other being
+  `convergence_run_state` with `phase = "unrecoverable"`) and quarantines the export naming the affected engines —
+  unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
+  `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
+  Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
 
 ### `group_state_changed`
 
@@ -699,6 +719,63 @@ Metadata notes:
 - `candidate_count` and `eligible_count` are copied from the canonicalization result that drove the decision.
 - If `error_kinds` contains `missing_retained_anchor`, the engine also emits `epoch_state_changed` with
   `new_state = "unrecoverable"` and `reason = "missing_retained_anchor"`.
+
+### `convergence_run_state`
+
+Emitted when a distributed-convergence run changes lifecycle phase. Correlated with its `convergence_decision` through
+the `convergence.run_id` context, so a run's phases and its selection are one story.
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | Lifecycle phase the run moved into. |
+| `current_tip_epoch` | Canonical tip the run is working from. An epoch the engine has locally materialized. |
+| `retained_anchor_horizon` | Retained-history horizon available to the run, when known. |
+| `reason` | Stable call-site reason for the phase change, when one applies. |
+| `error_kind` | Stable error tag underlying a failed or unrecoverable phase. |
+
+`phase` values:
+
+- `started`
+- `waiting`
+- `evaluating`
+- `selected`
+- `blocked`
+- `applied`
+- `failed`
+- `stable`
+- `unrecoverable`
+
+`reason` values found in production call sites:
+
+- `no_eligible_input`
+- `resolving`
+- `syncing`
+- `blocked`
+- `group_quarantined`
+- `already_unrecoverable`
+- `frozen_pass_integrity_failure`
+
+`error_kind` values found in production call sites:
+
+- `frozen_member_integrity`
+- `missing_retained_anchor`
+
+Metadata notes:
+
+- This event has `group_ref`.
+- `phase = "unrecoverable"` is terminal: the convergence pass halted and the group stays blocked until a verified repair
+  path clears the marker. `crates/incident-replay` treats it as one of its two halt surfaces (the other being
+  `epoch_state_changed` with `new_state = "unrecoverable"`) and quarantines the export naming the affected engines.
+- `current_tip_epoch` is the engine's own materialized tip, so analyzers may fold it into a per-engine epoch high-water
+  mark the same way they fold `convergence_decision.current_tip_epoch`. Real exports carry roughly twice as many
+  run-state rows as decisions, making this the denser of the two signals.
+- A pass whose base epoch disagrees with the tip is no longer a halt. Older exports carry that disagreement as
+  `phase = "unrecoverable"` with `reason = "convergence_pass_base_changed"` and `error_kind = "base_epoch_mismatch"`;
+  since mdk#1182 the engine discards the stale pass and reopens at the tip, emitting the non-terminal
+  `convergence_pass_discarded` instead. Analyzers reading historical exports should still recognize the retired pair as
+  a halt; nothing emits it today.
+- The `missing_retained_anchor` halt is the one `unrecoverable` phase that carries no `reason`, only that `error_kind`,
+  so a consumer reporting a halt reason must fall back to `error_kind`.
 
 ### `peeler_outcome`
 

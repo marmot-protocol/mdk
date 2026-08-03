@@ -29,6 +29,13 @@
 //!   producer-attested normalized-history import/accept gate. Archetypes never
 //!   masquerade as source-verified replay, and byte replay remains unavailable
 //!   without sensitive local state.
+//! - [`route`] — [`route::route`] composes the above into one
+//!   [`route::Routing`]: the primary [`route::Outcome`] plus the
+//!   [`route::Advisory`] lines for co-occurring findings. Every incident route
+//!   reads the producer-attested history first and only then synthesizes an
+//!   archetype, and a route whose recovery fails closed falls through to the
+//!   remaining lower-precedence ones, so a reproducible incident sharing the
+//!   export is not discarded.
 
 pub mod accept;
 pub mod artifact;
@@ -37,6 +44,7 @@ pub mod convergence;
 pub mod export;
 pub mod fork;
 pub mod ndjson;
+pub mod route;
 pub mod synth;
 
 pub use accept::{AcceptError, accept, accept_convergence};
@@ -47,7 +55,8 @@ pub use artifact::{
     UnavailableEvidenceV1, accept_attested_history, archetype_artifact, import_attested_history,
 };
 pub use classify::{
-    BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory,
+    BehindEngine, BehindMode, HaltedEngine, QuarantineReason, Verdict, classify, halt_advisory,
+    liveness_advisory,
 };
 pub use convergence::{
     ConvergenceDecisionKind, ConvergenceRecoveryError, RecoveredConvergence, recover_convergence,
@@ -55,4 +64,7 @@ pub use convergence::{
 pub use export::{AgentStateExport, ParseError, parse};
 pub use fork::{ForkCommitKind, ForkRecoveryError, RecoveredFork, recover_fork};
 pub use ndjson::{StreamParseError, is_stream, parse_stream};
+pub use route::{
+    Advisory, CONVERGENCE_NAME, INCIDENT_NAME, MEMBERSHIP_INCIDENT_NAME, Outcome, Routing, route,
+};
 pub use synth::{synthesize, synthesize_convergence};

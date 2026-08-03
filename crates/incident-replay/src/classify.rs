@@ -4,7 +4,7 @@
 //! this verdict, so a healthy export yields zero vectors and a clean exit rather
 //! than a crash. Built incrementally, one rule per behaviour.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::export::{AgentStateExport, EventKind};
@@ -75,6 +75,23 @@ pub enum QuarantineReason {
     TruncatedProjections,
     /// A fork resolution's winning snapshot was missing — unreproducible.
     MissingSnapshot,
+    /// Engines recorded halting unrecoverably and are *still* halted at the end
+    /// of the export: no verified repair cleared the marker afterwards. Unlike
+    /// [`QuarantineReason::EpochDivergence`], this is not an inference from lag —
+    /// the engine itself recorded that it stopped — so it needs no cross-pull
+    /// confirmation and it is a diagnosis rather than a re-pull target. There is
+    /// still nothing to replay: a halt is a client failure, not a branch contest.
+    ///
+    /// "Still halted" is decided per `(engine, group)` by comparing the newest
+    /// halt row against the newest verified-repair row
+    /// (`epoch_state_changed { new_state: "stable", reason: "join_welcome_repair"
+    /// }`); surviving halts then fold back per engine. See [`HaltLifecycle`] for
+    /// why newest-wins needs no global ordering and why missing evidence keeps the
+    /// halt.
+    UnrecoverableHalt {
+        /// Every engine that recorded a halt, in engine-id order.
+        engines: Vec<HaltedEngine>,
+    },
     /// Engines trail the group's epoch high-water mark by at least
     /// [`EPOCH_DIVERGENCE_MIN_LAG`] epochs with no recorded contest explaining
     /// it. Persistent across pulls this is a silent split; on any single pull an
@@ -101,6 +118,14 @@ impl fmt::Display for QuarantineReason {
             QuarantineReason::MissingSnapshot => {
                 f.write_str("a fork resolution's winning snapshot was missing")
             }
+            QuarantineReason::UnrecoverableHalt { engines } => {
+                f.write_str("engines halted unrecoverably:")?;
+                for (index, engine) in engines.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { ", " };
+                    write!(f, "{separator}{engine}")?;
+                }
+                Ok(())
+            }
             QuarantineReason::EpochDivergence {
                 group_epoch,
                 engines,
@@ -113,6 +138,21 @@ impl fmt::Display for QuarantineReason {
                 Ok(())
             }
         }
+    }
+}
+
+/// One engine that recorded halting unrecoverably.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HaltedEngine {
+    /// The engine that halted.
+    pub engine_id: String,
+    /// Every distinct halt reason it recorded, deduplicated and in sort order.
+    pub reasons: Vec<String>,
+}
+
+impl fmt::Display for HaltedEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.engine_id, self.reasons.join(", "))
     }
 }
 
@@ -201,8 +241,17 @@ pub fn classify(export: &AgentStateExport) -> Verdict {
     if kinds().any(EventKind::is_fork_resolution) {
         return Verdict::ForkRecovery;
     }
-    // No contested branch anywhere — the liveness gate now guards the healthy
-    // verdict. It ranks below the incident routes deliberately: a reproducible
+    // No contested branch anywhere. Two liveness gates now guard the healthy
+    // verdict, the better-evidenced one first: an engine that *recorded* halting
+    // unrecoverably outranks one merely *inferred* to be behind, because the halt
+    // is the engine's own statement and it usually explains the lag (on the real
+    // 26a9f546 export the halted engine is exactly the one the divergence gate
+    // labelled `went dark`). Reporting the inference over the diagnosis would
+    // send the operator to re-pull for confirmation they already have.
+    if let Some(reason) = unrecoverable_halt(export) {
+        return Verdict::Quarantine { reason };
+    }
+    // The liveness gate ranks below the incident routes deliberately: a reproducible
     // contest is worth replaying even when another engine's data is stale
     // (recovery fail-closes downstream if the data it needs is missing). It
     // exists because a stuck or dead device is only visible *across* engines:
@@ -223,12 +272,126 @@ pub fn classify(export: &AgentStateExport) -> Verdict {
 /// convergence) outranks the liveness gate on purpose — so an export that
 /// carries *both* a replayable incident and an engine left behind routes to the
 /// incident, and the liveness signal never reaches the operator. This exposes the
-/// same rule-5 computation so a caller (the CLI) can surface it as a secondary
+/// same rule-6 computation so a caller (the CLI) can surface it as a secondary
 /// advisory alongside the primary outcome. Returns `None` when no engine is left
 /// behind — the gate stays unarmed on untimed or synthetic exports, exactly as
 /// [`classify`]'s healthy path does.
 pub fn liveness_advisory(export: &AgentStateExport) -> Option<QuarantineReason> {
     epoch_divergence(export)
+}
+
+/// The unrecoverable-halt incident an export carries, independent of its routing
+/// [`Verdict`].
+///
+/// The sibling of [`liveness_advisory`], for the same reason: [`classify`]
+/// returns one verdict, so an export carrying both a replayable incident and a
+/// halted engine routes to the incident and the halt would never reach the
+/// operator. The CLI prints this as a secondary advisory alongside the primary
+/// outcome.
+pub fn halt_advisory(export: &AgentStateExport) -> Option<QuarantineReason> {
+    unrecoverable_halt(export)
+}
+
+/// One group's halt lifecycle on one engine, folded from the event log.
+///
+/// `Unrecoverable` is per-group state with exactly one legal exit, so the halt
+/// and its repair are a two-event lifecycle rather than two independent facts —
+/// hence the newest of each, not a count.
+#[derive(Default)]
+struct HaltLifecycle<'a> {
+    /// Every distinct reason the engine gave for halting this group.
+    reasons: BTreeSet<&'a str>,
+    /// The newest halt row's timestamp, when the halt rows carry one.
+    last_halt_ms: Option<u64>,
+    /// The newest verified-repair row's timestamp, when it carries one.
+    last_repair_ms: Option<u64>,
+}
+
+impl HaltLifecycle<'_> {
+    /// Whether the halt still stands at the end of the export.
+    ///
+    /// Newest-repair-strictly-after-newest-halt is the whole rule, and it needs
+    /// no global event ordering because a live halt is *continuously
+    /// re-asserted*: opening a session over a durably halted group re-emits
+    /// `hydrate_unrecoverable_group` (`cgka-engine/src/engine.rs`) and every
+    /// convergence attempt against one emits `already_unrecoverable`
+    /// (`cgka-engine/src/distributed_convergence.rs`). A halt that outlived a
+    /// repair therefore leaves rows *after* it, and one that did not, does not.
+    /// Both rows also come from a single engine — one clock, one recorder file —
+    /// so none of rule 6's cross-device [`CATCH_UP_GRACE_MS`] skew allowance
+    /// applies and a strict comparison is sound. (`seq` must never be substituted
+    /// for the clock: it restarts at 0 on every recorder open *within the same
+    /// file*, so it does not order rows across a restart — the exact boundary a
+    /// durable halt survives. See `docs/marmot-architecture/audit-logging.md`.)
+    ///
+    /// Absence fails closed in both directions: an unrepaired halt keeps its
+    /// quarantine, and so does a halt whose evidence cannot be ordered. Untimed
+    /// rows never clear anything — arming rule 5 needs no timestamps, but
+    /// *clearing* it does, and guessing here would turn a real halt into a
+    /// healthy verdict. This is also why untimed fixtures and
+    /// pre-instrumentation exports classify exactly as before.
+    fn still_halted(&self) -> bool {
+        if self.reasons.is_empty() {
+            return false;
+        }
+        match (self.last_halt_ms, self.last_repair_ms) {
+            (Some(halt), Some(repair)) => repair <= halt,
+            _ => true,
+        }
+    }
+}
+
+/// The gate for engines that recorded halting unrecoverably.
+///
+/// Like the liveness gate it fires only on positive evidence, but it needs far
+/// less of it to arm: a halt is self-reported, so no threshold is needed to
+/// distinguish it from noise. It does require an `engine_id` — the report is
+/// per-engine, and an unattributable halt could not be named.
+///
+/// The gate is *cleared* per `(engine_id, group_ref)` rather than per engine,
+/// because that is the granularity the halt actually has: the engine's state
+/// machine holds `Unrecoverable` for one group, and a repair in another group
+/// proves nothing about it. Surviving halts then fold back per engine, so an
+/// engine halted in two groups is still one halted engine with the union of its
+/// reasons — the report shape rule 5 has always had.
+fn unrecoverable_halt(export: &AgentStateExport) -> Option<QuarantineReason> {
+    let mut lifecycles: BTreeMap<(&str, Option<&str>), HaltLifecycle> = BTreeMap::new();
+    for event in &export.events {
+        let Some(engine_id) = event.engine_id.as_deref() else {
+            continue;
+        };
+        let group_scope = (engine_id, event.group_ref.as_deref());
+        if let Some(reason) = event.kind.unrecoverable_halt_reason() {
+            let lifecycle = lifecycles.entry(group_scope).or_default();
+            lifecycle.reasons.insert(reason);
+            lifecycle.last_halt_ms = lifecycle.last_halt_ms.max(event.wall_time_ms);
+        } else if event.kind.is_verified_repair() {
+            // Recorded even when no halt has been seen yet: the fold is over
+            // timestamps, not file order, so a repair may legitimately arrive
+            // before the halt it postdates.
+            let lifecycle = lifecycles.entry(group_scope).or_default();
+            lifecycle.last_repair_ms = lifecycle.last_repair_ms.max(event.wall_time_ms);
+        }
+    }
+
+    let mut halted: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for ((engine_id, _group_ref), lifecycle) in &lifecycles {
+        if lifecycle.still_halted() {
+            halted
+                .entry(engine_id)
+                .or_default()
+                .extend(lifecycle.reasons.iter().copied());
+        }
+    }
+
+    let engines: Vec<HaltedEngine> = halted
+        .into_iter()
+        .map(|(engine_id, reasons)| HaltedEngine {
+            engine_id: engine_id.to_owned(),
+            reasons: reasons.into_iter().map(str::to_owned).collect(),
+        })
+        .collect();
+    (!engines.is_empty()).then_some(QuarantineReason::UnrecoverableHalt { engines })
 }
 
 /// Per-engine activity, folded from the event log.
@@ -240,8 +403,11 @@ struct EngineActivity {
     high_water_epoch: Option<u64>,
 }
 
-/// The gate that separates "no contested branch" from "healthy": engines left
-/// ≥ [`EPOCH_DIVERGENCE_MIN_LAG`] epochs behind the group's high-water mark.
+/// The weaker of the two gates between "no contested branch" and "healthy":
+/// engines left ≥ [`EPOCH_DIVERGENCE_MIN_LAG`] epochs behind the group's
+/// high-water mark. Weaker because it *infers* the split from lag, where
+/// [`unrecoverable_halt`] reads the engine's own report of it — hence the lower
+/// precedence and the hedged, re-pull-first framing below.
 ///
 /// It fires only on positive evidence — events without an `engine_id` or
 /// `wall_time_ms` leave it unarmed — so synthetic fixtures and older exports

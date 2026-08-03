@@ -1,0 +1,55 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "_comment": "Synthetic. Two co-occurring incidents at one epoch, as the real 26a9f546 export carried: a contested convergence whose recovery fail-closes (an effective_commit_depth win on UNEQUAL valid depths, so the witness boost is not provably decisive) alongside a cleanly reproducible membership fork.",
+  "events": [
+    {
+      "kind": {
+        "type": "convergence_decision",
+        "current_tip_epoch": 30,
+        "candidates": [
+          {
+            "branch_id": "path:branch-kept",
+            "score": { "witness_quorum_met": true, "valid_commit_depth": 3 }
+          },
+          {
+            "branch_id": "path:branch-dropped",
+            "score": { "witness_quorum_met": false, "valid_commit_depth": 1 }
+          }
+        ],
+        "rule_trace": [
+          { "rule_name": "eligibility", "decisive": false },
+          { "rule_name": "effective_commit_depth", "decisive": true }
+        ],
+        "selected_branch_id": "path:branch-kept",
+        "losing_branch_ids": ["path:branch-dropped"]
+      }
+    },
+    {
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 30,
+        "invalidated_msg_id": "inv-1",
+        "winner": "candidate"
+      }
+    },
+    {
+      "account_ref": "alpha",
+      "kind": {
+        "type": "group_state_changed",
+        "epoch": 31,
+        "change_kind": "admin_added",
+        "actor_member_ref": "member-alpha"
+      }
+    },
+    {
+      "account_ref": "beta",
+      "kind": {
+        "type": "group_state_changed",
+        "epoch": 31,
+        "change_kind": "member_added",
+        "actor_member_ref": "member-beta"
+      }
+    }
+  ],
+  "derived_projections": { "pagination": {} }
+}
