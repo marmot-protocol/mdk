@@ -12,6 +12,7 @@ mod ingest;
 mod send;
 mod store;
 
+pub(crate) use ingest::ForkProbeError;
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 #[cfg(feature = "test-conformance-snapshot")]

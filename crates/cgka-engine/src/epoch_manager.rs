@@ -307,6 +307,18 @@ impl EpochManager {
         Ok((group_id, prior_epoch))
     }
 
+    /// Re-own a pre-commit epoch after a process restart. Hydration calls this
+    /// with epochs rebuilt from durable evidence of a confirmed own commit
+    /// (the stamped stored wire row), so the fork-detection router keeps
+    /// resolving same-epoch rivals pairwise instead of taking the
+    /// distributed-convergence detour a cold `committed_from` map would force.
+    pub(crate) fn restore_committed_from(&mut self, group_id: GroupId, epoch: EpochId) {
+        self.committed_from
+            .entry(group_id)
+            .or_default()
+            .insert(epoch);
+    }
+
     pub(crate) fn prune_committed_from_before(
         &mut self,
         group_id: &GroupId,

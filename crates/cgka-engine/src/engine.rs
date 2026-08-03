@@ -1560,6 +1560,27 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager.set_stable(group_id.clone(), group.epoch);
             ("stable", "hydrate_stable_group")
         };
+        // Fork-routing state (`EpochManager::committed_from` + the
+        // fork-recovery incumbents) lives only in memory; rebuild both from
+        // durable evidence (retained `fork-` snapshots + stored commit rows)
+        // so a restarted member resolves a same-epoch rival on the same
+        // pairwise path it would have taken before the restart. Runs after
+        // the pending-publish restore above (a restored pending owns the
+        // newest fork snapshot at its source epoch). Best-effort: a failed
+        // rebuild only forfeits the pairwise fast path — distributed
+        // convergence still resolves the fork — so it must not quarantine a
+        // healthy group. Skipped while Unrecoverable: ingest is halted there
+        // and the rebuild's probe replay would touch frozen state.
+        if !group.unrecoverable
+            && let Err(error) = self.rebuild_fork_routing_state_on_hydrate(group_id)
+        {
+            tracing::warn!(
+                target: "cgka_engine::hydrate",
+                method = "hydrate_one_stored_group",
+                %error,
+                "failed to rebuild fork-routing state; group stays on the convergence path"
+            );
+        }
         if let Some(request) = leave_request {
             self.leave_requests.insert(group_id.clone(), request);
             self.leaving_groups.insert(group_id.clone());

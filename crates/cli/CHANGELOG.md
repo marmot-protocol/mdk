@@ -52,6 +52,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   avoiding false failures when unrelated startup work is delayed under loaded
   `nextest` shards.
 
+- Fork-resolution routing state now survives a process restart. Which
+  resolution path a member takes for a same-epoch commit race depended on two
+  in-memory maps (`committed_from` and the fork-recovery incumbents), so a
+  restarted member detoured through convergence instead of resolving the race
+  pairwise as it would have before the restart. The engine now rebuilds both
+  maps during group hydration from evidence that is already durable: retained
+  `fork-*` snapshots, stored commit rows, and their confirm-time convergence
+  stamps. No storage schema change; pruning bounds and the
+  `committed_from => incumbent` invariant carry over.
+  ([#1241](https://github.com/marmot-protocol/mdk/pull/1241))
+
 - Same-epoch commit races now converge every member onto the same branch. A
   member that had committed from the contested epoch resolved the race through
   pairwise fork recovery and invalidated the losing commit terminally, while

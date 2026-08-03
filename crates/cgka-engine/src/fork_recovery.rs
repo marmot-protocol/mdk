@@ -18,15 +18,17 @@
 //! distributed-convergence pass, not terminal).
 
 use crate::engine::Engine;
+use crate::message_processor::ForkProbeError;
+use crate::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{MessageStorage, StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::{AuditEventKind, ForkWinner};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 struct CommitRecoveryRecord {
@@ -105,6 +107,20 @@ impl ForkRecoveryManager {
         Ok(name)
     }
 
+    /// Advance the snapshot-name allocator past a durable snapshot's counter,
+    /// so a name minted after restart can never collide with one already on
+    /// disk (a `create_group_snapshot` under an existing name would fail or
+    /// clobber, depending on the backend).
+    fn observe_snapshot_counter(&mut self, snapshot_name: &str) {
+        if let Some(counter) = snapshot_name
+            .strip_prefix("fork-")
+            .and_then(|suffix| suffix.split('-').nth(1))
+            .and_then(|counter| counter.parse::<u64>().ok())
+        {
+            self.snapshot_counter = self.snapshot_counter.max(counter);
+        }
+    }
+
     pub(crate) fn record_pending(
         &mut self,
         pending: PendingStateRef,
@@ -114,13 +130,7 @@ impl ForkRecoveryManager {
         ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
-        if let Some(counter) = snapshot_name
-            .strip_prefix("fork-")
-            .and_then(|suffix| suffix.split('-').nth(1))
-            .and_then(|counter| counter.parse::<u64>().ok())
-        {
-            self.snapshot_counter = self.snapshot_counter.max(counter);
-        }
+        self.observe_snapshot_counter(&snapshot_name);
         self.pending.insert(
             pending,
             CommitRecoveryRecord {
@@ -153,8 +163,27 @@ impl ForkRecoveryManager {
     }
 
     fn record_applied(&mut self, record: CommitRecoveryRecord) {
+        self.observe_snapshot_counter(&record.snapshot_name);
         self.incumbents
             .insert((record.group_id.clone(), record.source_epoch), record);
+    }
+
+    fn has_incumbent(&self, group_id: &GroupId, source_epoch: EpochId) -> bool {
+        self.incumbents
+            .contains_key(&(group_id.clone(), source_epoch))
+    }
+
+    /// Snapshot names currently owned by restored pending publishes for this
+    /// group. Hydration must not hand these to a rebuilt incumbent: after a
+    /// fork rewind, an unconfirmed re-commit from the same source epoch owns
+    /// the NEWEST `fork-<epoch>-…` snapshot while the previously applied
+    /// incumbent keeps an older one.
+    fn pending_snapshot_names(&self, group_id: &GroupId) -> BTreeSet<String> {
+        self.pending
+            .values()
+            .filter(|record| &record.group_id == group_id)
+            .map(|record| record.snapshot_name.clone())
+            .collect()
     }
 
     /// Decide the pairwise race and, when the candidate wins, displace the
@@ -499,6 +528,200 @@ impl<S: StorageProvider> Engine<S> {
             .prune_before(&self.storage, group_id, oldest_retained_epoch);
         self.epoch_manager
             .prune_committed_from_before(group_id, oldest_retained_epoch);
+        Ok(())
+    }
+
+    /// Rebuild the two fork-routing structures that live only in memory —
+    /// `EpochManager::committed_from` and the fork-recovery `incumbents` map —
+    /// from their durable evidence on session open. Without this, a restarted
+    /// member routes a same-epoch rival through distributed convergence while
+    /// the same member before the restart would have resolved it pairwise;
+    /// convergence eventually reaches the same branch, but the detour (and the
+    /// divergent intermediate states it produces) is avoidable.
+    ///
+    /// Durable evidence, per fork snapshot `fork-<source_epoch>-<counter>-…`
+    /// still on disk:
+    /// - the applied commit at that source epoch is the group's single
+    ///   `Processed` commit row whose MLS wire bytes carry that epoch;
+    /// - an own commit's ordering metadata comes from its confirm-time
+    ///   [`cgka_traits::message::OwnCommitConvergenceStamp`] (MLS cannot
+    ///   replay a device's own commit), an inbound commit's from replaying it
+    ///   against the fork snapshot (the same probe the pairwise router uses);
+    /// - `committed_from` is re-owned only for epochs whose stored applied
+    ///   evidence includes a stamped own-commit row, and only alongside a
+    ///   rebuilt incumbent — so the pairwise router can never be steered into
+    ///   the fail-closed `MissingSnapshot` arm by a half-rebuilt map.
+    ///
+    /// The rewind-horizon bound of [`Self::prune_fork_recovery_for_group`]
+    /// carries over: epochs below `current - max_rewind_commits` are not
+    /// rebuilt and their snapshots are released (best-effort), exactly as
+    /// `prune_before` would have done had the process kept running.
+    ///
+    /// Must run after any pending-publish restore for the group: an
+    /// unconfirmed re-commit staged from a rewound epoch owns the newest
+    /// `fork-` snapshot at that epoch, which this rebuild must skip.
+    pub(crate) fn rebuild_fork_routing_state_on_hydrate(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let pending_snapshots = self.fork_recovery.pending_snapshot_names(group_id);
+        // Newest fork snapshot per source epoch (mirrors `newest_fork_snapshot`
+        // in the pending-publish hydration path). Names that fail to parse —
+        // including transient `fork-probe-…` guards — are ignored.
+        let mut newest_by_epoch: BTreeMap<u64, (u64, String)> = BTreeMap::new();
+        for name in self.storage.list_group_snapshots(group_id)? {
+            if pending_snapshots.contains(&name) {
+                continue;
+            }
+            let Some(suffix) = name.strip_prefix("fork-") else {
+                continue;
+            };
+            let mut parts = suffix.split('-');
+            let (Some(source_epoch), Some(counter)) = (
+                parts.next().and_then(|part| part.parse::<u64>().ok()),
+                parts.next().and_then(|part| part.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            let entry = newest_by_epoch
+                .entry(source_epoch)
+                .or_insert((counter, name.clone()));
+            if counter > entry.0 {
+                *entry = (counter, name);
+            }
+        }
+        if newest_by_epoch.is_empty() {
+            return Ok(());
+        }
+
+        let current_epoch = self.storage.get_group(group_id)?.epoch;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+        let oldest_retained_epoch = EpochId(
+            current_epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
+
+        // One decode pass over the horizon's stored rows: the single
+        // `Processed` commit per source epoch (the applied incumbent), and the
+        // source epochs holding a stamped own-commit row (stamps are written
+        // only at confirm, so a stamped row proves "we ourselves committed
+        // from this epoch" regardless of the row's current state — a
+        // fork-invalidated own commit keeps its `committed_from` entry, same
+        // as the in-memory map).
+        type AppliedRow = (
+            MessageId,
+            Vec<u8>,
+            Option<cgka_traits::message::OwnCommitConvergenceStamp>,
+        );
+        let mut applied_by_epoch: BTreeMap<u64, AppliedRow> = BTreeMap::new();
+        let mut own_commit_epochs: BTreeSet<u64> = BTreeSet::new();
+        for record in self
+            .storage
+            .list_messages(group_id, oldest_retained_epoch)?
+        {
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            let Some(message) = payload.as_openmls_wire() else {
+                continue;
+            };
+            let Ok(projection) = project_mls_message(&message.payload) else {
+                continue;
+            };
+            if projection.kind != OpenMlsContentKind::Commit {
+                continue;
+            }
+            let Some(source_epoch) = projection.source_epoch else {
+                continue;
+            };
+            let stamp = payload.own_commit_stamp().cloned();
+            if stamp.is_some() {
+                own_commit_epochs.insert(source_epoch);
+            }
+            if record.state != MessageState::Processed {
+                continue;
+            }
+            let row = (record.id.clone(), message.payload.clone(), stamp);
+            // Steady state holds one Processed commit per source epoch; if a
+            // crash left more, prefer the own-stamped row (its ordering
+            // metadata was authenticated at confirm time and needs no replay).
+            let entry = applied_by_epoch.entry(source_epoch).or_insert(row.clone());
+            if entry.2.is_none() && row.2.is_some() {
+                *entry = row;
+            }
+        }
+
+        for (source_epoch_raw, (_, snapshot_name)) in newest_by_epoch {
+            let source_epoch = EpochId(source_epoch_raw);
+            if source_epoch < oldest_retained_epoch {
+                // Outside the rewind horizon: had the process kept running,
+                // `prune_before` would have released this snapshot already.
+                match self
+                    .storage
+                    .release_group_snapshot(group_id, &snapshot_name)
+                {
+                    Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                    Err(_e) => tracing::warn!(
+                        target: "cgka_engine::fork_recovery",
+                        method = "rebuild_fork_routing_state_on_hydrate",
+                        source_epoch = source_epoch.0,
+                        "failed to release a fork snapshot outside the rewind horizon"
+                    ),
+                }
+                continue;
+            }
+            if self.fork_recovery.has_incumbent(group_id, source_epoch) {
+                continue;
+            }
+            let Some((storage_id, mls_bytes, stamp)) = applied_by_epoch.remove(&source_epoch_raw)
+            else {
+                // No applied commit row: the snapshot is an orphan of a crash
+                // between snapshot creation and the apply transaction. Leave
+                // it; the horizon prune retires it once the group advances.
+                continue;
+            };
+            let (priority, committer) = match stamp {
+                Some(stamp) => (stamp.priority, stamp.committer),
+                None => match self.probe_commit_ordering_metadata_for_recovery(
+                    group_id,
+                    source_epoch,
+                    &snapshot_name,
+                    &mls_bytes,
+                ) {
+                    Ok(metadata) => metadata,
+                    Err(ForkProbeError::InvalidCandidate) => {
+                        // The stored applied commit no longer replays against
+                        // its own pre-commit snapshot; without a trustworthy
+                        // ordering key, leave this epoch on the convergence
+                        // path (the pre-rebuild restart behavior).
+                        tracing::warn!(
+                            target: "cgka_engine::fork_recovery",
+                            method = "rebuild_fork_routing_state_on_hydrate",
+                            source_epoch = source_epoch.0,
+                            "stored applied commit failed its fork-snapshot replay; not rebuilding this incumbent"
+                        );
+                        continue;
+                    }
+                    Err(ForkProbeError::Engine(error)) => return Err(error),
+                },
+            };
+            let ordering_key =
+                CommitOrderingKey::from_commit_bytes(source_epoch, priority, committer, &mls_bytes);
+            self.fork_recovery.record_applied(CommitRecoveryRecord {
+                group_id: group_id.clone(),
+                source_epoch,
+                ordering_key,
+                storage_id,
+                snapshot_name,
+            });
+            if own_commit_epochs.contains(&source_epoch_raw) {
+                self.epoch_manager
+                    .restore_committed_from(group_id.clone(), source_epoch);
+            }
+        }
         Ok(())
     }
 }

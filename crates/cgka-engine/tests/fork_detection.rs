@@ -178,6 +178,25 @@ fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<Sql
     engine
 }
 
+/// Restart under the SAME legacy-compatibility profile `build_client` used.
+/// The restart-routing tests below must isolate the fork-routing rebuild:
+/// reopening under `ProtocolProfile::Current` would additionally arm the
+/// strict-cutover probe gate, which rejects the rival Add commit outright
+/// (see `strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent`)
+/// instead of letting it race the incumbent.
+fn reopen_legacy_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
+    let mut engine = EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine
+}
+
 fn raw_self_update_commit(
     storage: &SqliteAccountStorage,
     sender: &MemberId,
@@ -1594,6 +1613,304 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
         },
         "both nodes must end on the identical branch"
     );
+}
+
+/// Shared fixture for the restart-routing tests: `local` creates the group
+/// with `rival` as a second admin, then both invite someone from epoch 1
+/// without seeing each other's commit — a same-epoch privileged fork. Both
+/// confirm their own publish. Returns local's storage (for the restart), the
+/// two competing epoch-1 commits, and the group id.
+async fn forked_privileged_invites(
+    local_id: &[u8],
+    rival_id: &[u8],
+    local_invitee_id: &[u8],
+    rival_invitee_id: &[u8],
+) -> (
+    cgka_traits::types::GroupId,
+    SqliteAccountStorage,
+    TransportMessage,
+    TransportMessage,
+) {
+    let (mut local, local_storage) = build_client_with_storage(local_id);
+    let mut rival = build_client(rival_id);
+    let mut local_invitee = build_client(local_invitee_id);
+    let mut rival_invitee = build_client(rival_invitee_id);
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let (group_id, create) = local
+        .create_group(CreateGroupRequest {
+            name: "restart-routing".into(),
+            description: String::new(),
+            members: vec![rival_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![rival.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            local.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    rival.join_welcome(welcome).await.unwrap();
+    assert_eq!(local.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(rival.epoch(&group_id).unwrap().0, 1);
+
+    let local_invitee_kp = local_invitee.fresh_key_package().await.unwrap();
+    let rival_invitee_kp = rival_invitee.fresh_key_package().await.unwrap();
+    let local_invite = local
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![local_invitee_kp],
+        })
+        .await
+        .unwrap();
+    let rival_invite = rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![rival_invitee_kp],
+        })
+        .await
+        .unwrap();
+    let (local_commit, rival_root) = match (local_invite, rival_invite) {
+        (
+            SendResult::GroupEvolution {
+                msg: l,
+                pending: lp,
+                ..
+            },
+            SendResult::GroupEvolution {
+                msg: r,
+                pending: rp,
+                ..
+            },
+        ) => {
+            local.confirm_published(lp).await.unwrap();
+            rival.confirm_published(rp).await.unwrap();
+            (l, r)
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+    (group_id, local_storage, local_commit, rival_root)
+}
+
+#[tokio::test]
+async fn restarted_incumbent_keeper_still_resolves_pairwise_and_parks_loser_root() {
+    // The fork-routing state (`committed_from` + the fork-recovery incumbent)
+    // used to live only in memory: a RESTARTED member that had committed from
+    // epoch 1 no longer knew it, so the same-epoch rival detoured through
+    // distributed convergence instead of losing the pairwise race. After the
+    // hydrate-time rebuild, the restarted path must be byte-for-byte the
+    // no-restart path of `pairwise_incumbent_defers_to_deeper_convergence_branch`:
+    // Stale/AlreadyAtEpoch, no ForkRecovered, and the loser root parked
+    // `ConvergenceDeferred` at its source epoch.
+    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+
+    // The local (restarted) member must WIN the pairwise race: privileged
+    // same-epoch commits order by committer identity, lower wins.
+    let first = b"restart-park-first".as_slice();
+    let second = b"restart-park-second".as_slice();
+    let (local_id, rival_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let (group_id, local_storage, local_commit, rival_root) = forked_privileged_invites(
+        local_id,
+        rival_id,
+        b"restart-park-david",
+        b"restart-park-eve",
+    )
+    .await;
+
+    let local_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(local_id)),
+        &local_commit.payload,
+    );
+    let rival_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &rival_root.payload,
+    );
+    assert!(
+        local_key < rival_key,
+        "identity choice must make the restarted incumbent win the pairwise race"
+    );
+
+    // RESTART: routing state must be rebuilt from durable evidence, not lost.
+    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+    let _ = local.drain_events();
+
+    let outcome = local
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..rival_root.clone()
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "restart must not reroute the pairwise loser into convergence, got {outcome:?}"
+    );
+    let events = local.drain_events();
+    assert!(
+        extract_fork_recovered(&events, &group_id).is_none(),
+        "incumbent-wins must not roll the restarted winner back"
+    );
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+
+    // Same parked disposition as the no-restart path: `ConvergenceDeferred`
+    // (reconsiderable by branch materialization), keyed by its SOURCE epoch.
+    let rival_root_content_id = {
+        use sha2::{Digest, Sha256};
+        MessageId::new(Sha256::digest(&rival_root.payload).to_vec())
+    };
+    let parked = local_storage.get_message(&rival_root_content_id).unwrap();
+    assert_eq!(
+        parked.state,
+        MessageState::ConvergenceDeferred,
+        "the pairwise loser-root must be parked reconsiderable after a restart too"
+    );
+    assert_eq!(
+        parked.epoch,
+        EpochId(1),
+        "the parked loser-root must be keyed by its source epoch"
+    );
+}
+
+#[tokio::test]
+async fn restarted_incumbent_rolls_back_to_winning_rival_via_rebuilt_snapshot() {
+    // Mirror image of the test above: the inbound rival WINS the pairwise
+    // race. The restarted member must roll back onto the rival commit through
+    // the durable fork snapshot referenced by the REBUILT incumbent record —
+    // emitting ForkRecovered exactly as the never-restarted path does.
+    let first = b"restart-roll-first".as_slice();
+    let second = b"restart-roll-second".as_slice();
+    // Local must LOSE: give it the higher (worse) committer identity.
+    let (local_id, rival_id) = if pad32(first) < pad32(second) {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    let (group_id, local_storage, local_commit, rival_root) = forked_privileged_invites(
+        local_id,
+        rival_id,
+        b"restart-roll-david",
+        b"restart-roll-eve",
+    )
+    .await;
+
+    let local_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(local_id)),
+        &local_commit.payload,
+    );
+    let rival_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &rival_root.payload,
+    );
+    assert!(
+        rival_key < local_key,
+        "identity choice must make the inbound rival win the pairwise race"
+    );
+
+    // RESTART: both the incumbent's ordering key (from the stamped own-commit
+    // row) and its pre-commit snapshot binding must survive the reopen.
+    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+    let _ = local.drain_events();
+
+    local
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..rival_root.clone()
+        })
+        .await
+        .unwrap();
+    let events = local.drain_events();
+    let (source_epoch, recovered_epoch, winner, invalidated) =
+        extract_fork_recovered(&events, &group_id)
+            .expect("restarted loser must emit ForkRecovered after rolling back to the rival");
+    assert_eq!(source_epoch.0, 1);
+    assert_eq!(recovered_epoch.0, 2);
+    assert_eq!(winner, &rival_key);
+    assert_eq!(invalidated, &local_key);
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+
+    // The group state now reflects the rival branch: its invitee joined, the
+    // abandoned local branch's invitee did not.
+    let members: Vec<_> = local
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert!(
+        members.contains(&MemberId::new(pad32(b"restart-roll-eve"))),
+        "rival branch's invitee must be present after the rebuilt rollback"
+    );
+    assert!(
+        !members.contains(&MemberId::new(pad32(b"restart-roll-david"))),
+        "the abandoned local branch's invitee must be gone"
+    );
+    // The invalidated own commit is retired on its durable row, exactly as in
+    // the never-restarted path. Resolve the row through the event: the
+    // rebuilt incumbent record carries the storage-layer identity. The
+    // displaced incumbent is parked `ConvergenceDeferred` at its source
+    // epoch, not retired terminally, so a peer that keeps extending its
+    // branch can still bring this node back onto it (see
+    // `pairwise_candidate_win_leaves_old_incumbent_reconsiderable`). A
+    // missing row is tolerated only for pre-parking recovery states.
+    let invalidated_commit_id = events
+        .iter()
+        .find_map(|event| match event {
+            GroupEvent::ForkRecovered {
+                group_id: event_group,
+                invalidated_commit_id,
+                ..
+            } if event_group == &group_id => Some(invalidated_commit_id.clone()),
+            _ => None,
+        })
+        .expect("ForkRecovered carries the invalidated commit's storage id");
+    match local_storage.get_message(&invalidated_commit_id) {
+        Ok(record) => {
+            assert_eq!(
+                record.state,
+                MessageState::ConvergenceDeferred,
+                "the displaced incumbent must stay reconsiderable after a restart-path rollback"
+            );
+            assert_eq!(
+                record.epoch,
+                EpochId(1),
+                "the parked incumbent must be keyed by its source epoch"
+            );
+        }
+        Err(cgka_traits::storage::StorageError::NotFound) => {}
+        Err(other) => panic!("unexpected storage error: {other:?}"),
+    }
 }
 
 #[tokio::test]

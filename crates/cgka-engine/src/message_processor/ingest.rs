@@ -71,7 +71,7 @@ enum ScheduledAutoCommitReplay {
     NotApplicable,
 }
 
-enum ForkProbeError {
+pub(crate) enum ForkProbeError {
     InvalidCandidate,
     Engine(EngineError),
 }
@@ -2308,7 +2308,7 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    fn probe_commit_ordering_metadata_for_recovery(
+    pub(crate) fn probe_commit_ordering_metadata_for_recovery(
         &self,
         group_id: &GroupId,
         source_epoch: EpochId,
