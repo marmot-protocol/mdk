@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub struct CampaignMeasurementsV1 {
     pub schema_version: String,
     pub total_wall_us: u64,
-    pub convergence_latency_us: u64,
+    pub convergence_latency_us: Option<u64>,
     pub blocked_send_duration_us: u64,
     pub pass_count: usize,
     pub reorg_count: usize,
@@ -109,11 +109,21 @@ impl CampaignMeasurementsV1 {
                         .saturating_add(pending.bus_mailbox_messages),
                 );
             }
-            for decision in &observation.convergence_decisions {
-                let _ = decision;
-                pass_count = pass_count.saturating_add(1);
-            }
+            pass_count = pass_count.saturating_add(observation.convergence_decisions.len());
         }
+
+        let convergence_latency_us = report
+            .quiescence_observations
+            .iter()
+            .rev()
+            .find(|observation| observation.status.is_quiescent())
+            .and_then(|observation| {
+                report
+                    .step_log
+                    .iter()
+                    .find(|step| step.step_index == observation.step_index)
+                    .map(|step| step.wall_us)
+            });
 
         let first_failing_action = report.step_log.iter().find_map(|step| {
             matches!(step.status, ScenarioStepStatus::Failed { .. }).then_some(step.step_index)
@@ -137,7 +147,7 @@ impl CampaignMeasurementsV1 {
         Self {
             schema_version: "1".into(),
             total_wall_us,
-            convergence_latency_us: total_wall_us,
+            convergence_latency_us,
             blocked_send_duration_us,
             pass_count,
             reorg_count: engine_metrics
@@ -176,6 +186,11 @@ impl CampaignMeasurementsV1 {
                 database_bytes
                     .is_none()
                     .then(|| "database_bytes".to_owned()),
+            )
+            .chain(
+                convergence_latency_us
+                    .is_none()
+                    .then(|| "convergence_latency_us".to_owned()),
             )
             .collect(),
         }

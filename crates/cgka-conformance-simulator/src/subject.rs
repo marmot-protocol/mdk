@@ -277,7 +277,11 @@ pub trait ConvergenceSubject: Send {
         None
     }
 
-    fn select_scenario_group(&mut self, _group: &str) -> Result<(), SubjectError> {
+    fn select_scenario_group(
+        &mut self,
+        _group: &str,
+        _allow_create: bool,
+    ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::MultiGroup))
     }
 
@@ -671,6 +675,15 @@ pub struct EngineHarnessSubject {
     replay_capture_target_tick: Option<usize>,
     observed_recipient_ticks: usize,
     last_byte_replay: Option<EngineByteReplayV1>,
+}
+
+fn sqlite_database_files(path: &std::path::Path) -> [std::path::PathBuf; 3] {
+    let sidecar = |suffix: &str| {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        std::path::PathBuf::from(value)
+    };
+    [path.to_path_buf(), sidecar("-wal"), sidecar("-shm")]
 }
 
 #[derive(Clone)]
@@ -1191,13 +1204,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
         (!paths.is_empty()).then(|| {
             paths
                 .into_iter()
-                .flat_map(|path| {
-                    [
-                        path.to_path_buf(),
-                        path.with_extension("sqlite-wal"),
-                        path.with_extension("sqlite-shm"),
-                    ]
-                })
+                .flat_map(sqlite_database_files)
                 .filter_map(|path| std::fs::metadata(path).ok())
                 .fold(0_u64, |sum, metadata| sum.saturating_add(metadata.len()))
         })
@@ -1217,17 +1224,37 @@ impl ConvergenceSubject for EngineHarnessSubject {
         Some(aggregate)
     }
 
-    fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {
-        self.active_scenario_group = Some(group.to_owned());
-        if let Some(group_id) = self.scenario_groups.get(group).cloned() {
-            for client in self.clients.values_mut() {
-                client.select_default_group(group_id.clone());
+    fn select_scenario_group(
+        &mut self,
+        group: &str,
+        allow_create: bool,
+    ) -> Result<(), SubjectError> {
+        let Some(group_id) = self.scenario_groups.get(group).cloned() else {
+            if allow_create {
+                self.active_scenario_group = Some(group.to_owned());
+                return Ok(());
             }
+            return Err(SubjectError::new(
+                "unknown_scenario_group",
+                format!("scenario group {group} has not been created"),
+            ));
+        };
+        self.active_scenario_group = Some(group.to_owned());
+        for client in self.clients.values_mut() {
+            client.select_default_group(group_id.clone());
         }
         Ok(())
     }
 
     async fn create_group(&mut self, action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {
+        if let Some(group) = &self.active_scenario_group
+            && self.scenario_groups.contains_key(group)
+        {
+            return Err(SubjectError::new(
+                "duplicate_scenario_group",
+                format!("scenario group {group} was created more than once"),
+            ));
+        }
         let initial_admins = self.member_ids(action.initial_admins)?;
         let key_packages = self.fresh_key_packages(action.invitees).await?;
         let required_features = required_features_from_names(action.required_features)?;
@@ -1241,14 +1268,8 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 initial_admins,
             )
             .await;
-        if let Some(group) = &self.active_scenario_group
-            && let Some(existing) = self.scenario_groups.insert(group.clone(), group_id.clone())
-            && existing != group_id
-        {
-            return Err(SubjectError::new(
-                "duplicate_scenario_group",
-                format!("scenario group {group} was created more than once"),
-            ));
+        if let Some(group) = &self.active_scenario_group {
+            self.scenario_groups.insert(group.clone(), group_id.clone());
         }
         if let Some(pending_ref) = pending_ref {
             self.insert_pending(action.pending, action.creator, pending_ref)?;
@@ -2077,6 +2098,17 @@ mod tests {
         QuiescenceStatus, drive_subject_to_quiescence,
     };
 
+    #[test]
+    fn sqlite_database_accounting_uses_real_sidecar_names() {
+        assert_eq!(
+            sqlite_database_files(std::path::Path::new("client.sqlite3")),
+            [
+                std::path::PathBuf::from("client.sqlite3"),
+                std::path::PathBuf::from("client.sqlite3-wal"),
+                std::path::PathBuf::from("client.sqlite3-shm"),
+            ]
+        );
+    }
     async fn create_current_group_and_join(
         subject: &mut EngineHarnessSubject,
         creator: &str,

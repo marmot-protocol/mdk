@@ -625,9 +625,13 @@ pub async fn run_vector_fixture_report_with_capture(
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let protocol_profile = fixture_protocol_profile(fixture)?;
-    let mut subject =
-        EngineHarnessSubject::new(&fixture.scenario.clients, protocol_profile, storage_mode)
-            .map_err(subject_setup_error)?;
+    let mut subject = EngineHarnessSubject::new_with_topology(
+        &fixture.scenario.clients,
+        &fixture.scenario.topology,
+        protocol_profile,
+        storage_mode,
+    )
+    .map_err(subject_setup_error)?;
     if capture_sensitive_replay
         && let Some(recipient_tick) = final_planned_recipient_tick(&fixture.scenario)
     {
@@ -1204,7 +1208,7 @@ async fn run_scenario_report_inner(
         let step = &action.step;
         let step_result = if let Some(group) = action.scenario_group.as_deref() {
             subject
-                .select_scenario_group(group)
+                .select_scenario_group(group, matches!(step, ScenarioStep::CreateGroup { .. }))
                 .map_err(|error| subject_step_error(step_index, error))
         } else {
             Ok(())
@@ -1429,7 +1433,7 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
     }
 }
 
-fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
+pub(crate) fn subject_setup_error(error: SubjectError) -> ScenarioRunError {
     let message = error.to_string();
     ScenarioRunError {
         step_index: None,

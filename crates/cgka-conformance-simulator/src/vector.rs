@@ -468,12 +468,17 @@ impl TraceExpectation {
                     });
                     return;
                 }
-                let first = snapshots[0].1;
-                if snapshots.iter().all(|(_, snapshot)| *snapshot == first) {
+                let duplicate_pair = snapshots.iter().enumerate().find_map(|(left, item)| {
+                    snapshots[(left + 1)..]
+                        .iter()
+                        .find(|other| item.1 == other.1)
+                        .map(|other| (item.0, other.0))
+                });
+                if let Some((left, right)) = duplicate_pair {
                     mismatches.push(ExpectationFailure {
                         kind: "clients_unexpectedly_equivalent".into(),
                         message: format!(
-                            "clients {clients:?} converged despite named unrecoverable outcome: {reason}"
+                            "clients {left} and {right} were equivalent despite named pairwise non-equivalence: {reason}"
                         ),
                         expected: json!({
                             "clients": clients,
@@ -1672,6 +1677,39 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn non_equivalence_requires_every_named_pair_to_differ() {
+        let shared = exact_snapshot("shared-id", "shared-commitment");
+        let mut alice = observation("alice", 7, 1);
+        alice.canonical_state = Some(shared.clone());
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(shared);
+        let mut carol = observation("carol", 7, 1);
+        carol.canonical_state = Some(exact_snapshot("carol-id", "carol-commitment"));
+        let expectation = TraceExpectation::ClientsNotEquivalent {
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            reason: "named split".into(),
+        };
+
+        let failures = compare_trace_expectations(
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![alice.clone(), bob, carol.clone()]),
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "clients_unexpectedly_equivalent");
+
+        alice.canonical_state = Some(exact_snapshot("alice-id", "alice-commitment"));
+        let mut bob = observation("bob", 7, 1);
+        bob.canonical_state = Some(exact_snapshot("bob-id", "bob-commitment"));
+        let failures =
+            compare_trace_expectations(None, &[expectation], &trace(vec![alice, bob, carol]));
+        assert!(
+            failures.is_empty(),
+            "all three snapshots differ: {failures:#?}"
+        );
     }
 
     #[test]

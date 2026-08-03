@@ -137,9 +137,10 @@ fn run_fork_recovery(
         ForkCommitKind::Membership => MEMBERSHIP_INCIDENT_NAME,
     };
     match accept(&fork, name) {
-        Ok(vector) => {
-            persist_or_report(&archetype_artifact(export, source_format, vector), out_dir)
-        }
+        Ok(vector) => match archetype_artifact(export, source_format, vector) {
+            Ok(artifact) => persist_or_report(&artifact, out_dir),
+            Err(error) => quarantine(&error),
+        },
         Err(err) => quarantine(&err),
     }
 }
@@ -164,9 +165,10 @@ fn run_convergence(
         Err(err) => return quarantine(&err),
     };
     match accept_convergence(&conv, CONVERGENCE_NAME) {
-        Ok(vector) => {
-            persist_or_report(&archetype_artifact(export, source_format, vector), out_dir)
-        }
+        Ok(vector) => match archetype_artifact(export, source_format, vector) {
+            Ok(artifact) => persist_or_report(&artifact, out_dir),
+            Err(error) => quarantine(&error),
+        },
         Err(err) => quarantine(&err),
     }
 }
@@ -221,10 +223,7 @@ fn write_artifact(
     dir: &Path,
 ) -> std::io::Result<(PathBuf, PathBuf)> {
     fs_private::create_dir_all_private(dir)?;
-    let stem = artifact.vector.scenario_name.rsplit_once('/').map_or(
-        artifact.vector.scenario_name.as_str(),
-        |(stem, _version)| stem,
-    );
+    let stem = artifact_stem(&artifact.vector.scenario_name);
     let vector_path = dir.join(format!("{stem}.v1.json"));
     let artifact_path = dir.join(format!("{stem}.incident.v1.json"));
     let vector_json = serde_json::to_string_pretty(&artifact.vector).expect("vector serializes");
@@ -232,6 +231,24 @@ fn write_artifact(
     fs_private::write_private(&vector_path, format!("{vector_json}\n").as_bytes())?;
     fs_private::write_private(&artifact_path, format!("{artifact_json}\n").as_bytes())?;
     Ok((vector_path, artifact_path))
+}
+
+fn artifact_stem(scenario_name: &str) -> String {
+    let raw_stem = scenario_name
+        .rsplit_once('/')
+        .map_or(scenario_name, |(stem, _version)| stem);
+    let mut stem = raw_stem
+        .chars()
+        .take(96)
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '-',
+        })
+        .collect::<String>();
+    if stem.is_empty() || stem == "." || stem == ".." {
+        stem = "incident".into();
+    }
+    stem
 }
 
 #[cfg(test)]
@@ -251,5 +268,14 @@ mod tests {
             read_utf8_limited(io::Cursor::new("ciao".as_bytes()), 4).unwrap(),
             "ciao"
         );
+    }
+
+    #[test]
+    fn artifact_stem_is_one_safe_path_component() {
+        let stem = artifact_stem("../../outside/incident/v1");
+        assert!(!stem.contains('/'));
+        assert!(!stem.contains('\\'));
+        assert_ne!(stem, ".");
+        assert_ne!(stem, "..");
     }
 }

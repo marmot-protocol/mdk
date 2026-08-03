@@ -4,9 +4,10 @@ use cgka_conformance_simulator::{
     engine_harness_feature_registry, run_scenario_report_with_subject,
 };
 use cgka_conformance_simulator::{
-    SubjectFailureCategory, compile_scenario, generate_milestone3_adversarial_family,
-    generate_milestone3_offline_regression, generate_milestone3_self_update_regression,
-    generate_milestone3_sustained_regression, run_generated_case_report,
+    SubjectFailureCategory, compile_scenario, generate_milestone3_adversarial_case,
+    generate_milestone3_adversarial_family, generate_milestone3_offline_regression,
+    generate_milestone3_self_update_regression, generate_milestone3_sustained_regression,
+    run_generated_case_report, run_generated_case_report_with_capture,
 };
 #[cfg(feature = "test-policy-overrides")]
 use cgka_traits::group::ProtocolProfile;
@@ -26,8 +27,7 @@ fn milestone3_catalog_covers_every_required_workload_shape() {
 }
 
 async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
-    let cases = generate_milestone3_adversarial_family(7, case_index + 1);
-    assert_case(&cases[case_index]).await
+    assert_case(&generate_milestone3_adversarial_case(7, case_index as u64)).await
 }
 
 async fn assert_case(
@@ -84,6 +84,20 @@ async fn offline_retained_history_flood_runs_as_a_small_regression() {
     );
 }
 
+#[tokio::test]
+async fn retained_relay_rejects_unavailable_sensitive_checkpoint_capture() {
+    let case = generate_milestone3_offline_regression(7);
+    let error = run_generated_case_report_with_capture(
+        &case,
+        None,
+        cgka_conformance_simulator::HarnessStorageMode::InMemorySqlite,
+        true,
+    )
+    .await
+    .expect_err("retained relay cannot produce an engine checkpoint");
+    assert_eq!(error.kind, "sensitive_replay_capture_unsupported");
+}
+
 #[ignore = "multi-round retained-history flood; run explicitly"]
 #[tokio::test]
 async fn offline_retained_history_flood_campaign() {
@@ -130,12 +144,19 @@ async fn losing_branch_invite_has_a_named_unrecoverable_outcome() {
     let _ = assert_generated_case(3).await;
 }
 
-#[test]
-fn mixed_binary_versions_are_compatible_but_mixed_policies_are_not() {
-    let cases = generate_milestone3_adversarial_family(7, 11);
-    compile_scenario(&cases[10].scenario).expect("mixed binaries with one policy compile");
+#[tokio::test]
+async fn remaining_catalog_workloads_execute_under_the_strict_oracle() {
+    for case_index in [4, 5, 6, 7, 8, 9, 11] {
+        let _ = assert_generated_case(case_index).await;
+    }
+}
 
-    let mut incompatible = cases[10].scenario.clone();
+#[tokio::test]
+async fn mixed_binary_versions_run_but_mixed_policies_are_rejected() {
+    let case = generate_milestone3_adversarial_case(7, 10);
+    let _ = assert_case(&case).await;
+
+    let mut incompatible = case.scenario.clone();
     incompatible.topology.processes[1].policy_version = "marmot-convergence-v2".into();
     let error = compile_scenario(&incompatible).expect_err("mixed policies fail preflight");
     assert_eq!(error.kind, "incompatible_convergence_policy");
@@ -241,7 +262,9 @@ async fn replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_in
         .attach(&bus);
     let mut observer = ClientBuilder::new(b"resource-observer".to_vec())
         .registry(registry)
-        .replay_probe_budget_for_tests(Some(0))
+        // Two probes cover the competing-commit BFS, but not the application-
+        // witness fallback materialization. The pass must share one ceiling.
+        .replay_probe_budget_for_tests(Some(2))
         .attach(&bus);
 
     let bob_kp = bob.fresh_key_package().await;
@@ -259,6 +282,11 @@ async fn replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_in
     assert!(bob.tick().await.iter().all(Result::is_ok));
     assert!(observer.tick().await.iter().all(Result::is_ok));
 
+    alice.send_app(b"retained-witness".to_vec()).await;
+    bus.deliver_all();
+    assert!(bob.tick().await.iter().all(Result::is_ok));
+    assert!(observer.tick().await.iter().all(Result::is_ok));
+
     let alice_pending = alice.self_update().await;
     let bob_pending = bob.self_update().await;
     alice.confirm(alice_pending).await;
@@ -272,7 +300,7 @@ async fn replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_in
                 .err()
                 .is_some_and(|error| error.to_string().contains("replay budget exceeded"))
         }),
-        "zero replay budget must surface a typed fail-closed error: {outcomes:?}"
+        "the shared BFS-plus-fallback budget must surface a typed fail-closed error: {outcomes:?}"
     );
     assert!(
         observer.has_pending_convergence_inputs(),

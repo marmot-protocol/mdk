@@ -85,8 +85,60 @@ fn missing_action_mapping_fails_closed_instead_of_becoming_exact() {
 }
 
 #[test]
+fn exact_history_preconditions_have_typed_fail_closed_errors() {
+    let mut export = export_with_history();
+    export
+        .normalized_scenario_history
+        .as_mut()
+        .unwrap()
+        .sensitive_state_included = true;
+    assert!(matches!(
+        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(ExactHistoryImportError::SensitiveStateIncluded)
+    ));
+
+    let mut export = export_with_history();
+    export
+        .normalized_scenario_history
+        .as_mut()
+        .unwrap()
+        .expected_outcomes
+        .clear();
+    assert!(matches!(
+        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(ExactHistoryImportError::MissingExpectedOutcomes)
+    ));
+
+    let mut export = export_with_history();
+    export
+        .normalized_scenario_history
+        .as_mut()
+        .unwrap()
+        .incident_event_indices
+        .clear();
+    assert!(matches!(
+        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(ExactHistoryImportError::MissingIncidentEvidence)
+    ));
+
+    let mut export = export_with_history();
+    let event_count = export.events.len();
+    export
+        .normalized_scenario_history
+        .as_mut()
+        .unwrap()
+        .action_evidence[0]
+        .source_event_indices = vec![event_count];
+    assert!(matches!(
+        import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(ExactHistoryImportError::SourceEventOutOfRange { .. })
+    ));
+}
+
+#[test]
 fn legacy_export_is_an_explicitly_inexact_archetype() {
-    let export = parse(r#"{ "events": [] }"#).expect("parses");
+    let mut export = export_with_history();
+    export.normalized_scenario_history = None;
     assert!(
         import_exact_history(&export, IncidentSourceFormatV1::AgentStateDocument)
             .expect("absence is not malformed")
@@ -101,7 +153,8 @@ fn legacy_export_is_an_explicitly_inexact_archetype() {
         &export,
         IncidentSourceFormatV1::AgentStateDocument,
         synthesize(&fork, "archetype/v1", "alice", "bob"),
-    );
+    )
+    .expect("incident evidence permits archetype synthesis");
     assert_eq!(
         artifact.replay_fidelity,
         IncidentReplayFidelityV1::OutcomeEquivalentArchetype
@@ -116,4 +169,21 @@ fn legacy_export_is_an_explicitly_inexact_archetype() {
             .iter()
             .any(|field| { field.field == "exact_scenario_action_history" })
     );
+}
+
+#[test]
+fn archetype_without_incident_evidence_fails_closed() {
+    let export = parse(r#"{ "events": [] }"#).expect("parses");
+    let fork = RecoveredFork {
+        source_epoch: 30,
+        commit: ForkCommitKind::Membership,
+    };
+    assert!(matches!(
+        archetype_artifact(
+            &export,
+            IncidentSourceFormatV1::AgentStateDocument,
+            synthesize(&fork, "archetype/v1", "alice", "bob"),
+        ),
+        Err(ExactHistoryImportError::MissingIncidentEvidence)
+    ));
 }

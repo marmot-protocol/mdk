@@ -3,10 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    ScenarioAccountV2, ScenarioAssertionV2, ScenarioComparison, ScenarioDeviceV2,
-    ScenarioMessageSelectorV2, ScenarioPredicateV2, ScenarioProcessV2, ScenarioResourceMetric,
-    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, ScenarioTransportClass, SubjectOutboundOutcome,
-    VectorFixture, compile_scenario, run_scenario_report,
+    HarnessStorageMode, ScenarioAccountV2, ScenarioAssertionV2, ScenarioComparison,
+    ScenarioDeviceV2, ScenarioMessageSelectorV2, ScenarioPredicateV2, ScenarioProcessV2,
+    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTopologyV2, ScenarioTransportClass,
+    SubjectOutboundOutcome, VectorFixture, compile_scenario, run_scenario_report,
+    run_vector_fixture_report_with_capture,
 };
 
 fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
@@ -93,6 +94,82 @@ fn authoring_schema_references_resolve_against_the_ir_schema_id() {
             );
         }
     }
+}
+
+#[test]
+fn nested_and_non_group_actions_fail_ir_preflight() {
+    let base = ScenarioSpec {
+        name: "scenario-ir/invalid-group-wrapper".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![],
+    };
+    let mut nested = base.clone();
+    nested.steps.push(ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(ScenarioStep::InGroup {
+            group: "blue".into(),
+            action: Box::new(ScenarioStep::ClearEvents {
+                clients: vec!["alice".into()],
+            }),
+        }),
+    });
+    assert!(
+        compile_scenario(&nested)
+            .expect_err("nested wrapper fails")
+            .message
+            .contains("nested")
+    );
+
+    let mut nongroup = base;
+    nongroup.steps.push(ScenarioStep::InGroup {
+        group: "red".into(),
+        action: Box::new(ScenarioStep::DeliverAll),
+    });
+    assert!(
+        compile_scenario(&nongroup)
+            .expect_err("transport action is not group scoped")
+            .message
+            .contains("not a group-scoped action")
+    );
+}
+
+#[tokio::test]
+async fn typoed_group_label_fails_closed_at_execution() {
+    let scenario = ScenarioSpec {
+        name: "scenario-ir/unknown-group".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![
+            ScenarioStep::InGroup {
+                group: "red".into(),
+                action: Box::new(ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "red".into(),
+                    invitees: vec![],
+                    required_features: vec![],
+                    initial_admins: Some(vec!["alice".into()]),
+                    pending: "red-create".into(),
+                }),
+            },
+            ScenarioStep::InGroup {
+                group: "reed".into(),
+                action: Box::new(ScenarioStep::Observe {
+                    clients: vec!["alice".into()],
+                }),
+            },
+        ],
+    };
+    let report = run_scenario_report(&scenario, None)
+        .await
+        .expect("execution failures are reported structurally");
+    assert!(report.step_log.iter().any(|step| matches!(
+        &step.status,
+        cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. }
+            if kind == "unknown_scenario_group"
+    )));
 }
 
 fn collect_external_refs<'a>(value: &'a serde_json::Value, refs: &mut Vec<&'a str>) {
@@ -597,4 +674,35 @@ async fn topology_can_join_two_device_leaves_for_one_account() {
             .all(|observation| observation.member_count == 3)
     );
     assert!(report.expectation_failures.is_empty());
+
+    let fixture = VectorFixture {
+        scenario_name: scenario.name.clone(),
+        vector_version: "1".into(),
+        conformance_version: env!("CARGO_PKG_VERSION").into(),
+        seed: None,
+        application_profile: None,
+        scenario,
+        expected_trace: None,
+        expected_outcomes: vec![],
+    };
+    let (captured_report, _) =
+        run_vector_fixture_report_with_capture(&fixture, HarnessStorageMode::InMemorySqlite, false)
+            .await
+            .expect("capture runner preserves explicit topology");
+    let captured_state = captured_report
+        .observed_trace
+        .as_ref()
+        .and_then(|trace| trace.observations.first())
+        .and_then(|observation| observation.canonical_state.as_ref())
+        .map(|state| serde_json::to_value(state).expect("canonical state serializes"))
+        .expect("capture runner observes exact state");
+    let identities = captured_state
+        .pointer("/snapshot/sorted_member_identities_hex")
+        .and_then(serde_json::Value::as_array)
+        .expect("live snapshot carries sorted identities");
+    assert_eq!(identities.len(), 3);
+    assert_eq!(
+        identities[0], identities[1],
+        "capture runner must preserve the shared account identity of both devices"
+    );
 }

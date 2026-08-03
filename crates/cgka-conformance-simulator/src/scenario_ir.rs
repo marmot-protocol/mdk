@@ -105,12 +105,9 @@ pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, Scena
             lower_group_action(source_step_index, step, &topology)?;
         validate_step(source_step_index, executable_step, &clients, &topology)?;
         let action_id = stable_action_id(source_step_index, step);
-        let mut required_capabilities = required_capabilities(executable_step)
+        let required_capabilities = required_capabilities(step)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        if scenario_group.is_some() {
-            required_capabilities.insert(SubjectCapability::MultiGroup);
-        }
         actions.push(CompiledScenarioActionV2 {
             schedule: ScenarioActionScheduleV2 {
                 action_id,

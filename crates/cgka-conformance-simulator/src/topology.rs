@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ScenarioRunError, SubjectFailureCategory};
 
+const UNSPECIFIED_VERSION: &str = "unspecified";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioTopologyV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,8 +61,8 @@ impl ScenarioTopologyV2 {
                     .iter()
                     .map(|client| ScenarioProcessV2 {
                         id: format!("process:{client}"),
-                        binary_version: "unspecified".into(),
-                        policy_version: "unspecified".into(),
+                        binary_version: UNSPECIFIED_VERSION.into(),
+                        policy_version: UNSPECIFIED_VERSION.into(),
                         relays: Vec::new(),
                     })
                     .collect(),
@@ -154,7 +156,7 @@ impl ScenarioTopologyV2 {
             .processes
             .iter()
             .map(|process| process.policy_version.as_str())
-            .filter(|version| *version != "unspecified")
+            .filter(|version| *version != UNSPECIFIED_VERSION)
             .collect::<BTreeSet<_>>();
         if explicit_policy_versions.len() > 1 {
             return Err(topology_error_with_kind(

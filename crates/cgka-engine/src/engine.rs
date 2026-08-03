@@ -244,9 +244,11 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     /// Test-only selection experiment switch. It is always true in production;
     /// only the feature-gated builder method can disable witness admission.
+    #[cfg(feature = "test-policy-overrides")]
     pub(crate) admit_app_witnesses: bool,
     /// Optional hard replay-probe ceiling for explicit exhaustion campaigns.
     /// Production construction cannot set it.
+    #[cfg(feature = "test-policy-overrides")]
     pub(crate) replay_probe_budget_override: Option<u64>,
     #[cfg(feature = "test-conformance-snapshot")]
     pub(crate) conformance_replay_probe_count: u64,
@@ -346,7 +348,9 @@ pub struct EngineBuilder<S: StorageProvider> {
     wall_clock: Arc<dyn WallClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
     convergence_clock: Arc<dyn ConvergenceClock>,
+    #[cfg(feature = "test-policy-overrides")]
     admit_app_witnesses: bool,
+    #[cfg(feature = "test-policy-overrides")]
     replay_probe_budget_override: Option<u64>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
@@ -367,7 +371,9 @@ impl<S: StorageProvider> EngineBuilder<S> {
             wall_clock: Arc::new(SystemWallClock),
             maintenance_random: Arc::new(OsMaintenanceRandom),
             convergence_clock: Arc::new(SystemConvergenceClock::default()),
+            #[cfg(feature = "test-policy-overrides")]
             admit_app_witnesses: true,
+            #[cfg(feature = "test-policy-overrides")]
             replay_probe_budget_override: None,
             recorder: None,
         }
@@ -559,7 +565,9 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 app_message_past_epoch_limit: self.max_past_epochs as u64,
                 ..crate::canonicalization::CanonicalizationPolicy::default()
             },
+            #[cfg(feature = "test-policy-overrides")]
             admit_app_witnesses: self.admit_app_witnesses,
+            #[cfg(feature = "test-policy-overrides")]
             replay_probe_budget_override: self.replay_probe_budget_override,
             #[cfg(feature = "test-conformance-snapshot")]
             conformance_replay_probe_count: 0,

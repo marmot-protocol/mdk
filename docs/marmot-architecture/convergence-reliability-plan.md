@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-02
+updated: 2026-08-03
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -663,12 +663,15 @@ state; v1 does not claim automatic repair for the stranded device.
   witness expiry, deferred commits, and anchor pruning as explicit boundary cases rather than accidental confounders.
 - [x] Produce curves and boundary failures; never auto-tune production policy from simulator output.
 
-`CampaignMeasurementsV1` is embedded in every scenario report. In-process reports record the conservative
-whole-scenario convergence-latency envelope, true queued-acceptance-to-publication/refusal wall time, decisions,
+`CampaignMeasurementsV1` is embedded in every scenario report. In-process reports record the wall time of the final
+successful fixed-point convergence attempt when a scenario requests one (and mark it unavailable otherwise), true
+queued-acceptance-to-publication/refusal wall time, decisions,
 restart-preserved reorg histograms, dispositions, logical outcomes, unresolved work, maximum sampled transport depth,
 exact completed OpenMLS replay probes, and file-backed SQLite/WAL/SHM size. The child-process campaign runner adds
-per-case CPU time, peak RSS, and OS-accounted write blocks and makes worker exit/signal failure explicit. OS write
-blocks may be zero under caching and are not presented as SQLite logical writes.
+per-case CPU time and peak RSS where the host exposes them, Linux OS-accounted write blocks, an explicit unavailable
+field list elsewhere, and worker exit/signal/timeout failure. OS write blocks may be zero under caching and are not
+presented as SQLite logical writes; every worker has a configurable hard deadline and is killed and reaped if it
+exceeds it.
 
 The feature-gated policy sweep holds retained input, tip, anchor, time, eligibility horizons, and all other constants
 fixed, emits explicit rejected boundary points, and sets `production_auto_tuning_permitted` to false. P4/P5
@@ -717,6 +720,11 @@ identities. Explicitly authored account/device topology alone opts into account-
 credentials for two modeled devices of one account. The complete 41-case canonical scenario suite passes with this
 boundary, including exact fixtures, bidirectional decryptability, generated chaos/delivery families, and strict
 pre-join resource retirement.
+
+The `just milestone3-ci` gate executes every catalog family (including the feature-gated witness and replay-budget
+campaigns), all three sustained headline workloads, policy sweeps, and a file-backed isolated worker with a hard
+timeout. GitHub's simulator job runs this gate in addition to the ordinary simulator and vector suites; the exit gate
+is not based on compile-only catalog coverage.
 
 ## Milestone 4: Independent Verification And Adequacy
 

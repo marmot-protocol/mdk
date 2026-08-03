@@ -294,12 +294,12 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
     }
 
     for step in &spec.steps {
-        let step = match step {
-            ScenarioStep::InGroup { action, .. } => action.as_ref(),
-            step => step,
-        };
+        let mut step = step;
+        while let ScenarioStep::InGroup { action, .. } = step {
+            step = action.as_ref();
+        }
         match step {
-            ScenarioStep::InGroup { .. } => unreachable!("in_group was unwrapped above"),
+            ScenarioStep::InGroup { .. } => unreachable!("all group wrappers were unwrapped"),
             ScenarioStep::CreateGroup { .. } => {
                 stimuli.insert(ScenarioStimulus::CreateGroup);
             }

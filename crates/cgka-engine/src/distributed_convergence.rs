@@ -1167,8 +1167,26 @@ impl<S: StorageProvider> Engine<S> {
             StoredCanonicalizationOptions {
                 replay_profile: replay_profile_policy,
                 admitted_message_ids: Some(&admitted_message_ids),
-                admit_app_witnesses: self.admit_app_witnesses,
-                replay_probe_budget_override: self.replay_probe_budget_override,
+                admit_app_witnesses: {
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        self.admit_app_witnesses
+                    }
+                    #[cfg(not(feature = "test-policy-overrides"))]
+                    {
+                        true
+                    }
+                },
+                replay_probe_budget_override: {
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        self.replay_probe_budget_override
+                    }
+                    #[cfg(not(feature = "test-policy-overrides"))]
+                    {
+                        None
+                    }
+                },
             },
         )?;
         let mut result = result;

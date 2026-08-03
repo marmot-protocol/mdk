@@ -3,11 +3,12 @@
 //! Families produce ordinary [`ScenarioSpec`] values plus the metadata needed
 //! to replay or promote a generated case into a fixed vector.
 
+use crate::scenario::subject_setup_error;
 use crate::{
     GeneratedScenarioMetadata, HarnessStorageMode, RetainedRelaySubject, ScenarioFailureCaptureV1,
     ScenarioMessageSelectorV2, ScenarioOutboundSelection, ScenarioReport, ScenarioRunError,
-    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
-    TraceExpectation, VectorFixture, fingerprint_report_failure,
+    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectFailureCategory,
+    SubjectOutboundOutcome, TraceExpectation, VectorFixture, fingerprint_report_failure,
     run_scenario_report_with_outcomes_and_capture,
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_subject,
     stable_action_id,
@@ -136,24 +137,26 @@ pub fn generate_milestone3_adversarial_family(
     cases: usize,
 ) -> Vec<GeneratedScenarioCase> {
     (0..cases)
-        .map(|case_index| {
-            let case_index = case_index as u64;
-            let mut rng =
-                StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
-            let (family_name, subject, mut scenario, mut expected_outcomes) =
-                milestone3_case(&mut rng, case_index);
-            add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
-            GeneratedScenarioCase {
-                family_name,
-                generator_version: "1".into(),
-                seed,
-                case_index,
-                subject,
-                scenario,
-                expected_outcomes,
-            }
-        })
+        .map(|case_index| generate_milestone3_adversarial_case(seed, case_index as u64))
         .collect()
+}
+
+/// Generate one catalog case without regenerating and discarding every prior
+/// index. This is the process-runner entry point for deterministic isolation.
+pub fn generate_milestone3_adversarial_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
+    let (family_name, subject, mut scenario, mut expected_outcomes) =
+        milestone3_case(&mut rng, case_index);
+    add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
+    GeneratedScenarioCase {
+        family_name,
+        generator_version: "1".into(),
+        seed,
+        case_index,
+        subject,
+        scenario,
+        expected_outcomes,
+    }
 }
 
 /// One-round form of the sustained mixed-traffic workload for normal
@@ -269,6 +272,15 @@ pub async fn run_generated_case_report_with_capture(
             .await?
         }
         GeneratedSubjectKind::RetainedRelay => {
+            if capture_sensitive_replay {
+                return Err(ScenarioRunError {
+                    step_index: None,
+                    kind: "sensitive_replay_capture_unsupported".into(),
+                    category: SubjectFailureCategory::Environment,
+                    message: "retained-relay generated cases cannot capture an engine checkpoint"
+                        .into(),
+                });
+            }
             let mut subject = RetainedRelaySubject::new(
                 &case.scenario.clients,
                 &case.scenario.topology,
@@ -413,15 +425,6 @@ async fn run_generated_scenario(
             )
             .await
         }
-    }
-}
-
-fn subject_setup_error(error: crate::SubjectError) -> ScenarioRunError {
-    ScenarioRunError {
-        step_index: None,
-        kind: error.code,
-        category: error.category,
-        message: error.message,
     }
 }
 
@@ -1572,9 +1575,6 @@ fn milestone3_restart_boundaries(
             ["bob", "carol"],
             "create",
         ),
-        ScenarioStep::RestartClient {
-            client: "alice".into(),
-        },
         confirmed_step("alice", "create"),
         ScenarioStep::DeliverAll,
         tick(["bob", "carol"]),
@@ -1592,6 +1592,9 @@ fn milestone3_restart_boundaries(
         },
         ScenarioStep::DeliverAll,
         tick(["bob", "carol"]),
+        ScenarioStep::RestartClient {
+            client: "alice".into(),
+        },
     ];
     (
         "milestone3/restart-boundaries/v1".into(),
@@ -2600,6 +2603,10 @@ fn add_strict_reliability_oracle(
         scenario.name
     );
 
+    let final_group = scenario.steps.iter().rev().find_map(|step| match step {
+        ScenarioStep::InGroup { group, .. } => Some(group.clone()),
+        _ => None,
+    });
     scenario.steps.push(ScenarioStep::DeliverAll);
     scenario.steps.push(ScenarioStep::Tick {
         clients: scenario.clients.clone(),
@@ -2611,9 +2618,15 @@ fn add_strict_reliability_oracle(
     scenario.steps.push(ScenarioStep::Tick {
         clients: scenario.clients.clone(),
     });
-    scenario.steps.push(ScenarioStep::ObserveExact {
+    let observe = ScenarioStep::ObserveExact {
         clients: exact_clients.clone(),
-    });
+    };
+    scenario.steps.push(
+        final_group.map_or(observe.clone(), |group| ScenarioStep::InGroup {
+            group,
+            action: Box::new(observe),
+        }),
+    );
 
     if exact_clients.len() >= 2 {
         expected.push(TraceExpectation::ClientsExactlyEquivalent {

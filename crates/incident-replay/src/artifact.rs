@@ -170,14 +170,18 @@ pub fn archetype_artifact(
     export: &AgentStateExport,
     source_format: IncidentSourceFormatV1,
     vector: VectorFixture,
-) -> IncidentScenarioArtifactV1 {
-    IncidentScenarioArtifactV1 {
+) -> Result<IncidentScenarioArtifactV1, ExactHistoryImportError> {
+    let incident_event_indices = incident_event_indices(export);
+    if incident_event_indices.is_empty() {
+        return Err(ExactHistoryImportError::MissingIncidentEvidence);
+    }
+    Ok(IncidentScenarioArtifactV1 {
         schema_version: "1".into(),
         source_format,
         replay_fidelity: IncidentReplayFidelityV1::OutcomeEquivalentArchetype,
         evidence_confidence: EvidenceConfidenceV1::DerivedOutcomeEquivalent,
         source_event_count: export.events.len(),
-        incident_event_indices: incident_event_indices(export),
+        incident_event_indices,
         action_evidence: Vec::new(),
         unavailable_fields: vec![
             unavailable(
@@ -199,7 +203,7 @@ pub fn archetype_artifact(
         ],
         byte_replay_available: false,
         vector,
-    }
+    })
 }
 
 pub fn accept_exact_history(

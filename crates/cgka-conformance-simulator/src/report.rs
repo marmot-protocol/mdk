@@ -704,6 +704,13 @@ mod tests {
         assert_eq!(failures[0].kind, "scenario_step_failed:backend");
         assert!(failures[0].message.contains("replay budget exceeded"));
         assert_eq!(measurements.first_failing_action, Some(4));
+        assert_eq!(measurements.convergence_latency_us, None);
+        assert!(
+            measurements
+                .unavailable_process_fields
+                .iter()
+                .any(|field| field == "convergence_latency_us")
+        );
         assert!(
             measurements
                 .limiting_resource

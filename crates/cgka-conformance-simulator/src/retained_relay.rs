@@ -450,8 +450,12 @@ impl ConvergenceSubject for RetainedRelaySubject {
         self.engine.engine_metrics()
     }
 
-    fn select_scenario_group(&mut self, group: &str) -> Result<(), SubjectError> {
-        self.engine.select_scenario_group(group)
+    fn select_scenario_group(
+        &mut self,
+        group: &str,
+        allow_create: bool,
+    ) -> Result<(), SubjectError> {
+        self.engine.select_scenario_group(group, allow_create)
     }
 
     async fn create_group(&mut self, action: SubjectCreateGroup<'_>) -> Result<(), SubjectError> {
