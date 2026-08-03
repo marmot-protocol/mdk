@@ -8,7 +8,7 @@
 //! - Apply the winning commit and return to Stable
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::canonicalization::{CanonicalizationPolicy, ConvergenceStatus};
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
@@ -648,10 +648,13 @@ async fn convergence_privileged_remove_beats_grinding_ordinary_self_update() {
 
 /// A peer's same-epoch commit that arrives during our own `PendingPublish`
 /// window is buffered `Retryable` before any peel. When our own commit confirms
-/// and wins the fork, replay must reclassify the buffered commit terminal: the
-/// content row lands `EpochInvalidated`, and the raw transport wrapper is
-/// retired `Processed` — not left `Retryable` to be re-peeled on every later
-/// publish-cycle replay.
+/// and wins the fork, replay must reclassify the buffered commit: the content
+/// row parks `ConvergenceDeferred` — reconsiderable, not terminal, because
+/// nodes that did not commit from that epoch resolve the same conflict through
+/// distributed convergence, where the rival branch can still win by growing
+/// deeper (see `pairwise_incumbent_defers_to_deeper_convergence_branch`) — and
+/// the raw transport wrapper is retired `Processed`, not left `Retryable` to be
+/// re-peeled on every later publish-cycle replay.
 #[tokio::test]
 async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
     use cgka_traits::ingest::IngestOutcome;
@@ -725,8 +728,10 @@ async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
 
     assert_eq!(
         alice_storage.get_message(&content_id).unwrap().state,
-        MessageState::EpochInvalidated,
-        "the losing fork commit's content row carries the real verdict"
+        MessageState::ConvergenceDeferred,
+        "the pairwise-losing fork commit's content row is parked reconsiderable \
+         (cross-seam: distributed convergence may still select its branch if it \
+         grows deeper), not terminally EpochInvalidated"
     );
     assert_eq!(
         alice_storage.get_message(&raw_id).unwrap().state,
@@ -1347,4 +1352,219 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
         recovery_probe,
         SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
     ));
+}
+
+#[tokio::test]
+async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
+    // Cross-seam divergence, as observed in multi-VM soak runs: a node that
+    // committed from epoch N resolves a same-epoch rival PAIRWISE
+    // (ForkRecoveryManager — ordering key only, depth-blind), while every
+    // node that did NOT commit from N resolves the same conflict through
+    // distributed convergence, where a deeper valid branch outranks the
+    // ordering key. If the pairwise loser is invalidated terminally, the
+    // pairwise node can never follow the fleet onto the rival branch once
+    // that branch grows — a permanent lineage split in which each side keeps
+    // decrypting only its own history.
+    //
+    // This test drives the exact sequence: the pairwise winner must first
+    // reject the rival root (incumbent wins on the ordering key), then
+    // CONVERGE onto the rival branch after a follow-on commit makes it the
+    // deeper valid branch.
+    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+
+    // Fix which identity wins the pairwise race up front (privileged admin
+    // commits at the same epoch order by committer identity).
+    let first = b"seam-first".as_slice();
+    let second = b"seam-second".as_slice();
+    let (winner_id, loser_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Concrete Engine type: the test drives the convergence pass to
+    // completion explicitly (`converge_stored_openmls_messages_at`), which is
+    // not part of the CgkaEngine trait surface.
+    let (mut winner, _winner_storage) = build_client_with_storage(winner_id); // pairwise incumbent-keeper
+    let mut loser = build_client(loser_id); //  rival whose branch grows deeper
+    let mut david = build_client(b"seam-david");
+    let mut eve = build_client(b"seam-eve");
+    let mut frank = build_client(b"seam-frank");
+
+    let loser_kp = loser.fresh_key_package().await.unwrap();
+    let (group_id, create) = winner
+        .create_group(CreateGroupRequest {
+            name: "cross-seam".into(),
+            description: String::new(),
+            members: vec![loser_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![loser.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            winner.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    loser.join_welcome(welcome).await.unwrap();
+    assert_eq!(winner.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(loser.epoch(&group_id).unwrap().0, 1);
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Rival commits from epoch 1: the winner invites david, the loser invites
+    // eve. Neither sees the other's commit yet.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let winner_invite = winner
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let loser_invite = loser
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (winner_commit, loser_root) = match (&winner_invite, &loser_invite) {
+        (
+            SendResult::GroupEvolution { msg: w, pending: wp, .. },
+            SendResult::GroupEvolution { msg: l, pending: lp, .. },
+        ) => {
+            let (w, l, wp, lp) = (w.clone(), l.clone(), *wp, *lp);
+            winner.confirm_published(wp).await.unwrap();
+            loser.confirm_published(lp).await.unwrap();
+            (w, l)
+        }
+        _ => unreachable!(),
+    };
+    let winner_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(winner_id)),
+        &winner_commit.payload,
+    );
+    let loser_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(loser_id)),
+        &loser_root.payload,
+    );
+    assert!(
+        winner_key < loser_key,
+        "identity choice must make the incumbent win the pairwise race"
+    );
+
+    // Seam 1 on the winner: the rival root LOSES the pairwise race. The
+    // winner keeps its own branch (no ForkRecovered), and — the fix under
+    // test — the loser's root must stay reconsiderable, not terminally
+    // invalidated.
+    let outcome = winner.ingest(route(loser_root.clone())).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadyAtEpoch { .. }
+        }
+    ));
+    let events = winner.drain_events();
+    assert!(
+        extract_fork_recovered(&events, &group_id).is_none(),
+        "incumbent-wins must not roll the winner back"
+    );
+    assert_eq!(winner.epoch(&group_id).unwrap().0, 2);
+
+    // The loser's branch grows deeper: a follow-on invite from ITS epoch 2.
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let loser_follow_on = match loser
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            loser.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(loser.epoch(&group_id).unwrap().0, 3);
+
+    // Seam 2 on the winner: the follow-on commit routes into distributed
+    // convergence, which must now select the rival branch (valid depth 2 from
+    // the fork point vs the winner's own depth 1) and rewind the winner onto
+    // it — the same branch every convergence-only node picks. Before the fix
+    // the rival root was `EpochInvalidated` and could never be materialized,
+    // so the winner stayed on its own lineage forever.
+    let follow_on_outcome = winner.ingest(route(loser_follow_on)).await.unwrap();
+    assert!(
+        matches!(follow_on_outcome, IngestOutcome::Buffered { .. }),
+        "the rival follow-on must enter the convergence pass, got {follow_on_outcome:?}"
+    );
+    // Drive the pass past its quiescence window (production wnd gets here via
+    // the passage of time); the deeper rival branch must now be selected.
+    let result = winner
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("cross-seam reorg onto the deeper rival branch");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    assert_eq!(
+        winner.epoch(&group_id).unwrap().0,
+        3,
+        "winner must converge onto the deeper rival branch"
+    );
+    let winner_members: Vec<_> = winner
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert!(
+        winner_members.contains(&MemberId::new(pad32(b"seam-eve"))),
+        "rival branch's first invitee must be present after convergence"
+    );
+    assert!(
+        winner_members.contains(&MemberId::new(pad32(b"seam-frank"))),
+        "rival branch's second invitee must be present after convergence"
+    );
+    assert!(
+        !winner_members.contains(&MemberId::new(pad32(b"seam-david"))),
+        "the abandoned pairwise branch's invitee must be gone"
+    );
+    let loser_members: Vec<_> = loser
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(
+        {
+            let mut w = winner_members.clone();
+            w.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            w
+        },
+        {
+            let mut l = loser_members.clone();
+            l.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            l
+        },
+        "both nodes must end on the identical branch"
+    );
 }
