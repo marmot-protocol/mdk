@@ -13,6 +13,9 @@ on:
       - integrations/openclaw/marmot/**
       - scripts/install-opencode-marmot.sh
       - integrations/opencode/marmot/**
+      - scripts/install-pi-marmot.sh
+      - integrations/pi/marmot/**
+      - integrations/terminal-harness/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
@@ -50,7 +53,7 @@ env:
 
 jobs:
   build:
-    name: Build wn-agent and wn-opencode (${{ matrix.target }})
+    name: Build wn-agent and terminal harnesses (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -100,6 +103,12 @@ jobs:
 
       - name: Smoke test wn-opencode
         run: ./target/${{ matrix.rust_target }}/release/wn-opencode --help
+
+      - name: Build wn-pi
+        run: cargo build --locked --release -p wn-pi --bin wn-pi --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test wn-pi
+        run: ./target/${{ matrix.rust_target }}/release/wn-pi --help
 
       - name: Package wn-agent bundle
         shell: bash
@@ -229,6 +238,71 @@ jobs:
         with:
           name: wn-opencode-${{ matrix.target }}
           path: dist/wn-opencode-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Package wn-pi bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          rust_target="${{ matrix.rust_target }}"
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          release_tag=""
+          artifact_version="$sha_short"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^wn-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: wn-agent releases must use a version tag like wn-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#wn-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: wn-agent release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          stage_parent="$RUNNER_TEMP/wn-pi-stage"
+          bundle_dir="$stage_parent/wn-pi-$target"
+          asset="$RUNNER_TEMP/wn-pi-$target-$artifact_version.tar.gz"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          install -m 0755 "target/$rust_target/release/wn-pi" "$bundle_dir/wn-pi"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "wn-pi",
+            "target": "$target",
+            "rust_target": "$rust_target",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "rustc": "$(rustc --version)",
+            "cargo": "$(cargo --version)",
+            "contents": [
+              "wn-pi",
+              "manifest.json"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            tar -czf "$asset" "wn-pi-$target"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p "dist/wn-pi-$target"
+          cp "$asset" "$asset.sha256" "dist/wn-pi-$target/"
+
+      - name: Upload wn-pi bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-pi-${{ matrix.target }}
+          path: dist/wn-pi-${{ matrix.target }}/*
           if-no-files-found: error
 
   plugin:
@@ -453,7 +527,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
@@ -462,6 +536,10 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-linux-aarch64 --dir dist/opencode-linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-darwin-aarch64 --dir dist/opencode-darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-darwin-x86_64 --dir dist/opencode-darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-linux-x86_64 --dir dist/pi-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-linux-aarch64 --dir dist/pi-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-aarch64 --dir dist/pi-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-x86_64 --dir dist/pi-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
 
@@ -495,8 +573,13 @@ jobs:
           sed \
             -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-            scripts/install-opencode-marmot.sh > dist/install/install-opencode-marmot.sh
+          scripts/install-opencode-marmot.sh > dist/install/install-opencode-marmot.sh
           chmod 0755 dist/install/install-opencode-marmot.sh
+          sed \
+            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+            scripts/install-pi-marmot.sh > dist/install/install-pi-marmot.sh
+          chmod 0755 dist/install/install-pi-marmot.sh
 
       - name: Create or update wn-agent release
         shell: bash
@@ -516,6 +599,7 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
           \`\`\`
 
           Install this exact WN Agent release with:
@@ -524,16 +608,19 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-pi-marmot.sh | bash
           \`\`\`
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
           - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
+          - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
+          - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -555,6 +642,14 @@ jobs:
             dist/opencode-darwin/wn-opencode-darwin-aarch64-"$version".tar.gz.sha256
             dist/opencode-darwin-intel/wn-opencode-darwin-x86_64-"$version".tar.gz
             dist/opencode-darwin-intel/wn-opencode-darwin-x86_64-"$version".tar.gz.sha256
+            dist/pi-linux/wn-pi-linux-x86_64-"$version".tar.gz
+            dist/pi-linux/wn-pi-linux-x86_64-"$version".tar.gz.sha256
+            dist/pi-linux-arm/wn-pi-linux-aarch64-"$version".tar.gz
+            dist/pi-linux-arm/wn-pi-linux-aarch64-"$version".tar.gz.sha256
+            dist/pi-darwin/wn-pi-darwin-aarch64-"$version".tar.gz
+            dist/pi-darwin/wn-pi-darwin-aarch64-"$version".tar.gz.sha256
+            dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz
+            dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz.sha256
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
             dist/plugin/openclaw-marmot-plugin-"$version".tgz
@@ -562,6 +657,7 @@ jobs:
             dist/install/install-hermes-marmot.sh
             dist/install/install-openclaw-marmot.sh
             dist/install/install-opencode-marmot.sh
+            dist/install/install-pi-marmot.sh
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -599,6 +695,7 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-hermes-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-opencode-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-pi-marmot.sh | bash
           \`\`\`
 
           Use the versioned \`$tag\` release URLs when you need a pinned install.
@@ -618,6 +715,7 @@ jobs:
             dist/install/install-hermes-marmot.sh
             dist/install/install-openclaw-marmot.sh
             dist/install/install-opencode-marmot.sh
+            dist/install/install-pi-marmot.sh
           )
 
           if gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

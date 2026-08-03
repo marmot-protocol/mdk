@@ -11,6 +11,8 @@ systems to Marmot through `wn-agent`.
 - `hermes/marmot` - Hermes platform plugin.
 - `openclaw/marmot` - OpenClaw channel plugin.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
+- `pi/marmot` - `wn-pi` Pi harness binary.
+- `terminal-harness` - shared terminal-harness control/runtime library.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
@@ -46,8 +48,8 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-opencode` is a pure OpenCode harness. It subscribes to allowed Marmot
-prompts and invokes the `opencode` binary; it should stay narrower than the
+`wn-opencode` and `wn-pi` are pure terminal harnesses. They subscribe to allowed
+Marmot prompts and invoke their respective binaries; they should stay narrower than the
 gateway integrations unless there is a concrete product reason to broaden it.
 
 Do not force every feature from Hermes/OpenClaw onto harnesses. Borrow shared
@@ -73,7 +75,7 @@ defaults conservatively:
 
 - Hermes/OpenClaw default to mention-style activation in multi-party groups and
   always reply in effective DMs.
-- `wn-opencode` currently supports only always-on activation for explicitly
+- Terminal harnesses currently support only always-on activation for explicitly
   allowed senders.
 
 When changing activation or allowlist semantics, reason about both default
@@ -140,6 +142,10 @@ just openclaw-dev-e2e-connector
 cargo test -p wn-opencode
 just opencode-dev-e2e-connector
 just opencode-installer-test
+
+cargo test -p wn-pi
+just pi-dev-e2e-connector
+just pi-installer-test
 ```
 
 For shared connector or release-workflow changes, run `just fast-ci` before

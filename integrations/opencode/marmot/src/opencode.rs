@@ -1,7 +1,10 @@
-use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use async_trait::async_trait;
+use marmot_terminal_harness::{
+    Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
+};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -10,39 +13,22 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout_at;
 use tracing::debug;
 
-use crate::bridge::TRACE_TARGET;
-use crate::error::{HarnessError, Result};
-
 const STDERR_CAPTURE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Invocation {
+pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
-    pub(crate) timeout: Duration,
-    pub(crate) idle_timeout: Duration,
-    pub(crate) cwd: PathBuf,
-    pub(crate) session_id: Option<String>,
-    pub(crate) prompt: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Outcome {
-    pub(crate) observed_session: Option<String>,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) error_summary: Option<String>,
-    pub(crate) stderr: String,
-    pub(crate) elapsed_ms: u128,
-}
-
-#[derive(Debug)]
-pub(crate) struct RunFailure {
-    pub(crate) error: HarnessError,
-    pub(crate) observed_session: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RunnerEvent {
-    Text(String),
+#[async_trait]
+impl Backend for OpencodeBackend {
+    async fn run(
+        &self,
+        invocation: Invocation,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        run_with_bin(&self.bin, invocation, tx).await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,11 +68,12 @@ struct OpencodeErrorData {
     status_code: Option<u16>,
 }
 
-pub(crate) async fn run(
+async fn run_with_bin(
+    bin: &str,
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
-    let mut command = Command::new(&invocation.bin);
+    let mut command = Command::new(bin);
     command
         .args(build_run_args(
             invocation.session_id.as_deref(),
@@ -99,7 +86,7 @@ pub(crate) async fn run(
         .kill_on_drop(true);
 
     let mut child = command.spawn().map_err(|_| RunFailure {
-        error: HarnessError::OpencodeSpawn,
+        error: HarnessError::BackendSpawn,
         observed_session: None,
     })?;
     let total_deadline = tokio::time::Instant::now() + invocation.timeout;
@@ -108,7 +95,7 @@ pub(crate) async fn run(
         None => {
             kill_and_reap(&mut child).await;
             return Err(RunFailure {
-                error: HarnessError::OpencodeSpawn,
+                error: HarnessError::BackendSpawn,
                 observed_session: None,
             });
         }
@@ -118,7 +105,7 @@ pub(crate) async fn run(
         None => {
             kill_and_reap(&mut child).await;
             return Err(RunFailure {
-                error: HarnessError::OpencodeSpawn,
+                error: HarnessError::BackendSpawn,
                 observed_session: None,
             });
         }
@@ -148,7 +135,7 @@ pub(crate) async fn run(
                         // still caps both operations.
                         tx.send(RunnerEvent::Text(text))
                             .await
-                            .map_err(|_| HarnessError::OpencodeStream)?;
+                            .map_err(|_| HarnessError::BackendStream)?;
                     }
                 }
                 Ok(Some(ParsedEvent::Session(session_id))) => {
@@ -189,7 +176,7 @@ pub(crate) async fn run(
         })
         .await
         {
-            Err(_) => return Err(HarnessError::OpencodeIdle),
+            Err(_) => return Err(HarnessError::BackendIdle),
             Ok(result) => result?,
         };
         Ok::<Outcome, HarnessError>(Outcome {
@@ -214,7 +201,7 @@ pub(crate) async fn run(
         Err(_) => {
             cleanup_failed_run(&mut child, &mut stderr_task).await;
             Err(RunFailure {
-                error: HarnessError::OpencodeTimedOut,
+                error: HarnessError::BackendTimedOut,
                 observed_session,
             })
         }
@@ -226,8 +213,8 @@ async fn next_stdout_line(
     idle_deadline: tokio::time::Instant,
 ) -> std::result::Result<Option<String>, HarnessError> {
     match timeout_at(idle_deadline, lines.next_line()).await {
-        Err(_) => Err(HarnessError::OpencodeIdle),
-        Ok(Err(_)) => Err(HarnessError::OpencodeStream),
+        Err(_) => Err(HarnessError::BackendIdle),
+        Ok(Err(_)) => Err(HarnessError::BackendStream),
         Ok(Ok(line)) => Ok(line),
     }
 }
@@ -346,17 +333,26 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::sync::mpsc;
 
     use super::*;
 
+    const MOCK_BIN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-opencode.sh"
+    );
+
+    async fn run(
+        invocation: Invocation,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        run_with_bin(MOCK_BIN, invocation, tx).await
+    }
+
     fn mock_invocation(dir: &tempfile::TempDir, scenario: &str) -> Invocation {
         Invocation {
-            bin: concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/mock-opencode.sh"
-            )
-            .to_owned(),
             timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_millis(500),
             cwd: dir.path().to_path_buf(),
@@ -455,7 +451,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert!(matches!(failure.error, HarnessError::BackendIdle));
         assert_eq!(failure.observed_session.as_deref(), Some("ses_idle"));
     }
 
@@ -518,7 +514,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(failure.error, HarnessError::OpencodeTimedOut),
+            matches!(failure.error, HarnessError::BackendTimedOut),
             "expected total timeout, got {failure:?}"
         );
     }
@@ -539,7 +535,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert!(matches!(failure.error, HarnessError::BackendIdle));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -559,7 +555,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert!(matches!(failure.error, HarnessError::BackendIdle));
         assert!(
             started.elapsed() < Duration::from_millis(1_350),
             "stdout EOF must not reset the existing idle deadline"
@@ -582,7 +578,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -604,7 +600,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
+        assert!(matches!(failure.error, HarnessError::BackendTimedOut));
         assert_eq!(
             failure.observed_session.as_deref(),
             Some("ses_backpressure")

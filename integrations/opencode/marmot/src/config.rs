@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{HarnessError, Result};
+use crate::opencode::OpencodeBackend;
 
 pub(crate) const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;
 pub(crate) const MARMOT_MESSAGE_BYTES_CEILING: usize = 60_000;
@@ -142,6 +143,28 @@ impl Config {
             max_pending_per_group,
             state_path,
         })
+    }
+
+    pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
+        let backend = OpencodeBackend {
+            bin: self.opencode_bin,
+        };
+        let config = marmot_terminal_harness::Config {
+            socket: self.socket,
+            auth_token: self.auth_token,
+            allowed_senders: self.allowed_senders,
+            account_id_hex: self.account_id_hex,
+            request_timeout: self.request_timeout,
+            max_reply_bytes: self.max_reply_bytes,
+            max_pending_per_group: self.max_pending_per_group,
+            state_path: self.state_path,
+            backend_timeout: self.opencode_timeout,
+            backend_idle_timeout: self.opencode_idle_timeout,
+            display_name: "opencode",
+            reply_prefix: "wn-opencode",
+            bin_env_name: "WN_OPENCODE_BIN",
+        };
+        (config, backend)
     }
 }
 

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::bridge::TRACE_TARGET;
+use crate::TRACE_TARGET;
 use crate::error::{HarnessError, Result};
 
 #[derive(Clone, Debug)]
@@ -260,7 +260,7 @@ impl ControlClient {
 
     fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("wn-opencode-{}-{seq}", std::process::id())
+        format!("terminal-harness-{}-{seq}", std::process::id())
     }
 }
 
@@ -336,7 +336,7 @@ mod tests {
     fn rich_context_golden_events_decode() {
         let fixture = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../fixtures/agent-control-v2-rich-context.json"),
+                .join("../../fixtures/agent-control-v2-rich-context.json"),
         )
         .unwrap();
         let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();

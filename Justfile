@@ -177,6 +177,12 @@ opencode-installer-test:
 opencode-dev-e2e-connector:
     cargo test -p wn-opencode --test e2e_connector -- --ignored --nocapture
 
+pi-installer-test:
+    integrations/pi/marmot/tests/test_installer.sh
+
+pi-dev-e2e-connector:
+    cargo test -p wn-pi --test e2e_connector -- --ignored --nocapture
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail

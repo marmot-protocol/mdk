@@ -25,25 +25,25 @@ const MAX_REPLY_BYTES: usize = 64;
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
-#[ignore = "spawns real wn-agent and wn-opencode processes"]
-async fn debug_inbound_reaches_fake_opencode_and_records_chunked_finals() {
+#[ignore = "spawns real wn-agent and wn-pi processes"]
+async fn debug_inbound_reaches_fake_pi_and_records_chunked_finals() {
     let temp = TempDir::new().expect("temp dir");
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
         .expect("make temp root private");
     let marmot_home = temp.path().join("marmot-home");
     let socket = temp.path().join("a.sock");
-    let state_path = temp.path().join("wn-opencode-state").join("sessions.json");
-    let fake_opencode = write_fake_opencode(temp.path());
+    let state_path = temp.path().join("wn-pi-state").join("sessions.json");
+    let fake_pi = write_fake_pi(temp.path());
 
     let agent = ChildGuard::new(spawn_wn_agent(&marmot_home, &socket, temp.path()));
 
     wait_for_agent(&socket).await;
     let account = create_account(&socket).await;
 
-    let harness = ChildGuard::new(spawn_wn_opencode(
+    let harness = ChildGuard::new(spawn_wn_pi(
         &socket,
         &state_path,
-        &fake_opencode,
+        &fake_pi,
         &account.account_id_hex,
         temp.path(),
     ));
@@ -135,79 +135,65 @@ fn spawn_wn_agent(home: &Path, socket: &Path, log_root: &Path) -> SpawnedChild {
     }
 }
 
-fn spawn_wn_opencode(
+fn spawn_wn_pi(
     socket: &Path,
     state_path: &Path,
-    fake_opencode: &Path,
+    fake_pi: &Path,
     account_id_hex: &str,
     log_root: &Path,
 ) -> SpawnedChild {
-    let stdout_path = log_root.join("wn-opencode.out.log");
-    let stderr_path = log_root.join("wn-opencode.err.log");
-    let stdout = File::create(&stdout_path).expect("create wn-opencode stdout log");
-    let stderr = File::create(&stderr_path).expect("create wn-opencode stderr log");
-    let child = Command::new(env!("CARGO_BIN_EXE_wn-opencode"))
+    let stdout_path = log_root.join("wn-pi.out.log");
+    let stderr_path = log_root.join("wn-pi.err.log");
+    let stdout = File::create(&stdout_path).expect("create wn-pi stdout log");
+    let stderr = File::create(&stderr_path).expect("create wn-pi stderr log");
+    let child = Command::new(env!("CARGO_BIN_EXE_wn-pi"))
         .env("MARMOT_AGENT_SOCKET", socket)
-        .env("WN_OPENCODE_ACCOUNT_ID_HEX", account_id_hex)
-        .env("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER_ACCOUNT_ID_HEX)
-        .env("WN_OPENCODE_BIN", fake_opencode)
-        .env("WN_OPENCODE_STATE_PATH", state_path)
-        .env("WN_OPENCODE_MAX_REPLY_BYTES", MAX_REPLY_BYTES.to_string())
-        .env("WN_OPENCODE_TIMEOUT_SECS", "5")
-        .env("WN_OPENCODE_REQUEST_TIMEOUT_SECS", "5")
-        .env("RUST_LOG", "warn,wn_opencode=info")
+        .env("WN_PI_ACCOUNT_ID_HEX", account_id_hex)
+        .env("WN_PI_ALLOWED_SENDERS_HEX", SENDER_ACCOUNT_ID_HEX)
+        .env("WN_PI_BIN", fake_pi)
+        .env("WN_PI_STATE_PATH", state_path)
+        .env("WN_PI_MAX_REPLY_BYTES", MAX_REPLY_BYTES.to_string())
+        .env("WN_PI_TIMEOUT_SECS", "5")
+        .env("WN_PI_REQUEST_TIMEOUT_SECS", "5")
+        .env("RUST_LOG", "warn,wn_pi=info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("spawn wn-opencode");
+        .expect("spawn wn-pi");
     SpawnedChild {
-        name: "wn-opencode",
+        name: "wn-pi",
         child,
         stdout_path,
         stderr_path,
     }
 }
 
-fn write_fake_opencode(root: &Path) -> std::path::PathBuf {
-    let script = root.join("fake-opencode");
+fn write_fake_pi(root: &Path) -> std::path::PathBuf {
+    let script = root.join("fake-pi");
     fs::write(
         &script,
         r#"#!/usr/bin/env bash
 set -euo pipefail
-if [ "${1:-}" != "run" ] || [ "${2:-}" != "--format" ] || [ "${3:-}" != "json" ]; then
-  echo "unexpected opencode args: $*" >&2
+if [ "${1:-}" != "--mode" ] || [ "${2:-}" != "json" ]; then
+  echo "unexpected pi args: $*" >&2
   exit 64
 fi
-found_delimiter=0
-prompt=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    found_delimiter=1
-    shift
-    prompt="${1:-}"
-    break
-  fi
-  shift
-done
-if [ "$found_delimiter" -ne 1 ]; then
-  echo "missing prompt delimiter: $*" >&2
-  exit 64
-fi
+prompt="$(cat)"
 tail=""
 for _ in $(seq 1 40); do
   tail="${tail}chunk "
 done
-printf '%s\n' '{"type":"step_start","sessionID":"ses_e2e"}'
-printf '{"type":"text","part":{"text":"marmot-e2e-ok: %s %s"}}\n' "$prompt" "$tail"
+printf '%s\n' '{"type":"session","version":3,"id":"ses_e2e","cwd":"/tmp"}'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"marmot-e2e-ok: %s %s"}],"stopReason":"stop"}}\n' "$prompt" "$tail"
 "#,
     )
-    .expect("write fake opencode");
+    .expect("write fake pi");
     let mut permissions = fs::metadata(&script)
-        .expect("fake opencode metadata")
+        .expect("fake pi metadata")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod fake opencode");
+    fs::set_permissions(&script, permissions).expect("chmod fake pi");
     script
 }
 
@@ -239,7 +225,7 @@ async fn create_account(socket: &Path) -> AgentControlAccount {
         socket,
         "req-create-account",
         AgentControlRequest::AccountCreate {
-            label: Some("wn-opencode-e2e".to_owned()),
+            label: Some("wn-pi-e2e".to_owned()),
             publish_key_package: false,
         },
     )
@@ -291,7 +277,7 @@ async fn inject_until_recorded_finals(
                 None
             }
         },
-        "recorded wn-opencode final sends",
+        "recorded wn-pi final sends",
         Duration::from_secs(30),
     )
     .await
