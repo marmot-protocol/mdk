@@ -1577,7 +1577,7 @@ impl<S: StorageProvider> Engine<S> {
             tracing::warn!(
                 target: "cgka_engine::hydrate",
                 method = "hydrate_one_stored_group",
-                %error,
+                transient = error.is_transient(),
                 "failed to rebuild fork-routing state; group stays on the convergence path"
             );
         }
