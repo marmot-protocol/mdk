@@ -883,7 +883,7 @@ impl<S: StorageProvider> Engine<S> {
                                         &group_id, &msg.id, msg_epoch, current,
                                     ));
                                 }
-                                ForkResolution::IncumbentWins
+                                ForkResolution::IncumbentWins { .. }
                                 | ForkResolution::CandidateWins { .. } => {
                                     // recovery_snapshot_name_for_fork and
                                     // resolve_fork_candidate read the same
@@ -945,10 +945,43 @@ impl<S: StorageProvider> Engine<S> {
                                     Some((msg_epoch, winner, invalidated, invalidated_storage_id));
                                 continue;
                             }
-                            ForkResolution::IncumbentWins => {
-                                self.update_stored_message_state(
-                                    &msg.id,
-                                    MessageState::EpochInvalidated,
+                            ForkResolution::IncumbentWins { .. } => {
+                                // The candidate lost this node's PAIRWISE race
+                                // — but nodes that did not commit from this
+                                // epoch resolve the same conflict through
+                                // distributed convergence, where a deeper
+                                // candidate branch outranks the ordering key.
+                                // Terminal `EpochInvalidated` froze this node
+                                // on its own lineage forever (convergence
+                                // never re-admits it — see
+                                // `convergence_input::can_start_pass`), so two
+                                // honest nodes could keep different branches
+                                // permanently. Park the loser
+                                // `ConvergenceDeferred` instead: that state
+                                // re-enters branch materialization (see
+                                // `unresolved_commit_state`) so a later pass
+                                // can still select its branch once follow-on
+                                // commits arrive — while staying out of the
+                                // linear pending replay, which would choke on
+                                // a cross-branch commit. If its branch loses
+                                // in convergence too, it is re-classified
+                                // terminal (`LosingBranch`) there.
+                                //
+                                // Re-persist the full row (not just the state):
+                                // the row was stored above under this node's
+                                // CURRENT epoch, but convergence-input rows are
+                                // keyed by the commit's SOURCE epoch (see
+                                // `buffer_openmls_convergence_message_with_time`)
+                                // — the apply stage reads `record.epoch` to
+                                // pick the retained-anchor rewind target, so a
+                                // current-epoch row would make the reorg replay
+                                // this epoch-N commit against the live tip
+                                // state (WrongEpoch).
+                                self.persist_openmls_wire_message(
+                                    &openmls_msg,
+                                    &group_id,
+                                    msg_epoch,
+                                    MessageState::ConvergenceDeferred,
                                 )?;
                                 return Ok(IngestOutcome::Stale {
                                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
