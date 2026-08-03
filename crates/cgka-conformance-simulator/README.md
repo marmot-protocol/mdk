@@ -67,6 +67,9 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   preserves model action identities, exercises unequal histories, freeze/settle, crash/restart, temporary resource
   failure, administrative progress, and losing-branch joiner repair, and emits a minimal assumption-labeled
   starvation trace that compiles into Scenario IR.
+- `mutation_adequacy` — nine simulator-only single-rule mutants with minimal deterministic witnesses. The executable
+  catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
+  publication-ack, and retention-boundary mutations without compiling mutation switches into production.
 
 ## Testing layers
 
@@ -109,6 +112,12 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
     [`src/lifecycle_model.rs`](src/lifecycle_model.rs), [`tests/lifecycle_model.rs`](tests/lifecycle_model.rs)
   - **What it catches:** Missing input-closure/fairness assumptions, frozen-pass loss across restart, settlement over
     unequal histories, temporary resource failure without repair, and unsupported losing-branch joiner recovery.
+
+- **Layer:** Mutation adequacy
+  - **Files:** [`src/mutation_adequacy.rs`](src/mutation_adequacy.rs),
+    [`tests/mutation_adequacy.rs`](tests/mutation_adequacy.rs), [`MUTATION_MATRIX.md`](MUTATION_MATRIX.md)
+  - **What it catches:** Verification layers that agree with production only because both omitted or share the same
+    faulty semantic rule.
 
 ## Run the tests
 

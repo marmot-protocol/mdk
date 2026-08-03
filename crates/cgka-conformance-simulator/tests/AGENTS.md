@@ -29,6 +29,10 @@ Map for simulator tests.
   - **Owns:** Stateright lifecycle mirror, fair bounded progress, crash/resource recovery, stranded-joiner repair, and
     stable-action-id counterexample-to-Scenario-IR validation.
 
+- **File:** `mutation_adequacy.rs`
+  - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
+    verification-layer matrix.
+
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 

@@ -779,14 +779,22 @@ may become stranded; their only modeled repair is reset/rejoin with fresh state.
 
 ### 4.3 Mutation adequacy
 
-- [ ] Mutate selector comparison order.
-- [ ] Mutate witness sender/epoch deduplication.
-- [ ] Mutate app-message witness admission/removal to determine which scenarios actually depend on it.
-- [ ] Mutate cutoff admission and frozen-member persistence.
-- [ ] Mutate scheduler deadlines and re-arm classification.
-- [ ] Mutate output invalidation and publication acknowledgement.
-- [ ] Mutate retained-history and expiration boundaries.
-- [ ] Maintain a matrix showing which verification layer kills each mutation.
+- [x] Mutate selector comparison order.
+- [x] Mutate witness sender/epoch deduplication.
+- [x] Mutate app-message witness admission/removal to determine which scenarios actually depend on it.
+- [x] Mutate cutoff admission and frozen-member persistence.
+- [x] Mutate scheduler deadlines and re-arm classification.
+- [x] Mutate output invalidation and publication acknowledgement.
+- [x] Mutate retained-history and expiration boundaries.
+- [x] Maintain a matrix showing which verification layer kills each mutation.
+
+`SemanticMutation::ALL` contains nine one-rule simulator mutants with minimal deterministic witnesses. The campaign
+requires every mutant to change the adopted observation; none is a production compile feature. It kills raw-depth-first
+selection, non-deduplicated witnesses, witness removal, exclusive cutoff, crash-lost frozen state, suppressed
+post-settlement re-arm, retained losing output, uncleared accepted publication, and inclusive expiration. The
+machine-checked [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) has exactly one row
+per executable mutant and maps each to its primary independent layer plus a production-shaped regression. There are
+no surviving targeted mutations or tracked adequacy gaps at this checkpoint.
 
 ### 4.4 Protocol decision gate
 
