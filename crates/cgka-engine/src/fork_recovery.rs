@@ -47,7 +47,14 @@ pub(crate) enum ForkResolution {
         /// `update_message_state` call site.
         invalidated_storage_id: MessageId,
     },
-    IncumbentWins,
+    IncumbentWins {
+        /// Ordering key of the commit this node kept. Carried so the
+        /// `fork_resolution` audit row can record WHICH branch survived —
+        /// without it, incumbent-wins rows are unverifiable against other
+        /// nodes' logs (cross-node convergence cannot be proven from
+        /// forensics alone).
+        kept: CommitOrderingKey,
+    },
     MissingSnapshot,
 }
 
@@ -164,7 +171,9 @@ impl ForkRecoveryManager {
             candidate_mls_bytes,
         );
         if candidate_key >= incumbent.ordering_key {
-            return Ok(ForkResolution::IncumbentWins);
+            return Ok(ForkResolution::IncumbentWins {
+                kept: incumbent.ordering_key,
+            });
         }
 
         storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
@@ -337,7 +346,11 @@ impl<S: StorageProvider> Engine<S> {
                 Some(hex::encode(invalidated.commit_digest)),
                 Some(hex::encode(invalidated_storage_id.as_slice())),
             ),
-            ForkResolution::IncumbentWins => (ForkWinner::Incumbent, None, None),
+            ForkResolution::IncumbentWins { kept } => (
+                ForkWinner::Incumbent,
+                Some(hex::encode(kept.commit_digest)),
+                None,
+            ),
             ForkResolution::MissingSnapshot => (ForkWinner::MissingSnapshot, None, None),
         };
         self.audit_group(

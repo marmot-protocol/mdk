@@ -52,6 +52,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   avoiding false failures when unrelated startup work is delayed under loaded
   `nextest` shards.
 
+- Same-epoch commit races now converge every member onto the same branch. A
+  member that had committed from the contested epoch resolved the race through
+  pairwise fork recovery and invalidated the losing commit terminally, while
+  everyone else resolved it through distributed convergence, where a deeper
+  valid branch can win later — so honest members could keep different lineages
+  forever and silently lose every application message sent on the other side.
+  The pairwise loser is now parked reconsiderable (`ConvergenceDeferred`,
+  keyed by its source epoch) so a later convergence pass adopts the same
+  branch everywhere, and `fork_resolution` audit rows now record the kept
+  incumbent's commit digest so cross-member convergence is provable from
+  forensic logs. ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session
