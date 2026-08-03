@@ -11,6 +11,7 @@ pub mod test_support;
 
 use std::collections::HashSet;
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ pub const MARMOT_MESSAGE_BYTES_CEILING: usize = 60_000;
 pub const TRACE_TARGET: &str = "marmot_terminal_harness";
 
 /// Fully validated configuration consumed by the shared terminal-harness bridge.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// Local `wn-agent` control socket.
     pub socket: PathBuf,
@@ -55,8 +56,25 @@ pub struct Config {
     pub spec: ConfigSpec,
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("auth_token_present", &self.auth_token.is_some())
+            .field("allowed_senders_count", &self.allowed_senders.len())
+            .field("account_id_present", &self.account_id_hex.is_some())
+            .field("request_timeout", &self.request_timeout)
+            .field("max_reply_bytes", &self.max_reply_bytes)
+            .field("max_pending_per_group", &self.max_pending_per_group)
+            .field("backend_timeout", &self.backend_timeout)
+            .field("backend_idle_timeout", &self.backend_idle_timeout)
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One backend invocation prepared by the shared bridge.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Invocation {
     /// Total invocation timeout.
     pub timeout: Duration,
@@ -70,8 +88,20 @@ pub struct Invocation {
     pub prompt: String,
 }
 
+impl fmt::Debug for Invocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Invocation")
+            .field("timeout", &self.timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("prompt_len", &self.prompt.len())
+            .field("session_present", &self.session_id.is_some())
+            .finish()
+    }
+}
+
 /// Privacy-safe backend completion metadata.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct Outcome {
     /// Session id observed from the backend event stream.
     pub observed_session: Option<String>,
@@ -85,8 +115,20 @@ pub struct Outcome {
     pub elapsed_ms: u128,
 }
 
+impl fmt::Debug for Outcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Outcome")
+            .field("session_present", &self.observed_session.is_some())
+            .field("exit_code", &self.exit_code)
+            .field("error_summary_present", &self.error_summary.is_some())
+            .field("stderr_len", &self.stderr.len())
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish()
+    }
+}
+
 /// Backend failure plus any session id observed before failure.
-#[derive(Debug)]
 pub struct RunFailure {
     /// Shared failure classification.
     pub error: HarnessError,
@@ -94,11 +136,32 @@ pub struct RunFailure {
     pub observed_session: Option<String>,
 }
 
+impl fmt::Debug for RunFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunFailure")
+            .field("error_kind", &self.error.privacy_safe_kind())
+            .field("session_present", &self.observed_session.is_some())
+            .finish()
+    }
+}
+
 /// Completed backend output forwarded to the reply collector.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum RunnerEvent {
     /// Completed assistant text; never a thinking or tool delta.
     Text(String),
+}
+
+impl fmt::Debug for RunnerEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("Text")
+                .field("text_len", &text.len())
+                .finish(),
+        }
+    }
 }
 
 /// Backend-specific command construction and event parsing boundary.
@@ -117,4 +180,47 @@ pub(crate) fn dirs_home() -> Result<PathBuf> {
     env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| HarnessError::Config("$HOME is not set".to_owned()))
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn invocation_and_outcome_debug_redact_backend_content() {
+        let invocation = Invocation {
+            timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
+            cwd: PathBuf::from("/secret/worktree"),
+            session_id: Some("secret-session".to_owned()),
+            prompt: "secret prompt".to_owned(),
+        };
+        let invocation_debug = format!("{invocation:?}");
+        for secret in ["/secret", "secret-session", "secret prompt"] {
+            assert!(!invocation_debug.contains(secret));
+        }
+        assert!(invocation_debug.contains("prompt_len: 13"));
+        assert!(invocation_debug.contains("session_present: true"));
+
+        let outcome = Outcome {
+            observed_session: Some("secret-session".to_owned()),
+            exit_code: Some(64),
+            error_summary: Some("secret-summary".to_owned()),
+            stderr: "secret stderr".to_owned(),
+            elapsed_ms: 10,
+        };
+        let outcome_debug = format!("{outcome:?}");
+        for secret in ["secret-session", "secret-summary", "secret stderr"] {
+            assert!(!outcome_debug.contains(secret));
+        }
+        assert!(outcome_debug.contains("stderr_len: 13"));
+    }
+
+    #[test]
+    fn runner_event_debug_reports_only_text_length() {
+        let event = RunnerEvent::Text("secret reply".to_owned());
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("secret reply"));
+        assert!(debug.contains("text_len: 12"));
+    }
 }

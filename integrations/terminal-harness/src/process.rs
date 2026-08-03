@@ -1,4 +1,4 @@
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
@@ -30,18 +30,21 @@ pub fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<std::io::Res
 
 /// Captures a bounded prefix of backend stderr.
 pub async fn capture_stderr(stderr: ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
+    capture_bounded(stderr).await
+}
+
+async fn capture_bounded(mut reader: impl AsyncRead + Unpin) -> String {
+    let mut buf = [0_u8; 1024];
     let mut captured = String::new();
-    while let Ok(read) = reader.read_until(b'\n', &mut buf).await {
-        if read == 0 {
-            break;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) if captured.len() < STDERR_CAPTURE_BYTES => {
+                captured.push_str(&String::from_utf8_lossy(&buf[..read]));
+                truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
+            }
+            Ok(_) => {}
         }
-        if captured.len() < STDERR_CAPTURE_BYTES {
-            captured.push_str(&String::from_utf8_lossy(&buf));
-            truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
-        }
-        buf.clear();
     }
     captured
 }
@@ -108,5 +111,13 @@ mod tests {
         let mut value = "ééé".to_owned();
         truncate_to_char_boundary(&mut value, 5);
         assert_eq!(value, "éé");
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_bounds_one_long_line_while_draining_it() {
+        let input = std::io::Cursor::new(vec![b'x'; STDERR_CAPTURE_BYTES * 100]);
+        let captured = capture_bounded(input).await;
+        assert_eq!(captured.len(), STDERR_CAPTURE_BYTES);
+        assert!(captured.bytes().all(|byte| byte == b'x'));
     }
 }

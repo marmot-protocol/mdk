@@ -17,7 +17,7 @@ const SPEC: ConfigSpec = ConfigSpec {
     legacy_allowed_senders_env: Some("WN_OPENCODE_ADMIN_HEX"),
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Config(LoadedConfig);
 
 impl Config {

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub struct ConfigSpec {
 }
 
 /// Shared configuration plus backend values needed by a connector crate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoadedConfig {
     /// Validated shared bridge configuration.
     pub harness: Config,
@@ -41,6 +42,15 @@ pub struct LoadedConfig {
     pub home: PathBuf,
     /// Backend command or absolute binary path.
     pub bin: String,
+}
+
+impl fmt::Debug for LoadedConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedConfig")
+            .field("harness", &self.harness)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Loads shared connector configuration from a caller-provided lookup function.
@@ -304,5 +314,23 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(loaded.harness.spec.env_prefix, "WN_TEST");
+    }
+
+    #[test]
+    fn loaded_config_debug_redacts_paths_binary_and_credentials() {
+        let loaded = load(&[
+            ("HOME", "/secret/home"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ACCOUNT_ID_HEX", SENDER),
+            ("WN_TEST_BIN", "/secret/bin/test-agent"),
+            ("MARMOT_AGENT_AUTH_TOKEN", "secret-token"),
+        ])
+        .unwrap();
+        let debug = format!("{loaded:?}");
+        for secret in ["/secret", "secret-token", SENDER] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("auth_token_present: true"));
+        assert!(debug.contains("account_id_present: true"));
     }
 }

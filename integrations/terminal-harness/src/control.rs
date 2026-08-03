@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use crate::TRACE_TARGET;
 use crate::error::{HarnessError, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ControlClient {
     socket: PathBuf,
     auth_token: Option<String>,

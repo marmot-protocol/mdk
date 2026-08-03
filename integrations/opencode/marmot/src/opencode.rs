@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout_at;
 use tracing::debug;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
 }

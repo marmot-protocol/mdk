@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout_at;
 use tracing::debug;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PiBackend {
     pub(crate) bin: String,
     pub(crate) session_dir: std::path::PathBuf,

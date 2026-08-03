@@ -229,9 +229,22 @@ no_start_log="$fixture_root/systemctl-no-start.log"
 run_linux_service_case "$fixture_root" 1 "$no_start_log" "--no-start-$harness_binary"
 assert_log_contains "$no_start_log" "--user restart $agent_service"
 assert_log_excludes "$no_start_log" "--user is-active --quiet $harness_service"
-assert_log_excludes "$no_start_log" "--user enable $harness_service"
+assert_log_contains "$no_start_log" "--user enable $harness_service"
 assert_log_excludes "$no_start_log" "--user enable --now $harness_service"
 assert_log_excludes "$no_start_log" "--user restart $harness_service"
+[ -f "$unit_dir/$harness_service" ]
+
+no_start_agent_log="$fixture_root/systemctl-no-start-agent.log"
+run_linux_service_case "$fixture_root" 1 "$no_start_agent_log" "--no-start-wn-agent"
+assert_log_excludes "$no_start_agent_log" "--user is-active --quiet $agent_service"
+assert_log_contains "$no_start_agent_log" "--user enable $agent_service"
+assert_log_excludes "$no_start_agent_log" "--user enable --now $agent_service"
+assert_log_excludes "$no_start_agent_log" "--user restart $agent_service"
+assert_log_excludes "$no_start_agent_log" "--user is-active --quiet $harness_service"
+assert_log_contains "$no_start_agent_log" "--user enable $harness_service"
+assert_log_excludes "$no_start_agent_log" "--user enable --now $harness_service"
+assert_log_excludes "$no_start_agent_log" "--user restart $harness_service"
+[ -f "$unit_dir/$agent_service" ]
 [ -f "$unit_dir/$harness_service" ]
 
 custom_log="$fixture_root/systemctl-custom.log"
@@ -330,6 +343,17 @@ env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     >/dev/null 2>"$bad_allowlist_stderr" || bad_allowlist_status=$?
 [ "$bad_allowlist_status" -ne 0 ]
 grep -F "invalid allowlist value:" "$bad_allowlist_stderr" >/dev/null
+
+unresolved_version_status=0
+unresolved_version_stderr="$fixture_root/unresolved-version.err"
+env -u MARMOT_RELEASE_TAG -u MARMOT_RELEASE_TAG_DEFAULT \
+    -u WN_AGENT_SHA -u WN_AGENT_VERSION -u WN_AGENT_VERSION_DEFAULT \
+    MARMOT_TERMINAL_HARNESS="$kind" \
+    bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" \
+    <"$shared_installer" >/dev/null 2>"$unresolved_version_stderr" \
+    || unresolved_version_status=$?
+[ "$unresolved_version_status" -ne 0 ]
+grep -F "could not resolve a release version" "$unresolved_version_stderr" >/dev/null
 
 case "$installer_dry_run" in
     *"wn-agent-"*"$fixture_version.tar.gz"* ) ;;

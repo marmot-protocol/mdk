@@ -118,7 +118,7 @@ Options:
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --$HARNESS_KIND-bin PATH      $HARNESS_DISPLAY_NAME binary or command name (default: $HARNESS_DEFAULT_BIN)
   --no-service             Do not install/start LaunchAgents or systemd user units
-  --no-start-wn-agent      Do not start wn-agent before bootstrap
+  --no-start-wn-agent      Install services but do not start wn-agent or the harness
   --no-start-$HARNESS_BINARY   Install the service but do not activate it
   --system                 Install binaries to /usr/local/bin instead of ~/.local/bin
   --dry-run                Print actions without installing
@@ -179,7 +179,7 @@ append_csv() {
     local item
     local -a _items
     IFS=',' read -r -a _items <<<"$value"
-    for item in "${_items[@]}"; do
+    for item in ${_items[@]+"${_items[@]}"}; do
         item="${item#"${item%%[![:space:]]*}"}"
         item="${item%"${item##*[![:space:]]}"}"
         [ -z "$item" ] || printf '%s\n' "$item"
@@ -232,7 +232,7 @@ validate_welcomer_inputs() {
         echo "error: at least one --allow-welcomer/--allow-sender value is required" >&2
         exit 1
     fi
-    for welcomer in "${ALLOW_WELCOMERS[@]}"; do
+    for welcomer in ${ALLOW_WELCOMERS[@]+"${ALLOW_WELCOMERS[@]}"}; do
         if ! is_welcomer_ref_syntax "$welcomer"; then
             echo "error: invalid allowlist value: $welcomer" >&2
             echo "expected a Nostr npub or 64-character hex account id" >&2
@@ -439,7 +439,11 @@ install_macos_wn_agent_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install LaunchAgent $plist"
-        log "would run: launchctl bootstrap gui/$UID $plist"
+        if [ "$NO_START_WN_AGENT" -eq 1 ]; then
+            log "would install LaunchAgent without starting it: $label"
+        else
+            log "would run: launchctl bootstrap gui/$UID $plist"
+        fi
         return 0
     fi
 
@@ -460,7 +464,7 @@ install_macos_wn_agent_service() {
         plist_string "$MARMOT_HOME"
         plist_string "--socket"
         plist_string "$MARMOT_AGENT_SOCKET"
-        for relay in "${RELAYS[@]}"; do
+        for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
             plist_string "--relay"
             plist_string "$relay"
         done
@@ -479,6 +483,10 @@ install_macos_wn_agent_service() {
     ) || return 1
     chmod 600 "$plist" || return 1
 
+    if [ "$NO_START_WN_AGENT" -eq 1 ]; then
+        log "installed LaunchAgent without starting it: $label"
+        return 0
+    fi
     launchctl bootout "gui/$UID" "$plist" >/dev/null 2>&1 || true
     run launchctl bootstrap "gui/$UID" "$plist" || return 1
     launchctl kickstart -k "gui/$UID/$label" >/dev/null 2>&1 || true
@@ -495,7 +503,7 @@ install_macos_harness_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install LaunchAgent $plist"
-        if [ "$NO_START_HARNESS" -eq 1 ]; then
+        if [ "$NO_START_HARNESS" -eq 1 ] || [ "$NO_START_WN_AGENT" -eq 1 ]; then
             log "would install LaunchAgent without starting it: $label"
         else
             log "would run: launchctl bootstrap gui/$UID $plist"
@@ -545,7 +553,7 @@ install_macos_harness_service() {
     ) || return 1
     chmod 600 "$plist" || return 1
 
-    if [ "$NO_START_HARNESS" -eq 1 ]; then
+    if [ "$NO_START_HARNESS" -eq 1 ] || [ "$NO_START_WN_AGENT" -eq 1 ]; then
         log "installed LaunchAgent without starting it: $label"
         return 0
     fi
@@ -582,7 +590,11 @@ install_linux_wn_agent_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would restart $MARMOT_AGENT_SERVICE_NAME.service when active; otherwise enable --now"
+        if [ "$NO_START_WN_AGENT" -eq 1 ]; then
+            log "would install systemd user service without starting it: $MARMOT_AGENT_SERVICE_NAME.service"
+        else
+            log "would restart $MARMOT_AGENT_SERVICE_NAME.service when active; otherwise enable --now"
+        fi
         return 0
     fi
 
@@ -605,7 +617,7 @@ install_linux_wn_agent_service() {
             "$(systemd_quote "$MARMOT_HOME")" \
             "$(systemd_quote --socket)" \
             "$(systemd_quote "$MARMOT_AGENT_SOCKET")"
-        for relay in "${RELAYS[@]}"; do
+        for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
             printf ' %s %s' "$(systemd_quote --relay)" "$(systemd_quote "$relay")"
         done
         printf '\n'
@@ -619,6 +631,11 @@ install_linux_wn_agent_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
+    if [ "$NO_START_WN_AGENT" -eq 1 ]; then
+        run systemctl --user enable "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
+        log "installed and enabled systemd user service without starting it: $MARMOT_AGENT_SERVICE_NAME.service"
+        return 0
+    fi
     activate_systemd_user_service "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
     log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
 }
@@ -631,7 +648,7 @@ install_linux_harness_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        if [ "$NO_START_HARNESS" -eq 1 ]; then
+        if [ "$NO_START_HARNESS" -eq 1 ] || [ "$NO_START_WN_AGENT" -eq 1 ]; then
             log "would install systemd user service without starting it: $MARMOT_HARNESS_SERVICE_NAME.service"
         else
             log "would restart $MARMOT_HARNESS_SERVICE_NAME.service when active; otherwise enable --now"
@@ -675,8 +692,9 @@ install_linux_harness_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    if [ "$NO_START_HARNESS" -eq 1 ]; then
-        log "installed systemd user service without starting it: $MARMOT_HARNESS_SERVICE_NAME.service"
+    if [ "$NO_START_HARNESS" -eq 1 ] || [ "$NO_START_WN_AGENT" -eq 1 ]; then
+        run systemctl --user enable "$MARMOT_HARNESS_SERVICE_NAME.service" || return 1
+        log "installed and enabled systemd user service without starting it: $MARMOT_HARNESS_SERVICE_NAME.service"
         return 0
     fi
     activate_systemd_user_service "$MARMOT_HARNESS_SERVICE_NAME.service" || return 1
@@ -706,7 +724,7 @@ start_temp_agent() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] wn-agent --home %q --socket %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
         local relay
-        for relay in "${RELAYS[@]}"; do
+        for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
             printf ' --relay %q' "$relay"
         done
         printf '\n'
@@ -719,7 +737,7 @@ start_temp_agent() {
     run mkdir -p "$MARMOT_HOME"
     local -a args=(--home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
     local relay
-    for relay in "${RELAYS[@]}"; do
+    for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
         args+=(--relay "$relay")
     done
     log "starting temporary wn-agent for bootstrap"
@@ -734,7 +752,7 @@ bootstrap_agent() {
         need_cmd wn-agent
     fi
 
-    if [ "$INSTALL_SERVICE" -eq 1 ] && [ "$NO_START_WN_AGENT" -ne 1 ]; then
+    if [ "$INSTALL_SERVICE" -eq 1 ]; then
         install_wn_agent_service || start_temp_agent
     else
         start_temp_agent
@@ -753,11 +771,11 @@ bootstrap_agent() {
         --no-quic
     )
     local relay
-    for relay in "${RELAYS[@]}"; do
+    for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
         args+=(--relay "$relay")
     done
     local welcomer
-    for welcomer in "${ALLOW_WELCOMERS[@]}"; do
+    for welcomer in ${ALLOW_WELCOMERS[@]+"${ALLOW_WELCOMERS[@]}"}; do
         args+=(--allow-welcomer "$welcomer")
     done
 
@@ -920,6 +938,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$MARMOT_RELEASE_TAG" = "wn-agent-vlatest" ]; then
+    echo "error: could not resolve a release version; set MARMOT_RELEASE_TAG or WN_AGENT_VERSION" >&2
+    exit 1
+fi
 
 if [ "${#RELAYS[@]}" -eq 0 ]; then
     while IFS= read -r relay; do

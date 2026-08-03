@@ -18,7 +18,7 @@ const SPEC: ConfigSpec = ConfigSpec {
     legacy_allowed_senders_env: None,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Config {
     shared: LoadedConfig,
     pi_session_dir: PathBuf,
@@ -119,7 +119,9 @@ mod tests {
     fn account_error_names_the_actual_source_variable() {
         let mut pairs = defaults();
         pairs.push(("MARMOT_ACCOUNT_ID_HEX", "invalid"));
-        let error = Config::from_pairs(&pairs).unwrap_err();
+        let error = Config::from_pairs(&pairs)
+            .err()
+            .expect("invalid account id");
         assert!(error.to_string().contains("MARMOT_ACCOUNT_ID_HEX"));
     }
 }
