@@ -58,6 +58,11 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families, writes JSON reports and
   failure capsules, emits fixture candidates for generated cases, and replays capsules that contain byte checkpoints.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
+- `reference_convergence` — a small serializable convergence oracle with its own policy, candidate, score,
+  dependency, authorization, and disposition types. It has no production engine imports. Bounded corpus and proptest
+  adapters compare it to the production selector/canonicalizer, while the common Scenario IR lifecycle comparison
+  reaches the full OpenMLS engine subject. `WitnessMode::Disabled` measures the app-witness rule's marginal effect
+  without rewriting policy constants.
 
 ## Testing layers
 
@@ -88,6 +93,12 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
 - **Layer:** Replay probes
   - **Files:** [`tests/openmls_replay_probe.rs`](tests/openmls_replay_probe.rs)
   - **What it catches:** Byte-first replay behavior and fixture materialization probes.
+
+- **Layer:** Independent reference model
+  - **Files:** [`src/reference_convergence.rs`](src/reference_convergence.rs),
+    [`tests/independent_reference_model.rs`](tests/independent_reference_model.rs)
+  - **What it catches:** Semantic drift in authentication/authorization filtering, candidate dependency closure,
+    branch scoring, proposal/app/commit dispositions, and the production selector's comparison order.
 
 ## Run the tests
 

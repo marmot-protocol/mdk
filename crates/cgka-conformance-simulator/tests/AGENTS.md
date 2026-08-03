@@ -21,6 +21,10 @@ Map for simulator tests.
 - **File:** `generated_policy_cases.rs`
   - **Owns:** Rust consumer for bounded policy cases shared with Tamarin generation.
 
+- **File:** `independent_reference_model.rs`
+  - **Owns:** Production-independent symbolic selector/canonicalizer differential tests, including small shrinkable
+    selector inputs, authentication/authorization, dependency closure, proposal expiry, and witness-free comparison.
+
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 

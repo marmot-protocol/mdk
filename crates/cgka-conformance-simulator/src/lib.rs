@@ -34,6 +34,7 @@ pub mod policy_cases;
 mod policy_sweep;
 pub mod proptest_support;
 mod quiescence;
+pub mod reference_convergence;
 mod reference_subject;
 pub mod report;
 mod retained_relay;

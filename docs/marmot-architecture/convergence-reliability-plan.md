@@ -739,12 +739,21 @@ is not based on compile-only catalog coverage.
 
 ### 4.1 Independent reference model
 
-- [ ] Implement symbolic authenticated candidates, authorization, dependency closure, witness scoring, selection, and
+- [x] Implement symbolic authenticated candidates, authorization, dependency closure, witness scoring, selection, and
   dispositions without calling production selector/canonicalization code.
-- [ ] Include proposal expiry and multi-parent commit sentinels, and keep an app-message-witness-free reference variant
+- [x] Include proposal expiry and multi-parent commit sentinels, and keep an app-message-witness-free reference variant
   so the witness mechanism's marginal effect is measurable.
-- [ ] Differentially compare reference model, production selector, and full engine.
-- [ ] Keep model inputs small and shrinkable.
+- [x] Differentially compare reference model, production selector, and full engine.
+- [x] Keep model inputs small and shrinkable.
+
+`reference_convergence` is deliberately type-independent of `cgka-engine`; a source guard rejects production selector
+or canonicalizer imports. It models authenticated/authorized candidates and inputs, iterative parent closure,
+multi-proposal commit dependencies, candidate-relative witness retention, selection, and keyed dispositions. The
+committed Tamarin policy corpus and 256-case shrinkable proptest corpus compare its winner to the production selector;
+named dependency/proposal sentinels compare dispositions to the production canonicalizer; and the bounded common
+Scenario IR lifecycle comparison continues through the real OpenMLS engine subject. Authentication/authorization
+negative cases remain reference-only because the engine canonicalizer's public comparison boundary is post-peeling.
+The witness-free variant is an explicit model dimension, not a locally modified convergence policy.
 
 ### 4.2 Liveness and lifecycle model
 
