@@ -259,12 +259,12 @@ milestone3-ci:
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
 
 # Independent model, lifecycle/fairness, mutation adequacy, and protocol
-# decision gates. Kept as an explicit hardening lane until CI budgets are set.
+# decision gates.
 milestone4-ci:
-    cargo test -p cgka-conformance-simulator --test independent_reference_model --locked
-    cargo test -p cgka-conformance-simulator --test lifecycle_model --locked
-    cargo test -p cgka-conformance-simulator --test mutation_adequacy --locked
-    cargo test -p cgka-conformance-simulator --test protocol_decision_gate --locked
+    cargo nextest run -p cgka-conformance-simulator --test independent_reference_model --locked
+    cargo nextest run -p cgka-conformance-simulator --test lifecycle_model --locked
+    cargo nextest run -p cgka-conformance-simulator --test mutation_adequacy --locked
+    cargo nextest run -p cgka-conformance-simulator --test protocol_decision_gate --locked
     just tla-liveness
     just tla-liveness-counterexample
 
@@ -324,6 +324,8 @@ tla-liveness: _tla-tools
     set -euo pipefail
     jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
     mkdir -p target/tla/states
+    # Settled terminal states are legitimate deadlocks; temporal properties
+    # still reject pre-settlement stalls under the declared fairness assumptions.
     java -XX:+UseParallelGC -jar "$jar" -workers 1 -deadlock \
         -metadir target/tla/states \
         -config ConvergenceLifecycle.fair.cfg \
@@ -345,7 +347,7 @@ tla-liveness-counterexample: _tla-tools
         exit 1
     fi
     cat "$output"
-    rg -q 'Temporal properties were violated|Error: The behavior up to this point is' "$output"
+    rg -q 'Temporal properties were violated' "$output"
 
 policy-casegen:
     @cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json

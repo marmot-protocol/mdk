@@ -768,17 +768,18 @@ The witness-free variant is an explicit model dimension, not a locally modified 
 - [x] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
 
 TLA+/TLC is the temporal-liveness authority; Stateright is retained as the executable Rust trace bridge. The fair TLC
-model exhausts 684 distinct states (1,785 generated) and checks settlement after closure, administrative progress,
+model exhausts 720 distinct states (1,821 generated) and checks settlement after closure, administrative progress,
 stranded-joiner repair, frozen-revision durability, and settled-history equality. Its assumptions are explicit:
 input closure plus strong fairness for delivery, restart, resource recovery, freeze, settle, and permitted repair.
 Crash and resource failure are temporary bounded events in the finite model. The unfair configuration is an
 expected-failure gate and produces a temporal counterexample when those scheduling assumptions are absent.
 
-The Stateright mirror checks the same bounded lifecycle while carrying stable identities such as
-`model-step-0:self_update`. Its minimized two-action starvation witness names
+The Stateright mirror checks the same bounded lifecycle, including the durable/volatile frozen-revision split, while
+carrying stable identities such as `model-step-0:self_update`. Its minimized two-action starvation witness names
 `eventual_input_closure_or_fair_admin_scheduling` as the violated assumption. The committed canonical Scenario IR
-counterexample compiles to stable action ids and preserves the self-update/admin-change prefix. Losing-branch joiners
-may become stranded; their only modeled repair is reset/rejoin with fresh state. Tamarin's scope is unchanged.
+counterexample compiles to stable action ids; a drift test derives its self-update/barrier action kinds from the model
+trace instead of pinning magic schedule indices. Losing-branch joiners may become stranded; their only modeled repair
+is reset/rejoin with fresh state. Tamarin's scope is unchanged.
 
 ### 4.3 Mutation adequacy
 
@@ -791,13 +792,16 @@ may become stranded; their only modeled repair is reset/rejoin with fresh state.
 - [x] Mutate retained-history and expiration boundaries.
 - [x] Maintain a matrix showing which verification layer kills each mutation.
 
-`SemanticMutation::ALL` contains nine one-rule simulator mutants with minimal deterministic witnesses. The campaign
-requires every mutant to change the adopted observation; none is a production compile feature. It kills raw-depth-first
-selection, non-deduplicated witnesses, witness removal, exclusive cutoff, crash-lost frozen state, suppressed
-post-settlement re-arm, retained losing output, uncleared accepted publication, and inclusive expiration. The
-machine-checked [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) has exactly one row
-per executable mutant and maps each to its primary independent layer plus a production-shaped regression. There are
-no surviving targeted mutations or tracked adequacy gaps at this checkpoint.
+The macro-generated `SemanticMutation::ALL` catalog contains nine one-rule simulator mutants with minimal deterministic
+witnesses. The campaign requires every mutant to change the adopted observation; none is a production compile feature.
+It kills raw-depth-first selection, non-deduplicated witnesses, witness removal, exclusive cutoff, crash-lost durable
+frozen state, suppressed post-settlement re-arm, retained losing output, uncleared accepted publication, and inclusive
+expiration. Frozen-state and scheduler mutants execute alternate transitions through the shared Rust lifecycle model;
+the publication mutant drives a real `ReferenceModelSubject` and compares structural pending work before and after
+acknowledgement. The machine-checked
+[`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) has exactly one row per executable
+mutant and maps each to its primary independent layer plus a production-shaped regression. There are no surviving
+targeted mutations or tracked adequacy gaps at this checkpoint.
 
 ### 4.4 Protocol decision gate
 
@@ -1029,7 +1033,7 @@ incorrect result.
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
 | 2026-08-02 | Milestone 3 integration verification | Preserved legacy client identities while limiting account-scoped credential sharing to explicitly authored topology; all canonical semantic oracles and active decryptability probes remain compatible with the new deployment model | `implicit_topology_preserves_legacy_client_identity_seeds`; `explicit_topology_shares_account_identity_across_devices`; `cargo test -p cgka-conformance-simulator --test canonical_scenarios` (41 passed) |
 | 2026-08-03 | 4.1 independent reference model | Added a type-independent authenticated candidate/dependency/proposal/witness selector and disposition model, including witness-free comparison; differentially checked the adopted corpus, production canonicalizer sentinels, common full-engine lifecycle, and 256 shrinkable generated cases | `independent_reference_model` (8 tests); source-coupling guard; `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters` |
-| 2026-08-03 | 4.2 bounded liveness and lifecycle model | Selected TLA+/TLC as temporal authority and Stateright as the Rust trace bridge; checked input closure, strong fairness, freeze/settle, crash/restart, temporary resource failure, unequal histories, and stranded-joiner repair; retained an expected unfair counterexample with stable Scenario IR action identity | `lifecycle_model` (5 tests); `just tla-liveness` (684 distinct states, 1,785 generated, depth 14); `just tla-liveness-counterexample` |
+| 2026-08-03 | 4.2 bounded liveness and lifecycle model | Selected TLA+/TLC as temporal authority and Stateright as the Rust trace bridge; checked input closure, strong fairness, freeze/settle, durable/volatile crash recovery, temporary resource failure, unequal histories, and stranded-joiner repair; retained an expected unfair counterexample with drift-checked Scenario IR action kinds | `lifecycle_model` (5 tests); `just tla-liveness` (720 distinct states, 1,821 generated, depth 14); `just tla-liveness-counterexample` |
 | 2026-08-03 | 4.3 semantic mutation adequacy | Added nine simulator-only one-rule mutants spanning selection, witness handling, cutoff/frozen state, scheduling, output, publication, and retention; every mutant is killed and the checked matrix maps it to independent and production-shaped evidence | `mutation_adequacy` (3 tests); [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) |
 | 2026-08-03 | 4.4 protocol decision gate | Reverified adopted Marmot convergence commit `4ad4ae2`, classified every P/E/A ledger id, pinned all v1 policy values and the future required-component rule, and demonstrated operational non-interference across batch, wake-delay, and temporary-resource variants | `protocol_decision_gate` (5 tests); [`PROTOCOL_DECISIONS.md`](../../crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md); `just convergence-ledger-gate` |
 | 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |

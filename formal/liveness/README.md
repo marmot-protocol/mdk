@@ -6,14 +6,15 @@ model; it is intentionally not stretched into a scheduler or crash/restart
 model.
 
 `ConvergenceLifecycle.tla` models unequal histories, eventual input closure,
-freeze/settle, durable frozen state across crash/restart, temporary resource
+freeze/settle, a durable frozen revision plus a crash-lost volatile staged
+revision that is rehydrated on restart, temporary resource
 failure, a pending privileged administrative change, repeated member
 self-updates, and a joiner stranded on a losing branch. The only modeled repair
 for that joiner is a fresh-state rejoin; consumed signature state is not reused.
 
-TLC is authoritative for temporal claims because `WF` is explicit and infinite
-stuttering executions are part of the state space. The fair configuration
-assumes:
+TLC is authoritative for temporal claims because fairness assumptions are
+explicit and infinite stuttering executions are part of the state space. The
+fair configuration assumes:
 
 - convergence-relevant input eventually closes;
 - input closure, delivery, restart, resource recovery, freeze, settle, and

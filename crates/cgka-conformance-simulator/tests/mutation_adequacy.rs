@@ -4,9 +4,9 @@ use cgka_conformance_simulator::mutation_adequacy::{
     SemanticMutation, run_all_mutation_sentinels, run_mutation_sentinel,
 };
 
-#[test]
-fn every_targeted_semantic_mutation_is_killed() {
-    let results = run_all_mutation_sentinels();
+#[tokio::test]
+async fn every_targeted_semantic_mutation_is_killed() {
+    let results = run_all_mutation_sentinels().await;
     assert_eq!(results.len(), SemanticMutation::ALL.len());
     for result in results {
         assert!(
@@ -18,8 +18,8 @@ fn every_targeted_semantic_mutation_is_killed() {
     }
 }
 
-#[test]
-fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() {
+#[tokio::test]
+async fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() {
     let expected = [
         (
             SemanticMutation::SchedulerDeadlineRearm,
@@ -29,10 +29,7 @@ fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() {
             SemanticMutation::OutputInvalidation,
             "InvalidatedLosingBranch",
         ),
-        (
-            SemanticMutation::PublicationAcknowledgement,
-            "resolution:Some(Accepted)",
-        ),
+        (SemanticMutation::PublicationAcknowledgement, "pending:2->0"),
         (
             SemanticMutation::RetainedHistoryExpirationBoundary,
             "Accepted",
@@ -40,7 +37,7 @@ fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() {
     ];
     for (mutation, baseline) in expected {
         assert_eq!(
-            run_mutation_sentinel(mutation).baseline_observation,
+            run_mutation_sentinel(mutation).await.baseline_observation,
             baseline,
             "{mutation:?}"
         );

@@ -64,12 +64,15 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   reaches the full OpenMLS engine subject. `WitnessMode::Disabled` measures the app-witness rule's marginal effect
   without rewriting policy constants.
 - `lifecycle_model` — the bounded Rust/Stateright mirror of the authoritative TLA+ lifecycle specification. It
-  preserves model action identities, exercises unequal histories, freeze/settle, crash/restart, temporary resource
-  failure, administrative progress, and losing-branch joiner repair, and emits a minimal assumption-labeled
-  starvation trace that compiles into Scenario IR.
-- `mutation_adequacy` — nine simulator-only single-rule mutants with minimal deterministic witnesses. The executable
+  preserves model action identities, explicitly separates durable frozen revision from crash-lost volatile staged
+  revision, exercises unequal histories, freeze/settle, crash/restart, temporary resource failure, administrative
+  progress, and losing-branch joiner repair, and emits a minimal assumption-labeled starvation trace whose projected
+  action kinds are drift-checked against committed Scenario IR.
+- `mutation_adequacy` — nine simulator-only single-rule mutants with minimal deterministic witnesses. The generated
   catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
-  publication-ack, and retention-boundary mutations without compiling mutation switches into production.
+  publication-ack, and retention-boundary mutations without compiling mutation switches into production. Lifecycle
+  mutants run through the shared Rust transition model; publication acknowledgement runs through a real independent
+  reference subject and its structural pending-work observation.
 
 ## Testing layers
 

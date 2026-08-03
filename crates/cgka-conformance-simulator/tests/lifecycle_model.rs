@@ -15,8 +15,14 @@ fn settled_history_is_equal(_: &StaterightLifecycle, state: &LifecycleState) -> 
     state.phase != PassPhase::Settled || state.history_a == state.history_b
 }
 
-fn frozen_revision_is_durable(_: &StaterightLifecycle, state: &LifecycleState) -> bool {
-    state.phase != PassPhase::Frozen || state.frozen_revision.is_some()
+fn frozen_revision_is_partitioned(_: &StaterightLifecycle, state: &LifecycleState) -> bool {
+    state.phase != PassPhase::Frozen
+        || match state.crashed {
+            true => state.frozen_revision.is_some() && state.staged_revision.is_none(),
+            false => {
+                state.frozen_revision.is_some() && state.staged_revision == state.frozen_revision
+            }
+        }
 }
 
 fn pending_admin_eventually_applies(_: &StaterightLifecycle, state: &LifecycleState) -> bool {
@@ -54,8 +60,8 @@ impl Model for StaterightLifecycle {
         vec![
             Property::always("settled_history_is_equal", settled_history_is_equal),
             Property::always(
-                "frozen_revision_is_durable_across_crash",
-                frozen_revision_is_durable,
+                "frozen_revision_is_partitioned_and_recovered_across_crash",
+                frozen_revision_is_partitioned,
             ),
             Property::eventually(
                 "pending_admin_eventually_applies",
@@ -117,12 +123,16 @@ fn crash_and_resource_recovery_preserve_frozen_membership() {
         .next_state(&state, LifecycleActionKind::FreezePass)
         .unwrap();
     let frozen = state.frozen_revision;
+    assert_eq!(state.staged_revision, frozen);
     state = model
         .next_state(&state, LifecycleActionKind::Crash)
         .unwrap();
+    assert_eq!(state.frozen_revision, frozen);
+    assert_eq!(state.staged_revision, None);
     state = model
         .next_state(&state, LifecycleActionKind::Restart)
         .unwrap();
+    assert_eq!(state.staged_revision, frozen);
     state = model
         .next_state(&state, LifecycleActionKind::FailResource)
         .unwrap();
@@ -144,6 +154,7 @@ fn applied_admin_progress_is_monotonic_across_later_settlement() {
         input_open: false,
         phase: PassPhase::Frozen,
         frozen_revision: Some(2),
+        staged_revision: Some(2),
         admin_pending: false,
         admin_applied: true,
         ..LifecycleState::default()
@@ -156,11 +167,36 @@ fn applied_admin_progress_is_monotonic_across_later_settlement() {
 
 #[test]
 fn committed_counterexample_is_canonical_scenario_ir_with_stable_action_ids() {
+    let trace = minimal_admin_starvation_trace();
     let spec: ScenarioSpec = serde_json::from_str(include_str!(
         "../../../formal/liveness/counterexamples/admin-starvation.scenario.json"
     ))
     .expect("counterexample is Scenario IR JSON");
     let compiled = compile_scenario(&spec).expect("counterexample compiles");
-    assert_eq!(compiled.actions[4].schedule.action_id, "step-4:self_update");
-    assert_eq!(compiled.actions[6].schedule.action_id, "step-6:barrier");
+    let mut compiled_actions = compiled.actions.iter();
+    let projected_ids = trace
+        .scenario_step_kinds()
+        .map(|expected_kind| {
+            compiled_actions
+                .find(|action| {
+                    action
+                        .schedule
+                        .action_id
+                        .rsplit_once(':')
+                        .is_some_and(|(_, kind)| kind == expected_kind)
+                })
+                .unwrap_or_else(|| panic!("counterexample has no {expected_kind} projection"))
+                .schedule
+                .action_id
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projected_ids.len(), trace.actions.len());
+    assert_eq!(
+        projected_ids
+            .iter()
+            .map(|action_id| action_id.rsplit_once(':').unwrap().1)
+            .collect::<Vec<_>>(),
+        trace.scenario_step_kinds().collect::<Vec<_>>()
+    );
 }

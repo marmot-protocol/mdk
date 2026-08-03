@@ -29,7 +29,10 @@ pub struct LifecycleState {
     pub history_b: u8,
     pub input_open: bool,
     pub phase: PassPhase,
+    /// Durable frozen-pass revision retained across a process crash.
     pub frozen_revision: Option<u8>,
+    /// Volatile in-process copy used to settle the active frozen pass.
+    pub staged_revision: Option<u8>,
     pub crashed: bool,
     pub resource_available: bool,
     pub crash_budget: u8,
@@ -48,6 +51,7 @@ impl Default for LifecycleState {
             input_open: true,
             phase: PassPhase::Collecting,
             frozen_revision: None,
+            staged_revision: None,
             crashed: false,
             resource_available: true,
             crash_budget: 1,
@@ -75,6 +79,13 @@ pub enum LifecycleActionKind {
     InviteOnLosingBranch,
     RepairJoinerWithFreshState,
     StopUnfairly,
+}
+
+/// Simulator-only alternate lifecycle rules used by mutation adequacy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleMutation {
+    LoseDurableFrozenRevisionOnCrash,
+    SuppressRearmAfterSettlement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,6 +118,15 @@ impl LifecycleActionKind {
             Self::InviteOnLosingBranch => "invite_on_losing_branch",
             Self::RepairJoinerWithFreshState => "repair_joiner_with_fresh_state",
             Self::StopUnfairly => "stop_unfairly",
+        }
+    }
+
+    /// Canonical Scenario IR step kind used when projecting a model trace.
+    pub const fn scenario_step_kind(self) -> Option<&'static str> {
+        match self {
+            Self::SelfUpdate => Some("self_update"),
+            Self::StopUnfairly => Some("barrier"),
+            _ => None,
         }
     }
 }
@@ -206,13 +226,17 @@ impl LifecycleModel {
                 next.self_updates_remaining -= 1;
                 next.phase = PassPhase::Collecting;
                 next.frozen_revision = None;
+                next.staged_revision = None;
             }
             LifecycleActionKind::FreezePass => {
                 next.phase = PassPhase::Frozen;
                 next.frozen_revision = Some(next.history_a);
+                next.staged_revision = Some(next.history_a);
             }
             LifecycleActionKind::SettlePass => {
-                if next.frozen_revision != Some(next.history_a) || next.history_a != next.history_b
+                if next.frozen_revision != Some(next.history_a)
+                    || next.staged_revision != next.frozen_revision
+                    || next.history_a != next.history_b
                 {
                     return None;
                 }
@@ -226,8 +250,14 @@ impl LifecycleModel {
             LifecycleActionKind::Crash => {
                 next.crashed = true;
                 next.crash_budget -= 1;
+                next.staged_revision = None;
             }
-            LifecycleActionKind::Restart => next.crashed = false,
+            LifecycleActionKind::Restart => {
+                next.crashed = false;
+                if next.phase == PassPhase::Frozen {
+                    next.staged_revision = next.frozen_revision;
+                }
+            }
             LifecycleActionKind::FailResource => {
                 next.resource_available = false;
                 next.resource_failure_budget -= 1;
@@ -243,6 +273,29 @@ impl LifecycleModel {
         }
         Some(next)
     }
+
+    pub(crate) fn next_state_with_mutation(
+        &self,
+        state: &LifecycleState,
+        action: LifecycleActionKind,
+        mutation: LifecycleMutation,
+    ) -> Option<LifecycleState> {
+        if mutation == LifecycleMutation::SuppressRearmAfterSettlement
+            && action == LifecycleActionKind::SelfUpdate
+            && state.phase == PassPhase::Settled
+            && self.actions(state).contains(&action)
+        {
+            return Some(state.clone());
+        }
+
+        let mut next = self.next_state(state, action)?;
+        if mutation == LifecycleMutation::LoseDurableFrozenRevisionOnCrash
+            && action == LifecycleActionKind::Crash
+        {
+            next.frozen_revision = None;
+        }
+        Some(next)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +303,15 @@ pub struct LifecycleTrace {
     pub violated_assumption: Option<String>,
     pub actions: Vec<LifecycleAction>,
     pub states: Vec<LifecycleState>,
+}
+
+impl LifecycleTrace {
+    /// Scenario IR kinds, in order, that are represented by this model trace.
+    pub fn scenario_step_kinds(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.actions
+            .iter()
+            .filter_map(|action| action.kind.scenario_step_kind())
+    }
 }
 
 /// Minimal finite witness for the administrative-progress non-guarantee.

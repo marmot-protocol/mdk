@@ -6,54 +6,50 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::SubjectOutboundOutcome;
-use crate::lifecycle_model::{LifecycleActionKind, LifecycleModel, LifecycleState, PassPhase};
+use crate::lifecycle_model::{
+    LifecycleActionKind, LifecycleModel, LifecycleMutation, LifecycleState, PassPhase,
+};
 use crate::reference_convergence::{
     ReferenceAppMessage, ReferenceCandidate, ReferenceDisposition, ReferenceInput, ReferencePolicy,
     ReferencePriority, ReferenceWitness, WitnessMode, compare, evaluate, score, select,
 };
-use crate::subject::record_outbound_acknowledgement;
+use crate::{
+    ConvergenceSubject, ReferenceModelSubject, SubjectCreateGroup, SubjectOutboundOutcome,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticMutation {
-    SelectorComparisonOrder,
-    WitnessSenderEpochDeduplication,
-    AppWitnessAdmissionRemoval,
-    CutoffBoundaryAdmission,
-    FrozenMemberPersistence,
-    SchedulerDeadlineRearm,
-    OutputInvalidation,
-    PublicationAcknowledgement,
-    RetainedHistoryExpirationBoundary,
+macro_rules! semantic_mutations {
+    ($( $variant:ident => $id:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum SemanticMutation {
+            $( $variant, )+
+        }
+
+        impl SemanticMutation {
+            /// Complete catalog generated from the same declaration as the enum.
+            pub const ALL: &'static [Self] = &[
+                $( Self::$variant, )+
+            ];
+
+            pub const fn id(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $id, )+
+                }
+            }
+        }
+    };
 }
 
-impl SemanticMutation {
-    pub const ALL: [Self; 9] = [
-        Self::SelectorComparisonOrder,
-        Self::WitnessSenderEpochDeduplication,
-        Self::AppWitnessAdmissionRemoval,
-        Self::CutoffBoundaryAdmission,
-        Self::FrozenMemberPersistence,
-        Self::SchedulerDeadlineRearm,
-        Self::OutputInvalidation,
-        Self::PublicationAcknowledgement,
-        Self::RetainedHistoryExpirationBoundary,
-    ];
-
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::SelectorComparisonOrder => "selector_comparison_order",
-            Self::WitnessSenderEpochDeduplication => "witness_sender_epoch_deduplication",
-            Self::AppWitnessAdmissionRemoval => "app_witness_admission_removal",
-            Self::CutoffBoundaryAdmission => "cutoff_boundary_admission",
-            Self::FrozenMemberPersistence => "frozen_member_persistence",
-            Self::SchedulerDeadlineRearm => "scheduler_deadline_rearm",
-            Self::OutputInvalidation => "output_invalidation",
-            Self::PublicationAcknowledgement => "publication_acknowledgement",
-            Self::RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
-        }
-    }
+semantic_mutations! {
+    SelectorComparisonOrder => "selector_comparison_order",
+    WitnessSenderEpochDeduplication => "witness_sender_epoch_deduplication",
+    AppWitnessAdmissionRemoval => "app_witness_admission_removal",
+    CutoffBoundaryAdmission => "cutoff_boundary_admission",
+    FrozenMemberPersistence => "frozen_member_persistence",
+    SchedulerDeadlineRearm => "scheduler_deadline_rearm",
+    OutputInvalidation => "output_invalidation",
+    PublicationAcknowledgement => "publication_acknowledgement",
+    RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,14 +65,15 @@ impl MutationSentinelResult {
     }
 }
 
-pub fn run_all_mutation_sentinels() -> Vec<MutationSentinelResult> {
-    SemanticMutation::ALL
-        .into_iter()
-        .map(run_mutation_sentinel)
-        .collect()
+pub async fn run_all_mutation_sentinels() -> Vec<MutationSentinelResult> {
+    let mut results = Vec::with_capacity(SemanticMutation::ALL.len());
+    for mutation in SemanticMutation::ALL.iter().copied() {
+        results.push(run_mutation_sentinel(mutation).await);
+    }
+    results
 }
 
-pub fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentinelResult {
+pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentinelResult {
     let (baseline_observation, mutant_observation) = match mutation {
         SemanticMutation::SelectorComparisonOrder => selector_order_sentinel(),
         SemanticMutation::WitnessSenderEpochDeduplication => witness_dedup_sentinel(),
@@ -85,7 +82,7 @@ pub fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentinelResu
         SemanticMutation::FrozenMemberPersistence => frozen_persistence_sentinel(),
         SemanticMutation::SchedulerDeadlineRearm => scheduler_rearm_sentinel(),
         SemanticMutation::OutputInvalidation => output_invalidation_sentinel(),
-        SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel(),
+        SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
     };
     MutationSentinelResult {
@@ -212,25 +209,42 @@ fn frozen_persistence_sentinel() -> (String, String) {
     let model = LifecycleModel {
         fair_after_input_closure: false,
     };
-    let mut state = LifecycleState {
+    let state = LifecycleState {
         history_a: 2,
         history_b: 2,
         input_open: false,
         crash_budget: 1,
         ..LifecycleState::default()
     };
-    state = model
+    let frozen = model
         .next_state(&state, LifecycleActionKind::FreezePass)
         .unwrap();
-    state = model
-        .next_state(&state, LifecycleActionKind::Crash)
+    let baseline_crashed = model
+        .next_state(&frozen, LifecycleActionKind::Crash)
         .unwrap();
-    state = model
-        .next_state(&state, LifecycleActionKind::Restart)
+    let baseline = model
+        .next_state(&baseline_crashed, LifecycleActionKind::Restart)
         .unwrap();
-    let baseline = format!("{:?}:{:?}", state.phase, state.frozen_revision);
-    let mutant = format!("{:?}:{:?}", PassPhase::Collecting, Option::<u8>::None);
-    (baseline, mutant)
+    let mutant_crashed = model
+        .next_state_with_mutation(
+            &frozen,
+            LifecycleActionKind::Crash,
+            LifecycleMutation::LoseDurableFrozenRevisionOnCrash,
+        )
+        .unwrap();
+    let mutant = model
+        .next_state(&mutant_crashed, LifecycleActionKind::Restart)
+        .unwrap();
+    (
+        format!(
+            "phase:{:?}:durable:{:?}:staged:{:?}",
+            baseline.phase, baseline.frozen_revision, baseline.staged_revision
+        ),
+        format!(
+            "phase:{:?}:durable:{:?}:staged:{:?}",
+            mutant.phase, mutant.frozen_revision, mutant.staged_revision
+        ),
+    )
 }
 
 fn scheduler_rearm_sentinel() -> (String, String) {
@@ -243,6 +257,7 @@ fn scheduler_rearm_sentinel() -> (String, String) {
         input_open: true,
         phase: PassPhase::Settled,
         frozen_revision: Some(2),
+        staged_revision: Some(2),
         admin_pending: false,
         admin_applied: true,
         ..LifecycleState::default()
@@ -250,8 +265,13 @@ fn scheduler_rearm_sentinel() -> (String, String) {
     let baseline = model
         .next_state(&settled, LifecycleActionKind::SelfUpdate)
         .expect("new convergence input reopens collection");
-    // Mutant: a settled pass suppresses re-arm for genuinely new input.
-    let mutant = settled;
+    let mutant = model
+        .next_state_with_mutation(
+            &settled,
+            LifecycleActionKind::SelfUpdate,
+            LifecycleMutation::SuppressRearmAfterSettlement,
+        )
+        .expect("mutated transition consumes new input without re-arming");
     (
         format!(
             "phase:{:?}:frozen:{:?}",
@@ -287,13 +307,54 @@ fn output_invalidation_sentinel() -> (String, String) {
     (format!("{baseline:?}"), format!("{mutant:?}"))
 }
 
-fn publication_ack_sentinel() -> (String, String) {
-    let mut baseline = None;
-    record_outbound_acknowledgement(&mut baseline, SubjectOutboundOutcome::Accepted);
-    let mutant = None::<SubjectOutboundOutcome>;
+async fn publication_ack_observation(acknowledge: bool) -> String {
+    let clients = vec!["alice".to_owned(), "bob".to_owned()];
+    let invitees = vec!["bob".to_owned()];
+    let initial_admins = vec!["alice".to_owned()];
+    let mut subject = ReferenceModelSubject::new(&clients).expect("reference subject");
+    subject
+        .create_group(SubjectCreateGroup {
+            action_id: "mutation-step-0:create_group",
+            creator: "alice",
+            name: "publication-ack-mutation",
+            invitees: &invitees,
+            required_features: &[],
+            initial_admins: &initial_admins,
+            pending: "create",
+        })
+        .await
+        .expect("reference group creation emits publication work");
+    let before = subject
+        .structural_progress()
+        .expect("pending-work observation before acknowledgement")
+        .outbound_awaiting_acknowledgement;
+    let outbound = subject
+        .poll_outbound("alice")
+        .expect("reference outbound publication work");
+    assert_eq!(before, outbound.len());
+    if acknowledge {
+        for artifact in outbound {
+            subject
+                .acknowledge_outbound(
+                    "alice",
+                    &artifact.outbound_id,
+                    SubjectOutboundOutcome::Accepted,
+                )
+                .await
+                .expect("accepted acknowledgement clears reference publication work");
+        }
+    }
+    let after = subject
+        .structural_progress()
+        .expect("pending-work observation after acknowledgement")
+        .outbound_awaiting_acknowledgement;
+    format!("pending:{before}->{after}")
+}
+
+async fn publication_ack_sentinel() -> (String, String) {
     (
-        format!("resolution:{baseline:?}"),
-        format!("resolution:{mutant:?}"),
+        publication_ack_observation(true).await,
+        publication_ack_observation(false).await,
     )
 }
 

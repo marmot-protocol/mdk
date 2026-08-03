@@ -321,6 +321,9 @@ jobs:
       - name: Run Milestone 3 adversarial campaign gate
         run: just milestone3-ci
 
+      - name: Run Milestone 4 independent verification gate
+        run: just milestone4-ci
+
       - name: Run encrypted file-backed vector report
         run: |
           cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \

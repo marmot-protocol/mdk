@@ -401,9 +401,8 @@ proptest! {
         let reference_refs: Vec<&ReferenceCandidate> = reference.iter().collect();
         let production = select_canonical_branch(current_tip, &candidates, &policy).map(|c| c.id.as_str());
         let model = select(current_tip, &reference_refs, &reference_policy(&policy)).map(|c| c.id.as_str());
-        prop_assert_eq!(
-            model,
-            production,
+        prop_assert!(
+            model == production,
             "selector drift at current_tip={}, policy={:?}, candidates={:?}",
             current_tip,
             policy,
