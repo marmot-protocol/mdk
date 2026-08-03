@@ -1385,7 +1385,7 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     // Concrete Engine type: the test drives the convergence pass to
     // completion explicitly (`converge_stored_openmls_messages_at`), which is
     // not part of the CgkaEngine trait surface.
-    let (mut winner, _winner_storage) = build_client_with_storage(winner_id); // pairwise incumbent-keeper
+    let (mut winner, winner_storage) = build_client_with_storage(winner_id); // pairwise incumbent-keeper
     let mut loser = build_client(loser_id); //  rival whose branch grows deeper
     let mut david = build_client(b"seam-david");
     let mut eve = build_client(b"seam-eve");
@@ -1496,6 +1496,25 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
         "incumbent-wins must not roll the winner back"
     );
     assert_eq!(winner.epoch(&group_id).unwrap().0, 2);
+    // The parked loser-root row IS the fix: `ConvergenceDeferred` (so branch
+    // materialization re-admits it) and keyed by its SOURCE epoch (the apply
+    // stage derives its retained-anchor rewind target from `record.epoch`; a
+    // current-epoch key would skip the rewind and fail replay).
+    let loser_root_content_id = {
+        use sha2::{Digest, Sha256};
+        MessageId::new(Sha256::digest(&loser_root.payload).to_vec())
+    };
+    let parked = winner_storage.get_message(&loser_root_content_id).unwrap();
+    assert_eq!(
+        parked.state,
+        MessageState::ConvergenceDeferred,
+        "the pairwise loser-root must be parked reconsiderable, not terminally invalidated"
+    );
+    assert_eq!(
+        parked.epoch,
+        EpochId(1),
+        "the parked loser-root must be keyed by its source epoch, not the winner's current epoch"
+    );
 
     // The loser's branch grows deeper: a follow-on invite from ITS epoch 2.
     let frank_kp = frank.fresh_key_package().await.unwrap();
