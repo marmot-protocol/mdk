@@ -11,6 +11,7 @@ use cgka_conformance_simulator::{
     ScenarioSpec, TraceExpectation, VectorFixture, compile_scenario, run_scenario_spec,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::export::AgentStateExport;
 use crate::export::EventKind;
@@ -63,6 +64,10 @@ pub struct NormalizedActionEvidenceV1 {
     pub source_event_indices: Vec<usize>,
 }
 
+fn assume_sensitive_state_included() -> bool {
+    true
+}
+
 /// Optional normalized history supplied alongside a forensic export. `complete`
 /// means complete for the declared Scenario IR actions, not that unavailable
 /// transport bytes or MLS secrets suddenly exist.
@@ -83,7 +88,7 @@ pub struct NormalizedScenarioHistoryV1 {
     pub unavailable_fields: Vec<UnavailableEvidenceV1>,
     /// Producer assertion that no database/OpenMLS checkpoint or raw key state
     /// is embedded. This does not redact free-form Scenario IR labels/payloads.
-    #[serde(default)]
+    #[serde(default = "assume_sensitive_state_included")]
     pub sensitive_state_included: bool,
 }
 
@@ -127,11 +132,14 @@ pub enum NormalizedHistoryImportError {
     InvalidScenario(String),
     #[error("the simulator could not run normalized history")]
     Run(String),
+    #[error("normalized-history simulator execution timed out")]
+    RunTimedOut,
     #[error("producer-attested normalized history did not reproduce its recorded outcomes")]
     NotReproduced,
 }
 
 const MAX_NORMALIZED_HISTORY_BYTES: usize = 1024 * 1024;
+const NORMALIZED_HISTORY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Import producer-attested normalized Scenario IR. `Ok(None)` is the ordinary
 /// legacy-export case and should fall back to archetype synthesis with explicit
@@ -244,7 +252,14 @@ pub fn accept_attested_history(
         .build()
         .map_err(|error| NormalizedHistoryImportError::Run(error.to_string()))?;
     let trace = runtime
-        .block_on(run_scenario_spec(&artifact.vector.scenario))
+        .block_on(async {
+            tokio::time::timeout(
+                NORMALIZED_HISTORY_RUN_TIMEOUT,
+                run_scenario_spec(&artifact.vector.scenario),
+            )
+            .await
+        })
+        .map_err(|_| NormalizedHistoryImportError::RunTimedOut)?
         .map_err(|error| NormalizedHistoryImportError::Run(error.to_string()))?;
     if artifact.vector.compare_observed_trace(&trace).is_empty() {
         artifact.reproduction_status = IncidentReproductionStatusV1::Reproduced;

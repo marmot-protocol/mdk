@@ -182,7 +182,10 @@ fn quarantine(reason: &dyn std::fmt::Display) -> ExitCode {
 }
 
 fn normalized_history_failure(error: &NormalizedHistoryImportError) -> ExitCode {
-    if matches!(error, NormalizedHistoryImportError::Run(_)) {
+    if matches!(
+        error,
+        NormalizedHistoryImportError::Run(_) | NormalizedHistoryImportError::RunTimedOut
+    ) {
         eprintln!("error: normalized-history simulator infrastructure failed");
         ExitCode::from(2)
     } else {

@@ -151,6 +151,28 @@ fn attested_history_preconditions_have_typed_fail_closed_errors() {
 }
 
 #[test]
+fn missing_sensitive_state_attestation_fails_closed() {
+    let mut export = export_with_history();
+    let history = export
+        .normalized_scenario_history
+        .take()
+        .expect("history is present");
+    let mut encoded = serde_json::to_value(history).expect("history serializes");
+    encoded
+        .as_object_mut()
+        .expect("history is an object")
+        .remove("sensitive_state_included");
+    export.normalized_scenario_history = Some(
+        serde_json::from_value(encoded).expect("history without the attestation still parses"),
+    );
+
+    assert!(matches!(
+        import_attested_history(&export, IncidentSourceFormatV1::AgentStateDocument),
+        Err(NormalizedHistoryImportError::SensitiveStateIncluded)
+    ));
+}
+
+#[test]
 fn legacy_export_is_an_explicitly_inexact_archetype() {
     let mut export = export_with_history();
     export.normalized_scenario_history = None;
