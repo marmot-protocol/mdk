@@ -8,8 +8,11 @@ Current integrations:
 - [`hermes/marmot`](hermes/marmot) - Hermes platform plugin.
 - [`openclaw/marmot`](openclaw/marmot) - OpenClaw channel plugin.
 - [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
+- [`pi/marmot`](pi/marmot) - `wn-pi` Pi harness binary.
+- [`terminal-harness`](terminal-harness) - shared hardened runtime for the
+  OpenCode and Pi terminal harnesses.
 
-All three are intentionally thin at the Marmot boundary. They do not own MLS
+All integrations are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
 transport, or durable encrypted sends. `wn-agent` owns those concerns and exposes
 the local `marmot.agent-control.v2` newline-delimited JSON protocol over a Unix
@@ -26,6 +29,7 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-hermes-marmot.sh`
 - `scripts/install-openclaw-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
+- `scripts/install-pi-marmot.sh`
 
 By default the production-shaped installs create separate local agent identities
 per connector:
@@ -34,27 +38,27 @@ per connector:
 | --- | --- | --- |
 | Hermes | `$HOME/.marmot-agents/hermes` | `wn-agent-hermes.service` / `org.marmot.wn-agent.hermes` |
 | OpenClaw | `$HOME/.marmot-agents/openclaw` | `wn-agent-openclaw.service` / `org.marmot.wn-agent.openclaw` |
-| Terminal harnesses | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` |
+| OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
+| Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
-uses the public relay defaults shared with the phone app pilot setup. The
-terminal-harness home currently runs OpenCode through `wn-opencode`; future
-terminal harnesses can share this same Marmot identity and route by harness-level
-commands.
+uses the public relay defaults shared with the phone app pilot setup. OpenCode
+and Pi use separate connector homes and Marmot identities by default. They share
+implementation in `integrations/terminal-harness`, but they do not share prompts,
+sessions, sockets, or services unless an operator explicitly configures a shared
+deployment.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
-gateway automatically. `wn-opencode` installs its own harness binary and service
-in addition to `wn-agent`, because it is a standalone harness rather than a
-plugin loaded by an existing gateway.
+gateway automatically. `wn-opencode` and `wn-pi` each install their own harness
+binary and service in addition to `wn-agent`, because they are standalone
+harnesses rather than plugins loaded by an existing gateway.
 
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, and the terminal-harness agent present as separate
-Nostr identities when installed with default options. This matches how users
-reason about them: Hermes is one chat agent, OpenClaw is another, and the
-terminal harness is another.
+which means Hermes, OpenClaw, OpenCode, and Pi present as separate Nostr
+identities when installed with default options.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
 when selection is unambiguous. If no local account exists, bootstrap creates one.
@@ -66,10 +70,10 @@ The installers persist the selected account into connector-specific config:
 - Hermes uses `MARMOT_ACCOUNT_ID_HEX` or the Marmot plugin config.
 - OpenClaw uses `channels.marmot.accountIdHex` or `MARMOT_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
+- `wn-pi` uses `WN_PI_ACCOUNT_ID_HEX`.
 
-So installing Hermes, OpenClaw, and the OpenCode-backed terminal harness on one
-machine with default options creates distinct agent identities and distinct
-chat/group memberships.
+Installing all four connectors on one machine with default options therefore
+creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
 
@@ -100,6 +104,9 @@ Each host runtime keeps its own runtime state:
 - `wn-opencode` keeps harness configuration in
   `$MARMOT_HOME/dev/wn-opencode.env` and session state under
   `$XDG_STATE_HOME/wn-opencode` by default.
+- `wn-pi` keeps harness configuration in `$MARMOT_HOME/dev/wn-pi.env`, connector
+  state under `$XDG_STATE_HOME/wn-pi`, and Pi sessions under
+  `$MARMOT_HOME/dev/pi-sessions` by default.
 
 Each integration also makes its own activation decision:
 
@@ -107,15 +114,15 @@ Each integration also makes its own activation decision:
   they default to mention-style activation and always reply in effective DMs.
   They also support richer gateway features such as live previews, durable reply
   routing, profile onboarding, and media handling.
-- `wn-opencode` is a pure harness. It currently supports only `always`
-  activation for prompt messages from explicitly allowed senders, and it has no
-  media, profile onboarding, or live-preview behavior.
+- `wn-opencode` and `wn-pi` are pure harnesses. They currently support only
+  `always` activation for prompt messages from explicitly allowed senders, and
+  have no media, profile onboarding, or live-preview behavior.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the
 same account and group, every eligible integration can reply. For example, a
-direct message from an allowlisted sender could trigger Hermes/OpenClaw and
-`wn-opencode` if all are running and configured for that account.
+direct message from an allowlisted sender could trigger Hermes/OpenClaw,
+`wn-opencode`, and `wn-pi` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
@@ -126,11 +133,11 @@ the same account.
 
 Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
 `wn-agent`. Their sync path is config-driven and may reconcile the connector
-allowlist to the configured set. `wn-opencode` requires at least one allowed
-sender and installs those senders into both the prompt allowlist and the
-`wn-agent` welcomer allowlist. Its startup mirroring is additive: removing a
-sender only from `wn-agent` is not a full OpenCode revoke while
-`WN_OPENCODE_ALLOWED_SENDERS_HEX` still contains that sender.
+allowlist to the configured set. Both terminal harnesses require at least one
+allowed sender and install those senders into both the prompt allowlist and the
+`wn-agent` welcomer allowlist. Their startup mirroring is additive: removing a
+sender only from `wn-agent` is not a full harness revoke while the sender remains
+in `WN_OPENCODE_ALLOWED_SENDERS_HEX` or `WN_PI_ALLOWED_SENDERS_HEX`.
 
 For shared-account deployments, prefer one explicit source of truth for the
 account's allowed welcomers, or configure every integration with the same
@@ -186,6 +193,12 @@ just openclaw-dev-e2e-connector
 cargo test -p wn-opencode
 just opencode-dev-e2e-connector
 just opencode-installer-test
+
+cargo test -p marmot-terminal-harness
+
+cargo test -p wn-pi
+just pi-dev-e2e-connector
+just pi-installer-test
 ```
 
 For release-installer work, test dry-runs and real release assets from the

@@ -14,14 +14,15 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::bridge::TRACE_TARGET;
+use crate::TRACE_TARGET;
 use crate::error::{HarnessError, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ControlClient {
     socket: PathBuf,
     auth_token: Option<String>,
     request_timeout: Duration,
+    request_prefix: &'static str,
     request_seq: Arc<AtomicU64>,
 }
 
@@ -30,11 +31,13 @@ impl ControlClient {
         socket: PathBuf,
         auth_token: Option<String>,
         request_timeout: Duration,
+        request_prefix: &'static str,
     ) -> Self {
         Self {
             socket,
             auth_token,
             request_timeout,
+            request_prefix,
             request_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -260,7 +263,7 @@ impl ControlClient {
 
     fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("wn-opencode-{}-{seq}", std::process::id())
+        format!("{}-{}-{seq}", self.request_prefix, std::process::id())
     }
 }
 
@@ -336,7 +339,7 @@ mod tests {
     fn rich_context_golden_events_decode() {
         let fixture = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../fixtures/agent-control-v2-rich-context.json"),
+                .join("../../fixtures/agent-control-v2-rich-context.json"),
         )
         .unwrap();
         let events: Vec<AgentControlEvent> = serde_json::from_str(&fixture).unwrap();
@@ -346,6 +349,17 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentControlEvent::ReactionRemoved { .. }))
         );
+    }
+
+    #[test]
+    fn request_ids_keep_harness_identity() {
+        let client = ControlClient::new(
+            PathBuf::from("/unused"),
+            None,
+            Duration::from_secs(1),
+            "wn-pi",
+        );
+        assert!(client.next_request_id().starts_with("wn-pi-"));
     }
 
     #[tokio::test]
@@ -369,7 +383,7 @@ mod tests {
             write_frame(&mut write_half, &response).await.unwrap();
         });
 
-        let client = ControlClient::new(socket, None, Duration::from_secs(5));
+        let client = ControlClient::new(socket, None, Duration::from_secs(5), "wn-test");
         let err = client
             .call("account_list", AgentControlRequest::AccountList)
             .await

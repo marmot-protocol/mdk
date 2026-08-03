@@ -1,19 +1,19 @@
 [package]
-name = "wn-opencode"
+name = "wn-pi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [[bin]]
-name = "wn-opencode"
+name = "wn-pi"
 path = "src/main.rs"
 
 [dependencies]
-clap.workspace = true
-marmot-terminal-harness.workspace = true
 async-trait.workspace = true
-serde.workspace = true
+clap.workspace = true
+fs-private.workspace = true
+marmot-terminal-harness.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true

@@ -6,13 +6,13 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum RawRecord {
     Bare(String),
@@ -31,7 +31,6 @@ impl RawRecord {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct SessionStore {
     path: PathBuf,
     map: Mutex<HashMap<String, SessionRecord>>,

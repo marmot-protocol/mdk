@@ -10,14 +10,13 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::chunking::split_reply_chunks;
-use crate::config::{Config, dirs_home};
 use crate::control::ControlClient;
 use crate::error::{HarnessError, Result};
-use crate::opencode::{Invocation, Outcome, RunFailure, RunnerEvent};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
-
-pub(crate) const TRACE_TARGET: &str = "wn_opencode";
+use crate::{
+    Backend, Config, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+};
 
 const DEDUPE_LIMIT: usize = 2048;
 const GROUP_QUEUE_LIMIT: usize = 4096;
@@ -25,24 +24,33 @@ const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const SEND_RETRY_ATTEMPTS: usize = 3;
 
-pub(crate) async fn run(config: Config) -> Result<()> {
+/// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
+pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
     info!(
         target: TRACE_TARGET,
         method = "startup",
         allowed_senders = config.allowed_senders.len(),
         max_reply_bytes = config.max_reply_bytes,
-        "wn-opencode starting"
+        harness = config.spec.display_name,
+        "terminal harness starting"
     );
 
+    let home = dirs_home()?;
     let client = ControlClient::new(
         config.socket.clone(),
         config.auth_token.clone(),
         config.request_timeout,
+        config.spec.reply_prefix,
     );
-    let account_ref = resolve_account(&client, config.account_id_hex.as_deref()).await?;
+    let account_ref = resolve_account(
+        &client,
+        config.account_id_hex.as_deref(),
+        config.spec.account_env_name,
+    )
+    .await?;
     install_allowlist(&client, &account_ref, &config.allowed_senders).await?;
 
-    let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &dirs_home())?);
+    let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &home)?);
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
     let ctx = Arc::new(BridgeContext {
         cfg: Arc::new(config),
@@ -51,6 +59,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         sessions,
         queues,
         dedupe: Arc::new(InboundDedupe::new(DEDUPE_LIMIT)),
+        backend: Arc::new(backend),
+        home,
     });
 
     subscribe_loop(ctx).await
@@ -63,6 +73,8 @@ struct BridgeContext {
     sessions: Arc<SessionStore>,
     queues: Arc<GroupQueues>,
     dedupe: Arc<InboundDedupe>,
+    backend: Arc<dyn Backend>,
+    home: PathBuf,
 }
 
 async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
@@ -227,7 +239,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                         &account_id_hex,
                         &group_id_hex,
                         &message.message_id_hex,
-                        "[wn-opencode] too many prompts are already queued for this group; try again shortly.",
+                        &format!("[{}] too many prompts are already queued for this group; try again shortly.", ctx_for_reply.cfg.spec.reply_prefix),
                         0,
                     )
                     .await
@@ -317,7 +329,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                "[wn-opencode] failed to prepare this prompt.",
+                &format!(
+                    "[{}] failed to prepare this prompt.",
+                    ctx.cfg.spec.reply_prefix
+                ),
                 0,
             )
             .await;
@@ -339,15 +354,15 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         .as_ref()
         .and_then(|record| (!record.session_id.is_empty()).then(|| record.session_id.clone()));
     let invocation = Invocation {
-        bin: ctx.cfg.opencode_bin.clone(),
-        timeout: ctx.cfg.opencode_timeout,
-        idle_timeout: ctx.cfg.opencode_idle_timeout,
+        timeout: ctx.cfg.backend_timeout,
+        idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
         prompt,
     };
     let (tx, mut rx) = mpsc::channel(16);
-    let runner = tokio::spawn(crate::opencode::run(invocation, tx));
+    let backend = ctx.backend.clone();
+    let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
@@ -373,7 +388,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                             target: TRACE_TARGET,
                             method = "send_final",
                             error_kind = err.privacy_safe_kind(),
-                            "failed to send opencode reply chunk"
+                            "failed to send backend reply chunk"
                         );
                         delivery_failed = true;
                         break;
@@ -404,17 +419,18 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         Ok(Err(failure)) => {
             warn!(
                 target: TRACE_TARGET,
-                method = "opencode_run",
+                method = "backend_run",
                 error_kind = failure.error.privacy_safe_kind(),
-                "opencode invocation failed"
+                "backend invocation failed"
             );
-            let text = handle_opencode_run_failure(
+            let text = handle_backend_run_failure(
+                &ctx.cfg,
                 &ctx.sessions,
                 &inbound.group_ref,
                 known_session.as_ref(),
                 cwd,
                 &failure,
-                ctx.cfg.opencode_idle_timeout,
+                ctx.cfg.backend_idle_timeout,
             )
             .await;
             let _ = send_reply(
@@ -431,16 +447,19 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             let err = HarnessError::from(err);
             warn!(
                 target: TRACE_TARGET,
-                method = "opencode_run",
+                method = "backend_run",
                 error_kind = err.privacy_safe_kind(),
-                "opencode task join failed"
+                "backend task join failed"
             );
             let _ = send_reply(
                 &ctx,
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                "[wn-opencode] opencode failed while completing this prompt.",
+                &format!(
+                    "[{}] {} failed while completing this prompt.",
+                    ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+                ),
                 0,
             )
             .await;
@@ -458,14 +477,14 @@ async fn finish_success(
 ) {
     info!(
         target: TRACE_TARGET,
-        method = "opencode_run",
+        method = "backend_run",
         chunk_count = delivery.chunk_count,
         elapsed_ms = outcome.elapsed_ms,
         exit_code = outcome.exit_code.unwrap_or(-1),
         observed_session = outcome.observed_session.is_some(),
         stderr_bytes = outcome.stderr.len(),
         delivery_failed = delivery.failed,
-        "opencode invocation completed"
+        "backend invocation completed"
     );
 
     let needs_persist = known_session
@@ -487,7 +506,7 @@ async fn finish_success(
             target: TRACE_TARGET,
             method = "session_store",
             error_kind = err.privacy_safe_kind(),
-            "failed to persist opencode session"
+            "failed to persist backend session"
         );
     }
 
@@ -497,14 +516,23 @@ async fn finish_success(
             &inbound.account_ref,
             &inbound.group_ref,
             &inbound.message_ref,
-            "[wn-opencode] failed to deliver the complete opencode response; some chunks may be missing.",
+            &format!(
+                "[{}] failed to deliver the complete {} response; some chunks may be missing.",
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            ),
             delivery.failure_chunk_index,
         )
         .await;
     } else if delivery.chunk_count == 0 {
         let mut message = match outcome.error_summary {
-            Some(summary) => format!("[wn-opencode] opencode reported {summary}"),
-            None => String::from("[wn-opencode] opencode produced no text output"),
+            Some(summary) => format!(
+                "[{}] {} reported {summary}",
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            ),
+            None => format!(
+                "[{}] {} produced no text output",
+                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            ),
         };
         if let Some(code) = outcome.exit_code
             && code != 0
@@ -530,7 +558,8 @@ struct DeliveryReport {
     failure_chunk_index: usize,
 }
 
-async fn handle_opencode_run_failure(
+async fn handle_backend_run_failure(
+    config: &Config,
     sessions: &SessionStore,
     group_ref: &str,
     known_session: Option<&SessionRecord>,
@@ -551,22 +580,33 @@ async fn handle_opencode_run_failure(
             target: TRACE_TARGET,
             method = "session_store",
             error_kind = store_err.privacy_safe_kind(),
-            "failed to persist opencode session"
+            "failed to persist backend session"
         );
     }
 
     match &failure.error {
-        HarnessError::OpencodeIdle => format!(
-            "[wn-opencode] opencode went silent for {}s without producing output; killing the invocation.",
+        HarnessError::BackendIdle => format!(
+            "[{}] {} went silent for {}s without producing output; killing the invocation.",
+            config.spec.reply_prefix,
+            config.spec.display_name,
             idle_timeout.as_secs()
         ),
-        HarnessError::OpencodeTimedOut => {
-            "[wn-opencode] opencode timed out before producing a complete response.".to_owned()
+        HarnessError::BackendTimedOut => {
+            format!(
+                "[{}] {} timed out before producing a complete response.",
+                config.spec.reply_prefix, config.spec.display_name
+            )
         }
-        HarnessError::OpencodeSpawn => {
-            "[wn-opencode] failed to start opencode; check WN_OPENCODE_BIN.".to_owned()
+        HarnessError::BackendSpawn => {
+            format!(
+                "[{}] failed to start {}; check {}.",
+                config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
+            )
         }
-        _ => "[wn-opencode] opencode failed while streaming its response.".to_owned(),
+        _ => format!(
+            "[{}] {} failed while streaming its response.",
+            config.spec.reply_prefix, config.spec.display_name
+        ),
     }
 }
 
@@ -594,19 +634,19 @@ async fn resolve_cwd_and_prompt(
     known_session: Option<&SessionRecord>,
 ) -> Result<Option<(PathBuf, String)>> {
     if let Some(record) = known_session {
-        let cwd = validate_session_cwd(&record.cwd, &dirs_home()).await?;
+        let cwd = validate_session_cwd(&record.cwd, &ctx.home).await?;
         return Ok(Some((cwd, inbound.text.clone())));
     }
 
     let (name, rest) = match parse_repo_picker(&inbound.text) {
-        RepoPicker::Absent => return Ok(Some((dirs_home(), inbound.text.clone()))),
+        RepoPicker::Absent => return Ok(Some((ctx.home.clone(), inbound.text.clone()))),
         RepoPicker::Invalid => {
             send_reply(
                 ctx,
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                "[wn-opencode] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.",
+                &format!("[{}] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.", ctx.cfg.spec.reply_prefix),
                 0,
             )
             .await?;
@@ -614,7 +654,7 @@ async fn resolve_cwd_and_prompt(
         }
         RepoPicker::Valid { path, prompt } => (path, prompt),
     };
-    let cwd = match resolve_repo(&name, &dirs_home()).await {
+    let cwd = match resolve_repo(&name, &ctx.home).await {
         Ok(cwd) => cwd,
         Err(err) => {
             let text = err.to_string();
@@ -623,7 +663,7 @@ async fn resolve_cwd_and_prompt(
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                &format!("[wn-opencode] {text}"),
+                &format!("[{}] {text}", ctx.cfg.spec.reply_prefix),
                 0,
             )
             .await?;
@@ -645,7 +685,10 @@ async fn resolve_cwd_and_prompt(
             &inbound.account_ref,
             &inbound.group_ref,
             &inbound.message_ref,
-            &format!("[wn-opencode] Session workdir set to ~/{name}. Send your prompt."),
+            &format!(
+                "[{}] Session workdir set to ~/{name}. Send your prompt.",
+                ctx.cfg.spec.reply_prefix
+            ),
             0,
         )
         .await?;
@@ -654,7 +697,11 @@ async fn resolve_cwd_and_prompt(
     Ok(Some((cwd, rest)))
 }
 
-async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Result<String> {
+async fn resolve_account(
+    client: &ControlClient,
+    preferred: Option<&str>,
+    account_env_name: &'static str,
+) -> Result<String> {
     let accounts = client.account_list().await?;
     if let Some(preferred) = preferred {
         if let Some(account_ref) = find_account_ref(&accounts, preferred) {
@@ -670,9 +717,9 @@ async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Res
         ));
     }
     if accounts.len() > 1 {
-        return Err(HarnessError::Config(
-            "multiple local accounts are present; set WN_OPENCODE_ACCOUNT_ID_HEX".to_owned(),
-        ));
+        return Err(HarnessError::Config(format!(
+            "multiple local accounts are present; set {account_env_name}"
+        )));
     }
     Ok(accounts[0].account_id_hex.clone())
 }
@@ -829,6 +876,31 @@ mod tests {
     use super::*;
     use crate::store::SessionStore;
 
+    fn test_config(root: &std::path::Path) -> Config {
+        Config {
+            socket: root.join("socket"),
+            auth_token: None,
+            allowed_senders: HashSet::new(),
+            account_id_hex: None,
+            request_timeout: Duration::from_secs(1),
+            max_reply_bytes: 30_000,
+            max_pending_per_group: 4,
+            state_path: root.join("sessions.json"),
+            backend_timeout: Duration::from_secs(60),
+            backend_idle_timeout: Duration::from_secs(45),
+            spec: crate::ConfigSpec {
+                env_prefix: "WN_OPENCODE",
+                default_home_name: "harnesses",
+                default_bin: "opencode",
+                display_name: "opencode",
+                reply_prefix: "wn-opencode",
+                bin_env_name: "WN_OPENCODE_BIN",
+                account_env_name: "WN_OPENCODE_ACCOUNT_ID_HEX",
+                legacy_allowed_senders_env: Some("WN_OPENCODE_ADMIN_HEX"),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn dedupe_rejects_repeated_message_refs() {
         let dedupe = InboundDedupe::new(8);
@@ -900,11 +972,12 @@ mod tests {
         let home = dir.path().to_path_buf();
         let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
         let failure = RunFailure {
-            error: HarnessError::OpencodeIdle,
+            error: HarnessError::BackendIdle,
             observed_session: Some("ses_idle".to_owned()),
         };
 
-        let reply = handle_opencode_run_failure(
+        let reply = handle_backend_run_failure(
+            &test_config(&home),
             &store,
             "group1",
             None,

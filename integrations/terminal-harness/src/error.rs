@@ -3,10 +3,10 @@ use std::io;
 use agent_control::AgentControlError;
 use thiserror::Error;
 
-pub(crate) type Result<T> = std::result::Result<T, HarnessError>;
+pub type Result<T> = std::result::Result<T, HarnessError>;
 
 #[derive(Debug, Error)]
-pub(crate) enum HarnessError {
+pub enum HarnessError {
     #[error("{0}")]
     Config(String),
     #[error("i/o error kind={kind:?}")]
@@ -28,20 +28,20 @@ pub(crate) enum HarnessError {
     },
     #[error("control request rejected for {method}: {code}")]
     ControlRejected { method: &'static str, code: String },
-    #[error("opencode invocation timed out")]
-    OpencodeTimedOut,
-    #[error("opencode went idle without producing output")]
-    OpencodeIdle,
-    #[error("opencode stream error")]
-    OpencodeStream,
-    #[error("opencode process failed to start")]
-    OpencodeSpawn,
+    #[error("backend invocation timed out")]
+    BackendTimedOut,
+    #[error("backend went idle without producing output")]
+    BackendIdle,
+    #[error("backend stream error")]
+    BackendStream,
+    #[error("backend process failed to start")]
+    BackendSpawn,
     #[error("task join error")]
     Join,
 }
 
 impl HarnessError {
-    pub(crate) fn privacy_safe_kind(&self) -> &'static str {
+    pub fn privacy_safe_kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
             Self::Io { .. } => "io",
@@ -52,10 +52,10 @@ impl HarnessError {
             Self::ResponseIdMismatch { .. } => "response_id_mismatch",
             Self::UnexpectedResponse { .. } => "unexpected_response",
             Self::ControlRejected { .. } => "control_rejected",
-            Self::OpencodeTimedOut => "opencode_timeout",
-            Self::OpencodeIdle => "opencode_idle",
-            Self::OpencodeStream => "opencode_stream",
-            Self::OpencodeSpawn => "opencode_spawn",
+            Self::BackendTimedOut => "backend_timeout",
+            Self::BackendIdle => "backend_idle",
+            Self::BackendStream => "backend_stream",
+            Self::BackendSpawn => "backend_spawn",
             Self::Join => "join",
         }
     }

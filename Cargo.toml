@@ -21,7 +21,9 @@ members = [
     "crates/marmot-app",
     "crates/marmot-uniffi",
     "crates/cli",
+    "integrations/terminal-harness",
     "integrations/opencode/marmot",
+    "integrations/pi/marmot",
 ]
 
 [workspace.package]
@@ -128,6 +130,7 @@ marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 wn-cli = { path = "crates/cli" }
+marmot-terminal-harness = { path = "integrations/terminal-harness" }
 
 # hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2
 # dependency under cfg(hax). Pin the upstream removal until the next hax

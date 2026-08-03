@@ -11,7 +11,9 @@ Hermes is the first supported adapter. OpenClaw is the second: a TypeScript chan
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
 connector. `wn-opencode` is a pure Rust harness at
 [`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
-OpenCode.
+OpenCode. `wn-pi` is the corresponding Pi harness at
+[`integrations/pi/marmot`](../../integrations/pi/marmot). Both use the shared hardened runtime in
+[`integrations/terminal-harness`](../../integrations/terminal-harness).
 
 ## Names
 
@@ -166,6 +168,30 @@ private `wn-opencode.env`, and starts a same-user `wn-opencode` service where su
 uses `wn-agent-harnesses.service` on Linux or `org.marmot.wn-agent.harnesses` on macOS. `WN_OPENCODE_MAX_REPLY_BYTES`
 defaults to 30000 bytes per Marmot reply chunk.
 
+## Pi Harness Install
+
+The same WN Agent release publishes the `wn-pi` harness binary and installer. Pi itself must already be installed and
+authenticated.
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The Pi installer creates or reuses the isolated agent home at `~/.marmot-agents/pi`, writes a private `wn-pi.env`,
+and starts same-user `wn-agent` and `wn-pi` services where supported. Its connector service is `wn-agent-pi.service`
+on Linux or `org.marmot.wn-agent.pi` on macOS. Pi sessions default to
+`~/.marmot-agents/pi/dev/pi-sessions`, and `WN_PI_MAX_REPLY_BYTES` defaults to 30000 bytes per Marmot reply chunk.
+
+Pi-specific configuration and development commands live in
+[`integrations/pi/marmot/README.md`](../../integrations/pi/marmot/README.md).
+
 ## Cutting A WN Agent Release
 
 After the release commit is merged to `master`, cut a WN Agent release tag with:
@@ -257,7 +283,10 @@ cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
+bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
+just opencode-installer-test
+just pi-installer-test
 ```
 
 Before checkpointing broader release work, run the normal repo checks from the root:

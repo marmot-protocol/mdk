@@ -2,4 +2,4 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-exec "$repo_root/integrations/terminal-harness/tests/test_installer.sh" opencode
+exec "$repo_root/integrations/terminal-harness/tests/test_installer.sh" pi

@@ -1,6 +1,6 @@
 # wn-opencode
 
-`wn-opencode` is the first terminal-harness backend for Marmot. It runs
+`wn-opencode` is a terminal-harness backend for Marmot. It runs
 [OpenCode](https://opencode.ai/) through the local `wn-agent` connector and
 sends every message from an allowed sender to `opencode run --format json`.
 
@@ -97,7 +97,7 @@ Configure with environment variables:
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
 | `WN_OPENCODE_STATE_PATH` | `$XDG_STATE_HOME/wn-opencode/sessions.json` | Session map path |
 | `WN_OPENCODE_ACTIVATION` | `always` | Only `always` is supported today |
-| `RUST_LOG` | `info,wn_opencode=info` | tracing filter |
+| `RUST_LOG` | `info,marmot_terminal_harness=info` | tracing filter |
 
 The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the harness sender allowlist does not narrow that token's

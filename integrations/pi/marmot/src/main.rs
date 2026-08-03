@@ -1,5 +1,5 @@
 mod config;
-mod opencode;
+mod pi;
 
 use std::process::ExitCode;
 
@@ -9,9 +9,9 @@ use tracing::error;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "wn-opencode",
+    name = "wn-pi",
     version,
-    about = "Marmot harness that routes allowed group messages to opencode"
+    about = "Marmot harness that routes allowed group messages to Pi"
 )]
 struct Cli {}
 
@@ -27,17 +27,16 @@ async fn main() -> ExitCode {
                 target: marmot_terminal_harness::TRACE_TARGET,
                 method = "main",
                 error_kind = err.privacy_safe_kind(),
-                "wn-opencode exiting after error"
+                "wn-pi exiting after error"
             );
-            eprintln!("wn-opencode: {err}");
+            eprintln!("wn-pi: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run() -> Result<()> {
-    let config = config::Config::from_env()?;
-    let (config, backend) = config.into_harness();
+    let (config, backend) = config::Config::from_env()?.into_harness()?;
     marmot_terminal_harness::run(config, backend).await
 }
 

@@ -3204,6 +3204,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-terminal-harness"
+version = "0.9.10"
+dependencies = [
+ "agent-control",
+ "async-trait",
+ "fs-private",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "marmot-uniffi"
 version = "0.9.10"
 dependencies = [
@@ -7115,13 +7130,27 @@ dependencies = [
 name = "wn-opencode"
 version = "0.9.10"
 dependencies = [
- "agent-control",
+ "async-trait",
  "clap",
- "fs-private",
+ "marmot-terminal-harness",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "wn-pi"
+version = "0.9.10"
+dependencies = [
+ "async-trait",
+ "clap",
+ "fs-private",
+ "marmot-terminal-harness",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -55,6 +55,8 @@ Primary implementation areas:
 - `integrations/hermes/marmot` - Hermes gateway plugin for the local `wn-agent` control socket.
 - `integrations/openclaw/marmot` - OpenClaw channel plugin for the local `wn-agent` control socket.
 - `integrations/opencode/marmot` - OpenCode terminal harness for the local `wn-agent` control socket.
+- `integrations/pi/marmot` - Pi terminal harness for the local `wn-agent` control socket.
+- `integrations/terminal-harness` - shared hardened runtime for terminal-harness connectors.
 
 Reference and model support:
 
