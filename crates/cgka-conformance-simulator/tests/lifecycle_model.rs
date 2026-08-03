@@ -110,7 +110,7 @@ fn crash_and_resource_recovery_preserve_frozen_membership() {
     let mut state = LifecycleState {
         history_a: 2,
         history_b: 2,
-        input_open: true,
+        input_open: false,
         ..LifecycleState::default()
     };
     state = model
@@ -131,6 +131,27 @@ fn crash_and_resource_recovery_preserve_frozen_membership() {
         .unwrap();
     assert_eq!(state.phase, PassPhase::Frozen);
     assert_eq!(state.frozen_revision, frozen);
+}
+
+#[test]
+fn applied_admin_progress_is_monotonic_across_later_settlement() {
+    let model = LifecycleModel {
+        fair_after_input_closure: false,
+    };
+    let state = LifecycleState {
+        history_a: 2,
+        history_b: 2,
+        input_open: false,
+        phase: PassPhase::Frozen,
+        frozen_revision: Some(2),
+        admin_pending: false,
+        admin_applied: true,
+        ..LifecycleState::default()
+    };
+    let settled = model
+        .next_state(&state, LifecycleActionKind::SettlePass)
+        .expect("a valid later pass settles");
+    assert!(settled.admin_applied);
 }
 
 #[test]

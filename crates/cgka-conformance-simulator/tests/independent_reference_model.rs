@@ -15,6 +15,7 @@ use cgka_conformance_simulator::reference_convergence::{
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use proptest::prelude::*;
+use proptest::test_runner::{RngAlgorithm, RngSeed};
 
 const POLICY_CASES_JSON: &str = include_str!("../../../formal/tamarin/policy_cases.json");
 
@@ -57,9 +58,17 @@ fn reference_policy(value: &ConvergencePolicy) -> ReferencePolicy {
 #[test]
 fn independent_source_has_no_production_model_import() {
     let source = include_str!("../src/reference_convergence.rs");
-    assert!(!source.contains("use cgka_engine"));
-    assert!(!source.contains("crate::canonicalization"));
-    assert!(!source.contains("crate::convergence"));
+    for forbidden in [
+        "cgka_engine",
+        "canonicalization",
+        "crate::convergence",
+        "crate::{convergence",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "reference model must stay independent of {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -277,6 +286,58 @@ fn missing_parent_disposition_matches_production_canonicalizer() {
     }));
 }
 
+#[test]
+fn invalid_commit_shape_is_not_misclassified_as_a_missing_parent() {
+    let reference = evaluate(&ReferenceInput {
+        current_tip_epoch: 3,
+        retained_anchor_epoch: 1,
+        candidates: vec![reference_candidate(&candidate("parent", 1, 3, 0))],
+        commits: vec![
+            ReferenceCommit {
+                message_id: "non-advancing".into(),
+                branch_id: "non-advancing-tip".into(),
+                parent_branch_id: Some("parent".into()),
+                sender: b"alice".to_vec(),
+                source_epoch: 3,
+                fork_epoch: 1,
+                resulting_epoch: 3,
+                tip_priority: ReferencePriority::Ordinary,
+                tip_digest: [3; 32],
+                consumed_proposal_ids: Vec::new(),
+                authenticated: true,
+                authorized: true,
+            },
+            ReferenceCommit {
+                message_id: "duplicate-branch".into(),
+                branch_id: "parent".into(),
+                parent_branch_id: Some("parent".into()),
+                sender: b"alice".to_vec(),
+                source_epoch: 3,
+                fork_epoch: 1,
+                resulting_epoch: 4,
+                tip_priority: ReferencePriority::Ordinary,
+                tip_digest: [4; 32],
+                consumed_proposal_ids: Vec::new(),
+                authenticated: true,
+                authorized: true,
+            },
+        ],
+        proposals: Vec::new(),
+        app_messages: Vec::new(),
+        policy: ReferencePolicy::default(),
+        witness_mode: WitnessMode::Enabled,
+    });
+
+    assert_eq!(
+        reference.dispositions["non-advancing"],
+        ReferenceDisposition::DroppedInvalidCommit
+    );
+    assert_eq!(
+        reference.dispositions["duplicate-branch"],
+        ReferenceDisposition::DroppedInvalidCommit
+    );
+}
+
 fn arb_witnesses() -> impl Strategy<Value = Vec<AppWitness>> {
     prop::collection::vec((0u64..6, 0u8..4), 0..8).prop_map(|items| {
         items
@@ -290,7 +351,15 @@ fn arb_witnesses() -> impl Strategy<Value = Vec<AppWitness>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    // This differential property stays beside the bounded reference corpus so
+    // model/production conversion helpers have one owner. Unlike general
+    // simulator invariants, it does not drive the engine harness.
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        rng_algorithm: RngAlgorithm::ChaCha,
+        rng_seed: RngSeed::Fixed(0x4d34_5245_464d_4f44),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn small_shrinkable_selector_inputs_match_independent_model(
@@ -332,7 +401,14 @@ proptest! {
         let reference_refs: Vec<&ReferenceCandidate> = reference.iter().collect();
         let production = select_canonical_branch(current_tip, &candidates, &policy).map(|c| c.id.as_str());
         let model = select(current_tip, &reference_refs, &reference_policy(&policy)).map(|c| c.id.as_str());
-        prop_assert_eq!(model, production);
+        prop_assert_eq!(
+            model,
+            production,
+            "selector drift at current_tip={}, policy={:?}, candidates={:?}",
+            current_tip,
+            policy,
+            candidates
+        );
     }
 }
 

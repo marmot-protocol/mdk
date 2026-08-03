@@ -43,8 +43,14 @@ fn every_ledger_id_has_one_versioning_decision() {
         include_str!("../../../docs/marmot-architecture/convergence-constant-inventory.txt");
     let inventory_ids: BTreeSet<&str> = inventory
         .lines()
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split('|').next())
+        .map(|line| {
+            line.split_once('|')
+                .unwrap_or_else(|| panic!("malformed convergence constant inventory row: {line}"))
+                .0
+                .trim()
+        })
         .collect();
     let decision_ids: BTreeSet<&str> = CONSTANT_DECISIONS.iter().map(|entry| entry.id).collect();
     assert_eq!(decision_ids, inventory_ids);
@@ -73,6 +79,10 @@ fn semantic_or_coupled_change_requires_a_new_required_component() {
             VersioningRule::OperationalNonInterference
         );
     }
+    assert!(
+        future_policy_change_requires_new_required_app_component(&["UNCLASSIFIED"]),
+        "unknown constants fail closed until they receive a versioning decision"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +97,7 @@ struct DriveReport {
     intermediate_winners: Vec<Option<String>>,
     settled_winner: Option<String>,
     resource_refusals: usize,
+    idle_ticks: usize,
 }
 
 fn candidate(id: &str, depth: u64, digest: u8) -> ReferenceCandidate {
@@ -136,13 +147,13 @@ fn drive_closed_input(input: &ReferenceInput, variant: OperationalVariant) -> Dr
     let mut admitted = 0usize;
     let mut pass = 0usize;
     let mut resource_refusals = 0usize;
+    let mut idle_ticks = 0usize;
     let mut intermediate_winners = Vec::new();
     let mut failed_once = false;
     while admitted < input.app_messages.len() {
-        for _ in 0..variant.wake_delay_ticks {
-            // Scheduler delay is observable latency only; no input is admitted
-            // and no result is called settled during these ticks.
-        }
+        // Scheduler delay is observable latency only; no input is admitted and
+        // no result is called settled during these ticks.
+        idle_ticks += variant.wake_delay_ticks;
         if !failed_once && variant.fail_resource_before_pass == Some(pass) {
             resource_refusals += 1;
             failed_once = true;
@@ -161,6 +172,7 @@ fn drive_closed_input(input: &ReferenceInput, variant: OperationalVariant) -> Dr
         settled_winner: evaluate(input).selected_branch_id,
         intermediate_winners,
         resource_refusals,
+        idle_ticks,
     }
 }
 
@@ -200,11 +212,17 @@ fn scheduler_and_resource_variants_cannot_change_closed_input_settlement() {
     );
     assert_eq!(reports[2].resource_refusals, 1);
     assert_eq!(reports[2].intermediate_winners.len(), 2);
+    assert_eq!(reports[0].idle_ticks, 0);
+    assert_eq!(reports[1].idle_ticks, 14);
+    assert_eq!(reports[2].idle_ticks, 6);
 }
 
 #[test]
 fn protocol_decision_record_names_the_adopted_non_guarantee() {
-    let record = include_str!("../PROTOCOL_DECISIONS.md");
+    let record = include_str!("../PROTOCOL_DECISIONS.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(record.contains(ADOPTED_MARMOT_CONVERGENCE_COMMIT));
     assert!(record.contains("no administrative-progress"));
     assert!(record.contains("guarantee while valid selection-relevant input"));

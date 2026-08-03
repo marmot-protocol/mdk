@@ -1,6 +1,6 @@
 //! Independent, symbolic convergence oracle.
 //!
-//! This module intentionally does not import `cgka_engine`. It restates the
+//! This module intentionally does not import the production engine crate. It restates the
 //! observable convergence contract using small serializable values so bounded
 //! differential tests can detect drift in the production selector and
 //! canonicalizer. Authentication and authorization are explicit inputs here;
@@ -142,6 +142,7 @@ pub enum ReferenceDisposition {
     DroppedUnauthorized,
     DroppedBeyondAnchor,
     DroppedBeyondRollbackHorizon,
+    DroppedInvalidCommit,
     DroppedExpiredProposal,
     InvalidatedBeyondAppRetention,
     InvalidatedLosingBranch,
@@ -208,6 +209,11 @@ pub fn evaluate(input: &ReferenceInput) -> ReferenceResult {
             if commit.resulting_epoch <= commit.source_epoch
                 || graph.contains_key(&commit.branch_id)
             {
+                dispositions.insert(
+                    commit.message_id.clone(),
+                    ReferenceDisposition::DroppedInvalidCommit,
+                );
+                materialized.insert(commit.message_id.clone());
                 continue;
             }
             let parent = match &commit.parent_branch_id {
@@ -510,7 +516,7 @@ fn eligible(current_tip: u64, candidate: &ReferenceCandidate, policy: &Reference
     current_tip.saturating_sub(candidate.fork_epoch) <= policy.max_rewind_commits
 }
 
-fn compare(a: &ReferenceScore, b: &ReferenceScore) -> Ordering {
+pub(crate) fn compare(a: &ReferenceScore, b: &ReferenceScore) -> Ordering {
     a.effective_commit_depth
         .cmp(&b.effective_commit_depth)
         .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))

@@ -235,6 +235,13 @@ pub enum SubjectOutboundOutcome {
     ReachedNoEndpoint,
 }
 
+pub(crate) fn record_outbound_acknowledgement(
+    resolution: &mut Option<SubjectOutboundOutcome>,
+    outcome: SubjectOutboundOutcome,
+) {
+    *resolution = Some(outcome);
+}
+
 /// One transport-ready artifact emitted by a subject participant.
 ///
 /// `outbound_id` is an adapter-owned opaque acknowledgement handle. The
@@ -1165,7 +1172,7 @@ impl EngineHarnessSubject {
                 && record.pending == Some(pending)
                 && record.resolution.is_none()
             {
-                record.resolution = Some(outcome);
+                record_outbound_acknowledgement(&mut record.resolution, outcome);
             }
         }
     }
@@ -1469,10 +1476,14 @@ impl ConvergenceSubject for EngineHarnessSubject {
                     self.client_mut(client)?
                         .forget_regenerated_queued_intent(&record.artifact.message.id);
                 }
-                self.outbound_records
-                    .get_mut(&outbound_sequence)
-                    .expect("validated outbound record remains present")
-                    .resolution = Some(outcome);
+                record_outbound_acknowledgement(
+                    &mut self
+                        .outbound_records
+                        .get_mut(&outbound_sequence)
+                        .expect("validated outbound record remains present")
+                        .resolution,
+                    outcome,
+                );
             }
             SubjectOutboundOutcome::ReachedNoEndpoint => {
                 if record
@@ -1538,10 +1549,14 @@ impl ConvergenceSubject for EngineHarnessSubject {
                                 ),
                             )
                     })?;
-                    self.outbound_records
-                        .get_mut(&outbound_sequence)
-                        .expect("validated outbound record remains present")
-                        .resolution = Some(outcome);
+                    record_outbound_acknowledgement(
+                        &mut self
+                            .outbound_records
+                            .get_mut(&outbound_sequence)
+                            .expect("validated outbound record remains present")
+                            .resolution,
+                        outcome,
+                    );
                 }
 
                 if let Some((group_id, _)) = &record.queued_intent {

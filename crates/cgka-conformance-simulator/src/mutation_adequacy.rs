@@ -4,15 +4,15 @@
 //! rule over a minimal input, then records whether the adopted behavior differs.
 //! Production code is never compiled with a mutation feature.
 
-use std::cmp::Ordering;
-
 use serde::{Deserialize, Serialize};
 
+use crate::SubjectOutboundOutcome;
 use crate::lifecycle_model::{LifecycleActionKind, LifecycleModel, LifecycleState, PassPhase};
 use crate::reference_convergence::{
-    ReferenceCandidate, ReferencePolicy, ReferencePriority, ReferenceScore, ReferenceWitness,
-    score, select,
+    ReferenceAppMessage, ReferenceCandidate, ReferenceDisposition, ReferenceInput, ReferencePolicy,
+    ReferencePriority, ReferenceWitness, WitnessMode, compare, evaluate, score, select,
 };
+use crate::subject::record_outbound_acknowledgement;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,7 +142,7 @@ fn selector_order_sentinel() -> (String, String) {
             a.tip_epoch
                 .saturating_sub(a.fork_epoch)
                 .cmp(&b.tip_epoch.saturating_sub(b.fork_epoch))
-                .then_with(|| compare_reference_scores(&score(a, &policy), &score(b, &policy)))
+                .then_with(|| compare(&score(a, &policy), &score(b, &policy)))
         })
         .unwrap()
         .id
@@ -215,6 +215,8 @@ fn frozen_persistence_sentinel() -> (String, String) {
     let mut state = LifecycleState {
         history_a: 2,
         history_b: 2,
+        input_open: false,
+        crash_budget: 1,
         ..LifecycleState::default()
     };
     state = model
@@ -231,73 +233,97 @@ fn frozen_persistence_sentinel() -> (String, String) {
     (baseline, mutant)
 }
 
-#[derive(Clone, Copy)]
-struct SchedulerState {
-    input_revision: u8,
-    armed_revision: Option<u8>,
-}
-
 fn scheduler_rearm_sentinel() -> (String, String) {
-    let settled = SchedulerState {
-        input_revision: 1,
-        armed_revision: None,
+    let model = LifecycleModel {
+        fair_after_input_closure: false,
     };
-    let new_input_revision = settled.input_revision + 1;
-    let baseline = SchedulerState {
-        input_revision: new_input_revision,
-        armed_revision: Some(new_input_revision),
+    let settled = LifecycleState {
+        history_a: 2,
+        history_b: 2,
+        input_open: true,
+        phase: PassPhase::Settled,
+        frozen_revision: Some(2),
+        admin_pending: false,
+        admin_applied: true,
+        ..LifecycleState::default()
     };
-    let mutant = SchedulerState {
-        input_revision: new_input_revision,
-        // Mutant: a settled pass suppresses re-arm for genuinely new input.
-        armed_revision: settled.armed_revision,
-    };
+    let baseline = model
+        .next_state(&settled, LifecycleActionKind::SelfUpdate)
+        .expect("new convergence input reopens collection");
+    // Mutant: a settled pass suppresses re-arm for genuinely new input.
+    let mutant = settled;
     (
-        format!("armed:{:?}", baseline.armed_revision),
-        format!("armed:{:?}", mutant.armed_revision),
+        format!(
+            "phase:{:?}:frozen:{:?}",
+            baseline.phase, baseline.frozen_revision
+        ),
+        format!(
+            "phase:{:?}:frozen:{:?}",
+            mutant.phase, mutant.frozen_revision
+        ),
     )
 }
 
 fn output_invalidation_sentinel() -> (String, String) {
-    let projected = vec![("losing", "payload"), ("winner", "payload-2")];
-    let baseline: Vec<_> = projected
-        .iter()
-        .filter(|(branch, _)| *branch == "winner")
-        .copied()
-        .collect();
-    let mutant = projected;
+    let input = ReferenceInput {
+        current_tip_epoch: 3,
+        retained_anchor_epoch: 1,
+        candidates: vec![candidate("winner", 2, 0), candidate("losing", 1, 1)],
+        commits: Vec::new(),
+        proposals: Vec::new(),
+        app_messages: vec![ReferenceAppMessage {
+            message_id: "losing-output".into(),
+            sender: b"alice".to_vec(),
+            epoch: 2,
+            decrypts_on_branches: vec!["losing".into()],
+            authenticated: true,
+            authorized: true,
+        }],
+        policy: ReferencePolicy::default(),
+        witness_mode: WitnessMode::Disabled,
+    };
+    let baseline = evaluate(&input).dispositions["losing-output"];
+    let mutant = ReferenceDisposition::Accepted;
     (format!("{baseline:?}"), format!("{mutant:?}"))
 }
 
 fn publication_ack_sentinel() -> (String, String) {
-    let pending = vec!["outbound-1"];
-    let baseline: Vec<&str> = pending
-        .iter()
-        .copied()
-        .filter(|id| *id != "outbound-1")
-        .collect();
-    let mutant = pending;
-    (format!("{baseline:?}"), format!("{mutant:?}"))
-}
-
-fn expiration_sentinel() -> (String, String) {
-    let reference_tip = 6u64;
-    let message_epoch = 1u64;
-    let limit = 5u64;
-    let baseline_expired = reference_tip.saturating_sub(message_epoch) > limit;
-    let mutant_expired = reference_tip.saturating_sub(message_epoch) >= limit;
+    let mut baseline = None;
+    record_outbound_acknowledgement(&mut baseline, SubjectOutboundOutcome::Accepted);
+    let mutant = None::<SubjectOutboundOutcome>;
     (
-        format!("expired:{baseline_expired}"),
-        format!("expired:{mutant_expired}"),
+        format!("resolution:{baseline:?}"),
+        format!("resolution:{mutant:?}"),
     )
 }
 
-fn compare_reference_scores(a: &ReferenceScore, b: &ReferenceScore) -> Ordering {
-    a.effective_commit_depth
-        .cmp(&b.effective_commit_depth)
-        .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))
-        .then_with(|| a.app_witness_score.cmp(&b.app_witness_score))
-        .then_with(|| b.tip_priority.cmp(&a.tip_priority))
-        .then_with(|| b.tip_committer.cmp(&a.tip_committer))
-        .then_with(|| b.tip_digest.cmp(&a.tip_digest))
+fn expiration_sentinel() -> (String, String) {
+    let input = ReferenceInput {
+        current_tip_epoch: 6,
+        retained_anchor_epoch: 1,
+        candidates: vec![ReferenceCandidate {
+            id: "winner".into(),
+            fork_epoch: 1,
+            tip_epoch: 6,
+            tip_priority: ReferencePriority::Ordinary,
+            tip_committer: b"alice".to_vec(),
+            tip_digest: [0; 32],
+            app_witnesses: Vec::new(),
+        }],
+        commits: Vec::new(),
+        proposals: Vec::new(),
+        app_messages: vec![ReferenceAppMessage {
+            message_id: "boundary-message".into(),
+            sender: b"alice".to_vec(),
+            epoch: 1,
+            decrypts_on_branches: vec!["winner".into()],
+            authenticated: true,
+            authorized: true,
+        }],
+        policy: ReferencePolicy::default(),
+        witness_mode: WitnessMode::Disabled,
+    };
+    let baseline = evaluate(&input).dispositions["boundary-message"];
+    let mutant = ReferenceDisposition::InvalidatedBeyondAppRetention;
+    (format!("{baseline:?}"), format!("{mutant:?}"))
 }

@@ -5,6 +5,7 @@
 //! common group/publication/application lifecycle while declaring exact MLS
 //! projection and adversarial transport capabilities unsupported.
 
+use crate::subject::record_outbound_acknowledgement;
 use crate::{
     ClientEventCounts, ClientObservation, ClientStructuralProgress, ConvergenceSubject,
     EpochChangeObservation, ScenarioAdminPolicyObservation, ScenarioPredicateObservationV2,
@@ -616,10 +617,14 @@ impl ConvergenceSubject for ReferenceModelSubject {
             self.queued
                 .retain(|delivery| delivery.outbound_id != outbound_id);
         }
-        self.outbound
-            .get_mut(&sequence)
-            .expect("validated reference outbound remains present")
-            .resolution = Some(outcome);
+        record_outbound_acknowledgement(
+            &mut self
+                .outbound
+                .get_mut(&sequence)
+                .expect("validated reference outbound remains present")
+                .resolution,
+            outcome,
+        );
         Ok(())
     }
 

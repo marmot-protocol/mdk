@@ -177,12 +177,16 @@ const fn decision(
 
 pub fn future_policy_change_requires_new_required_app_component(changed_ids: &[&str]) -> bool {
     changed_ids.iter().any(|changed| {
-        CONSTANT_DECISIONS.iter().any(|decision| {
-            decision.id == *changed
-                && matches!(
-                    decision.versioning,
-                    VersioningRule::ImplicitV1 | VersioningRule::CoupledToImplicitV1
-                )
-        })
+        match CONSTANT_DECISIONS
+            .iter()
+            .find(|decision| decision.id == *changed)
+        {
+            Some(decision) => matches!(
+                decision.versioning,
+                VersioningRule::ImplicitV1 | VersioningRule::CoupledToImplicitV1
+            ),
+            // Unknown constants have no proof of operational non-interference.
+            None => true,
+        }
     })
 }

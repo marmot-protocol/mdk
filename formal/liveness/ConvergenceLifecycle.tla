@@ -63,7 +63,7 @@ SettlePass ==
     /\ ~crashed /\ resourceAvailable /\ phase = "frozen"
     /\ frozenRevision = historyA /\ historyA = historyB
     /\ phase' = "settled"
-    /\ adminApplied' = adminPending
+    /\ adminApplied' = (adminApplied \/ adminPending)
     /\ adminPending' = FALSE
     /\ joiner' = IF joiner = "pending_losing" THEN "stranded" ELSE joiner
     /\ UNCHANGED <<historyA, historyB, inputOpen, frozenRevision, crashed,

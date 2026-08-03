@@ -52,7 +52,7 @@ impl Default for LifecycleState {
             resource_available: true,
             crash_budget: 1,
             resource_failure_budget: 1,
-            self_updates_remaining: 2,
+            self_updates_remaining: 3,
             admin_pending: true,
             admin_applied: false,
             joiner: JoinerState::None,
@@ -73,7 +73,6 @@ pub enum LifecycleActionKind {
     FailResource,
     RecoverResource,
     InviteOnLosingBranch,
-    MarkJoinerStranded,
     RepairJoinerWithFreshState,
     StopUnfairly,
 }
@@ -106,7 +105,6 @@ impl LifecycleActionKind {
             Self::FailResource => "fail_resource",
             Self::RecoverResource => "recover_resource",
             Self::InviteOnLosingBranch => "invite_on_losing_branch",
-            Self::MarkJoinerStranded => "mark_joiner_stranded",
             Self::RepairJoinerWithFreshState => "repair_joiner_with_fresh_state",
             Self::StopUnfairly => "stop_unfairly",
         }
@@ -143,7 +141,10 @@ impl LifecycleModel {
         if state.history_a != state.history_b {
             actions.push(LifecycleActionKind::DeliverHistory);
         }
-        if state.phase == PassPhase::Collecting && state.history_a == state.history_b {
+        if !state.input_open
+            && state.phase == PassPhase::Collecting
+            && state.history_a == state.history_b
+        {
             actions.push(LifecycleActionKind::FreezePass);
         }
         if state.phase == PassPhase::Frozen {
@@ -156,10 +157,10 @@ impl LifecycleModel {
             actions.push(LifecycleActionKind::FailResource);
         }
         match state.joiner {
-            JoinerState::None => actions.push(LifecycleActionKind::InviteOnLosingBranch),
-            JoinerState::PendingOnLosingBranch => {
-                actions.push(LifecycleActionKind::MarkJoinerStranded)
+            JoinerState::None if state.phase != PassPhase::Settled => {
+                actions.push(LifecycleActionKind::InviteOnLosingBranch)
             }
+            JoinerState::None | JoinerState::PendingOnLosingBranch => {}
             JoinerState::Stranded => actions.push(LifecycleActionKind::RepairJoinerWithFreshState),
             JoinerState::RejoinedFresh => {}
         }
@@ -179,9 +180,6 @@ impl LifecycleModel {
             PassPhase::Settled => {}
         }
         match state.joiner {
-            JoinerState::PendingOnLosingBranch => {
-                vec![LifecycleActionKind::MarkJoinerStranded]
-            }
             JoinerState::Stranded => vec![LifecycleActionKind::RepairJoinerWithFreshState],
             _ => Vec::new(),
         }
@@ -219,7 +217,7 @@ impl LifecycleModel {
                     return None;
                 }
                 next.phase = PassPhase::Settled;
-                next.admin_applied = next.admin_pending;
+                next.admin_applied = next.admin_applied || next.admin_pending;
                 next.admin_pending = false;
                 if next.joiner == JoinerState::PendingOnLosingBranch {
                     next.joiner = JoinerState::Stranded;
@@ -238,7 +236,6 @@ impl LifecycleModel {
             LifecycleActionKind::InviteOnLosingBranch => {
                 next.joiner = JoinerState::PendingOnLosingBranch
             }
-            LifecycleActionKind::MarkJoinerStranded => next.joiner = JoinerState::Stranded,
             LifecycleActionKind::RepairJoinerWithFreshState => {
                 next.joiner = JoinerState::RejoinedFresh
             }
