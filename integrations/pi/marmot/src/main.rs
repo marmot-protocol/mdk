@@ -1,11 +1,10 @@
 mod config;
-mod error;
 mod pi;
 
 use std::process::ExitCode;
 
 use clap::Parser;
-use error::Result;
+use marmot_terminal_harness::Result;
 use tracing::error;
 
 #[derive(Debug, Parser)]
@@ -37,7 +36,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let (config, backend) = config::Config::from_env()?.into_harness();
+    let (config, backend) = config::Config::from_env()?.into_harness()?;
     marmot_terminal_harness::run(config, backend).await
 }
 

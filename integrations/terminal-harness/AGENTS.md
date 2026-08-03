@@ -7,7 +7,8 @@ before changing this crate.
 
 - Own the `wn-agent` control client, inbound reconnect/resync loop, account and
   allowlist selection, per-group queues, deduplication, workdir picker, private
-  session mapping, durable reply chunking, and backend lifecycle boundary.
+  session mapping, durable reply chunking, shared env configuration, process
+  lifecycle plumbing, connector e2e support, and backend lifecycle boundary.
 - Keep backend command construction and event parsing in each harness crate.
 - Preserve privacy-safe diagnostics and never log identifiers, paths, prompts,
   model output, or transport data.

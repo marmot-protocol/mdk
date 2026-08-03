@@ -24,6 +24,7 @@ const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const SEND_RETRY_ATTEMPTS: usize = 3;
 
+/// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
     info!(
         target: TRACE_TARGET,
@@ -34,15 +35,22 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         "terminal harness starting"
     );
 
+    let home = dirs_home()?;
     let client = ControlClient::new(
         config.socket.clone(),
         config.auth_token.clone(),
         config.request_timeout,
+        config.reply_prefix,
     );
-    let account_ref = resolve_account(&client, config.account_id_hex.as_deref()).await?;
+    let account_ref = resolve_account(
+        &client,
+        config.account_id_hex.as_deref(),
+        config.account_env_name,
+    )
+    .await?;
     install_allowlist(&client, &account_ref, &config.allowed_senders).await?;
 
-    let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &dirs_home())?);
+    let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &home)?);
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
     let ctx = Arc::new(BridgeContext {
         cfg: Arc::new(config),
@@ -52,6 +60,7 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         queues,
         dedupe: Arc::new(InboundDedupe::new(DEDUPE_LIMIT)),
         backend: Arc::new(backend),
+        home,
     });
 
     subscribe_loop(ctx).await
@@ -65,6 +74,7 @@ struct BridgeContext {
     queues: Arc<GroupQueues>,
     dedupe: Arc<InboundDedupe>,
     backend: Arc<dyn Backend>,
+    home: PathBuf,
 }
 
 async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
@@ -621,12 +631,12 @@ async fn resolve_cwd_and_prompt(
     known_session: Option<&SessionRecord>,
 ) -> Result<Option<(PathBuf, String)>> {
     if let Some(record) = known_session {
-        let cwd = validate_session_cwd(&record.cwd, &dirs_home()).await?;
+        let cwd = validate_session_cwd(&record.cwd, &ctx.home).await?;
         return Ok(Some((cwd, inbound.text.clone())));
     }
 
     let (name, rest) = match parse_repo_picker(&inbound.text) {
-        RepoPicker::Absent => return Ok(Some((dirs_home(), inbound.text.clone()))),
+        RepoPicker::Absent => return Ok(Some((ctx.home.clone(), inbound.text.clone()))),
         RepoPicker::Invalid => {
             send_reply(
                 ctx,
@@ -641,7 +651,7 @@ async fn resolve_cwd_and_prompt(
         }
         RepoPicker::Valid { path, prompt } => (path, prompt),
     };
-    let cwd = match resolve_repo(&name, &dirs_home()).await {
+    let cwd = match resolve_repo(&name, &ctx.home).await {
         Ok(cwd) => cwd,
         Err(err) => {
             let text = err.to_string();
@@ -684,7 +694,11 @@ async fn resolve_cwd_and_prompt(
     Ok(Some((cwd, rest)))
 }
 
-async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Result<String> {
+async fn resolve_account(
+    client: &ControlClient,
+    preferred: Option<&str>,
+    account_env_name: &'static str,
+) -> Result<String> {
     let accounts = client.account_list().await?;
     if let Some(preferred) = preferred {
         if let Some(account_ref) = find_account_ref(&accounts, preferred) {
@@ -700,9 +714,9 @@ async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Res
         ));
     }
     if accounts.len() > 1 {
-        return Err(HarnessError::Config(
-            "multiple local accounts are present; set WN_OPENCODE_ACCOUNT_ID_HEX".to_owned(),
-        ));
+        return Err(HarnessError::Config(format!(
+            "multiple local accounts are present; set {account_env_name}"
+        )));
     }
     Ok(accounts[0].account_id_hex.clone())
 }
@@ -874,6 +888,7 @@ mod tests {
             display_name: "opencode",
             reply_prefix: "wn-opencode",
             bin_env_name: "WN_OPENCODE_BIN",
+            account_env_name: "WN_OPENCODE_ACCOUNT_ID_HEX",
         }
     }
 

@@ -14,6 +14,7 @@ on:
       - scripts/install-opencode-marmot.sh
       - integrations/opencode/marmot/**
       - scripts/install-pi-marmot.sh
+      - scripts/install-terminal-harness-marmot.sh
       - integrations/pi/marmot/**
       - integrations/terminal-harness/**
       - Cargo.toml
@@ -570,16 +571,16 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
-          sed \
-            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-          scripts/install-opencode-marmot.sh > dist/install/install-opencode-marmot.sh
-          chmod 0755 dist/install/install-opencode-marmot.sh
-          sed \
-            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-            scripts/install-pi-marmot.sh > dist/install/install-pi-marmot.sh
-          chmod 0755 dist/install/install-pi-marmot.sh
+          for harness in opencode pi; do
+            awk -v harness="$harness" \
+              'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
+              scripts/install-terminal-harness-marmot.sh | \
+              sed \
+                -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+                -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+                > "dist/install/install-$harness-marmot.sh"
+            chmod 0755 "dist/install/install-$harness-marmot.sh"
+          done
 
       - name: Create or update wn-agent release
         shell: bash

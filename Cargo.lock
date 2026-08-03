@@ -7128,15 +7128,12 @@ dependencies = [
 name = "wn-opencode"
 version = "0.9.10"
 dependencies = [
- "agent-control",
  "async-trait",
  "clap",
- "fs-private",
  "marmot-terminal-harness",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7146,7 +7143,6 @@ dependencies = [
 name = "wn-pi"
 version = "0.9.10"
 dependencies = [
- "agent-control",
  "async-trait",
  "clap",
  "fs-private",

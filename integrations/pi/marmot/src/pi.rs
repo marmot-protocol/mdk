@@ -4,22 +4,27 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    Backend, HarnessError, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET,
+    Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
+    process::{capture_stderr, cleanup_failed_run, next_stdout_line, strip_ansi, write_stdin},
 };
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::timeout_at;
 use tracing::debug;
-
-const STDERR_CAPTURE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PiBackend {
     pub(crate) bin: String,
     pub(crate) session_dir: std::path::PathBuf,
+}
+
+impl PiBackend {
+    pub(crate) fn new(bin: String, session_dir: std::path::PathBuf) -> Result<Self> {
+        fs_private::create_dir_all_private(&session_dir)?;
+        Ok(Self { bin, session_dir })
+    }
 }
 
 #[async_trait]
@@ -39,10 +44,6 @@ async fn run_with_bin(
     invocation: Invocation,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
-    fs_private::create_dir_all_private(session_dir).map_err(|error| RunFailure {
-        error: error.into(),
-        observed_session: None,
-    })?;
     let mut command = Command::new(bin);
     command
         .args(build_run_args(
@@ -60,7 +61,7 @@ async fn run_with_bin(
         observed_session: None,
     })?;
     let total_deadline = tokio::time::Instant::now() + invocation.timeout;
-    let mut stdin = child.stdin.take().ok_or(RunFailure {
+    let stdin = child.stdin.take().ok_or(RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
     })?;
@@ -73,22 +74,13 @@ async fn run_with_bin(
         observed_session: None,
     })?;
     let mut stderr_task = tokio::spawn(capture_stderr(stderr));
+    let mut writer_task = write_stdin(stdin, invocation.prompt);
     let start = Instant::now();
     let mut observed_session = None;
     let mut error_summary = None;
     let mut idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
 
     let lifecycle_result = timeout_at(total_deadline, async {
-        stdin
-            .write_all(invocation.prompt.as_bytes())
-            .await
-            .map_err(|_| HarnessError::BackendStream)?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|_| HarnessError::BackendStream)?;
-        drop(stdin);
-
         let mut lines = BufReader::new(stdout).lines();
         loop {
             let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
@@ -127,6 +119,11 @@ async fn run_with_bin(
             idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
         }
 
+        match timeout_at(idle_deadline, &mut writer_task).await {
+            Err(_) => return Err(HarnessError::BackendIdle),
+            Ok(result) => result.map_err(HarnessError::from)??,
+        }
+
         let (status, stderr) = match timeout_at(idle_deadline, async {
             let status = child.wait().await.map_err(HarnessError::from)?;
             let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
@@ -150,14 +147,14 @@ async fn run_with_bin(
     match lifecycle_result {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
             Err(RunFailure {
                 error,
                 observed_session,
             })
         }
         Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, Some(&mut writer_task)).await;
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
@@ -174,7 +171,7 @@ fn build_run_args(session_dir: &Path, session_id: Option<&str>) -> Vec<String> {
         session_dir.to_string_lossy().into_owned(),
     ];
     if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
-        args.push("--session".to_owned());
+        args.push("--session-id".to_owned());
         args.push(session_id.to_owned());
     }
     args
@@ -237,72 +234,6 @@ fn assistant_text(content: Option<&Value>) -> String {
     }
 }
 
-async fn next_stdout_line(
-    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
-    idle_deadline: tokio::time::Instant,
-) -> std::result::Result<Option<String>, HarnessError> {
-    match timeout_at(idle_deadline, lines.next_line()).await {
-        Err(_) => Err(HarnessError::BackendIdle),
-        Ok(Err(_)) => Err(HarnessError::BackendStream),
-        Ok(Ok(line)) => Ok(line),
-    }
-}
-
-async fn cleanup_failed_run(child: &mut Child, stderr_task: &mut JoinHandle<String>) {
-    stderr_task.abort();
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-    if !stderr_task.is_finished() {
-        let _ = stderr_task.await;
-    }
-}
-
-async fn capture_stderr(stderr: tokio::process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
-    let mut captured = String::new();
-    while let Ok(read) = reader.read_until(b'\n', &mut buf).await {
-        if read == 0 {
-            break;
-        }
-        if captured.len() < STDERR_CAPTURE_BYTES {
-            captured.push_str(&String::from_utf8_lossy(&buf));
-            truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
-        }
-        buf.clear();
-    }
-    captured
-}
-
-fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-}
-
-fn strip_ansi(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -321,7 +252,7 @@ mod tests {
                 "json",
                 "--session-dir",
                 "/private/sessions",
-                "--session",
+                "--session-id",
                 "abc-123"
             ]
         );
@@ -358,6 +289,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn backend_constructor_creates_private_session_dir_once() {
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = root.path().join("sessions");
+        let backend = PiBackend::new("pi".to_owned(), session_dir.clone()).unwrap();
+        assert_eq!(backend.session_dir, session_dir);
+        assert_eq!(
+            fs::metadata(&backend.session_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            fs_private::PRIVATE_DIR_MODE
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn runner_pipes_prompt_and_streams_completed_text() {
         let root = tempfile::tempdir().unwrap();
@@ -380,6 +328,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).unwrap();
         let session_dir = root.path().join("private-sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = run_with_bin(
             script.to_str().unwrap(),
@@ -407,5 +356,90 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
             fs::metadata(session_dir).unwrap().permissions().mode() & 0o777,
             fs_private::PRIVATE_DIR_MODE
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_reads_stdout_while_writing_a_large_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("chatty-pi");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+for _ in $(seq 1 5000); do
+  printf '%s\n' '{"type":"progress"}'
+done
+prompt="$(cat)"
+printf '%s\n' '{"type":"session","version":3,"id":"pi-chatty"}'
+printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"received:%s"}],"stopReason":"stop"}}\n' "${#prompt}"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let session_dir = root.path().join("sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            &session_dir,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: Some("missing-session".to_owned()),
+                prompt: "p".repeat(60_000),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.observed_session.as_deref(), Some("pi-chatty"));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("received:60000".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authenticated Pi 0.79.6 and makes a real model request"]
+    async fn real_pi_0_79_6_contract() {
+        let version = std::process::Command::new("pi")
+            .arg("--version")
+            .output()
+            .expect("run pi --version");
+        assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "0.79.6");
+
+        let root = tempfile::tempdir().unwrap();
+        let session_dir = root.path().join("sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let outcome = run_with_bin(
+            "pi",
+            &session_dir,
+            Invocation {
+                timeout: Duration::from_secs(120),
+                idle_timeout: Duration::from_secs(30),
+                cwd: root.path().to_path_buf(),
+                session_id: Some("wn-pi-real-contract".to_owned()),
+                prompt: "Reply with exactly PI_CONNECTOR_OK and nothing else.".to_owned(),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.observed_session.as_deref(),
+            Some("wn-pi-real-contract")
+        );
+        let mut reply = String::new();
+        while let Some(RunnerEvent::Text(text)) = rx.recv().await {
+            reply.push_str(&text);
+        }
+        assert_eq!(reply.trim(), "PI_CONNECTOR_OK");
     }
 }

@@ -140,10 +140,12 @@ just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
 
 cargo test -p wn-opencode
+cargo test -p marmot-terminal-harness
 just opencode-dev-e2e-connector
 just opencode-installer-test
 
 cargo test -p wn-pi
+cargo test -p marmot-terminal-harness
 just pi-dev-e2e-connector
 just pi-installer-test
 ```

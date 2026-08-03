@@ -22,6 +22,7 @@ pub(crate) struct ControlClient {
     socket: PathBuf,
     auth_token: Option<String>,
     request_timeout: Duration,
+    request_prefix: &'static str,
     request_seq: Arc<AtomicU64>,
 }
 
@@ -30,11 +31,13 @@ impl ControlClient {
         socket: PathBuf,
         auth_token: Option<String>,
         request_timeout: Duration,
+        request_prefix: &'static str,
     ) -> Self {
         Self {
             socket,
             auth_token,
             request_timeout,
+            request_prefix,
             request_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -260,7 +263,7 @@ impl ControlClient {
 
     fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("terminal-harness-{}-{seq}", std::process::id())
+        format!("{}-{}-{seq}", self.request_prefix, std::process::id())
     }
 }
 
@@ -348,6 +351,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_ids_keep_harness_identity() {
+        let client = ControlClient::new(
+            PathBuf::from("/unused"),
+            None,
+            Duration::from_secs(1),
+            "wn-pi",
+        );
+        assert!(client.next_request_id().starts_with("wn-pi-"));
+    }
+
     #[tokio::test]
     async fn call_rejects_mismatched_response_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -369,7 +383,7 @@ mod tests {
             write_frame(&mut write_half, &response).await.unwrap();
         });
 
-        let client = ControlClient::new(socket, None, Duration::from_secs(5));
+        let client = ControlClient::new(socket, None, Duration::from_secs(5), "wn-test");
         let err = client
             .call("account_list", AgentControlRequest::AccountList)
             .await

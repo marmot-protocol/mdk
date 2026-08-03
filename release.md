@@ -195,6 +195,7 @@ Before a WN Agent release, run the normal preflight plus:
 
 ```sh
 cargo test -p agent-connector
+cargo test -p marmot-terminal-harness
 cargo test -p wn-opencode
 cargo test -p wn-pi
 bash scripts/install-hermes-marmot.sh --dry-run --yes
@@ -202,6 +203,11 @@ bash scripts/install-openclaw-marmot.sh --dry-run --yes
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
 ```
+
+Bridge and control logs for both terminal harnesses now use the
+`marmot_terminal_harness` tracing target. Include
+`marmot_terminal_harness=debug` in `RUST_LOG`; the former `wn_opencode` target
+continues to cover only OpenCode-specific command and event parsing.
 
 Cut the release tag from the current `origin/master` commit:
 

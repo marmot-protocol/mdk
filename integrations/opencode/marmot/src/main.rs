@@ -1,11 +1,10 @@
 mod config;
-mod error;
 mod opencode;
 
 use std::process::ExitCode;
 
 use clap::Parser;
-use error::Result;
+use marmot_terminal_harness::Result;
 use tracing::error;
 
 #[derive(Debug, Parser)]

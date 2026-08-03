@@ -10,18 +10,16 @@ name = "wn-opencode"
 path = "src/main.rs"
 
 [dependencies]
-agent-control.workspace = true
 clap.workspace = true
-fs-private.workspace = true
 marmot-terminal-harness.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+marmot-terminal-harness = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

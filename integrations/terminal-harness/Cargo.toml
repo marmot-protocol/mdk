@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+test-support = ["dep:tempfile"]
+
 [dependencies]
 agent-control.workspace = true
 async-trait.workspace = true
@@ -14,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

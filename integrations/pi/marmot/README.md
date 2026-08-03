@@ -34,10 +34,12 @@ export MARMOT_HOME="$HOME/.marmot-agents/pi"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
 export WN_PI_ALLOWED_SENDERS_HEX="..."
 
+# Shell 1: wn-agent runs in the foreground.
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
+# Shell 2: bootstrap the identity, then start the harness.
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --label pi-harness-agent --allow-welcomer "$WN_PI_ALLOWED_SENDERS_HEX" --qr
 

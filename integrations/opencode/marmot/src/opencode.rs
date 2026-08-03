@@ -4,16 +4,14 @@ use std::time::Instant;
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     Backend, HarnessError, Invocation, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET,
+    process::{capture_stderr, cleanup_failed_run, kill_and_reap, next_stdout_line, strip_ansi},
 };
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::timeout_at;
 use tracing::debug;
-
-const STDERR_CAPTURE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct OpencodeBackend {
@@ -192,44 +190,20 @@ async fn run_with_bin(
     match lifecycle_result {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, None).await;
             Err(RunFailure {
                 error,
                 observed_session,
             })
         }
         Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            cleanup_failed_run(&mut child, &mut stderr_task, None).await;
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
             })
         }
     }
-}
-
-async fn next_stdout_line(
-    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
-    idle_deadline: tokio::time::Instant,
-) -> std::result::Result<Option<String>, HarnessError> {
-    match timeout_at(idle_deadline, lines.next_line()).await {
-        Err(_) => Err(HarnessError::BackendIdle),
-        Ok(Err(_)) => Err(HarnessError::BackendStream),
-        Ok(Ok(line)) => Ok(line),
-    }
-}
-
-async fn cleanup_failed_run(child: &mut Child, stderr_task: &mut JoinHandle<String>) {
-    stderr_task.abort();
-    kill_and_reap(child).await;
-    if !stderr_task.is_finished() {
-        let _ = stderr_task.await;
-    }
-}
-
-async fn kill_and_reap(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 pub(crate) fn build_run_args(session_id: Option<&str>, prompt: &str) -> Vec<String> {
@@ -280,55 +254,6 @@ impl OpencodeError {
         }
         summary
     }
-}
-
-async fn capture_stderr(stderr: tokio::process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
-    let mut captured = String::new();
-    while let Ok(read) = reader.read_until(b'\n', &mut buf).await {
-        if read == 0 {
-            break;
-        }
-        if captured.len() < STDERR_CAPTURE_BYTES {
-            captured.push_str(&String::from_utf8_lossy(&buf));
-            if captured.len() > STDERR_CAPTURE_BYTES {
-                truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
-            }
-        }
-        buf.clear();
-    }
-    captured
-}
-
-fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
-}
-
-pub(crate) fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            while let Some(&next) = chars.peek() {
-                chars.next();
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -403,27 +328,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_ansi_removes_csi_sequences() {
-        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
-    }
-
-    #[test]
-    fn truncate_to_char_boundary_keeps_valid_utf8() {
-        let mut value = "a".repeat(STDERR_CAPTURE_BYTES - 1);
-        value.push('é');
-        value.push_str("tail");
-        truncate_to_char_boundary(&mut value, STDERR_CAPTURE_BYTES);
-        assert!(value.is_char_boundary(value.len()));
-        assert_eq!(value.len(), STDERR_CAPTURE_BYTES - 1);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn run_streams_text_from_mock_binary() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        let outcome = run(mock_invocation(&dir, "stream-text"), tx).await.unwrap();
+        let mut invocation = mock_invocation(&dir, "stream-text");
+        invocation.idle_timeout = Duration::from_secs(2);
+        let outcome = run(invocation, tx).await.unwrap();
         assert_eq!(outcome.observed_session, Some("ses_mock".to_owned()));
         assert_eq!(outcome.exit_code, Some(0));
         assert_eq!(outcome.error_summary, None);
