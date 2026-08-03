@@ -757,12 +757,25 @@ The witness-free variant is an explicit model dimension, not a locally modified 
 
 ### 4.2 Liveness and lifecycle model
 
-- [ ] Prototype the self-update/admin-progress case in TLA+/TLC and Stateright, then record the tool decision.
-- [ ] Model unequal histories, eventual input closure, pass freeze/settle, crash/restart, fairness, and resource failure.
-- [ ] Model joiner/invite/device-add state that becomes stranded on a losing branch and its permitted repair transitions.
-- [ ] Emit model traces that preserve enough action identity to compile into Scenario IR regression cases.
-- [ ] Produce minimal counterexample traces consumable by Scenario IR where practical.
-- [ ] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
+- [x] Prototype the self-update/admin-progress case in TLA+/TLC and Stateright, then record the tool decision.
+- [x] Model unequal histories, eventual input closure, pass freeze/settle, crash/restart, fairness, and resource failure.
+- [x] Model joiner/invite/device-add state that becomes stranded on a losing branch and its permitted repair transitions.
+- [x] Emit model traces that preserve enough action identity to compile into Scenario IR regression cases.
+- [x] Produce minimal counterexample traces consumable by Scenario IR where practical.
+- [x] Keep Tamarin focused on symbolic safety/security and executable bounded policy cases.
+
+TLA+/TLC is the temporal-liveness authority; Stateright is retained as the executable Rust trace bridge. The fair TLC
+model exhausts 684 distinct states (1,785 generated) and checks settlement after closure, administrative progress,
+stranded-joiner repair, frozen-revision durability, and settled-history equality. Its assumptions are explicit:
+input closure plus strong fairness for delivery, restart, resource recovery, freeze, settle, and permitted repair.
+Crash and resource failure are temporary bounded events in the finite model. The unfair configuration is an
+expected-failure gate and produces a temporal counterexample when those scheduling assumptions are absent.
+
+The Stateright mirror checks the same bounded lifecycle while carrying stable identities such as
+`model-step-0:self_update`. Its minimized two-action starvation witness names
+`eventual_input_closure_or_fair_admin_scheduling` as the violated assumption. The committed canonical Scenario IR
+counterexample compiles to stable action ids and preserves the self-update/admin-change prefix. Losing-branch joiners
+may become stranded; their only modeled repair is reset/rejoin with fresh state. Tamarin's scope is unchanged.
 
 ### 4.3 Mutation adequacy
 

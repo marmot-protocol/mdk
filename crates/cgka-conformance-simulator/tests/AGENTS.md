@@ -25,6 +25,10 @@ Map for simulator tests.
   - **Owns:** Production-independent symbolic selector/canonicalizer differential tests, including small shrinkable
     selector inputs, authentication/authorization, dependency closure, proposal expiry, and witness-free comparison.
 
+- **File:** `lifecycle_model.rs`
+  - **Owns:** Stateright lifecycle mirror, fair bounded progress, crash/resource recovery, stranded-joiner repair, and
+    stable-action-id counterexample-to-Scenario-IR validation.
+
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 

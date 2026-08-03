@@ -63,6 +63,10 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   adapters compare it to the production selector/canonicalizer, while the common Scenario IR lifecycle comparison
   reaches the full OpenMLS engine subject. `WitnessMode::Disabled` measures the app-witness rule's marginal effect
   without rewriting policy constants.
+- `lifecycle_model` — the bounded Rust/Stateright mirror of the authoritative TLA+ lifecycle specification. It
+  preserves model action identities, exercises unequal histories, freeze/settle, crash/restart, temporary resource
+  failure, administrative progress, and losing-branch joiner repair, and emits a minimal assumption-labeled
+  starvation trace that compiles into Scenario IR.
 
 ## Testing layers
 
@@ -99,6 +103,12 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
     [`tests/independent_reference_model.rs`](tests/independent_reference_model.rs)
   - **What it catches:** Semantic drift in authentication/authorization filtering, candidate dependency closure,
     branch scoring, proposal/app/commit dispositions, and the production selector's comparison order.
+
+- **Layer:** Lifecycle model checking
+  - **Files:** [`../../formal/liveness/`](../../formal/liveness/),
+    [`src/lifecycle_model.rs`](src/lifecycle_model.rs), [`tests/lifecycle_model.rs`](tests/lifecycle_model.rs)
+  - **What it catches:** Missing input-closure/fairness assumptions, frozen-pass loss across restart, settlement over
+    unequal histories, temporary resource failure without repair, and unsupported losing-branch joiner recovery.
 
 ## Run the tests
 

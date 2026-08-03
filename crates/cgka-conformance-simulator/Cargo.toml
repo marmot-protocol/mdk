@@ -46,3 +46,4 @@ libc.workspace = true
 transport-quic-stream.workspace = true
 transport-quic-broker.workspace = true
 rusqlite.workspace = true
+stateright = "0.31.0"

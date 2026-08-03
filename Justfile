@@ -269,6 +269,48 @@ tamarin-interactive:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
     @make -C formal/tamarin interactive
 
+# TLC v1.7.4 is pinned for reproducible lifecycle-model output. Override the
+# downloaded jar with TLA2TOOLS_JAR=/path/to/tla2tools.jar when working offline.
+tla-liveness:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
+    if [[ ! -f "$jar" ]]; then
+        mkdir -p "$(dirname "$jar")"
+        curl --fail --location --silent --show-error \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+            --output "$jar"
+    fi
+    mkdir -p target/tla/states
+    java -XX:+UseParallelGC -jar "$jar" -workers 1 -deadlock \
+        -metadir target/tla/states \
+        -config ConvergenceLifecycle.fair.cfg \
+        formal/liveness/ConvergenceLifecycle.tla
+
+tla-liveness-counterexample:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jar="${TLA2TOOLS_JAR:-target/tla/tla2tools-v1.7.4.jar}"
+    if [[ ! -f "$jar" ]]; then
+        mkdir -p "$(dirname "$jar")"
+        curl --fail --location --silent --show-error \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+            --output "$jar"
+    fi
+    output="$(mktemp)"
+    trap 'rm -f "$output"' EXIT
+    mkdir -p target/tla/states
+    if java -XX:+UseParallelGC -jar "$jar" -workers 1 -deadlock \
+        -metadir target/tla/states \
+        -config ConvergenceLifecycle.unfair.cfg \
+        formal/liveness/ConvergenceLifecycle.tla >"$output" 2>&1; then
+        cat "$output"
+        echo "error: unfair lifecycle model unexpectedly satisfied admin progress" >&2
+        exit 1
+    fi
+    cat "$output"
+    rg -q 'Temporal properties were violated|Error: The behavior up to this point is' "$output"
+
 policy-casegen:
     @cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
 

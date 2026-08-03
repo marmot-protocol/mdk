@@ -27,6 +27,7 @@ pub mod client;
 mod decryptability;
 mod failure_capsule;
 pub mod family;
+pub mod lifecycle_model;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
