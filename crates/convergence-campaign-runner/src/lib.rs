@@ -68,7 +68,7 @@ pub fn verify_manifest_inputs(
     let scenario = std::fs::read(&manifest.scenario.path)
         .map_err(|error| RunnerError::environment("scenario_read", error))?;
     let actual = hex::encode(sha2::Sha256::digest(&scenario));
-    if actual != manifest.scenario.sha256 {
+    if !actual.eq_ignore_ascii_case(&manifest.scenario.sha256) {
         return Err(RunnerError::validation(
             "scenario_digest_mismatch",
             "scenario bytes do not match the manifest digest",

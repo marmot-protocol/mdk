@@ -113,7 +113,65 @@ fn validate_scenario_binding(
             ));
         }
     }
+    if matches!(manifest.backend, DistributedBackendV1::Container(_))
+        && compiled.topology.relays.len() > 1
+    {
+        return Err(RunnerError::validation(
+            "multiple_container_relays_unsupported",
+            "container campaigns currently require zero or one declared relay",
+        ));
+    }
+    validate_partition_restart_order(manifest, &compiled)?;
     Ok(())
+}
+
+fn validate_partition_restart_order(
+    manifest: &DistributedCampaignManifestV1,
+    compiled: &cgka_conformance_simulator::CompiledScenarioV2,
+) -> Result<(), RunnerError> {
+    let barrier_order = compiled
+        .actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| match &action.step {
+            cgka_conformance_simulator::ScenarioStep::Barrier { name } => {
+                Some((name.as_str(), index))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut faults = manifest.faults.iter().collect::<Vec<_>>();
+    faults.sort_by_key(|fault| barrier_order.get(fault.at_barrier.as_str()).copied());
+    let mut active = std::collections::BTreeSet::<(String, String)>::new();
+    for fault in faults {
+        match &fault.action {
+            crate::DistributedFaultV1::NetworkPartition { participant, peer } => {
+                active.insert((participant.clone(), fault_peer_key(peer)));
+            }
+            crate::DistributedFaultV1::NetworkHeal { participant, peer } => {
+                active.remove(&(participant.clone(), fault_peer_key(peer)));
+            }
+            crate::DistributedFaultV1::CrashParticipantHost { participant }
+                if active.iter().any(|(subject, peer)| {
+                    subject == participant || peer == &format!("participant:{participant}")
+                }) =>
+            {
+                return Err(RunnerError::validation(
+                    "partition_peer_restart_unsupported",
+                    "heal participant partitions before recreating either endpoint",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn fault_peer_key(peer: &crate::FaultPeerV1) -> String {
+    match peer {
+        crate::FaultPeerV1::Relay => "relay".into(),
+        crate::FaultPeerV1::Participant(participant) => format!("participant:{participant}"),
+    }
 }
 
 async fn run_container(
@@ -124,11 +182,24 @@ async fn run_container(
     let mut receipts = Vec::new();
     let mut cleanup_failures = Vec::new();
     for command in &plan.setup {
-        match execute(command, None).await {
+        match execute(command, CommandContext::default()).await {
             Ok(receipt) => receipts.push(receipt),
-            Err(error) => {
+            Err(failure) => {
+                if let Some(receipt) = failure.receipt {
+                    receipts.push(receipt);
+                }
                 cleanup(plan, None, &mut receipts, &mut cleanup_failures).await;
-                return Err(error);
+                let receipt = DistributedRunReceiptV1 {
+                    schema_version: DISTRIBUTED_RUN_RECEIPT_VERSION.into(),
+                    campaign_id: manifest.campaign_id.clone(),
+                    backend: "container".into(),
+                    command_receipts: receipts,
+                    process_report: None,
+                    cleanup_failures,
+                    completed: false,
+                };
+                write_receipt(manifest, &receipt)?;
+                return Err(failure.error);
             }
         }
     }
@@ -143,23 +214,29 @@ async fn run_container(
     }
     cleanup(plan, run_token, &mut receipts, &mut cleanup_failures).await;
 
+    let process_report = if let Ok(result) = &result {
+        let path = manifest.output_dir.join("process-report.json");
+        match serde_json::to_vec_pretty(&result.report) {
+            Ok(bytes) => match fs_private::write_private(&path, &bytes) {
+                Ok(()) => Some(path),
+                Err(_) => {
+                    cleanup_failures.push("report_write".into());
+                    None
+                }
+            },
+            Err(_) => {
+                cleanup_failures.push("report_serialize".into());
+                None
+            }
+        }
+    } else {
+        None
+    };
     let completed = result
         .as_ref()
         .map(|result| result.report.completed)
         .unwrap_or(false)
         && cleanup_failures.is_empty();
-    let process_report = if let Ok(result) = &result {
-        let path = manifest.output_dir.join("process-report.json");
-        fs_private::write_private(
-            &path,
-            &serde_json::to_vec_pretty(&result.report)
-                .map_err(|error| RunnerError::environment("report_serialize", error))?,
-        )
-        .map_err(|error| RunnerError::environment("report_write", error))?;
-        Some(path)
-    } else {
-        None
-    };
     let receipt = DistributedRunReceiptV1 {
         schema_version: DISTRIBUTED_RUN_RECEIPT_VERSION.into(),
         campaign_id: manifest.campaign_id.clone(),
@@ -195,7 +272,13 @@ async fn run_container_scenario(
             error,
             run_token: None,
         })?;
-    let compiled = compile_scenario(scenario).map_err(|error| ContainerScenarioFailure {
+    let scenario = lower_container_host_faults(manifest, scenario).map_err(|error| {
+        ContainerScenarioFailure {
+            error,
+            run_token: None,
+        }
+    })?;
+    let compiled = compile_scenario(&scenario).map_err(|error| ContainerScenarioFailure {
         error: RunnerError::environment("scenario_compile", error),
         run_token: None,
     })?;
@@ -216,7 +299,7 @@ async fn run_container_scenario(
     let mut orchestrator = ProcessOrchestrator::launch_with(
         node_launch,
         Some(relay_urls),
-        scenario,
+        &scenario,
         &manifest.output_dir,
     )
     .await
@@ -225,9 +308,11 @@ async fn run_container_scenario(
         run_token: None,
     })?;
     let run_token = orchestrator.run_token().to_owned();
+    let host_run_root = orchestrator.run_root().to_path_buf();
     let mut hook = ContainerFaultHook {
         commands: plan.fault_commands.clone(),
         run_token: run_token.clone(),
+        host_run_root,
         receipts,
     };
     let report = orchestrator
@@ -241,9 +326,62 @@ async fn run_container_scenario(
     report.map(|report| ContainerScenarioResult { report, run_token })
 }
 
+fn lower_container_host_faults(
+    manifest: &DistributedCampaignManifestV1,
+    scenario: &ScenarioSpec,
+) -> Result<ScenarioSpec, RunnerError> {
+    let process_by_participant = scenario
+        .topology
+        .devices
+        .iter()
+        .map(|device| (device.client.as_str(), device.process.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut crashes = BTreeMap::<&str, Vec<&str>>::new();
+    for fault in &manifest.faults {
+        if let crate::DistributedFaultV1::CrashParticipantHost { participant } = &fault.action {
+            let process = process_by_participant
+                .get(participant.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    RunnerError::validation(
+                        "crash_process_mapping",
+                        "crashed participant has no topology process",
+                    )
+                })?;
+            crashes
+                .entry(fault.at_barrier.as_str())
+                .or_default()
+                .push(process);
+        }
+    }
+    let mut lowered = scenario.clone();
+    lowered.steps = Vec::with_capacity(scenario.steps.len() + crashes.len() * 2);
+    for step in &scenario.steps {
+        lowered.steps.push(step.clone());
+        if let cgka_conformance_simulator::ScenarioStep::Barrier { name } = step
+            && let Some(processes) = crashes.get(name.as_str())
+        {
+            for process in processes {
+                lowered
+                    .steps
+                    .push(cgka_conformance_simulator::ScenarioStep::CrashProcess {
+                        process: (*process).into(),
+                    });
+                lowered
+                    .steps
+                    .push(cgka_conformance_simulator::ScenarioStep::RestartProcess {
+                        process: (*process).into(),
+                    });
+            }
+        }
+    }
+    Ok(lowered)
+}
+
 struct ContainerFaultHook<'a> {
     commands: BTreeMap<String, Vec<PlannedCommandV1>>,
     run_token: String,
+    host_run_root: PathBuf,
     receipts: &'a mut Vec<CommandReceiptV1>,
 }
 
@@ -252,12 +390,26 @@ impl ProcessBarrierHook for ContainerFaultHook<'_> {
     async fn before_barrier(&mut self, name: &str) -> Result<(), ProcessOrchestratorError> {
         let commands = self.commands.remove(name).unwrap_or_default();
         for command in commands {
-            let receipt = execute(&command, Some(&self.run_token))
-                .await
-                .map_err(|error| {
-                    ProcessOrchestratorError::new("distributed_fault", error.to_string())
-                })?;
-            self.receipts.push(receipt);
+            match execute(
+                &command,
+                CommandContext {
+                    run_token: Some(&self.run_token),
+                    host_run_root: Some(&self.host_run_root),
+                },
+            )
+            .await
+            {
+                Ok(receipt) => self.receipts.push(receipt),
+                Err(failure) => {
+                    if let Some(receipt) = failure.receipt {
+                        self.receipts.push(receipt);
+                    }
+                    return Err(ProcessOrchestratorError::new(
+                        "distributed_fault",
+                        failure.error.to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -270,7 +422,11 @@ async fn run_vm(
     let command = plan.vm_driver.as_ref().ok_or_else(|| {
         RunnerError::validation("vm_plan", "VM plan is missing its external driver")
     })?;
-    let command_receipts = vec![execute(command, None).await?];
+    let executed = execute(command, CommandContext::default()).await;
+    let (command_receipts, error) = match executed {
+        Ok(receipt) => (vec![receipt], None),
+        Err(failure) => (failure.receipt.into_iter().collect(), Some(failure.error)),
+    };
     let receipt = DistributedRunReceiptV1 {
         schema_version: DISTRIBUTED_RUN_RECEIPT_VERSION.into(),
         campaign_id: manifest.campaign_id.clone(),
@@ -278,9 +434,12 @@ async fn run_vm(
         command_receipts,
         process_report: None,
         cleanup_failures: Vec::new(),
-        completed: true,
+        completed: error.is_none(),
     };
     write_receipt(manifest, &receipt)?;
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(receipt)
 }
 
@@ -304,9 +463,14 @@ async fn cleanup_participants(
             ],
             success_exit_codes: vec![0, 1],
         };
-        match execute(&command, None).await {
+        match execute(&command, CommandContext::default()).await {
             Ok(receipt) => receipts.push(receipt),
-            Err(error) => failures.push(error.code),
+            Err(failure) => {
+                if let Some(receipt) = failure.receipt {
+                    receipts.push(receipt);
+                }
+                failures.push(failure.error.code);
+            }
         }
     }
 }
@@ -318,24 +482,73 @@ async fn cleanup(
     failures: &mut Vec<String>,
 ) {
     for command in &plan.cleanup {
-        match execute(command, run_token).await {
+        match execute(
+            command,
+            CommandContext {
+                run_token,
+                host_run_root: None,
+            },
+        )
+        .await
+        {
             Ok(receipt) => receipts.push(receipt),
-            Err(error) => failures.push(error.code),
+            Err(failure) => {
+                if let Some(receipt) = failure.receipt {
+                    receipts.push(receipt);
+                }
+                failures.push(failure.error.code);
+            }
         }
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct CommandContext<'a> {
+    run_token: Option<&'a str>,
+    host_run_root: Option<&'a Path>,
+}
+
+struct CommandFailure {
+    error: RunnerError,
+    receipt: Option<CommandReceiptV1>,
+}
+
 async fn execute(
     command: &PlannedCommandV1,
-    run_token: Option<&str>,
-) -> Result<CommandReceiptV1, RunnerError> {
-    let args = command
-        .args
-        .iter()
-        .map(|argument| {
-            argument.replace("{run_token}", run_token.unwrap_or("unavailable-run-token"))
-        })
-        .collect::<Vec<_>>();
+    context: CommandContext<'_>,
+) -> Result<CommandReceiptV1, CommandFailure> {
+    let mut args = Vec::with_capacity(command.args.len());
+    for argument in &command.args {
+        let mut rendered = argument.clone();
+        if rendered.contains("{run_token}") {
+            let token = context.run_token.ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "missing_run_token",
+                    format!("{} requires an unavailable run token", command.purpose),
+                ),
+                receipt: None,
+            })?;
+            rendered = rendered.replace("{run_token}", token);
+        }
+        if rendered.contains("{host_run_root}") {
+            let root = context.host_run_root.ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "missing_host_run_root",
+                    format!("{} requires an unavailable host run root", command.purpose),
+                ),
+                receipt: None,
+            })?;
+            let root = root.to_str().ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "non_utf8_host_run_root",
+                    "host run root must be valid UTF-8",
+                ),
+                receipt: None,
+            })?;
+            rendered = rendered.replace("{host_run_root}", root);
+        }
+        args.push(rendered);
+    }
     let mut child = Command::new(&command.program);
     child
         .args(args)
@@ -345,8 +558,14 @@ async fn execute(
         .kill_on_drop(true);
     let status = timeout(INFRASTRUCTURE_COMMAND_TIMEOUT, child.status())
         .await
-        .map_err(|_| RunnerError::validation("command_timeout", &command.purpose))?
-        .map_err(|error| RunnerError::environment("command_spawn", error))?;
+        .map_err(|_| CommandFailure {
+            error: RunnerError::validation("command_timeout", &command.purpose),
+            receipt: None,
+        })?
+        .map_err(|error| CommandFailure {
+            error: RunnerError::environment("command_spawn", error),
+            receipt: None,
+        })?;
     let exit_code = status.code();
     let accepted = exit_code.is_some_and(|code| command.success_exit_codes.contains(&code));
     let receipt = CommandReceiptV1 {
@@ -355,10 +574,13 @@ async fn execute(
         accepted,
     };
     if !accepted {
-        return Err(RunnerError::validation(
-            "command_failed",
-            format!("{} exited outside its accepted status set", command.purpose),
-        ));
+        return Err(CommandFailure {
+            error: RunnerError::validation(
+                "command_failed",
+                format!("{} exited outside its accepted status set", command.purpose),
+            ),
+            receipt: Some(receipt),
+        });
     }
     Ok(receipt)
 }
@@ -378,4 +600,231 @@ fn write_receipt(
 
 pub fn receipt_path(output_dir: &Path) -> PathBuf {
     output_dir.join("distributed-run.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ContainerBackendV1, DistributedFaultV1, DistributedParticipantV1, OciRuntimeV1,
+        ScenarioArtifactV1, ScheduledFaultV1, VirtualMachineBackendV1,
+    };
+    use std::collections::BTreeSet;
+
+    fn manifest(root: &Path, backend: DistributedBackendV1) -> DistributedCampaignManifestV1 {
+        DistributedCampaignManifestV1 {
+            schema_version: "1".into(),
+            campaign_id: "receipt-test".into(),
+            scenario: ScenarioArtifactV1 {
+                path: root.join("scenario.json"),
+                sha256: "00".repeat(32),
+            },
+            participants: ["alice", "bob"]
+                .into_iter()
+                .map(|id| DistributedParticipantV1 {
+                    id: id.into(),
+                    build_id: "test".into(),
+                    container_image: None,
+                })
+                .collect(),
+            backend,
+            faults: Vec::new(),
+            output_dir: root.join("output"),
+        }
+    }
+
+    fn planned(purpose: &str, program: &str, args: Vec<String>) -> PlannedCommandV1 {
+        PlannedCommandV1 {
+            purpose: purpose.into(),
+            program: program.into(),
+            args,
+            success_exit_codes: vec![0],
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_run_token_fails_before_spawning_a_command() {
+        let command = planned(
+            "requires_token",
+            "definitely-not-a-real-program",
+            vec!["{run_token}".into()],
+        );
+        let failure = execute(&command, CommandContext::default())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error.code, "missing_run_token");
+        assert!(failure.receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_vm_command_writes_an_incomplete_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = manifest(
+            root.path(),
+            DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+                driver: "false".into(),
+                driver_args: Vec::new(),
+                capabilities: BTreeSet::new(),
+            }),
+        );
+        fs_private::create_dir_all_private(&manifest.output_dir).unwrap();
+        let plan = DistributedExecutionPlanV1 {
+            schema_version: "1".into(),
+            campaign_id: manifest.campaign_id.clone(),
+            backend: "virtual_machine".into(),
+            setup: Vec::new(),
+            fault_commands: BTreeMap::new(),
+            cleanup: Vec::new(),
+            vm_driver: Some(planned("failing_vm_driver", "false", Vec::new())),
+        };
+        let error = run_vm(&manifest, &plan).await.unwrap_err();
+        assert_eq!(error.code, "command_failed");
+        let receipt: DistributedRunReceiptV1 =
+            serde_json::from_slice(&std::fs::read(receipt_path(&manifest.output_dir)).unwrap())
+                .unwrap();
+        assert!(!receipt.completed);
+        assert_eq!(receipt.command_receipts.len(), 1);
+        assert!(!receipt.command_receipts[0].accepted);
+    }
+
+    #[tokio::test]
+    async fn failed_container_setup_writes_an_incomplete_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "receipt-test".into(),
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        fs_private::create_dir_all_private(&manifest.output_dir).unwrap();
+        let plan = DistributedExecutionPlanV1 {
+            schema_version: "1".into(),
+            campaign_id: manifest.campaign_id.clone(),
+            backend: "container".into(),
+            setup: vec![planned("failing_setup", "false", Vec::new())],
+            fault_commands: BTreeMap::new(),
+            cleanup: Vec::new(),
+            vm_driver: None,
+        };
+        let scenario = ScenarioSpec {
+            name: "unused".into(),
+            spec_version: "2".into(),
+            clients: Vec::new(),
+            topology: cgka_conformance_simulator::ScenarioTopologyV2::default(),
+            steps: Vec::new(),
+        };
+        let error = run_container(&manifest, &plan, &scenario)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "command_failed");
+        let receipt: DistributedRunReceiptV1 =
+            serde_json::from_slice(&std::fs::read(receipt_path(&manifest.output_dir)).unwrap())
+                .unwrap();
+        assert!(!receipt.completed);
+        assert_eq!(receipt.command_receipts.len(), 1);
+        assert!(!receipt.command_receipts[0].accepted);
+    }
+
+    #[test]
+    fn host_crash_fault_lowers_to_owned_process_crash_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "crash-lowering".into(),
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        manifest.faults = vec![ScheduledFaultV1 {
+            at_barrier: "crash".into(),
+            action: DistributedFaultV1::CrashParticipantHost {
+                participant: "alice".into(),
+            },
+        }];
+        let scenario = ScenarioSpec {
+            name: "crash".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: cgka_conformance_simulator::ScenarioTopologyV2 {
+                devices: vec![
+                    cgka_conformance_simulator::ScenarioDeviceV2 {
+                        id: "device:alice".into(),
+                        account: "alice".into(),
+                        process: "process:alice".into(),
+                        client: "alice".into(),
+                    },
+                    cgka_conformance_simulator::ScenarioDeviceV2 {
+                        id: "device:bob".into(),
+                        account: "bob".into(),
+                        process: "process:bob".into(),
+                        client: "bob".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            steps: vec![cgka_conformance_simulator::ScenarioStep::Barrier {
+                name: "crash".into(),
+            }],
+        };
+        let lowered = lower_container_host_faults(&manifest, &scenario).unwrap();
+        assert!(matches!(
+            &lowered.steps[1],
+            cgka_conformance_simulator::ScenarioStep::CrashProcess { process }
+                if process == "process:alice"
+        ));
+        assert!(matches!(
+            &lowered.steps[2],
+            cgka_conformance_simulator::ScenarioStep::RestartProcess { process }
+                if process == "process:alice"
+        ));
+    }
+
+    #[test]
+    fn container_binding_rejects_multi_relay_topologies() {
+        let root = tempfile::tempdir().unwrap();
+        let mut scenario = cgka_conformance_simulator::generate_cross_route_regression_family()
+            .into_iter()
+            .next()
+            .unwrap()
+            .scenario;
+        scenario
+            .topology
+            .relays
+            .push(cgka_conformance_simulator::ScenarioRelayV2 {
+                id: "relay:secondary".into(),
+                implementation_version: "test".into(),
+                policy_version: "test".into(),
+            });
+        let mut manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "relay-validation".into(),
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        manifest.participants = scenario
+            .clients
+            .iter()
+            .map(|id| DistributedParticipantV1 {
+                id: id.clone(),
+                build_id: "test".into(),
+                container_image: None,
+            })
+            .collect();
+        let error = validate_scenario_binding(&manifest, &scenario).unwrap_err();
+        assert_eq!(error.code, "multiple_container_relays_unsupported");
+    }
 }

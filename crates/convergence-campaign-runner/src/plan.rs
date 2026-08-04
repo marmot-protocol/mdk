@@ -5,6 +5,7 @@ use cgka_conformance_simulator::process_orchestrator::{
     ProcessNodeLaunchV1, process_participant_token,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::RunnerError;
 use crate::manifest::{
@@ -70,27 +71,19 @@ pub fn build_execution_plan(
     match &manifest.backend {
         DistributedBackendV1::Container(container) => container_plan(manifest, container),
         DistributedBackendV1::VirtualMachine(vm) => {
+            let normalized_manifest = manifest.output_dir.join("normalized-manifest.json");
+            let normalized_manifest = utf8_path(&normalized_manifest, "normalized_manifest")?;
+            let scenario = utf8_path(&manifest.scenario.path, "scenario")?;
+            let output_dir = utf8_path(&manifest.output_dir, "output_dir")?;
+            let driver = utf8_path(&vm.driver, "vm_driver")?;
             let args = vm
                 .driver_args
                 .iter()
                 .map(|argument| {
                     argument
-                        .replace(
-                            "{manifest}",
-                            manifest
-                                .output_dir
-                                .join("normalized-manifest.json")
-                                .to_str()
-                                .unwrap_or("<non-utf8>"),
-                        )
-                        .replace(
-                            "{scenario}",
-                            manifest.scenario.path.to_str().unwrap_or("<non-utf8>"),
-                        )
-                        .replace(
-                            "{output_dir}",
-                            manifest.output_dir.to_str().unwrap_or("<non-utf8>"),
-                        )
+                        .replace("{manifest}", normalized_manifest)
+                        .replace("{scenario}", scenario)
+                        .replace("{output_dir}", output_dir)
                         .replace(
                             "{participant_count}",
                             &manifest.participants.len().to_string(),
@@ -106,7 +99,7 @@ pub fn build_execution_plan(
                 cleanup: Vec::new(),
                 vm_driver: Some(PlannedCommandV1::exact(
                     "run_external_vm_campaign",
-                    vm.driver.to_string_lossy(),
+                    driver,
                     args,
                 )),
             })
@@ -244,38 +237,171 @@ fn container_fault_commands(
     fault: &DistributedFaultV1,
 ) -> Vec<PlannedCommandV1> {
     match fault {
-        DistributedFaultV1::NetworkPartition { participant, peer } => vec![exec(
-            runtime,
-            participant_container(participant),
-            "partition_network",
+        DistributedFaultV1::NetworkPartition { participant, peer } => {
+            let container = participant_container(participant);
+            let peer = peer_container(peer, relay);
+            let chain = partition_chain(participant, &peer);
+            let peer_set = partition_set(participant, &peer);
             vec![
-                "iptables".into(),
-                "-I".into(),
-                "OUTPUT".into(),
-                "-d".into(),
-                peer_container(peer, relay),
-                "-j".into(),
-                "REJECT".into(),
-            ],
-        )],
-        DistributedFaultV1::NetworkHeal { participant, peer } => {
-            vec![PlannedCommandV1::idempotent(
-                "heal_network_partition",
-                runtime,
-                [
-                    vec!["exec".into(), participant_container(participant)],
+                PlannedCommandV1::idempotent(
+                    "create_network_partition_peer_set",
+                    runtime,
+                    vec![
+                        "exec".into(),
+                        container.clone(),
+                        "ipset".into(),
+                        "create".into(),
+                        peer_set.clone(),
+                        "hash:ip".into(),
+                    ],
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "reset_network_partition_peer_set",
+                    vec!["ipset".into(), "flush".into(), peer_set.clone()],
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "record_network_partition_peer_address",
+                    vec!["ipset".into(), "add".into(), peer_set.clone(), peer],
+                ),
+                PlannedCommandV1::idempotent(
+                    "create_network_partition_chain",
+                    runtime,
+                    vec![
+                        "exec".into(),
+                        container.clone(),
+                        "iptables".into(),
+                        "-N".into(),
+                        chain.clone(),
+                    ],
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "reset_network_partition_chain",
+                    vec!["iptables".into(), "-F".into(), chain.clone()],
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "partition_network_inbound",
                     vec![
                         "iptables".into(),
-                        "-D".into(),
-                        "OUTPUT".into(),
-                        "-d".into(),
-                        peer_container(peer, relay),
+                        "-A".into(),
+                        chain.clone(),
+                        "-m".into(),
+                        "set".into(),
+                        "--match-set".into(),
+                        peer_set.clone(),
+                        "src".into(),
                         "-j".into(),
                         "REJECT".into(),
                     ],
-                ]
-                .concat(),
-            )]
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "partition_network_outbound",
+                    vec![
+                        "iptables".into(),
+                        "-A".into(),
+                        chain.clone(),
+                        "-m".into(),
+                        "set".into(),
+                        "--match-set".into(),
+                        peer_set,
+                        "dst".into(),
+                        "-j".into(),
+                        "REJECT".into(),
+                    ],
+                ),
+                exec(
+                    runtime,
+                    container.clone(),
+                    "activate_inbound_partition",
+                    vec![
+                        "iptables".into(),
+                        "-I".into(),
+                        "INPUT".into(),
+                        "-j".into(),
+                        chain.clone(),
+                    ],
+                ),
+                exec(
+                    runtime,
+                    container,
+                    "activate_outbound_partition",
+                    vec![
+                        "iptables".into(),
+                        "-I".into(),
+                        "OUTPUT".into(),
+                        "-j".into(),
+                        chain,
+                    ],
+                ),
+            ]
+        }
+        DistributedFaultV1::NetworkHeal { participant, peer } => {
+            let container = participant_container(participant);
+            let peer = peer_container(peer, relay);
+            let chain = partition_chain(participant, &peer);
+            let peer_set = partition_set(participant, &peer);
+            ["INPUT", "OUTPUT"]
+                .into_iter()
+                .map(|direction| {
+                    PlannedCommandV1::idempotent(
+                        format!("heal_{}_network_partition", direction.to_ascii_lowercase()),
+                        runtime,
+                        vec![
+                            "exec".into(),
+                            container.clone(),
+                            "iptables".into(),
+                            "-D".into(),
+                            direction.into(),
+                            "-j".into(),
+                            chain.clone(),
+                        ],
+                    )
+                })
+                .chain([
+                    PlannedCommandV1::idempotent(
+                        "flush_network_partition_chain",
+                        runtime,
+                        vec![
+                            "exec".into(),
+                            container.clone(),
+                            "iptables".into(),
+                            "-F".into(),
+                            chain.clone(),
+                        ],
+                    ),
+                    PlannedCommandV1::idempotent(
+                        "remove_network_partition_chain",
+                        runtime,
+                        vec![
+                            "exec".into(),
+                            container.clone(),
+                            "iptables".into(),
+                            "-X".into(),
+                            chain.clone(),
+                        ],
+                    ),
+                    PlannedCommandV1::idempotent(
+                        "remove_network_partition_peer_set",
+                        runtime,
+                        vec![
+                            "exec".into(),
+                            container.clone(),
+                            "ipset".into(),
+                            "destroy".into(),
+                            peer_set,
+                        ],
+                    ),
+                ])
+                .collect()
         }
         DistributedFaultV1::NetworkShape {
             participant,
@@ -323,13 +449,10 @@ fn container_fault_commands(
             runtime,
             vec!["restart".into(), relay.into()],
         )],
-        DistributedFaultV1::CrashParticipantHost { participant } => {
-            vec![PlannedCommandV1::idempotent(
-                "crash_participant_host",
-                runtime,
-                vec!["kill".into(), participant_container(participant)],
-            )]
-        }
+        // The process orchestrator must own the crash/relaunch so its JSONL
+        // stdio handles are replaced with the new container process. The
+        // runner lowers this manifest fault into CrashProcess + RestartProcess.
+        DistributedFaultV1::CrashParticipantHost { .. } => Vec::new(),
         DistributedFaultV1::FillDisk { participant, bytes } => vec![exec(
             runtime,
             participant_container(participant),
@@ -343,13 +466,13 @@ fn container_fault_commands(
         )],
         DistributedFaultV1::ReleaseDisk { participant } => vec![PlannedCommandV1::idempotent(
             "release_participant_disk",
-            runtime,
+            "rm",
             vec![
-                "exec".into(),
-                participant_container(participant),
-                "rm".into(),
                 "-f".into(),
-                participant_pressure_path(participant),
+                format!(
+                    "{{host_run_root}}/participants/{}/.disk-pressure",
+                    process_participant_token(participant)
+                ),
             ],
         )],
         DistributedFaultV1::DatabaseContention {
@@ -420,6 +543,25 @@ fn peer_container(peer: &FaultPeerV1, relay: &str) -> String {
         FaultPeerV1::Relay => relay.into(),
         FaultPeerV1::Participant(participant) => participant_container(participant),
     }
+}
+
+fn partition_chain(participant: &str, peer: &str) -> String {
+    let digest = Sha256::digest(format!("{participant}\0{peer}"));
+    format!("MARMOT_{}", hex::encode(&digest[..8]).to_ascii_uppercase())
+}
+
+fn partition_set(participant: &str, peer: &str) -> String {
+    let digest = Sha256::digest(format!("{participant}\0{peer}"));
+    format!("MSET_{}", hex::encode(&digest[..8]).to_ascii_uppercase())
+}
+
+fn utf8_path<'a>(path: &'a std::path::Path, field: &str) -> Result<&'a str, RunnerError> {
+    path.to_str().ok_or_else(|| {
+        RunnerError::validation(
+            "non_utf8_path",
+            format!("{field} must be representable as UTF-8 argv"),
+        )
+    })
 }
 
 fn format_basis_points(value: u16) -> String {
