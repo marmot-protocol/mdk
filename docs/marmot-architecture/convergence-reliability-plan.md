@@ -996,12 +996,20 @@ that scaling the existing corpus is sufficient.
 
 ### 6.2 Container and VM execution
 
-- [ ] Add containers before VMs.
-- [ ] Add network partition, latency, bandwidth, and loss controls.
-- [ ] Add relay and participant host restarts.
-- [ ] Add slow/full disk and database contention.
-- [ ] Add mixed-build rolling upgrades.
-- [ ] Use VMs only for kernel, filesystem, network, or host-isolation behavior containers cannot represent.
+- [x] Add containers before VMs.
+- [x] Add network partition, latency, bandwidth, and loss controls.
+- [x] Add relay and participant host restarts.
+- [x] Add slow/full disk and database contention.
+- [x] Add mixed-build rolling upgrades.
+- [x] Use VMs only for kernel, filesystem, network, or host-isolation behavior containers cannot represent.
+
+The distributed runner consumes the same pinned Scenario IR and process-node protocol as the smaller adapters. Its OCI
+backend binds faults to named scenario barriers, uses one isolated network and retained relay, supports exact images per
+participant, and records argv-level setup/fault/cleanup receipts. The VM backend is a capability-checked handoff to an
+external harness and is rejected when containers can represent the requested campaign. The current real-container
+verification covers traffic shaping plus reset and the cross-route deeper-branch regression; host restart, full disk,
+database contention, and mixed-image operations have deterministic command-plan coverage and are scheduled for
+infrastructure-capable execution lanes.
 
 ### 6.3 Execution lanes
 
@@ -1144,6 +1152,8 @@ incorrect result.
 | 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
 | 2026-08-04 | Milestone 5 app/process simulation | Added a production-shaped app-runtime adapter, versioned child-node protocol, multi-process orchestrator, projection/event observation, retained-relay repair, real pause/resume/kill/restart, cross-adapter comparison, and privacy-safe failure capsules; then replaced milestone-scoped module/test names with durable capability names | Commits `a3296b16` through `19d0d5f8`; `app_runtime_adapter`; `node_protocol`; `process_orchestrator`; `just fast-ci` |
 | 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
+| 2026-08-04 | 6.1 decision-route assurance closure | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine, process, and real-container regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
+| 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 
 ## Post-Milestone 6 Cleanup
 

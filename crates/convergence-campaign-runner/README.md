@@ -20,3 +20,7 @@ public relay endpoints. Campaign artifacts are written with owner-only modes.
 
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
+
+The operator contract, backend boundary, artifact posture, and real-container
+verification commands live in
+[`docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md).
