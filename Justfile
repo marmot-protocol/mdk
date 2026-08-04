@@ -353,7 +353,7 @@ tla-liveness-counterexample: _tla-tools
         exit 1
     fi
     cat "$output"
-    rg -q 'Temporal properties were violated' "$output"
+    grep -q 'Temporal properties were violated' "$output"
 
 policy-casegen:
     @cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
