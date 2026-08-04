@@ -23,6 +23,8 @@ use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use zeroize::Zeroizing;
 
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
@@ -366,10 +368,29 @@ pub trait AccountDeviceSignerStorage {
 /// application has no public-event cache entry. Storage therefore exposes the
 /// serialized OpenMLS entities as opaque bytes; the engine owns their schema,
 /// profile classification, and deletion.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredKeyPackageBundle {
     pub storage_key: Vec<u8>,
-    pub value: Vec<u8>,
+    /// Serialized `KeyPackageBundle`, including its private init and leaf keys.
+    pub value: Zeroizing<Vec<u8>>,
+}
+
+struct RedactedValue;
+
+impl fmt::Debug for RedactedValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl fmt::Debug for StoredKeyPackageBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredKeyPackageBundle")
+            .field("storage_key", &self.storage_key)
+            .field("value", &RedactedValue)
+            .finish()
+    }
 }
 
 pub trait KeyPackageBundleStorage {
@@ -496,4 +517,21 @@ pub trait StorageProvider:
     }
 
     fn backend(&self) -> Backend;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_key_package_debug_redacts_serialized_private_key_material() {
+        let bundle = StoredKeyPackageBundle {
+            storage_key: b"public-storage-key".to_vec(),
+            value: Zeroizing::new(vec![222, 173, 190, 239]),
+        };
+        let debug = format!("{bundle:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("222, 173, 190, 239"));
+    }
 }

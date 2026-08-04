@@ -1,3 +1,4 @@
+use crate::codec::SensitiveBytes;
 use cgka_traits::capabilities::GroupCapabilities;
 #[cfg(feature = "test-conformance-replay")]
 use cgka_traits::convergence_pass::DurableConvergencePass;
@@ -58,5 +59,25 @@ pub(super) struct OpenMlsValueSnapshot {
     pub(super) label: Vec<u8>,
     pub(super) storage_key: Vec<u8>,
     pub(super) group_key: Vec<u8>,
-    pub(super) value: Vec<u8>,
+    pub(super) value: SensitiveBytes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::SensitiveBytes;
+
+    #[test]
+    fn openmls_snapshot_values_have_sensitive_ownership() {
+        let row = OpenMlsValueSnapshot {
+            label: b"EpochSecrets".to_vec(),
+            storage_key: b"storage-key".to_vec(),
+            group_key: b"group-key".to_vec(),
+            value: SensitiveBytes::new(b"secret-json".to_vec()),
+        };
+
+        fn assert_sensitive(_: &SensitiveBytes) {}
+        assert_sensitive(&row.value);
+        assert_eq!(row.value.as_slice(), b"secret-json");
+    }
 }

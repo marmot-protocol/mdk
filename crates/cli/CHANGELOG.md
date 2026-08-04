@@ -24,6 +24,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- OpenMLS persistence now zeroizes temporary SQLite serialization,
+  deserialization, and rollback-snapshot buffers for MLS private keys, epoch and
+  message secrets, PSKs, pending group state, application-export state, and
+  stored key-package handoffs on success and error paths.
 - `wn login --nsec-stdin` and `wn account create --nsec-stdin` now keep stdin
   nsecs in a dedicated zeroizing sidecar instead of materializing them into the
   generic `Cli` command tree. Daemon execute frames and `AccountSetupRequest`

@@ -1,17 +1,180 @@
+use std::fmt;
+use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::EpochId;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::{DeserializeOwned, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 /// Total bind-parameter budget for generated statements that use chunked
 /// positive-`IN` lists. This stays below SQLite's historical 999-variable
 /// default and includes any fixed parameters that precede the list.
 pub(crate) const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
 
+/// Bytes whose current allocation is wiped when ownership ends.
+///
+/// JSON deserialization grows this buffer explicitly so each replaced
+/// allocation is zeroized before deallocation. The storage backend is JSON-only;
+/// deliberately accepting only sequence input avoids a binary deserializer
+/// constructing an intermediate ordinary `Vec<u8>` before this type takes over.
+pub(crate) struct SensitiveBytes(Zeroizing<Vec<u8>>);
+
+impl SensitiveBytes {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Zeroizing::new(Vec::with_capacity(capacity)))
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.0.len() == self.0.capacity() {
+            let next_capacity = if self.0.capacity() == 0 {
+                8
+            } else {
+                self.0
+                    .capacity()
+                    .checked_mul(2)
+                    .expect("sensitive byte buffer capacity overflow")
+            };
+            let mut next = Zeroizing::new(Vec::with_capacity(next_capacity));
+            next.extend_from_slice(self.0.as_slice());
+            let previous = std::mem::replace(&mut self.0, next);
+            drop(previous);
+        }
+        self.0.push(byte);
+    }
+}
+
+impl AsRef<[u8]> for SensitiveBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Serialize for SensitiveBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SensitiveBytesVisitor;
+
+        impl<'de> Visitor<'de> for SensitiveBytesVisitor {
+            type Value = SensitiveBytes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON byte array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = SensitiveBytes::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_seq(SensitiveBytesVisitor)
+    }
+}
+
+#[derive(Default)]
+struct JsonLength {
+    bytes: usize,
+}
+
+impl Write for JsonLength {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("sensitive JSON length overflow"))?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct SensitiveJsonWriter {
+    bytes: SensitiveBytes,
+    limit: usize,
+}
+
+impl SensitiveJsonWriter {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: SensitiveBytes::with_capacity(capacity),
+            limit: capacity,
+        }
+    }
+
+    fn into_bytes(self) -> SensitiveBytes {
+        self.bytes
+    }
+}
+
+impl Write for SensitiveJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let remaining = self.limit - self.bytes.0.len();
+        if bytes.len() > remaining {
+            return Err(io::Error::other(
+                "sensitive JSON changed size between serialization passes",
+            ));
+        }
+        self.bytes.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn serialize<T: Serialize>(value: &T) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| StorageError::Serialization(e.to_string()))
+}
+
+pub(crate) fn serialize_sensitive_json<T: Serialize + ?Sized>(
+    value: &T,
+) -> serde_json::Result<SensitiveBytes> {
+    // The first pass counts bytes without retaining them. The second pass writes
+    // into a fixed-capacity zeroizing allocation and fails rather than growing
+    // if a stateful Serialize implementation produces a larger document.
+    let mut length = JsonLength::default();
+    serde_json::to_writer(&mut length, value)?;
+    let mut writer = SensitiveJsonWriter::with_capacity(length.bytes);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.into_bytes())
+}
+
+pub(crate) fn serialize_sensitive<T: Serialize + ?Sized>(
+    value: &T,
+) -> StorageResult<SensitiveBytes> {
+    serialize_sensitive_json(value).map_err(|e| StorageError::Serialization(e.to_string()))
 }
 
 pub(crate) fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> StorageResult<T> {
@@ -148,6 +311,44 @@ pub(crate) fn unix_now_seconds_i64() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct ExpandsBetweenSerializationPasses(Cell<bool>);
+
+    impl Serialize for ExpandsBetweenSerializationPasses {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if self.0.replace(false) {
+                serializer.serialize_str("short")
+            } else {
+                serializer.serialize_str(
+                    "a second serialization pass must not grow the sensitive allocation",
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn sensitive_json_rejects_second_pass_growth_instead_of_reallocating() {
+        let value = ExpandsBetweenSerializationPasses(Cell::new(true));
+        let error = match serialize_sensitive(&value) {
+            Ok(_) => panic!("second pass unexpectedly grew the sensitive allocation"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, StorageError::Serialization(message) if message.contains("sensitive JSON changed size"))
+        );
+    }
+
+    #[test]
+    fn sensitive_bytes_round_trip_large_json_array_without_format_change() {
+        let value = vec![0xa5; 4_096];
+        let encoded = serialize_sensitive(&value).unwrap();
+
+        assert_eq!(encoded.as_slice(), serde_json::to_vec(&value).unwrap());
+        let decoded: SensitiveBytes = deserialize(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.as_slice(), value);
+    }
 
     fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
         rusqlite::Error::SqliteFailure(

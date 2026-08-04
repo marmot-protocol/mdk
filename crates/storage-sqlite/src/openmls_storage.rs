@@ -6,6 +6,7 @@ use crate::connection::SharedConnection;
 use cgka_traits::storage::{StorageError, StorageResult, StoredKeyPackageBundle};
 use cgka_traits::types::GroupId as MarmotGroupId;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug)]
 pub struct SqliteOpenMlsStorage {
@@ -45,12 +46,15 @@ impl SqliteOpenMlsStorage {
             )
             .map_err(crate::codec::map_sqlite_error)?;
         let rows = statement
-            .query_map(params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL], |row| {
-                Ok(StoredKeyPackageBundle {
-                    storage_key: row.get(0)?,
-                    value: row.get(1)?,
-                })
-            })
+            .query_map(
+                params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL.as_bytes()],
+                |row| {
+                    Ok(StoredKeyPackageBundle {
+                        storage_key: row.get(0)?,
+                        value: Zeroizing::new(row.get(1)?),
+                    })
+                },
+            )
             .map_err(crate::codec::map_sqlite_error)?;
         rows.collect::<Result<Vec<StoredKeyPackageBundle>, _>>()
             .map_err(crate::codec::map_sqlite_error)
@@ -65,7 +69,11 @@ impl SqliteOpenMlsStorage {
             .execute(
                 "DELETE FROM openmls_values
                  WHERE provider_version = ?1 AND label = ?2 AND storage_key = ?3",
-                params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL, storage_key],
+                params![
+                    CURRENT_VERSION,
+                    labels::KEY_PACKAGE_LABEL.as_bytes(),
+                    storage_key
+                ],
             )
             .map_err(crate::codec::map_sqlite_error)?;
         Ok(())

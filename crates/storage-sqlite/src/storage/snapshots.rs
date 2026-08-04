@@ -165,6 +165,33 @@ mod tests {
     }
 
     #[test]
+    fn malformed_snapshot_is_rejected_before_restore_mutates_live_state() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let live_group = sample_group(gid(1), 1, 2);
+        store.put_group(&live_group).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_group_snapshots (group_id, name, snapshot)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    live_group.id.as_slice(),
+                    "malformed",
+                    b"{\"openmls_values\":[[1,2,3]".as_slice()
+                ],
+            )
+            .unwrap();
+
+        let error = store
+            .rollback_group_to_snapshot(&live_group.id, "malformed")
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Serialization(_)));
+        assert_eq!(store.get_group(&live_group.id).unwrap(), live_group);
+    }
+
+    #[test]
     fn snapshot_create_joins_outer_transaction() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
