@@ -1493,7 +1493,6 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_groups(&effects);
-        let mut summary = SyncSummary::default();
         self.arm_recovery_from_effects(&effects);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
@@ -1513,6 +1512,7 @@ impl AppClient {
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
