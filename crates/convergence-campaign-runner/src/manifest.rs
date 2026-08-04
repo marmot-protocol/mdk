@@ -22,7 +22,7 @@ pub struct DistributedCampaignManifestV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioArtifactV1 {
     pub path: PathBuf,
-    /// Lowercase SHA-256 of the exact scenario bytes.
+    /// SHA-256 of the exact scenario bytes, accepted in either hex case.
     pub sha256: String,
 }
 
@@ -184,11 +184,11 @@ impl DistributedCampaignManifestV1 {
                 .scenario
                 .sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(RunnerError::validation(
                 "scenario_digest",
-                "scenario sha256 must be 64 lowercase hexadecimal characters",
+                "scenario sha256 must be 64 hexadecimal characters",
             ));
         }
         let mut participants = BTreeSet::new();

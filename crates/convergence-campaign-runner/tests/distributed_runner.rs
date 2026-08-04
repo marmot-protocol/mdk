@@ -71,6 +71,12 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
                 },
             },
             ScheduledFaultV1 {
+                at_barrier: "disk-release".into(),
+                action: DistributedFaultV1::ReleaseDisk {
+                    participant: "alice".into(),
+                },
+            },
+            ScheduledFaultV1 {
                 at_barrier: "database-contention".into(),
                 action: DistributedFaultV1::DatabaseContention {
                     participant: "bob".into(),
@@ -104,6 +110,7 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         "shape",
         "relay-restart",
         "disk-full",
+        "disk-release",
         "database-contention",
         "host-crash",
     ] {
@@ -122,6 +129,62 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     let shape = &plan.fault_commands["shape"][0];
     assert!(shape.args.contains(&"1.25%".into()));
     assert!(shape.args.contains(&"512kbit".into()));
+    let partition = &plan.fault_commands["partition"];
+    assert!(
+        partition
+            .iter()
+            .any(|command| { command.args.iter().any(|argument| argument == "INPUT") })
+    );
+    assert!(
+        partition
+            .iter()
+            .any(|command| { command.args.iter().any(|argument| argument == "OUTPUT") })
+    );
+    assert_eq!(
+        partition
+            .iter()
+            .filter(|command| command.purpose == "record_network_partition_peer_address")
+            .count(),
+        1
+    );
+    let release = &plan.fault_commands["disk-release"][0];
+    assert_eq!(release.program, "rm");
+    assert!(
+        release
+            .args
+            .iter()
+            .any(|argument| argument.contains("{host_run_root}"))
+    );
+}
+
+#[test]
+fn scenario_digest_accepts_uppercase_hex() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.scenario.sha256.make_ascii_uppercase();
+    verify_manifest_inputs(&manifest).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn vm_plan_rejects_non_utf8_argv_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![ScheduledFaultV1 {
+        at_barrier: "slow-disk".into(),
+        action: DistributedFaultV1::SlowBlockDevice {
+            participant: "alice".into(),
+            latency_ms: 50,
+        },
+    }];
+    manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver: "/tmp/driver".into(),
+        driver_args: vec!["{scenario}".into()],
+        capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
+    });
+    manifest.scenario.path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+    let error = build_execution_plan(&manifest).unwrap_err();
+    assert_eq!(error.code, "non_utf8_path");
 }
 
 #[test]
