@@ -969,9 +969,17 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 }
                 if record.state == MessageState::Processed {
                     own_commits.insert_canonical(projection.message_digest);
-                    if let Some(stamp) = own_commit_stamp {
-                        own_commits.insert_stamped(projection.message_digest, stamp);
-                    }
+                }
+                // The stamp is written only at confirm time, so its presence
+                // alone proves this is an own commit MLS cannot re-process.
+                // Register it independently of `Processed`: a pairwise
+                // CandidateWins resolution parks the displaced own incumbent
+                // `ConvergenceDeferred` (see `fork_recovery`), and replaying
+                // its branch still needs the stamp — the prefix-canonical
+                // guard at the stamp's use site keeps a diverging prefix from
+                // mis-realizing it.
+                if let Some(stamp) = own_commit_stamp {
+                    own_commits.insert_stamped(projection.message_digest, stamp);
                 }
                 commit_messages.push(StoredCommitMessage {
                     message,
@@ -1611,13 +1619,34 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // apply at all (MLS cannot re-process own commits), and it avoids
     // re-replaying history the live state already reflects.
     let applied_prefix = already_applied_commit_prefix(storage, result, current_epoch)?;
-    let apply_start_epoch =
-        apply_start_epoch_for_canonicalization_result(storage, result, &applied_prefix)?
-            .unwrap_or(current_epoch);
+    let has_new_commits = result.accepted_commits.len() > applied_prefix.len();
+    // A displaced own commit parked `ConvergenceDeferred` by a pairwise
+    // CandidateWins resolution (see `fork_recovery`) can head the selected
+    // branch WITHOUT being in the already-applied prefix. MLS cannot
+    // re-process own commits and this apply cannot nest the selection stage's
+    // per-commit anchor rollforward, so realize such a leading run in one
+    // step: skip it from the replay and rewind to the retained anchor at the
+    // run's final resulting epoch — the exact post-merge state its last own
+    // commit produced.
+    let own_anchor_prefix =
+        anchor_realizable_own_commit_prefix(storage, group_id, result, &applied_prefix)?;
+    let mut skipped_prefix = applied_prefix;
+    skipped_prefix.extend(own_anchor_prefix.commit_ids.iter().cloned());
+    let apply_start_epoch = match own_anchor_prefix.resulting_epoch {
+        Some(epoch) => epoch,
+        None => apply_start_epoch_for_canonicalization_result(storage, result, &skipped_prefix)?
+            .unwrap_or(current_epoch),
+    };
+    // The own-anchor case must rewind even when the anchor epoch equals the
+    // live tip epoch: the live tip is a DIFFERENT branch's state at that
+    // epoch (that is what displaced the own incumbent), while the retained
+    // anchor holds the own commit's post-merge state.
+    let rewind_to_retained_anchor =
+        apply_start_epoch < current_epoch || own_anchor_prefix.resulting_epoch.is_some();
     let replay_messages = replay_messages_for_canonicalization_result(
         storage,
         result,
-        &applied_prefix,
+        &skipped_prefix,
         apply_start_epoch,
     )?;
     let live_message_records = storage
@@ -1626,13 +1655,17 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     let live_queued_outbound = storage
         .list_queued_outbound_intents(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    let has_new_commits = result.accepted_commits.len() > applied_prefix.len();
     let snapshot = apply_snapshot_name(group_id, result);
     storage
         .create_group_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let prepare_result = if has_new_commits && apply_start_epoch == current_epoch {
+    // Never refresh the current-epoch anchor when this apply is about to
+    // rewind to a retained anchor: in the own-anchor case the live tip and
+    // the rewind target share an epoch number, and retaining here would
+    // overwrite the own commit's post-merge state with the displacing
+    // branch's state before the rollback reads it.
+    let prepare_result = if has_new_commits && !rewind_to_retained_anchor {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
     } else {
         Ok(())
@@ -1648,7 +1681,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // therefore returns to the pre-apply live state instead of committing an
     // older message/queue image and rebuilding it row by row.
     let apply_result = storage.with_transaction(|storage| {
-        if apply_start_epoch < current_epoch {
+        if rewind_to_retained_anchor {
             let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
             storage
                 .rollback_group_to_snapshot(group_id, &anchor_snapshot)
@@ -1786,6 +1819,73 @@ fn apply_start_epoch_for_canonicalization_result<S: StorageProvider>(
     Ok(Some(record.epoch.0))
 }
 
+#[derive(Default)]
+struct AnchorRealizableOwnPrefix {
+    /// Selected-branch commit ids (hex) realized via the retained anchor
+    /// instead of replay.
+    commit_ids: BTreeSet<String>,
+    /// Resulting epoch of the run's last own commit — the retained-anchor
+    /// rewind target that realizes the whole run.
+    resulting_epoch: Option<u64>,
+}
+
+/// The leading run — after the already-applied prefix — of this device's own
+/// confirm-stamped commits on the selected branch, bounded to those whose
+/// resulting-epoch retained anchor still exists. Such commits reach the apply
+/// stage outside the applied prefix when a pairwise CandidateWins resolution
+/// parked a displaced own incumbent `ConvergenceDeferred` (see
+/// `fork_recovery`) and convergence later selected its regrown branch. MLS
+/// refuses to re-process own commits, so the apply realizes the run by
+/// rewinding to the retained anchor at its final resulting epoch — the exact
+/// post-merge state captured when the commit confirmed — mirroring the
+/// selection stage's stamp rollforward (`PrevalidatedOwnCommits`). The first
+/// commit that is not an anchor-realizable own commit ends the run; anything
+/// after it replays normally from that state.
+fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    result: &CanonicalizationResult,
+    applied_prefix: &BTreeSet<String>,
+) -> Result<AnchorRealizableOwnPrefix, OpenMlsProjectionError> {
+    let mut prefix = AnchorRealizableOwnPrefix::default();
+    let mut snapshots: Option<Vec<String>> = None;
+    for commit_id in result
+        .accepted_commits
+        .iter()
+        .filter(|commit_id| !applied_prefix.contains(*commit_id))
+    {
+        let message_id = message_id_from_hex(commit_id)?;
+        let record = match storage.get_message(&message_id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => break,
+            Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
+        };
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            break;
+        };
+        if payload.own_commit_stamp().is_none() {
+            break;
+        }
+        let resulting_epoch = record.epoch.0.saturating_add(1);
+        if snapshots.is_none() {
+            snapshots = Some(
+                storage
+                    .list_group_snapshots(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
+            );
+        }
+        let retained = snapshots
+            .as_ref()
+            .is_some_and(|names| names.contains(&retained_anchor_snapshot_name(resulting_epoch)));
+        if !retained {
+            break;
+        }
+        prefix.commit_ids.insert(commit_id.clone());
+        prefix.resulting_epoch = Some(resulting_epoch);
+    }
+    Ok(prefix)
+}
+
 fn rollback_and_release_group_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1913,9 +2013,11 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // transaction guards hard crashes mid-merge.
     storage.with_transaction(|storage| {
         // No pre-validated own commits here: snapshot rollforward cannot nest
-        // inside this transaction, and the already-applied prefix (which is
-        // where own commits can appear on an accepted branch) was excluded
-        // from `replay_messages` before this call.
+        // inside this transaction, and every own commit on the accepted
+        // branch was excluded from `replay_messages` before this call —
+        // either as part of the already-applied prefix or as an
+        // anchor-realizable own-commit run whose retained-anchor rewind the
+        // caller performs itself (`anchor_realizable_own_commit_prefix`).
         let output = process_openmls_messages_inner(
             storage,
             group_id,
