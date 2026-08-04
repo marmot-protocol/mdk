@@ -461,6 +461,50 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Admit an application message that OpenMLS authenticated on the live
+    /// branch to a relevant collecting pass before ingest finalizes delivery.
+    /// Candidate-branch apps enter through the convergence buffer; without
+    /// this matching seam, provisional-live-branch apps could become
+    /// `Processed` outside the immutable batch and branch selection would
+    /// depend on transport order.
+    pub(crate) fn admit_authenticated_app_witness_with_time(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+        now: ConvergenceTime,
+    ) -> Result<(), OpenMlsProjectionError> {
+        // This seam only completes an already-open batch. It must not turn an
+        // ordinary app arriving after a settled race into a fresh convergence
+        // trigger; if the app precedes a candidate-branch input, that later
+        // input opens and seeds a pass from all retained rows, including this
+        // one.
+        if !self
+            .storage
+            .convergence_pass(group_id)
+            .map_err(storage_projection_error)?
+            .is_some_and(|pass| pass.phase == ConvergencePassPhase::Collecting)
+        {
+            return Ok(());
+        }
+        let (admission, opened) =
+            self.admit_stored_message_to_convergence_pass(group_id, message_id, now)?;
+        if opened {
+            crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
+        }
+        if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
+            let epoch = self
+                .storage
+                .get_group(group_id)
+                .map_err(storage_projection_error)?
+                .epoch;
+            self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
+            return Err(OpenMlsProjectionError::Replay(
+                "frozen convergence pass failed integrity verification".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn admit_stored_message_to_convergence_pass(
         &self,
         group_id: &GroupId,

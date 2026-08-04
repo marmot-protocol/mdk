@@ -281,7 +281,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.ingest_welcome(&msg, recipient.clone()).await?
             }
             TransportEnvelope::GroupMessage { transport_group_id } => {
-                self.ingest_group_message(&msg, transport_group_id.clone(), false)
+                self.ingest_group_message(&msg, transport_group_id.clone(), None)
                     .await?
             }
         };
@@ -1012,6 +1012,7 @@ impl<S: StorageProvider> Engine<S> {
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
         let mut progressed = 0usize;
         let mut terminal = 0usize;
+        let mut buffered_convergence_input = false;
         for mut record in deferred[start..end].iter().cloned() {
             let lifecycle = record
                 .deferred_peel
@@ -1045,7 +1046,7 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             };
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec(), true)
+                .ingest_group_message(&msg, group_id.as_slice().to_vec(), Some(now))
                 .await
             {
                 Ok(IngestOutcome::TransportDeferred { .. }) => {}
@@ -1062,7 +1063,15 @@ impl<S: StorageProvider> Engine<S> {
                     // PeelDeferred state — the catch-all arm below would
                     // retire the replay buffer.
                 }
-                Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
+                Ok(IngestOutcome::Buffered { .. }) => {
+                    buffered_convergence_input = true;
+                    if self.raw_transport_row_awaiting_retry(&record.id)? {
+                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    }
+                    self.note_peel_deferred_row_retired(group_id);
+                    progressed += 1;
+                }
+                Ok(IngestOutcome::Processed) => {
                     // The peeled content now has its own content-derived record;
                     // retire the raw transport wrapper so it does not keep
                     // re-entering this retry loop as a stale duplicate — but ONLY
@@ -1125,6 +1134,15 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(e);
                 }
             }
+        }
+
+        if buffered_convergence_input && self.has_unresolved_convergence_inputs(group_id)? {
+            self.converge_stored_openmls_messages_with_time(group_id, now)
+                .map_err(|error| {
+                    EngineError::Backend(format!(
+                        "converge deferred-peel batch after candidate admission: {error}"
+                    ))
+                })?;
         }
 
         let queue_depth = {
@@ -1418,6 +1436,8 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
         let records = self.storage.list_messages(group_id, EpochId(0))?;
+        let replay_admission_time = self.convergence_now();
+        let mut buffered_convergence_input = false;
         for record in records {
             if !matches!(
                 record.state,
@@ -1432,10 +1452,15 @@ impl<S: StorageProvider> Engine<S> {
             };
             let was_peel_deferred = record.state == MessageState::PeelDeferred;
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec(), was_peel_deferred)
+                .ingest_group_message(
+                    &msg,
+                    group_id.as_slice().to_vec(),
+                    was_peel_deferred.then_some(replay_admission_time),
+                )
                 .await
             {
                 Ok(IngestOutcome::Buffered { .. }) => {
+                    buffered_convergence_input = true;
                     if was_peel_deferred {
                         // The content-derived row is now the buffered
                         // convergence witness; retire the raw deferred wrapper
@@ -1522,6 +1547,15 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(e);
                 }
             }
+        }
+        if buffered_convergence_input && self.has_unresolved_convergence_inputs(group_id)? {
+            let now = self.convergence_now();
+            self.converge_stored_openmls_messages_with_time(group_id, now)
+                .map_err(|error| {
+                    EngineError::Backend(format!(
+                        "converge buffered replay batch after candidate admission: {error}"
+                    ))
+                })?;
         }
         Ok(())
     }

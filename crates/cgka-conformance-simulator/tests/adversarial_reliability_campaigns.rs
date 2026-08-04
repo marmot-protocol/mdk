@@ -163,9 +163,14 @@ async fn losing_branch_invite_has_a_named_unrecoverable_outcome() {
 
 #[tokio::test]
 async fn remaining_catalog_workloads_execute_under_the_strict_oracle() {
-    for case_index in [4, 5, 6, 7, 8, 9, 11] {
+    for case_index in [4, 5, 6, 7, 8, 11] {
         let _ = assert_generated_case(case_index).await;
     }
+}
+
+#[tokio::test]
+async fn branch_local_app_witnesses_converge_independent_of_transport_order() {
+    let _ = assert_generated_case(9).await;
 }
 
 #[tokio::test]

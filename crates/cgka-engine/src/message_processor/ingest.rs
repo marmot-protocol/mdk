@@ -48,6 +48,7 @@ struct PastPeelRecovery {
     message_retention_seconds: Option<u64>,
     snapshot_name: String,
     attempt_count: u64,
+    candidate_branch_context: bool,
 }
 
 struct RetainedSelfRemoveProposal {
@@ -164,7 +165,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
-        allow_candidate_branch_contexts: bool,
+        candidate_admission_time: Option<crate::convergence_clock::ConvergenceTime>,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
 
@@ -362,6 +363,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
             let mut recovered_source_retention = None;
+            let mut recovered_from_candidate_branch = false;
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
@@ -370,7 +372,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg,
                             &group_id,
                             current_epoch,
-                            allow_candidate_branch_contexts,
+                            candidate_admission_time.is_some(),
                         )
                         .await
                     {
@@ -410,6 +412,7 @@ impl<S: StorageProvider> Engine<S> {
                         Err(e) => return Err(e),
                     };
                     if let Some(recovery) = recovered {
+                        recovered_from_candidate_branch = recovery.candidate_branch_context;
                         recovered_source_retention =
                             Some((recovery.source_epoch, recovery.message_retention_seconds));
                         self.audit_group(
@@ -494,7 +497,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg,
                             &group_id,
                             current_epoch,
-                            allow_candidate_branch_contexts,
+                            candidate_admission_time.is_some(),
                         )
                         .await
                     {
@@ -534,6 +537,7 @@ impl<S: StorageProvider> Engine<S> {
                         Err(e) => return Err(e),
                     };
                     if let Some(recovery) = recovered {
+                        recovered_from_candidate_branch = recovery.candidate_branch_context;
                         recovered_source_retention =
                             Some((recovery.source_epoch, recovery.message_retention_seconds));
                         self.audit_group(
@@ -734,6 +738,37 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
+
+            // A candidate branch context authenticates the outer transport
+            // wrapper, but it does not replace the live OpenMLS group. Feed
+            // the recovered inner message into branch materialization rather
+            // than asking the canonical live state to decrypt it. In
+            // particular, a same-epoch application message on a sibling
+            // branch otherwise reaches `process_message` on the wrong secret
+            // tree and surfaces an AeadError that aborts the whole drain.
+            if recovered_from_candidate_branch {
+                let now = candidate_admission_time
+                    .expect("candidate contexts are only attempted with a pinned admission time");
+                self.buffer_openmls_convergence_message_with_time(
+                    &group_id,
+                    openmls_msg.clone(),
+                    now,
+                )
+                .map_err(|error| {
+                    EngineError::Backend(format!("buffer candidate-branch message: {error}"))
+                })?;
+                // Do not freeze a convergence pass here. Candidate contexts are
+                // only enabled while a caller is draining retained input, and
+                // converging after the first recovered row would make branch
+                // selection depend on transport order: later app witnesses in
+                // the same bounded drain would miss the frozen batch. The drain
+                // retires the raw wrapper and starts one pass after admitting all
+                // currently recoverable content rows.
+                return Ok(IngestOutcome::Buffered {
+                    group_id,
+                    epoch: current_epoch,
+                });
+            }
 
             // Pre-membership classification (mdk#339): an application
             // message whose MLS epoch precedes this device's join epoch can
@@ -1169,6 +1204,19 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         self.audit_group(&group_id, decoded);
                     }
+                    // Preserve app-witness order independence across the two
+                    // ingest routes. A live-branch app authenticated while a
+                    // competing-branch pass is collecting must join the same
+                    // frozen set as candidate-branch apps recovered below the
+                    // transport seam.
+                    self.admit_authenticated_app_witness_with_time(
+                        &group_id,
+                        &msg.id,
+                        candidate_admission_time.unwrap_or_else(|| self.convergence_now()),
+                    )
+                    .map_err(|error| {
+                        EngineError::Backend(format!("admit authenticated app witness: {error}"))
+                    })?;
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
                         sender,
@@ -2466,6 +2514,7 @@ impl<S: StorageProvider> Engine<S> {
                         message_retention_seconds,
                         snapshot_name,
                         attempt_count,
+                        candidate_branch_context: false,
                     }));
                 }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
@@ -2531,6 +2580,7 @@ impl<S: StorageProvider> Engine<S> {
                             candidate.source_epoch.0
                         ),
                         attempt_count,
+                        candidate_branch_context: true,
                     }));
                 }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => {}
