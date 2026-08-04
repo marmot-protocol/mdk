@@ -406,6 +406,49 @@ fn an_untimed_repair_does_not_clear_a_halt() {
 }
 
 #[test]
+fn one_untimed_halt_row_among_timed_ones_still_blocks_a_later_repair() {
+    // Mixed instrumentation: the same engine and group recorded an untimed halt, a
+    // timed halt, and then a repair newer than the *timed* halt. The untimed row
+    // may be the newest evidence of all — nothing in the export says otherwise —
+    // so the halt is unorderable and stands, exactly as when no halt row carries a
+    // clock at all. Reading the newest timed halt as *the* halt position is the
+    // fail-open direction: it lets a repair clear a halt whose real position is
+    // unknown, turning a live halt into a healthy verdict on partially
+    // instrumented input.
+    assert_eq!(
+        classify(&load("quarantine-partially-timed-halt-with-repair.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_repair_sharing_the_halt_millisecond_does_not_clear_it() {
+    // The other boundary of the same comparison: both rows carry a clock, and it
+    // is the same one. A millisecond is coarser than the two transitions, so a
+    // tie says only that they landed in the same tick — not which came first —
+    // and the two orders have opposite meanings. Strictly-after is therefore the
+    // rule, and a tie fails closed like any other unorderable pair.
+    assert_eq!(
+        classify(&load("quarantine-halt-and-repair-at-one-instant.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
 fn a_convergence_run_at_the_tip_proves_the_engine_is_not_behind() {
     // engine-b's group-state evidence stops at epoch 4, but it went on to run a
     // convergence pass whose canonical tip was 6 — an epoch it can only have

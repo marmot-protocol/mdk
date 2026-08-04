@@ -169,14 +169,22 @@ Precedence, highest first:
    stable` alone is the engine's ordinary healthy state (see the rejected designs
    below). Clearing is decided per **`(engine_id, group_ref)`** — `Unrecoverable`
    is per-group state, so a repair in one group must not clear another group's
-   halt — by **newest halt vs. newest repair**, with surviving halts folded back
+   halt — by **repair strictly after the newest halt**, with surviving halts
+   folded back
    per engine so an engine halted in two groups is still one halted engine with
    the union of its reasons. Newest-wins needs no global event ordering because a
    live halt is continuously re-asserted (every session open re-emits
    `hydrate_unrecoverable_group`; every convergence attempt emits
    `already_unrecoverable`), so a halt that outlived its repair leaves rows after
    it. Both rows come from one engine — one clock, one recorder file — so rule 6's
-   cross-device grace does not apply here. It therefore outranks rule 6, which it usually
+   cross-device grace does not apply here. Two boundaries of that comparison are
+   contract, not incident: a repair sharing the halt's millisecond does **not**
+   clear it (a tie orders nothing, and the two orders mean opposite things), and
+   **one untimed halt row makes the whole halt side unorderable** — not just that
+   row. The untimed row may be the newest halt evidence there is, so the newest
+   *timed* halt is only a lower bound on the halt's position and a repair after
+   that bound proves nothing; taking it as the halt's position is the fail-open
+   direction, clearing a live halt on partially instrumented input. It therefore outranks rule 6, which it usually
    explains: on the real 26a9f546 export the halted engine is exactly the one
    rule 6 labelled `went dark`, and reporting the inference over the diagnosis
    would send the operator to re-pull for a confirmation they already have.
