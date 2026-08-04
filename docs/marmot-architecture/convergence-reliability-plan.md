@@ -974,24 +974,24 @@ that scaling the existing corpus is sufficient.
 
 ### 6.1 Decision-route assurance closure
 
-- [ ] Inventory every production path that selects, rejects, defers, invalidates, replays, or applies a competing
+- [x] Inventory every production path that selects, rejects, defers, invalidates, replays, or applies a competing
   commit, and map each site to the adopted canonical rule, reference-model transition, mutation sentinel, and campaign
   family that exercises it.
-- [ ] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
+- [x] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
   result does not depend on whether input first passes through pairwise fork recovery, ordinary ingest, stored
   convergence, retained-history replay, or crash/restart recovery.
-- [ ] Promote the #1236 incident into a permanent synthetic regression family with at least four participants,
+- [x] Promote the #1236 incident into a permanent synthetic regression family with at least four participants,
   simultaneous same-source-epoch committers, committer-versus-observer routing, ordering-key-versus-depth disagreement,
   branch growth, application traffic, delivery permutations, and restarts around every durable transition.
-- [ ] Extend the independent selector/lifecycle models and mutation matrix with route choice, reconsiderable versus
+- [x] Extend the independent selector/lifecycle models and mutation matrix with route choice, reconsiderable versus
   terminal loser disposition, volatile routing history, restart, and deliberately inconsistent decision seams.
-- [ ] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
+- [x] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
   in every adapter that can expose them. Epoch, roster, profile, and visible projection equality are insufficient on
   their own.
-- [ ] Require a durable disposition for every scenario application input: canonical projection, explicit invalidation,
+- [x] Require a durable disposition for every scenario application input: canonical projection, explicit invalidation,
   retry/resend eligibility, or a named fail-closed outcome. Include sender-visible handling for application messages
   invalidated by fork recovery.
-- [ ] Record which assurance claims each route-equivalence campaign covers and reopen a claim when a field, soak, or
+- [x] Record which assurance claims each route-equivalence campaign covers and reopen a claim when a field, soak, or
   mutation result falsifies one of its premises.
 
 ### 6.2 Container and VM execution

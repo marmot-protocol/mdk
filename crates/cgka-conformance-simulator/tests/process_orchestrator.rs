@@ -6,9 +6,10 @@ use cgka_conformance_simulator::process_orchestrator::{
     PROCESS_SCENARIO_REPORT_SCHEMA_VERSION, ProcessOrchestrator,
 };
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
-    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, compile_scenario, run_scenario_report,
-    run_scenario_report_with_subject,
+    AppRuntimeHarness, RouteCampaignAdapter, RouteRestartCheckpoint, ScenarioAccountV2,
+    ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec, ScenarioStep,
+    ScenarioTopologyV2, compile_scenario, generate_cross_route_regression_family,
+    run_scenario_report, run_scenario_report_with_subject, scenario_for_route_adapter,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -237,6 +238,61 @@ async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
         assert!(observation.application.invalidated_message_ids.is_empty());
         assert!(observation.progress.observably_quiescent());
     }
+    orchestrator.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn separate_processes_recover_the_cross_route_deeper_branch() {
+    let campaign = generate_cross_route_regression_family()
+        .into_iter()
+        .find(|campaign| campaign.restart_checkpoint == RouteRestartCheckpoint::None)
+        .unwrap();
+    let scenario = scenario_for_route_adapter(&campaign, RouteCampaignAdapter::Process);
+    let artifacts = tempfile::tempdir().unwrap();
+    let mut orchestrator = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &scenario,
+        artifacts.path(),
+    )
+    .await
+    .unwrap();
+
+    let report = orchestrator.run().await.unwrap();
+    assert!(report.completed, "{report:#?}");
+    assert_eq!(report.decryptability_probes.len(), 1, "{report:#?}");
+    assert!(report.decryptability_probes[0].succeeded(), "{report:#?}");
+    assert!(
+        report
+            .application_dispositions
+            .iter()
+            .all(|disposition| !disposition.entry.pending),
+        "{report:#?}"
+    );
+    let final_observations = &report.observations[report.observations.len() - 4..];
+    assert_eq!(
+        final_observations
+            .iter()
+            .map(|observation| observation.protocol.epoch)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{final_observations:#?}"
+    );
+    assert!(
+        final_observations
+            .iter()
+            .all(|observation| observation.protocol.member_count == 6),
+        "{final_observations:#?}"
+    );
+    assert_eq!(
+        final_observations
+            .iter()
+            .map(|observation| observation.protocol.state_commitment_sha256.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{final_observations:#?}"
+    );
     orchestrator.shutdown().await;
 }
 

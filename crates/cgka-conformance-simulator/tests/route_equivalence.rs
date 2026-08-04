@@ -162,6 +162,7 @@ fn route_matrix_names_every_production_owner_and_executable_mutation() {
         "pairwise_fork_recovery",
         "stored_convergence",
         "candidate_materialization",
+        "candidate_branch_transport_admission",
         "retained_history_replay",
         "crash_restart_recovery",
         "application_disposition",

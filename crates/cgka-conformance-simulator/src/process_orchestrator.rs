@@ -1498,6 +1498,8 @@ fn process_subject_descriptor() -> SubjectDescriptor {
             SubjectCapability::ApplicationMessaging,
             SubjectCapability::TransportDelivery,
             SubjectCapability::EventObservation,
+            SubjectCapability::ExactConformanceObservation,
+            SubjectCapability::ActiveDecryptabilityProbe,
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
             SubjectCapability::VirtualTime,

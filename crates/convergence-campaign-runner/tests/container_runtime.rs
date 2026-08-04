@@ -3,8 +3,9 @@
 
 use cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1;
 use cgka_conformance_simulator::{
-    ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec,
-    ScenarioStep, ScenarioTopologyV2,
+    RouteCampaignAdapter, RouteRestartCheckpoint, ScenarioAccountV2, ScenarioDeviceV2,
+    ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
+    generate_cross_route_regression_family, scenario_for_route_adapter,
 };
 use convergence_campaign_runner::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
@@ -160,4 +161,66 @@ async fn real_container_nodes_survive_network_shaping_and_reach_exact_state() {
             .unwrap();
     assert!(process_report.completed);
     assert!(process_report.decryptability_probes[0].succeeded());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires `docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .`"]
+async fn real_container_nodes_recover_the_cross_route_deeper_branch() {
+    let campaign = generate_cross_route_regression_family()
+        .into_iter()
+        .find(|campaign| campaign.restart_checkpoint == RouteRestartCheckpoint::None)
+        .unwrap();
+    let scenario = scenario_for_route_adapter(&campaign, RouteCampaignAdapter::Distributed);
+    let root = tempfile::tempdir().unwrap();
+    let scenario_path = root.path().join("scenario.json");
+    let scenario_bytes = serde_json::to_vec_pretty(&scenario).unwrap();
+    fs_private::write_private(&scenario_path, &scenario_bytes).unwrap();
+    let image = std::env::var("CGKA_CONVERGENCE_IMAGE")
+        .unwrap_or_else(|_| "marmot-conformance:local".into());
+    let manifest = DistributedCampaignManifestV1 {
+        schema_version: "1".into(),
+        campaign_id: "cross-route-deeper-branch-container-v1".into(),
+        scenario: ScenarioArtifactV1 {
+            path: scenario_path,
+            sha256: hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+        },
+        participants: scenario
+            .clients
+            .iter()
+            .map(|id| DistributedParticipantV1 {
+                id: id.clone(),
+                build_id: "current".into(),
+                container_image: None,
+            })
+            .collect(),
+        backend: DistributedBackendV1::Container(ContainerBackendV1 {
+            runtime: OciRuntimeV1::Docker,
+            namespace: format!("marmot-cross-route-{}", std::process::id()),
+            default_participant_image: image.clone(),
+            relay_image: image,
+            relay_command: vec![
+                "cgka-conformance-relay".into(),
+                "--bind".into(),
+                "0.0.0.0:8080".into(),
+            ],
+            node_command: vec!["cgka-conformance-node".into()],
+        }),
+        faults: Vec::new(),
+        output_dir: root.path().join("output"),
+    };
+
+    let receipt = run_manifest(&manifest).await.unwrap();
+    assert!(receipt.completed, "{receipt:#?}");
+    let process_report: ProcessScenarioReportV1 =
+        serde_json::from_slice(&std::fs::read(receipt.process_report.as_ref().unwrap()).unwrap())
+            .unwrap();
+    assert!(process_report.completed, "{process_report:#?}");
+    assert_eq!(process_report.decryptability_probes.len(), 1);
+    assert!(process_report.decryptability_probes[0].succeeded());
+    assert!(
+        process_report
+            .application_dispositions
+            .iter()
+            .all(|disposition| !disposition.entry.pending)
+    );
 }
