@@ -68,9 +68,18 @@ const ESCALATION_ARM_THRESHOLD: usize = 3;
 /// Deadline for one of alice's commits to reach bob and advance his epoch.
 const EPOCH_ADVANCE_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Wait that outlasts the engine's convergence quiescence window, so bob's
-/// convergence pass can open and fold alice's retained commit.
-const CONVERGENCE_QUIESCENCE_WAIT: Duration = Duration::from_millis(1_200);
+/// Poll interval while waiting for bob's epoch to advance.
+///
+/// The engine's settlement quiescence window (`V1_SETTLEMENT_QUIESCENCE_MS`, 1 s)
+/// is a genuine floor on how soon bob's open convergence pass can freeze and
+/// fold alice's commit, so this wait cannot be removed — but it can be *waited
+/// out* rather than slept through. The window's deadline is only pushed back when
+/// the pass admits an input that could change its deterministic resolution
+/// (`cgka_engine::distributed_convergence::admit_convergence_input`), and neither
+/// re-draining nor re-driving convergence admits one once alice's single commit
+/// is in, so polling this fast converges on the floor instead of on a multiple of
+/// it.
+const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -311,9 +320,14 @@ impl StalledGroup {
     /// commit, without ever reaching the group's live epoch on his own.
     ///
     /// Applying an inbound commit is a two-step in this crate: the delivery is
-    /// retained by `sync`, and the convergence pass that folds it opens only
-    /// after its quiescence window closes. The account worker drives that second
+    /// retained by `sync`, and the convergence pass that folds it cannot freeze
+    /// until its quiescence window closes. The account worker drives that second
     /// step; a direct client must call `retry_group_convergence` itself.
+    ///
+    /// Awaits bob's observable epoch rather than a fixed wait, the shape
+    /// `wait_for_inbound_delivered` in `since_floor.rs` uses: each pass re-drains,
+    /// re-drives convergence, and reads the epoch, so the loop returns as soon as
+    /// the fold lands instead of one whole `EPOCH_ADVANCE_POLL_INTERVAL` late.
     async fn advance_bobs_epoch(&mut self, name: &str) {
         let before = self.bobs_epoch();
         self.alice
@@ -323,7 +337,6 @@ impl StalledGroup {
         let deadline = Instant::now() + EPOCH_ADVANCE_DEADLINE;
         loop {
             self.bob.sync().await.unwrap();
-            sleep(CONVERGENCE_QUIESCENCE_WAIT).await;
             self.bob
                 .retry_group_convergence(&self.group_id)
                 .await
@@ -335,6 +348,7 @@ impl StalledGroup {
                 Instant::now() < deadline,
                 "bob did not apply alice's commit within the deadline",
             );
+            sleep(EPOCH_ADVANCE_POLL_INTERVAL).await;
         }
     }
 
