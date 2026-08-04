@@ -368,10 +368,18 @@ fn cross_route_scenario(
         ScenarioStep::Tick {
             clients: core_clients.clone(),
         },
+        // Candidate-branch outer decryption is deliberately admitted through
+        // the bounded deferred-peel sweep rather than attacker-paced initial
+        // ingest. That sweep can open a fresh convergence pass, so advance a
+        // second quiescence window before asserting the fixed point.
+        ScenarioStep::AdvanceTime { delta_ms: 1_000 },
         ScenarioStep::DeliverAll,
         ScenarioStep::Tick {
             clients: core_clients.clone(),
         },
+        in_group(ScenarioStep::ObserveExact {
+            clients: core_clients.clone(),
+        }),
         in_group(ScenarioStep::SendAppMessage {
             sender: "alice".into(),
             payload: "application-after-cross-route-settlement/alice".into(),

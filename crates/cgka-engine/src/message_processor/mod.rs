@@ -103,6 +103,13 @@ impl DeferredPeelGroupState {
 
     fn note_row_persisted(&mut self) {
         self.deferred_rows += 1;
+        // The direct ingest attempt used only the canonical and retained
+        // past-epoch contexts. A newly retained ciphertext has not yet been
+        // tried against reconstructed competing branch-tip contexts, even if
+        // the group's context fingerprint itself is unchanged. Reopen the
+        // bounded sweep so this row receives that one lifecycle-governed
+        // attempt; its durable per-row fingerprint prevents repeated work.
+        self.gate = None;
     }
 }
 
@@ -274,7 +281,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.ingest_welcome(&msg, recipient.clone()).await?
             }
             TransportEnvelope::GroupMessage { transport_group_id } => {
-                self.ingest_group_message(&msg, transport_group_id.clone())
+                self.ingest_group_message(&msg, transport_group_id.clone(), false)
                     .await?
             }
         };
@@ -968,9 +975,10 @@ impl<S: StorageProvider> Engine<S> {
             .is_some_and(|state| state.gate == Some(fingerprint))
         {
             // The peel context is unchanged since the last full unproductive
-            // cycle: every retained row would fail exactly as before. New
-            // deferrals don't clear this gate either — a row is only deferred
-            // after failing a live peel against this same context.
+            // cycle: every retained row would fail exactly as before. A newly
+            // admitted row clears this gate because direct ingest did not try
+            // reconstructed branch-tip contexts; its durable row fingerprint
+            // suppresses repeat work after the bounded sweep reaches it.
             tracing::debug!(
                 target: "cgka_engine::message_processor",
                 method = "retry_deferred_peels",
@@ -1037,7 +1045,7 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             };
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec())
+                .ingest_group_message(&msg, group_id.as_slice().to_vec(), true)
                 .await
             {
                 Ok(IngestOutcome::TransportDeferred { .. }) => {}
@@ -1184,8 +1192,9 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Fingerprint of everything that can change a deferred peel's outcome:
-    /// the group's live epoch and the retained peel-snapshot set. While this
-    /// is unchanged, re-peeling a deferred row is guaranteed wasted work.
+    /// the group's live epoch, retained peel-snapshot set, and authenticated
+    /// commit graph used to reconstruct competing branch-tip contexts. While
+    /// this is unchanged, re-peeling a deferred row is guaranteed wasted work.
     fn deferred_peel_context_fingerprint(
         &self,
         group_id: &GroupId,
@@ -1203,6 +1212,36 @@ impl<S: StorageProvider> Engine<S> {
         for name in names {
             hasher.update((name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
+        }
+        let mut candidate_rows = self
+            .storage
+            .list_messages(group_id, EpochId(0))?
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    MessageState::Sent
+                        | MessageState::Created
+                        | MessageState::Retryable
+                        | MessageState::ConvergenceDeferred
+                        | MessageState::Processed
+                ) && crate::openmls_projection::decode_openmls_wire_projection(&record.payload)
+                    .is_some_and(|(_, projection)| {
+                        projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
+                    })
+            })
+            .map(|record| {
+                (
+                    record.id.as_slice().to_vec(),
+                    crate::audit_helpers::message_state_str(record.state),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidate_rows.sort();
+        for (message_id, state) in candidate_rows {
+            hasher.update((message_id.len() as u64).to_be_bytes());
+            hasher.update(message_id);
+            hasher.update(state.as_bytes());
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&hasher.finalize());
@@ -1393,7 +1432,7 @@ impl<S: StorageProvider> Engine<S> {
             };
             let was_peel_deferred = record.state == MessageState::PeelDeferred;
             match self
-                .ingest_group_message(&msg, group_id.as_slice().to_vec())
+                .ingest_group_message(&msg, group_id.as_slice().to_vec(), was_peel_deferred)
                 .await
             {
                 Ok(IngestOutcome::Buffered { .. }) => {

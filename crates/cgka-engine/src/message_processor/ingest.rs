@@ -12,8 +12,9 @@ use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
 use crate::identity::member_id_of_sender;
 use crate::openmls_projection::{
-    OpenMlsContentKind, process_commit_with_app_data_updates, project_mls_message,
-    retained_anchor_epoch_from_snapshot_name,
+    OpenMlsContentKind, OpenMlsProjectionError, ReplayProfilePolicy,
+    process_commit_with_app_data_updates, project_mls_message,
+    retained_anchor_epoch_from_snapshot_name, stored_candidate_peel_contexts,
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -163,6 +164,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
+        allow_candidate_branch_contexts: bool,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
 
@@ -368,6 +370,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg,
                             &group_id,
                             current_epoch,
+                            allow_candidate_branch_contexts,
                         )
                         .await
                     {
@@ -491,6 +494,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg,
                             &group_id,
                             current_epoch,
+                            allow_candidate_branch_contexts,
                         )
                         .await
                     {
@@ -2411,6 +2415,7 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
+        allow_candidate_branch_contexts: bool,
     ) -> Result<Option<PastPeelRecovery>, EngineError> {
         use crate::snapshot_guard::SnapshotRollbackGuard;
         let snapshots = self.available_past_peel_snapshots(group_id)?;
@@ -2465,6 +2470,71 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
                 Err(err) => return Err(EngineError::Peeler(err)),
+            }
+        }
+
+        // A future commit on a provisionally losing SAME-EPOCH branch is not
+        // decryptable with either the canonical context or a past-epoch
+        // snapshot. Reconstruct every still-eligible sibling tip under the
+        // bounded convergence candidate graph and try those memory-only
+        // contexts. This is transport admission only: a successful peel still
+        // enters ordinary authenticated MLS validation and canonicalization.
+        //
+        // Do this only from the bounded deferred-peel retry lifecycle, never
+        // on an attacker-paced first delivery. The first miss durably consumes
+        // one of the per-group deferred-row slots; sweeps then cap both rows per
+        // pass and distinct context attempts per row.
+        if !allow_candidate_branch_contexts {
+            return Ok(None);
+        }
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
+        let profile_policy = ReplayProfilePolicy {
+            reject_legacy_group_additions: self.new_protocol_profile
+                == cgka_traits::group::ProtocolProfile::Current,
+        };
+        let branch_contexts = match stored_candidate_peel_contexts(
+            &self.storage,
+            group_id,
+            current_epoch,
+            policy.convergence.max_rewind_commits,
+            profile_policy,
+        ) {
+            Ok(contexts) => contexts,
+            // Candidate amplification is already bounded by the convergence
+            // replay budget. Exhaustion leaves the raw row deferred; its
+            // durable retry/residence policy supplies the named resource
+            // refusal instead of turning hostile branch shape into an engine
+            // error that aborts the whole drain.
+            Err(OpenMlsProjectionError::ReplayBudgetExceeded) => return Ok(None),
+            Err(error) => {
+                return Err(EngineError::Backend(format!(
+                    "materialize candidate peel contexts: {error}"
+                )));
+            }
+        };
+        for candidate in branch_contexts {
+            attempt_count = attempt_count.saturating_add(1);
+            match self
+                .peeler
+                .peel_group_message(msg, &candidate.context)
+                .await
+            {
+                Ok(peeled) => {
+                    return Ok(Some(PastPeelRecovery {
+                        peeled,
+                        source_epoch: candidate.source_epoch,
+                        message_retention_seconds: candidate.message_retention_seconds,
+                        snapshot_name: format!(
+                            "candidate-branch-context-{}",
+                            candidate.source_epoch.0
+                        ),
+                        attempt_count,
+                    }));
+                }
+                Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => {}
+                Err(error) => return Err(EngineError::Peeler(error)),
             }
         }
         Ok(None)

@@ -21,7 +21,7 @@ use crate::engine::Engine;
 use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{MessageStorage, StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::{AuditEventKind, ForkWinner};
@@ -188,6 +188,44 @@ impl ForkRecoveryManager {
             Err(StorageError::NotFound) => None,
             Err(e) => return Err(EngineError::Storage(e)),
         };
+        // The pre-commit snapshot also predates every local descendant of the
+        // incumbent root. Preserve authenticated descendant commits before the
+        // rollback so a branch that already grew locally does not lose the
+        // very evidence that makes it canonical. This matters when the outer
+        // transport echo is withheld or delayed: OpenMLS cannot process our
+        // own commit again, so the confirm-time convergence stamp on this row
+        // is the only replayable representation of that descendant.
+        let mut displaced_descendant_commits = storage
+            .list_messages(group_id, source_epoch)?
+            .into_iter()
+            .filter(|record| record.id != incumbent.storage_id)
+            .filter_map(|mut record| {
+                let payload = StoredMessagePayload::decode(&record.payload).ok()?;
+                let message = payload.as_openmls_wire()?;
+                if message.payload.as_slice() == candidate_mls_bytes {
+                    return None;
+                }
+                let projection =
+                    crate::openmls_projection::project_mls_message(&message.payload).ok()?;
+                let projected_source_epoch = projection.source_epoch?;
+                if projection.kind != crate::openmls_projection::OpenMlsContentKind::Commit
+                    || projected_source_epoch <= source_epoch.0
+                {
+                    return None;
+                }
+                record.epoch = EpochId(projected_source_epoch);
+                // Unlike the displaced root, a descendant is new branch-growth
+                // evidence that must open the next convergence generation.
+                // `ConvergenceDeferred` is reconsiderable only when some new
+                // Created/Retryable edge opens a pass; using it here would
+                // leave a locally-authored deeper branch parked forever after
+                // the rollback removed its canonical status.
+                record.state = MessageState::Retryable;
+                Some(record)
+            })
+            .collect::<Vec<_>>();
+        displaced_descendant_commits
+            .sort_by(|left, right| left.id.as_slice().cmp(right.id.as_slice()));
         storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
 
         // Ordering rationale (recoverability). The displaced row is
@@ -231,6 +269,9 @@ impl ForkRecoveryManager {
         if let Some(mut record) = displaced_incumbent_row {
             record.epoch = incumbent.source_epoch;
             record.state = MessageState::ConvergenceDeferred;
+            storage.put_message(&record)?;
+        }
+        for record in displaced_descendant_commits {
             storage.put_message(&record)?;
         }
 

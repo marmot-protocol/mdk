@@ -185,7 +185,7 @@ fn route_matrix_names_every_production_owner_and_executable_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scheduler_route_counterexample_is_exact_decryptable_and_reopens_depth_claim() {
+async fn scheduler_route_recovers_the_deeper_branch_through_candidate_peel_contexts() {
     let campaign = generate_cross_route_regression_family()
         .into_iter()
         .find(|campaign| campaign.restart_checkpoint == RouteRestartCheckpoint::None)
@@ -199,12 +199,22 @@ async fn scheduler_route_counterexample_is_exact_decryptable_and_reopens_depth_c
             .step_log
             .iter()
             .all(|step| step.status.is_completed()),
-        "{report:#?}"
+        "observations before failure: {:#?}; step log: {:#?}",
+        report
+            .observed_trace
+            .as_ref()
+            .map(|trace| &trace.observations),
+        report.step_log,
     );
     let trace = report.observed_trace.as_ref().unwrap();
     assert!(trace.errors.is_empty(), "{trace:#?}");
     assert_eq!(trace.decryptability_probes.len(), 1);
-    assert!(trace.decryptability_probes[0].succeeded(), "{trace:#?}");
+    assert!(
+        trace.decryptability_probes[0].succeeded(),
+        "decryptability probe: {:#?}; observations: {:#?}",
+        trace.decryptability_probes[0],
+        trace.observations
+    );
     let pre_follow_on = &trace.observations[..4];
     let bob_alice_root = pre_follow_on
         .iter()
@@ -228,14 +238,8 @@ async fn scheduler_route_counterexample_is_exact_decryptable_and_reopens_depth_c
         .collect::<BTreeSet<_>>();
     assert_eq!(exact.len(), 1, "{final_observations:#?}");
     for observation in final_observations {
-        assert_eq!(
-            observation.epoch, 2,
-            "the scheduler-route counterexample currently selects the shallow branch: {observation:#?}"
-        );
-        assert_eq!(
-            observation.member_count, 5,
-            "the deeper follow-on invite is currently absent from the selected branch"
-        );
+        assert_eq!(observation.epoch, 3, "{observation:#?}");
+        assert_eq!(observation.member_count, 6, "{observation:#?}");
         assert_eq!(observation.group_name, "cross-route-base");
         assert!(
             observation
@@ -260,8 +264,7 @@ async fn scheduler_route_counterexample_is_exact_decryptable_and_reopens_depth_c
     let mut claim =
         AssuranceClaimRecordV1::open(cgka_conformance_simulator::RECONSIDERABLE_LOSER_CLAIM);
     claim.cover(&campaign.campaign_id);
-    claim.reopen("scheduler_route_selects_shallow_branch_after_pairwise_then_follow_on");
-    assert_eq!(claim.status, AssuranceClaimStatus::Reopened);
+    assert_eq!(claim.status, AssuranceClaimStatus::Covered);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -314,7 +317,7 @@ async fn cross_route_family_reaches_exact_decryptable_app_runtime_state() {
 
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scheduler_route_counterexample_persists_without_application_witnesses() {
+async fn scheduler_route_recovers_the_deeper_branch_without_application_witnesses() {
     let campaign = generate_cross_route_regression_family()
         .into_iter()
         .find(|campaign| campaign.restart_checkpoint == RouteRestartCheckpoint::None)
@@ -336,7 +339,7 @@ async fn scheduler_route_counterexample_persists_without_application_witnesses()
     assert!(
         final_observations
             .iter()
-            .all(|observation| observation.epoch == 2),
+            .all(|observation| observation.epoch == 3),
         "{final_observations:#?}"
     );
 }

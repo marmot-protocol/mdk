@@ -12,6 +12,7 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::{Member, ProtocolProfile};
+use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -246,6 +247,16 @@ pub(crate) struct StoredCanonicalizationOptions<'a> {
     pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
     pub(crate) admit_app_witnesses: bool,
     pub(crate) replay_probe_budget_override: Option<u64>,
+}
+
+/// A transport peel context reconstructed from one authenticated competing
+/// OpenMLS branch. It is deliberately memory-only: exporter bytes are held in
+/// [`GroupContextSnapshot`] (and zeroized on drop), never copied into message
+/// rows, reports, or forensic artifacts.
+pub(crate) struct CandidatePeelContext {
+    pub(crate) context: GroupContextSnapshot,
+    pub(crate) source_epoch: EpochId,
+    pub(crate) message_retention_seconds: Option<u64>,
 }
 
 impl Default for StoredCanonicalizationOptions<'_> {
@@ -1070,6 +1081,213 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
     Ok(result)
+}
+
+/// Reconstruct the tip context of every currently reachable competing branch
+/// inside the retained convergence horizon.
+///
+/// The outer transport envelope is encrypted with the sender's branch-local
+/// MLS exporter. A follow-on commit can therefore be opaque to a member that
+/// provisionally selected a sibling branch at the same epoch. Looking only at
+/// the canonical and past-epoch snapshots creates a circular dependency: the
+/// engine cannot see the follow-on that proves the losing root became deeper,
+/// so it never selects the branch whose exporter would reveal that follow-on.
+///
+/// This helper breaks that cycle without putting transport policy into the
+/// selector. It replays only already-authenticated, retained commit roots under
+/// the same bounded candidate graph used by canonicalization and returns
+/// memory-only peeler contexts for their tips. A successful outer peel still
+/// has to pass ordinary MLS authentication and canonicalization before it can
+/// affect state.
+pub(crate) fn stored_candidate_peel_contexts<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    current_epoch: EpochId,
+    max_rewind_commits: u64,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<Vec<CandidatePeelContext>, OpenMlsProjectionError> {
+    let retained_anchor_epoch = current_epoch.0.saturating_sub(max_rewind_commits);
+    let records = storage
+        .list_messages(group_id, EpochId(0))
+        .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+    let mut commits = Vec::new();
+    let mut own_commits = PrevalidatedOwnCommits::default();
+
+    for record in records {
+        if !record_state_can_contribute_to_openmls_graph(record.state) {
+            continue;
+        }
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|error| OpenMlsProjectionError::Serialize(format!("{error:?}")))?;
+        let own_commit_stamp = payload.own_commit_stamp().cloned();
+        let Some(message) = payload.as_openmls_wire().cloned() else {
+            continue;
+        };
+        let projection = project_mls_message(&message.payload)?;
+        if projection.kind != OpenMlsContentKind::Commit {
+            continue;
+        }
+        let Some(source_epoch) = projection.source_epoch else {
+            continue;
+        };
+        if source_epoch < retained_anchor_epoch {
+            continue;
+        }
+        if record.state == MessageState::Processed {
+            own_commits.insert_canonical(projection.message_digest);
+        }
+        if let Some(stamp) = own_commit_stamp {
+            own_commits.insert_stamped(projection.message_digest, stamp);
+        }
+        commits.push(StoredCommitMessage {
+            message,
+            source_epoch,
+            digest: projection.message_digest,
+            state: record.state,
+        });
+    }
+    let historical_start = historical_replay_start_epoch(&commits, current_epoch.0);
+    let replay_start_epoch = historical_start.or_else(|| {
+        commits
+            .iter()
+            .filter(|commit| {
+                unresolved_commit_state(commit.state) && commit.source_epoch == current_epoch.0
+            })
+            .map(|commit| commit.source_epoch)
+            .min()
+    });
+    let Some(replay_start_epoch) = replay_start_epoch else {
+        return Ok(Vec::new());
+    };
+    if historical_start.is_none() {
+        // Starting from the live epoch only unresolved roots can extend the
+        // current state. Older Processed commits describe the prefix already
+        // embodied by that state and must not be replayed again.
+        commits.retain(|commit| {
+            unresolved_commit_state(commit.state) && commit.source_epoch >= current_epoch.0
+        });
+        return candidate_peel_contexts_from_current(
+            storage,
+            group_id,
+            commits,
+            replay_start_epoch,
+            own_commits,
+            max_rewind_commits,
+            profile_policy,
+        );
+    }
+
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+    let live_snapshot = retained_anchor_probe_snapshot_name(group_id, replay_start_epoch);
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), live_snapshot)
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    let anchor_snapshot = retained_anchor_snapshot_name(replay_start_epoch);
+    let result = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
+        Ok(()) => candidate_peel_contexts_from_current(
+            storage,
+            group_id,
+            commits,
+            replay_start_epoch,
+            own_commits,
+            max_rewind_commits,
+            profile_policy,
+        ),
+        Err(StorageError::SnapshotMissing(_)) => Ok(Vec::new()),
+        Err(error) => Err(OpenMlsProjectionError::Snapshot(format!("{error:?}"))),
+    };
+    guard
+        .commit()
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    result
+}
+
+fn candidate_peel_contexts_from_current<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    commits: Vec<StoredCommitMessage>,
+    replay_start_epoch: u64,
+    own_commits: PrevalidatedOwnCommits,
+    max_rewind_commits: u64,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<Vec<CandidatePeelContext>, OpenMlsProjectionError> {
+    let mut budget = ReplayBudget::for_pass(commits.len(), max_rewind_commits);
+    let paths = build_stored_openmls_candidate_paths(
+        storage,
+        group_id,
+        commits,
+        &[],
+        replay_start_epoch,
+        &own_commits,
+        profile_policy,
+        &mut budget,
+    )?
+    .candidate_paths;
+
+    let mut contexts = Vec::with_capacity(paths.len());
+    for path in paths {
+        budget.consume()?;
+        if let Some(context) = replay_candidate_peel_context(
+            storage,
+            group_id,
+            &path.messages,
+            &own_commits,
+            profile_policy,
+        )? {
+            contexts.push(context);
+        }
+    }
+    contexts.sort_by_key(|candidate| candidate.source_epoch);
+    Ok(contexts)
+}
+
+fn replay_candidate_peel_context<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<Option<CandidatePeelContext>, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+    let snapshot = replay_snapshot_name(group_id, messages);
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    let replay =
+        process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy);
+    let result = match replay {
+        Ok(_) => {
+            let crypto = RustCrypto::default();
+            let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+            let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+            let mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
+                .map_err(|error| {
+                    OpenMlsProjectionError::Replay(format!(
+                        "load candidate peel context: {error:?}"
+                    ))
+                })?
+                .ok_or(OpenMlsProjectionError::MissingGroup)?;
+            let source_epoch = EpochId(mls_group.epoch().as_u64());
+            let message_retention_seconds =
+                crate::app_components::message_retention_seconds_of_group(&mls_group)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+            let context =
+                crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+            Ok(Some(CandidatePeelContext {
+                context,
+                source_epoch,
+                message_retention_seconds,
+            }))
+        }
+        // Candidate construction already rejected paths that cannot replay.
+        // If a repeated materialization loses a race with retained state, skip
+        // that context and let ordinary convergence re-evaluate the row.
+        Err(OpenMlsProjectionError::Replay(_)) => Ok(None),
+        Err(error) => Err(error),
+    };
+    guard
+        .commit()
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    result
 }
 
 fn append_dropped_messages(
