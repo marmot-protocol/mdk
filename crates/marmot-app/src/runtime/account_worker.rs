@@ -1063,9 +1063,13 @@ async fn handle_account_worker_command(
             }
         }
         AccountWorkerCommand::RepairFullHistory { respond } => {
+            let sync_started_at = Instant::now();
             let result = match client.repair_full_history().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    if client.has_pending_epoch_backfill() {
+                        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
+                    }
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("repair_full_history");
                     }
@@ -1082,6 +1086,11 @@ async fn handle_account_worker_command(
                     Err(message)
                 }
             };
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountSync,
+                sync_started_at.elapsed(),
+                result.is_ok(),
+            );
             let _ = respond.send(result);
         }
         AccountWorkerCommand::CreateGroup {

@@ -77,13 +77,6 @@ pub struct AppRuntimeObservationV1 {
     pub local: AppRuntimeLocalDiagnosticsV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppRuntimeScenarioResultV1 {
-    pub schema_version: String,
-    pub adapter: SubjectDescriptor,
-    pub observations: Vec<AppRuntimeObservationV1>,
-}
-
 struct Participant {
     root: TempDir,
     app: MarmotApp,
@@ -242,7 +235,6 @@ impl AppRuntimeHarness {
         let relay_url = self.relay_url.clone();
         let participant = self.participant_mut(client)?;
         if participant.online
-            && participant.runtime.is_some()
             && let Some(runtime) = participant.runtime.take()
         {
             runtime.shutdown().await;
@@ -365,7 +357,44 @@ impl AppRuntimeHarness {
             if !participant.online {
                 continue;
             }
-            let group_id_hex = hex::encode(group_id.as_slice());
+            let members = participant
+                .runtime()?
+                .group_members(&participant.account_id, &group_id)
+                .await
+                .map_err(app_error)?;
+            participant.cached_members.insert(
+                group_label.clone(),
+                members
+                    .into_iter()
+                    .map(|member| member.member_id_hex)
+                    .collect(),
+            );
+            let state = participant
+                .runtime()?
+                .group_mls_state(&participant.account_id, &group_id)
+                .await
+                .map_err(app_error)?;
+            participant
+                .cached_epochs
+                .insert(group_label.clone(), state.epoch);
+            drain_runtime_events(participant);
+        }
+        Ok(())
+    }
+
+    async fn accept_pending_invites(&self, clients: &[String]) -> Result<(), SubjectError> {
+        let Some(group_label) = self.active_scenario_group.as_ref() else {
+            return Ok(());
+        };
+        let Some(group_id) = self.scenario_groups.get(group_label) else {
+            return Ok(());
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        for label in clients {
+            let participant = self.participant(label)?;
+            if !participant.online {
+                continue;
+            }
             if participant
                 .app
                 .group(&participant.account_id, &group_id_hex)
@@ -374,33 +403,10 @@ impl AppRuntimeHarness {
             {
                 participant
                     .runtime()?
-                    .accept_group_invite(&participant.account_id, &group_id)
+                    .accept_group_invite(&participant.account_id, group_id)
                     .await
                     .map_err(app_error)?;
             }
-            let members = participant
-                .runtime()?
-                .group_members(&participant.account_id, &group_id)
-                .await;
-            if let Ok(members) = members {
-                participant.cached_members.insert(
-                    group_label.clone(),
-                    members
-                        .into_iter()
-                        .map(|member| member.member_id_hex)
-                        .collect(),
-                );
-            }
-            if let Ok(state) = participant
-                .runtime()?
-                .group_mls_state(&participant.account_id, &group_id)
-                .await
-            {
-                participant
-                    .cached_epochs
-                    .insert(group_label.clone(), state.epoch);
-            }
-            drain_runtime_events(participant);
         }
         Ok(())
     }
@@ -734,7 +740,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
     }
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
-        self.catch_up(clients).await
+        self.catch_up(clients).await?;
+        self.accept_pending_invites(clients).await?;
+        self.refresh_cached_members(clients).await
     }
 
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
@@ -835,35 +843,109 @@ impl AppRuntimeHarness {
             .account_ids(target_labels)?
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let members = actor_participant
+            .runtime()?
+            .group_members(&actor_participant.account_id, group_id)
+            .await
+            .map_err(app_error)?
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() || !targets.is_subset(&members) {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "invalid_admin_set",
+                "the requested admin set must contain group members",
+            ));
+        }
         let current = group
             .admin_policy
             .admins
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let mut applied = Vec::new();
         for account_id in targets.difference(&current) {
-            actor_participant
+            if let Err(error) = actor_participant
                 .runtime()?
                 .promote_admin(&actor_participant.account_id, group_id, account_id)
                 .await
-                .map_err(app_error)?;
-        }
-        for account_id in current.difference(&targets) {
-            if account_id == &actor_participant.account_id {
-                actor_participant
-                    .runtime()?
-                    .self_demote_admin(&actor_participant.account_id, group_id)
-                    .await
-                    .map_err(app_error)?;
-            } else {
-                actor_participant
-                    .runtime()?
-                    .demote_admin(&actor_participant.account_id, group_id, account_id)
-                    .await
-                    .map_err(app_error)?;
+            {
+                return Err(
+                    compensate_admin_changes(actor_participant, group_id, &applied, error).await,
+                );
             }
+            applied.push(AdminChange::Promoted(account_id.clone()));
+        }
+        for account_id in current
+            .difference(&targets)
+            .filter(|account_id| *account_id != &actor_participant.account_id)
+        {
+            if let Err(error) = actor_participant
+                .runtime()?
+                .demote_admin(&actor_participant.account_id, group_id, account_id)
+                .await
+            {
+                return Err(
+                    compensate_admin_changes(actor_participant, group_id, &applied, error).await,
+                );
+            }
+            applied.push(AdminChange::Demoted(account_id.clone()));
+        }
+        if current.contains(&actor_participant.account_id)
+            && !targets.contains(&actor_participant.account_id)
+            && let Err(error) = actor_participant
+                .runtime()?
+                .self_demote_admin(&actor_participant.account_id, group_id)
+                .await
+        {
+            return Err(
+                compensate_admin_changes(actor_participant, group_id, &applied, error).await,
+            );
         }
         Ok(())
     }
+}
+
+enum AdminChange {
+    Promoted(String),
+    Demoted(String),
+}
+
+async fn compensate_admin_changes(
+    actor: &Participant,
+    group_id: &GroupId,
+    applied: &[AdminChange],
+    original: AppError,
+) -> SubjectError {
+    let Ok(runtime) = actor.runtime() else {
+        return SubjectError::classified(
+            SubjectFailureCategory::Environment,
+            "admin_set_compensation_failed",
+            "admin policy update failed after the participant runtime became unavailable",
+        );
+    };
+    for change in applied.iter().rev() {
+        let result = match change {
+            AdminChange::Promoted(account) => {
+                runtime
+                    .demote_admin(&actor.account_id, group_id, account)
+                    .await
+            }
+            AdminChange::Demoted(account) => {
+                runtime
+                    .promote_admin(&actor.account_id, group_id, account)
+                    .await
+            }
+        };
+        if result.is_err() {
+            return SubjectError::classified(
+                SubjectFailureCategory::Environment,
+                "admin_set_compensation_failed",
+                "admin policy update failed and its applied changes could not be fully compensated",
+            );
+        }
+    }
+    app_error(original)
 }
 
 fn app_for_root(root: &Path, relay_url: &str) -> MarmotApp {
@@ -889,11 +971,6 @@ pub(crate) fn public_protocol_projection(
         group_name: &'a str,
         member_count: usize,
     }
-    let member_count = if member_count == 0 {
-        member_identities.len()
-    } else {
-        member_count
-    };
     let encoded = serde_json::to_vec(&Commitment {
         epoch,
         member_identities: &member_identities,
@@ -912,9 +989,9 @@ pub(crate) fn public_protocol_projection(
     }
 }
 
-fn opaque_public_identity(account: &str) -> String {
+pub(crate) fn opaque_public_identity(account: &str) -> String {
     format!(
-        "opaque:{}",
+        "unknown:{}",
         &hex::encode(Sha256::digest(account.as_bytes()))[..16]
     )
 }
@@ -953,11 +1030,66 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
     }
 }
 
-fn app_error(error: impl std::fmt::Display) -> SubjectError {
+fn app_error(error: AppError) -> SubjectError {
+    let category = match error {
+        AppError::RuntimeBusy
+        | AppError::AccountSessionBusy
+        | AppError::RuntimeStopping
+        | AppError::TransportClosed
+        | AppError::AccountCatchUp(_)
+        | AppError::RelayDirectory(_)
+        | AppError::Publish(_)
+        | AppError::BlobStore(_)
+        | AppError::AuditLogUpload(_)
+        | AppError::ExternalSignerUnavailable(_)
+        | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
+        AppError::Json(_)
+        | AppError::Hex(_)
+        | AppError::InvalidChatPin(_)
+        | AppError::InvalidMessageDraft(_)
+        | AppError::InvalidPublicKey
+        | AppError::InvalidKeyPackageEvent(_)
+        | AppError::InvalidDirectorySearch(_)
+        | AppError::InvalidGroupProfile(_)
+        | AppError::InvalidNostrRouting(_)
+        | AppError::InvalidGroupAvatarUrl(_)
+        | AppError::InvalidAgentTextStreamPolicy(_)
+        | AppError::InvalidEncryptedMedia(_)
+        | AppError::InvalidAppMessagePayload(_)
+        | AppError::InvalidPushToken(_)
+        | AppError::InvalidPushServer(_)
+        | AppError::InvalidPushGossip(_)
+        | AppError::InvalidRelayTelemetrySettings(_)
+        | AppError::InvalidAuditLogFile(_)
+        | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
+        AppError::MissingKeyPackage(_)
+        | AppError::UnknownGroup(_)
+        | AppError::GroupDisbanding(_)
+        | AppError::AgentStreamMissingStart
+        | AppError::AgentStreamStartNotConfirmed
+        | AppError::AgentStreamUnsupportedRoute
+        | AppError::AgentStreamMissingCandidate
+        | AppError::MissingDefaultRelays
+        | AppError::MissingRelayLists(_)
+        | AppError::FollowListUnavailable
+        | AppError::ExternalSignerMismatch
+        | AppError::ExternalSignerRejected
+        | AppError::MissingDirectoryEntry(_)
+        | AppError::NotificationsDisabled
+        | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
+        AppError::Account(_)
+        | AppError::AccountHome(_)
+        | AppError::Session(_)
+        | AppError::Storage(_)
+        | AppError::Transport(_)
+        | AppError::Io(_)
+        | AppError::Sqlite(_)
+        | AppError::SqlcipherKeyDerivation(_) => SubjectFailureCategory::Environment,
+    };
     SubjectError::classified(
-        SubjectFailureCategory::Environment,
+        category,
         "app_runtime_operation_failed",
-        error.to_string(),
+        "application runtime operation failed",
     )
 }
 
@@ -969,7 +1101,21 @@ fn block_on_subject<F>(future: F) -> Result<(), SubjectError>
 where
     F: std::future::Future<Output = Result<(), SubjectError>>,
 {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        SubjectError::classified(
+            SubjectFailureCategory::Environment,
+            "tokio_runtime_missing",
+            "app-runtime adapter requires an active Tokio runtime",
+        )
+    })?;
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return Err(SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "tokio_runtime_flavor_unsupported",
+            "blocking app-runtime adapter operations require a multi-thread Tokio runtime",
+        ));
+    }
+    tokio::task::block_in_place(|| handle.block_on(future))
 }
 
 fn walk_file_bytes(root: &Path) -> Vec<u64> {
@@ -986,4 +1132,36 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_commitment_preserves_a_reported_zero_member_count() {
+        let projection = public_protocol_projection(
+            7,
+            vec!["alice".into()],
+            vec!["alice".into()],
+            "group".into(),
+            0,
+        );
+        assert_eq!(projection.member_count, 0);
+    }
+
+    #[test]
+    fn app_errors_are_classified_without_serializing_inner_details() {
+        let marker = "private-storage-path";
+        let environment = app_error(AppError::SqlcipherKeyDerivation(marker.into()));
+        assert_eq!(environment.category, SubjectFailureCategory::Environment);
+        assert!(!environment.message.contains(marker));
+
+        let protocol = app_error(AppError::InvalidGroupProfile(marker.into()));
+        assert_eq!(protocol.category, SubjectFailureCategory::Protocol);
+        assert!(!protocol.message.contains(marker));
+
+        let resource = app_error(AppError::RuntimeBusy);
+        assert_eq!(resource.category, SubjectFailureCategory::Resource);
+    }
 }

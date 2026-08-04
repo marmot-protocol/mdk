@@ -18,7 +18,7 @@ fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
 fn two_client_scenario() -> ScenarioSpec {
     let clients = vec!["alice".to_owned(), "bob".to_owned()];
     ScenarioSpec {
-        name: "milestone5-app-runtime-black-box".into(),
+        name: "app-runtime-black-box".into(),
         spec_version: "2".into(),
         clients: clients.clone(),
         topology: Default::default(),
@@ -114,6 +114,48 @@ async fn app_runtime_subject_uses_distinct_private_encrypted_roots_and_public_pr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observations_keep_pending_invites_until_an_explicit_tick() {
+    let clients = vec!["alice".to_owned(), "bob".to_owned()];
+    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    subject.select_scenario_group("main", true).unwrap();
+    subject
+        .create_group(cgka_conformance_simulator::SubjectCreateGroup {
+            action_id: "create",
+            creator: "alice",
+            name: "pending invite",
+            invitees: &["bob".into()],
+            required_features: &[],
+            initial_admins: &["alice".into()],
+            pending: "create",
+        })
+        .await
+        .unwrap();
+
+    subject.catch_up(&clients).await.unwrap();
+    let pending = subject.observations(&clients).await.unwrap();
+    assert!(
+        pending
+            .iter()
+            .find(|item| item.participant == "bob")
+            .unwrap()
+            .application
+            .pending_confirmation
+    );
+
+    subject.tick(&["bob".into()]).await.unwrap();
+    let accepted = subject.observations(&clients).await.unwrap();
+    assert!(
+        !accepted
+            .iter()
+            .find(|item| item.participant == "bob")
+            .unwrap()
+            .application
+            .pending_confirmation
+    );
+    subject.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
     let clients = vec!["alice".to_owned(), "bob".to_owned()];
     let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
@@ -130,7 +172,7 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
         })
         .await
         .unwrap();
-    subject.catch_up(&clients).await.unwrap();
+    subject.tick(&clients).await.unwrap();
 
     subject.set_online("bob", false).await.unwrap();
     subject
@@ -160,9 +202,25 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
         .await
         .unwrap();
 
-    // No new event is published after Bob reconnects. Startup EOSE/history
-    // completion and the runtime's selected backfill policy must close the gap.
+    // No new event is published after Bob reconnects. Incremental catch-up has
+    // no live trigger capable of proving or repairing the retained-history gap.
     subject.set_online("bob", true).await.unwrap();
+    subject.catch_up(&["bob".into()]).await.unwrap();
+    let incremental = subject.observations(&clients).await.unwrap();
+    let incremental_alice = incremental
+        .iter()
+        .find(|item| item.participant == "alice")
+        .unwrap();
+    let incremental_bob = incremental
+        .iter()
+        .find(|item| item.participant == "bob")
+        .unwrap();
+    assert_ne!(
+        incremental_bob.protocol.state_commitment_sha256,
+        incremental_alice.protocol.state_commitment_sha256,
+        "ordinary catch-up unexpectedly repaired the quiet retained-history gap"
+    );
+
     subject.repair_full_history(&["bob".into()]).await.unwrap();
     let observations = match subject
         .await_observable_settlement(&clients, Duration::from_secs(15))
@@ -194,5 +252,14 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
             .any(|payload| { payload == "retained while bob was offline" })
     );
     assert_eq!(bob.local.reopen_count, 1);
+    subject.shutdown().await;
+}
+
+#[tokio::test]
+async fn blocking_subject_operations_refuse_current_thread_runtimes_without_panicking() {
+    let clients = vec!["alice".to_owned()];
+    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    let error = subject.deliver_all().unwrap_err();
+    assert_eq!(error.code, "tokio_runtime_flavor_unsupported");
     subject.shutdown().await;
 }

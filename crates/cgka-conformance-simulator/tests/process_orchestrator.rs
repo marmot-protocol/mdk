@@ -36,20 +36,9 @@ fn process_scenario(name: &str, lifecycle: bool) -> ScenarioSpec {
         },
     ];
     if lifecycle {
-        steps.extend([
-            ScenarioStep::SetClientOffline {
-                client: "bob".into(),
-            },
-            ScenarioStep::ReconnectClient {
-                client: "bob".into(),
-            },
-            ScenarioStep::CrashProcess {
-                process: "process:bob".into(),
-            },
-            ScenarioStep::RestartProcess {
-                process: "process:bob".into(),
-            },
-        ]);
+        steps.push(ScenarioStep::SetClientOffline {
+            client: "bob".into(),
+        });
     }
     steps.extend([
         in_group(
@@ -67,6 +56,27 @@ fn process_scenario(name: &str, lifecycle: bool) -> ScenarioSpec {
                 payload: "visible after settlement".into(),
             },
         ),
+    ]);
+    if lifecycle {
+        steps.extend([
+            ScenarioStep::CrashProcess {
+                process: "process:alice".into(),
+            },
+            ScenarioStep::RestartProcess {
+                process: "process:alice".into(),
+            },
+            ScenarioStep::ReconnectClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::CrashProcess {
+                process: "process:bob".into(),
+            },
+            ScenarioStep::RestartProcess {
+                process: "process:bob".into(),
+            },
+        ]);
+    }
+    steps.extend([
         ScenarioStep::SyncRelayHistory {
             clients: clients.clone(),
             sync: cgka_conformance_simulator::ScenarioRelaySyncModeV2::FullHistory,
@@ -140,7 +150,7 @@ fn controlled_relay_topology() -> ScenarioTopologyV2 {
 
 fn cross_adapter_scenario() -> ScenarioSpec {
     ScenarioSpec {
-        name: "milestone5-cross-adapter".into(),
+        name: "cross-adapter-public-state".into(),
         spec_version: "2".into(),
         clients: vec!["alice".into()],
         topology: Default::default(),
@@ -180,12 +190,16 @@ fn cross_adapter_scenario() -> ScenarioSpec {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
-    let spec = process_scenario("milestone5-process", false);
+    let spec = process_scenario("app-process-canonical-schedule", false);
     let expected_schedule = compile_scenario(&spec).unwrap().expanded_schedule();
-    let mut orchestrator =
-        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
-            .await
-            .unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let mut orchestrator = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    .unwrap();
     let roots = orchestrator.participant_roots();
     assert_eq!(roots.values().collect::<BTreeSet<_>>().len(), 2);
     #[cfg(unix)]
@@ -197,7 +211,7 @@ async fn orchestrator_runs_canonical_schedule_with_isolated_process_roots() {
         );
     }
 
-    let report = orchestrator.run(&spec).await.unwrap();
+    let report = orchestrator.run().await.unwrap();
     assert!(report.completed, "{report:#?}");
     assert_eq!(report.canonical_schedule, expected_schedule);
     assert_eq!(report.actions.len(), expected_schedule.len());
@@ -243,11 +257,15 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
     assert!(app_report.invariant_failures.is_empty(), "{app_report:#?}");
     let app_observation = app.observations(&spec.clients).await.unwrap().remove(0);
 
-    let mut process =
-        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
-            .await
-            .unwrap();
-    let process_report = process.run(&spec).await.unwrap();
+    let process_artifacts = tempfile::tempdir().unwrap();
+    let mut process = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        process_artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let process_report = process.run().await.unwrap();
     assert!(process_report.completed, "{process_report:#?}");
     let process_observation = process_report.observations.last().unwrap();
 
@@ -273,25 +291,31 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_kill_pause_resume_and_restart_agree_with_uninterrupted_execution() {
-    let uninterrupted_spec = process_scenario("milestone5-uninterrupted", false);
+    let uninterrupted_spec = process_scenario("uninterrupted-app-process", false);
+    let uninterrupted_artifacts = tempfile::tempdir().unwrap();
     let mut uninterrupted = ProcessOrchestrator::launch(
         env!("CARGO_BIN_EXE_cgka-conformance-node"),
         &uninterrupted_spec,
+        uninterrupted_artifacts.path(),
     )
     .await
     .unwrap();
-    let uninterrupted_report = uninterrupted.run(&uninterrupted_spec).await.unwrap();
+    let uninterrupted_report = uninterrupted.run().await.unwrap();
     assert!(uninterrupted_report.completed, "{uninterrupted_report:#?}");
     let uninterrupted_final =
         &uninterrupted_report.observations[uninterrupted_report.observations.len() - 2..];
     uninterrupted.shutdown().await;
 
-    let recovered_spec = process_scenario("milestone5-recovered", true);
-    let mut recovered =
-        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &recovered_spec)
-            .await
-            .unwrap();
-    let recovered_report = recovered.run(&recovered_spec).await.unwrap();
+    let recovered_spec = process_scenario("recovered-app-process", true);
+    let recovered_artifacts = tempfile::tempdir().unwrap();
+    let mut recovered = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &recovered_spec,
+        recovered_artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let recovered_report = recovered.run().await.unwrap();
     assert!(recovered_report.completed, "{recovered_report:#?}");
     let recovered_final = &recovered_report.observations[recovered_report.observations.len() - 2..];
 
@@ -343,7 +367,7 @@ async fn process_kill_pause_resume_and_restart_agree_with_uninterrupted_executio
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_failures_write_replayable_privacy_safe_capsules() {
     let marker = "sensitive-production-log-marker";
-    let mut spec = process_scenario("milestone5-failure-capsule", false);
+    let mut spec = process_scenario("app-process-failure-capsule", false);
     spec.steps.push(in_group(
         "main",
         ScenarioStep::ExpectUpdateAdminPolicyError {
@@ -352,11 +376,15 @@ async fn process_failures_write_replayable_privacy_safe_capsules() {
             error: marker.into(),
         },
     ));
-    let mut orchestrator =
-        ProcessOrchestrator::launch(env!("CARGO_BIN_EXE_cgka-conformance-node"), &spec)
-            .await
-            .unwrap();
-    let report = orchestrator.run(&spec).await.unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let mut orchestrator = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let report = orchestrator.run().await.unwrap();
     assert!(!report.completed);
     assert_eq!(report.failure_capsules.len(), 1);
     let capsule_path = &report.failure_capsules[0];
@@ -386,6 +414,32 @@ async fn process_failures_write_replayable_privacy_safe_capsules() {
     assert!(!capsule.replay.steps.is_empty());
     assert!(!capsule.sensitive_data_included);
     orchestrator.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsupported_process_capabilities_fail_before_launch() {
+    let mut spec = process_scenario("unsupported-process-capability", false);
+    spec.steps.push(in_group(
+        "main",
+        ScenarioStep::ProbeBidirectionalDecryptability {
+            clients: vec!["alice".into(), "bob".into()],
+        },
+    ));
+    let artifacts = tempfile::tempdir().unwrap();
+    let error = match ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    {
+        Ok(mut orchestrator) => {
+            orchestrator.shutdown().await;
+            panic!("unsupported capability launched participant processes")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "process_capability_preflight");
 }
 
 #[test]
@@ -426,4 +480,33 @@ fn process_cli_writes_a_private_versioned_report() {
         serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
     assert_eq!(report.schema_version, "1");
     assert!(report.completed, "{report:#?}");
+}
+
+#[test]
+fn process_cli_failure_report_keeps_capsules_after_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let scenario_path = root.path().join("scenario.json");
+    let report_path = root.path().join("report.json");
+    let mut spec = process_scenario("cli-failure-capsule", false);
+    spec.steps.push(in_group(
+        "main",
+        ScenarioStep::ExpectUpdateAdminPolicyError {
+            client: "alice".into(),
+            admins: vec!["alice".into()],
+            error: "controlled failure".into(),
+        },
+    ));
+    fs_private::write_private(&scenario_path, &serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-conformance-process"))
+        .arg(&scenario_path)
+        .arg(env!("CARGO_BIN_EXE_cgka-conformance-node"))
+        .arg(&report_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1 =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert!(!report.completed);
+    assert_eq!(report.failure_capsules.len(), 1);
+    assert!(report.failure_capsules[0].is_file());
 }

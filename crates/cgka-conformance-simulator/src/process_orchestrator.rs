@@ -18,8 +18,9 @@ use crate::node_protocol::{
     NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
-    ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
-    SubjectFailureCategory, compile_scenario,
+    CompiledScenarioV2, ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec,
+    ScenarioStep, SubjectCapability, SubjectDescriptor, SubjectFailureCategory, compile_scenario,
+    preflight_compiled_scenario,
 };
 
 pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
@@ -31,7 +32,6 @@ pub struct ProcessScenarioReportV1 {
     pub schema_version: String,
     pub scenario_name: String,
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
-    pub participant_roots: BTreeMap<String, PathBuf>,
     pub actions: Vec<ProcessActionResultV1>,
     pub observations: Vec<NodeObservationV1>,
     pub lifecycle: Vec<ProcessLifecycleEventV1>,
@@ -89,6 +89,8 @@ impl std::error::Error for ProcessOrchestratorError {}
 pub struct ProcessOrchestrator {
     node_executable: PathBuf,
     run_root: tempfile::TempDir,
+    artifact_directory: PathBuf,
+    compiled: CompiledScenarioV2,
     _relays: BTreeMap<String, MockRelay>,
     relay_urls: BTreeMap<String, String>,
     nodes: BTreeMap<String, NodeProcess>,
@@ -113,10 +115,16 @@ impl ProcessOrchestrator {
     pub async fn launch(
         node_executable: impl AsRef<Path>,
         scenario: &ScenarioSpec,
+        artifact_directory: impl AsRef<Path>,
     ) -> Result<Self, ProcessOrchestratorError> {
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
+        preflight_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(|error| {
+            ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
+        })?;
+        let artifact_directory = artifact_directory.as_ref().to_path_buf();
+        fs_private::create_dir_all_private(&artifact_directory).map_err(environment_error)?;
         let run_root = tempfile::Builder::new()
             .prefix("marmot-process-conformance-")
             .tempdir()
@@ -159,10 +167,13 @@ impl ProcessOrchestrator {
             .iter()
             .map(|process| (process.id.clone(), process.relays.clone()))
             .collect::<BTreeMap<_, _>>();
+        let clients = compiled.clients.clone();
 
         let mut orchestrator = Self {
             node_executable: node_executable.as_ref().to_path_buf(),
             run_root,
+            artifact_directory,
+            compiled,
             _relays: relays,
             relay_urls,
             nodes: BTreeMap::new(),
@@ -172,7 +183,7 @@ impl ProcessOrchestrator {
             groups: BTreeMap::new(),
             lifecycle: Vec::new(),
         };
-        for client in &compiled.clients {
+        for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
         }
         orchestrator.configure_peers().await?;
@@ -183,10 +194,6 @@ impl ProcessOrchestrator {
         Ok(orchestrator)
     }
 
-    pub fn run_root(&self) -> &Path {
-        self.run_root.path()
-    }
-
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
         self.nodes
             .iter()
@@ -194,19 +201,13 @@ impl ProcessOrchestrator {
             .collect()
     }
 
-    pub async fn run(
-        &mut self,
-        scenario: &ScenarioSpec,
-    ) -> Result<ProcessScenarioReportV1, ProcessOrchestratorError> {
-        let compiled = compile_scenario(scenario).map_err(|error| {
-            ProcessOrchestratorError::new("scenario_compile", error.to_string())
-        })?;
+    pub async fn run(&mut self) -> Result<ProcessScenarioReportV1, ProcessOrchestratorError> {
+        let compiled = self.compiled.clone();
         let schedule = compiled.expanded_schedule();
         let mut report = ProcessScenarioReportV1 {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
-            scenario_name: scenario.name.clone(),
+            scenario_name: compiled.name.clone(),
             canonical_schedule: schedule,
-            participant_roots: self.participant_roots(),
             actions: Vec::new(),
             observations: Vec::new(),
             lifecycle: Vec::new(),
@@ -309,7 +310,7 @@ impl ProcessOrchestrator {
                     body => return Err((Some(creator.clone()), unexpected_response(body))),
                 };
                 self.groups.insert(group.clone(), group_id.clone());
-                let labels = self.nodes.keys().cloned().collect::<Vec<_>>();
+                let labels = self.running_labels();
                 for client in &labels {
                     self.expect_ack(
                         client,
@@ -426,13 +427,18 @@ impl ProcessOrchestrator {
                 Ok((labels, ProcessActionStatusV1::Completed))
             }
             ScenarioStep::SyncRelayHistory { clients, sync } => {
+                let clients = clients
+                    .iter()
+                    .filter(|client| self.nodes.get(*client).is_some_and(|node| !node.paused))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let full_history = matches!(
                     sync,
                     ScenarioRelaySyncModeV2::FullHistory
                         | ScenarioRelaySyncModeV2::SetReconciliation
                 );
-                self.catch_up(clients, action_id, full_history).await?;
-                Ok((clients.clone(), ProcessActionStatusV1::Completed))
+                self.catch_up(&clients, action_id, full_history).await?;
+                Ok((clients, ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Observe { clients } | ScenarioStep::ObserveExact { clients } => {
                 let observations = self.observe(clients, action_id).await?;
@@ -603,7 +609,7 @@ impl ProcessOrchestrator {
     }
 
     async fn configure_peers(&mut self) -> Result<(), ProcessOrchestratorError> {
-        let labels = self.nodes.keys().cloned().collect::<Vec<_>>();
+        let labels = self.running_labels();
         for label in labels {
             let response = self
                 .nodes
@@ -967,7 +973,7 @@ impl ProcessOrchestrator {
         action_id: &str,
         error: &NodeErrorV1,
     ) -> Result<PathBuf, ProcessOrchestratorError> {
-        let directory = self.run_root.path().join("failure-capsules");
+        let directory = self.artifact_directory.join("failure-capsules");
         fs_private::create_dir_all_private(&directory).map_err(environment_error)?;
         let digest = hex::encode(sha2::Sha256::digest(action_id.as_bytes()));
         let path = directory.join(format!("{}.json", &digest[..16]));
@@ -1026,6 +1032,29 @@ impl NodeProcess {
             ));
         }
         Ok(response.body)
+    }
+}
+
+fn process_subject_descriptor() -> SubjectDescriptor {
+    SubjectDescriptor {
+        adapter: "marmot_app_process".into(),
+        adapter_version: "1".into(),
+        storage_backend: "sqlcipher_per_process".into(),
+        capabilities: BTreeSet::from([
+            SubjectCapability::GroupMutation,
+            SubjectCapability::ApplicationMessaging,
+            SubjectCapability::TransportDelivery,
+            SubjectCapability::EventObservation,
+            SubjectCapability::AdminPolicyObservation,
+            SubjectCapability::CrashReopen,
+            SubjectCapability::VirtualTime,
+            SubjectCapability::OutboundPublication,
+            SubjectCapability::StructuralProgress,
+            SubjectCapability::ParticipantConnectivity,
+            SubjectCapability::ProcessLifecycle,
+            SubjectCapability::MultiGroup,
+            SubjectCapability::RetainedRelayHistory,
+        ]),
     }
 }
 
@@ -1149,7 +1178,6 @@ mod tests {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
             scenario_name: "round-trip".into(),
             canonical_schedule: Vec::new(),
-            participant_roots: BTreeMap::new(),
             actions: Vec::new(),
             observations: Vec::new(),
             lifecycle: Vec::new(),

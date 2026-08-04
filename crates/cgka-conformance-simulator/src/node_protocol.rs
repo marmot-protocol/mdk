@@ -21,7 +21,7 @@ use tokio::io::{
 };
 use tokio::sync::broadcast;
 
-use crate::app_runtime::public_protocol_projection;
+use crate::app_runtime::{opaque_public_identity, public_protocol_projection};
 use crate::{
     AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1, SubjectFailureCategory,
 };
@@ -221,9 +221,6 @@ pub struct NodeObservationV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProgressV1 {
-    pub commands_in_flight: usize,
-    pub outbox_pending: usize,
-    pub relay_query_in_flight: bool,
     pub relay_inbound_events_seen: usize,
     pub relay_inbound_events_delivered: usize,
     pub relay_publish_attempts: usize,
@@ -236,11 +233,12 @@ pub struct NodeProgressV1 {
 }
 
 impl NodeProgressV1 {
+    /// The node serves one command at a time, so quiescence is the combination
+    /// of no observed relay/retry work and two identical public checkpoints.
+    /// This projection deliberately makes no claim about an unexposed runtime
+    /// outbox signal.
     pub fn observably_quiescent(&self) -> bool {
-        self.commands_in_flight == 0
-            && self.outbox_pending == 0
-            && !self.relay_query_in_flight
-            && self.relay_directory_inflight_fetches == 0
+        self.relay_directory_inflight_fetches == 0
             && !self.retry_timer_armed
             && self.stable_checkpoint_observations >= 2
     }
@@ -529,7 +527,9 @@ impl NodeServer {
                 match result {
                     Ok(()) => {
                         state.retry_timer_armed = false;
-                        accept_active_invite(state).await?;
+                        if state.active_group.is_some() {
+                            accept_active_invite(state).await?;
+                        }
                         Ok(ack(action_id, 0, None))
                     }
                     Err(error) => {
@@ -586,6 +586,9 @@ where
             break;
         }
         let response = if line.len() > MAX_NODE_JSONL_BYTES {
+            if !line.ends_with(b"\n") {
+                discard_through_newline(&mut reader).await?;
+            }
             NodeResponseV1 {
                 protocol: NODE_PROTOCOL_VERSION.into(),
                 request_id: "oversized".into(),
@@ -619,6 +622,24 @@ where
     }
     server.shutdown().await;
     Ok(())
+}
+
+async fn discard_through_newline<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(newline + 1);
+            return Ok(());
+        }
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
 }
 
 pub async fn run_node_stdio() -> std::io::Result<()> {
@@ -674,7 +695,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
             reverse
                 .get(member.member_id_hex.as_str())
                 .map(|label| (*label).to_owned())
-                .unwrap_or_else(|| opaque_identity(&member.member_id_hex))
+                .unwrap_or_else(|| opaque_public_identity(&member.member_id_hex))
         })
         .collect::<Vec<_>>();
     members.sort();
@@ -686,7 +707,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
             reverse
                 .get(account.as_str())
                 .map(|label| (*label).to_owned())
-                .unwrap_or_else(|| opaque_identity(account))
+                .unwrap_or_else(|| opaque_public_identity(account))
         })
         .collect::<Vec<_>>();
     admins.sort();
@@ -748,9 +769,6 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
         protocol,
         application,
         progress: NodeProgressV1 {
-            commands_in_flight: 0,
-            outbox_pending: 0,
-            relay_query_in_flight: telemetry.health.directory_inflight_fetches > 0,
             relay_inbound_events_seen: telemetry.metrics.inbound_events_seen,
             relay_inbound_events_delivered: telemetry.metrics.inbound_events_delivered,
             relay_publish_attempts: telemetry.metrics.publish_attempts,
@@ -775,34 +793,97 @@ async fn set_admins(
         .map_err(app_node_error)?
         .ok_or_else(|| protocol_error("unknown_group", "group projection is unavailable"))?;
     let targets = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let members = state
+        .runtime
+        .group_members(&state.account_id, group_id)
+        .await
+        .map_err(app_node_error)?
+        .into_iter()
+        .map(|member| member.member_id_hex)
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() || !targets.is_subset(&members) {
+        return Err(protocol_error(
+            "invalid_admin_set",
+            "the requested admin set must contain group members",
+        ));
+    }
     let current = group
         .admin_policy
         .admins
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let mut applied = Vec::new();
     for account in targets.difference(&current) {
-        state
+        if let Err(error) = state
             .runtime
             .promote_admin(&state.account_id, group_id, account)
             .await
-            .map_err(app_node_error)?;
-    }
-    for account in current.difference(&targets) {
-        if account == &state.account_id {
-            state
-                .runtime
-                .self_demote_admin(&state.account_id, group_id)
-                .await
-                .map_err(app_node_error)?;
-        } else {
-            state
-                .runtime
-                .demote_admin(&state.account_id, group_id, account)
-                .await
-                .map_err(app_node_error)?;
+        {
+            return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
         }
+        applied.push(NodeAdminChange::Promoted(account.clone()));
+    }
+    for account in current
+        .difference(&targets)
+        .filter(|account| *account != &state.account_id)
+    {
+        if let Err(error) = state
+            .runtime
+            .demote_admin(&state.account_id, group_id, account)
+            .await
+        {
+            return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
+        }
+        applied.push(NodeAdminChange::Demoted(account.clone()));
+    }
+    if current.contains(&state.account_id)
+        && !targets.contains(&state.account_id)
+        && let Err(error) = state
+            .runtime
+            .self_demote_admin(&state.account_id, group_id)
+            .await
+    {
+        return Err(compensate_node_admin_changes(state, group_id, &applied, error).await);
     }
     Ok(())
+}
+
+enum NodeAdminChange {
+    Promoted(String),
+    Demoted(String),
+}
+
+async fn compensate_node_admin_changes(
+    state: &NodeRuntimeState,
+    group_id: &GroupId,
+    applied: &[NodeAdminChange],
+    original: AppError,
+) -> NodeErrorV1 {
+    for change in applied.iter().rev() {
+        let result = match change {
+            NodeAdminChange::Promoted(account) => {
+                state
+                    .runtime
+                    .demote_admin(&state.account_id, group_id, account)
+                    .await
+            }
+            NodeAdminChange::Demoted(account) => {
+                state
+                    .runtime
+                    .promote_admin(&state.account_id, group_id, account)
+                    .await
+            }
+        };
+        if result.is_err() {
+            return NodeErrorV1 {
+                code: "admin_set_compensation_failed".into(),
+                category: SubjectFailureCategory::Environment,
+                retryable: false,
+                message: "admin policy update failed and its applied changes could not be fully compensated".into(),
+            };
+        }
+    }
+    app_node_error(original)
 }
 
 fn active_group(state: &NodeRuntimeState) -> Result<GroupId, NodeErrorV1> {
@@ -837,13 +918,6 @@ fn projection_checkpoint(
         serde_json::to_vec(&(protocol, application))
             .expect("public node observation is serializable"),
     ))
-}
-
-fn opaque_identity(account: &str) -> String {
-    format!(
-        "unknown:{}",
-        &hex::encode(Sha256::digest(account.as_bytes()))[..16]
-    )
 }
 
 fn ack(
@@ -951,9 +1025,6 @@ mod tests {
             request
         );
         let mut progress = NodeProgressV1 {
-            commands_in_flight: 0,
-            outbox_pending: 0,
-            relay_query_in_flight: false,
             relay_inbound_events_seen: 1,
             relay_inbound_events_delivered: 1,
             relay_publish_attempts: 1,

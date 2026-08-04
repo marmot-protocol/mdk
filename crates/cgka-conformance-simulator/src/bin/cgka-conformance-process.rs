@@ -26,10 +26,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unexpected extra arguments".into());
     }
     let scenario: ScenarioSpec = serde_json::from_slice(&std::fs::read(scenario_path)?)?;
-    let mut orchestrator = ProcessOrchestrator::launch(node_bin, &scenario).await?;
-    let report = orchestrator.run(&scenario).await?;
-    orchestrator.write_report_private(&report, &out)?;
+    let artifact_name = format!(
+        "{}.artifacts",
+        out.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("conformance-process")
+    );
+    let artifact_directory = out
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(artifact_name);
+    let mut orchestrator =
+        ProcessOrchestrator::launch(node_bin, &scenario, artifact_directory).await?;
+    let report_result = orchestrator.run().await.and_then(|report| {
+        orchestrator.write_report_private(&report, &out)?;
+        Ok(report)
+    });
     orchestrator.shutdown().await;
+    let report = report_result?;
     if report.completed {
         Ok(())
     } else {
