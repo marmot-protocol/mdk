@@ -108,8 +108,16 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     only *after* a failure — and one rule keeps it honest: a lower route may
     override a higher route's quarantine only by producing an accepted vector. A
     second quarantine never displaces the higher-precedence one; it becomes an
-    `advisory (fallback route):` instead. Vector names live here too: they are
-    pipeline facts, not CLI ones.
+    `advisory (fallback route):` instead. When the fall-through *does* produce an
+    accepted vector, the superseded finding is also written into that artifact's
+    `unavailable_fields` as `contested_convergence_replay`, with the same sentence
+    the advisory carries: the advisory is stdout, the artifact is what gets
+    persisted and read later as evidence, and an envelope showing a clean accepted
+    archetype with no trace of the higher-precedence incident that shared the
+    export fails the standard `archetype` already enforces on itself. The
+    `fallback route` finding has no such home by construction — both routes failed
+    closed, so there is no accepted artifact — and the advisory line is its only
+    surface. Vector names live here too: they are pipeline facts, not CLI ones.
 - **Module:** `src/main.rs`
   - **Role:** CLI — read one export file, detect its format, print the `Routing`.
     Reading and formatting only; route policy is `src/route.rs`. Exits 0 for any

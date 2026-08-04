@@ -50,6 +50,71 @@ fn a_fail_closed_convergence_falls_through_to_a_clean_fork() {
 }
 
 #[test]
+fn a_superseded_route_is_recorded_in_the_accepted_artifact() {
+    // The advisory line is stdout; the artifact is what gets written to disk and
+    // passed around as evidence. Without this, someone opening the persisted
+    // envelope sees a clean accepted fork archetype with no trace that the same
+    // export carried a higher-precedence contested convergence at the same epoch
+    // that could not be replayed — which is exactly the standard `archetype`
+    // enforces on itself ("an artifact that cannot point at its own source rows is
+    // not publishable evidence"). `unavailable_fields` is where the artifact
+    // already states what it could not cover, so the finding belongs there.
+    let routing = routed("convergence-failclosed-with-clean-fork.json");
+
+    let Outcome::Accepted(artifact) = &routing.outcome else {
+        panic!("expected the fork fallback to be accepted, got {routing:?}");
+    };
+    let superseded = artifact
+        .unavailable_fields
+        .iter()
+        .find(|evidence| evidence.field == "contested_convergence_replay")
+        .unwrap_or_else(|| {
+            panic!(
+                "artifact should record the superseded route, got {:?}",
+                artifact.unavailable_fields
+            )
+        });
+    assert!(
+        superseded
+            .reason
+            .contains("quorum boost is not provably decisive"),
+        "the recorded reason should be why the convergence failed closed, got {:?}",
+        superseded.reason
+    );
+    // Text and artifact must say the same thing, or the operator reading one and
+    // the auditor reading the other disagree about the same export.
+    assert_eq!(
+        routing
+            .advisories
+            .iter()
+            .find(|advisory| advisory.label == "superseded route")
+            .map(|advisory| advisory.detail.as_str()),
+        Some(superseded.reason.as_str()),
+    );
+}
+
+#[test]
+fn a_clean_route_records_no_superseded_evidence() {
+    // The counterpart: an export whose highest-precedence route reproduced has
+    // nothing superseded, so the field must be absent rather than present-and-
+    // empty. Otherwise every artifact would carry the entry and it would stop
+    // meaning anything.
+    let routing = routed("replayable-membership-fork.json");
+
+    let Outcome::Accepted(artifact) = &routing.outcome else {
+        panic!("expected the fork route to be accepted, got {routing:?}");
+    };
+    assert!(
+        !artifact
+            .unavailable_fields
+            .iter()
+            .any(|evidence| evidence.field == "contested_convergence_replay"),
+        "an unsuperseded artifact should not claim a superseded route, got {:?}",
+        artifact.unavailable_fields
+    );
+}
+
+#[test]
 fn a_fallback_that_also_fails_leaves_the_higher_quarantine_primary() {
     // Fall-through may only upgrade the outcome. When the fork route fails too,
     // the convergence quarantine stays primary — it is the higher-precedence
