@@ -2441,7 +2441,9 @@ async fn selfremove_full_flow_with_auto_commit() {
     advance_selfremove_auto_commit(&mut alice, &group_id).await;
 
     // Alice has a projected pending epoch/member set, but the group is not
-    // Stable/applied yet. New sends must wait for publish confirmation.
+    // Stable/applied yet. New sends wait for publish confirmation — retained,
+    // not refused: `PendingPublish` owes its exit to a publish outcome, and a
+    // relay that stalls that outcome must not make alice's message vanish.
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
     let alice_members = alice.members(&group_id).unwrap();
     assert_eq!(
@@ -2456,8 +2458,8 @@ async fn selfremove_full_flow_with_auto_commit() {
         })
         .await;
     assert!(
-        matches!(pending_send, Err(EngineError::InvalidTransition(_))),
-        "auto-commit should leave alice in PendingPublish until confirmed"
+        matches!(pending_send, Ok(SendResult::Queued { .. })),
+        "auto-commit leaves alice in PendingPublish, so the app message is retained; got {pending_send:?}"
     );
 
     // drain_auto_publish yields the commit alice produced.
@@ -2465,6 +2467,22 @@ async fn selfremove_full_flow_with_auto_commit() {
     assert_eq!(auto_msgs.len(), 1);
     let auto = auto_msgs.remove(0);
     alice.confirm_published(auto.pending).await.unwrap();
+
+    // Confirmation is what releases the retained message, and it is prepared
+    // against the epoch the confirm established.
+    let mut released = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        released.len(),
+        1,
+        "the retained app message should be released once the group is Stable again; got {released:?}"
+    );
+    assert!(
+        matches!(
+            released.remove(0),
+            SendResult::ApplicationMessage { source_epoch, .. } if source_epoch.0 == 2
+        ),
+        "the released message must be encrypted under the confirmed epoch"
+    );
     let alice_events = alice.drain_events();
     assert!(
         emits_departure_of(&alice_events, &bob.self_id()),
@@ -2775,7 +2793,7 @@ async fn repeat_leave_in_the_same_epoch_is_classified_by_the_engine() {
 /// own SelfRemove-only commit. The observer remains sendable until the delayed
 /// commit is staged; after staging, publish-before-apply blocks new sends.
 #[tokio::test]
-async fn observed_selfremove_proposal_delays_commit_then_blocks_outbound_app_messages() {
+async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
@@ -2855,21 +2873,31 @@ async fn observed_selfremove_proposal_delays_commit_then_blocks_outbound_app_mes
     let auto = carol.drain_auto_publish();
     assert_eq!(auto.len(), 1, "carol should stage a SelfRemove-only commit");
 
-    // Carol cannot send application data while her SelfRemove-only commit is
-    // pending publication.
-    let blocked = carol
+    // Carol cannot *publish* application data while her SelfRemove-only commit
+    // is pending publication, but the payload is retained rather than refused:
+    // she observed someone else's departure, and that must not cost her the
+    // message she is typing.
+    let retained = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello after observing a proposal"),
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
-        "observing a SelfRemove must block outbound app messages until commit publish resolves; got {blocked:?}"
+        matches!(retained, Ok(SendResult::Queued { .. })),
+        "observing a SelfRemove must retain outbound app messages until commit publish resolves; got {retained:?}"
     );
 
     let auto = auto.into_iter().next().unwrap();
     carol.confirm_published(auto.pending).await.unwrap();
+
+    // Resolving the publish releases the retained payload.
+    let released = carol.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(released.as_slice(), [SendResult::ApplicationMessage { .. }]),
+        "the retained message should be released after confirm; got {released:?}"
+    );
+
     let send_result = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),

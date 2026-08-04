@@ -266,6 +266,21 @@ impl EpochState {
         matches!(self, EpochState::Stable { .. } | EpochState::Recovering(_))
     }
 
+    /// Whether this state is a step whose exit is already owed by another
+    /// party: `PendingPublish` awaits a publish outcome, `Merging` awaits its
+    /// merge, and `Recovering` awaits a convergence decision.
+    ///
+    /// `Stable` awaits nothing, and `Unrecoverable` / `Disbanded` are terminal:
+    /// no outcome is owed, so work held for them would be held forever. This is
+    /// the boundary outbound application work is retained across — see
+    /// `CgkaEngine::send`.
+    pub fn is_awaiting_resolution(&self) -> bool {
+        matches!(
+            self,
+            EpochState::PendingPublish(_) | EpochState::Merging(_) | EpochState::Recovering(_)
+        )
+    }
+
     /// Whether this group is in the terminal `Unrecoverable` state and requires
     /// a repair path before it may apply or ingest more group traffic.
     pub fn is_unrecoverable(&self) -> bool {

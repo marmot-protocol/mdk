@@ -300,7 +300,10 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(&intent, SendIntent::Disband { .. }) {
             return self.do_request_disband(group_id);
         }
-        if self.should_queue_outbound_intent(&group_id).await? {
+        if self
+            .should_queue_outbound_intent(&group_id, &intent)
+            .await?
+        {
             return self.queue_outbound_intent(group_id, intent);
         }
 
@@ -318,13 +321,14 @@ impl<S: StorageProvider> Engine<S> {
         };
         self.validate_send_acceptance(&intent)?;
         if let Some(state) = self.epoch_manager.state(&group_id)
-            && !matches!(state, EpochState::Stable { .. })
+            && !state.is_stable()
+            && !state.is_awaiting_resolution()
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: state.name(),
                     to: "queue_app_message",
-                    reason: "queue_app_message requires Stable",
+                    reason: "queue_app_message requires a non-terminal group state",
                 },
             ));
         }
@@ -577,11 +581,25 @@ impl<S: StorageProvider> Engine<S> {
     async fn should_queue_outbound_intent(
         &mut self,
         group_id: &GroupId,
+        intent: &SendIntent,
     ) -> Result<bool, EngineError> {
         if let Some(state) = self.epoch_manager.state(group_id)
-            && !matches!(state, EpochState::Stable { .. })
+            && !state.is_stable()
         {
-            return Ok(false);
+            // A state awaiting resolution owes its exit to a publish outcome, a
+            // merge, or a convergence decision — all of which can take minutes
+            // when relays misbehave. Retain application payloads across that
+            // window so a stalled group operation cannot make a user's message
+            // vanish; the drain re-prepares them from whatever canonical state
+            // the group lands on.
+            //
+            // Group-state intents keep the strict `Stable` requirement: a
+            // second staged evolution has no epoch to apply to, and the
+            // per-intent guards in `do_send_ready` report that as the illegal
+            // transition it is. Terminal states retain nothing.
+            return Ok(
+                matches!(intent, SendIntent::AppMessage { .. }) && state.is_awaiting_resolution()
+            );
         }
 
         let now_ms = self.convergence_now_ms();

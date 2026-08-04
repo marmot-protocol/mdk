@@ -13,10 +13,10 @@
 //!    `EngineError::UnknownPending`.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::GroupCapabilities;
@@ -25,7 +25,7 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupMaintenanceState,
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, PeriodicMaintenancePolicy,
@@ -229,6 +229,18 @@ fn registry_with_reactions() -> FeatureRegistry {
 
 fn build(id: &[u8]) -> impl CgkaEngine {
     build_with_peeler(id, Box::new(MockPeeler))
+}
+
+fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap()
 }
 
 fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
@@ -1639,4 +1651,214 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     // The slot is now genuinely consumed: a further confirm is UnknownPending.
     let third = alice.confirm_published(inv_pending).await;
     assert!(matches!(third, Err(EngineError::UnknownPending)));
+}
+
+// ── Retained app messages across a temporary non-stable state ────────────────
+
+/// A chat payload the engine's app-payload validation accepts from `engine`.
+fn app_payload_for(engine: &impl CgkaEngine, body: &str) -> Vec<u8> {
+    cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        body.to_string(),
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+async fn group_with_bob(
+    alice: &mut impl CgkaEngine,
+    bob: &mut impl CgkaEngine,
+) -> cgka_traits::types::GroupId {
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("expected a staged group creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for welcome in welcomes {
+        bob.join_welcome(welcome).await.unwrap();
+    }
+    group_id
+}
+
+#[tokio::test]
+async fn app_message_is_retained_while_a_publish_is_pending() {
+    let mut alice = build(b"alice");
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    // Stage a self-update. The group is now `PendingPublish` — a temporary
+    // state whose exit is a publish outcome the transport still owes us.
+    let staged = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(staged, SendResult::GroupEvolution { .. }));
+
+    // A user typing during that window must not lose their message: the
+    // engine retains the intent durably instead of refusing the send.
+    let payload = app_payload_for(&alice, "typed while the publish was stalled");
+    let queued = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect("a temporary non-stable state must retain an app message, not reject it");
+    assert!(
+        matches!(queued, SendResult::Queued { .. }),
+        "expected durable retention, got {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
+    // The whole point of retaining an *intent* rather than ciphertext: the
+    // group's epoch can advance while the message waits. If the engine froze
+    // the wire bytes at queue time, the message would be sealed under the
+    // pre-commit epoch and every recipient that already applied the commit
+    // would have to reach back through its retained history to read it.
+    let bob_clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build(b"alice");
+    let mut bob = build_with_clock(b"bob", bob_clock.clone());
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let queue_time_epoch = alice.epoch(&group_id).unwrap();
+
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+
+    let payload = app_payload_for(&alice, "written before the epoch moved");
+    assert!(matches!(
+        alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+
+    // The publish finally lands and the group advances while the message waits.
+    alice.confirm_published(pending).await.unwrap();
+    let drain_time_epoch = alice.epoch(&group_id).unwrap();
+    assert_eq!(
+        drain_time_epoch.0,
+        queue_time_epoch.0 + 1,
+        "the confirmed self-update must advance the epoch while the message waited"
+    );
+
+    let mut drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(
+        source_epoch, drain_time_epoch,
+        "the retained intent must be encrypted under the epoch it drains at, not the one it was queued at"
+    );
+
+    // And that is not bookkeeping: bob, who has applied the commit and is
+    // therefore *at* the drain-time epoch, decrypts it.
+    bob.ingest(commit).await.unwrap();
+    bob_clock.advance_ms(1_000);
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        drain_time_epoch,
+        "bob must have applied the self-update before reading the retained message"
+    );
+    let outcome = bob.ingest(msg).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Processed),
+        "bob at the drain-time epoch must decrypt the retained message; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolving_a_publish_schedules_the_drain_for_retained_app_messages() {
+    // Retention is only half a fix. Nothing in the engine drains itself: the
+    // runtime drains the groups the engine reports through
+    // `drain_pending_convergence_groups`. If a publish outcome does not put the
+    // group on that list, a retained message sits until some unrelated event
+    // happens to schedule the group — which is exactly the "message never
+    // sent" symptom retention was meant to remove.
+    for resolve_by_confirming in [true, false] {
+        let mut alice = build(b"alice");
+        let mut bob = build(b"bob");
+        let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("self-update stages a group evolution")
+        };
+        let payload = app_payload_for(&alice, "retained across the publish");
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        // Staging and retention alone must not claim the group is drainable —
+        // it is still PendingPublish, so a drain now would do nothing and burn
+        // the schedule.
+        assert!(
+            !alice.drain_pending_convergence_groups().contains(&group_id),
+            "a group awaiting a publish outcome is not drainable yet"
+        );
+
+        if resolve_by_confirming {
+            alice.confirm_published(pending).await.unwrap();
+        } else {
+            alice.publish_failed(pending).await.unwrap();
+        }
+
+        assert!(
+            alice.drain_pending_convergence_groups().contains(&group_id),
+            "resolving the publish (confirmed = {resolve_by_confirming}) must schedule the drain \
+             for the retained app message"
+        );
+    }
 }

@@ -3674,6 +3674,26 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         "send must report Unrecoverable; got {send_err:?}"
     );
 
+    // The durable-retention path observes the same terminal boundary. States
+    // that merely await a publish outcome retain an app message and release it
+    // later; a halted group owes no outcome, so retaining here would promise a
+    // delivery nothing can ever make.
+    let queue_err = restarted
+        .queue_app_message(
+            group_id.clone(),
+            app_payload_for(&restarted, b"must not be retained while halted"),
+        )
+        .await
+        .expect_err("queue_app_message must refuse Unrecoverable");
+    assert!(
+        matches!(
+            queue_err,
+            cgka_traits::error::EngineError::InvalidTransition(ref t)
+                if t.from == "Unrecoverable"
+        ),
+        "queue_app_message must report Unrecoverable; got {queue_err:?}"
+    );
+
     // A verified replacement Welcome must be able to repair a frozen active
     // record. Alice removes Carol from the live branch and re-adds her with a
     // fresh KeyPackage; Carol intentionally never ingests the removal, so her

@@ -35,7 +35,7 @@ use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::types::EpochId;
+use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider as _;
 
@@ -316,6 +316,7 @@ impl<S: StorageProvider> Engine<S> {
                 "deferred fork-recovery prune after confirm; will retry on next pass"
             );
         }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
@@ -501,6 +502,7 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
             self.schedule_pending_convergence_group(&queued_group_id);
         }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         self.forget_pending_commit_for_recovery(pending)?;
         self.restore_self_remove_auto_commit_schedules_for_group(
             &group_id,
@@ -509,6 +511,34 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
+    }
+
+    /// Put a group back on the runtime's drain list when it still holds durable
+    /// outbound intents.
+    ///
+    /// A publish outcome is the only exit from `PendingPublish`, and the
+    /// application payloads retained across that window are released by the
+    /// next convergence drain (`converge_and_drain_queued_outbound_intents`).
+    /// Nothing else schedules them once the group is Stable again, so the
+    /// outcome must.
+    ///
+    /// Best-effort by construction: this runs after the outcome is durable, so
+    /// a transient backend lock here must not fail an already-committed
+    /// confirm/rollback. Losing the signal only defers the release to the
+    /// runtime's next pass over this group; the intents stay durable.
+    fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
+        match self.storage.list_queued_outbound_intents(group_id) {
+            Ok(retained) if !retained.is_empty() => {
+                self.schedule_pending_convergence_group(group_id);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "cgka_engine::publish",
+                method = "schedule_drain_for_retained_outbound_intents",
+                transient = error.is_transient(),
+                "deferred retained-intent drain scheduling after a publish outcome"
+            ),
+        }
     }
 }
 

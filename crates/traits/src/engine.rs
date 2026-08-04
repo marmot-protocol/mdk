@@ -657,10 +657,25 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Encrypt + prepare an outbound message or group operation.
     ///
-    /// **State.** Valid when the group is in `Stable`. If convergence input
-    /// is still unresolved, the engine stores the intent and returns
-    /// [`SendResult::Queued`]. Returns `InvalidTransition` if called during
-    /// `PendingPublish` / `Merging`.
+    /// **State.** Group-state intents (commits, admin changes) are valid only
+    /// from `Stable`; any other state returns `InvalidTransition`.
+    ///
+    /// [`SendIntent::AppMessage`] is additionally accepted from every state
+    /// that [`EpochState::is_awaiting_resolution`], because such a state owes
+    /// its exit to a publish outcome, a merge, or a convergence decision — none
+    /// of which the user who is typing controls, and all of which can take
+    /// minutes when relays misbehave. The payload is stored and
+    /// [`SendResult::Queued`] returned; the engine re-prepares it against
+    /// whatever canonical state the group lands on, so a message retained
+    /// across an epoch change is encrypted under the *later* epoch. Terminal
+    /// states (`Unrecoverable`, `Disbanded`) still return `InvalidTransition`:
+    /// no outcome is owed there, so retention would promise a delivery nothing
+    /// can make.
+    ///
+    /// Unresolved convergence input queues every intent kind the same way.
+    ///
+    /// [`EpochState::is_awaiting_resolution`]:
+    ///     crate::engine_state::EpochState::is_awaiting_resolution
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
 
     /// Durably accept an application-message intent without preparing MLS or
@@ -669,9 +684,10 @@ pub trait CgkaEngine: Send + Sync {
     /// This is the transport-lifecycle fallback for a locally ready signing
     /// account whose transport is not active. The same authoritative
     /// quarantine, disband, removal, unrecoverable, leave, and epoch-state
-    /// gates as [`Self::send`] still apply. On success the group is scheduled
-    /// for convergence so the intent is regenerated from current canonical
-    /// state before publication.
+    /// gates as [`Self::send`] still apply — including its retention boundary:
+    /// states awaiting resolution accept the payload, terminal states refuse
+    /// it. On success the group is scheduled for convergence so the intent is
+    /// regenerated from current canonical state before publication.
     async fn queue_app_message(
         &mut self,
         group_id: GroupId,
