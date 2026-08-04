@@ -42,6 +42,21 @@ impl AccountManager {
         }
     }
 
+    /// Force one complete relay-history query for a local account and project
+    /// every returned event through the ordinary runtime path.
+    pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RepairFullHistory { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response
+            .await
+            .map_err(|_| AppError::TransportClosed)?
+            .map_err(AppError::AccountCatchUp)
+    }
+
     /// Create the group and return its canonical id. Invitation delivery is
     /// reported independently through `WelcomeDeliveryPending` events and
     /// `pending_welcome_deliveries`.

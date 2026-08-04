@@ -20,6 +20,7 @@
 //!
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
+pub mod app_runtime;
 mod audit_capture;
 pub mod bus;
 mod campaign_metrics;
@@ -29,12 +30,14 @@ mod failure_capsule;
 pub mod family;
 pub mod lifecycle_model;
 pub mod mutation_adequacy;
+pub mod node_protocol;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
 pub mod policy_contract;
 #[cfg(feature = "test-policy-overrides")]
 mod policy_sweep;
+pub mod process_orchestrator;
 pub mod proptest_support;
 mod quiescence;
 pub mod reference_convergence;
@@ -51,6 +54,10 @@ pub mod subject;
 mod topology;
 pub mod vector;
 
+pub use app_runtime::{
+    APP_RUNTIME_OBSERVATION_SCHEMA_VERSION, AppRuntimeApplicationProjectionV1, AppRuntimeHarness,
+    AppRuntimeLocalDiagnosticsV1, AppRuntimeObservationV1, AppRuntimeProtocolProjectionV1,
+};
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use campaign_metrics::{
     CampaignHistogramBucketV1, CampaignHistogramV1, CampaignMeasurementsV1,

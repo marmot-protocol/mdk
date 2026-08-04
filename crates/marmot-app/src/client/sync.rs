@@ -651,6 +651,29 @@ impl AppClient {
         Ok(())
     }
 
+    /// Explicit account-wide repair for a host that has independent evidence
+    /// its incremental cursor may be incomplete (for example, a long-offline
+    /// participant that has no new traffic capable of arming epoch-stall
+    /// detection). Unlike the automatic detector path, this is a caller-owned
+    /// operation and therefore does not mutate the detector's debounce state.
+    pub(crate) async fn repair_full_history(&mut self) -> Result<SyncSummary, AppError> {
+        if self.refresh_group_routes()? {
+            self.app.save_state(&self.state)?;
+        }
+        // Caller-directed repair is a fresh transport preparation, not an
+        // assumption that startup ordering already installed the signer and
+        // current group subscriptions.
+        self.relay_plane
+            .set_transport_signer(self.transport_signer.clone())
+            .await;
+        self.runtime.activate_transport(None).await?;
+        self.sync_runtime_groups().await?;
+        self.record_subscription_rebuild(None).await;
+        let mut summary = self.sync_sdk_relay().await?;
+        summary.merge(self.drain_pending_session_events().await?);
+        Ok(summary)
+    }
+
     pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,
