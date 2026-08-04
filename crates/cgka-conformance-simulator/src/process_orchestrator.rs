@@ -1496,7 +1496,7 @@ fn decode_node_response(
     let raw: serde_json::Value = serde_json::from_str(line).map_err(environment_error)?;
     let protocol = raw.get("protocol").and_then(serde_json::Value::as_str);
     let response_request_id = raw.get("request_id").and_then(serde_json::Value::as_str);
-    if protocol != Some(NODE_PROTOCOL_VERSION) || response_request_id != Some(&request_id) {
+    if protocol != Some(NODE_PROTOCOL_VERSION) || response_request_id != Some(request_id) {
         return Err(ProcessOrchestratorError::new(
             "node_protocol_mismatch",
             "node response did not match the request",
