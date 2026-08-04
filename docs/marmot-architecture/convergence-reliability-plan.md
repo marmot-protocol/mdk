@@ -1013,11 +1013,19 @@ infrastructure-capable execution lanes.
 
 ### 6.3 Execution lanes
 
-- [ ] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
-- [ ] Nightly lane: seed matrices, file-backed storage, crash matrix, retained relays, mutation subset.
-- [ ] Weekly/manual lane: process/container soak, resource and constant sweeps.
-- [ ] Release-hardening lane: mixed-version and incident-derived corpus.
-- [ ] Define wall-clock, CPU, memory, disk, artifact-retention, and flake budgets for every lane.
+- [x] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
+- [x] Nightly lane: seed matrices, file-backed storage, crash matrix, retained relays, mutation subset.
+- [x] Weekly/manual lane: process/container soak, resource and constant sweeps.
+- [x] Release-hardening lane: mixed-version and incident-derived corpus.
+- [x] Define wall-clock, CPU, memory, disk, artifact-retention, and flake budgets for every lane.
+
+Four versioned lane manifests now define both included capabilities and reviewed limits. The PR workflow remains
+container-free and keeps formal/model/vector checks parallel; nightly adds process campaigns and one real-container
+cross-route regression; the scheduled weekly/manual workflow runs the full current container suite and expanded
+resource/constant campaigns; release hardening additionally requires an operator-supplied, reviewed distributed
+manifest so mixed-version evidence cannot silently degrade into a current-build-only run. A typed budget evaluator
+fails wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. The evidence-bundle validator requires
+route/model/adapter/mutation/boundary/counterexample/assumption/untested-surface sections and a passing same-lane budget.
 
 ### 6.4 Failure corpus lifecycle
 
@@ -1154,6 +1162,7 @@ incorrect result.
 | 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
 | 2026-08-04 | 6.1 decision-route assurance closure | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine, process, and real-container regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
 | 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
+| 2026-08-04 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
 
 ## Post-Milestone 6 Cleanup
 

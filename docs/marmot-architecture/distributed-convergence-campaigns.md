@@ -73,6 +73,28 @@ CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
 The default CI lane validates command construction and the process boundary without requiring Docker. Scheduled lanes
 may opt into the real-container tests when the runner environment advertises that capability.
 
+## Execution lanes and budgets
+
+Reviewed lane manifests live under `crates/convergence-campaign-runner/lanes`. The Rust policy test requires those
+files to equal the built-in policy exactly, so a budget or coverage change cannot arrive as an unreviewed JSON edit.
+The four lanes are:
+
+- pull request: strict formal checks, fixed vectors, and bounded engine/reference/relay coverage without Docker;
+- nightly: expanded seeds, file-backed storage, crash and retained-relay matrices, targeted mutations, process runs,
+  selected containers, and the incident corpus;
+- weekly/manual: process/container soak plus full targeted mutations, resource sweeps, constant sweeps, and mixed-build
+  support; and
+- release hardening: the largest reviewed bounds, mixed-version execution, and incident-derived regressions.
+
+Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
+and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
+any limit is exceeded. A flake is therefore evidence, not permission to turn a failing assertion green silently.
+
+The version-1 evidence-bundle type requires a scoped assurance claim, covered decision routes, models, adapters,
+mutation results, tested workload/constant boundaries, unresolved counterexamples, residual assumptions, untested
+surfaces, a passing same-lane budget evaluation, and digest-pinned artifacts. `check-evidence` rejects incomplete
+bundles; valid bundles are written with owner-only permissions.
+
 ## What this evidence means
 
 A passing distributed campaign establishes the declared scenario, build matrix, fault schedule, adapter capabilities,

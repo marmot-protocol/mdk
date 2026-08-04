@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "lane": "release_hardening",
+  "contents": {
+    "strict_formal_gate": true,
+    "fixed_vectors": true,
+    "engine_reference_relay_cases": 2048,
+    "generated_seed_cases": 8192,
+    "file_backed_storage": true,
+    "crash_matrix": true,
+    "retained_relays": true,
+    "mutation_scope": "full_targeted",
+    "process_campaigns": true,
+    "container_campaigns": true,
+    "resource_sweeps": true,
+    "constant_sweeps": true,
+    "mixed_version": true,
+    "incident_corpus": true
+  },
+  "budgets": {
+    "max_wall_clock_seconds": 28800,
+    "max_cpu_seconds": 57600,
+    "max_peak_rss_bytes": 12884901888,
+    "max_disk_bytes": 53687091200,
+    "max_artifact_bytes": 16106127360,
+    "artifact_retention_days": 180,
+    "max_flake_retries": 1,
+    "max_flake_rate_basis_points": 10
+  }
+}
