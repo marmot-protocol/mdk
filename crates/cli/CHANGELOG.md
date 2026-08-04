@@ -24,10 +24,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Account projection storage types now redact encrypted group-image decryption
+  and Blossom upload keys from `Debug` output, including nested group
+  formatting. The TUI group diagnostics panel no longer retains or renders raw
+  group component `data_hex`, so blossom image key material cannot leak through
+  diagnostics `Debug` or on-screen lines.
+  
 - OpenMLS persistence now zeroizes temporary SQLite serialization,
   deserialization, and rollback-snapshot buffers for MLS private keys, epoch and
   message secrets, PSKs, pending group state, application-export state, and
   stored key-package handoffs on success and error paths.
+  
 - `wn login --nsec-stdin` and `wn account create --nsec-stdin` now keep stdin
   nsecs in a dedicated zeroizing sidecar instead of materializing them into the
   generic `Cli` command tree. Daemon execute frames and `AccountSetupRequest`

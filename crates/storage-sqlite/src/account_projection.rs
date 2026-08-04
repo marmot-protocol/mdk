@@ -10,6 +10,7 @@ use rusqlite::{
     types::{Type, Value},
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 const SECURE_DELETE_RETENTION_OPERATION: &str = "retention";
 const SECURE_DELETE_LOCAL_GROUP_OPERATION: &str = "local_group";
@@ -105,7 +106,12 @@ pub struct StoredAccountState {
     pub groups: Vec<StoredAccountGroup>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `image_key_hex`/`image_upload_key_hex` are key material mirrored from the
+/// blossom image component for chat-list projection. They are stored in
+/// SQLCipher, but must not appear in `Debug` output. Nested
+/// [`StoredAccountGroupComponent`] values redact in-band component bytes that
+/// carry the same keys.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredAccountGroup {
     pub group_id_hex: String,
     pub endpoint: String,
@@ -137,6 +143,35 @@ pub struct StoredAccountGroup {
     pub components: Vec<StoredAccountGroupComponent>,
 }
 
+impl fmt::Debug for StoredAccountGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredAccountGroup")
+            .field("group_id_hex", &self.group_id_hex)
+            .field("endpoint", &self.endpoint)
+            .field("profile_name", &self.profile_name)
+            .field("profile_description", &self.profile_description)
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("image_media_type", &self.image_media_type)
+            .field("admin_keys_hex", &self.admin_keys_hex)
+            .field("archived", &self.archived)
+            .field("pending_confirmation", &self.pending_confirmation)
+            .field("member_count", &self.member_count)
+            .field("welcomer_account_id_hex", &self.welcomer_account_id_hex)
+            .field(
+                "via_welcome_message_id_hex",
+                &self.via_welcome_message_id_hex,
+            )
+            .field("nostr_routing_last_epoch", &self.nostr_routing_last_epoch)
+            .field("prior_nostr_routes", &self.prior_nostr_routes)
+            .field("self_membership", &self.self_membership)
+            .field("components", &self.components)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNostrRoute {
     pub nostr_group_id_hex: String,
@@ -144,11 +179,25 @@ pub struct StoredNostrRoute {
     pub last_epoch: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `component_data_hex` carries MLS-protected component bytes. Blossom image
+/// payloads embed avatar decryption and Blossom upload keys; other components
+/// may carry sensitive policy bytes. SQLCipher protects persistence, but
+/// `Debug` must never render raw component bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredAccountGroupComponent {
     pub component_id: u16,
     pub component_name: String,
     pub component_data_hex: String,
+}
+
+impl fmt::Debug for StoredAccountGroupComponent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredAccountGroupComponent")
+            .field("component_id", &self.component_id)
+            .field("component_name", &self.component_name)
+            .field("component_data_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

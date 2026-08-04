@@ -2892,3 +2892,23 @@ fn app_messages_replay_order_matches_cursor_comparator() {
     assert_eq!(dups[0].group_id_hex, "aa");
     assert_eq!(dups[1].group_id_hex, "bb");
 }
+
+#[test]
+fn stored_account_group_component_debug_redacts_blossom_image_payload() {
+    use cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID;
+
+    const IMAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const UPLOAD_KEY_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let component = StoredAccountGroupComponent {
+        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        component_name: "marmot.group.blossom.image.v1".to_owned(),
+        component_data_hex: format!("00{IMAGE_KEY_HEX}{UPLOAD_KEY_HEX}"),
+    };
+
+    let rendered = format!("{component:?}");
+    assert!(!rendered.contains(IMAGE_KEY_HEX));
+    assert!(!rendered.contains(UPLOAD_KEY_HEX));
+    assert!(rendered.contains("marmot.group.blossom.image.v1"));
+    assert!(rendered.contains("redacted"));
+}
