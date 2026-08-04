@@ -195,6 +195,8 @@ pub fn generate_adversarial_reliability_self_update_regression(seed: u64) -> Gen
     })
 }
 
+/// Build a reduced catalog case while preserving its deterministic identity
+/// and strict reliability oracle.
 fn adversarial_reliability_regression_case(
     seed: u64,
     case_index: u64,
@@ -1141,6 +1143,7 @@ fn convergence_chaos_restart_delivery_faults(
     (scenario, expected)
 }
 
+/// Select one of the twelve adversarial workload shapes by stable case index.
 fn adversarial_reliability_case(
     rng: &mut StdRng,
     case_index: u64,
@@ -1176,6 +1179,7 @@ fn adversarial_reliability_case(
     }
 }
 
+/// Build the full retained-history flood, scaling its rounds by catalog cycle.
 fn adversarial_reliability_offline_retained_flood(
     case_index: u64,
 ) -> (
@@ -1188,6 +1192,7 @@ fn adversarial_reliability_offline_retained_flood(
     adversarial_reliability_offline_retained_flood_with_rounds(case_index, rounds)
 }
 
+/// Build a retained-relay catch-up workload with an explicit flood duration.
 fn adversarial_reliability_offline_retained_flood_with_rounds(
     case_index: u64,
     rounds: usize,
@@ -1277,6 +1282,7 @@ fn adversarial_reliability_offline_retained_flood_with_rounds(
     )
 }
 
+/// Build sustained mixed application, proposal, and commit traffic.
 fn adversarial_reliability_sustained_mixed_traffic(
     rng: &mut StdRng,
     case_index: u64,
@@ -1290,6 +1296,7 @@ fn adversarial_reliability_sustained_mixed_traffic(
     adversarial_reliability_sustained_mixed_traffic_with_rounds(rng, case_index, rounds)
 }
 
+/// Build mixed traffic with an explicit number of deterministic rounds.
 fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
     rng: &mut StdRng,
     case_index: u64,
@@ -1355,6 +1362,7 @@ fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
     )
 }
 
+/// Build the full self-update stream followed by an administrative race.
 fn adversarial_reliability_self_update_adversary(
     case_index: u64,
 ) -> (
@@ -1366,6 +1374,7 @@ fn adversarial_reliability_self_update_adversary(
     adversarial_reliability_self_update_adversary_with_rounds(case_index, 12)
 }
 
+/// Build a self-update/admin race with an explicit update count.
 fn adversarial_reliability_self_update_adversary_with_rounds(
     case_index: u64,
     rounds: usize,
@@ -1421,6 +1430,7 @@ fn adversarial_reliability_self_update_adversary_with_rounds(
     )
 }
 
+/// Build an invite from a losing branch and require its named terminal outcome.
 fn adversarial_reliability_losing_invite_outcome(
     case_index: u64,
 ) -> (
@@ -1497,6 +1507,7 @@ fn adversarial_reliability_losing_invite_outcome(
     )
 }
 
+/// Build split relay histories that must reconcile after set equalization.
 fn adversarial_reliability_unequal_relay_reconciliation(
     case_index: u64,
 ) -> (
@@ -1564,6 +1575,7 @@ fn adversarial_reliability_unequal_relay_reconciliation(
     )
 }
 
+/// Build restart transitions around durable convergence-phase boundaries.
 fn adversarial_reliability_restart_boundaries(
     case_index: u64,
 ) -> (
@@ -1615,6 +1627,7 @@ fn adversarial_reliability_restart_boundaries(
     )
 }
 
+/// Build concurrent groups to verify noisy-neighbor workload isolation.
 fn adversarial_reliability_multi_group_noisy_neighbor(
     case_index: u64,
 ) -> (
@@ -1700,6 +1713,7 @@ fn adversarial_reliability_multi_group_noisy_neighbor(
     )
 }
 
+/// Build a shared-account, multi-device witness topology and workload.
 fn adversarial_reliability_multi_device_account(
     case_index: u64,
 ) -> (
@@ -1753,6 +1767,7 @@ fn adversarial_reliability_multi_device_account(
     )
 }
 
+/// Build competing branches whose selection depends on application witnesses.
 fn adversarial_reliability_app_witness_value(
     case_index: u64,
 ) -> (
@@ -1827,6 +1842,7 @@ fn adversarial_reliability_app_witness_value(
     )
 }
 
+/// Build a mixed-binary compatibility case with policy preflight constraints.
 fn adversarial_reliability_mixed_binary_compatibility(
     case_index: u64,
 ) -> (
@@ -1866,6 +1882,7 @@ fn adversarial_reliability_mixed_binary_compatibility(
     )
 }
 
+/// Build clock, scheduler, timestamp, and relay-cursor adversarial inputs.
 fn adversarial_reliability_clock_cursor_attack(
     case_index: u64,
 ) -> (
@@ -1930,6 +1947,7 @@ fn adversarial_reliability_clock_cursor_attack(
     )
 }
 
+/// Construct account, device, process, and client mappings for a workload.
 fn adversarial_reliability_account_topology(
     clients: &[(&str, &str, &str)],
 ) -> crate::ScenarioTopologyV2 {
@@ -1971,6 +1989,7 @@ fn adversarial_reliability_account_topology(
     }
 }
 
+/// Construct a topology in which every client reads from one retained relay.
 fn adversarial_reliability_single_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
     let mut topology = adversarial_reliability_account_topology(
         &clients
@@ -1989,6 +2008,7 @@ fn adversarial_reliability_single_relay_topology(clients: &[String]) -> crate::S
     topology
 }
 
+/// Construct unequal relay subscriptions for later history reconciliation.
 fn adversarial_reliability_split_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
     let mut topology = adversarial_reliability_single_relay_topology(clients);
     topology.relays = vec![
