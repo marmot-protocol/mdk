@@ -150,7 +150,7 @@ fn slow_block_devices_require_a_capable_vm_backend() {
     assert_eq!(error.code, "vm_required_for_block_latency");
 
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
-        driver: "/opt/darkmatter-automated-testing/scripts/dmvm.rb".into(),
+        driver: "/usr/local/bin/cgka-vm-campaign".into(),
         driver_args: vec![
             "campaign".into(),
             "--scenario".into(),

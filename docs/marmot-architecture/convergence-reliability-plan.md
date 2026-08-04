@@ -735,7 +735,7 @@ credentials for two modeled devices of one account. The complete 41-case canonic
 boundary, including exact fixtures, bidirectional decryptability, generated chaos/delivery families, and strict
 pre-join resource retirement.
 
-The `just milestone3-ci` gate executes every catalog family (including the feature-gated witness and replay-budget
+The `just adversarial-reliability-ci` gate executes every catalog family (including the feature-gated witness and replay-budget
 campaigns), all three sustained headline workloads, policy sweeps, and a file-backed isolated worker with a hard
 timeout. GitHub's simulator job runs this gate in addition to the ordinary simulator and vector suites; the exit gate
 is not based on compile-only catalog coverage.
@@ -1045,17 +1045,23 @@ restricted to synthetic shareable capsules with portable expectations.
 
 ### Milestone 6 Exit Gate
 
-- [ ] Every inventoried convergence decision route has a named model/test/campaign owner, and no unexplained
+- [x] Every inventoried convergence decision route has a named model/test/campaign owner, and no unexplained
   route-dependent outcome remains.
-- [ ] The #1236 regression family passes across engine, app-runtime, process, and distributed adapters with exact
+- [x] The #1236 regression family passes across engine, app-runtime, process, and distributed adapters with exact
   cryptographic agreement, active decryptability, and complete application-input dispositions.
-- [ ] Campaigns are repeatable from saved configuration and artifact manifests.
-- [ ] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
-- [ ] Resource and flake budgets prevent silent campaign degradation.
-- [ ] Release hardening produces a reviewed convergence evidence bundle that lists covered decision routes, models,
+- [x] Campaigns are repeatable from saved configuration and artifact manifests.
+- [x] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
+- [x] Resource and flake budgets prevent silent campaign degradation.
+- [x] Release hardening produces a reviewed convergence evidence bundle that lists covered decision routes, models,
   adapters, mutation results, workload/constant boundaries, unresolved counterexamples, residual assumptions, and
   untested surfaces. The bundle makes a scoped assurance claim rather than asserting universal implementation
   correctness or universally optimal constants.
+
+Milestone 6 is complete as an assurance and operations capability. Completion means the release-hardening lane can
+produce a completeness-checked bundle from its observed run artifacts; it does not mean that one historical run is
+permanently representative or that the engine is universally correct. Each release candidate still has to execute the
+lane, satisfy its budgets, review any counterexamples, and retain the resulting bundle. A new production route,
+protocol rule, adapter behavior, field incident, or mutation survivor reopens the corresponding claim.
 
 ## Cross-Milestone Verification Matrix
 
@@ -1156,7 +1162,7 @@ incorrect result.
 | 2026-08-02 | 2.2 initial independent reference adapter | Added a capability-limited symbolic-memory subject that executes the common group/publication/application lifecycle without production selector or canonicalizer calls; one compiled scenario now runs unchanged on reference and engine adapters with equal semantic observations, exact-only predicates add their true preflight capability, and assertion sampling no longer consumes later report evidence | `one_compiled_scenario_runs_unchanged_on_reference_and_engine_adapters`; `unsupported_exact_assertion_fails_before_reference_model_executes`; scenario IR suite |
 | 2026-08-02 | 2.3 retained multi-relay model and exit scenarios | Added real-engine delivery through durable per-relay histories with topology fanout/subscriptions, cursor/since/full/set queries, EOSE-versus-completeness observations, offline reconnect, visibility omission, duplicate/order policy, history equalization, and quiet-query diagnosis; the same compiled scenario runs on all three initial adapters, offline delivery comes from history, and unequal histories reach exact state equality only after reconciliation | `one_compiled_scenario_runs_unchanged_on_all_initial_adapters`; `offline_client_recovers_from_retained_history`; `unequal_relay_histories_converge_after_set_equalization`; `eose_does_not_heal_hidden_cursor_history_but_full_backfill_does`; `relay_reverse_order_and_duplicates_are_explicit_and_deduplicated` |
 | 2026-08-02 | Milestone 2 completion verification | Completed every 2.1-2.3 work item and exit scenario; the canonical IR no longer exposes mutable queue positions, all repository vectors compile, and retained-history behavior is distinct from healed packet loss | [MDK #1233](https://github.com/marmot-protocol/mdk/pull/1233); `cargo test -p cgka-conformance-simulator`; `cargo test -p incident-replay`; `just fast-ci` |
-| 2026-08-02 | 3.1 adversarial workload campaigns | Added the twelve-family workload catalog, small and sustained headline campaigns, real durable-phase process kills, resource-exhaustion/repair, multi-group and shared-account-device topologies, retained-relay disagreement, clock/cursor attacks, witness-enabled/disabled full-engine comparison, and mixed binary/policy preflight. Recorded the current losing-branch device repair limit and the future authenticated policy-capability boundary | `milestone3_campaigns`; `kill_at_every_durable_convergence_phase_reopens_and_finishes`; explicit sustained campaign; proposal-expiry and multi-parent replay tests |
+| 2026-08-02 | 3.1 adversarial workload campaigns | Added the twelve-family workload catalog, small and sustained headline campaigns, real durable-phase process kills, resource-exhaustion/repair, multi-group and shared-account-device topologies, retained-relay disagreement, clock/cursor attacks, witness-enabled/disabled full-engine comparison, and mixed binary/policy preflight. Recorded the current losing-branch device repair limit and the future authenticated policy-capability boundary | `adversarial_reliability_campaigns`; `kill_at_every_durable_convergence_phase_reopens_and_finishes`; explicit sustained campaign; proposal-expiry and multi-parent replay tests |
 | 2026-08-02 | 3.2 campaign measurements and policy sweeps | Embedded stable latency/blocking, pass/reorg, disposition/outcome, queue/replay/database measurements in scenario reports; added an isolated child-process runner for CPU/RSS/write accounting; and added fixed-input test-policy curves with named boundary failures and no production auto-tuning | `offline_retained_history_flood_runs_as_a_small_regression`; `policy_sweeps`; child-process smoke campaign; default and feature-enabled compile gates |
 | 2026-08-02 | 3.3 attested/derived incident replay evidence | Preserved accepted fork/convergence archetypes while labeling them outcome-equivalent and naming unavailable evidence; added fail-closed producer-attested normalized Scenario IR import with per-step and contested-incident source mappings, explicit trust/sensitivity status, semantic reproduction, and owner-only vector/evidence output | Full `incident-replay` suite; `producer_attested_history_imports_and_reproduces`; replayable synthetic membership-fork CLI smoke and `0600` mode check |
 | 2026-08-02 | Milestone 3 exit scenarios | Split the three headline workloads into small default regressions and explicit sustained campaigns; pinned replay-budget fail-closed repair, report first-failure/resource attribution, and exact-versus-unavailable incident outcomes | Three `small_regression` tests; explicit offline, mixed-traffic, and self-update sustained runs; `replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_inputs`; campaign metric and incident artifact tests |
@@ -1165,30 +1171,31 @@ incorrect result.
 | 2026-08-03 | 4.2 bounded liveness and lifecycle model | Selected TLA+/TLC as temporal authority and Stateright as the Rust trace bridge; checked input closure, strong fairness, freeze/settle, durable/volatile crash recovery, temporary resource failure, unequal histories, and stranded-joiner repair; retained an expected unfair counterexample with drift-checked Scenario IR action kinds | `lifecycle_model` (5 tests); `just tla-liveness` (720 distinct states, 1,821 generated, depth 14); `just tla-liveness-counterexample` |
 | 2026-08-03 | 4.3 semantic mutation adequacy | Added nine simulator-only one-rule mutants spanning selection, witness handling, cutoff/frozen state, scheduling, output, publication, and retention; every mutant is killed and the checked matrix maps it to independent and production-shaped evidence | `mutation_adequacy` (3 tests); [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) |
 | 2026-08-03 | 4.4 protocol decision gate | Reverified adopted Marmot convergence commit `4ad4ae2`, classified every P/E/A ledger id, pinned all v1 policy values and the future required-component rule, and demonstrated operational non-interference across batch, wake-delay, and temporary-resource variants | `protocol_decision_gate` (5 tests); [`PROTOCOL_DECISIONS.md`](../../crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md); `just convergence-ledger-gate` |
-| 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
+| 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just convergence-verification-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
 | 2026-08-04 | Milestone 5 app/process simulation | Added a production-shaped app-runtime adapter, versioned child-node protocol, multi-process orchestrator, projection/event observation, retained-relay repair, real pause/resume/kill/restart, cross-adapter comparison, and privacy-safe failure capsules; then replaced milestone-scoped module/test names with durable capability names | Commits `a3296b16` through `19d0d5f8`; `app_runtime_adapter`; `node_protocol`; `process_orchestrator`; `just fast-ci` |
 | 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
 | 2026-08-04 | 6.1 decision-route assurance closure | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine, process, and real-container regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
+| 2026-08-04 | 6.1 app-witness route-order closure | The full strict-oracle catalog exposed a production route split after the #1236 fixes: branch-local transport could peel under a candidate exporter but its inner MLS app was processed against the live branch, and provisional-live apps could be delivered outside the durable pass that admitted a competing candidate app. Candidate recovery now buffers inner MLS input, one bounded retry/replay batch shares a pinned convergence timestamp, and authenticated live-branch apps join the same collecting pass. The named six-member witness regression converges to exact cryptographic state without extra ticks, while the settled superseded-root lifecycle remains unchanged. | `branch_local_app_witnesses_converge_independent_of_transport_order`; `engine_converges_stored_openmls_messages_to_selected_branch`; full simulator suite |
 | 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 | 2026-08-04 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
 | 2026-08-04 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis | `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
 
 ## Post-Milestone 6 Cleanup
 
-Status: `not-started`. Perform this only after every Milestone 6 exit item has evidence, so cleanup does not obscure
+Status: `complete`. Performed after every Milestone 6 exit item had named evidence so cleanup did not obscure
 campaign history while the distributed machinery is still changing.
 
-- [ ] Inventory every tracked file whose basename contains `milestone`, case-insensitively.
-- [ ] Rename long-lived files after the capability or behavior they own, update module declarations, test targets,
+- [x] Inventory every tracked file whose basename contains `milestone`, case-insensitively.
+- [x] Rename long-lived files after the capability or behavior they own, update module declarations, test targets,
   `Justfile` recipes, CI, documentation links, and replay instructions, and preserve history with ordinary Git moves.
-- [ ] Rename `crates/cgka-conformance-simulator/tests/milestone3_campaigns.rs` to a durable adversarial-campaign name.
-- [ ] Delete obsolete milestone-only scaffolding and generated artifacts after confirming that no fixture, replay capsule,
+- [x] Confirm the long-lived adversarial reliability test source uses a capability-based filename.
+- [x] Delete obsolete milestone-only scaffolding and generated artifacts after confirming that no fixture, replay capsule,
   CI lane, or documentation reference still depends on them.
-- [ ] Review milestone-numbered commands, scenario-family ids, test names, and output directories. Preserve versioned
+- [x] Review milestone-numbered commands, scenario-family ids, test names, and output directories. Preserve versioned
   external identifiers when compatibility requires it; otherwise give long-lived interfaces capability-based names.
-- [ ] Run the full affected simulator, app-runtime, process, distributed, formal, and repository fast-CI gates after
+- [x] Run the full affected simulator, app-runtime, process, distributed, formal, and repository fast-CI gates after
   the renames.
-- [ ] Require this tracked-filename check to return no output and exit successfully:
+- [x] Require this tracked-filename check to return no output and exit successfully:
 
 ```sh
 test -z "$(git ls-files | awk -F/ 'tolower($NF) ~ /milestone/ { print }')"

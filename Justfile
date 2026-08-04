@@ -448,10 +448,18 @@ dead-code-audit:
 
 # Guard against retired legacy naming reappearing (see PR #725).
 naming-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
     ./scripts/check_legacy_naming.sh
+    tracked_milestone_names="$(git ls-files | awk -F/ 'tolower($NF) ~ /milestone/ { print }')"
+    if [[ -n "$tracked_milestone_names" ]]; then
+        echo "tracked filenames must use capability names, not milestone names:" >&2
+        echo "$tracked_milestone_names" >&2
+        exit 1
+    fi
 
 # Keep convergence policy, resource, scheduler, and history-recovery constants
-# attached to reviewed Milestone 0 ledger entries.
+# attached to reviewed convergence-constant ledger entries.
 convergence-ledger-gate:
     ./scripts/check_convergence_constant_ledger.sh
 
