@@ -14,7 +14,8 @@
 //! commit is the transport-layer `MessageId`. The two are kept separate inside
 //! `CommitRecoveryRecord` so the ordering key remains transport-independent
 //! while the engine can still reach back to the storage record that needs
-//! `MessageState::EpochInvalidated`.
+//! parking as `MessageState::ConvergenceDeferred` (reconsiderable by a later
+//! distributed-convergence pass, not terminal).
 
 use crate::engine::Engine;
 use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
@@ -32,8 +33,9 @@ struct CommitRecoveryRecord {
     group_id: GroupId,
     source_epoch: EpochId,
     ordering_key: CommitOrderingKey,
-    /// Storage-layer identity of the commit. Used to update
-    /// `MessageState::EpochInvalidated` when this commit loses a fork.
+    /// Storage-layer identity of the commit. Used to park the row
+    /// `MessageState::ConvergenceDeferred` when this commit loses a fork
+    /// (its branch stays reconsiderable for distributed convergence).
     storage_id: MessageId,
     snapshot_name: String,
 }
@@ -43,8 +45,8 @@ pub(crate) enum ForkResolution {
     CandidateWins {
         winner: CommitOrderingKey,
         invalidated: CommitOrderingKey,
-        /// `MessageId` of the now-invalidated incumbent, for the storage
-        /// `update_message_state` call site.
+        /// `MessageId` of the now-displaced incumbent, for the storage
+        /// write that parks its row `ConvergenceDeferred`.
         invalidated_storage_id: MessageId,
     },
     IncumbentWins {
@@ -176,12 +178,45 @@ impl ForkRecoveryManager {
             });
         }
 
+        // Capture the incumbent's stored row BEFORE the rollback: the
+        // pre-commit snapshot predates the incumbent's own persist, so the
+        // rollback below sweeps its row away entirely. Re-persisting it
+        // afterwards (parked, see below) is what keeps the displaced branch
+        // reconsiderable.
+        let displaced_incumbent_row = match storage.get_message(&incumbent.storage_id) {
+            Ok(record) => Some(record),
+            Err(StorageError::NotFound) => None,
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
         storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
         match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
             Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
             Err(e) => return Err(EngineError::Storage(e)),
         }
         self.incumbents.remove(&key);
+
+        // Park the pairwise-losing incumbent `ConvergenceDeferred`, not
+        // terminally `EpochInvalidated` — the mirror of the incumbent-wins
+        // seam in `ingest_group_message`. The losing branch may still gain
+        // follow-on commits from peers that applied it and never saw the
+        // candidate; distributed convergence then selects the DEEPER branch,
+        // and every convergence-only node reorgs onto it. A terminal (or
+        // missing) row is excluded from convergence input, so this node could
+        // never materialize that branch's root and would diverge from the
+        // fleet forever. If the incumbent's branch also loses in convergence,
+        // it is re-classified terminal there (`LosingBranch`).
+        //
+        // The row is re-keyed at the commit's SOURCE epoch (convergence
+        // derives its rewind target from `record.epoch`) and its payload is
+        // preserved verbatim — for an own commit it carries the convergence
+        // ordering stamp (`stamp_processed_own_commit_record`) that replay
+        // needs to rebuild the ordering key (MLS refuses to process own
+        // commits).
+        if let Some(mut record) = displaced_incumbent_row {
+            record.epoch = incumbent.source_epoch;
+            record.state = MessageState::ConvergenceDeferred;
+            storage.put_message(&record)?;
+        }
 
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
@@ -370,18 +405,14 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
-            match self
-                .storage
-                .update_message_state(invalidated_storage_id, MessageState::EpochInvalidated)
-            {
-                Ok(()) | Err(StorageError::NotFound) => {}
-                Err(e) => return Err(EngineError::Storage(e)),
-            }
+            // `ForkRecoveryManager::resolve` parked the displaced incumbent's
+            // row `ConvergenceDeferred` at its source epoch (captured before
+            // the rollback swept it); record the transition for forensics.
             self.audit_group(
                 group_id,
                 crate::audit_helpers::message_state_changed_event(
                     hex::encode(invalidated_storage_id.as_slice()),
-                    MessageState::EpochInvalidated,
+                    MessageState::ConvergenceDeferred,
                     "fork_loser",
                 ),
             );

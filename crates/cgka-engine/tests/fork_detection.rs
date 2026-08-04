@@ -1595,3 +1595,239 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
         "both nodes must end on the identical branch"
     );
 }
+
+#[tokio::test]
+async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
+    // The mirror of `pairwise_incumbent_defers_to_deeper_convergence_branch`,
+    // for the CANDIDATE-wins outcome of the pairwise race: node X's own
+    // confirmed commit A loses to an inbound rival B and X rolls back onto B
+    // (ForkRecovered). The displaced incumbent A must be parked
+    // `ConvergenceDeferred` at its SOURCE epoch — not terminally
+    // `EpochInvalidated` — because a peer that applied A and never saw B can
+    // keep extending the A-branch. Once that branch is deeper, distributed
+    // convergence selects it fleet-wide, and X can only follow if A's stored
+    // row (with its own-commit ordering stamp) is still convergence input.
+    use cgka_traits::ingest::IngestOutcome;
+
+    // Privileged same-epoch commits order by committer identity: the rival's
+    // identity must sort BEFORE X's so the inbound candidate B wins.
+    let first = b"cwin-first".as_slice();
+    let second = b"cwin-second".as_slice();
+    let (rival_id, x_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Concrete Engine type: the test drives the convergence pass to
+    // completion explicitly (`converge_stored_openmls_messages_at`), which is
+    // not part of the CgkaEngine trait surface.
+    let (mut x, x_storage) = build_client_with_storage(x_id); // rolls back onto B, must later reorg onto A
+    let mut rival = build_client(rival_id); //                   authors the pairwise-winning B
+    let (mut y, _y_storage) = build_client_with_storage(b"cwin-y"); // applied A, never sees B
+    let mut david = build_client(b"cwin-david");
+    let mut eve = build_client(b"cwin-eve");
+    let mut frank = build_client(b"cwin-frank");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let y_kp = y.fresh_key_package().await.unwrap();
+    let (group_id, create) = x
+        .create_group(CreateGroupRequest {
+            name: "candidate-win-reconsider".into(),
+            description: String::new(),
+            members: vec![rival_kp, y_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // Both peers need admin so their commits below pass the MIP-03
+            // committer guard (rival's rival root, Y's follow-on invite).
+            initial_admins: vec![rival.self_id(), y.self_id()],
+        })
+        .await
+        .unwrap();
+    let (rival_welcome, y_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            x.confirm_published(pending).await.unwrap();
+            let y_welcome = welcomes.remove(1);
+            (welcomes.remove(0), y_welcome)
+        }
+        _ => unreachable!(),
+    };
+    rival.join_welcome(rival_welcome).await.unwrap();
+    y.join_welcome(y_welcome).await.unwrap();
+    assert_eq!(x.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(y.epoch(&group_id).unwrap().0, 1);
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // (1) X commits from epoch 1 (commit A: invite david) and confirms — A is
+    // X's fork-recovery incumbent. (2)'s rival B (invite eve) branches from
+    // the same epoch without seeing A.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let commit_a = match x
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            x.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let commit_b = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let a_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(x_id)),
+        &commit_a.payload,
+    );
+    let b_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &commit_b.payload,
+    );
+    assert!(
+        b_key < a_key,
+        "identity choice must make the inbound candidate win the pairwise race"
+    );
+
+    // (2) B arrives at X and WINS: X rolls back off A onto B (ForkRecovered).
+    x.ingest(route(commit_b)).await.unwrap();
+    let events = x.drain_events();
+    let (source_epoch, recovered_epoch, winner, invalidated) =
+        extract_fork_recovered(&events, &group_id)
+            .expect("candidate win must roll X back and emit ForkRecovered");
+    assert_eq!(source_epoch.0, 1);
+    assert_eq!(recovered_epoch.0, 2);
+    assert_eq!(winner, &b_key);
+    assert_eq!(invalidated, &a_key);
+    assert_eq!(x.epoch(&group_id).unwrap().0, 2);
+
+    // The fix under test: the displaced incumbent A is parked reconsiderable
+    // at its SOURCE epoch, with its stored payload (own-commit convergence
+    // stamp) intact — not terminally `EpochInvalidated`, which would exclude
+    // it from every later convergence pass and freeze X off the A-branch.
+    let parked = x_storage.get_message(&commit_a.id).unwrap();
+    assert_eq!(
+        parked.state,
+        MessageState::ConvergenceDeferred,
+        "the pairwise-losing incumbent must be parked reconsiderable, not terminally invalidated"
+    );
+    assert_eq!(
+        parked.epoch,
+        EpochId(1),
+        "the parked incumbent must be keyed by its source epoch for the convergence rewind target"
+    );
+
+    // (3) Y applied A (and never sees B), then extends the A-branch with a
+    // follow-on invite from ITS epoch 2 — the A-branch is now depth 2. Y never
+    // committed from epoch 1, so A routes through Y's convergence pass; drive
+    // it past quiescence to settle A onto Y.
+    y.ingest(route(commit_a.clone())).await.unwrap();
+    y.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("A settles on Y through convergence");
+    assert_eq!(y.epoch(&group_id).unwrap().0, 2);
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let follow_on = match y
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            y.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(y.epoch(&group_id).unwrap().0, 3);
+
+    // (4) X ingests the follow-on: source epoch 2 >= X's current epoch, so it
+    // routes into distributed convergence, which must select the DEEPER
+    // A-branch (depth 2 from the fork point vs B's depth 1) and reorg X onto
+    // it — the same branch every convergence-only node picks. Before the fix
+    // A's root was `EpochInvalidated` and could never be materialized, so X
+    // stayed on the B lineage forever.
+    let follow_on_outcome = x.ingest(route(follow_on)).await.unwrap();
+    assert!(
+        matches!(follow_on_outcome, IngestOutcome::Buffered { .. }),
+        "the A-branch follow-on must enter the convergence pass, got {follow_on_outcome:?}"
+    );
+    // Drive the pass past its quiescence window (production gets here via the
+    // passage of time); the deeper A-branch must now be selected.
+    let result = x
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("reorg back onto the deeper A-branch");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    assert_eq!(
+        x.epoch(&group_id).unwrap().0,
+        3,
+        "X must converge onto the deeper A-branch"
+    );
+    let x_members: Vec<_> = x
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert!(
+        x_members.contains(&MemberId::new(pad32(b"cwin-david"))),
+        "A-branch's first invitee must be present after convergence"
+    );
+    assert!(
+        x_members.contains(&MemberId::new(pad32(b"cwin-frank"))),
+        "A-branch's second invitee must be present after convergence"
+    );
+    assert!(
+        !x_members.contains(&MemberId::new(pad32(b"cwin-eve"))),
+        "the abandoned B-branch's invitee must be gone"
+    );
+    let y_members: Vec<_> = y
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(
+        {
+            let mut a = x_members.clone();
+            a.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            a
+        },
+        {
+            let mut b = y_members.clone();
+            b.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            b
+        },
+        "X and Y must end on the identical branch"
+    );
+}
