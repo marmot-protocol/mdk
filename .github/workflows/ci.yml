@@ -324,8 +324,13 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run simulator tests
-        run: cargo nextest run -p cgka-conformance-simulator --locked --profile ci
+      - name: Run simulator smoke tests
+        # Multi-minute generated reliability batches and the Milestone 3
+        # campaign run in the scheduled Simulator Nightly workflow. Milestone
+        # 4 binaries run in their dedicated fast gate below.
+        run: |
+          cargo nextest run -p cgka-conformance-simulator --locked --profile ci \
+            -E 'not binary(milestone3_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate) and not (binary(canonical_scenarios) & (test(=convergence_chaos_family_generates_specs_with_semantic_expectations) | test(=convergence_chaos_family_seed_changes_scenarios) | test(=convergence_e2e_delivery_family_runs_generated_variants)))'
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
@@ -334,9 +339,6 @@ jobs:
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
         with:
           tool: just
-
-      - name: Run Milestone 3 adversarial campaign gate
-        run: just milestone3-ci
 
       - name: Run Milestone 4 independent verification gate
         run: just milestone4-ci
