@@ -50,6 +50,13 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
                 },
             },
             ScheduledFaultV1 {
+                at_barrier: "heal".into(),
+                action: DistributedFaultV1::NetworkHeal {
+                    participant: "alice".into(),
+                    peer: FaultPeerV1::Relay,
+                },
+            },
+            ScheduledFaultV1 {
                 at_barrier: "shape".into(),
                 action: DistributedFaultV1::NetworkShape {
                     participant: "bob".into(),
@@ -107,6 +114,7 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     assert_eq!(plan.cleanup.len(), 2);
     for barrier in [
         "partition",
+        "heal",
         "shape",
         "relay-restart",
         "disk-full",
@@ -120,6 +128,7 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         .setup
         .iter()
         .chain(plan.fault_commands.values().flatten())
+        .chain(plan.fault_rollbacks.values().flatten())
         .chain(&plan.cleanup)
     {
         assert_ne!(command.program, "sh");
@@ -155,6 +164,62 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
             .filter(|command| command.purpose == "record_network_partition_peer_address")
             .count(),
         1
+    );
+    let heal = &plan.fault_commands["heal"];
+    assert!(
+        partition
+            .iter()
+            .chain(heal)
+            .chain(&plan.fault_rollbacks["partition"])
+            .chain(&plan.fault_rollbacks["heal"])
+            .all(|command| command.success_exit_codes != [0, 1, 2])
+    );
+    for purpose in [
+        "reset_network_partition_peer_set",
+        "reset_network_partition_chain",
+        "partition_network_inbound",
+        "partition_network_outbound",
+        "activate_inbound_partition",
+        "activate_outbound_partition",
+        "verify_network_partition_inbound_rule",
+        "verify_network_partition_outbound_rule",
+        "verify_inbound_partition_active",
+        "verify_outbound_partition_active",
+    ] {
+        assert_eq!(
+            partition
+                .iter()
+                .find(|command| command.purpose == purpose)
+                .unwrap()
+                .success_exit_codes,
+            [0],
+            "{purpose}"
+        );
+    }
+    for purpose in [
+        "verify_inbound_partition_healed",
+        "verify_outbound_partition_healed",
+        "verify_network_partition_chain_removed",
+        "verify_network_partition_peer_set_removed",
+    ] {
+        assert_eq!(
+            heal.iter()
+                .find(|command| command.purpose == purpose)
+                .unwrap()
+                .success_exit_codes,
+            [1],
+            "{purpose}"
+        );
+    }
+    assert!(
+        plan.fault_rollbacks["partition"]
+            .iter()
+            .any(|command| command.purpose == "verify_outbound_partition_healed")
+    );
+    assert!(
+        plan.fault_rollbacks["heal"]
+            .iter()
+            .any(|command| command.purpose == "verify_outbound_partition_active")
     );
     let release = &plan.fault_commands["disk-release"][0];
     assert_eq!(release.program, "rm");
