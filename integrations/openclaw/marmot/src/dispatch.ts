@@ -235,6 +235,96 @@ function replyFallbackBody(availability: string): string {
 }
 
 /**
+ * Aggregate bound for the rendered conversation-history supplemental entry,
+ * mirroring the Hermes adapter-local bound (#1223): retain at most the newest
+ * eight records and keep the complete serialized entry — envelope, records,
+ * and aggregate truncation metadata — within 16 KiB of UTF-8.
+ */
+export const TIMELINE_CONTEXT_MESSAGE_LIMIT = 8;
+export const TIMELINE_CONTEXT_BYTE_LIMIT = 16 * 1024;
+
+interface TimelineContextPayload {
+  order: "chronological";
+  relation: "before_current_message";
+  messages: AgentControlTimelineMessage[];
+  messages_truncated?: boolean;
+  omitted_message_count?: number;
+  oversized_message_count?: number;
+}
+
+function timelineContextEntry(payload: TimelineContextPayload) {
+  return {
+    label: "Marmot conversation history",
+    source: "marmot",
+    type: "chat_window",
+    payload,
+  };
+}
+
+/** UTF-8 size of the complete serialized supplemental entry. */
+function timelineContextEntryBytes(payload: TimelineContextPayload): number {
+  return Buffer.byteLength(JSON.stringify(timelineContextEntry(payload)), "utf8");
+}
+
+/**
+ * Whether one record alone already exceeds the budget, judged against an entry
+ * carrying the truncation metadata that would accompany its omission.
+ */
+function timelineMessageExceedsByteLimit(message: AgentControlTimelineMessage): boolean {
+  return (
+    timelineContextEntryBytes({
+      order: "chronological",
+      relation: "before_current_message",
+      messages: [message],
+      messages_truncated: true,
+      omitted_message_count: 1,
+    }) > TIMELINE_CONTEXT_BYTE_LIMIT
+  );
+}
+
+/**
+ * Build the bounded conversation-history entry: drop oldest records first,
+ * keep retained records in chronological order, and omit an oversized
+ * remaining record rather than exceed the byte budget. Reports only aggregate
+ * omitted/oversized counts (privacy-safe).
+ */
+function boundTimelineContextEntry(history: AgentControlTimelineMessage[]) {
+  const bounded = history.slice(-TIMELINE_CONTEXT_MESSAGE_LIMIT);
+  let omittedMessageCount = history.length - bounded.length;
+  let oversizedMessageCount = 0;
+  for (const message of history.slice(0, omittedMessageCount)) {
+    if (timelineMessageExceedsByteLimit(message)) {
+      oversizedMessageCount += 1;
+    }
+  }
+
+  for (;;) {
+    const payload: TimelineContextPayload = {
+      order: "chronological",
+      relation: "before_current_message",
+      messages: bounded,
+      ...(omittedMessageCount > 0
+        ? { messages_truncated: true, omitted_message_count: omittedMessageCount }
+        : {}),
+      ...(oversizedMessageCount > 0 ? { oversized_message_count: oversizedMessageCount } : {}),
+    };
+    if (timelineContextEntryBytes(payload) <= TIMELINE_CONTEXT_BYTE_LIMIT) {
+      return timelineContextEntry(payload);
+    }
+    const dropped = bounded.shift();
+    if (dropped === undefined) {
+      // The metadata-only envelope is intentionally tiny, so this is a
+      // defensive fallback rather than an expected path.
+      return timelineContextEntry(payload);
+    }
+    if (timelineMessageExceedsByteLimit(dropped)) {
+      oversizedMessageCount += 1;
+    }
+    omittedMessageCount += 1;
+  }
+}
+
+/**
  * Convert Marmot reply hydration and buffered ambient facts into OpenClaw's
  * native, explicitly-untrusted supplemental context. None of this data enters a
  * system prompt, and ambient events never invoke this dispatcher themselves.
@@ -268,16 +358,7 @@ function inboundSupplemental(
     });
   }
   if (history.length > 0) {
-    untrustedContext.push({
-      label: "Marmot conversation history",
-      source: "marmot",
-      type: "chat_window",
-      payload: {
-        order: "chronological",
-        relation: "before_current_message",
-        messages: history,
-      },
-    });
+    untrustedContext.push(boundTimelineContextEntry(history));
   }
   for (const ambient of message.ambientContext ?? []) {
     untrustedContext.push({

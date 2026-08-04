@@ -5,6 +5,8 @@ import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
   buildMarmotTurnConfig,
   createMarmotInboundDispatcher,
+  TIMELINE_CONTEXT_BYTE_LIMIT,
+  TIMELINE_CONTEXT_MESSAGE_LIMIT,
   type MarmotDispatchClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
@@ -828,5 +830,171 @@ describe("createMarmotInboundDispatcher inbound media", () => {
     expect(downloads).toHaveLength(0);
     const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
     expect("media" in ctxArg).toBe(false);
+  });
+});
+
+describe("timeline context budget", () => {
+  interface ChatWindowEntry {
+    label: string;
+    source: string;
+    type: string;
+    payload: {
+      order: string;
+      relation: string;
+      messages: Array<Record<string, unknown>>;
+      messages_truncated?: boolean;
+      omitted_message_count?: number;
+      oversized_message_count?: number;
+    };
+  }
+
+  const utf8Bytes = (value: unknown): number =>
+    Buffer.byteLength(JSON.stringify(value), "utf8");
+
+  async function renderTimelineEntry(history: unknown[]): Promise<ChatWindowEntry | undefined> {
+    buildCtxMock.mockClear();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-history-budget",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => undefined),
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(emptyCalls(), { history }) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "ping",
+      recordedAt: 1_721_000_000,
+    });
+
+    const context = buildCtxMock.mock.calls.at(-1)?.[0] as unknown as {
+      supplemental?: { untrustedContext?: ChatWindowEntry[] };
+    };
+    return context.supplemental?.untrustedContext?.find((entry) => entry.type === "chat_window");
+  }
+
+  it("passes a small page through without truncation metadata", async () => {
+    const messages = [0, 1, 2].map((index) => ({
+      message_id_hex: `${index}`,
+      text: `message-${index}`,
+    }));
+
+    const entry = await renderTimelineEntry(messages);
+
+    expect(entry?.payload.messages).toEqual(messages);
+    expect(entry?.payload).not.toHaveProperty("messages_truncated");
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+  });
+
+  it("omits one oversized record rather than exceeding the budget", async () => {
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "newest", text: "🙂".repeat(10_000) },
+    ]);
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(1);
+    expect(entry?.payload.oversized_message_count).toBe(1);
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+  });
+
+  it("counts multiple oversized records dropped oldest-first", async () => {
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "old-1", text: "🙂".repeat(10_000) },
+      { message_id_hex: "old-2", text: "🙂".repeat(10_000) },
+      { message_id_hex: "newest", text: "kept" },
+    ]);
+
+    expect(entry?.payload.messages.map((message) => message.message_id_hex)).toEqual(["newest"]);
+    expect(entry?.payload.omitted_message_count).toBe(2);
+    expect(entry?.payload.oversized_message_count).toBe(2);
+    expect(JSON.stringify(entry)).not.toContain("old-1");
+    expect(JSON.stringify(entry)).not.toContain("old-2");
+  });
+
+  it("counts oversized records outside the count window", async () => {
+    const entry = await renderTimelineEntry(
+      Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT + 1 }, (_, index) => ({
+        message_id_hex: `${index}`,
+        text: "🙂".repeat(10_000),
+      })),
+    );
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+    expect(entry?.payload.oversized_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+  });
+
+  it("does not misclassify a record displaced by aggregate metadata", async () => {
+    const finalMessage: { message_id_hex: string; text: string } = {
+      message_id_hex: "final",
+      text: "",
+    };
+    const referenceEntry = {
+      label: "Marmot conversation history",
+      source: "marmot",
+      type: "chat_window",
+      payload: {
+        order: "chronological",
+        relation: "before_current_message",
+        messages: [finalMessage],
+        messages_truncated: true,
+        omitted_message_count: 1,
+      },
+    };
+    finalMessage.text = "x".repeat(TIMELINE_CONTEXT_BYTE_LIMIT - utf8Bytes(referenceEntry));
+    // Sanity: as the sole retained record (with omission metadata) it exactly fits.
+    expect(utf8Bytes(referenceEntry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
+
+    const entry = await renderTimelineEntry([
+      { message_id_hex: "oversized", text: "🙂".repeat(10_000) },
+      ...Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT - 1 }, (_, index) => ({
+        message_id_hex: `small-${index}`,
+        text: "",
+      })),
+      finalMessage,
+    ]);
+
+    expect(entry?.payload.messages).toEqual([]);
+    expect(entry?.payload.omitted_message_count).toBe(TIMELINE_CONTEXT_MESSAGE_LIMIT + 1);
+    expect(entry?.payload.oversized_message_count).toBe(1);
+  });
+
+  it("retains only the newest records from a twenty-record page", async () => {
+    const messageId = (index: number) => index.toString(16).padStart(64, "0");
+    const messages = Array.from({ length: 20 }, (_, index) => ({
+      message_id_hex: messageId(index),
+      text: "x".repeat(1_500),
+    }));
+
+    const entry = await renderTimelineEntry(messages);
+
+    expect(entry?.payload.messages.map((message) => message.message_id_hex)).toEqual(
+      Array.from({ length: TIMELINE_CONTEXT_MESSAGE_LIMIT }, (_, index) =>
+        messageId(20 - TIMELINE_CONTEXT_MESSAGE_LIMIT + index),
+      ),
+    );
+    expect(entry?.payload.omitted_message_count).toBe(20 - TIMELINE_CONTEXT_MESSAGE_LIMIT);
+    expect(entry?.payload).not.toHaveProperty("oversized_message_count");
+    expect(utf8Bytes(entry)).toBeLessThanOrEqual(TIMELINE_CONTEXT_BYTE_LIMIT);
   });
 });
