@@ -1055,6 +1055,9 @@ fn group_members_status_summarizes_member_records() {
 
 #[test]
 fn diagnostics_panel_lines_show_mls_and_components() {
+    const IMAGE_KEY_HEX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const UPLOAD_KEY_HEX: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
     let diagnostics = parse_group_diagnostics(&serde_json::json!({
         "group": {
             "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1062,6 +1065,11 @@ fn diagnostics_panel_lines_show_mls_and_components() {
                 "component_id": 32769,
                 "component": "marmot.group.profile.v1",
                 "data_hex": "010203"
+            },
+            "image": {
+                "component_id": 32770,
+                "component": "marmot.group.blossom.image.v1",
+                "data_hex": format!("00{IMAGE_KEY_HEX}{UPLOAD_KEY_HEX}")
             },
             "admin_policy": {
                 "component_id": 32771,
@@ -1081,12 +1089,26 @@ fn diagnostics_panel_lines_show_mls_and_components() {
     }))
     .expect("diagnostics");
 
+    let debug_rendered = format!("{diagnostics:?}");
+    assert!(!debug_rendered.contains(IMAGE_KEY_HEX));
+    assert!(!debug_rendered.contains(UPLOAD_KEY_HEX));
+    assert!(!debug_rendered.contains("010203"));
+    assert!(!debug_rendered.contains("aabbcc"));
+    assert!(!debug_rendered.contains("ffee"));
+
     // The diagnostics panel drops the leading status line (now in the status bar):
     // it starts straight at the MLS summary.
     let rendered = diagnostics_panel_lines(Some(&diagnostics))
         .iter()
         .map(line_text)
         .collect::<Vec<_>>();
+
+    let rendered_joined = rendered.join("\n");
+    assert!(!rendered_joined.contains(IMAGE_KEY_HEX));
+    assert!(!rendered_joined.contains(UPLOAD_KEY_HEX));
+    assert!(!rendered_joined.contains("010203"));
+    assert!(!rendered_joined.contains("aabbcc"));
+    assert!(!rendered_joined.contains("ffee"));
 
     assert_eq!(
         rendered[0],
@@ -1096,17 +1118,22 @@ fn diagnostics_panel_lines_show_mls_and_components() {
     assert!(
         rendered
             .iter()
-            .any(|line| line == "marmot.group.profile.v1 id=32769 data=010203")
+            .any(|line| line == "marmot.group.profile.v1 id=32769")
     );
     assert!(
         rendered
             .iter()
-            .any(|line| line == "marmot.group.admin-policy.v1 id=32771 data=aabbcc")
+            .any(|line| line == "marmot.group.blossom.image.v1 id=32770")
     );
     assert!(
         rendered
             .iter()
-            .any(|line| line == "marmot.group.agent-text-stream.quic.v1 id=32774 data=ffee")
+            .any(|line| line == "marmot.group.admin-policy.v1 id=32771")
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line == "marmot.group.agent-text-stream.quic.v1 id=32774")
     );
 }
 

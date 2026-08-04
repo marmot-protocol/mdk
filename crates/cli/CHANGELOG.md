@@ -26,7 +26,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
-  formatting.
+  formatting. The TUI group diagnostics panel no longer retains or renders raw
+  group component `data_hex`, so blossom image key material cannot leak through
+  diagnostics `Debug` or on-screen lines.
 
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed

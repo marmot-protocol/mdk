@@ -106,6 +106,11 @@ pub struct StoredAccountState {
     pub groups: Vec<StoredAccountGroup>,
 }
 
+/// `image_key_hex`/`image_upload_key_hex` are key material mirrored from the
+/// blossom image component for chat-list projection. They are stored in
+/// SQLCipher, but must not appear in `Debug` output. Nested
+/// [`StoredAccountGroupComponent`] values redact in-band component bytes that
+/// carry the same keys.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredAccountGroup {
     pub group_id_hex: String,
@@ -138,11 +143,6 @@ pub struct StoredAccountGroup {
     pub components: Vec<StoredAccountGroupComponent>,
 }
 
-/// `image_key_hex`/`image_upload_key_hex` are key material mirrored from the
-/// blossom image component for chat-list projection. They are stored in
-/// SQLCipher, but must not appear in `Debug` output. Nested
-/// [`StoredAccountGroupComponent`] values redact in-band component bytes that
-/// carry the same keys.
 impl fmt::Debug for StoredAccountGroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoredAccountGroup")
@@ -179,6 +179,10 @@ pub struct StoredNostrRoute {
     pub last_epoch: u64,
 }
 
+/// `component_data_hex` carries MLS-protected component bytes. Blossom image
+/// payloads embed avatar decryption and Blossom upload keys; other components
+/// may carry sensitive policy bytes. SQLCipher protects persistence, but
+/// `Debug` must never render raw component bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredAccountGroupComponent {
     pub component_id: u16,
@@ -186,10 +190,6 @@ pub struct StoredAccountGroupComponent {
     pub component_data_hex: String,
 }
 
-/// `component_data_hex` carries MLS-protected component bytes. Blossom image
-/// payloads embed avatar decryption and Blossom upload keys; other components
-/// may carry sensitive policy bytes. SQLCipher protects persistence, but
-/// `Debug` must never render raw component bytes.
 impl fmt::Debug for StoredAccountGroupComponent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoredAccountGroupComponent")

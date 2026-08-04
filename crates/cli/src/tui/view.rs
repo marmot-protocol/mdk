@@ -337,9 +337,8 @@ pub(crate) fn group_component_diagnostics_line(
         .map(|id| id.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     Line::from(format!(
-        "{} id={id} data={}",
+        "{} id={id}",
         terminal_safe_text(&component.component),
-        terminal_safe_text(&component.data_hex)
     ))
 }
 

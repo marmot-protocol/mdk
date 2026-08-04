@@ -3322,7 +3322,9 @@ fn stored_group_image_component_debug_redacts_key_material() {
     let parent_rendered = format!("{stored:?}");
     assert!(!parent_rendered.contains(IMAGE_KEY_HEX));
     assert!(!parent_rendered.contains(UPLOAD_KEY_HEX));
-    assert!(parent_rendered.contains("group"));
+    assert!(parent_rendered.contains("profile_name: \"group\""));
+    assert!(parent_rendered.contains("image_key_hex"));
+    assert!(parent_rendered.contains("redacted"));
 }
 
 #[test]

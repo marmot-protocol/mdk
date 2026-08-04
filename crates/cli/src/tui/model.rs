@@ -441,7 +441,6 @@ pub(crate) struct GroupDiagnostics {
 pub(crate) struct GroupComponentDiagnostics {
     pub(crate) component: String,
     pub(crate) component_id: Option<u64>,
-    pub(crate) data_hex: String,
 }
 
 #[derive(Debug)]
@@ -4649,7 +4648,6 @@ pub(crate) fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDi
         Some(GroupComponentDiagnostics {
             component: value_string(component, "component").unwrap_or_else(|| key.to_owned()),
             component_id: component.get("component_id").and_then(Value::as_u64),
-            data_hex: value_string(component, "data_hex").unwrap_or_default(),
         })
     })
     .collect()
