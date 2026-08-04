@@ -5191,3 +5191,51 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
         "the arm must leave its durable forensic row even on a failing pass"
     );
 }
+
+/// An escalation recorded while an inbound delivery is ingested must ride the
+/// summary that seam returns.
+///
+/// `ingest_received_delivery` is the runtime's dominant receive path — the
+/// account worker feeds every delivery it receives through it — and its `Ok` is
+/// what the worker publishes escalations from. The other escalation tests all
+/// deliver through `sync()`, so this pins the receive seam's own drain.
+#[tokio::test]
+async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_id_hex = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://ingest-seam.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("ingest seam", &[]).await.unwrap();
+
+    client.apply_backfill_decision(
+        &group_id,
+        9,
+        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
+    );
+
+    let mut delivery = relay_delivery("escalation-seam", "55".repeat(32));
+    delivery.account_id = MemberId::new(hex::decode(&account_id_hex).unwrap());
+    let summary = client
+        .ingest_received_delivery(delivery)
+        .await
+        .expect("an undecryptable delivery still completes its ingest pass");
+
+    assert_eq!(
+        summary
+            .epoch_stall_escalations
+            .iter()
+            .map(|escalation| (
+                escalation.group_id.clone(),
+                escalation.stalled_epoch,
+                escalation.arms
+            ))
+            .collect::<Vec<_>>(),
+        vec![(group_id, 9, 4)],
+        "the receive seam must publish the escalation recorded during its ingest"
+    );
+}
