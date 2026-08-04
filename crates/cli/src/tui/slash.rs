@@ -35,7 +35,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
             }
         }
         "login" => match rest.as_slice() {
-            [identity] if identity.starts_with("nsec") => {
+            [identity] if crate::is_nostr_secret(identity) => {
                 Ok(SlashCommand::AccountImportSecret(identity.clone()))
             }
             [identity] => Ok(SlashCommand::AccountAddPublic(identity.clone())),

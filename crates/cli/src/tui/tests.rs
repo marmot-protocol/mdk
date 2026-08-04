@@ -348,6 +348,14 @@ fn slash_command_parser_handles_account_onboarding_commands() {
 }
 
 #[test]
+fn slash_command_parser_classifies_uppercase_nsec_as_secret() {
+    assert_eq!(
+        parse_slash_command("/login NSEC1SECRET"),
+        Ok(SlashCommand::AccountImportSecret("NSEC1SECRET".to_owned()))
+    );
+}
+
+#[test]
 fn slash_command_parser_handles_logout() {
     // `/logout` acts on the currently selected account and takes no arguments, so
     // a stray argument is a parse error rather than a silently ignored token.
@@ -2076,6 +2084,14 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
     assert_eq!(
         composer_display_text("/ login npub1bob"),
         "/ login npub1bob"
+    );
+}
+
+#[test]
+fn composer_redacts_uppercase_nsec_import() {
+    assert_eq!(
+        composer_display_text("/login NSEC1SECRET"),
+        "/login <hidden nsec>"
     );
 }
 

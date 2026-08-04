@@ -614,7 +614,8 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     let imported = timeout(
         Duration::from_secs(40),
         runtime.create_or_import_account(AccountSetupRequest {
-            identity: Some(secret),
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(secret)),
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
             discovery_relays: vec![endpoint(&stall_url)],
@@ -639,10 +640,12 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     let account_id = keys.public_key().to_hex();
     let secret = keys.secret_key().to_bech32().unwrap();
     let service_name = format!("com.marmot.test.runtime-orphan-{account_id}");
-    let setup = AccountSetupRequest {
-        identity: Some(secret),
-        default_relays: vec![endpoint(&url)],
-        bootstrap_relays: vec![endpoint(&url)],
+    let relay_endpoint = endpoint(&url);
+    let setup = |secret: &str| AccountSetupRequest {
+        identity: None,
+        import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
+        default_relays: vec![relay_endpoint.clone()],
+        bootstrap_relays: vec![relay_endpoint.clone()],
         publish_missing_relay_lists: true,
         ..AccountSetupRequest::default()
     };
@@ -657,13 +660,13 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     );
     let first_runtime = MarmotAppRuntime::new(first_app.clone());
     let first = first_runtime
-        .create_or_import_account(setup.clone())
+        .create_or_import_account(setup(&secret))
         .await
         .unwrap();
     assert_eq!(first.account.account_id_hex, account_id);
     assert!(matches!(
         first_runtime
-            .create_or_import_account(setup.clone())
+            .create_or_import_account(setup(&secret))
             .await,
         Err(AppError::AccountHome(AccountHomeError::AccountExists(
             duplicate
@@ -685,7 +688,7 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     );
     let recovered_runtime = MarmotAppRuntime::new(recovered_app.clone());
     let recovered = recovered_runtime
-        .create_or_import_account(setup)
+        .create_or_import_account(setup(&secret))
         .await
         .expect("runtime import should recover the matching orphaned Keychain credential");
 
@@ -719,7 +722,8 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
         format!("com.marmot.test.runtime-rollback-recovered-{recovered_account_id}");
     let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
     let successful_setup = AccountSetupRequest {
-        identity: Some(recovered_secret.clone()),
+        identity: None,
+        import_nsec: Some(zeroize::Zeroizing::new(recovered_secret.clone())),
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
@@ -736,7 +740,14 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     );
     let first_runtime = MarmotAppRuntime::new(first_app.clone());
     first_runtime
-        .create_or_import_account(successful_setup.clone())
+        .create_or_import_account(AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(recovered_secret.clone())),
+            default_relays: successful_setup.default_relays.clone(),
+            bootstrap_relays: successful_setup.bootstrap_relays.clone(),
+            publish_missing_relay_lists: successful_setup.publish_missing_relay_lists,
+            ..AccountSetupRequest::default()
+        })
         .await
         .unwrap();
     first_runtime.shutdown().await;
@@ -758,7 +769,8 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     assert!(matches!(
         recovered_runtime
             .create_or_import_account(AccountSetupRequest {
-                identity: Some(recovered_secret),
+                identity: None,
+                import_nsec: Some(zeroize::Zeroizing::new(recovered_secret)),
                 ..AccountSetupRequest::default()
             })
             .await,
@@ -788,7 +800,10 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     assert!(matches!(
         new_runtime
             .create_or_import_account(AccountSetupRequest {
-                identity: Some(new_keys.secret_key().to_bech32().unwrap()),
+                identity: None,
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    new_keys.secret_key().to_bech32().unwrap(),
+                )),
                 ..AccountSetupRequest::default()
             })
             .await,
@@ -1290,8 +1305,9 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     let first_runtime = MarmotAppRuntime::new(first_app.clone());
     let second_runtime = MarmotAppRuntime::new(second_app);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
-    let setup = AccountSetupRequest {
-        identity: Some(secret),
+    let setup = |secret: &str| AccountSetupRequest {
+        identity: None,
+        import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
@@ -1300,11 +1316,11 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     };
 
     let first = first_runtime
-        .create_or_import_account(setup.clone())
+        .create_or_import_account(setup(&secret))
         .await
         .unwrap();
     second_runtime
-        .create_or_import_account(setup)
+        .create_or_import_account(setup(&secret))
         .await
         .unwrap();
 
@@ -1511,7 +1527,10 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -1609,7 +1628,10 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -1749,7 +1771,10 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -1853,7 +1878,10 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -1938,7 +1966,10 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2180,7 +2211,10 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -2309,7 +2343,10 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -2397,8 +2434,14 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
-    let bob = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let carol = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -2480,7 +2523,10 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -2574,7 +2620,10 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let group_id = runtime
         .create_group(
@@ -2628,7 +2677,10 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -2687,7 +2739,10 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -2841,7 +2896,10 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -2939,7 +2997,10 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -3012,7 +3073,10 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -3265,7 +3329,10 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
@@ -3412,7 +3479,10 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
 
     let mut bob_chats = runtime
@@ -3492,7 +3562,10 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -3598,7 +3671,10 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -3680,7 +3756,10 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
 
@@ -3749,7 +3828,10 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
 
@@ -6325,7 +6407,10 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let bob_id = bob.account.account_id_hex.clone();
     let bob_label = bob.account.label.clone();
@@ -6797,7 +6882,10 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
 
     let mut events = runtime.subscribe();
@@ -6862,7 +6950,10 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
@@ -6955,7 +7046,10 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
     };
-    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();

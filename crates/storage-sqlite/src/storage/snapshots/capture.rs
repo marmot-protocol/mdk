@@ -5,8 +5,13 @@ use super::rows::{
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
+#[cfg(feature = "test-conformance-replay")]
+use crate::serialize;
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, deserialize, serialize,
+    SqliteAccountStorage, SqliteResultExt,
+    codec::{SensitiveBytes, serialize_sensitive},
+    connection::retry_on_busy,
+    deserialize,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
@@ -39,10 +44,11 @@ fn create_on_connection(
     name: &str,
 ) -> StorageResult<()> {
     let snapshot = capture_snapshot(conn, group_id)?;
+    let snapshot_blob = serialize_sensitive(&snapshot)?;
     conn.execute(
         "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
              VALUES (?1, ?2, ?3)",
-        params![group_id.as_slice(), name, serialize(&snapshot)?],
+        params![group_id.as_slice(), name, snapshot_blob.as_slice()],
     )
     .storage()?;
     Ok(())
@@ -222,7 +228,7 @@ fn openmls_values(
                 label: row.get(0)?,
                 storage_key: row.get(1)?,
                 group_key: row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
-                value: row.get(3)?,
+                value: SensitiveBytes::new(row.get(3)?),
             })
         },
     )

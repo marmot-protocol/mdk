@@ -208,6 +208,12 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidPublicKey => Self::InvalidIdentity {
                 details: "invalid nostr public key".into(),
             },
+            AppError::UnexpectedPrivateKey => Self::InvalidIdentity {
+                details: "this operation does not accept a private key".into(),
+            },
+            AppError::IdentityKeyMismatch => Self::InvalidIdentity {
+                details: "public identity does not match the imported private key".into(),
+            },
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent { details },
             AppError::Publish(details) => Self::Publish { details },
             AppError::FollowListUnavailable => Self::FollowListUnavailable,

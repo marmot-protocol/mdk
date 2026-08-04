@@ -2,6 +2,7 @@
 
 use cgka_traits::TransportEndpoint;
 use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
+use zeroize::Zeroizing;
 
 use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi, normalize_member_ref_ffi};
 use crate::errors::MarmotKitError;
@@ -107,6 +108,7 @@ impl Marmot {
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
+            import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),
@@ -133,15 +135,21 @@ impl Marmot {
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        let (public_identity, import_nsec) = if marmot_app::is_nostr_secret(&identity) {
+            (None, Some(Zeroizing::new(identity)))
+        } else {
+            (Some(identity), None)
+        };
         let request = AccountSetupRequest {
-            identity: None,
+            identity: public_identity,
+            import_nsec,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
-        let result = self.runtime.login(identity, request).await?;
+        let result = self.runtime.create_or_import_account(request).await?;
         Ok(AccountSummaryFfi {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
@@ -168,6 +176,7 @@ impl Marmot {
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
         let request = AccountSetupRequest {
             identity: None,
+            import_nsec: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             discovery_relays: ffi_discovery_relays(&bootstrap_relays),

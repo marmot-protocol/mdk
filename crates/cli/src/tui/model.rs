@@ -4739,7 +4739,10 @@ pub(crate) fn composer_display_text(input: &str) -> String {
     if let Some(command_input) = trimmed.strip_prefix('/')
         && let Ok(words) = split_slash_command_words(command_input)
         && words.first().map(String::as_str) == Some("login")
-        && words.iter().skip(1).any(|word| word.starts_with("nsec"))
+        && words
+            .iter()
+            .skip(1)
+            .any(|word| crate::is_nostr_secret(word))
     {
         return "/login <hidden nsec>".to_owned();
     }

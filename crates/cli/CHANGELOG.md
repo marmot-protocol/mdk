@@ -29,6 +29,23 @@ versioning through the workspace version in the root `Cargo.toml`.
   formatting. The TUI group diagnostics panel no longer retains or renders raw
   group component `data_hex`, so blossom image key material cannot leak through
   diagnostics `Debug` or on-screen lines.
+  
+- OpenMLS persistence now zeroizes temporary SQLite serialization,
+  deserialization, and rollback-snapshot buffers for MLS private keys, epoch and
+  message secrets, PSKs, pending group state, application-export state, and
+  stored key-package handoffs on success and error paths.
+  
+- `wn login --nsec-stdin` and `wn account create --nsec-stdin` now keep stdin
+  nsecs in a dedicated zeroizing sidecar instead of materializing them into the
+  generic `Cli` command tree. Daemon execute frames and `AccountSetupRequest`
+  use redacted `Debug`, avoid secret `Clone`, and wipe nsec-bearing request
+  framing buffers on the final owned request payload where the implementation
+  controls the buffer (`Zeroizing` encode/read paths). Transient allocator or
+  `BufReader` copies are not guaranteed wiped. When the daemon app runtime is
+  disabled (no `--relay`), account setup skips hosted validation and falls back
+  to local `wn` execution while keeping the stdin `nsec` sidecar owned. Uppercase
+  `NSEC…` argv identities are rejected at the same early gate as lowercase
+  `nsec…`.
 
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
