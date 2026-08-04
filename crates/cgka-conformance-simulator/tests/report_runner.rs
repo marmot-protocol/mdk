@@ -374,12 +374,16 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         report["metadata"]["generated"]["family_name"],
         "convergence-e2e-delivery/v1"
     );
-    assert_eq!(
-        report["app_invalidation_observations"]
-            .as_array()
-            .map(Vec::len),
-        Some(0)
-    );
+    let invalidations = report["app_invalidation_observations"]
+        .as_array()
+        .expect("application invalidations array");
+    assert_eq!(invalidations.len(), 2);
+    assert!(invalidations.iter().all(|observation| {
+        observation["reason"] == "losing_branch"
+            && observation["payload_ref"]
+                .as_str()
+                .is_some_and(|payload_ref| payload_ref.starts_with("sha256:"))
+    }));
     let epoch_change_count = report["epoch_change_observations"]
         .as_array()
         .map(Vec::len)

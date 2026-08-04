@@ -977,17 +977,20 @@ that scaling the existing corpus is sufficient.
 - [x] Inventory every production path that selects, rejects, defers, invalidates, replays, or applies a competing
   commit, and map each site to the adopted canonical rule, reference-model transition, mutation sentinel, and campaign
   family that exercises it.
-- [x] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
+- [ ] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
   result does not depend on whether input first passes through pairwise fork recovery, ordinary ingest, stored
-  convergence, retained-history replay, or crash/restart recovery.
+  convergence, retained-history replay, or crash/restart recovery. Engine and app-runtime coverage is complete; the
+  process/distributed subjects still need a controllable publication or relay-visibility seam that can stage the two
+  same-source-epoch roots without letting the second committer catch up first.
 - [x] Promote the #1236 incident into a permanent synthetic regression family with at least four participants,
   simultaneous same-source-epoch committers, committer-versus-observer routing, ordering-key-versus-depth disagreement,
   branch growth, application traffic, delivery permutations, and restarts around every durable transition.
 - [x] Extend the independent selector/lifecycle models and mutation matrix with route choice, reconsiderable versus
   terminal loser disposition, volatile routing history, restart, and deliberately inconsistent decision seams.
-- [x] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
+- [ ] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
   in every adapter that can expose them. Epoch, roster, profile, and visible projection equality are insufficient on
-  their own.
+  their own. Process exact-state and decryptability probes pass for its retained-history route, but that route
+  currently receives a sequential input set rather than the #1236 fork input set.
 - [x] Require a durable disposition for every scenario application input: canonical projection, explicit invalidation,
   retry/resend eligibility, or a named fail-closed outcome. Include sender-visible handling for application messages
   invalidated by fork recovery.
@@ -1007,7 +1010,8 @@ The distributed runner consumes the same pinned Scenario IR and process-node pro
 backend binds faults to named scenario barriers, uses one isolated network and retained relay, supports exact images per
 participant, and records argv-level setup/fault/cleanup receipts. The VM backend is a capability-checked handoff to an
 external harness and is rejected when containers can represent the requested campaign. The current real-container
-verification covers traffic shaping plus reset and the cross-route deeper-branch regression; host restart, full disk,
+verification covers traffic shaping plus reset and the retained-history cross-route scenario. It does not yet stage
+the simultaneous same-source-epoch roots required to count as #1236 regression evidence. Host restart, full disk,
 database contention, and mixed-image operations have deterministic command-plan coverage and are scheduled for
 infrastructure-capable execution lanes.
 
@@ -1021,7 +1025,7 @@ infrastructure-capable execution lanes.
 
 Four versioned lane manifests now define both included capabilities and reviewed limits. The PR workflow remains
 container-free and keeps formal/model/vector checks parallel; nightly adds process campaigns and one real-container
-cross-route regression; the scheduled weekly/manual workflow runs the full current container suite and expanded
+cross-route retained-history campaign; the scheduled weekly/manual workflow runs the full current container suite and expanded
 resource/constant campaigns; release hardening additionally requires an operator-supplied, reviewed distributed
 manifest so mixed-version evidence cannot silently degrade into a current-build-only run. A typed budget evaluator
 fails wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. The evidence-bundle validator requires
@@ -1047,8 +1051,10 @@ restricted to synthetic shareable capsules with portable expectations.
 
 - [x] Every inventoried convergence decision route has a named model/test/campaign owner, and no unexplained
   route-dependent outcome remains.
-- [x] The #1236 regression family passes across engine, app-runtime, process, and distributed adapters with exact
-  cryptographic agreement, active decryptability, and complete application-input dispositions.
+- [ ] The #1236 regression family passes across engine, app-runtime, process, and distributed adapters with exact
+  cryptographic agreement, active decryptability, and complete application-input dispositions. Engine and app-runtime
+  pass; process and distributed execution need controllable same-epoch publication staging before they can make this
+  claim.
 - [x] Campaigns are repeatable from saved configuration and artifact manifests.
 - [x] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
 - [x] Resource and flake budgets prevent silent campaign degradation.
@@ -1057,11 +1063,13 @@ restricted to synthetic shareable capsules with portable expectations.
   untested surfaces. The bundle makes a scoped assurance claim rather than asserting universal implementation
   correctness or universally optimal constants.
 
-Milestone 6 is complete as an assurance and operations capability. Completion means the release-hardening lane can
-produce a completeness-checked bundle from its observed run artifacts; it does not mean that one historical run is
-permanently representative or that the engine is universally correct. Each release candidate still has to execute the
-lane, satisfy its budgets, review any counterexamples, and retain the resulting bundle. A new production route,
-protocol rule, adapter behavior, field incident, or mutation survivor reopens the corresponding claim.
+Milestone 6 remains open on cross-adapter #1236 reproduction. The release-hardening lane can produce a
+completeness-checked bundle from its observed run artifacts, but that bundle must list the process/distributed
+same-epoch staging gap as an untested surface until the unchecked exit item above passes. Completion will not mean that
+one historical run is permanently representative or that the engine is universally correct. Each release candidate
+still has to execute the lane, satisfy its budgets, review any counterexamples, and retain the resulting bundle. A new
+production route, protocol rule, adapter behavior, field incident, or mutation survivor reopens the corresponding
+claim.
 
 ## Cross-Milestone Verification Matrix
 
@@ -1174,7 +1182,7 @@ incorrect result.
 | 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just convergence-verification-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
 | 2026-08-04 | Milestone 5 app/process simulation | Added a production-shaped app-runtime adapter, versioned child-node protocol, multi-process orchestrator, projection/event observation, retained-relay repair, real pause/resume/kill/restart, cross-adapter comparison, and privacy-safe failure capsules; then replaced milestone-scoped module/test names with durable capability names | Commits `a3296b16` through `19d0d5f8`; `app_runtime_adapter`; `node_protocol`; `process_orchestrator`; `just fast-ci` |
 | 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
-| 2026-08-04 | 6.1 decision-route assurance closure | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine, process, and real-container regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
+| 2026-08-04 | 6.1 decision-route assurance progress | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine/app regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work. Process and real-container subjects execute the retained-history scenario but cannot yet stage the same-source-epoch roots, so cross-adapter closure remains open | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
 | 2026-08-04 | 6.1 app-witness route-order closure | The full strict-oracle catalog exposed a production route split after the #1236 fixes: branch-local transport could peel under a candidate exporter but its inner MLS app was processed against the live branch, and provisional-live apps could be delivered outside the durable pass that admitted a competing candidate app. Candidate recovery now buffers inner MLS input, one bounded retry/replay batch shares a pinned convergence timestamp, and authenticated live-branch apps join the same collecting pass. The named six-member witness regression converges to exact cryptographic state without extra ticks, while the settled superseded-root lifecycle remains unchanged. | `branch_local_app_witnesses_converge_independent_of_transport_order`; `engine_converges_stored_openmls_messages_to_selected_branch`; full simulator suite |
 | 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 | 2026-08-04 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
@@ -1182,8 +1190,9 @@ incorrect result.
 
 ## Post-Milestone 6 Cleanup
 
-Status: `complete`. Performed after every Milestone 6 exit item had named evidence so cleanup did not obscure
-campaign history while the distributed machinery is still changing.
+Status: `complete`. This hygiene pass remains complete independently of the reopened cross-adapter assurance item: all
+Milestone 6 work had named evidence or an explicit residual gap before cleanup, so the renames did not obscure campaign
+history while the distributed machinery was changing.
 
 - [x] Inventory every tracked file whose basename contains `milestone`, case-insensitively.
 - [x] Rename long-lived files after the capability or behavior they own, update module declarations, test targets,
