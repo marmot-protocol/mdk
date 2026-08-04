@@ -477,12 +477,12 @@ async fn process_failures_write_replayable_privacy_safe_capsules() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsupported_process_capabilities_fail_before_launch() {
     let mut spec = process_scenario("unsupported-process-capability", false);
-    spec.steps.push(in_group(
-        "main",
-        ScenarioStep::ProbeBidirectionalDecryptability {
-            clients: vec!["alice".into(), "bob".into()],
+    spec.steps.push(ScenarioStep::OmitMessage {
+        selector: cgka_conformance_simulator::ScenarioMessageSelectorV2 {
+            sender: Some("alice".into()),
+            ..Default::default()
         },
-    ));
+    });
     let artifacts = tempfile::tempdir().unwrap();
     let error = match ProcessOrchestrator::launch(
         env!("CARGO_BIN_EXE_cgka-conformance-node"),
