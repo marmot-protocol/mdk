@@ -342,6 +342,32 @@ async fn minimize_failing_case(
 
     let mut candidate = case.scenario.clone();
     let mut changed = false;
+    loop {
+        let mut reduced_unit = false;
+        for unit in semantic_reduction_units(&candidate.steps) {
+            let mut trial = candidate.clone();
+            remove_step_indices(&mut trial.steps, &unit);
+            if reproduces_failure(
+                &trial,
+                expected_trace.cloned(),
+                case.expected_outcomes.clone(),
+                &target_identity,
+                storage_mode,
+                case.subject,
+            )
+            .await
+            {
+                candidate = trial;
+                changed = true;
+                reduced_unit = true;
+                break;
+            }
+        }
+        if !reduced_unit {
+            break;
+        }
+    }
+
     let mut index = 0;
     while index < candidate.steps.len() {
         if !is_minimizer_removable(&candidate.steps[index]) {
@@ -369,6 +395,72 @@ async fn minimize_failing_case(
     }
 
     changed.then_some(candidate)
+}
+
+/// Dependency-aware reduction units. Removing a fault arm without its release
+/// (or a lifecycle stop without its restart) changes the scenario's meaning and
+/// commonly produces a different terminal failure. These units are attempted
+/// before individual noise steps.
+pub fn semantic_reduction_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
+    let mut open = std::collections::BTreeMap::<String, usize>::new();
+    let mut units = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let Some((key, opens)) = semantic_pair_marker(step, None) else {
+            continue;
+        };
+        if opens {
+            open.insert(key, index);
+        } else if let Some(start) = open.remove(&key) {
+            units.push(vec![start, index]);
+        }
+    }
+    units
+}
+
+fn semantic_pair_marker(step: &ScenarioStep, group: Option<&str>) -> Option<(String, bool)> {
+    if let ScenarioStep::InGroup {
+        group: nested_group,
+        action,
+    } = step
+    {
+        return semantic_pair_marker(action, Some(nested_group));
+    }
+    let prefix = group.map_or_else(String::new, |group| format!("group:{group}:"));
+    match step {
+        ScenarioStep::WithholdMessage { label, .. } => {
+            Some((format!("{prefix}withhold:{label}"), true))
+        }
+        ScenarioStep::ReleaseWithheld { label } => {
+            Some((format!("{prefix}withhold:{label}"), false))
+        }
+        ScenarioStep::SetPartition { .. } => Some((format!("{prefix}partition"), true)),
+        ScenarioStep::ClearPartition => Some((format!("{prefix}partition"), false)),
+        ScenarioStep::SetClientOffline { client } => {
+            Some((format!("{prefix}offline:{client}"), true))
+        }
+        ScenarioStep::ReconnectClient { client } => {
+            Some((format!("{prefix}offline:{client}"), false))
+        }
+        ScenarioStep::CrashProcess { process } => {
+            Some((format!("{prefix}process:{process}"), true))
+        }
+        ScenarioStep::RestartProcess { process } => {
+            Some((format!("{prefix}process:{process}"), false))
+        }
+        ScenarioStep::InjectStorageFault { fault } => {
+            Some((format!("{prefix}storage:{}", fault.target), true))
+        }
+        ScenarioStep::ClearStorageFault { target } => {
+            Some((format!("{prefix}storage:{target}"), false))
+        }
+        _ => None,
+    }
+}
+
+fn remove_step_indices(steps: &mut Vec<ScenarioStep>, indices: &[usize]) {
+    for index in indices.iter().rev() {
+        steps.remove(*index);
+    }
 }
 
 async fn reproduces_failure(

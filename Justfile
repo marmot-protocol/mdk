@@ -313,11 +313,15 @@ convergence-verification-ci:
 convergence-lane-policy:
     cargo nextest run -p convergence-campaign-runner --test lane_policy --locked
 
+convergence-failure-corpus:
+    cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
+    cargo nextest run -p cgka-conformance-simulator --test semantic_reduction --locked
+
 # Capability-level lane entry points. The PR workflow runs the first lane as
 # separate parallel jobs; the scheduled workflows use the aggregate recipes.
-convergence-pr-lane: convergence-lane-policy simulator-smoke convergence-verification-ci
+convergence-pr-lane: convergence-lane-policy convergence-failure-corpus simulator-smoke convergence-verification-ci
 
-convergence-nightly-lane: convergence-lane-policy simulator-full adversarial-reliability-ci convergence-verification-ci
+convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus simulator-full adversarial-reliability-ci convergence-verification-ci
     cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --test route_equivalence --locked
     cargo nextest run -p convergence-campaign-runner --locked
 

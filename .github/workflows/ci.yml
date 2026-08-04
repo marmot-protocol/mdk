@@ -338,6 +338,9 @@ jobs:
       - name: Validate convergence execution-lane policy
         run: just convergence-lane-policy
 
+      - name: Validate convergence failure-corpus lifecycle
+        run: just convergence-failure-corpus
+
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 

@@ -1029,11 +1029,19 @@ route/model/adapter/mutation/boundary/counterexample/assumption/untested-surface
 
 ### 6.4 Failure corpus lifecycle
 
-- [ ] Automatically save failing seeds/capsules.
-- [ ] Minimize semantically, not only by generic step removal.
-- [ ] Classify product defect, protocol ambiguity, environment failure, or expected resource refusal.
-- [ ] Promote stable synthetic regressions into vectors.
-- [ ] Track recurrence and time-to-diagnosis.
+- [x] Automatically save failing seeds/capsules.
+- [x] Minimize semantically, not only by generic step removal.
+- [x] Classify product defect, protocol ambiguity, environment failure, or expected resource refusal.
+- [x] Promote stable synthetic regressions into vectors.
+- [x] Track recurrence and time-to-diagnosis.
+
+Simulator failures write portable and optional sensitive replay capsules; process-node capsules and distributed-run
+failures can be added to the same private versioned corpus. The index retains seeds, adapters, build matrices,
+recurrence, minimum diagnosis time, reduction candidates, and promoted vector paths without copying raw error text.
+The reducer now treats paired transport, partition, lifecycle, and storage actions as dependency units before removing
+independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
+the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
+restricted to synthetic shareable capsules with portable expectations.
 
 ### Milestone 6 Exit Gate
 
@@ -1163,6 +1171,7 @@ incorrect result.
 | 2026-08-04 | 6.1 decision-route assurance closure | Inventoried production commit/proposal/application decision routes; added route-equivalence, restart, mutation, disposition, exact-state, and decryptability evidence; promoted the #1236 topology into engine, process, and real-container regression coverage; and fixed deferred branch-tip transport peeling without restoring attacker-paced work | `route_equivalence`; `process_orchestrator`; ignored `container_runtime`; `fork_detection` |
 | 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 | 2026-08-04 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
+| 2026-08-04 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis | `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
 
 ## Post-Milestone 6 Cleanup
 

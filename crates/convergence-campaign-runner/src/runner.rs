@@ -14,7 +14,9 @@ use tokio::time::timeout;
 
 use crate::manifest::{DistributedBackendV1, DistributedCampaignManifestV1};
 use crate::plan::{DistributedExecutionPlanV1, PlannedCommandV1, build_execution_plan};
-use crate::{RunnerError, container_node_launch, verify_manifest_inputs};
+use crate::{
+    RunnerError, container_node_launch, record_distributed_failure, verify_manifest_inputs,
+};
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
 const INFRASTRUCTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
@@ -55,10 +57,22 @@ pub async fn run_manifest(
             .map_err(|error| RunnerError::environment("manifest_serialize", error))?,
     )
     .map_err(|error| RunnerError::environment("manifest_write", error))?;
-    match &manifest.backend {
+    let result = match &manifest.backend {
         DistributedBackendV1::Container(_) => run_container(manifest, &plan, &scenario).await,
         DistributedBackendV1::VirtualMachine(_) => run_vm(manifest, &plan).await,
+    };
+    if let Err(error) = &result
+        && let Err(corpus_error) = record_distributed_failure(manifest, error)
+    {
+        return Err(RunnerError::validation(
+            "failure_corpus_record",
+            format!(
+                "run failed with {}; failure evidence could not be recorded ({})",
+                error.code, corpus_error.code
+            ),
+        ));
     }
+    result
 }
 
 fn validate_scenario_binding(

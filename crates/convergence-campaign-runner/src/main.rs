@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
-    CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
-    DistributedBackendV1, build_execution_plan, load_manifest, run_manifest,
-    verify_manifest_inputs,
+    CampaignAdapterV1, CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1,
+    ConvergenceEvidenceBundleV1, DistributedBackendV1, FailureClassificationV1,
+    build_execution_plan, load_manifest, observation_from_capsule, read_failure_corpus,
+    run_manifest, verify_manifest_inputs, write_failure_corpus,
 };
 
 #[derive(Debug, Parser)]
@@ -45,6 +47,41 @@ enum Commands {
     },
     /// Validate that an evidence bundle contains every required assurance section.
     CheckEvidence { bundle: PathBuf },
+    /// Add an automatically written simulator capsule to the durable failure corpus.
+    IndexCapsule {
+        corpus: PathBuf,
+        capsule: PathBuf,
+        adapter: String,
+        build_id: String,
+    },
+    /// Index a process-node capsule together with its pinned canonical scenario.
+    IndexNodeCapsule {
+        corpus: PathBuf,
+        capsule: PathBuf,
+        scenario: PathBuf,
+        build_id: String,
+    },
+    /// Apply the reviewed four-way classification to a corpus entry.
+    ClassifyFailure {
+        corpus: PathBuf,
+        fingerprint: String,
+        classification: String,
+    },
+    /// Record time-to-diagnosis and an optional promoted vector.
+    DiagnoseFailure {
+        corpus: PathBuf,
+        fingerprint: String,
+        elapsed_seconds: u64,
+        #[arg(long)]
+        promoted_vector: Option<PathBuf>,
+    },
+    /// Turn a stable synthetic failure capsule into a fixed vector candidate.
+    PromoteCapsule {
+        capsule: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        generator_version: String,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +175,88 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_slice(&std::fs::read(bundle)?)?;
             bundle.validate()?;
             println!("valid-evidence {}", bundle.source_revision);
+        }
+        Commands::IndexCapsule {
+            corpus,
+            capsule,
+            adapter,
+            build_id,
+        } => {
+            let failure = cgka_conformance_simulator::read_failure_capsule(&capsule)?;
+            let observation = observation_from_capsule(
+                &failure,
+                capsule,
+                adapter.parse::<CampaignAdapterV1>()?,
+                BTreeMap::from([("indexed_build".into(), build_id)]),
+            );
+            let fingerprint = observation.fingerprint.clone();
+            let mut index = read_failure_corpus(&corpus)?;
+            index.record(observation)?;
+            write_failure_corpus(&corpus, &index)?;
+            println!("indexed-failure {fingerprint}");
+        }
+        Commands::IndexNodeCapsule {
+            corpus,
+            capsule,
+            scenario,
+            build_id,
+        } => {
+            use sha2::Digest;
+
+            let node_capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
+                serde_json::from_slice(&std::fs::read(&capsule)?)?;
+            let scenario_bytes = std::fs::read(scenario)?;
+            let scenario = serde_json::from_slice(&scenario_bytes)?;
+            let observation = convergence_campaign_runner::observation_from_node_capsule(
+                &node_capsule,
+                capsule,
+                scenario,
+                &hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+                BTreeMap::from([("indexed_build".into(), build_id)]),
+            );
+            let fingerprint = observation.fingerprint.clone();
+            let mut index = read_failure_corpus(&corpus)?;
+            index.record(observation)?;
+            write_failure_corpus(&corpus, &index)?;
+            println!("indexed-failure {fingerprint}");
+        }
+        Commands::ClassifyFailure {
+            corpus,
+            fingerprint,
+            classification,
+        } => {
+            let mut index = read_failure_corpus(&corpus)?;
+            index.reclassify(
+                &fingerprint,
+                classification.parse::<FailureClassificationV1>()?,
+            )?;
+            write_failure_corpus(&corpus, &index)?;
+            println!("classified-failure {fingerprint}");
+        }
+        Commands::DiagnoseFailure {
+            corpus,
+            fingerprint,
+            elapsed_seconds,
+            promoted_vector,
+        } => {
+            let mut index = read_failure_corpus(&corpus)?;
+            index.mark_diagnosed(&fingerprint, elapsed_seconds, promoted_vector)?;
+            write_failure_corpus(&corpus, &index)?;
+            println!("diagnosed-failure {fingerprint}");
+        }
+        Commands::PromoteCapsule {
+            capsule,
+            output,
+            generator_version,
+        } => {
+            let capsule = cgka_conformance_simulator::read_failure_capsule(&capsule)?;
+            let vector = cgka_conformance_simulator::promote_failure_capsule_to_vector(
+                &capsule,
+                &generator_version,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&vector)?;
+            fs_private::write_private(&output, &bytes)?;
+            println!("promoted-vector {}", output.display());
         }
     }
     Ok(())

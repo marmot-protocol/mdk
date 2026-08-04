@@ -95,6 +95,28 @@ mutation results, tested workload/constant boundaries, unresolved counterexample
 surfaces, a passing same-lane budget evaluation, and digest-pinned artifacts. `check-evidence` rejects incomplete
 bundles; valid bundles are written with owner-only permissions.
 
+## Failure corpus lifecycle
+
+Generated simulator failures already write a portable capsule, a minimized Scenario IR reproducer, and—when enabled—a
+sensitive byte-replay capsule. Distributed execution now also appends a message-free record to a private version-1
+corpus whenever a run fails. Simulator capsules and process-node capsules can be indexed with their pinned scenario;
+the corpus groups them by semantic fingerprint, counts recurrence across adapters/build matrices, retains seeds and
+capsule paths, and records the best time-to-diagnosis plus promoted-vector paths.
+
+Every entry has exactly one reviewable classification: product defect, protocol ambiguity, environment failure, or
+expected resource refusal. Environment failures are recognized conservatively. Resource and protocol failures remain
+product defects until an operator explicitly establishes that a refusal was expected or that the protocol is
+ambiguous; the tooling does not turn an unexpected failure into an expected outcome automatically.
+
+Scenario minimization first removes semantic dependency units—partition/heal, offline/reconnect, crash/restart,
+storage-fault/clear, and withhold/release pairs—then removes independent transport noise while requiring the same
+semantic failure identity. Non-layer-specific VM, container, process, and app-runtime failures emit a candidate for the
+next smaller adapter. The candidate carries the minimized canonical scenario and failure identity, so the smaller
+adapter must reproduce the same failure before the layer is removed from the diagnosis.
+
+Only synthetic shareable capsules with portable expectations may be promoted into fixed vector candidates. Sensitive
+capsules remain local and are never eligible for promotion.
+
 ## What this evidence means
 
 A passing distributed campaign establishes the declared scenario, build matrix, fault schedule, adapter capabilities,
