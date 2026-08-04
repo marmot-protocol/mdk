@@ -709,12 +709,21 @@ impl AppClient {
     /// Move every recorded escalation onto the summary a seam is about to
     /// return.
     ///
-    /// Call this as the LAST step before `Ok(summary)`, and only at the
-    /// outermost seams — the ones whose `Ok` is handed to a caller rather than
-    /// followed by more fallible work. An interior `?` returns before the move
-    /// runs, so the stash simply rides the next successful seam instead of
-    /// being lost with the failed pass's summary. Moving (not copying) is what
-    /// keeps delivery exactly-once.
+    /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
+    /// — the ones whose `Ok` is handed to a caller rather than followed by more
+    /// fallible work. An interior `?` returns before the move runs, so the stash
+    /// simply rides the next successful seam instead of being lost with the
+    /// failed pass's summary. Moving (not copying) is what keeps delivery
+    /// exactly-once. Because the stash is shared, a seam that omits this call
+    /// *defers* delivery to the next seam that does; it does not lose it.
+    ///
+    /// One nested case needs care: [`Self::drain_pending_session_events`] drains
+    /// while nested inside `sync_inner`, so its escalations leave the stash and
+    /// ride `summary` from the merge onwards. Nothing fallible may be inserted
+    /// between that merge and `sync_inner`'s `Ok` — past the merge they sit on a
+    /// local summary again, and a `?` would take them down with the pass. (Which
+    /// also makes `sync_inner`'s own call belt-and-braces rather than
+    /// load-bearing: the nested drain has already emptied the stash.)
     ///
     /// Residual: the receive arm drops the whole client on a failed pass, which
     /// discards this stash and the detector's `escalated` latch together, so a
