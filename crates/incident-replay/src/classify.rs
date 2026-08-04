@@ -146,7 +146,8 @@ impl fmt::Display for QuarantineReason {
 pub struct HaltedEngine {
     /// The engine that halted.
     pub engine_id: String,
-    /// Every distinct halt reason it recorded, deduplicated and in sort order.
+    /// Why it halted, deduplicated and in sort order: the causes it recorded, or
+    /// its re-assertions when it recorded no cause. See [`reported_halt_reasons`].
     pub reasons: Vec<String>,
 }
 
@@ -410,10 +411,33 @@ fn unrecoverable_halt(export: &AgentStateExport) -> Option<QuarantineReason> {
         .into_iter()
         .map(|(engine_id, reasons)| HaltedEngine {
             engine_id: engine_id.to_owned(),
-            reasons: reasons.into_iter().map(str::to_owned).collect(),
+            reasons: reported_halt_reasons(&reasons),
         })
         .collect();
     (!engines.is_empty()).then_some(QuarantineReason::UnrecoverableHalt { engines })
+}
+
+/// One engine's halt reasons as the operator should read them: its causes, or its
+/// re-assertions when it recorded no cause.
+///
+/// A re-assertion never names why the engine stopped (see
+/// [`export::is_halt_re_assertion`]), so beside a real cause it is noise in the
+/// line an operator reads first. It is not dropped unconditionally, because a
+/// halt that predates the export window leaves nothing *but* re-assertions and
+/// that engine still has to be named — which is also the honest report for it:
+/// this export shows the halt standing, not what caused it.
+///
+/// [`export::is_halt_re_assertion`]: crate::export::is_halt_re_assertion
+fn reported_halt_reasons(reasons: &BTreeSet<&str>) -> Vec<String> {
+    let causes: Vec<String> = reasons
+        .iter()
+        .filter(|reason| !crate::export::is_halt_re_assertion(reason))
+        .map(|reason| (*reason).to_owned())
+        .collect();
+    if causes.is_empty() {
+        return reasons.iter().map(|reason| (*reason).to_owned()).collect();
+    }
+    causes
 }
 
 /// Per-engine activity, folded from the event log.
