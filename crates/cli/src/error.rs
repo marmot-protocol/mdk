@@ -565,6 +565,14 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "invalid_public_key",
             "message": err.to_string(),
         }),
+        AppError::UnexpectedPrivateKey => json!({
+            "code": "unexpected_private_key",
+            "message": err.to_string(),
+        }),
+        AppError::IdentityKeyMismatch => json!({
+            "code": "identity_key_mismatch",
+            "message": err.to_string(),
+        }),
         AppError::InvalidKeyPackageEvent(reason) => json!({
             "code": "invalid_key_package_event",
             "message": err.to_string(),
@@ -663,5 +671,24 @@ mod tests {
             error["repair"]["remote"],
             "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
         );
+    }
+
+    #[test]
+    fn secret_identity_errors_do_not_echo_nsec_material() {
+        let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+        let cases = [
+            WnError::SecretArgumentRejected { command: "login" },
+            WnError::ConflictingSecretInput { command: "login" },
+            WnError::MissingStdinSecret { command: "login" },
+            WnError::InvalidStdinSecret {
+                command: "account create",
+            },
+        ];
+        for err in cases {
+            let message = err.to_string();
+            assert!(!message.contains(nsec), "{message}");
+            let json = wn_error_json(&err).to_string();
+            assert!(!json.contains(nsec), "{json}");
+        }
     }
 }

@@ -24,6 +24,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- `wn login --nsec-stdin` and `wn account create --nsec-stdin` now keep stdin
+  nsecs in a dedicated zeroizing sidecar instead of materializing them into the
+  generic `Cli` command tree. Daemon execute frames and `AccountSetupRequest`
+  use redacted `Debug`, avoid secret `Clone`, and wipe nsec-bearing request
+  framing buffers on the final owned request payload where the implementation
+  controls the buffer (`Zeroizing` encode/read paths). Transient allocator or
+  `BufReader` copies are not guaranteed wiped. When the daemon app runtime is
+  disabled (no `--relay`), account setup skips hosted validation and falls back
+  to local `wn` execution while keeping the stdin `nsec` sidecar owned. Uppercase
+  `NSEC…` argv identities are rejected at the same early gate as lowercase
+  `nsec…`.
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session

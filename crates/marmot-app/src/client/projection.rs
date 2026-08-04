@@ -563,6 +563,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::RelayDirectory(_) => "read_marker_failed:relay_directory",
         AppError::AccountCatchUp(_) => "read_marker_failed:account_catch_up",
         AppError::InvalidPublicKey => "read_marker_failed:invalid_public_key",
+        AppError::UnexpectedPrivateKey => "read_marker_failed:unexpected_private_key",
+        AppError::IdentityKeyMismatch => "read_marker_failed:identity_key_mismatch",
         AppError::ExternalSignerUnavailable(_) => "read_marker_failed:external_signer_unavailable",
         AppError::ExternalSignerMismatch => "read_marker_failed:external_signer_mismatch",
         AppError::ExternalSignerRejected => "read_marker_failed:external_signer_rejected",

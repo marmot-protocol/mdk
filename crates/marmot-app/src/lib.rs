@@ -85,6 +85,7 @@ mod ids;
 mod key_package_records;
 mod media;
 mod messages;
+mod nostr_secret;
 mod notifications;
 mod projection;
 mod publisher_sequences;
@@ -168,6 +169,7 @@ pub use media::{
     MediaUploadResult, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
+pub use nostr_secret::is_nostr_secret;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
