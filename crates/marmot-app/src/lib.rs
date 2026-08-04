@@ -719,8 +719,13 @@ impl From<AppError> for SyncFailure {
 }
 
 /// A group that full-history replay is not repairing: it armed `arms` epoch-gap
-/// backfills without once passing cleanly through an epoch, so it is still
-/// stalled below the group's live epoch at `stalled_epoch`.
+/// backfills in one run with no sign in between that the device caught up, so it
+/// is still stalled below the group's live epoch at `stalled_epoch`.
+///
+/// "No sign it caught up" is the honest strength of the claim. The runtime never
+/// decrypts the traffic that would reveal a group's live epoch, so it infers the
+/// stall from what it can see, and an advance it does not observe reads the same
+/// as no advance at all. Surface this as a strong hint, not a verdict.
 ///
 /// Reported once per unrecovered run so the application can say "this group
 /// cannot catch up; re-syncing is recommended" and offer the stronger repair —

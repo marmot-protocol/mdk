@@ -1089,9 +1089,8 @@ impl AppClient {
         if let BackfillDecision::ArmAndEscalate { arms } = decision {
             // The replay is armed above regardless: escalating reports that
             // replay alone is not repairing this group, it does not replace the
-            // attempt. The stronger repair (key-package rotation plus a full
-            // re-activation) publishes new key material, so it stays the app's
-            // decision — MDK reports the condition and names the repair.
+            // attempt (see EPOCH_STALL_ESCALATION_ARM_THRESHOLD for why
+            // reporting is all this decision does).
             tracing::warn!(
                 target: "marmot_app::epoch_stall",
                 method = "apply_backfill_decision",
@@ -1129,6 +1128,9 @@ impl AppClient {
     /// also makes `sync_inner`'s own call belt-and-braces rather than
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
+    /// A run is still forgotten when a caller discards the client outright; the
+    /// [`super::epoch_stall`] module header covers that case and what
+    /// re-escalating then costs.
     fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations

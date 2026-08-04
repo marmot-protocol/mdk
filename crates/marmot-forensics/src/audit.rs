@@ -1111,18 +1111,25 @@ pub enum AuditEventKind {
         reason: EpochBackfillDeferredReason,
         retry_ordinal: u64,
     },
-    /// A group armed `arms` epoch-gap backfills without ever passing cleanly
-    /// through an epoch: full-history replay keeps recovering some backlog while
-    /// the device stays behind the group. Emitted once per unrecovered run, at
-    /// the arm that reached `arm_threshold`, alongside that arm's
-    /// `epoch_stall_backfill_armed` row.
+    /// A group armed `arms` epoch-gap backfills in one run with nothing in
+    /// between to show the device had caught up: full-history replay keeps
+    /// recovering some backlog while the device stays behind the group. Emitted
+    /// once per unrecovered run, at the arm that reached `arm_threshold`,
+    /// alongside that arm's `epoch_stall_backfill_armed` row.
     ///
     /// This is the durable record of the escalation the runtime reports to the
     /// app, which decides whether to run the stronger repair (key-package
-    /// rotation plus a full transport re-activation). The run counter is
-    /// in-memory, so a process restart can escalate the same group again; the row
-    /// is what makes each escalation permanent evidence, and the field-evidence
+    /// rotation plus a full transport re-activation). Where recording is enabled
+    /// it is what makes each escalation permanent evidence, and the field-evidence
     /// loop that tunes `arm_threshold`.
+    ///
+    /// Reading it needs care in both directions, because the run counter behind
+    /// `arms` is in-memory. A second row for one group is not necessarily a second
+    /// independent failure: a restart clears the counter, so it can be the same
+    /// unresolved condition re-earning a whole run of arms. And the absence of a
+    /// second row is not recovery: re-escalating needs the device's own epoch to
+    /// keep moving, so a group wedged at a single epoch escalates at most once
+    /// however long it stays wedged.
     ///
     /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
     /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the
