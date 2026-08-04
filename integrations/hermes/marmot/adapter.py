@@ -452,16 +452,72 @@ def _referenced_channel_context(reply: Any) -> Optional[str]:
     return f"Marmot referenced-message context (untrusted): {json.dumps(fact, separators=(',', ':'))}"
 
 
-def _timeline_channel_context(messages: Any) -> Optional[str]:
-    if not isinstance(messages, list) or not messages:
-        return None
+TIMELINE_CONTEXT_MESSAGE_LIMIT = 8
+TIMELINE_CONTEXT_BYTE_LIMIT = 16 * 1024
+_TIMELINE_CONTEXT_PREFIX = "Marmot conversation history (untrusted): "
+
+
+def _timeline_message_exceeds_byte_limit(message: Any) -> bool:
     fact = {
         "type": "chat_window",
         "order": "chronological",
         "relation": "before_current_message",
-        "messages": messages,
+        "messages": [message],
+        "messages_truncated": True,
+        "omitted_message_count": 1,
     }
-    return f"Marmot conversation history (untrusted): {json.dumps(fact, separators=(',', ':'))}"
+    rendered = f"{_TIMELINE_CONTEXT_PREFIX}{json.dumps(fact, separators=(',', ':'))}"
+    return len(rendered.encode("utf-8")) > TIMELINE_CONTEXT_BYTE_LIMIT
+
+
+def _timeline_channel_context(messages: Any) -> Optional[str]:
+    if not isinstance(messages, list) or not messages:
+        return None
+    initially_omitted = (
+        messages[:-TIMELINE_CONTEXT_MESSAGE_LIMIT]
+        if len(messages) > TIMELINE_CONTEXT_MESSAGE_LIMIT
+        else []
+    )
+    omitted_message_count = len(initially_omitted)
+    oversized_message_count = sum(
+        1 for message in initially_omitted if _timeline_message_exceeds_byte_limit(message)
+    )
+    bounded_messages = messages[-TIMELINE_CONTEXT_MESSAGE_LIMIT:]
+
+    while True:
+        fact = {
+            "type": "chat_window",
+            "order": "chronological",
+            "relation": "before_current_message",
+            "messages": bounded_messages,
+        }
+        if omitted_message_count:
+            fact["messages_truncated"] = True
+            fact["omitted_message_count"] = omitted_message_count
+        if oversized_message_count:
+            fact["oversized_message_count"] = oversized_message_count
+
+        rendered = f"{_TIMELINE_CONTEXT_PREFIX}{json.dumps(fact, separators=(',', ':'))}"
+        if len(rendered.encode("utf-8")) <= TIMELINE_CONTEXT_BYTE_LIMIT:
+            return rendered
+
+        if len(bounded_messages) > 1:
+            if _timeline_message_exceeds_byte_limit(bounded_messages[0]):
+                oversized_message_count += 1
+            bounded_messages = bounded_messages[1:]
+            omitted_message_count += 1
+            continue
+
+        if bounded_messages:
+            if _timeline_message_exceeds_byte_limit(bounded_messages[0]):
+                oversized_message_count += 1
+            bounded_messages = []
+            omitted_message_count += 1
+            continue
+
+        # The metadata-only envelope is intentionally tiny, so this is a
+        # defensive fallback rather than an expected path.
+        return rendered
 
 
 def _mutation_channel_context(event: Dict[str, Any]) -> str:
