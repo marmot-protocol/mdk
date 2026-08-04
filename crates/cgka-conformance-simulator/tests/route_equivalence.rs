@@ -152,6 +152,9 @@ fn cross_route_catalog_covers_the_full_incident_matrix_and_reopens_claims() {
     claim.reopen("field_counterexample");
     assert_eq!(claim.status, AssuranceClaimStatus::Reopened);
     assert_eq!(claim.falsification.as_deref(), Some("field_counterexample"));
+    claim.cover(&campaigns[1].campaign_id);
+    assert_eq!(claim.status, AssuranceClaimStatus::Reopened);
+    assert_eq!(claim.falsification.as_deref(), Some("field_counterexample"));
 }
 
 #[test]
@@ -223,8 +226,10 @@ async fn scheduler_route_recovers_the_deeper_branch_through_candidate_peel_conte
         .unwrap()
         .scenario_input_ledger
         .iter()
-        .find(|entry| entry.scenario_id == "step-5:invite_members@main")
-        .unwrap();
+        .find(|entry| {
+            entry.sender == "alice" && entry.scenario_id.ends_with(":invite_members@main")
+        })
+        .expect("alice root invite must appear in Bob's pre-follow-on input ledger");
     assert_eq!(
         bob_alice_root.disposition,
         ScenarioInputDisposition::Deferred,

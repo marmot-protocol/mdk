@@ -108,6 +108,7 @@ struct AppRuntimeInputRecord {
     payload: String,
     logical_id: Option<String>,
     origin_branch_id: Option<String>,
+    origin_branch_unknown: bool,
     published: usize,
     failed: bool,
 }
@@ -250,6 +251,7 @@ impl AppRuntimeHarness {
             }
             participant.events = None;
             participant.online = false;
+            participant.cached_exact.clear();
             Ok(())
         }
     }
@@ -268,16 +270,18 @@ impl AppRuntimeHarness {
         participant.events = Some(runtime.subscribe());
         participant.runtime = Some(runtime);
         participant.online = true;
+        participant.cached_exact.clear();
         participant.reopen_count = participant.reopen_count.saturating_add(1);
         Ok(())
     }
 
     fn active_group_members(&self) -> Vec<String> {
-        self.active_scenario_group
+        let tracked = self
+            .active_scenario_group
             .as_ref()
             .and_then(|group| self.scenario_group_members.get(group))
-            .map(|members| members.iter().cloned().collect())
-            .unwrap_or_default()
+            .map(|members| members.iter().cloned().collect());
+        tracked.unwrap_or_else(|| self.participants.keys().cloned().collect())
     }
 
     pub async fn observations(
@@ -635,7 +639,6 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::RetainedRelayHistory,
                 SubjectCapability::ExactConformanceObservation,
                 SubjectCapability::ActiveDecryptabilityProbe,
-                SubjectCapability::VirtualTime,
             ]),
         }
     }
@@ -991,12 +994,14 @@ impl AppRuntimeHarness {
             .await;
         match result {
             Ok(summary) => {
-                let origin_branch_id = participant
+                let (origin_branch_id, origin_branch_unknown) = match participant
                     .runtime()?
                     .conformance_canonical_state_snapshot(&participant.account_id, &group_id)
                     .await
-                    .ok()
-                    .and_then(canonical_branch_id);
+                {
+                    Ok(snapshot) => (canonical_branch_id(snapshot), false),
+                    Err(_) => (None, true),
+                };
                 self.application_inputs.insert(
                     action_id.to_owned(),
                     AppRuntimeInputRecord {
@@ -1005,6 +1010,7 @@ impl AppRuntimeHarness {
                         payload: payload.to_owned(),
                         logical_id: summary.message_ids.first().cloned(),
                         origin_branch_id,
+                        origin_branch_unknown,
                         published: summary.published,
                         failed: false,
                     },
@@ -1020,6 +1026,7 @@ impl AppRuntimeHarness {
                         payload: payload.to_owned(),
                         logical_id: None,
                         origin_branch_id: None,
+                        origin_branch_unknown: false,
                         published: 0,
                         failed: true,
                     },
@@ -1058,6 +1065,8 @@ impl AppRuntimeHarness {
                         1,
                         vec!["app_runtime_send_failed".into()],
                     )
+                } else if input.origin_branch_unknown {
+                    (ScenarioInputDisposition::Deferred, true, 0, 0, Vec::new())
                 } else if invalidated
                     || input.origin_branch_id.is_some()
                         && input.origin_branch_id != current_branch_id
@@ -1093,7 +1102,7 @@ impl AppRuntimeHarness {
                     ignored: 0,
                     local_state: 0,
                     rejected,
-                    ingest_errors: 0,
+                    ingest_errors: usize::from(input.origin_branch_unknown),
                     delivered,
                     deduplicated: 0,
                     expired: 0,
@@ -1450,5 +1459,82 @@ mod tests {
 
         let resource = app_error(AppError::RuntimeBusy);
         assert_eq!(resource.category, SubjectFailureCategory::Resource);
+    }
+
+    #[tokio::test]
+    async fn offline_state_is_not_cached_and_untracked_delivery_targets_every_participant() {
+        let clients = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut harness = AppRuntimeHarness::new(&clients).await.unwrap();
+        assert_eq!(harness.active_group_members(), clients);
+        assert!(
+            !harness
+                .descriptor()
+                .capabilities
+                .contains(&SubjectCapability::VirtualTime)
+        );
+
+        harness.application_inputs.insert(
+            "step-1:send_application@main".into(),
+            AppRuntimeInputRecord {
+                action_id: "step-1:send_application@main".into(),
+                sender: "alice".into(),
+                payload: "payload".into(),
+                logical_id: Some("message".into()),
+                origin_branch_id: None,
+                origin_branch_unknown: true,
+                published: 1,
+                failed: false,
+            },
+        );
+        let ledger = harness.application_ledger_for(&AppRuntimeObservationV1 {
+            schema_version: APP_RUNTIME_OBSERVATION_SCHEMA_VERSION.into(),
+            participant: "alice".into(),
+            protocol: AppRuntimeProtocolProjectionV1 {
+                epoch: 1,
+                member_identities: Vec::new(),
+                admin_identities: Vec::new(),
+                group_name: "group".into(),
+                member_count: 1,
+                state_commitment_sha256: "commitment".into(),
+            },
+            canonical_state: ConformanceCanonicalStateSnapshot::Live(Box::default()),
+            application: AppRuntimeApplicationProjectionV1 {
+                visible_message_ids: Vec::new(),
+                visible_plaintexts: Vec::new(),
+                invalidated_message_ids: Vec::new(),
+                pending_confirmation: false,
+                stored_member_count: Some(1),
+                runtime_events_observed: 0,
+            },
+            local: AppRuntimeLocalDiagnosticsV1 {
+                online: true,
+                catch_up_attempts: 0,
+                reopen_count: 0,
+                retryable_failures: 0,
+                terminal_failures: 0,
+                database_exists: true,
+                database_encrypted: true,
+                database_bytes: None,
+                last_error_kind: None,
+            },
+        });
+        assert_eq!(ledger[0].disposition, ScenarioInputDisposition::Deferred);
+        assert_eq!(ledger[0].ingest_errors, 1);
+
+        harness
+            .participants
+            .get_mut("alice")
+            .unwrap()
+            .cached_exact
+            .insert(
+                "main".into(),
+                ConformanceCanonicalStateSnapshot::Live(Box::default()),
+            );
+        harness.set_online("alice", false).await.unwrap();
+        assert!(
+            harness.participants["alice"].cached_exact.is_empty(),
+            "offline observations must not reuse an earlier exact snapshot"
+        );
+        harness.set_online("bob", false).await.unwrap();
     }
 }

@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 /// from the stored bytes) and its consumed proposal references.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnCommitConvergenceStamp {
+    /// SHA-256 of the confirmed parent GroupContext from which this commit was
+    /// authored. Older unstamped-parent rows decode as `None` and are not
+    /// eligible for the anchor-rollforward fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_group_context_sha256: Option<String>,
     /// This device's member identity — the authenticated committer of the
     /// stored commit.
     pub committer: MemberId,

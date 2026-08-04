@@ -104,6 +104,12 @@ pub fn scenario_for_route_adapter(
                 RouteCampaignAdapter::AppRuntime
                 | RouteCampaignAdapter::Process
                 | RouteCampaignAdapter::Distributed,
+                ScenarioStep::AdvanceTime { .. },
+            ) => {}
+            (
+                RouteCampaignAdapter::AppRuntime
+                | RouteCampaignAdapter::Process
+                | RouteCampaignAdapter::Distributed,
                 ScenarioStep::WithholdMessage { .. },
             ) => steps.push(ScenarioStep::Barrier {
                 name: "retained-history-adapter-follow-on-visible".into(),
@@ -163,8 +169,9 @@ impl AssuranceClaimRecordV1 {
             self.covering_campaigns.push(campaign_id.into());
             self.covering_campaigns.sort();
         }
-        self.status = AssuranceClaimStatus::Covered;
-        self.falsification = None;
+        if self.status != AssuranceClaimStatus::Reopened {
+            self.status = AssuranceClaimStatus::Covered;
+        }
     }
 
     pub fn reopen(&mut self, falsification: impl Into<String>) {

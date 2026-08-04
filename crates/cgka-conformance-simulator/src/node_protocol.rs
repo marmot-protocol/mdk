@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub const NODE_PROTOCOL_VERSION: &str = "marmot-convergence-node-v1";
-pub const NODE_OBSERVATION_SCHEMA_VERSION: &str = "1";
+pub const NODE_OBSERVATION_SCHEMA_VERSION: &str = "2";
 pub const NODE_FAILURE_CAPSULE_SCHEMA_VERSION: &str = "1";
 pub const MAX_NODE_JSONL_BYTES: usize = 1_048_576;
 
@@ -139,6 +139,8 @@ pub enum NodeResponseBodyV1 {
         application_message_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         application_origin_branch_id: Option<String>,
+        #[serde(default)]
+        application_origin_branch_unknown: bool,
     },
     Observation {
         action_id: String,
@@ -512,16 +514,16 @@ impl NodeServer {
                     .send_message(&state.account_id, &group_id, payload.into_bytes())
                     .await
                     .map_err(app_node_error)?;
-                let exact = state
+                let (origin_branch_id, application_origin_branch_unknown) = match state
                     .runtime
                     .conformance_canonical_state_snapshot(&state.account_id, &group_id)
                     .await
-                    .map_err(app_node_error)?;
-                let origin_branch_id = match exact {
-                    ConformanceCanonicalStateSnapshot::Live(snapshot) => {
-                        Some(snapshot.selected_branch_id)
+                {
+                    Ok(ConformanceCanonicalStateSnapshot::Live(snapshot)) => {
+                        (Some(snapshot.selected_branch_id), false)
                     }
-                    ConformanceCanonicalStateSnapshot::Disbanded(_) => None,
+                    Ok(ConformanceCanonicalStateSnapshot::Disbanded(_)) => (None, false),
+                    Err(_) => (None, true),
                 };
                 Ok(NodeResponseBodyV1::Ack {
                     action_id,
@@ -529,6 +531,7 @@ impl NodeServer {
                     group_id_hex: None,
                     application_message_id: summary.message_ids.first().cloned(),
                     application_origin_branch_id: origin_branch_id,
+                    application_origin_branch_unknown,
                 })
             }
             NodeCommandV1::Leave { action_id } => {
@@ -962,6 +965,7 @@ fn ack(
         group_id_hex,
         application_message_id: None,
         application_origin_branch_id: None,
+        application_origin_branch_unknown: false,
     }
 }
 

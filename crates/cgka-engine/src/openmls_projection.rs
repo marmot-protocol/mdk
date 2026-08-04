@@ -28,6 +28,7 @@ use openmls::prelude::{
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
 
@@ -457,6 +458,7 @@ impl PrevalidatedOwnCommits {
 pub(crate) fn own_commit_stamp(
     staged: &openmls::group::StagedCommit,
     committer: MemberId,
+    parent_group_context_sha256: String,
 ) -> Result<cgka_traits::message::OwnCommitConvergenceStamp, cgka_traits::error::EngineError> {
     let priority = crate::app_components::commit_ordering_priority_for_staged(staged);
     let mut consumed_proposal_refs = staged
@@ -467,10 +469,46 @@ pub(crate) fn own_commit_stamp(
     consumed_proposal_refs.sort();
     consumed_proposal_refs.dedup();
     Ok(cgka_traits::message::OwnCommitConvergenceStamp {
+        parent_group_context_sha256: Some(parent_group_context_sha256),
         committer,
         priority,
         consumed_proposal_refs,
     })
+}
+
+pub(crate) fn confirmed_group_context_sha256<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<String, cgka_traits::error::EngineError> {
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let context: openmls::group::GroupContext = <S::Mls as OpenMlsStorageProvider<
+        CURRENT_VERSION,
+    >>::group_context(
+        storage.mls_storage(), &mls_group_id
+    )
+    .map_err(|error| {
+        cgka_traits::error::EngineError::Backend(format!(
+            "load confirmed parent group context: {error:?}"
+        ))
+    })?
+    .ok_or_else(|| {
+        cgka_traits::error::EngineError::Backend(
+            "confirmed parent group context is missing from storage".into(),
+        )
+    })?;
+    let bytes = context.tls_serialize_detached().map_err(|error| {
+        cgka_traits::error::EngineError::Serialize(format!(
+            "serialize confirmed parent group context: {error}"
+        ))
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn own_commit_stamp_parent_matches(
+    stamp: &cgka_traits::message::OwnCommitConvergenceStamp,
+    current_group_context_sha256: &str,
+) -> bool {
+    stamp.parent_group_context_sha256.as_deref() == Some(current_group_context_sha256)
 }
 
 /// Give retained proposal rows the same terminal disposition when a local
@@ -2779,6 +2817,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         if projection.kind == OpenMlsContentKind::Commit
             && prefix_canonical
             && let Some(stamp) = own_commits.stamp(&projection.message_digest)
+            && own_commit_stamp_parent_matches(
+                stamp,
+                &confirmed_group_context_sha256(storage, group_id)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?,
+            )
         {
             // MLS cannot process this device's own commit; realize its
             // pre-validated result by rolling the group forward to the
@@ -2822,6 +2865,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 committer: stamp.committer.as_slice().to_vec(),
                 consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
             });
+            // The exact parent GroupContext match above re-confirms the
+            // lineage before the anchor rollforward. Keep that fact explicit
+            // for a subsequent stamped own commit in the same path.
+            prefix_canonical = true;
             continue;
         }
         let processed = match if projection.kind == OpenMlsContentKind::Commit {
@@ -3419,7 +3466,7 @@ mod reuse_scope_tests {
 mod anchor_prefix_lineage_tests {
     use super::{
         AnchorRealizableOwnPrefix, anchor_realizable_own_commit_prefix,
-        retained_anchor_snapshot_name,
+        own_commit_stamp_parent_matches, retained_anchor_snapshot_name,
     };
     use crate::canonicalization::{CanonicalizationResult, ConvergenceStatus};
     use cgka_traits::engine::CommitOrderingPriority;
@@ -3451,6 +3498,7 @@ mod anchor_prefix_lineage_tests {
             },
         };
         let stamp = OwnCommitConvergenceStamp {
+            parent_group_context_sha256: None,
             committer: MemberId::new(vec![1u8; 32]),
             priority: CommitOrderingPriority::Privileged,
             consumed_proposal_refs: Vec::new(),
@@ -3465,6 +3513,21 @@ mod anchor_prefix_lineage_tests {
                 .unwrap(),
             deferred_peel: None,
         }
+    }
+
+    #[test]
+    fn own_commit_stamp_requires_the_exact_confirmed_parent_context() {
+        let mut stamp = OwnCommitConvergenceStamp {
+            parent_group_context_sha256: None,
+            committer: MemberId::new(vec![1u8; 32]),
+            priority: CommitOrderingPriority::Privileged,
+            consumed_proposal_refs: Vec::new(),
+        };
+        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
+        stamp.parent_group_context_sha256 = Some("parent-b".into());
+        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
+        stamp.parent_group_context_sha256 = Some("parent-a".into());
+        assert!(own_commit_stamp_parent_matches(&stamp, "parent-a"));
     }
 
     fn result_accepting(commit_ids: &[&[u8]]) -> CanonicalizationResult {

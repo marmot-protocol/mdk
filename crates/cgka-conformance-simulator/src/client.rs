@@ -405,6 +405,12 @@ fn build_harness_engine(
     audit_capture: &AuditCapture,
     options: HarnessEngineOptions<'_>,
 ) -> Engine<SqliteAccountStorage> {
+    #[cfg(not(debug_assertions))]
+    assert_ne!(
+        protocol_profile,
+        ProtocolProfile::Legacy,
+        "the legacy compatibility profile is unavailable in release harness builds"
+    );
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(identity.to_vec())

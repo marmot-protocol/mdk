@@ -106,6 +106,11 @@ impl<S: StorageProvider> Engine<S> {
         if has_pending_commit {
             self.retain_current_epoch_snapshot_for_group(&group_id)?;
         }
+        let parent_group_context_sha256 = has_pending_commit
+            .then(|| {
+                crate::openmls_projection::confirmed_group_context_sha256(&self.storage, &group_id)
+            })
+            .transpose()?;
 
         // One durable transaction for the plain-row writes this confirm performs
         // — merge the staged commit, mirror the Marmot record, refresh the
@@ -139,6 +144,9 @@ impl<S: StorageProvider> Engine<S> {
                         own_commit_stamp = Some(crate::openmls_projection::own_commit_stamp(
                             staged,
                             self.identity.self_id().clone(),
+                            parent_group_context_sha256
+                                .clone()
+                                .expect("pending commit captured a parent context"),
                         )?);
                     }
                     let source_epoch = EpochId(mls_group.epoch().as_u64());

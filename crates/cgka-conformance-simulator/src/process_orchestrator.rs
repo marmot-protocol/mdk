@@ -14,8 +14,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::node_protocol::{
-    NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1, NodeFailureCapsuleV1, NodeObservationV1,
-    NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
+    NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
+    NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
     BidirectionalDecryptabilityObservation, CompiledScenarioV2, DecryptabilityProbeSendStatus,
@@ -196,6 +196,7 @@ struct ProcessInputRecord {
     payload: String,
     logical_id: Option<String>,
     origin_branch_id: Option<String>,
+    origin_branch_unknown: bool,
     published: usize,
     failed: bool,
 }
@@ -599,7 +600,9 @@ impl ProcessOrchestrator {
                 let probe = self
                     .probe_bidirectional_decryptability(clients, action.schedule.source_step_index)
                     .await?;
-                if !probe.succeeded() {
+                let succeeded = probe.succeeded();
+                report.decryptability_probes.push(probe);
+                if !succeeded {
                     return Err((
                         None,
                         NodeErrorV1 {
@@ -611,7 +614,6 @@ impl ProcessOrchestrator {
                         },
                     ));
                 }
-                report.decryptability_probes.push(probe);
                 Ok((clients.clone(), ProcessActionStatusV1::Completed))
             }
             ScenarioStep::ObserveAdminPolicy { clients } => {
@@ -960,6 +962,7 @@ impl ProcessOrchestrator {
                 published,
                 application_message_id,
                 application_origin_branch_id,
+                application_origin_branch_unknown,
                 ..
             }) => {
                 self.application_inputs.insert(
@@ -970,6 +973,7 @@ impl ProcessOrchestrator {
                         payload: payload.into(),
                         logical_id: application_message_id.clone(),
                         origin_branch_id: application_origin_branch_id,
+                        origin_branch_unknown: application_origin_branch_unknown,
                         published,
                         failed: false,
                     },
@@ -986,6 +990,7 @@ impl ProcessOrchestrator {
                         payload: payload.into(),
                         logical_id: None,
                         origin_branch_id: None,
+                        origin_branch_unknown: false,
                         published: 0,
                         failed: true,
                     },
@@ -1142,6 +1147,8 @@ impl ProcessOrchestrator {
                 1,
                 vec!["app_runtime_send_failed".into()],
             )
+        } else if input.origin_branch_unknown {
+            (ScenarioInputDisposition::Deferred, true, 0, 0, Vec::new())
         } else if invalidated
             || input.origin_branch_id.as_deref().is_some()
                 && input.origin_branch_id.as_deref() != current_branch_id
@@ -1177,7 +1184,7 @@ impl ProcessOrchestrator {
             ignored: 0,
             local_state: 0,
             rejected,
-            ingest_errors: 0,
+            ingest_errors: usize::from(input.origin_branch_unknown),
             delivered,
             deduplicated: 0,
             expired: 0,
@@ -1477,15 +1484,40 @@ impl NodeProcess {
                 "node closed stdout before responding",
             ));
         }
-        let response: NodeResponseV1 = serde_json::from_str(&line).map_err(environment_error)?;
-        if response.protocol != NODE_PROTOCOL_VERSION || response.request_id != request_id {
-            return Err(ProcessOrchestratorError::new(
-                "node_protocol_mismatch",
-                "node response did not match the request",
-            ));
-        }
+        let response = decode_node_response(&line, &request_id)?;
         Ok(response.body)
     }
+}
+
+fn decode_node_response(
+    line: &str,
+    request_id: &str,
+) -> Result<NodeResponseV1, ProcessOrchestratorError> {
+    let raw: serde_json::Value = serde_json::from_str(line).map_err(environment_error)?;
+    let protocol = raw.get("protocol").and_then(serde_json::Value::as_str);
+    let response_request_id = raw.get("request_id").and_then(serde_json::Value::as_str);
+    if protocol != Some(NODE_PROTOCOL_VERSION) || response_request_id != Some(&request_id) {
+        return Err(ProcessOrchestratorError::new(
+            "node_protocol_mismatch",
+            "node response did not match the request",
+        ));
+    }
+    if raw
+        .pointer("/body/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("observation")
+        && raw
+            .pointer("/body/observation/schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(NODE_OBSERVATION_SCHEMA_VERSION)
+    {
+        return Err(ProcessOrchestratorError::new(
+            "node_observation_schema_mismatch",
+            "node observation schema is unsupported",
+        ));
+    }
+    let response: NodeResponseV1 = serde_json::from_value(raw).map_err(environment_error)?;
+    Ok(response)
 }
 
 fn process_subject_descriptor() -> SubjectDescriptor {
@@ -1502,7 +1534,6 @@ fn process_subject_descriptor() -> SubjectDescriptor {
             SubjectCapability::ActiveDecryptabilityProbe,
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
-            SubjectCapability::VirtualTime,
             SubjectCapability::OutboundPublication,
             SubjectCapability::StructuralProgress,
             SubjectCapability::ParticipantConnectivity,
@@ -1667,5 +1698,14 @@ mod tests {
         );
         let error = render_node_arg("{shell}", "p", "r", host, child).unwrap_err();
         assert_eq!(error.code, "unknown_node_command_placeholder");
+    }
+
+    #[test]
+    fn observation_schema_is_rejected_before_typed_observation_decoding() {
+        let line = format!(
+            r#"{{"protocol":"{NODE_PROTOCOL_VERSION}","request_id":"request-1","participant":"alice","body":{{"type":"observation","action_id":"observe","observation":{{"schema_version":"1"}}}}}}"#
+        );
+        let error = decode_node_response(&line, "request-1").unwrap_err();
+        assert_eq!(error.code, "node_observation_schema_mismatch");
     }
 }
