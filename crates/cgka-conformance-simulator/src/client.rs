@@ -416,6 +416,7 @@ fn build_harness_engine(
         .supported_app_components(harness_supported_app_components())
         .peeler(Box::new(peeler))
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
+    #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
     }

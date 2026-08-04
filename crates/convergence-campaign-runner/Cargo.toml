@@ -1,0 +1,27 @@
+[package]
+name = "convergence-campaign-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Container-first and VM-delegating distributed convergence campaign runner."
+
+[[bin]]
+name = "cgka-distributed-campaign"
+path = "src/main.rs"
+
+[dependencies]
+cgka-conformance-simulator.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+fs-private.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
