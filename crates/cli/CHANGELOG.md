@@ -47,6 +47,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   `NSEC…` argv identities are rejected at the same early gate as lowercase
   `nsec…`.
 
+- The runtime-start local-readiness regression test now asserts startup-before-
+  subscription ordering directly while retaining a bounded hang deadline,
+  avoiding false failures when unrelated startup work is delayed under loaded
+  `nextest` shards.
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session

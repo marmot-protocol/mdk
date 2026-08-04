@@ -1030,10 +1030,22 @@ async fn runtime_local_ready_before_directory_subscribe_body() {
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app);
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), runtime.start())
-        .await
-        .expect("runtime start must not wait for network subscription registration")
-        .unwrap();
+    // Poll startup first so a correct implementation returns before the spawned
+    // registration task can run. If startup ever awaits registration instead,
+    // the blocked-subscribe signal wins immediately; the timeout only bounds a
+    // genuine local-startup hang.
+    let start_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::select! {
+            biased;
+            result = runtime.start() => result,
+            () = relay.wait_for_blocked_subscribe() => {
+                panic!("runtime start waited for network subscription registration");
+            }
+        }
+    })
+    .await
+    .expect("runtime local startup must complete within the outer deadline");
+    start_result.unwrap();
     assert!(runtime.shared_services().lifecycle().is_running());
 
     tokio::time::timeout(
