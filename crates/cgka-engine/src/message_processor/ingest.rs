@@ -977,12 +977,35 @@ impl<S: StorageProvider> Engine<S> {
                                 // current-epoch row would make the reorg replay
                                 // this epoch-N commit against the live tip
                                 // state (WrongEpoch).
+                                //
+                                // Load-bearing invariant: this arm is reachable
+                                // only while NO convergence pass is active —
+                                // `commit_should_enter_convergence` routes any
+                                // stale commit into convergence whenever a pass
+                                // is live (its `active_pass` term), so a commit
+                                // that reaches this pairwise seam never belongs
+                                // to an open pass. The parked row is therefore
+                                // always picked up by the NEXT pass:
+                                // `seed_convergence_pass_members` seeds pass
+                                // membership from a storage scan that includes
+                                // `ConvergenceDeferred` rows. If that routing
+                                // guard is ever relaxed, a row parked here
+                                // while a pass is open would belong to no pass
+                                // and become an orphan.
                                 self.persist_openmls_wire_message(
                                     &openmls_msg,
                                     &group_id,
                                     msg_epoch,
                                     MessageState::ConvergenceDeferred,
                                 )?;
+                                self.audit_group(
+                                    &group_id,
+                                    crate::audit_helpers::message_state_changed_event(
+                                        hex::encode(msg.id.as_slice()),
+                                        MessageState::ConvergenceDeferred,
+                                        "pairwise_fork_loser",
+                                    ),
+                                );
                                 return Ok(IngestOutcome::Stale {
                                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                                 });
