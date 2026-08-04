@@ -1021,6 +1021,30 @@ pub enum AuditEventKind {
     /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
     /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
     EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
+    /// A group armed `arms` epoch-gap backfills without ever passing cleanly
+    /// through an epoch: full-history replay keeps recovering some backlog while
+    /// the device stays behind the group. Emitted once per unrecovered run, at
+    /// the arm that reached `arm_threshold`, alongside that arm's
+    /// `epoch_stall_backfill_armed` row.
+    ///
+    /// This is the durable record of the escalation the runtime reports to the
+    /// app, which decides whether to run the stronger repair (key-package
+    /// rotation plus a full transport re-activation). The run counter is
+    /// in-memory, so a process restart can escalate the same group again; the row
+    /// is what makes each escalation permanent evidence, and the field-evidence
+    /// loop that tunes `arm_threshold`.
+    ///
+    /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
+    /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the
+    /// epoch the device sat at when the escalating arm fired.
+    ///
+    /// Privacy: three scalar counts only — no ids, relay URLs, message ids, or
+    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    EpochStallBackfillEscalated {
+        stalled_epoch: u64,
+        arms: u64,
+        arm_threshold: u64,
+    },
     /// A durable convergence pass whose base epoch disagreed with the device's
     /// current tip was discarded, freeing convergence to reopen at the tip.
     /// Non-terminal by construction: it records a repair, not a fault. The
@@ -1090,6 +1114,7 @@ impl AuditEventKind {
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
             AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
+            AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
             AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }
     }

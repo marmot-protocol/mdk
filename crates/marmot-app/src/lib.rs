@@ -638,6 +638,9 @@ pub struct SyncSummary {
     pub messages: Vec<ReceivedMessage>,
     pub events: Vec<GroupEvent>,
     pub projection_updates: Vec<AppProjectionUpdate>,
+    /// Groups whose epoch-gap backfill has been armed repeatedly without the
+    /// device catching up. Surfaced as [`MarmotAppEvent::EpochStallEscalated`].
+    pub epoch_stall_escalations: Vec<EpochStallEscalation>,
 }
 
 impl SyncSummary {
@@ -649,7 +652,27 @@ impl SyncSummary {
         self.messages.extend(other.messages);
         self.events.extend(other.events);
         self.projection_updates.extend(other.projection_updates);
+        self.epoch_stall_escalations
+            .extend(other.epoch_stall_escalations);
     }
+}
+
+/// A group that full-history replay is not repairing: it armed `arms` epoch-gap
+/// backfills without once passing cleanly through an epoch, so it is still
+/// stalled below the group's live epoch at `stalled_epoch`.
+///
+/// Reported once per unrecovered run so the application can say "this group
+/// cannot catch up; re-syncing is recommended" and offer the stronger repair —
+/// rotating this device's key package and re-activating transport over full
+/// history. MDK deliberately does not rotate keys on its own: that publishes new
+/// key material and is the app's decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochStallEscalation {
+    pub group_id: GroupId,
+    /// The device's group epoch when the escalating backfill was armed.
+    pub stalled_epoch: u64,
+    /// Backfills armed in this unrecovered run, including the escalating one.
+    pub arms: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1329,6 +1352,7 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
+            pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),

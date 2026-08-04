@@ -857,6 +857,20 @@ pub enum MarmotAppEvent {
         message_id_hex: String,
         recipient_hex: String,
     },
+    /// This device has armed `arms` epoch-gap backfills for `group_id` without
+    /// catching up: it is still stalled at `stalled_epoch` while the group has
+    /// moved on, and full-history replay is not repairing it. Emitted once per
+    /// unrecovered run (see [`crate::EpochStallEscalation`]) so a UI/CLI/UniFFI
+    /// subscriber can surface "this group cannot catch up; re-syncing is
+    /// recommended" and offer the stronger repair — rotating this device's key
+    /// package and re-activating transport. MDK reports; the app decides.
+    EpochStallEscalated {
+        account_id_hex: String,
+        account_label: String,
+        group_id: GroupId,
+        stalled_epoch: u64,
+        arms: u32,
+    },
 }
 
 impl MarmotAppRuntime {

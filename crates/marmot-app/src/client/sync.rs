@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::AppClient;
+use super::epoch_stall::BackfillDecision;
 use crate::config::CursorPersistence;
 
 /// What the convergence scheduler should do next for a group, derived from
@@ -123,15 +124,16 @@ impl AppClient {
             let Ok(record) = self.runtime.group_record(group_id) else {
                 continue;
             };
-            if self
+            // Recording the recovery intent before the worker performs the
+            // external full-history replay, and recording an escalation this
+            // arm raises, are both the shared decision handler's job: a
+            // resource-refusal arm counts toward the same unrecovered run as a
+            // deferred-delivery arm, and the detector raises the run's
+            // escalation only once, at whichever path happens to arm third.
+            let decision = self
                 .epoch_stall
-                .observe_resource_refusal(group_id.clone(), record.epoch)
-            {
-                // Record the recovery intent before the worker performs the
-                // external full-history replay.
-                self.record_epoch_stall_backfill_armed(group_id, record.epoch.0);
-                self.epoch_backfill_pending = true;
-            }
+                .observe_resource_refusal(group_id.clone(), record.epoch);
+            self.apply_backfill_decision(group_id, record.epoch.0, decision);
         }
     }
 
@@ -223,6 +225,7 @@ impl AppClient {
         // unrelated send/ingest. Fold any pending events into this summary.
         let drained = self.drain_pending_session_events().await?;
         summary.merge(drained);
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
@@ -240,14 +243,32 @@ impl AppClient {
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
         let effects = self.runtime.drain().await?;
+        self.observe_drained_session_events(&effects).await
+    }
+
+    /// Project one drained batch of engine events, split from the drain itself
+    /// so the projection is exercisable against a given batch of effects.
+    pub(crate) async fn observe_drained_session_events(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
-        self.remember_pending_convergence_groups(&effects);
-        self.arm_recovery_from_effects(&effects);
-        fail_if_publish_failed(&effects)?;
+        self.remember_pending_convergence_groups(effects);
+        // Arm before the publish gate, not after. `drain()` empties the engine's
+        // in-memory event buffer one-shot and is these events' only source, and
+        // a `TransportObjectResourceRefused` is buffered only after its durable
+        // retention row is already deleted — so a refusal this pass does not arm
+        // on can never be re-observed. The arm survives the `?` because it is a
+        // field mutation plus a durable audit row, not summary state. The two
+        // conditions are correlated rather than independent: this drain
+        // publishes, so the failure and the refusal ride the same effects.
+        self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
         if effects.events.is_empty() {
+            self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
         let display_names = self.app.display_names_by_id()?;
@@ -301,6 +322,7 @@ impl AppClient {
             self.sync_runtime_groups().await?;
         }
         self.app.save_state(&self.state)?;
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
@@ -407,6 +429,7 @@ impl AppClient {
             if summary.joined_groups.is_empty()
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
+                && summary.epoch_stall_escalations.is_empty()
                 && self.pending_convergence_groups.is_empty()
                 && !self.epoch_backfill_pending
             {
@@ -470,6 +493,7 @@ impl AppClient {
             self.sync_runtime_groups().await?;
         }
         self.app.save_state(&self.state)?;
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
@@ -588,7 +612,9 @@ impl AppClient {
     /// Feed an unavailable group delivery to the epoch-stall detector.
     /// Transport-deferred input arms a backfill after the stalled-epoch
     /// threshold; resource refusal arms it immediately because it directly
-    /// proves the fetched history was not fully retained. Only observed under
+    /// proves the fetched history was not fully retained. Repeated arming that
+    /// never recovers the group escalates onto the next successful sync summary,
+    /// the seam every worker surface already publishes. Only observed under
     /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
     /// own recovery, and the main app sees the same evidence on its own next
     /// sync.
@@ -609,7 +635,7 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
-        let should_backfill = match outcome {
+        let decision = match outcome {
             IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
                 group_id.clone(),
                 message_id_hex.to_owned(),
@@ -618,16 +644,104 @@ impl AppClient {
             IngestOutcome::ResourceRefused { .. } => self
                 .epoch_stall
                 .observe_resource_refusal(group_id.clone(), record.epoch),
-            _ => false,
+            // Any other outcome carries no stall evidence, but it does tell the
+            // detector where this device now sits: a tracked group that leaves an
+            // epoch without arming at it has stopped failing to catch up, which
+            // ends its escalation run.
+            _ => {
+                self.epoch_stall
+                    .observe_group_epoch(&group_id, record.epoch);
+                BackfillDecision::Skip
+            }
         };
-        if should_backfill {
+        self.apply_backfill_decision(&group_id, record.epoch.0, decision);
+    }
+
+    /// Apply an epoch-stall backfill decision: arm the replay, and record an
+    /// escalation the detector raises.
+    ///
+    /// Every site that takes a [`BackfillDecision`] must route it through here.
+    /// The detector latches `escalated` when it raises
+    /// [`BackfillDecision::ArmAndEscalate`], so it raises that decision exactly
+    /// once per unrecovered run. That makes reporting exactly-once by
+    /// construction rather than by caller discipline: the escalation lands in
+    /// `pending_epoch_stall_escalations` instead of on whatever [`SyncSummary`]
+    /// the calling pass is building, so a later `?` on that pass cannot drop it
+    /// — it rides out on the next seam that returns `Ok` (see
+    /// [`Self::drain_epoch_stall_escalations`]).
+    pub(crate) fn apply_backfill_decision(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        stalled_epoch: u64,
+        decision: BackfillDecision,
+    ) {
+        if decision.arms_backfill() {
             // Record the arm decision before the replay side effect runs (the
             // worker seam calls run_pending_epoch_backfill after this returns).
             // Best-effort, fire-and-forget: recording can never block or fail
             // the backfill.
-            self.record_epoch_stall_backfill_armed(&group_id, record.epoch.0);
+            self.record_epoch_stall_backfill_armed(group_id, stalled_epoch);
             self.epoch_backfill_pending = true;
         }
+        if let BackfillDecision::ArmAndEscalate { arms } = decision {
+            // The replay is armed above regardless: escalating reports that
+            // replay alone is not repairing this group, it does not replace the
+            // attempt. The stronger repair (key-package rotation plus a full
+            // re-activation) publishes new key material, so it stays the app's
+            // decision — MDK reports the condition and names the repair.
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "apply_backfill_decision",
+                arms,
+                arm_threshold = self.epoch_stall.escalation_arm_threshold(),
+                "epoch-gap backfill armed repeatedly without recovering a group; escalating"
+            );
+            self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
+            self.pending_epoch_stall_escalations
+                .push(crate::EpochStallEscalation {
+                    group_id: group_id.clone(),
+                    stalled_epoch,
+                    arms,
+                });
+        }
+    }
+
+    /// Move every recorded escalation onto the summary a seam is about to
+    /// return.
+    ///
+    /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
+    /// — the ones whose `Ok` is handed to a caller rather than followed by more
+    /// fallible work. An interior `?` returns before the move runs, so the stash
+    /// simply rides the next successful seam instead of being lost with the
+    /// failed pass's summary. Moving (not copying) is what keeps delivery
+    /// exactly-once. Because the stash is shared, a seam that omits this call
+    /// *defers* delivery to the next seam that does; it does not lose it.
+    ///
+    /// One nested case needs care: [`Self::drain_pending_session_events`] drains
+    /// while nested inside `sync_inner`, so its escalations leave the stash and
+    /// ride `summary` from the merge onwards. Nothing fallible may be inserted
+    /// between that merge and `sync_inner`'s `Ok` — past the merge they sit on a
+    /// local summary again, and a `?` would take them down with the pass. (Which
+    /// also makes `sync_inner`'s own call belt-and-braces rather than
+    /// load-bearing: the nested drain has already emptied the stash.)
+    ///
+    /// Residual: the receive arm drops the whole client on a failed pass, so the
+    /// replacement starts with an empty stash and a fresh detector; the
+    /// `epoch_stall_backfill_escalated` row recorded just before the push is the
+    /// only trace that outlives them, and only where audit logging is on (opt-in,
+    /// off by default). Re-escalating then costs a whole fresh three-arm run, and
+    /// only its first arm can land at the epoch the device already sits at — an
+    /// arm at an epoch already fired at is a `Skip` — so arms two and three each
+    /// need the local epoch to genuinely advance. A group that is still advancing
+    /// therefore re-escalates roughly two epochs later, delayed rather than lost;
+    /// a group frozen at one local epoch arms once and never escalates again.
+    /// That second case is a pre-existing blind spot of the arm counter, not a
+    /// rebuild artifact — a group frozen from its first arm never escalates in a
+    /// fresh process either — and is tracked for a follow-up.
+    fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
+        summary
+            .epoch_stall_escalations
+            .append(&mut self.pending_epoch_stall_escalations);
     }
 
     /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
@@ -683,6 +797,7 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_groups(&effects);
+        let mut summary = SyncSummary::default();
         self.arm_recovery_from_effects(&effects);
         self.remember_published_reports(&effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
@@ -702,7 +817,6 @@ impl AppClient {
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
-        let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
@@ -729,6 +843,7 @@ impl AppClient {
             )
             .await;
         }
+        self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
 
