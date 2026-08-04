@@ -1528,7 +1528,7 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -1629,7 +1629,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -1772,7 +1772,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -1879,7 +1879,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -1967,7 +1967,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2212,7 +2212,7 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2344,7 +2344,7 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2435,11 +2435,11 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let carol = runtime.create_identity(setup).await.unwrap();
@@ -2524,7 +2524,7 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2621,7 +2621,7 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2678,7 +2678,7 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2740,7 +2740,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2897,7 +2897,7 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -2998,7 +2998,7 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3074,7 +3074,7 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3330,7 +3330,7 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3480,7 +3480,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3563,7 +3563,7 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3672,7 +3672,7 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3757,7 +3757,7 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -3829,7 +3829,7 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -6408,7 +6408,7 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -6883,7 +6883,7 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -6951,7 +6951,7 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
@@ -7047,7 +7047,7 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
         ..AccountSetupRequest::default()
     };
     let alice = runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();

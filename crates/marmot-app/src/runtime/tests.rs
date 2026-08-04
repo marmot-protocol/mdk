@@ -1554,7 +1554,37 @@ fn account_setup_request_rejects_and_redacts_uppercase_nsec_identity() {
     assert!(debug.contains("redacted"));
     let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
         .expect_err("uppercase nsec-shaped identity must be rejected");
-    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[test]
+fn account_setup_validation_rejects_import_nsec_for_login_operation() {
+    let request = AccountSetupRequest {
+        import_nsec: Some(Zeroizing::new(
+            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        )),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::Login)
+        .expect_err("login must not accept import_nsec");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[test]
+fn account_setup_validation_reports_identity_key_mismatch_without_leaking_secrets() {
+    use nostr::prelude::ToBech32;
+    let keys = nostr::Keys::generate();
+    let other = nostr::Keys::generate();
+    let request = AccountSetupRequest {
+        identity: Some(keys.public_key().to_bech32().unwrap()),
+        import_nsec: Some(Zeroizing::new(other.secret_key().to_bech32().unwrap())),
+        ..AccountSetupRequest::default()
+    };
+    let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
+        .expect_err("mismatched keys");
+    assert!(matches!(err, AppError::IdentityKeyMismatch));
+    let debug = format!("{err:?}");
+    assert!(!debug.contains("nsec"));
 }
 
 #[test]
@@ -1567,7 +1597,7 @@ fn account_setup_validation_rejects_nsec_in_identity_field() {
     };
     let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
         .expect_err("nsec-shaped identity must be rejected");
-    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
 #[tokio::test]
@@ -1587,7 +1617,7 @@ async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutat
         .create_or_import_account(request)
         .await
         .expect_err("mismatched identity and import_nsec must be rejected");
-    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(matches!(err, AppError::IdentityKeyMismatch));
     assert!(
         app.account_home().accounts().unwrap().is_empty(),
         "validation must run before account creation or import"
@@ -1621,7 +1651,21 @@ async fn account_setup_login_rejects_import_nsec_sidecar() {
         .login(keys.public_key().to_bech32().unwrap(), request)
         .await
         .expect_err("login must not accept import_nsec");
-    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
+}
+
+#[tokio::test]
+async fn account_setup_login_rejects_nsec_shaped_identity_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let err = runtime
+        .login(
+            "NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99",
+            AccountSetupRequest::default(),
+        )
+        .await
+        .expect_err("login must reject nsec-shaped identity");
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
 #[tokio::test]
@@ -1638,5 +1682,5 @@ async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
         .create_identity(request)
         .await
         .expect_err("create_identity must not accept import_nsec");
-    assert!(matches!(err, AppError::InvalidPublicKey));
+    assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }

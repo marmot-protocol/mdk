@@ -565,6 +565,14 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "invalid_public_key",
             "message": err.to_string(),
         }),
+        AppError::UnexpectedPrivateKey => json!({
+            "code": "unexpected_private_key",
+            "message": err.to_string(),
+        }),
+        AppError::IdentityKeyMismatch => json!({
+            "code": "identity_key_mismatch",
+            "message": err.to_string(),
+        }),
         AppError::InvalidKeyPackageEvent(reason) => json!({
             "code": "invalid_key_package_event",
             "message": err.to_string(),

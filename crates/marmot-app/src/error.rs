@@ -66,6 +66,10 @@ pub enum AppError {
     AccountCatchUp(String),
     #[error("invalid Nostr public key")]
     InvalidPublicKey,
+    #[error("this operation does not accept a private key")]
+    UnexpectedPrivateKey,
+    #[error("public identity does not match the imported private key")]
+    IdentityKeyMismatch,
     #[error("external signer unavailable for account")]
     ExternalSignerUnavailable(String),
     #[error("external signer public key does not match account")]
@@ -176,6 +180,8 @@ impl AppError {
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
             Self::InvalidPublicKey => "invalid_public_key",
+            Self::UnexpectedPrivateKey => "unexpected_private_key",
+            Self::IdentityKeyMismatch => "identity_key_mismatch",
             Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
             Self::ExternalSignerMismatch => "external_signer_mismatch",
             Self::ExternalSignerRejected => "external_signer_rejected",

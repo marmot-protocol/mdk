@@ -736,8 +736,11 @@ impl std::fmt::Debug for AccountSetupRequest {
 }
 
 impl AccountSetupRequest {
-    /// Copies relay/publish options for another setup attempt. Clears identity and `import_nsec`.
-    pub fn fresh_attempt(&self) -> Self {
+    /// Copies relay and publish options for another setup attempt.
+    ///
+    /// **Clears** [`Self::identity`] and [`Self::import_nsec`]; use only when
+    /// starting a fresh account setup with the same relay configuration.
+    pub fn relay_options_only(&self) -> Self {
         Self {
             identity: None,
             import_nsec: None,
@@ -3173,8 +3176,8 @@ impl MarmotAppRuntime {
         mut request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let identity = identity.into();
-        if is_nostr_secret(&identity) {
-            return Err(AppError::InvalidPublicKey);
+        if crate::is_nostr_secret(&identity) {
+            return Err(AppError::UnexpectedPrivateKey);
         }
         request.identity = Some(identity);
         validate_account_setup_request(&request, AccountSetupOperation::Login)?;
@@ -4236,7 +4239,7 @@ impl AccountManager {
         &self,
         identity: &str,
     ) -> Result<Option<AccountSummary>, AppError> {
-        let account_id = if is_nostr_secret(identity) {
+        let account_id = if crate::is_nostr_secret(identity) {
             AccountHome::account_id_for_secret(identity)?
         } else {
             AccountHome::account_id_for_public_key(identity)?
@@ -4348,15 +4351,9 @@ impl AccountManager {
     }
 }
 
-fn is_nostr_secret(value: &str) -> bool {
-    value
-        .get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("nsec"))
-}
-
 fn debug_identity_field(identity: &Option<String>) -> Option<&str> {
     identity.as_ref().map(|value| {
-        if is_nostr_secret(value) {
+        if crate::is_nostr_secret(value) {
             "**redacted**"
         } else {
             value.as_str()
@@ -4375,15 +4372,15 @@ fn validate_account_setup_request(
     operation: AccountSetupOperation,
 ) -> Result<(), AppError> {
     if let Some(identity) = request.identity.as_deref()
-        && is_nostr_secret(identity)
+        && crate::is_nostr_secret(identity)
     {
-        return Err(AppError::InvalidPublicKey);
+        return Err(AppError::UnexpectedPrivateKey);
     }
 
     match operation {
         AccountSetupOperation::CreateIdentityOnly | AccountSetupOperation::Login => {
             if request.import_nsec.is_some() {
-                return Err(AppError::InvalidPublicKey);
+                return Err(AppError::UnexpectedPrivateKey);
             }
         }
         AccountSetupOperation::CreateOrImport => {}
@@ -4395,7 +4392,7 @@ fn validate_account_setup_request(
         let from_identity = AccountHome::account_id_for_public_key(identity)?;
         let from_secret = AccountHome::account_id_for_secret(nsec)?;
         if from_identity != from_secret {
-            return Err(AppError::InvalidPublicKey);
+            return Err(AppError::IdentityKeyMismatch);
         }
     }
 

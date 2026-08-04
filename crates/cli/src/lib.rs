@@ -12,6 +12,7 @@ use cgka_traits::app_event::{
 };
 use clap::Parser;
 use marmot_account::{AccountHome, DEFAULT_KEYCHAIN_SERVICE_NAME};
+pub(crate) use marmot_app::is_nostr_secret;
 use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
     StreamStartView, UserProfileMetadata, tag_value,
@@ -980,10 +981,6 @@ pub(crate) fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<S
         .flatten()
         .and_then(|entry| entry.profile);
     profile_display_name(profile.as_ref())
-}
-
-pub(crate) fn is_nostr_secret(value: &str) -> bool {
-    value.starts_with("nsec")
 }
 
 fn resolve_relay(relay: Option<String>) -> Result<Option<String>, WnError> {
@@ -2330,6 +2327,18 @@ mod tests {
                 timestamp_flag: "--before",
                 message_id_flag: "--before-message-id",
             }
+        ));
+    }
+
+    #[test]
+    fn uppercase_nsec_argv_rejected_at_early_identity_gate() {
+        let identity =
+            Some("NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99".to_owned());
+        let err = super::validate_materialized_secret_identity("login", &identity, false)
+            .expect_err("uppercase nsec argv must be rejected before daemon/json materialization");
+        assert!(matches!(
+            err,
+            WnError::SecretArgumentRejected { command: "login" }
         ));
     }
 

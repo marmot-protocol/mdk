@@ -913,7 +913,37 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
 }
 
 #[tokio::test]
-async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
+async fn send_execute_connect_failure_recovers_cli_and_import_nsec() {
+    use crate::daemon::protocol::send_execute;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket = temp.path().join("missing.sock");
+    let mut cli = daemon_test_cli(crate::Command::Login {
+        identity: None,
+        nsec_stdin: true,
+        relay: Some("wss://relay.example".to_owned()),
+    });
+    cli.json = true;
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let import_nsec = Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
+        nsec.to_owned(),
+    )));
+
+    let recover = send_execute(&socket, cli, import_nsec)
+        .await
+        .expect_err("connect to missing socket must be recoverable");
+
+    assert!(matches!(recover.err, DaemonClientError::Connect { .. }));
+    assert!(recover.cli.json);
+    let recovered = recover
+        .import_nsec
+        .expect("import_nsec sidecar")
+        .into_inner();
+    assert_eq!(recovered.as_str(), nsec);
+}
+
+#[tokio::test]
+async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar() {
     let defaults = DaemonDefaults {
         home: PathBuf::from("/tmp/wn-daemon-home-nsec-fallback"),
         socket: PathBuf::from("/tmp/wn-daemon-nsec-fallback.sock"),
@@ -921,7 +951,7 @@ async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
         log_path: PathBuf::from("/tmp/wn-daemon-nsec-fallback.log"),
         relay: None,
         discovery_relays: Vec::new(),
-        default_account_relays: vec!["wss://relay.example".to_owned()],
+        default_account_relays: vec!["not-a-valid-relay-url".to_owned()],
         secret_store: Some(crate::SecretStoreKind::File),
         keychain_service: Some("daemon-keychain".to_owned()),
     };
@@ -931,8 +961,9 @@ async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
         relay: Some("wss://relay.example".to_owned()),
     });
     apply_defaults(&mut cli, &defaults);
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
     let mut import_nsec = Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
-        "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
+        nsec.to_owned(),
     )));
 
     let output = handle_app_runtime_account_setup_request(
@@ -949,11 +980,14 @@ async fn relayless_hosted_setup_fallback_preserves_import_nsec_sidecar() {
     )
     .await;
 
-    assert!(output.is_none());
     assert!(
-        import_nsec.is_some(),
-        "local fallback must retain ownership of the nsec sidecar"
+        output.is_none(),
+        "disabled app runtime must fall through before relay validation"
     );
+    let retained = import_nsec
+        .expect("local fallback must retain the nsec sidecar when hosting is disabled")
+        .into_inner();
+    assert_eq!(retained.as_str(), nsec);
 }
 
 #[test]

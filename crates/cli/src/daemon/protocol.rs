@@ -229,63 +229,18 @@ pub(crate) async fn send_execute(
         cli: Box::new(cli),
         import_nsec,
     };
-    match send_owned_daemon_request(socket, request).await {
+    match send_request(socket, &request).await {
         Ok(output) => Ok(output),
-        Err((err, request)) => {
-            let (cli, import_nsec) = take_execute_request(request);
+        Err(err) => {
+            let DaemonRequest::Execute { cli, import_nsec } = request else {
+                unreachable!("send_execute only constructs Execute requests")
+            };
             Err(RecoverableDaemonExecute {
                 err,
-                cli,
+                cli: *cli,
                 import_nsec,
             })
         }
-    }
-}
-
-fn take_execute_request(request: DaemonRequest) -> (Cli, Option<crate::secret::ImportNsec>) {
-    match request {
-        DaemonRequest::Execute { cli, import_nsec } => (*cli, import_nsec),
-        _ => panic!("expected Execute daemon request"),
-    }
-}
-
-async fn send_owned_daemon_request(
-    socket: &Path,
-    request: DaemonRequest,
-) -> Result<CliOutput, (DaemonClientError, DaemonRequest)> {
-    let bytes = match encode_daemon_request(&request) {
-        Ok(bytes) => bytes,
-        Err(err) => return Err((err, request)),
-    };
-    let mut stream = match UnixStream::connect(socket).await {
-        Ok(stream) => stream,
-        Err(source) => {
-            return Err((
-                DaemonClientError::Connect {
-                    socket: socket.to_owned(),
-                    source,
-                },
-                request,
-            ));
-        }
-    };
-    if let Err(source) = stream.write_all(&bytes).await {
-        return Err((DaemonClientError::Io(source), request));
-    }
-    if let Err(source) = stream.shutdown().await {
-        return Err((DaemonClientError::Io(source), request));
-    }
-
-    let mut response = Zeroizing::new(Vec::new());
-    if let Err(source) = stream.read_to_end(&mut response).await {
-        return Err((DaemonClientError::Io(source), request));
-    }
-    if response.is_empty() {
-        return Err((DaemonClientError::EmptyResponse, request));
-    }
-    match decode_daemon_output(&response) {
-        Ok(output) => Ok(output),
-        Err(err) => Err((err, request)),
     }
 }
 
@@ -452,6 +407,9 @@ pub(crate) async fn read_daemon_request(
     // never sends a newline cannot make us buffer unbounded memory before the
     // size check runs (read_until on a Take adapter stops silently at the limit
     // instead of erroring). Mirrors agent-control's `read_frame`.
+    //
+    // `BufReader` may retain read-ahead bytes outside this `Zeroizing` buffer;
+    // only the assembled frame payload is wiped on drop.
     let limit = (MAX_DAEMON_REQUEST_BYTES + 1) as u64;
     let read = {
         let mut reader = BufReader::new(&mut *stream).take(limit);
@@ -544,6 +502,10 @@ pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {
 /// `read_daemon_request` / `MAX_DAEMON_REQUEST_BYTES`); checking client-side
 /// turns an oversized request (e.g. `messages send` with a huge body) into a
 /// clear local error instead of a connection the daemon must reject.
+///
+/// The returned buffer is zeroized on drop. `serde_json::to_vec` and the
+/// trailing `push` may leave transient copies in freed heap memory; this does
+/// not wipe every intermediate allocation.
 pub(crate) fn encode_daemon_request(
     request: &DaemonRequest,
 ) -> Result<Zeroizing<Vec<u8>>, DaemonClientError> {

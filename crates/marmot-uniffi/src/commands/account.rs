@@ -135,7 +135,7 @@ impl Marmot {
         default_relays: Vec<String>,
         bootstrap_relays: Vec<String>,
     ) -> Result<AccountSummaryFfi, MarmotKitError> {
-        let (public_identity, import_nsec) = if identity.starts_with("nsec") {
+        let (public_identity, import_nsec) = if marmot_app::is_nostr_secret(&identity) {
             (None, Some(Zeroizing::new(identity)))
         } else {
             (Some(identity), None)

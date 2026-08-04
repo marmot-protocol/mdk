@@ -924,7 +924,7 @@ async fn connector_socket_subscribes_to_inbound_messages() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -1741,7 +1741,7 @@ async fn connector_policy_accepts_allowed_welcomer() {
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -1808,7 +1808,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -1866,7 +1866,7 @@ async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer(
         ..AccountSetupRequest::default()
     };
     let agent = agent_setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = human_runtime.create_identity(setup).await.unwrap();
@@ -2319,7 +2319,7 @@ async fn connector_socket_sends_final_message() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -2391,7 +2391,7 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -2626,7 +2626,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -2793,7 +2793,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -3002,7 +3002,7 @@ async fn connector_socket_cancels_stream_session() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -3247,7 +3247,7 @@ async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInvit
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -3858,7 +3858,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
@@ -4181,7 +4181,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
         ..AccountSetupRequest::default()
     };
     let agent = setup_runtime
-        .create_identity(setup.fresh_attempt())
+        .create_identity(setup.relay_options_only())
         .await
         .unwrap();
     let human = setup_runtime.create_identity(setup).await.unwrap();
