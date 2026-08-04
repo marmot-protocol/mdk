@@ -1016,8 +1016,9 @@ that scaling the existing corpus is sufficient.
 Four versioned lane manifests are the single reviewed policy source for intended contents and limits. The nightly and
 weekly entry points run only existing named targets, and selected-container filtering fails instead of silently passing
 when it matches no test. Scheduled runs inherit the source revision's mandatory PR formal gate instead of rerunning the
-same symbolic proof. Incident-corpus execution remains false until the failure-corpus slice lands. The conservative
-minimum case counts are liveness floors preventing empty evidence, not attestations that every declared capability ran.
+same symbolic proof. The failure-corpus validation recipe is now an explicit PR and scheduled-lane dependency, and the
+conservative minimum case counts are liveness floors preventing empty evidence, not attestations that every declared
+capability ran.
 
 The typed evaluator rejects zero-case observations, inconsistent flaky-case counts, work below the lane minimum, and
 wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. It is not yet fed by a workflow-owned
@@ -1030,11 +1031,19 @@ automatic correctness attestation.
 
 ### 6.4 Failure corpus lifecycle
 
-- [ ] Automatically save failing seeds/capsules.
-- [ ] Minimize semantically, not only by generic step removal.
-- [ ] Classify product defect, protocol ambiguity, environment failure, or expected resource refusal.
-- [ ] Promote stable synthetic regressions into vectors.
-- [ ] Track recurrence and time-to-diagnosis.
+- [x] Automatically save failing seeds/capsules.
+- [x] Minimize semantically, not only by generic step removal.
+- [x] Classify product defect, protocol ambiguity, environment failure, or expected resource refusal.
+- [x] Promote stable synthetic regressions into vectors.
+- [x] Track recurrence and time-to-diagnosis.
+
+Simulator failures write portable and optional sensitive replay capsules; process-node capsules and distributed-run
+failures can be added to the same private versioned corpus. The index retains seeds, adapters, build matrices,
+recurrence, minimum diagnosis time, reduction candidates, and promoted vector paths without copying raw error text.
+The reducer now treats paired transport, partition, lifecycle, and storage actions as dependency units before removing
+independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
+the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
+restricted to synthetic shareable capsules with portable expectations.
 
 ### Milestone 6 Exit Gate
 
@@ -1164,6 +1173,7 @@ incorrect result.
 | 2026-08-05 | 6.2 container and VM execution | Split the container-first distributed runner, barrier-bound faults, mixed-image participants, real OCI smoke coverage, and capability-gated external VM-driver boundary out of the larger assurance branch without carrying production convergence changes or a #1236 outcome assumption | [MDK #1270](https://github.com/marmot-protocol/mdk/pull/1270); `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 | 2026-08-05 | E9 outbound retention bound | Bounded the per-group durable outbound-intent retention queue at its single insertion point, covering every path that retains — the locally staged publication path, the pre-existing stable-but-unsettled path, and the offline outbox — the over-cap send is refused with a typed non-transient `EngineError` surfaced as a distinct FFI variant, and already-retained intents still drain and reclaim capacity once a publish is accepted | `cargo test -p cgka-engine --features test-policy-overrides --test publish_lifecycle`; `cargo test -p cgka-traits`; `cargo test -p cgka-conformance-simulator --test protocol_decision_gate`; `cargo test -p marmot-uniffi`; `just convergence-ledger-gate` |
 | 2026-08-06 | 6.3 lane policy and evidence foundations | Added single-source PR, nightly, weekly/manual, and release-hardening policy manifests; fail-closed standalone wall/CPU/RSS/disk/artifact/retention/flake evaluation; nonempty byte-verified evidence artifacts; and scheduled entry points without claiming workflow-owned measurement or incident-corpus execution yet | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
+| 2026-08-05 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis as a separate layer over the campaign runner | `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
 
 ## Post-Milestone 6 Cleanup
 

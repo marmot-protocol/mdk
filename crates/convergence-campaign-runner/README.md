@@ -40,6 +40,13 @@ driver receives the normalized, versioned ownership record for the exact run.
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
 
+Failed distributed executions append a privacy-safe entry to the private
+`failure-corpus.v1.json` in the campaign output directory. `index-capsule` and
+`index-node-capsule` add simulator or process failures, `classify-failure`
+applies the reviewed four-way disposition, `diagnose-failure` records
+time-to-diagnosis and vector promotion, and `promote-capsule` creates a fixed
+vector candidate from synthetic shareable evidence.
+
 The operator contract, backend boundary, artifact posture, and real-container
 verification commands live in
 [`docs/marmot-architecture/distributed-convergence-campaigns.md`](../../docs/marmot-architecture/distributed-convergence-campaigns.md).

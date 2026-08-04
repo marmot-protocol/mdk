@@ -14,7 +14,7 @@
     "resource_sweeps": false,
     "constant_sweeps": false,
     "mixed_version": false,
-    "incident_corpus": false
+    "incident_corpus": true
   },
   "budgets": {
     "max_wall_clock_seconds": 3600,
