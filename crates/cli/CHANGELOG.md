@@ -65,6 +65,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   dropped on the send path, so storage showed the new state while live
   subscribers were never notified.
 
+### Security
+
+- NIP-49 encrypted private-key export now zeroizes its normalized passphrase,
+  scrypt-derived key, cipher-owned key copy, and plaintext decrypt buffer on
+  success and error paths.
+
 ### Changed
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
