@@ -982,7 +982,27 @@ impl ProcessOrchestrator {
                 );
                 Ok(application_message_id)
             }
-            Ok(body) => Err((Some(sender.into()), unexpected_response(body))),
+            Ok(body) => {
+                // The scenario input ledger must remain total even when a
+                // node violates the response protocol. Probes and failure
+                // capsules join inputs by action id after execution, so an
+                // omitted record here would turn the original protocol error
+                // into an unrelated indexing panic.
+                self.application_inputs.insert(
+                    action_id.into(),
+                    ProcessInputRecord {
+                        action_id: action_id.into(),
+                        sender: sender.into(),
+                        payload: payload.into(),
+                        logical_id: None,
+                        origin_branch_id: None,
+                        origin_branch_unknown: false,
+                        published: 0,
+                        failed: true,
+                    },
+                );
+                Err((Some(sender.into()), unexpected_response(body)))
+            }
             Err(error) => {
                 self.application_inputs.insert(
                     action_id.into(),

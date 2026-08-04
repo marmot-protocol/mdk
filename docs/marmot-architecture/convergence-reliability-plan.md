@@ -965,7 +965,7 @@ models prove the rules represented in those models, while campaigns test the imp
 under observation. Neither substitutes for checking that every production decision route is represented.
 
 [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) demonstrated the missing dimension this milestone must
-close: the same same-epoch conflict could be routed through pairwise fork recovery on a committing member and
+close: the same-epoch conflict could be routed through pairwise fork recovery on a committing member and
 distributed convergence on an observing member, with the two seams applying different winner rules. A real-relay,
 four-VM soak found equal terminal epochs on incompatible cryptographic lineages. The existing bounded reference model
 represented one canonical selector but did not represent that route asymmetry. Milestone 6 therefore treats

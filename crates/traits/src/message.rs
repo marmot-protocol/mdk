@@ -26,6 +26,11 @@ pub struct OwnCommitConvergenceStamp {
     /// eligible for the anchor-rollforward fast path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_group_context_sha256: Option<String>,
+    /// SHA-256 of the confirmed GroupContext after this commit merged. The
+    /// retained-anchor fast path validates the epoch-only snapshot against
+    /// this value before treating it as this commit's post-merge state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_group_context_sha256: Option<String>,
     /// This device's member identity — the authenticated committer of the
     /// stored commit.
     pub committer: MemberId,

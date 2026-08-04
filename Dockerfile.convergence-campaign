@@ -14,9 +14,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
-# Campaign-only image. NET_ADMIN is granted per run, never baked into a
-# production service. The tools below implement explicit network and disk
-# fault actions from the versioned distributed manifest.
+# Campaign-only image. NET_ADMIN is granted only to short-lived fault-injector
+# containers, never participant processes or a production service. The tools
+# below implement explicit network and disk fault actions from the versioned
+# distributed manifest.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \

@@ -555,7 +555,7 @@ impl<S: StorageProvider> Engine<S> {
     /// transport order. Authentication still happens during branch
     /// materialization before the candidate can contribute witness weight.
     pub(crate) fn admit_app_witness_to_active_pass_with_time(
-        &self,
+        &mut self,
         group_id: &GroupId,
         message_id: &MessageId,
         now: ConvergenceTime,
@@ -598,6 +598,12 @@ impl<S: StorageProvider> Engine<S> {
         let (admission, _opened) =
             self.admit_stored_message_to_convergence_pass(group_id, message_id, now)?;
         if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
+            let epoch = self
+                .storage
+                .get_group(group_id)
+                .map_err(storage_projection_error)?
+                .epoch;
+            self.mark_group_unrecoverable_for_frozen_pass(group_id, epoch)?;
             return Err(OpenMlsProjectionError::Replay(
                 "frozen convergence pass failed integrity verification".into(),
             ));

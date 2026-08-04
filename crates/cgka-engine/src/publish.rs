@@ -167,6 +167,13 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
+                    own_commit_stamp
+                        .as_mut()
+                        .expect("pending commit produced a stamp")
+                        .resulting_group_context_sha256 =
+                        Some(crate::openmls_projection::confirmed_group_context_sha256(
+                            storage, &group_id,
+                        )?);
                 }
 
                 // Now the MLS group is at the new epoch. Mirror the Marmot

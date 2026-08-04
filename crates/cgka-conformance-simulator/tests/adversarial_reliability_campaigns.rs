@@ -53,28 +53,55 @@ async fn assert_case(
     let report = run_generated_case_report(case, None)
         .await
         .unwrap_or_else(|error| panic!("{}: {error}", case.family_name));
-    let pending_inputs = report
+    assert_report_has_no_failures(&case.family_name, &report);
+    report
+}
+
+fn assert_report_has_no_failures(
+    case_name: &str,
+    report: &cgka_conformance_simulator::ScenarioReport,
+) {
+    let pending_input_count = report
         .observed_trace
         .as_ref()
         .into_iter()
         .flat_map(|trace| &trace.observations)
         .flat_map(|observation| &observation.scenario_input_ledger)
         .filter(|entry| entry.pending)
+        .count();
+    let expectation_kinds = report
+        .expectation_failures
+        .iter()
+        .map(|failure| failure.kind.as_str())
+        .collect::<Vec<_>>();
+    let invariant_kinds = report
+        .invariant_failures
+        .iter()
+        .map(|failure| failure.kind.as_str())
+        .collect::<Vec<_>>();
+    let failed_steps = report
+        .step_log
+        .iter()
+        .filter_map(|step| match &step.status {
+            cgka_conformance_simulator::ScenarioStepStatus::Completed => None,
+            cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, category, .. } => {
+                Some((
+                    step.step_index,
+                    step.step_type.as_str(),
+                    kind.as_str(),
+                    category,
+                ))
+            }
+        })
         .collect::<Vec<_>>();
     assert!(
         report.expectation_failures.is_empty(),
-        "{} expectation failures: {:#?}; pending inputs: {pending_inputs:#?}; steps: {:#?}",
-        case.family_name,
-        report.expectation_failures,
-        report.step_log
+        "{case_name} expectation failure kinds: {expectation_kinds:#?}; pending input count: {pending_input_count}; failed step metadata: {failed_steps:#?}"
     );
     assert!(
         report.invariant_failures.is_empty(),
-        "{} invariant failures: {:#?}",
-        case.family_name,
-        report.invariant_failures
+        "{case_name} invariant failure kinds: {invariant_kinds:#?}; failed step metadata: {failed_steps:#?}"
     );
-    report
 }
 
 #[tokio::test]
@@ -128,16 +155,7 @@ async fn sustained_mixed_traffic_runs_as_a_small_regression() {
     let report = run_generated_case_report(&case, None)
         .await
         .expect("sustained regression runs");
-    assert!(
-        report.expectation_failures.is_empty(),
-        "{:#?}",
-        report.expectation_failures
-    );
-    assert!(
-        report.invariant_failures.is_empty(),
-        "{:#?}",
-        report.invariant_failures
-    );
+    assert_report_has_no_failures(&case.family_name, &report);
 }
 
 #[ignore = "multi-round sustained campaign; run explicitly"]
@@ -224,24 +242,7 @@ async fn full_engine_witness_ab_pair_can_select_different_canonical_branches() {
     .expect("witness-disabled run");
 
     for report in [&standard_report, &disabled_report] {
-        let pending_inputs = report
-            .observed_trace
-            .as_ref()
-            .into_iter()
-            .flat_map(|trace| &trace.observations)
-            .flat_map(|observation| &observation.scenario_input_ledger)
-            .filter(|entry| entry.pending)
-            .collect::<Vec<_>>();
-        assert!(
-            report.expectation_failures.is_empty(),
-            "failures={:#?}; pending={pending_inputs:#?}",
-            report.expectation_failures
-        );
-        assert!(
-            report.invariant_failures.is_empty(),
-            "{:#?}",
-            report.invariant_failures
-        );
+        assert_report_has_no_failures("full-engine-witness-ab", report);
     }
     let selected_state = |report: &cgka_conformance_simulator::ScenarioReport| {
         report

@@ -788,8 +788,11 @@ impl<S: StorageProvider> Engine<S> {
             // branch otherwise reaches `process_message` on the wrong secret
             // tree and surfaces an AeadError that aborts the whole drain.
             if recovered_from_candidate_branch {
-                let now = candidate_admission_time
-                    .expect("candidate contexts are only attempted with a pinned admission time");
+                let Some(now) = candidate_admission_time else {
+                    return Err(EngineError::Backend(
+                        "candidate-branch recovery requires a pinned admission time".into(),
+                    ));
+                };
                 self.buffer_openmls_convergence_message_with_time(
                     &group_id,
                     openmls_msg.clone(),

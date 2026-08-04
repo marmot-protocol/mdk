@@ -725,6 +725,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<bool, EngineError> {
+        let now = crate::convergence_clock::ConvergenceTime {
+            monotonic_ms: now_ms,
+            wall_ms: self.convergence_now().wall_ms,
+        };
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
                 // Discover everything decryptable under retained live and
@@ -745,19 +749,13 @@ impl<S: StorageProvider> Engine<S> {
                         })?
                         .is_some_and(|group| group.is_active());
                 if openmls_group_active {
-                    let _ = self.retry_deferred_peels(group_id).await?;
+                    let _ = self.retry_deferred_peels_with_time(group_id, now).await?;
                     if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                         return Ok(true);
                     }
                 }
                 let result = self
-                    .converge_stored_openmls_messages_with_time(
-                        group_id,
-                        crate::convergence_clock::ConvergenceTime {
-                            monotonic_ms: now_ms,
-                            wall_ms: self.convergence_now().wall_ms,
-                        },
-                    )
+                    .converge_stored_openmls_messages_with_time(group_id, now)
                     .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
                 if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled
                 {
@@ -768,14 +766,14 @@ impl<S: StorageProvider> Engine<S> {
                 // Retry one deferred-peel sweep first so newly available
                 // canonical context is visible. Application sends do not own
                 // this reservation and must finish catch-up before publishing.
-                let _ = self.retry_deferred_peels(group_id).await?;
+                let _ = self.retry_deferred_peels_with_time(group_id, now).await?;
                 if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                     return Ok(true);
                 }
                 continue;
             }
 
-            if self.retry_deferred_peels(group_id).await? == 0 {
+            if self.retry_deferred_peels_with_time(group_id, now).await? == 0 {
                 return Ok(!self.has_unresolved_convergence_inputs(group_id)?);
             }
         }
@@ -954,6 +952,15 @@ impl<S: StorageProvider> Engine<S> {
     ///   attempted per sweep (cursor resumes next pass) so a large historical
     ///   backlog never starves current-event processing.
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
+        let now = self.convergence_now();
+        self.retry_deferred_peels_with_time(group_id, now).await
+    }
+
+    async fn retry_deferred_peels_with_time(
+        &mut self,
+        group_id: &GroupId,
+        now: crate::convergence_clock::ConvergenceTime,
+    ) -> Result<usize, EngineError> {
         // A quarantined group has no epoch_manager entry, so the Stable gate
         // below would fall through and re-ingest its retained rows against
         // the very state validation rejected (mdk#364). The rows replay
@@ -967,7 +974,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(0);
         }
 
-        let now = self.convergence_now();
         let mut deferred: Vec<_> = self
             .storage
             .list_messages(group_id, EpochId(0))?
@@ -1260,6 +1266,14 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<[u8; 32], EngineError> {
         let epoch = self.epoch_manager.epoch(group_id).unwrap_or_default();
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
+        let retained_floor = EpochId(
+            epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
         let mut names: Vec<String> = self
             .available_past_peel_snapshots(group_id)?
             .into_iter()
@@ -1275,7 +1289,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let mut candidate_rows = self
             .storage
-            .list_messages(group_id, EpochId(0))?
+            .list_messages(group_id, retained_floor)?
             .into_iter()
             .filter(|record| {
                 matches!(

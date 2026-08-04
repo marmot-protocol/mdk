@@ -33,6 +33,7 @@ expression: payload
     },
     "stamp": {
       "parent_group_context_sha256": "abcd",
+      "resulting_group_context_sha256": "ef01",
       "committer": [
         238,
         238,

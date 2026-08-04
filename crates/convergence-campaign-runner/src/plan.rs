@@ -154,7 +154,12 @@ fn container_plan(
         fault_commands
             .entry(fault.at_barrier.clone())
             .or_default()
-            .extend(container_fault_commands(runtime, &relay, &fault.action));
+            .extend(container_fault_commands(
+                runtime,
+                &relay,
+                &container.default_participant_image,
+                &fault.action,
+            ));
     }
     let cleanup = vec![
         PlannedCommandV1::idempotent(
@@ -208,8 +213,6 @@ pub fn container_node_launch(
                 "{run_token}-{participant}".into(),
                 "--network".into(),
                 network.clone(),
-                "--cap-add".into(),
-                "NET_ADMIN".into(),
                 "--mount".into(),
                 "type=bind,src={host_run_root},dst={child_run_root}".into(),
                 image.clone(),
@@ -234,6 +237,7 @@ pub fn container_node_launch(
 fn container_fault_commands(
     runtime: &str,
     relay: &str,
+    fault_injector_image: &str,
     fault: &DistributedFaultV1,
 ) -> Vec<PlannedCommandV1> {
     match fault {
@@ -243,49 +247,49 @@ fn container_fault_commands(
             let chain = partition_chain(participant, &peer);
             let peer_set = partition_set(participant, &peer);
             vec![
-                PlannedCommandV1::idempotent(
-                    "create_network_partition_peer_set",
+                network_exec_idempotent(
                     runtime,
+                    fault_injector_image,
+                    container.clone(),
+                    "create_network_partition_peer_set",
                     vec![
-                        "exec".into(),
-                        container.clone(),
                         "ipset".into(),
                         "create".into(),
                         peer_set.clone(),
                         "hash:ip".into(),
                     ],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "reset_network_partition_peer_set",
                     vec!["ipset".into(), "flush".into(), peer_set.clone()],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "record_network_partition_peer_address",
                     vec!["ipset".into(), "add".into(), peer_set.clone(), peer],
                 ),
-                PlannedCommandV1::idempotent(
+                network_exec_idempotent(
+                    runtime,
+                    fault_injector_image,
+                    container.clone(),
                     "create_network_partition_chain",
-                    runtime,
-                    vec![
-                        "exec".into(),
-                        container.clone(),
-                        "iptables".into(),
-                        "-N".into(),
-                        chain.clone(),
-                    ],
+                    vec!["iptables".into(), "-N".into(), chain.clone()],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "reset_network_partition_chain",
                     vec!["iptables".into(), "-F".into(), chain.clone()],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "partition_network_inbound",
                     vec![
@@ -301,8 +305,9 @@ fn container_fault_commands(
                         "REJECT".into(),
                     ],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "partition_network_outbound",
                     vec![
@@ -318,8 +323,9 @@ fn container_fault_commands(
                         "REJECT".into(),
                     ],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container.clone(),
                     "activate_inbound_partition",
                     vec![
@@ -330,8 +336,9 @@ fn container_fault_commands(
                         chain.clone(),
                     ],
                 ),
-                exec(
+                network_exec(
                     runtime,
+                    fault_injector_image,
                     container,
                     "activate_outbound_partition",
                     vec![
@@ -352,12 +359,12 @@ fn container_fault_commands(
             ["INPUT", "OUTPUT"]
                 .into_iter()
                 .map(|direction| {
-                    PlannedCommandV1::idempotent(
-                        format!("heal_{}_network_partition", direction.to_ascii_lowercase()),
+                    network_exec_idempotent(
                         runtime,
+                        fault_injector_image,
+                        container.clone(),
+                        format!("heal_{}_network_partition", direction.to_ascii_lowercase()),
                         vec![
-                            "exec".into(),
-                            container.clone(),
                             "iptables".into(),
                             "-D".into(),
                             direction.into(),
@@ -367,38 +374,26 @@ fn container_fault_commands(
                     )
                 })
                 .chain([
-                    PlannedCommandV1::idempotent(
+                    network_exec_idempotent(
+                        runtime,
+                        fault_injector_image,
+                        container.clone(),
                         "flush_network_partition_chain",
-                        runtime,
-                        vec![
-                            "exec".into(),
-                            container.clone(),
-                            "iptables".into(),
-                            "-F".into(),
-                            chain.clone(),
-                        ],
+                        vec!["iptables".into(), "-F".into(), chain.clone()],
                     ),
-                    PlannedCommandV1::idempotent(
+                    network_exec_idempotent(
+                        runtime,
+                        fault_injector_image,
+                        container.clone(),
                         "remove_network_partition_chain",
-                        runtime,
-                        vec![
-                            "exec".into(),
-                            container.clone(),
-                            "iptables".into(),
-                            "-X".into(),
-                            chain.clone(),
-                        ],
+                        vec!["iptables".into(), "-X".into(), chain.clone()],
                     ),
-                    PlannedCommandV1::idempotent(
-                        "remove_network_partition_peer_set",
+                    network_exec_idempotent(
                         runtime,
-                        vec![
-                            "exec".into(),
-                            container.clone(),
-                            "ipset".into(),
-                            "destroy".into(),
-                            peer_set,
-                        ],
+                        fault_injector_image,
+                        container.clone(),
+                        "remove_network_partition_peer_set",
+                        vec!["ipset".into(), "destroy".into(), peer_set],
                     ),
                 ])
                 .collect()
@@ -409,8 +404,9 @@ fn container_fault_commands(
             jitter_ms,
             loss_basis_points,
             bandwidth_kbit,
-        } => vec![exec(
+        } => vec![network_exec(
             runtime,
+            fault_injector_image,
             participant_container(participant),
             "shape_network",
             vec![
@@ -430,12 +426,12 @@ fn container_fault_commands(
                 format!("{bandwidth_kbit}kbit"),
             ],
         )],
-        DistributedFaultV1::NetworkReset { participant } => vec![PlannedCommandV1::idempotent(
-            "reset_network_shape",
+        DistributedFaultV1::NetworkReset { participant } => vec![network_exec_idempotent(
             runtime,
+            fault_injector_image,
+            participant_container(participant),
+            "reset_network_shape",
             vec![
-                "exec".into(),
-                participant_container(participant),
                 "tc".into(),
                 "qdisc".into(),
                 "del".into(),
@@ -521,6 +517,49 @@ fn exec(runtime: &str, container: String, purpose: &str, command: Vec<String>) -
         runtime,
         [vec!["exec".into(), container], command].concat(),
     )
+}
+
+/// Run a network mutation from a short-lived, capability-scoped container
+/// sharing the participant's network namespace. Participant processes remain
+/// unprivileged; only this dedicated injector receives `NET_ADMIN`.
+fn network_exec(
+    runtime: &str,
+    image: &str,
+    participant_container: String,
+    purpose: impl Into<String>,
+    command: Vec<String>,
+) -> PlannedCommandV1 {
+    PlannedCommandV1::exact(
+        purpose,
+        runtime,
+        [
+            vec![
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                format!("container:{participant_container}"),
+                "--cap-drop".into(),
+                "ALL".into(),
+                "--cap-add".into(),
+                "NET_ADMIN".into(),
+                image.into(),
+            ],
+            command,
+        ]
+        .concat(),
+    )
+}
+
+fn network_exec_idempotent(
+    runtime: &str,
+    image: &str,
+    participant_container: String,
+    purpose: impl Into<String>,
+    command: Vec<String>,
+) -> PlannedCommandV1 {
+    let mut planned = network_exec(runtime, image, participant_container, purpose, command);
+    planned.success_exit_codes = vec![0, 1, 2];
+    planned
 }
 
 fn participant_container(participant: &str) -> String {

@@ -470,6 +470,7 @@ pub(crate) fn own_commit_stamp(
     consumed_proposal_refs.dedup();
     Ok(cgka_traits::message::OwnCommitConvergenceStamp {
         parent_group_context_sha256: Some(parent_group_context_sha256),
+        resulting_group_context_sha256: None,
         committer,
         priority,
         consumed_proposal_refs,
@@ -509,6 +510,13 @@ fn own_commit_stamp_parent_matches(
     current_group_context_sha256: &str,
 ) -> bool {
     stamp.parent_group_context_sha256.as_deref() == Some(current_group_context_sha256)
+}
+
+fn own_commit_stamp_result_matches(
+    stamp: &cgka_traits::message::OwnCommitConvergenceStamp,
+    resulting_group_context_sha256: &str,
+) -> bool {
+    stamp.resulting_group_context_sha256.as_deref() == Some(resulting_group_context_sha256)
 }
 
 /// Give retained proposal rows the same terminal disposition when a local
@@ -2112,9 +2120,33 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
     result: &CanonicalizationResult,
     applied_prefix: &BTreeSet<String>,
 ) -> Result<AnchorRealizableOwnPrefix, OpenMlsProjectionError> {
+    anchor_realizable_own_commit_prefix_with(
+        storage,
+        group_id,
+        result,
+        applied_prefix,
+        retained_anchor_matches_own_commit_stamp,
+    )
+}
+
+fn anchor_realizable_own_commit_prefix_with<S, F>(
+    storage: &S,
+    group_id: &GroupId,
+    result: &CanonicalizationResult,
+    applied_prefix: &BTreeSet<String>,
+    mut anchor_matches: F,
+) -> Result<AnchorRealizableOwnPrefix, OpenMlsProjectionError>
+where
+    S: StorageProvider,
+    F: FnMut(
+        &S,
+        &GroupId,
+        u64,
+        &cgka_traits::message::OwnCommitConvergenceStamp,
+    ) -> Result<bool, OpenMlsProjectionError>,
+{
     let mut prefix = AnchorRealizableOwnPrefix::default();
     let mut snapshots: Option<Vec<String>> = None;
-    let mut own_stamped_commit_ids_by_source_epoch: Option<BTreeMap<u64, Vec<Vec<u8>>>> = None;
     for commit_id in result
         .accepted_commits
         .iter()
@@ -2129,9 +2161,9 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             break;
         };
-        if payload.own_commit_stamp().is_none() {
+        let Some(stamp) = payload.own_commit_stamp() else {
             break;
-        }
+        };
         let resulting_epoch = record.epoch.0.saturating_add(1);
         if snapshots.is_none() {
             snapshots = Some(
@@ -2146,34 +2178,10 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
         if !retained {
             break;
         }
-        // Retained anchors are keyed by resulting epoch ALONE
-        // (`openmls-retained-anchor-<epoch>`) and `create_group_snapshot`
-        // replaces a same-named snapshot. So a name match does not prove the
-        // anchor holds THIS commit's post-merge state: if a second own commit
-        // was later confirmed at the same resulting epoch — e.g. on the branch
-        // that displaced this one — its confirm overwrote the anchor, and
-        // rewinding here would install the wrong state while skipping replay.
-        // Re-keying the anchor scheme is out of scope (it is shared with the
-        // convergence engine), so resolve the ambiguity conservatively: when
-        // more than one own confirm-stamped commit row could have produced an
-        // anchor at this resulting epoch, refuse the fast path and end the
-        // run. The commit then replays normally, which fails closed and lets
-        // convergence prune. A missed fast path is far cheaper than a wrong
-        // rewind.
-        if own_stamped_commit_ids_by_source_epoch.is_none() {
-            own_stamped_commit_ids_by_source_epoch = Some(
-                own_stamped_commit_ids_by_source_epoch_map(storage, group_id)?,
-            );
-        }
-        let ambiguous_anchor_lineage =
-            own_stamped_commit_ids_by_source_epoch
-                .as_ref()
-                .is_some_and(|by_source_epoch| {
-                    by_source_epoch.get(&record.epoch.0).is_some_and(|ids| {
-                        ids.iter().any(|id| id.as_slice() != message_id.as_slice())
-                    })
-                });
-        if ambiguous_anchor_lineage {
+        // Snapshot names are epoch-only and later local or peer applies can
+        // replace them. Validate the actual retained GroupContext against the
+        // confirm-time post-merge digest before skipping MLS replay.
+        if !anchor_matches(storage, group_id, resulting_epoch, stamp)? {
             break;
         }
         prefix.commit_ids.insert(commit_id.clone());
@@ -2182,33 +2190,29 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
     Ok(prefix)
 }
 
-/// Every stored own confirm-stamped commit row for the group, indexed by the
-/// row's source epoch (its resulting epoch minus one — the key a retained
-/// anchor is named after). Used to detect anchor-lineage ambiguity in
-/// [`anchor_realizable_own_commit_prefix`]. Rows are counted regardless of
-/// state: the retained anchor is written at CONFIRM time, so even a row that
-/// convergence later parked or invalidated may have overwritten it.
-fn own_stamped_commit_ids_by_source_epoch_map<S: StorageProvider>(
+fn retained_anchor_matches_own_commit_stamp<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
-) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, OpenMlsProjectionError> {
-    let mut by_source_epoch: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
-    let records = storage
-        .list_messages(group_id, EpochId(0))
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    for record in records {
-        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-            continue;
-        };
-        if payload.own_commit_stamp().is_none() {
-            continue;
-        }
-        by_source_epoch
-            .entry(record.epoch.0)
-            .or_default()
-            .push(record.id.as_slice().to_vec());
-    }
-    Ok(by_source_epoch)
+    resulting_epoch: u64,
+    stamp: &cgka_traits::message::OwnCommitConvergenceStamp,
+) -> Result<bool, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+
+    let live_snapshot = retained_anchor_probe_snapshot_name(group_id, resulting_epoch);
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), live_snapshot)
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    let anchor_snapshot = retained_anchor_snapshot_name(resulting_epoch);
+    let result = match storage.rollback_group_to_snapshot(group_id, &anchor_snapshot) {
+        Ok(()) => confirmed_group_context_sha256(storage, group_id)
+            .map(|digest| own_commit_stamp_result_matches(stamp, &digest))
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string())),
+        Err(StorageError::SnapshotMissing(_)) => Ok(false),
+        Err(error) => Err(OpenMlsProjectionError::Snapshot(format!("{error:?}"))),
+    };
+    guard
+        .commit()
+        .map_err(|error| OpenMlsProjectionError::Snapshot(format!("{error:?}")))?;
+    result
 }
 
 fn rollback_and_release_group_snapshot<S: StorageProvider>(
@@ -2848,6 +2852,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
                 Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
             }
+            let anchor_group_context_sha256 = confirmed_group_context_sha256(storage, group_id)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+            if !own_commit_stamp_result_matches(stamp, &anchor_group_context_sha256) {
+                return Err(OpenMlsProjectionError::Replay(format!(
+                    "own commit anchor lineage mismatch at epoch {resulting_epoch}"
+                )));
+            }
             mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
                 .map_err(|e| OpenMlsProjectionError::Replay(format!("anchor reload: {e:?}")))?
                 .ok_or(OpenMlsProjectionError::MissingGroup)?;
@@ -3463,10 +3474,11 @@ mod reuse_scope_tests {
 }
 
 #[cfg(test)]
-mod anchor_prefix_lineage_tests {
+mod own_commit_lineage_tests {
     use super::{
-        AnchorRealizableOwnPrefix, anchor_realizable_own_commit_prefix,
-        own_commit_stamp_parent_matches, retained_anchor_snapshot_name,
+        AnchorRealizableOwnPrefix, anchor_realizable_own_commit_prefix_with,
+        own_commit_stamp_parent_matches, own_commit_stamp_result_matches,
+        retained_anchor_snapshot_name,
     };
     use crate::canonicalization::{CanonicalizationResult, ConvergenceStatus};
     use cgka_traits::engine::CommitOrderingPriority;
@@ -3487,8 +3499,6 @@ mod anchor_prefix_lineage_tests {
     fn own_commit_row(id: &[u8], source_epoch: u64) -> MessageRecord {
         let message = TransportMessage {
             id: MessageId::new(id.to_vec()),
-            // The prefix scan never parses MLS bytes; only the stored
-            // envelope's stamp presence and the row's epoch matter here.
             payload: id.to_vec(),
             timestamp: Timestamp(0),
             causal_deps: Vec::new(),
@@ -3498,7 +3508,8 @@ mod anchor_prefix_lineage_tests {
             },
         };
         let stamp = OwnCommitConvergenceStamp {
-            parent_group_context_sha256: None,
+            parent_group_context_sha256: Some("parent".into()),
+            resulting_group_context_sha256: Some("result".into()),
             committer: MemberId::new(vec![1u8; 32]),
             priority: CommitOrderingPriority::Privileged,
             consumed_proposal_refs: Vec::new(),
@@ -3515,22 +3526,7 @@ mod anchor_prefix_lineage_tests {
         }
     }
 
-    #[test]
-    fn own_commit_stamp_requires_the_exact_confirmed_parent_context() {
-        let mut stamp = OwnCommitConvergenceStamp {
-            parent_group_context_sha256: None,
-            committer: MemberId::new(vec![1u8; 32]),
-            priority: CommitOrderingPriority::Privileged,
-            consumed_proposal_refs: Vec::new(),
-        };
-        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
-        stamp.parent_group_context_sha256 = Some("parent-b".into());
-        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
-        stamp.parent_group_context_sha256 = Some("parent-a".into());
-        assert!(own_commit_stamp_parent_matches(&stamp, "parent-a"));
-    }
-
-    fn result_accepting(commit_ids: &[&[u8]]) -> CanonicalizationResult {
+    fn result_accepting(commit_id: &[u8]) -> CanonicalizationResult {
         CanonicalizationResult {
             previous_tip: 2,
             selected_tip: Some(2),
@@ -3539,7 +3535,7 @@ mod anchor_prefix_lineage_tests {
             candidate_count: 1,
             eligible_count: 1,
             convergence_status: ConvergenceStatus::Settled,
-            accepted_commits: commit_ids.iter().map(hex::encode).collect(),
+            accepted_commits: vec![hex::encode(commit_id)],
             accepted_proposals: Vec::new(),
             accepted_app_messages: Vec::new(),
             deferred_messages: Vec::new(),
@@ -3555,7 +3551,7 @@ mod anchor_prefix_lineage_tests {
         }
     }
 
-    fn storage_with_anchor_at_epoch_2() -> SqliteAccountStorage {
+    fn storage_with_anchor() -> SqliteAccountStorage {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         storage
             .put_group(&Group {
@@ -3579,20 +3575,39 @@ mod anchor_prefix_lineage_tests {
     }
 
     #[test]
-    fn unambiguous_own_commit_uses_the_retained_anchor_fast_path() {
-        // Baseline for the regression below: exactly one own confirm-stamped
-        // commit row at source epoch 1, so the `openmls-retained-anchor-2`
-        // snapshot can only hold THAT commit's post-merge state.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn own_commit_stamp_requires_exact_parent_and_result_contexts() {
+        let mut stamp = OwnCommitConvergenceStamp {
+            parent_group_context_sha256: None,
+            resulting_group_context_sha256: None,
+            committer: MemberId::new(vec![1u8; 32]),
+            priority: CommitOrderingPriority::Privileged,
+            consumed_proposal_refs: Vec::new(),
+        };
+        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
+        stamp.parent_group_context_sha256 = Some("parent-b".into());
+        assert!(!own_commit_stamp_parent_matches(&stamp, "parent-a"));
+        stamp.parent_group_context_sha256 = Some("parent-a".into());
+        assert!(own_commit_stamp_parent_matches(&stamp, "parent-a"));
+
+        assert!(!own_commit_stamp_result_matches(&stamp, "result-a"));
+        stamp.resulting_group_context_sha256 = Some("result-b".into());
+        assert!(!own_commit_stamp_result_matches(&stamp, "result-a"));
+        stamp.resulting_group_context_sha256 = Some("result-a".into());
+        assert!(own_commit_stamp_result_matches(&stamp, "result-a"));
+    }
+
+    #[test]
+    fn matching_retained_context_allows_own_commit_anchor_fast_path() {
+        let storage = storage_with_anchor();
         storage
             .put_message(&own_commit_row(b"commit-a", 1))
             .unwrap();
-
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = anchor_realizable_own_commit_prefix_with(
             &storage,
             &group_id(),
-            &result_accepting(&[b"commit-a"]),
+            &result_accepting(b"commit-a"),
             &BTreeSet::new(),
+            |_, _, _, stamp| Ok(own_commit_stamp_result_matches(stamp, "result")),
         )
         .unwrap();
         assert_eq!(prefix.resulting_epoch, Some(2));
@@ -3600,66 +3615,23 @@ mod anchor_prefix_lineage_tests {
     }
 
     #[test]
-    fn same_epoch_own_commit_overwrite_refuses_the_anchor_fast_path() {
-        // Retained anchors are named by resulting epoch alone and
-        // `create_group_snapshot` REPLACES a same-named snapshot. When a
-        // second own commit is confirmed at the same resulting epoch — e.g.
-        // the displacing branch's own commit after the first was parked by a
-        // pairwise CandidateWins — `openmls-retained-anchor-2` no longer
-        // provably holds commit-a's post-merge state.
-        //
-        // Safe outcome asserted here: the fast path REFUSES the anchor (empty
-        // prefix, no resulting epoch), so the apply falls back to pre-existing
-        // behavior — normal replay, which fails closed on an own commit and
-        // lets convergence prune the branch. The unsafe outcome this guards
-        // against is a silent rewind to the OTHER commit's state with replay
-        // skipped.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn overwritten_retained_context_refuses_own_commit_anchor_fast_path() {
+        let storage = storage_with_anchor();
         storage
             .put_message(&own_commit_row(b"commit-a", 1))
             .unwrap();
-        storage
-            .put_message(&own_commit_row(b"commit-a2", 1))
-            .unwrap();
-
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = anchor_realizable_own_commit_prefix_with(
             &storage,
             &group_id(),
-            &result_accepting(&[b"commit-a"]),
+            &result_accepting(b"commit-a"),
             &BTreeSet::new(),
+            |_, _, _, stamp| Ok(own_commit_stamp_result_matches(stamp, "peer-result")),
         )
         .unwrap();
         assert_eq!(
             prefix.resulting_epoch,
-            AnchorRealizableOwnPrefix::default().resulting_epoch,
-            "ambiguous anchor lineage must not yield a rewind target"
+            AnchorRealizableOwnPrefix::default().resulting_epoch
         );
-        assert!(
-            prefix.commit_ids.is_empty(),
-            "ambiguous anchor lineage must not realize any commit via the anchor"
-        );
-    }
-
-    #[test]
-    fn own_commit_at_a_different_source_epoch_does_not_create_ambiguity() {
-        // Only rows that could have produced an anchor at the SAME resulting
-        // epoch are ambiguous; an own commit from another epoch names a
-        // different anchor and must not disable the fast path.
-        let storage = storage_with_anchor_at_epoch_2();
-        storage
-            .put_message(&own_commit_row(b"commit-a", 1))
-            .unwrap();
-        storage
-            .put_message(&own_commit_row(b"commit-b", 5))
-            .unwrap();
-
-        let prefix = anchor_realizable_own_commit_prefix(
-            &storage,
-            &group_id(),
-            &result_accepting(&[b"commit-a"]),
-            &BTreeSet::new(),
-        )
-        .unwrap();
-        assert_eq!(prefix.resulting_epoch, Some(2));
+        assert!(prefix.commit_ids.is_empty());
     }
 }
