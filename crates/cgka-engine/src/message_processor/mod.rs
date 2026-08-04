@@ -321,8 +321,7 @@ impl<S: StorageProvider> Engine<S> {
         };
         self.validate_send_acceptance(&intent)?;
         if let Some(state) = self.epoch_manager.state(&group_id)
-            && !state.is_stable()
-            && !state.is_awaiting_resolution()
+            && state.is_terminal()
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {

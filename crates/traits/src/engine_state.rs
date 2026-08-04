@@ -281,6 +281,19 @@ impl EpochState {
         )
     }
 
+    /// Whether this state is terminal — the exact complement of `Stable` plus
+    /// [`Self::is_awaiting_resolution`].
+    ///
+    /// `Unrecoverable` needs a verified repair path and `Disbanded` has no legal
+    /// exit at all, so neither will resolve on its own. Work may not be held for
+    /// a terminal group.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            EpochState::Unrecoverable(_) | EpochState::Disbanded(_)
+        )
+    }
+
     /// Whether this group is in the terminal `Unrecoverable` state and requires
     /// a repair path before it may apply or ingest more group traffic.
     pub fn is_unrecoverable(&self) -> bool {
@@ -615,38 +628,40 @@ mod tests {
 
     #[test]
     fn only_states_owed_an_outcome_await_resolution() {
-        // The engine retains outbound application work across exactly these
-        // states, so the split has to stay a deliberate decision rather than a
-        // side effect of adding a variant. `Stable` awaits nothing; the two
-        // terminal states are owed nothing, and retaining work for them would
-        // promise a delivery that never happens.
+        // The engine retains outbound application work across exactly the
+        // states that are owed an outcome by someone else, so this split has to
+        // stay a deliberate decision rather than something a new variant joins
+        // by accident. `Stable` is owed nothing because it needs nothing, and
+        // holding work for a terminal group would promise a delivery that never
+        // happens.
         let pending = EpochState::stable(EpochId(1))
             .begin_pending(EpochId(2), handle(), pref())
             .unwrap();
-        let merging = pending.clone().confirm_publish().unwrap();
-        let awaiting = [
-            pending,
-            merging,
-            EpochState::stable(EpochId(1)).detect_fork(vec![]),
+        let cases = [
+            (EpochState::stable(EpochId(1)), false),
+            (pending.clone(), true),
+            (pending.confirm_publish().unwrap(), true),
+            (EpochState::stable(EpochId(1)).detect_fork(vec![]), true),
+            (EpochState::stable(EpochId(1)).to_unrecoverable(), false),
+            (EpochState::disbanded(EpochId(1)), false),
         ];
-        for state in awaiting {
-            assert!(
+
+        for (state, awaits_an_outcome) in cases {
+            assert_eq!(
                 state.is_awaiting_resolution(),
-                "{} is owed an outcome",
+                awaits_an_outcome,
+                "{} is misclassified",
                 state.name()
             );
-            assert!(!state.is_stable());
-        }
-
-        let settled = [
-            EpochState::stable(EpochId(1)),
-            EpochState::stable(EpochId(1)).to_unrecoverable(),
-            EpochState::disbanded(EpochId(1)),
-        ];
-        for state in settled {
-            assert!(
-                !state.is_awaiting_resolution(),
-                "{} is not awaiting an outcome",
+            // Stable / awaiting / terminal must partition the machine, so a
+            // caller may reason with any one of them and get the same answer.
+            assert_eq!(
+                [state.is_stable(), awaits_an_outcome, state.is_terminal()]
+                    .iter()
+                    .filter(|holds| **holds)
+                    .count(),
+                1,
+                "{} must be exactly one of stable / awaiting / terminal",
                 state.name()
             );
         }
