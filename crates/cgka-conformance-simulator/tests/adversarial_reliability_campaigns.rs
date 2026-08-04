@@ -4,17 +4,18 @@ use cgka_conformance_simulator::{
     engine_harness_feature_registry, run_scenario_report_with_subject,
 };
 use cgka_conformance_simulator::{
-    SubjectFailureCategory, compile_scenario, generate_milestone3_adversarial_case,
-    generate_milestone3_adversarial_family, generate_milestone3_offline_regression,
-    generate_milestone3_self_update_regression, generate_milestone3_sustained_regression,
-    run_generated_case_report, run_generated_case_report_with_capture,
+    SubjectFailureCategory, compile_scenario, generate_adversarial_reliability_case,
+    generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
+    generate_adversarial_reliability_self_update_regression,
+    generate_adversarial_reliability_sustained_regression, run_generated_case_report,
+    run_generated_case_report_with_capture,
 };
 #[cfg(feature = "test-policy-overrides")]
 use cgka_traits::group::ProtocolProfile;
 
 #[test]
-fn milestone3_catalog_covers_every_required_workload_shape() {
-    let cases = generate_milestone3_adversarial_family(7, 12);
+fn adversarial_reliability_catalog_covers_every_required_workload_shape() {
+    let cases = generate_adversarial_reliability_family(7, 12);
     let names = cases
         .iter()
         .map(|case| case.family_name.as_str())
@@ -26,8 +27,24 @@ fn milestone3_catalog_covers_every_required_workload_shape() {
     }
 }
 
+#[test]
+fn generator_versions_track_the_renamed_output_contract() {
+    assert!(
+        generate_adversarial_reliability_family(7, 12)
+            .iter()
+            .all(|case| case.generator_version == "2")
+    );
+    for case in [
+        generate_adversarial_reliability_offline_regression(7),
+        generate_adversarial_reliability_sustained_regression(7),
+        generate_adversarial_reliability_self_update_regression(7),
+    ] {
+        assert_eq!(case.generator_version, "2-regression");
+    }
+}
+
 async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
-    assert_case(&generate_milestone3_adversarial_case(7, case_index as u64)).await
+    assert_case(&generate_adversarial_reliability_case(7, case_index as u64)).await
 }
 
 async fn assert_case(
@@ -61,7 +78,7 @@ async fn assert_case(
 
 #[tokio::test]
 async fn offline_retained_history_flood_runs_as_a_small_regression() {
-    let report = assert_case(&generate_milestone3_offline_regression(7)).await;
+    let report = assert_case(&generate_adversarial_reliability_offline_regression(7)).await;
     let measurements = &report.campaign_measurements;
     assert_eq!(measurements.schema_version, "1");
     assert!(measurements.total_wall_us > 0);
@@ -86,7 +103,7 @@ async fn offline_retained_history_flood_runs_as_a_small_regression() {
 
 #[tokio::test]
 async fn retained_relay_rejects_unavailable_sensitive_checkpoint_capture() {
-    let case = generate_milestone3_offline_regression(7);
+    let case = generate_adversarial_reliability_offline_regression(7);
     let error = run_generated_case_report_with_capture(
         &case,
         None,
@@ -106,7 +123,7 @@ async fn offline_retained_history_flood_campaign() {
 
 #[tokio::test]
 async fn sustained_mixed_traffic_runs_as_a_small_regression() {
-    let case = generate_milestone3_sustained_regression(7);
+    let case = generate_adversarial_reliability_sustained_regression(7);
     let report = run_generated_case_report(&case, None)
         .await
         .expect("sustained regression runs");
@@ -130,7 +147,7 @@ async fn sustained_mixed_traffic_campaign() {
 
 #[tokio::test]
 async fn self_update_admin_race_runs_as_a_small_regression() {
-    let _ = assert_case(&generate_milestone3_self_update_regression(7)).await;
+    let _ = assert_case(&generate_adversarial_reliability_self_update_regression(7)).await;
 }
 
 #[ignore = "sustained self-update adversary; run explicitly"]
@@ -153,7 +170,7 @@ async fn remaining_catalog_workloads_execute_under_the_strict_oracle() {
 
 #[tokio::test]
 async fn mixed_binary_versions_run_but_mixed_policies_are_rejected() {
-    let case = generate_milestone3_adversarial_case(7, 10);
+    let case = generate_adversarial_reliability_case(7, 10);
     let _ = assert_case(&case).await;
 
     let mut incompatible = case.scenario.clone();
@@ -166,7 +183,7 @@ async fn mixed_binary_versions_run_but_mixed_policies_are_rejected() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn full_engine_witness_ab_pair_can_select_different_canonical_branches() {
-    let cases = generate_milestone3_adversarial_family(7, 10);
+    let cases = generate_adversarial_reliability_family(7, 10);
     let case = &cases[9];
     let mut standard = EngineHarnessSubject::new_with_topology(
         &case.scenario.clients,

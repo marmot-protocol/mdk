@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
     HarnessStorageMode, ScenarioReport, VectorFixture, coverage_matrix_entry,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_milestone3_adversarial_family, generate_send_leave_family,
+    generate_adversarial_reliability_family, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report_with_capture, run_vector_fixture_report_with_capture,
     write_failure_capsule,
 };
@@ -238,7 +238,7 @@ async fn run_generated_family_reports(
         "send-leave/v1" => generate_send_leave_family(seed, cases),
         "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_family(seed, cases),
         "convergence-chaos/v1" => generate_convergence_chaos_family(seed, cases),
-        "milestone3-adversarial/v1" => generate_milestone3_adversarial_family(seed, cases),
+        "adversarial-reliability/v1" => generate_adversarial_reliability_family(seed, cases),
         other => return Err(format!("unsupported family {other}").into()),
     };
 
@@ -590,7 +590,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|milestone3-adversarial/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|adversarial-reliability/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Machine-readable Milestone 4 convergence-policy classification.
+//! Machine-readable convergence-policy classification.
 //!
 //! This is conformance metadata, not a wire format. Marmot convergence v1 is
 //! the implicit mandatory baseline. A future behavior-changing policy requires

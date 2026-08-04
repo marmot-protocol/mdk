@@ -131,29 +131,29 @@ cargo test -p cgka-conformance-simulator
 # Slower validation: raises property-test case counts according to test cost.
 cargo test -p cgka-conformance-simulator --features conformance-slow
 
-# Milestone 3 catalog and small headline regressions.
-cargo test -p cgka-conformance-simulator --test milestone3_campaigns
+# Adversarial reliability catalog and small headline regressions.
+cargo test -p cgka-conformance-simulator --test adversarial_reliability_campaigns
 
 # Deliberately slow offline, mixed-traffic, and self-update campaigns.
-cargo test -p cgka-conformance-simulator --test milestone3_campaigns \
+cargo test -p cgka-conformance-simulator --test adversarial_reliability_campaigns \
   -- --ignored --nocapture
 
 # Full generated adversarial catalog with durable report artifacts.
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
-  --family milestone3-adversarial/v1 --seed 7 --cases 12 \
-  --out target/cgka-milestone3-reports --storage file --strict-oracle
+  --family adversarial-reliability/v1 --seed 7 --cases 12 \
+  --out target/cgka-adversarial-reliability-reports --storage file --strict-oracle
 
 # Run each adversarial case in its own process and add OS resource measurements.
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign -- \
   --seed 7 --cases 12 --case-timeout-secs 300 \
-  --out target/cgka-milestone3-process-campaign --storage file
+  --out target/cgka-adversarial-reliability-process-campaign --storage file
 
 # Test-only one-variable policy curves around fixed retained inputs/horizons.
 cargo test -p cgka-conformance-simulator --features test-policy-overrides \
   --test policy_sweeps
 
-# Milestone 4 independent model, liveness, mutation, and protocol-decision gate.
-just milestone4-ci
+# Independent convergence model, liveness, mutation, and protocol-decision gate.
+just convergence-verification-ci
 ```
 
 Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latency is the measured wall time of the

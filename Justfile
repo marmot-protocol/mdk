@@ -2,6 +2,8 @@ set shell := ["bash", "-cu"]
 
 otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,wn-cli/otlp-export"
 test-features := "wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks"
+simulator-dedicated-filter := "not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate)"
+simulator-smoke-filter := simulator-dedicated-filter + " and not (binary(canonical_scenarios) & (test(=convergence_chaos_family_generates_specs_with_semantic_expectations) | test(=convergence_chaos_family_seed_changes_scenarios) | test(=convergence_e2e_delivery_family_runs_generated_variants)))"
 
 default:
     @just --list
@@ -256,17 +258,49 @@ conformance:
 conformance-slow:
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
-# Full Milestone 3 campaign gate: all catalog families, test-policy A/B and
-# resource sweeps, sustained headline workloads, and the isolated process runner.
-milestone3-ci:
-    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked
-    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked -- --ignored
-    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
-    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
+# Fast PR feedback: ordinary simulator coverage without dedicated verification
+# binaries or the generated multi-minute reliability batches.
+simulator-smoke:
+    cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-smoke-filter}}'
 
-# Independent model, lifecycle/fairness, mutation adequacy, and protocol
-# decision gates.
-milestone4-ci:
+# Complete generic simulator coverage for the nightly lane. Dedicated
+# adversarial and independent-verification binaries run in later recipes.
+simulator-full: simulator-filter-contract
+    cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked --profile ci -E '{{simulator-dedicated-filter}}'
+
+# Prove that the generic nightly lane restores exactly the generated batches
+# intentionally removed from the PR smoke lane.
+simulator-filter-contract:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work_dir="$(mktemp -d)"
+    trap 'rm -rf "$work_dir"' EXIT
+    list_tests() {
+        jq -r '."rust-suites" | to_entries[] | .key as $suite | .value.testcases | to_entries[] | select(.value["filter-match"].status == "matches") | "\($suite)::\(.key)"' | sort
+    }
+    cargo nextest list -p cgka-conformance-simulator --features conformance-slow --locked --profile ci \
+        -E '{{simulator-dedicated-filter}}' --message-format json | list_tests >"$work_dir/full"
+    cargo nextest list -p cgka-conformance-simulator --locked --profile ci \
+        -E '{{simulator-smoke-filter}}' --message-format json | list_tests >"$work_dir/smoke"
+    comm -23 "$work_dir/full" "$work_dir/smoke" >"$work_dir/actual"
+    printf '%s\n' \
+        'cgka-conformance-simulator::canonical_scenarios::convergence_chaos_family_generates_specs_with_semantic_expectations' \
+        'cgka-conformance-simulator::canonical_scenarios::convergence_chaos_family_seed_changes_scenarios' \
+        'cgka-conformance-simulator::canonical_scenarios::convergence_e2e_delivery_family_runs_generated_variants' \
+        >"$work_dir/expected"
+    diff -u "$work_dir/expected" "$work_dir/actual"
+
+# Full adversarial reliability gate: all catalog families, test-policy A/B,
+# resource sweeps, sustained headline workloads, and the isolated process runner.
+adversarial-reliability-ci:
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked
+    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked -- --ignored
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
+    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-adversarial-reliability-ci --storage file
+
+# Independent convergence model, lifecycle/fairness, mutation adequacy, and
+# protocol decision gates.
+convergence-verification-ci:
     cargo nextest run -p cgka-conformance-simulator --test independent_reference_model --locked
     cargo nextest run -p cgka-conformance-simulator --test lifecycle_model --locked
     cargo nextest run -p cgka-conformance-simulator --test mutation_adequacy --locked
@@ -353,7 +387,7 @@ tla-liveness-counterexample: _tla-tools
         exit 1
     fi
     cat "$output"
-    rg -q 'Temporal properties were violated' "$output"
+    grep -q 'Temporal properties were violated' "$output"
 
 policy-casegen:
     @cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json

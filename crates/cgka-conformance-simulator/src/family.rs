@@ -129,28 +129,28 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
     out
 }
 
-/// Generate the Milestone 3 adversarial catalog. Case indices rotate through
+/// Generate the adversarial reliability catalog. Case indices rotate through
 /// every required workload family; requesting more than twelve cases repeats
 /// the catalog with a new deterministic case id and schedule seed.
-pub fn generate_milestone3_adversarial_family(
+pub fn generate_adversarial_reliability_family(
     seed: u64,
     cases: usize,
 ) -> Vec<GeneratedScenarioCase> {
     (0..cases)
-        .map(|case_index| generate_milestone3_adversarial_case(seed, case_index as u64))
+        .map(|case_index| generate_adversarial_reliability_case(seed, case_index as u64))
         .collect()
 }
 
 /// Generate one catalog case without regenerating and discarding every prior
 /// index. This is the process-runner entry point for deterministic isolation.
-pub fn generate_milestone3_adversarial_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+pub fn generate_adversarial_reliability_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
     let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
     let (family_name, subject, mut scenario, mut expected_outcomes) =
-        milestone3_case(&mut rng, case_index);
+        adversarial_reliability_case(&mut rng, case_index);
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1".into(),
+        generator_version: "2".into(),
         seed,
         case_index,
         subject,
@@ -161,16 +161,16 @@ pub fn generate_milestone3_adversarial_case(seed: u64, case_index: u64) -> Gener
 
 /// One-round form of the sustained mixed-traffic workload for normal
 /// regression suites. The adversarial family retains the multi-round campaign.
-pub fn generate_milestone3_sustained_regression(seed: u64) -> GeneratedScenarioCase {
+pub fn generate_adversarial_reliability_sustained_regression(seed: u64) -> GeneratedScenarioCase {
     let case_index = 1_u64;
     let mut rng = StdRng::seed_from_u64(seed ^ 0x4d33_4144_5645_5253 ^ case_index.rotate_left(17));
     let (family_name, subject, mut scenario, mut expected_outcomes) =
-        milestone3_sustained_mixed_traffic_with_rounds(&mut rng, case_index, 1);
-    scenario.name = "milestone3/sustained-mixed-traffic/regression".into();
+        adversarial_reliability_sustained_mixed_traffic_with_rounds(&mut rng, case_index, 1);
+    scenario.name = "adversarial-reliability/sustained-mixed-traffic/regression".into();
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1-regression".into(),
+        generator_version: "2-regression".into(),
         seed,
         case_index,
         subject,
@@ -181,21 +181,23 @@ pub fn generate_milestone3_sustained_regression(seed: u64) -> GeneratedScenarioC
 
 /// One-round offline catch-up form for normal regression suites. The catalog
 /// case retains the multi-round retained-history flood.
-pub fn generate_milestone3_offline_regression(seed: u64) -> GeneratedScenarioCase {
-    milestone3_regression_case(seed, 0, |_, case_index| {
-        milestone3_offline_retained_flood_with_rounds(case_index, 1)
+pub fn generate_adversarial_reliability_offline_regression(seed: u64) -> GeneratedScenarioCase {
+    adversarial_reliability_regression_case(seed, 0, |_, case_index| {
+        adversarial_reliability_offline_retained_flood_with_rounds(case_index, 1)
     })
 }
 
 /// Two-update adversary for normal regression suites. The catalog case retains
 /// the sustained self-update stream before the privileged removal race.
-pub fn generate_milestone3_self_update_regression(seed: u64) -> GeneratedScenarioCase {
-    milestone3_regression_case(seed, 2, |_, case_index| {
-        milestone3_self_update_adversary_with_rounds(case_index, 2)
+pub fn generate_adversarial_reliability_self_update_regression(seed: u64) -> GeneratedScenarioCase {
+    adversarial_reliability_regression_case(seed, 2, |_, case_index| {
+        adversarial_reliability_self_update_adversary_with_rounds(case_index, 2)
     })
 }
 
-fn milestone3_regression_case(
+/// Build a reduced catalog case while preserving its deterministic identity
+/// and strict reliability oracle.
+fn adversarial_reliability_regression_case(
     seed: u64,
     case_index: u64,
     build: impl FnOnce(
@@ -214,7 +216,7 @@ fn milestone3_regression_case(
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1-regression".into(),
+        generator_version: "2-regression".into(),
         seed,
         case_index,
         subject,
@@ -1141,7 +1143,8 @@ fn convergence_chaos_restart_delivery_faults(
     (scenario, expected)
 }
 
-fn milestone3_case(
+/// Select one of the twelve adversarial workload shapes by stable case index.
+fn adversarial_reliability_case(
     rng: &mut StdRng,
     case_index: u64,
 ) -> (
@@ -1151,31 +1154,33 @@ fn milestone3_case(
     Vec<TraceExpectation>,
 ) {
     match case_index % 12 {
-        0 => milestone3_offline_retained_flood(case_index),
-        1 => milestone3_sustained_mixed_traffic(rng, case_index),
-        2 => milestone3_self_update_adversary(case_index),
-        3 => milestone3_losing_invite_outcome(case_index),
-        4 => milestone3_unequal_relay_reconciliation(case_index),
-        5 => milestone3_restart_boundaries(case_index),
-        6 => milestone3_multi_group_noisy_neighbor(case_index),
+        0 => adversarial_reliability_offline_retained_flood(case_index),
+        1 => adversarial_reliability_sustained_mixed_traffic(rng, case_index),
+        2 => adversarial_reliability_self_update_adversary(case_index),
+        3 => adversarial_reliability_losing_invite_outcome(case_index),
+        4 => adversarial_reliability_unequal_relay_reconciliation(case_index),
+        5 => adversarial_reliability_restart_boundaries(case_index),
+        6 => adversarial_reliability_multi_group_noisy_neighbor(case_index),
         7 => {
             let (mut scenario, expected) = convergence_chaos_large_commit_storm(rng, case_index);
-            scenario.name = format!("milestone3/candidate-replay-pressure/case-{case_index}");
+            scenario.name =
+                format!("adversarial-reliability/candidate-replay-pressure/case-{case_index}");
             (
-                "milestone3/candidate-replay-pressure/v1".into(),
+                "adversarial-reliability/candidate-replay-pressure/v1".into(),
                 GeneratedSubjectKind::Engine,
                 scenario,
                 expected,
             )
         }
-        8 => milestone3_multi_device_account(case_index),
-        9 => milestone3_app_witness_value(case_index),
-        10 => milestone3_mixed_binary_compatibility(case_index),
-        _ => milestone3_clock_cursor_attack(case_index),
+        8 => adversarial_reliability_multi_device_account(case_index),
+        9 => adversarial_reliability_app_witness_value(case_index),
+        10 => adversarial_reliability_mixed_binary_compatibility(case_index),
+        _ => adversarial_reliability_clock_cursor_attack(case_index),
     }
 }
 
-fn milestone3_offline_retained_flood(
+/// Build the full retained-history flood, scaling its rounds by catalog cycle.
+fn adversarial_reliability_offline_retained_flood(
     case_index: u64,
 ) -> (
     String,
@@ -1184,10 +1189,11 @@ fn milestone3_offline_retained_flood(
     Vec<TraceExpectation>,
 ) {
     let rounds = 3 + usize::try_from((case_index / 12) % 3).unwrap_or(0);
-    milestone3_offline_retained_flood_with_rounds(case_index, rounds)
+    adversarial_reliability_offline_retained_flood_with_rounds(case_index, rounds)
 }
 
-fn milestone3_offline_retained_flood_with_rounds(
+/// Build a retained-relay catch-up workload with an explicit flood duration.
+fn adversarial_reliability_offline_retained_flood_with_rounds(
     case_index: u64,
     rounds: usize,
 ) -> (
@@ -1259,20 +1265,25 @@ fn milestone3_offline_retained_flood_with_rounds(
     ]);
     let expected = vec![clients_converged(["alice", "bob", "carol"], None, Some(3))];
     (
-        "milestone3/offline-retained-history-flood/v1".into(),
+        "adversarial-reliability/offline-retained-history-flood/v1".into(),
         GeneratedSubjectKind::RetainedRelay,
         ScenarioSpec {
-            name: format!("milestone3/offline-retained-history-flood/case-{case_index}"),
+            name: format!(
+                "adversarial-reliability/offline-retained-history-flood/case-{case_index}"
+            ),
             spec_version: "2".into(),
             clients,
-            topology: milestone3_single_relay_topology(&labels(["alice", "bob", "carol", "david"])),
+            topology: adversarial_reliability_single_relay_topology(&labels([
+                "alice", "bob", "carol", "david",
+            ])),
             steps,
         },
         expected,
     )
 }
 
-fn milestone3_sustained_mixed_traffic(
+/// Build sustained mixed application, proposal, and commit traffic.
+fn adversarial_reliability_sustained_mixed_traffic(
     rng: &mut StdRng,
     case_index: u64,
 ) -> (
@@ -1282,10 +1293,11 @@ fn milestone3_sustained_mixed_traffic(
     Vec<TraceExpectation>,
 ) {
     let rounds = 4 + usize::try_from((case_index / 12) % 4).unwrap_or(0);
-    milestone3_sustained_mixed_traffic_with_rounds(rng, case_index, rounds)
+    adversarial_reliability_sustained_mixed_traffic_with_rounds(rng, case_index, rounds)
 }
 
-fn milestone3_sustained_mixed_traffic_with_rounds(
+/// Build mixed traffic with an explicit number of deterministic rounds.
+fn adversarial_reliability_sustained_mixed_traffic_with_rounds(
     rng: &mut StdRng,
     case_index: u64,
     rounds: usize,
@@ -1337,10 +1349,10 @@ fn milestone3_sustained_mixed_traffic_with_rounds(
         tick(["bob", "carol", "david"]),
     ]);
     (
-        "milestone3/sustained-mixed-traffic/v1".into(),
+        "adversarial-reliability/sustained-mixed-traffic/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/sustained-mixed-traffic/case-{case_index}"),
+            name: format!("adversarial-reliability/sustained-mixed-traffic/case-{case_index}"),
             spec_version: "2".into(),
             clients,
             topology: Default::default(),
@@ -1350,7 +1362,8 @@ fn milestone3_sustained_mixed_traffic_with_rounds(
     )
 }
 
-fn milestone3_self_update_adversary(
+/// Build the full self-update stream followed by an administrative race.
+fn adversarial_reliability_self_update_adversary(
     case_index: u64,
 ) -> (
     String,
@@ -1358,10 +1371,11 @@ fn milestone3_self_update_adversary(
     ScenarioSpec,
     Vec<TraceExpectation>,
 ) {
-    milestone3_self_update_adversary_with_rounds(case_index, 12)
+    adversarial_reliability_self_update_adversary_with_rounds(case_index, 12)
 }
 
-fn milestone3_self_update_adversary_with_rounds(
+/// Build a self-update/admin race with an explicit update count.
+fn adversarial_reliability_self_update_adversary_with_rounds(
     case_index: u64,
     rounds: usize,
 ) -> (
@@ -1403,10 +1417,10 @@ fn milestone3_self_update_adversary_with_rounds(
         tick(["alice", "bob", "carol"]),
     ]);
     (
-        "milestone3/self-update-admin-race/v1".into(),
+        "adversarial-reliability/self-update-admin-race/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/self-update-admin-race/case-{case_index}"),
+            name: format!("adversarial-reliability/self-update-admin-race/case-{case_index}"),
             spec_version: "2".into(),
             clients,
             topology: Default::default(),
@@ -1416,7 +1430,8 @@ fn milestone3_self_update_adversary_with_rounds(
     )
 }
 
-fn milestone3_losing_invite_outcome(
+/// Build an invite from a losing branch and require its named terminal outcome.
+fn adversarial_reliability_losing_invite_outcome(
     case_index: u64,
 ) -> (
     String,
@@ -1473,10 +1488,10 @@ fn milestone3_losing_invite_outcome(
         },
     ];
     (
-        "milestone3/losing-invite-unrecoverable/v1".into(),
+        "adversarial-reliability/losing-invite-unrecoverable/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/losing-invite-unrecoverable/case-{case_index}"),
+            name: format!("adversarial-reliability/losing-invite-unrecoverable/case-{case_index}"),
             spec_version: "2".into(),
             clients: clients.clone(),
             topology: Default::default(),
@@ -1492,7 +1507,8 @@ fn milestone3_losing_invite_outcome(
     )
 }
 
-fn milestone3_unequal_relay_reconciliation(
+/// Build split relay histories that must reconcile after set equalization.
+fn adversarial_reliability_unequal_relay_reconciliation(
     case_index: u64,
 ) -> (
     String,
@@ -1546,20 +1562,21 @@ fn milestone3_unequal_relay_reconciliation(
         tick(["bob"]),
     ];
     (
-        "milestone3/unequal-relay-reconciliation/v1".into(),
+        "adversarial-reliability/unequal-relay-reconciliation/v1".into(),
         GeneratedSubjectKind::RetainedRelay,
         ScenarioSpec {
-            name: format!("milestone3/unequal-relay-reconciliation/case-{case_index}"),
+            name: format!("adversarial-reliability/unequal-relay-reconciliation/case-{case_index}"),
             spec_version: "2".into(),
             clients: clients.clone(),
-            topology: milestone3_split_relay_topology(&clients),
+            topology: adversarial_reliability_split_relay_topology(&clients),
             steps,
         },
         vec![clients_converged(["alice", "bob"], None, Some(2))],
     )
 }
 
-fn milestone3_restart_boundaries(
+/// Build restart transitions around durable convergence-phase boundaries.
+fn adversarial_reliability_restart_boundaries(
     case_index: u64,
 ) -> (
     String,
@@ -1597,10 +1614,10 @@ fn milestone3_restart_boundaries(
         },
     ];
     (
-        "milestone3/restart-boundaries/v1".into(),
+        "adversarial-reliability/restart-boundaries/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/restart-boundaries/case-{case_index}"),
+            name: format!("adversarial-reliability/restart-boundaries/case-{case_index}"),
             spec_version: "2".into(),
             clients,
             topology: Default::default(),
@@ -1610,7 +1627,8 @@ fn milestone3_restart_boundaries(
     )
 }
 
-fn milestone3_multi_group_noisy_neighbor(
+/// Build concurrent groups to verify noisy-neighbor workload isolation.
+fn adversarial_reliability_multi_group_noisy_neighbor(
     case_index: u64,
 ) -> (
     String,
@@ -1682,10 +1700,10 @@ fn milestone3_multi_group_noisy_neighbor(
         ),
     ]);
     (
-        "milestone3/multi-group-noisy-neighbor/v1".into(),
+        "adversarial-reliability/multi-group-noisy-neighbor/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/multi-group-noisy-neighbor/case-{case_index}"),
+            name: format!("adversarial-reliability/multi-group-noisy-neighbor/case-{case_index}"),
             spec_version: "2".into(),
             clients,
             topology: Default::default(),
@@ -1695,7 +1713,8 @@ fn milestone3_multi_group_noisy_neighbor(
     )
 }
 
-fn milestone3_multi_device_account(
+/// Build a shared-account, multi-device witness topology and workload.
+fn adversarial_reliability_multi_device_account(
     case_index: u64,
 ) -> (
     String,
@@ -1704,7 +1723,7 @@ fn milestone3_multi_device_account(
     Vec<TraceExpectation>,
 ) {
     let clients = labels(["alice-phone", "alice-laptop", "bob"]);
-    let topology = milestone3_account_topology(&[
+    let topology = adversarial_reliability_account_topology(&[
         ("alice-phone", "account:alice", "build-a"),
         ("alice-laptop", "account:alice", "build-a"),
         ("bob", "account:bob", "build-a"),
@@ -1735,10 +1754,10 @@ fn milestone3_multi_device_account(
         tick(["alice-phone", "alice-laptop", "bob"]),
     ];
     (
-        "milestone3/multi-device-account/v1".into(),
+        "adversarial-reliability/multi-device-account/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/multi-device-account/case-{case_index}"),
+            name: format!("adversarial-reliability/multi-device-account/case-{case_index}"),
             spec_version: "2".into(),
             clients: clients.clone(),
             topology,
@@ -1748,7 +1767,8 @@ fn milestone3_multi_device_account(
     )
 }
 
-fn milestone3_app_witness_value(
+/// Build competing branches whose selection depends on application witnesses.
+fn adversarial_reliability_app_witness_value(
     case_index: u64,
 ) -> (
     String,
@@ -1757,7 +1777,7 @@ fn milestone3_app_witness_value(
     Vec<TraceExpectation>,
 ) {
     let scenario = ScenarioSpec {
-        name: format!("milestone3/app-witness-value/case-{case_index}"),
+        name: format!("adversarial-reliability/app-witness-value/case-{case_index}"),
         spec_version: "2".into(),
         topology: Default::default(),
         clients: labels(["alice", "bob", "carol", "david", "eve", "frank"]),
@@ -1815,14 +1835,15 @@ fn milestone3_app_witness_value(
         ],
     };
     (
-        "milestone3/app-witness-value/v1".into(),
+        "adversarial-reliability/app-witness-value/v1".into(),
         GeneratedSubjectKind::Engine,
         scenario,
         vec![clients_converged(["alice", "bob", "carol"], None, None)],
     )
 }
 
-fn milestone3_mixed_binary_compatibility(
+/// Build a mixed-binary compatibility case with policy preflight constraints.
+fn adversarial_reliability_mixed_binary_compatibility(
     case_index: u64,
 ) -> (
     String,
@@ -1831,15 +1852,17 @@ fn milestone3_mixed_binary_compatibility(
     Vec<TraceExpectation>,
 ) {
     let clients = labels(["alice", "bob"]);
-    let topology = milestone3_account_topology(&[
+    let topology = adversarial_reliability_account_topology(&[
         ("alice", "account:alice", "mdk-previous"),
         ("bob", "account:bob", "mdk-current"),
     ]);
     (
-        "milestone3/mixed-binary-compatibility-preflight/v1".into(),
+        "adversarial-reliability/mixed-binary-compatibility-preflight/v1".into(),
         GeneratedSubjectKind::Engine,
         ScenarioSpec {
-            name: format!("milestone3/mixed-binary-compatibility-preflight/case-{case_index}"),
+            name: format!(
+                "adversarial-reliability/mixed-binary-compatibility-preflight/case-{case_index}"
+            ),
             spec_version: "2".into(),
             clients,
             topology,
@@ -1859,7 +1882,8 @@ fn milestone3_mixed_binary_compatibility(
     )
 }
 
-fn milestone3_clock_cursor_attack(
+/// Build clock, scheduler, timestamp, and relay-cursor adversarial inputs.
+fn adversarial_reliability_clock_cursor_attack(
     case_index: u64,
 ) -> (
     String,
@@ -1910,20 +1934,23 @@ fn milestone3_clock_cursor_attack(
         tick(["bob"]),
     ];
     (
-        "milestone3/clock-scheduler-cursor/v1".into(),
+        "adversarial-reliability/clock-scheduler-cursor/v1".into(),
         GeneratedSubjectKind::RetainedRelay,
         ScenarioSpec {
-            name: format!("milestone3/clock-scheduler-cursor/case-{case_index}"),
+            name: format!("adversarial-reliability/clock-scheduler-cursor/case-{case_index}"),
             spec_version: "2".into(),
             clients: clients.clone(),
-            topology: milestone3_single_relay_topology(&clients),
+            topology: adversarial_reliability_single_relay_topology(&clients),
             steps,
         },
         vec![clients_converged(["alice", "bob"], Some(1), Some(2))],
     )
 }
 
-fn milestone3_account_topology(clients: &[(&str, &str, &str)]) -> crate::ScenarioTopologyV2 {
+/// Construct account, device, process, and client mappings for a workload.
+fn adversarial_reliability_account_topology(
+    clients: &[(&str, &str, &str)],
+) -> crate::ScenarioTopologyV2 {
     let mut accounts = BTreeSet::new();
     crate::ScenarioTopologyV2 {
         accounts: clients
@@ -1962,8 +1989,9 @@ fn milestone3_account_topology(clients: &[(&str, &str, &str)]) -> crate::Scenari
     }
 }
 
-fn milestone3_single_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
-    let mut topology = milestone3_account_topology(
+/// Construct a topology in which every client reads from one retained relay.
+fn adversarial_reliability_single_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
+    let mut topology = adversarial_reliability_account_topology(
         &clients
             .iter()
             .map(|client| (client.as_str(), client.as_str(), "mdk-current"))
@@ -1980,8 +2008,9 @@ fn milestone3_single_relay_topology(clients: &[String]) -> crate::ScenarioTopolo
     topology
 }
 
-fn milestone3_split_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
-    let mut topology = milestone3_single_relay_topology(clients);
+/// Construct unequal relay subscriptions for later history reconciliation.
+fn adversarial_reliability_split_relay_topology(clients: &[String]) -> crate::ScenarioTopologyV2 {
+    let mut topology = adversarial_reliability_single_relay_topology(clients);
     topology.relays = vec![
         crate::ScenarioRelayV2 {
             id: "relay:a".into(),

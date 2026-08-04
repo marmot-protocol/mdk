@@ -321,25 +321,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Run simulator tests
-        run: cargo nextest run -p cgka-conformance-simulator --locked --profile ci
-
-      - name: Run simulator doctests
-        run: cargo test -p cgka-conformance-simulator --doc --locked
-
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
         with:
           tool: just
 
-      - name: Run Milestone 3 adversarial campaign gate
-        run: just milestone3-ci
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run Milestone 4 independent verification gate
-        run: just milestone4-ci
+      - name: Run simulator smoke tests
+        # Multi-minute generated reliability batches and the adversarial
+        # campaign run in the scheduled Simulator Nightly workflow. Independent
+        # convergence checks run in their dedicated fast gate below.
+        run: just simulator-smoke
+
+      - name: Run simulator doctests
+        run: cargo test -p cgka-conformance-simulator --doc --locked
+
+      - name: Verify convergence with independent models
+        run: just convergence-verification-ci
 
       - name: Run encrypted file-backed vector report
         run: |

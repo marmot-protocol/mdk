@@ -441,9 +441,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ## Tooling And Report Checks
 
-### Milestone 3 Adversarial Catalog
+### Adversarial Reliability Catalog
 
-`milestone3-adversarial/v1` rotates through twelve deterministic workload shapes: retained-history offline floods;
+`adversarial-reliability/v1` rotates through twelve deterministic workload shapes: retained-history offline floods;
 sustained app/proposal/commit traffic; self-update versus admin progress; a named unrecoverable losing-branch invite;
 unequal relay reconciliation; restart boundaries plus the engine's real SIGKILL durable-phase matrix; multi-group noisy
 neighbors; replay-budget exhaustion; shared-account multi-device witnesses; full-engine app-witness A/B selection;
