@@ -1,65 +1,22 @@
 use super::labels::{OpenMlsValueLabel, ValueSensitivity, build_key, build_key_legacy};
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
+use crate::codec::{SensitiveBytes, serialize_sensitive_json};
 use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use serde::de::{DeserializeOwned, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
-use zeroize::Zeroizing;
-
-struct SecretBytes(Zeroizing<Vec<u8>>);
-
-impl SecretBytes {
-    fn new(bytes: Vec<u8>) -> Self {
-        Self(Zeroizing::new(bytes))
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-}
-
-impl Serialize for SecretBytes {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_slice().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretBytes {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SecretBytesVisitor;
-
-        impl<'de> Visitor<'de> for SecretBytesVisitor {
-            type Value = SecretBytes;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON byte array")
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut bytes = Zeroizing::new(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
-                while let Some(byte) = seq.next_element()? {
-                    bytes.push(byte);
-                }
-                Ok(SecretBytes(bytes))
-            }
-        }
-
-        deserializer.deserialize_seq(SecretBytesVisitor)
-    }
-}
+use serde::de::DeserializeOwned;
+use serde::{Serialize, Serializer};
 
 enum SerializedBuffer {
     Public(Vec<u8>),
-    Secret(SecretBytes),
+    Secret(SensitiveBytes),
 }
 
 impl SerializedBuffer {
     fn from_database(label: OpenMlsValueLabel, bytes: Vec<u8>) -> Self {
         match label.sensitivity() {
             ValueSensitivity::Public => Self::Public(bytes),
-            ValueSensitivity::Secret => Self::Secret(SecretBytes::new(bytes)),
+            ValueSensitivity::Secret => Self::Secret(SensitiveBytes::new(bytes)),
         }
     }
 
@@ -77,20 +34,13 @@ fn serialize_buffer<T: Serialize + ?Sized>(
 ) -> Result<SerializedBuffer, SqliteOpenMlsStorageError> {
     match label.sensitivity() {
         ValueSensitivity::Public => Ok(SerializedBuffer::Public(serde_json::to_vec(value)?)),
-        ValueSensitivity::Secret => {
-            // Serialize directly into zeroizing ownership. `to_writer` may leave
-            // a partial JSON document when serialization fails; the guard wipes
-            // that partial buffer as this error unwinds.
-            let mut bytes = Zeroizing::new(Vec::new());
-            serde_json::to_writer(&mut *bytes, value)?;
-            Ok(SerializedBuffer::Secret(SecretBytes(bytes)))
-        }
+        ValueSensitivity::Secret => Ok(SerializedBuffer::Secret(serialize_sensitive_json(value)?)),
     }
 }
 
 enum SerializedList {
     Public(Vec<Vec<u8>>),
-    Secret(Vec<SecretBytes>),
+    Secret(Vec<SensitiveBytes>),
 }
 
 impl SerializedList {
@@ -104,33 +54,24 @@ impl SerializedList {
         }
     }
 
-    fn push(&mut self, value: SerializedBuffer) {
-        match (self, value) {
-            (Self::Public(values), SerializedBuffer::Public(value)) => values.push(value),
-            (Self::Secret(values), SerializedBuffer::Secret(value)) => values.push(value),
-            _ => unreachable!("label sensitivity must be stable within one list operation"),
+    fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), SqliteOpenMlsStorageError> {
+        match self {
+            Self::Public(values) => values.push(serde_json::to_vec(value)?),
+            Self::Secret(values) => values.push(serialize_sensitive_json(value)?),
         }
+        Ok(())
     }
 
     fn remove_matching(&mut self, encoded: &SerializedBuffer) {
+        fn remove<T: AsRef<[u8]>>(values: &mut Vec<T>, encoded: &[u8]) {
+            if let Some(pos) = values.iter().position(|stored| stored.as_ref() == encoded) {
+                values.remove(pos);
+            }
+        }
+
         match self {
-            Self::Public(values) => {
-                if let Some(pos) = values
-                    .iter()
-                    .position(|stored| stored.as_slice() == encoded.as_slice())
-                {
-                    values.remove(pos);
-                }
-            }
-            Self::Secret(values) => {
-                if let Some(pos) = values
-                    .iter()
-                    .position(|stored| stored.as_slice() == encoded.as_slice())
-                {
-                    // Removing the SecretBytes drops its Zeroizing<Vec<u8>> here.
-                    values.remove(pos);
-                }
-            }
+            Self::Public(values) => remove(values, encoded.as_slice()),
+            Self::Secret(values) => remove(values, encoded.as_slice()),
         }
     }
 }
@@ -557,7 +498,7 @@ fn append_entity_on_connection<T: Entity<CURRENT_VERSION>>(
         legacy_storage_key.as_slice(),
         label,
     )?;
-    list.push(serialize_buffer(label, value)?);
+    list.push(value)?;
     write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)?;
     delete_value_on_connection(conn, legacy_storage_key.as_slice())
 }
@@ -622,7 +563,7 @@ mod tests {
 
     #[test]
     fn secret_value_paths_select_zeroizing_buffers() {
-        let label = OpenMlsValueLabel::secret(b"TestSecret");
+        let label = OpenMlsValueLabel::test_secret(b"TestSecret");
 
         assert!(matches!(
             serialize_buffer(label, &TestEntity(7)).unwrap(),
@@ -648,11 +589,25 @@ mod tests {
     }
 
     #[test]
+    fn list_push_derives_buffer_ownership_from_the_existing_list() {
+        let mut public = SerializedList::Public(Vec::new());
+        public.push(&TestEntity(7)).unwrap();
+        assert!(matches!(public, SerializedList::Public(values) if values == [b"7"]));
+
+        let mut secret = SerializedList::Secret(Vec::new());
+        secret.push(&TestEntity(8)).unwrap();
+        assert!(matches!(
+            secret,
+            SerializedList::Secret(values) if values.len() == 1 && values[0].as_slice() == b"8"
+        ));
+    }
+
+    #[test]
     fn value_storage_key_length_delimits_label_and_key() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
-        let label_a = OpenMlsValueLabel::public(b"A");
-        let label_ab = OpenMlsValueLabel::public(b"AB");
+        let label_a = OpenMlsValueLabel::test_public(b"A");
+        let label_ab = OpenMlsValueLabel::test_public(b"AB");
 
         // These two rows collide under the legacy concatenation:
         // label("A") + key("BC") == label("AB") + key("C").
@@ -685,7 +640,7 @@ mod tests {
     fn value_storage_reads_and_deletes_legacy_concatenated_key() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
-        let label = OpenMlsValueLabel::public(b"LegacyValue");
+        let label = OpenMlsValueLabel::test_public(b"LegacyValue");
         let key = b"row".to_vec();
         let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
 
@@ -734,7 +689,7 @@ mod tests {
     fn list_storage_migrates_legacy_concatenated_key_on_mutation() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mls = &store.openmls;
-        let label = OpenMlsValueLabel::public(b"LegacyList");
+        let label = OpenMlsValueLabel::test_public(b"LegacyList");
         let key = b"list".to_vec();
         let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
         let legacy_list = vec![serde_json::to_vec(&TestEntity(1)).unwrap()];

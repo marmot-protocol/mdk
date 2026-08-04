@@ -6,8 +6,8 @@ use super::rows::{
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
 use crate::openmls_storage::mls_group_key;
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, created_at_to_i64,
-    deserialize, epoch_to_i64, message_state_to_i64, serialize,
+    SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
+    created_at_to_i64, deserialize, epoch_to_i64, message_state_to_i64, serialize,
 };
 use cgka_traits::group::Group;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -51,17 +51,18 @@ fn rollback_snapshot(
     name: &str,
     mls_group_key: &[u8],
 ) -> StorageResult<()> {
-    let snapshot_blob: Vec<u8> = conn
-        .query_row(
+    let snapshot_blob = SensitiveBytes::new(
+        conn.query_row(
             "SELECT snapshot FROM cgka_group_snapshots
                  WHERE group_id = ?1 AND name = ?2",
             params![group_id.as_slice(), name],
-            |row| row.get(0),
+            |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
         .storage()?
-        .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?;
-    let snapshot: Snapshot = deserialize(&snapshot_blob)?;
+        .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?,
+    );
+    let snapshot: Snapshot = deserialize(snapshot_blob.as_slice())?;
     restore_snapshot(conn, group_id, &snapshot, mls_group_key)
 }
 
@@ -294,7 +295,7 @@ fn openmls_values(
                 value.label,
                 value.storage_key,
                 value.group_key,
-                value.value
+                value.value.as_slice()
             ],
         )
         .storage()?;
