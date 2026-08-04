@@ -648,6 +648,12 @@ impl<S: StorageProvider> Engine<S> {
                 }
             };
 
+            // The loaded group owns its state; release the provider's borrows
+            // before durable content-dedup and candidate-admission bookkeeping
+            // can mutate engine state. A fresh provider is installed
+            // immediately before OpenMLS processing.
+            drop(provider);
+
             // foundation/wire-envelopes.md + protocol-core/inbound-processing.md:
             // the canonical dedup/replay id MUST be stable for the carried
             // protocol bytes and MUST NOT depend on the transport event id. The
@@ -658,10 +664,45 @@ impl<S: StorageProvider> Engine<S> {
             // Rebind every downstream storage / convergence / fork-recovery row
             // and the in-memory dedup sets to this content-derived id.
             let content_id = content_dedup_id(&mls_bytes);
-            if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
+            // A candidate-route peel can retain the authenticated inner message
+            // as `ConvergenceDeferred` before the live branch reaches the
+            // message's epoch. Once a later canonical apply makes this raw
+            // wrapper directly peelable, the bounded deferred-peel retry must
+            // run normal MLS and app-payload validation instead of treating the
+            // retained candidate row as a terminal duplicate. External
+            // redelivery still takes the ordinary dedup path; only the engine's
+            // lifecycle-governed retry may reconsider this state.
+            let retrying_convergence_deferred = if candidate_admission_time.is_some() {
+                match self.storage.get_message(&content_id) {
+                    Ok(record) if record.state == MessageState::ConvergenceDeferred => true,
+                    Ok(record)
+                        if matches!(
+                            record.state,
+                            MessageState::Failed | MessageState::EpochInvalidated
+                        ) =>
+                    {
+                        // Candidate materialization already gave the content a
+                        // terminal verdict. Mirror that onto the still-opaque
+                        // raw wrapper so the retry loop cannot relabel it as a
+                        // successfully processed transport object.
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
+                            &raw_msg_id,
+                            "candidate_content_terminal",
+                        )?;
+                        false
+                    }
+                    Ok(_) | Err(StorageError::NotFound) => false,
+                    Err(error) => return Err(EngineError::Storage(error)),
+                }
+            } else {
+                false
+            };
+            if !retrying_convergence_deferred
+                && let Some(outcome) = self.recorded_message_outcome(&content_id)?
+            {
                 return Ok(outcome);
             }
-            if self.seen_message_ids.contains(&content_id) {
+            if !retrying_convergence_deferred && self.seen_message_ids.contains(&content_id) {
                 return Ok(IngestOutcome::Ignored {
                     category: InputRejectionCategory::Duplicate,
                 });
@@ -738,10 +779,6 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
-            // The loaded group owns its state; release the provider's borrows
-            // before candidate admission mutates engine bookkeeping. A fresh
-            // provider is installed immediately before OpenMLS processing.
-            drop(provider);
 
             // A candidate branch context authenticates the outer transport
             // wrapper, but it does not replace the live OpenMLS group. Feed
@@ -791,6 +828,9 @@ impl<S: StorageProvider> Engine<S> {
                 // an offline canonical app can still decrypt and deliver, while
                 // a sibling-branch miss remains visibly transport-deferred and
                 // cannot reopen the completed race by itself.
+                if msg_epoch > current_epoch {
+                    return Ok(IngestOutcome::TransportDeferred { group_id });
+                }
             }
 
             // Pre-membership classification (mdk#339): an application

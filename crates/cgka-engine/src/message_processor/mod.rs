@@ -746,14 +746,7 @@ impl<S: StorageProvider> Engine<S> {
                         .is_some_and(|group| group.is_active());
                 if openmls_group_active {
                     let _ = self.retry_deferred_peels(group_id).await?;
-                    let fairness_slot_available = self
-                        .storage
-                        .convergence_pass(group_id)?
-                        .is_some_and(|pass| {
-                            pass.phase == cgka_traits::ConvergencePassPhase::Completed
-                                && pass.fairness_slot_available
-                        });
-                    if fairness_slot_available {
+                    if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                         return Ok(true);
                     }
                 }
@@ -770,19 +763,13 @@ impl<S: StorageProvider> Engine<S> {
                 {
                     return Ok(false);
                 }
-                // A completed frozen batch grants one queued user intent before
-                // an inbound-only follow-up pass. Retry one deferred-peel sweep
-                // first so newly available canonical context is visible. Return
-                // to the drain only when that durable slot actually exists.
+                // A completed frozen batch grants one queued administrative
+                // group-state intent before an inbound-only follow-up pass.
+                // Retry one deferred-peel sweep first so newly available
+                // canonical context is visible. Application sends do not own
+                // this reservation and must finish catch-up before publishing.
                 let _ = self.retry_deferred_peels(group_id).await?;
-                let fairness_slot_available =
-                    self.storage
-                        .convergence_pass(group_id)?
-                        .is_some_and(|pass| {
-                            pass.phase == cgka_traits::ConvergencePassPhase::Completed
-                                && pass.fairness_slot_available
-                        });
-                if fairness_slot_available {
+                if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                     return Ok(true);
                 }
                 continue;
@@ -794,6 +781,31 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         Ok(false)
+    }
+
+    /// Whether a completed convergence generation's one-attempt reservation
+    /// is actively held by queued administrative group-state work. The durable
+    /// fairness bit alone is not sufficient: application sends do not own the
+    /// reservation and must not use it to bypass retained inbound commits.
+    fn convergence_fairness_slot_reserved_for_admin(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        let available = self
+            .storage
+            .convergence_pass(group_id)?
+            .is_some_and(|pass| {
+                pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                    && pass.fairness_slot_available
+            });
+        if !available {
+            return Ok(false);
+        }
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| is_admin_group_state_intent(&record.intent)))
     }
 
     pub(crate) fn has_unresolved_convergence_inputs(

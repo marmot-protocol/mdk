@@ -6910,10 +6910,9 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
 /// Regression for mdk#707 review finding 2: a raw `PeelDeferred` row
 /// that becomes peelable but whose content is terminally rejected (here a
 /// forged, unattributable application payload) must be retired from the
-/// deferred queue — marked terminal and released from the retry lifecycle —
-/// not left durably `PeelDeferred` holding a per-group cap slot. Without the
-/// fix, `retry_deferred_peels` treats the post-peel terminal rejection
-/// like "still cannot peel" and leaves the raw row deferred forever.
+/// deferred queue. The successfully peeled raw wrapper becomes `Processed`;
+/// its content-derived row carries the terminal `EpochInvalidated` verdict.
+/// Neither may remain durably deferred holding a per-group cap slot.
 #[tokio::test]
 async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
     let (mut alice, alice_storage) = build_client(b"alice");
@@ -6981,7 +6980,8 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
 
     // Deliver the epoch-2 commit and converge: carol catches up, re-peels the
     // forged message, and terminally rejects it. The raw deferred row must be
-    // retired (terminal `Failed`), not left `PeelDeferred`.
+    // retired as successfully peeled, while the content row records the
+    // terminal semantic disposition.
     carol
         .ingest(commit_to_epoch2)
         .await
@@ -7000,8 +7000,16 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(
         carol_storage.get_message(&forged.id).unwrap().state,
-        MessageState::Failed,
+        MessageState::Processed,
         "a deferred row terminally rejected after peel must leave the deferred queue"
+    );
+    assert_eq!(
+        carol_storage
+            .get_message(&content_id(&forged))
+            .unwrap()
+            .state,
+        MessageState::EpochInvalidated,
+        "the content-derived row must retain the terminal payload verdict"
     );
     for event in carol.drain_events() {
         if let GroupEvent::MessageReceived {

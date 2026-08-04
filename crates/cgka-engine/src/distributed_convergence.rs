@@ -41,7 +41,8 @@ use crate::openmls_projection::{
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cgka_traits::convergence_pass::{
-    ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassPhase, DurableConvergencePass,
+    ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
+    DurableConvergencePass,
 };
 use cgka_traits::engine::{
     AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
@@ -456,8 +457,7 @@ impl<S: StorageProvider> Engine<S> {
         let (admission, opened) = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
             let (admission, opened) = if app_active_pass_only {
-                let admitted =
-                    self.admit_app_witness_to_active_pass_with_time(group_id, &content_id, now)?;
+                let admitted = self.admit_pre_freeze_deferred_app(group_id, &content_id)?;
                 (
                     if admitted {
                         ConvergenceAdmissionOutcome::Admitted
@@ -488,6 +488,63 @@ impl<S: StorageProvider> Engine<S> {
             self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
         }
         Ok(())
+    }
+
+    /// Admit an app recovered from the already-retained deferred-peel backlog
+    /// to an existing collecting pass before that pass freezes.
+    ///
+    /// This seam never opens a pass and never extends either cutoff. The raw
+    /// transport object was accepted into the bounded retry lifecycle before
+    /// this scheduler drain began; once a candidate exporter reveals its inner
+    /// app, the immutable batch must own its eventual delivery or invalidation.
+    /// Delivery-only apps are members too, but remain non-gating and do not
+    /// acquire witness weight unless the ordinary canonicalizer proves them
+    /// selection-relevant.
+    fn admit_pre_freeze_deferred_app(
+        &self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+    ) -> Result<bool, OpenMlsProjectionError> {
+        let Some(mut pass) = self
+            .storage
+            .convergence_pass(group_id)
+            .map_err(storage_projection_error)?
+        else {
+            return Ok(false);
+        };
+        if pass.phase != ConvergencePassPhase::Collecting {
+            return Ok(false);
+        }
+        if pass
+            .members
+            .iter()
+            .any(|member| &member.message_id == message_id)
+        {
+            return Ok(true);
+        }
+        let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
+            return Ok(false);
+        };
+        if candidate.input.role != ConvergencePassMemberRole::AppWitnessCandidate {
+            return Ok(false);
+        }
+        let policy = self.convergence_policy_for_group(group_id)?;
+        let floor = pass
+            .base_epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
+        let ceiling = pass
+            .base_epoch
+            .0
+            .saturating_add(policy.convergence.max_rewind_commits);
+        if candidate.input.source_epoch < floor || candidate.input.source_epoch > ceiling {
+            return Ok(false);
+        }
+        pass.members.push(candidate.member);
+        self.storage
+            .put_convergence_pass(&pass)
+            .map_err(storage_projection_error)?;
+        Ok(true)
     }
 
     /// Admit a live-route application candidate to a relevant collecting pass
