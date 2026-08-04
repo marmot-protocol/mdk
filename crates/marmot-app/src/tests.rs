@@ -5078,21 +5078,9 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
 
     // Forensics are written before the failing step, so the durable evidence
     // survives the pass that lost the app-visible event.
-    let escalated_rows = app
-        .audit_log_files()
-        .unwrap()
-        .iter()
-        .flat_map(|file| {
-            std::fs::read_to_string(&file.path)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .collect::<Vec<_>>()
-        })
-        .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_escalated")
-        .count();
     assert_eq!(
-        escalated_rows, 1,
+        audit_rows_of_kind(&app, "epoch_stall_backfill_escalated"),
+        1,
         "the failing pass still leaves exactly one durable escalation row"
     );
 
@@ -5118,5 +5106,88 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     assert!(
         after.epoch_stall_escalations.is_empty(),
         "a delivered escalation must not be reported twice"
+    );
+}
+
+/// Count forensic audit rows of one kind across the account's JSONL files.
+fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
+    app.audit_log_files()
+        .unwrap()
+        .iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row["kind"]["type"] == kind)
+        .count()
+}
+
+/// A resource refusal carried by a drained-effects pass must arm epoch-gap
+/// recovery even when that same pass's publish check fails it.
+///
+/// `session.drain()` is the only source of these events and empties the engine's
+/// in-memory buffer one-shot, and `TransportObjectResourceRefused` is buffered
+/// only *after* its durable retention row is deleted — so a refusal this pass
+/// does not arm on is unrecoverable: no later pass can re-observe it. The two
+/// conditions are positively correlated rather than independent, because this
+/// drain publishes: the failure and the refusal ride the same effects.
+#[tokio::test]
+async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drain-arm.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drain arm ordering", &[])
+        .await
+        .unwrap();
+    assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
+
+    // One drained batch that carries both a resource refusal for the live group
+    // and a hard publish failure (its pending commit rolled back).
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    effects.failures.push(marmot_account::PublishFailure {
+        message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+        reason: "injected publish failure".to_owned(),
+    });
+    effects
+        .pending
+        .push(marmot_account::PendingResolution::RolledBack {
+            pending: cgka_traits::engine_state::PendingStateRef::new(7),
+        });
+
+    let result = client.observe_drained_session_events(&effects).await;
+
+    assert!(
+        result.is_err(),
+        "a rolled-back publish failure must still fail the drain pass"
+    );
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "the refusal is unrecoverable once drained, so it must arm before the pass can fail"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        1,
+        "the arm must leave its durable forensic row even on a failing pass"
     );
 }

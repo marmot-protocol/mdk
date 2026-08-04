@@ -243,13 +243,30 @@ impl AppClient {
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
         let effects = self.runtime.drain().await?;
+        self.observe_drained_session_events(&effects).await
+    }
+
+    /// Project one drained batch of engine events, split from the drain itself
+    /// so the projection is exercisable against a given batch of effects.
+    pub(crate) async fn observe_drained_session_events(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
-        self.remember_pending_convergence_groups(&effects);
-        fail_if_publish_failed(&effects)?;
+        self.remember_pending_convergence_groups(effects);
+        // Arm before the publish gate, not after. `drain()` empties the engine's
+        // in-memory event buffer one-shot and is these events' only source, and
+        // a `TransportObjectResourceRefused` is buffered only after its durable
+        // retention row is already deleted — so a refusal this pass does not arm
+        // on can never be re-observed. The arm survives the `?` because it is a
+        // field mutation plus a durable audit row, not summary state. The two
+        // conditions are correlated rather than independent: this drain
+        // publishes, so the failure and the refusal ride the same effects.
+        self.arm_recovery_from_effects(effects);
+        fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
-        self.arm_recovery_from_effects(&effects);
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
