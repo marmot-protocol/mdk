@@ -2487,3 +2487,67 @@ fn fork_snapshot_counters(storage: &SqliteAccountStorage, group_id: &GroupId) ->
         })
         .collect()
 }
+
+#[tokio::test]
+async fn hydrate_recovers_interrupted_fork_probe_snapshot() {
+    let local_id = b"fprobe-local".as_slice();
+    let (group_id, local_storage, _local_commit, _rival_root) =
+        forked_privileged_invites(local_id, b"fprobe-rival", b"fprobe-david", b"fprobe-eve").await;
+
+    // The live group record after the local's own commit applied (epoch 2).
+    let live_group = local_storage.get_group(&group_id).unwrap();
+    assert_eq!(live_group.epoch.0, 2);
+
+    // The retained fork snapshot for the local's own commit (source epoch 1).
+    let fork_snapshot = local_storage
+        .list_group_snapshots(&group_id)
+        .unwrap()
+        .into_iter()
+        .find(|name| name.strip_prefix("fork-").is_some() && !name.starts_with("fork-probe-"))
+        .expect("a retained fork-<epoch>-<counter> snapshot must exist after the local commit");
+
+    // Simulate the interrupted probe: capture the live state in a
+    // `fork-probe-` snapshot, then strand the on-disk group at the fork
+    // snapshot's pre-commit state (exactly what
+    // `probe_commit_ordering_metadata_for_recovery` does before the guard's
+    // `commit`).
+    local_storage
+        .create_group_snapshot(&group_id, "fork-probe-1-deadbeefcafebabe")
+        .unwrap();
+    local_storage
+        .rollback_group_to_snapshot(&group_id, &fork_snapshot)
+        .unwrap();
+
+    // Fixture invariant: the group is now stranded at the pre-commit state.
+    let stranded = local_storage.get_group(&group_id).unwrap();
+    assert_eq!(
+        stranded.epoch.0, 1,
+        "fixture must start in the crash-stranded pre-fork state"
+    );
+
+    // RESTART: hydration must detect the `fork-probe-` snapshot, restore the
+    // captured live state, and release the probe snapshot.
+    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    local
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate recovers the interrupted fork probe");
+
+    assert_eq!(
+        local_storage.get_group(&group_id).unwrap(),
+        live_group,
+        "hydrate must restore the pre-probe live state"
+    );
+    assert_eq!(
+        local.epoch(&group_id).unwrap().0,
+        2,
+        "the restored epoch must match the live state"
+    );
+    assert!(
+        !local_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .iter()
+            .any(|name| name.starts_with("fork-probe-")),
+        "the recovered fork-probe snapshot must be released"
+    );
+}

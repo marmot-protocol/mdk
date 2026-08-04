@@ -2058,6 +2058,47 @@ pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
     rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
+/// Recover the live state captured before a fork-recovery ordering-metadata
+/// probe that was interrupted by process termination.
+///
+/// [`Engine::probe_commit_ordering_metadata_for_recovery`] snapshots the live
+/// group, then rolls back to a retained fork snapshot to replay the probed
+/// commit against the correct pre-commit epoch. The [`SnapshotRollbackGuard`]
+/// restores the live state on the happy path and on in-process panics or async
+/// cancellation, but it cannot run on process termination. A surviving
+/// `fork-probe-` snapshot therefore always contains the newer live state that
+/// must win on the next open; the on-disk OpenMLS state is stranded at the
+/// rolled-back fork snapshot. More than one probe snapshot is not expected:
+/// fork probes are serialized per group and hydrate runs before any new work
+/// (the same invariant [`recover_interrupted_retained_anchor_probe`] relies
+/// on). If storage contains several, fail closed instead of guessing which
+/// live state is newest.
+///
+/// [`SnapshotRollbackGuard`]: crate::snapshot_guard::SnapshotRollbackGuard
+/// [`Engine::probe_commit_ordering_metadata_for_recovery`]: crate::message_processor::ingest::Engine::probe_commit_ordering_metadata_for_recovery
+pub(crate) fn recover_interrupted_fork_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<(), OpenMlsProjectionError> {
+    let probes = storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .into_iter()
+        .filter(|name| name.starts_with(FORK_PROBE_SNAPSHOT_PREFIX))
+        .collect::<Vec<_>>();
+
+    let Some(snapshot) = probes.first() else {
+        return Ok(());
+    };
+    if probes.len() != 1 {
+        return Err(OpenMlsProjectionError::Snapshot(
+            "multiple interrupted fork-recovery probes".into(),
+        ));
+    }
+
+    rollback_and_release_group_snapshot(storage, group_id, snapshot)
+}
+
 fn restore_live_message_and_queue_records<S: StorageProvider>(
     storage: &S,
     messages: &[MessageRecord],
@@ -3132,6 +3173,14 @@ fn retained_anchor_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String
 }
 
 const RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX: &str = "openmls-retained-probe-";
+
+/// Prefix for the transient snapshot created by
+/// [`crate::message_processor::ingest::Engine::probe_commit_ordering_metadata_for_recovery`]
+/// (the pairwise fork-resolution ordering-metadata probe). A surviving
+/// snapshot with this prefix identifies a probe interrupted by process
+/// termination; [`recover_interrupted_fork_probe`] restores the captured
+/// pre-probe live state before hydration loads MLS state.
+pub(crate) const FORK_PROBE_SNAPSHOT_PREFIX: &str = "fork-probe-";
 
 fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> String {
     let mut hasher = Sha256::new();

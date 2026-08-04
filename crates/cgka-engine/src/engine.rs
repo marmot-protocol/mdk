@@ -1285,6 +1285,14 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        // A fork-recovery ordering-metadata probe (pairwise fork resolution or
+        // the hydrate-time routing-state rebuild) snapshots the live group
+        // before rolling back to a retained fork snapshot. Process termination
+        // between the snapshot and the guard's `commit` strands the group at
+        // the rolled-back state; the surviving `fork-probe-` snapshot holds the
+        // live state that must win on reopen.
+        crate::openmls_projection::recover_interrupted_fork_probe(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = {

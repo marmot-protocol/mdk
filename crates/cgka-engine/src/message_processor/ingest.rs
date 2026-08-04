@@ -2322,7 +2322,8 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(mls_bytes);
         let digest = hasher.finalize();
         let probe_snapshot = format!(
-            "fork-probe-{}-{}",
+            "{}{}-{}",
+            crate::openmls_projection::FORK_PROBE_SNAPSHOT_PREFIX,
             source_epoch.0,
             hex::encode(&digest[..8])
         );
