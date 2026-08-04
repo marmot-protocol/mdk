@@ -189,12 +189,28 @@ impl ForkRecoveryManager {
             Err(e) => return Err(EngineError::Storage(e)),
         };
         storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
-        match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(EngineError::Storage(e)),
-        }
-        self.incumbents.remove(&key);
 
+        // Ordering rationale (recoverability). The displaced row is
+        // re-persisted BEFORE the recovery snapshot is released and before
+        // the in-memory incumbent is dropped. The rollback sweeps the
+        // incumbent's row away, so a failure between rollback and re-persist
+        // must stay retryable: with this order it returns `Err` while the
+        // snapshot is still retained and `self.incumbents` still holds the
+        // record that names it, so the caller fails closed and a later
+        // resolve can redo the rollback + re-persist. Releasing or forgetting
+        // first would lose the displaced branch permanently (row swept,
+        // snapshot gone, record gone). The in-memory removal is therefore the
+        // last step — the point of no return.
+        //
+        // The snapshot operations necessarily sit OUTSIDE any storage
+        // transaction: create/rollback/release drive their own SQLite
+        // transactions (see the boundary comment in
+        // `openmls_projection::apply_openmls_canonicalization_result_inner`).
+        // The re-persist is a single-row write and is already atomic on its
+        // own, so there is no multi-write group here worth wrapping in
+        // `with_transaction` — and this manager is generic over
+        // `MessageStorage`, which does not expose one.
+        //
         // Park the pairwise-losing incumbent `ConvergenceDeferred`, not
         // terminally `EpochInvalidated` — the mirror of the incumbent-wins
         // seam in `ingest_group_message`. The losing branch may still gain
@@ -217,6 +233,12 @@ impl ForkRecoveryManager {
             record.state = MessageState::ConvergenceDeferred;
             storage.put_message(&record)?;
         }
+
+        match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
+            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+            Err(e) => return Err(EngineError::Storage(e)),
+        }
+        self.incumbents.remove(&key);
 
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
