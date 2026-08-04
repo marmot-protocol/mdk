@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.91-bookworm AS builder
+
+WORKDIR /workspace
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --locked --release -p cgka-conformance-simulator \
+      --bin cgka-conformance-node --bin cgka-conformance-relay \
+    && mkdir -p /campaign-bin \
+    && cp target/release/cgka-conformance-node target/release/cgka-conformance-relay /campaign-bin/
+
+FROM debian:bookworm-slim
+
+# Campaign-only image. NET_ADMIN is granted per run, never baked into a
+# production service. The tools below implement explicit network and disk
+# fault actions from the versioned distributed manifest.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        iptables \
+        procps \
+        stress-ng \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /campaign-bin/cgka-conformance-node /usr/local/bin/
+COPY --from=builder /campaign-bin/cgka-conformance-relay /usr/local/bin/
+
+VOLUME ["/campaign"]
+CMD ["cgka-conformance-node"]
