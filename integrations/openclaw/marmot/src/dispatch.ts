@@ -286,7 +286,10 @@ function timelineMessageExceedsByteLimit(message: AgentControlTimelineMessage): 
  * Build the bounded conversation-history entry: drop oldest records first,
  * keep retained records in chronological order, and omit an oversized
  * remaining record rather than exceed the byte budget. Reports only aggregate
- * omitted/oversized counts (privacy-safe).
+ * omitted/oversized counts (privacy-safe). `oversized_message_count` counts
+ * every omitted record that is individually unrenderable — including records
+ * dropped by the count window, where size never drove the decision — matching
+ * the Hermes adapter's shared contract.
  */
 function boundTimelineContextEntry(history: AgentControlTimelineMessage[]) {
   const bounded = history.slice(-TIMELINE_CONTEXT_MESSAGE_LIMIT);
@@ -311,12 +314,9 @@ function boundTimelineContextEntry(history: AgentControlTimelineMessage[]) {
     if (timelineContextEntryBytes(payload) <= TIMELINE_CONTEXT_BYTE_LIMIT) {
       return timelineContextEntry(payload);
     }
-    const dropped = bounded.shift();
-    if (dropped === undefined) {
-      // The metadata-only envelope is intentionally tiny, so this is a
-      // defensive fallback rather than an expected path.
-      return timelineContextEntry(payload);
-    }
+    // Always defined: an empty `bounded` renders a metadata-only payload that
+    // fits the budget, so the check above returns before `shift` can drain it.
+    const dropped = bounded.shift() as AgentControlTimelineMessage;
     if (timelineMessageExceedsByteLimit(dropped)) {
       oversizedMessageCount += 1;
     }
@@ -493,6 +493,8 @@ export function createMarmotInboundDispatcher(
             recorded_at: message.recordedAt ?? 0,
             message_id_hex: message.messageIdHex,
           },
+          // Deliberately over-fetch beyond TIMELINE_CONTEXT_MESSAGE_LIMIT so
+          // the bounded entry can report an exact omitted_message_count.
           limit: 20,
         },
       );
