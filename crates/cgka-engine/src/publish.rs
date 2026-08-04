@@ -524,20 +524,27 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Best-effort by construction: this runs after the outcome is durable, so
     /// a transient backend lock here must not fail an already-committed
-    /// confirm/rollback. Losing the signal only defers the release to the
-    /// runtime's next pass over this group; the intents stay durable.
+    /// confirm/rollback. Skipping the schedule is not free, though: the intents
+    /// stay durable, but their release then waits until unrelated traffic
+    /// happens to schedule this group or the process restarts (session-open
+    /// hydration re-arms from the same durable queue). So a failed read — which
+    /// cannot prove the queue is empty — schedules the drain anyway; a spurious
+    /// no-op pass is cheaper than a stranded payload.
     fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
         match self.storage.list_queued_outbound_intents(group_id) {
             Ok(retained) if !retained.is_empty() => {
                 self.schedule_pending_convergence_group(group_id);
             }
             Ok(_) => {}
-            Err(error) => tracing::warn!(
-                target: "cgka_engine::publish",
-                method = "schedule_drain_for_retained_outbound_intents",
-                transient = error.is_transient(),
-                "deferred retained-intent drain scheduling after a publish outcome"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cgka_engine::publish",
+                    method = "schedule_drain_for_retained_outbound_intents",
+                    transient = error.is_transient(),
+                    "retained-intent read failed after a publish outcome; scheduling the drain anyway"
+                );
+                self.schedule_pending_convergence_group(group_id);
+            }
         }
     }
 }

@@ -964,6 +964,7 @@ struct FaultStorage {
     fault: ProcessedFault,
     lifecycle_fault: ProcessedFault,
     disband_request_fault: ProcessedFault,
+    queued_intent_list_fault: ProcessedFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -1065,6 +1066,11 @@ impl OutboundIntentStorage for FaultStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        if self.queued_intent_list_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected retained-intent read lock".into(),
+            ));
+        }
         self.inner.list_queued_outbound_intents(group_id)
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
@@ -1417,6 +1423,7 @@ fn build_fault_engine(
         fault,
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1438,6 +1445,7 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
         fault: ProcessedFault::default(),
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: disband_request_fault.clone(),
+        queued_intent_list_fault: ProcessedFault::default(),
     })
     .identity(pad32(b"alice-disband-rollback"))
     .account_identity_proof_signer(proof_signer(b"alice-disband-rollback"))
@@ -1525,6 +1533,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         fault: ProcessedFault::default(),
         lifecycle_fault: lifecycle_fault.clone(),
         disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
     })
     .identity(pad32(b"alice-maintenance"))
     .account_identity_proof_signer(proof_signer(b"alice-maintenance"))
@@ -1859,6 +1868,80 @@ async fn resolving_a_publish_schedules_the_drain_for_retained_app_messages() {
             alice.drain_pending_convergence_groups().contains(&group_id),
             "resolving the publish (confirmed = {resolve_by_confirming}) must schedule the drain \
              for the retained app message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_intent_queue_still_schedules_the_drain() {
+    // The drain scheduling above is driven by a read of the durable intent
+    // queue, and that read can fail transiently. A failed read cannot prove
+    // the queue is empty — and no other trigger exists in a running process,
+    // so a group skipped here holds its retained payload until unrelated
+    // traffic touches it or the process restarts. Unknown must therefore be
+    // treated as retained.
+    for resolve_by_confirming in [true, false] {
+        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let queued_intent_list_fault = ProcessedFault::default();
+        let mut alice = EngineBuilder::new(FaultStorage {
+            inner,
+            fault: ProcessedFault::default(),
+            lifecycle_fault: ProcessedFault::default(),
+            disband_request_fault: ProcessedFault::default(),
+            queued_intent_list_fault: queued_intent_list_fault.clone(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+        let mut bob = build(b"bob");
+        let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("self-update stages a group evolution")
+        };
+        let payload = app_payload_for(&alice, "retained behind a locked queue read");
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        // Clear anything the setup scheduled, so the assertion below can only
+        // observe a schedule the publish outcome itself made.
+        let _ = alice.drain_pending_convergence_groups();
+
+        // Arm only after the send: queueing the intent reads the queue too.
+        queued_intent_list_fault.arm(1);
+        if resolve_by_confirming {
+            alice
+                .confirm_published(pending)
+                .await
+                .expect("a failed retained-intent read must not fail a durable confirm");
+        } else {
+            alice
+                .publish_failed(pending)
+                .await
+                .expect("a failed retained-intent read must not fail a durable rollback");
+        }
+
+        assert!(
+            alice.drain_pending_convergence_groups().contains(&group_id),
+            "an unreadable intent queue (confirmed = {resolve_by_confirming}) must schedule the \
+             drain anyway; nothing else will"
         );
     }
 }
