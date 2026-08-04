@@ -1421,6 +1421,12 @@ impl TuiApp {
             }
             PopupSubmit::AddUserToChat { group_id, pubkey } => {
                 self.add_group_member(&group_id, pubkey)?;
+                // A search opened from group detail returns there, because the
+                // point of adding from that screen is to watch the member land in
+                // its list. A browse search instead reveals the chat it changed.
+                if self.search_add_target().is_some() {
+                    return self.return_to_group_detail(&group_id);
+                }
                 self.select_chat_by_group_id(&group_id)?;
                 self.reveal_chat_from_search();
                 Ok(())
@@ -1462,6 +1468,7 @@ impl TuiApp {
                     view.select_down();
                 }
             }
+            KeyCode::Char('a') => self.search_for_member_to_add(),
             KeyCode::Char('A') => self.open_add_member_popup(),
             KeyCode::Char('R') => self.open_rename_group_popup(),
             KeyCode::Char('x') => self.open_remove_member_popup(),
@@ -1492,6 +1499,29 @@ impl TuiApp {
         }
         self.screen = Screen::Main;
         self.focus = Focus::Chats;
+    }
+
+    /// The group an open user search was opened to add someone to, if that is why
+    /// it is open. `None` for a browse search, which has to ask.
+    fn search_add_target(&self) -> Option<&str> {
+        match &self.user_search.as_ref()?.purpose {
+            UserSearchPurpose::AddToGroup { group_id, .. } => Some(group_id),
+            UserSearchPurpose::Browse => None,
+        }
+    }
+
+    /// Search for someone to add to the open group (`a`), for when the pubkey is
+    /// not already in hand — `A` is the paste-a-pubkey path. The group-detail
+    /// view is left loaded, so returning to it needs no reload.
+    fn search_for_member_to_add(&mut self) {
+        let Some(view) = &self.group_detail else {
+            return;
+        };
+        let purpose = UserSearchPurpose::AddToGroup {
+            group_id: view.group_id.clone(),
+            group_name: view.name.clone(),
+        };
+        self.open_user_search_with(None, purpose);
     }
 
     fn open_add_member_popup(&mut self) {
@@ -1680,6 +1710,19 @@ impl TuiApp {
     /// query field or the result list handles the key per the screen's focus.
     pub(crate) fn handle_user_search_key(&mut self, key: KeyEvent) -> TuiResult<()> {
         if key.code == KeyCode::Esc {
+            // A search opened from group detail goes back there rather than to the
+            // main view, so `Esc` undoes the step that opened it. The refresh that
+            // return schedules can fail its account precondition, and a key handler
+            // reports rather than propagates: a `?` here would leave `run()` and end
+            // the session over a status-line error. One assignment covers both
+            // outcomes so the report cannot be overwritten by the settled status.
+            if let Some(group_id) = self.search_add_target().map(str::to_owned) {
+                self.status = match self.return_to_group_detail(&group_id) {
+                    Ok(()) => "group detail".to_owned(),
+                    Err(err) => format!("error: {err}"),
+                };
+                return Ok(());
+            }
             self.leave_screen();
             return Ok(());
         }
@@ -1794,16 +1837,28 @@ impl TuiApp {
     /// preselecting the open chat when one is loaded. `Enter` chains into the
     /// add-user confirm for the highlighted chat; `Esc` closes with no side
     /// effects. With no chats a status-line notice explains.
+    ///
+    /// A search opened from group detail already has its target, so it skips the
+    /// picker and confirms against that group directly.
     fn open_add_user_to_chat_popup(&mut self) {
-        let Some(result) = self
-            .user_search
-            .as_ref()
-            .and_then(UserSearchView::selected_result)
-        else {
+        let Some(view) = self.user_search.as_ref() else {
+            return;
+        };
+        let Some(result) = view.selected_result() else {
             return;
         };
         let pubkey = result.pubkey.clone();
         let label = result.display_label();
+        if let UserSearchPurpose::AddToGroup {
+            group_id,
+            group_name,
+        } = &view.purpose
+        {
+            self.popup = Some(Popup::confirm_add_user_to_chat(
+                group_id, group_name, &pubkey, &label,
+            ));
+            return;
+        }
         if self.chats.is_empty() {
             self.status = "no chats to add a user to; c starts a new chat".to_owned();
             return;

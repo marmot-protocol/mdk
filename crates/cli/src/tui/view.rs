@@ -364,6 +364,83 @@ pub(crate) fn row_label_style(selected: bool, color: Color) -> Style {
     }
 }
 
+/// A pane body together with the index of the body line a viewport has to keep
+/// visible: the *last* line of the selected row, since a row can span several
+/// lines. `None` when the body carries no selection at all.
+///
+/// Bodies are built at full length regardless of the pane's height, so without
+/// this anchor a pane silently hides its own selection once the body outgrows
+/// the area — the marker and the highlight both live inside the row.
+pub(crate) struct PaneBody {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) anchor: Option<usize>,
+}
+
+impl PaneBody {
+    /// Record the line about to be pushed as the selection anchor. Called at the
+    /// point a row is emitted, so the anchor cannot drift out of step with the
+    /// layout the way a recomputed index would.
+    fn anchor_next(&mut self) {
+        self.anchor = Some(self.lines.len());
+    }
+
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn extend(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        self.lines.extend(lines);
+    }
+}
+
+/// The vertical scroll offset, in post-wrap rows, that a `height`-row viewport
+/// `width` cells wide needs for `anchor` to be its last visible row. Zero
+/// whenever the content through the anchor already fits, so a pane that fits
+/// never scrolls, and moving the selection back up unwinds the offset.
+///
+/// The measurement runs through the same word wrapper the renderer uses and
+/// `Paragraph::scroll` counts post-wrap rows, so the offset cannot disagree with
+/// what actually gets drawn — which is the failure mode a hand-rolled row count
+/// would have.
+fn selection_scroll_offset(
+    lines: &[Line<'static>],
+    anchor: Option<usize>,
+    width: u16,
+    height: u16,
+) -> u16 {
+    let Some(anchor) = anchor else {
+        return 0;
+    };
+    let Some(through_anchor) = lines.get(..=anchor) else {
+        return 0;
+    };
+    let rows = Paragraph::new(through_anchor.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(height)
+}
+
+/// A wrapped body paragraph scrolled so its selection anchor stays visible in an
+/// `inner`-sized viewport. Selection-bearing bodies go through here rather than
+/// building a `Paragraph` directly, because an unscrolled render pins the offset
+/// at 0 and draws the selection off the bottom of the viewport.
+fn selection_paragraph(body: PaneBody, inner: Rect) -> Paragraph<'static> {
+    let offset = selection_scroll_offset(&body.lines, body.anchor, inner.width, inner.height);
+    Paragraph::new(body.lines)
+        .wrap(Wrap { trim: false })
+        .scroll((offset, 0))
+}
+
+/// Render a selection-bearing pane body inside `block`, scrolled to its
+/// selection. The viewport is the block's inner rect, so the borders are
+/// accounted for wherever this is called.
+fn render_selection_pane(frame: &mut Frame, area: Rect, block: Block<'_>, body: PaneBody) {
+    let inner = block.inner(area);
+    frame.render_widget(selection_paragraph(body, inner).block(block), area);
+}
+
 pub(crate) fn panel_block(title: &str, focused: bool) -> Block<'_> {
     let style = if focused {
         Style::default().fg(FOCUS_ACCENT)
@@ -402,8 +479,11 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 /// typed-token logout body renders red (irreversible key destruction); other
 /// bodies keep the default foreground. The `Image` variant renders through
 /// `render_image_popup`, so it has no body here.
-pub(crate) fn popup_body_lines(popup: &Popup) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+pub(crate) fn popup_body_lines(popup: &Popup) -> PaneBody {
+    let mut pane = PaneBody {
+        lines: Vec::new(),
+        anchor: None,
+    };
     match popup {
         Popup::Text {
             purpose,
@@ -416,20 +496,20 @@ pub(crate) fn popup_body_lines(popup: &Popup) -> Vec<Line<'static>> {
             } else {
                 Style::default()
             };
-            lines.extend(
+            pane.extend(
                 body.iter()
                     .map(|line| Line::from(Span::styled(terminal_safe_text(line), style))),
             );
-            lines.push(input_cursor_line("> ", input));
+            pane.push(input_cursor_line("> ", input));
         }
-        Popup::Confirm { body, .. } => lines.extend(body.iter().map(|line| {
+        Popup::Confirm { body, .. } => pane.extend(body.iter().map(|line| {
             Line::from(Span::styled(
                 terminal_safe_text(line),
                 Style::default().fg(Color::Yellow),
             ))
         })),
         Popup::Card { body, .. } => {
-            lines.extend(body.iter().map(|line| Line::from(terminal_safe_text(line))))
+            pane.extend(body.iter().map(|line| Line::from(terminal_safe_text(line))))
         }
         Popup::Picker {
             items, selected, ..
@@ -437,7 +517,10 @@ pub(crate) fn popup_body_lines(popup: &Popup) -> Vec<Line<'static>> {
             for (index, item) in items.iter().enumerate() {
                 let is_selected = index == *selected;
                 let marker = if is_selected { ">" } else { " " };
-                lines.push(Line::from(vec![
+                if is_selected {
+                    pane.anchor_next();
+                }
+                pane.push(Line::from(vec![
                     Span::raw(format!("{marker} ")),
                     Span::styled(
                         shorten(&terminal_safe_text(&item.label), 40),
@@ -449,7 +532,7 @@ pub(crate) fn popup_body_lines(popup: &Popup) -> Vec<Line<'static>> {
         // Rendered by `render_image_popup`, not here.
         Popup::Image { .. } => {}
     }
-    lines
+    pane
 }
 
 /// The content-sized, exactly-centered rect for a popup: a per-variant width
@@ -460,7 +543,7 @@ pub(crate) fn popup_body_lines(popup: &Popup) -> Vec<Line<'static>> {
 pub(crate) fn popup_rect(popup: &Popup, area: Rect) -> Rect {
     let width = popup_width(popup).min(area.width);
     let inner_width = width.saturating_sub(2).max(1);
-    let body_rows = Paragraph::new(popup_body_lines(popup))
+    let body_rows = Paragraph::new(popup_body_lines(popup).lines)
         .wrap(Wrap { trim: false })
         .line_count(inner_width);
     let body_rows = u16::try_from(body_rows).unwrap_or(u16::MAX);
@@ -831,9 +914,18 @@ impl TuiApp {
                 })
                 .collect()
         };
-        frame.render_widget(
+        // Drive the list with a ListState synced to the selection so the
+        // highlighted account always scrolls into view, exactly as the chats
+        // sidebar does. A plain `render_widget` pins the offset at 0, which
+        // hides the marker once the account list outgrows the card.
+        let mut state = ListState::default();
+        if !self.accounts.is_empty() {
+            state.select(Some(self.picker_selection.min(self.accounts.len() - 1)));
+        }
+        frame.render_stateful_widget(
             List::new(items).block(panel_block("Select Account", true)),
             area,
+            &mut state,
         );
     }
 
@@ -875,7 +967,9 @@ impl TuiApp {
         // static keymap with a persistent "what Enter does, Esc clears" hint,
         // recomputed here each frame so it survives later status events.
         let spans = match (self.screen, self.user_search.as_ref()) {
-            (Screen::UserSearch, Some(view)) => keymap_hint_spans(user_search_hint(view.focus)),
+            (Screen::UserSearch, Some(view)) => {
+                keymap_hint_spans(&user_search_hint(view.focus, &view.purpose))
+            }
             (Screen::Main, _) => {
                 match armed_interaction_hint(self.input.value(), self.selected_timeline_row()) {
                     Some(armed) => armed_hint_spans(&armed),
@@ -1168,8 +1262,10 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner);
+        // The rect is content-sized, so this only scrolls when the body could not
+        // fit the screen — a picker with more rows than the terminal is tall.
         frame.render_widget(
-            Paragraph::new(popup_body_lines(popup)).wrap(Wrap { trim: false }),
+            selection_paragraph(popup_body_lines(popup), rows[0]),
             rows[0],
         );
         frame.render_widget(
@@ -1189,11 +1285,11 @@ impl TuiApp {
             ])
             .split(area);
         match self.group_detail.as_ref() {
-            Some(view) => frame.render_widget(
-                Paragraph::new(group_detail_lines(Some(view)))
-                    .block(panel_block("Group Detail", true))
-                    .wrap(Wrap { trim: false }),
+            Some(view) => render_selection_pane(
+                frame,
                 root[0],
+                panel_block("Group Detail", true),
+                group_detail_lines(Some(view)),
             ),
             None => {
                 render_loading_screen(frame, root[0], "Group Detail", "loading group detail...")
@@ -1206,11 +1302,11 @@ impl TuiApp {
     fn render_user_search(&self, frame: &mut Frame) {
         let root = screen_body_layout(frame.area());
         match self.user_search.as_ref() {
-            Some(view) => frame.render_widget(
-                Paragraph::new(user_search_lines(view, self.searching_users.is_some()))
-                    .block(panel_block("User Search", true))
-                    .wrap(Wrap { trim: false }),
+            Some(view) => render_selection_pane(
+                frame,
                 root[0],
+                panel_block("User Search", true),
+                user_search_lines(view, self.searching_users.is_some()),
             ),
             None => render_loading_screen(frame, root[0], "User Search", "loading user search..."),
         }
@@ -1221,11 +1317,11 @@ impl TuiApp {
     fn render_profile(&self, frame: &mut Frame) {
         let root = screen_body_layout(frame.area());
         match self.profile_view.as_ref() {
-            Some(view) => frame.render_widget(
-                Paragraph::new(profile_lines(view))
-                    .block(panel_block("Profile", true))
-                    .wrap(Wrap { trim: false }),
+            Some(view) => render_selection_pane(
+                frame,
                 root[0],
+                panel_block("Profile", true),
+                profile_lines(view),
             ),
             None => render_loading_screen(frame, root[0], "Profile", "loading profile..."),
         }
@@ -1326,25 +1422,31 @@ pub(crate) fn input_cursor_line(prefix: &str, input: &Input) -> Line<'static> {
 /// The group-detail screen body: name and description header, the member list
 /// with admin/you badges and a selection highlight, then the relay hints. Every
 /// name, npub, and relay passes through `terminal_safe_text`.
-pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> Vec<Line<'static>> {
+pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> PaneBody {
     let Some(view) = view else {
-        return vec![Line::from("loading group detail...")];
+        return PaneBody {
+            lines: vec![Line::from("loading group detail...")],
+            anchor: None,
+        };
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Group ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            shorten(&terminal_safe_text(&view.name), 48),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ])];
+    let mut body = PaneBody {
+        lines: vec![Line::from(vec![
+            Span::styled("Group ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                shorten(&terminal_safe_text(&view.name), 48),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])],
+        anchor: None,
+    };
     if !view.description.is_empty() {
-        lines.push(Line::from(Span::styled(
+        body.push(Line::from(Span::styled(
             terminal_safe_text(&view.description),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Members ({})", view.members.len())));
+    body.push(Line::from(""));
+    body.push(Line::from(format!("Members ({})", view.members.len())));
     for (index, member) in view.members.iter().enumerate() {
         let is_selected = index == view.selected;
         let marker = if is_selected { ">" } else { " " };
@@ -1361,29 +1463,35 @@ pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> Vec<Line<'st
         if member.is_self {
             spans.push(Span::styled(" (you)", Style::default().fg(Color::DarkGray)));
         }
-        lines.push(Line::from(spans));
+        if is_selected {
+            body.anchor_next();
+        }
+        body.push(Line::from(spans));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Relays ({})", view.relays.len())));
+    body.push(Line::from(""));
+    body.push(Line::from(format!("Relays ({})", view.relays.len())));
     for relay in &view.relays {
-        lines.push(Line::from(format!("  {}", terminal_safe_text(relay))));
+        body.push(Line::from(format!("  {}", terminal_safe_text(relay))));
     }
-    lines
+    body
 }
 
 /// The user-search screen body: the query field (with the cursor cell in query
 /// focus) then the result rows, each showing the display label, a shortened
 /// npub, and the `matched_field · match_quality · provenance` attribution. Every
 /// name and npub passes through `terminal_safe_text`.
-pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<Line<'static>> {
+pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> PaneBody {
     let query_focused = view.focus == UserSearchFocus::Query;
-    let mut lines = input_field_lines(
-        &view.query.display(),
-        view.query.cursor(),
-        query_focused,
-        Some(Span::styled("search ", Style::default().fg(FOCUS_ACCENT))),
-    );
-    lines.push(Line::from(""));
+    let mut body = PaneBody {
+        lines: input_field_lines(
+            &view.query.display(),
+            view.query.cursor(),
+            query_focused,
+            Some(Span::styled("search ", Style::default().fg(FOCUS_ACCENT))),
+        ),
+        anchor: None,
+    };
+    body.push(Line::from(""));
     if view.results.is_empty() {
         // Distinguish an in-flight search (yellow) from a settled empty result
         // (dark gray), keyed off the async search flag.
@@ -1392,10 +1500,10 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
         } else {
             ("no results — type a query and press Enter", Color::DarkGray)
         };
-        lines.push(Line::from(Span::styled(text, Style::default().fg(color))));
-        return lines;
+        body.push(Line::from(Span::styled(text, Style::default().fg(color))));
+        return body;
     }
-    lines.push(Line::from(format!("Results ({})", view.results.len())));
+    body.push(Line::from(format!("Results ({})", view.results.len())));
     let results_focused = view.focus == UserSearchFocus::Results;
     for (index, result) in view.results.iter().enumerate() {
         let is_selected = results_focused && index == view.selected;
@@ -1419,13 +1527,18 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        lines.push(Line::from(spans));
+        body.push(Line::from(spans));
         let provenance = if result.radius == OFF_GRAPH_SEARCH_RADIUS {
             "discovery".to_owned()
         } else {
             format!("radius {}", result.radius)
         };
-        lines.push(Line::from(Span::styled(
+        // Anchor on the attribution line rather than the label above it, so
+        // scrolling to the last result brings the whole two-line row into view.
+        if is_selected {
+            body.anchor_next();
+        }
+        body.push(Line::from(Span::styled(
             format!(
                 "    {} · {} · {provenance}",
                 terminal_safe_text(&result.matched_field),
@@ -1434,24 +1547,28 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines
+    body
 }
 
 /// The own-profile screen body: the npub header, the six editable fields with a
 /// selection highlight (unset fields dimmed), then the follow list. Every value
 /// passes through `terminal_safe_text`; picture URLs render as literal text.
-pub(crate) fn profile_lines(view: &ProfileView) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Profile ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                shorten(&terminal_safe_text(&view.npub), 32),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from("Fields"),
-    ];
+/// Fields and follows share one selection index, so both can be the anchor.
+pub(crate) fn profile_lines(view: &ProfileView) -> PaneBody {
+    let mut body = PaneBody {
+        lines: vec![
+            Line::from(vec![
+                Span::styled("Profile ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    shorten(&terminal_safe_text(&view.npub), 32),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from("Fields"),
+        ],
+        anchor: None,
+    };
     for (index, field) in ProfileField::ALL.iter().enumerate() {
         let is_selected = index == view.selected;
         let marker = if is_selected { ">" } else { " " };
@@ -1459,7 +1576,10 @@ pub(crate) fn profile_lines(view: &ProfileView) -> Vec<Line<'static>> {
             Some(value) => Span::raw(terminal_safe_text(value)),
             None => Span::styled("(unset)".to_owned(), Style::default().fg(Color::DarkGray)),
         };
-        lines.push(Line::from(vec![
+        if is_selected {
+            body.anchor_next();
+        }
+        body.push(Line::from(vec![
             Span::raw(format!("{marker} ")),
             Span::styled(
                 format!("{}: ", field.label()),
@@ -1468,12 +1588,15 @@ pub(crate) fn profile_lines(view: &ProfileView) -> Vec<Line<'static>> {
             value_span,
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Follows ({})", view.follows.len())));
+    body.push(Line::from(""));
+    body.push(Line::from(format!("Follows ({})", view.follows.len())));
     for (index, follow) in view.follows.iter().enumerate() {
         let is_selected = ProfileField::ALL.len() + index == view.selected;
         let marker = if is_selected { ">" } else { " " };
-        lines.push(Line::from(vec![
+        if is_selected {
+            body.anchor_next();
+        }
+        body.push(Line::from(vec![
             Span::raw(format!("{marker} ")),
             Span::styled(
                 shorten(&terminal_safe_text(follow), 28),
@@ -1481,7 +1604,7 @@ pub(crate) fn profile_lines(view: &ProfileView) -> Vec<Line<'static>> {
             ),
         ]));
     }
-    lines
+    body
 }
 
 /// The relay-health screen body: a daemon-state and health-summary header, then

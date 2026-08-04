@@ -847,9 +847,9 @@ impl Popup {
         }
     }
 
-    /// The add-user-to-chat confirm. Built by the group picker's `Enter` (which
-    /// chose the target chat), so the guarding step and its wording live in one
-    /// place.
+    /// The add-user-to-chat confirm, so the guarding step and its wording live in
+    /// one place however the target was chosen: the group picker's `Enter` in a
+    /// browse search, or the group a group-detail search was aimed at.
     pub(crate) fn confirm_add_user_to_chat(
         group_id: &str,
         chat_label: &str,
@@ -1081,8 +1081,9 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "Messages: j/k or arrows move; PageUp/PageDown page; G/g newest/oldest.",
         "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
-        "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
+        "Group detail: j/k move; a search for a member to add; A add by pubkey; x remove; P promote; R rename; L leave.",
         "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat; f follow; x unfollow.",
+        "A search opened by group-detail a adds to that group and Esc returns to it.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",
@@ -1319,15 +1320,34 @@ impl UserSearchResultRow {
     }
 }
 
+/// Why the user-search screen was opened. `Browse` is the standalone search
+/// (`s` on the main view, `/users <query>`), where `a` still has to ask which
+/// chat to add the found user to. `AddToGroup` is the group-detail `a` flow: the
+/// target group is already known, so `a` confirms against it directly and the
+/// screen returns to that group's detail when the flow ends.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum UserSearchPurpose {
+    #[default]
+    Browse,
+    AddToGroup {
+        group_id: String,
+        /// Carried so the confirm can name the group without the group-detail
+        /// view still being loaded.
+        group_name: String,
+    },
+}
+
 /// The user-search screen state: a reusable query [`Input`], the one-shot
-/// results, the selection, and which region has focus. `users search` is a
-/// one-shot call (no streaming), so the results only change on `Enter`.
+/// results, the selection, which region has focus, and why the screen was
+/// opened. `users search` is a one-shot call (no streaming), so the results only
+/// change on `Enter`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserSearchView {
     pub(crate) query: Input,
     pub(crate) results: Vec<UserSearchResultRow>,
     pub(crate) selected: usize,
     pub(crate) focus: UserSearchFocus,
+    pub(crate) purpose: UserSearchPurpose,
 }
 
 impl Default for UserSearchView {
@@ -1337,6 +1357,7 @@ impl Default for UserSearchView {
             results: Vec::new(),
             selected: 0,
             focus: UserSearchFocus::Query,
+            purpose: UserSearchPurpose::Browse,
         }
     }
 }
@@ -1779,14 +1800,40 @@ fn build_relay_health_rows(spread: &Value, sync: &Value) -> Vec<RelayHealthRow> 
 }
 
 /// The user-search hints line, keyed by the screen's internal focus (the shared
-/// `hints_line` cannot see it, so `render_hints` calls this for the search screen).
-pub(crate) fn user_search_hint(focus: UserSearchFocus) -> &'static str {
-    match focus {
-        UserSearchFocus::Query => "type query  Enter search  Down results  Esc back",
-        UserSearchFocus::Results => {
+/// `hints_line` cannot see it, so `render_hints` calls this for the search
+/// screen) and by why the screen was opened. A search aimed at a group names that
+/// group, because `a` adds to it directly instead of asking which chat, and
+/// nothing else on the screen says which group that is.
+pub(crate) fn user_search_hint(focus: UserSearchFocus, purpose: &UserSearchPurpose) -> String {
+    match (focus, purpose) {
+        (UserSearchFocus::Query, _) => USER_SEARCH_QUERY_HINT.to_owned(),
+        (UserSearchFocus::Results, UserSearchPurpose::Browse) => {
             "j/k move  Enter profile  f follow  x unfollow  c chat  a add  i query  Esc back"
+                .to_owned()
         }
+        // The add segment leads, so it survives truncation on a narrow terminal.
+        (UserSearchFocus::Results, UserSearchPurpose::AddToGroup { group_name, .. }) => format!(
+            "j/k move  a add to {}  Enter profile  f follow  x unfollow  c chat  i query  Esc back",
+            hint_safe_name(group_name)
+        ),
     }
+}
+
+/// The query-focus search hint, shared so `hints_line`'s fallback arm and
+/// `user_search_hint` cannot drift apart.
+const USER_SEARCH_QUERY_HINT: &str = "type query  Enter search  Down results  Esc back";
+
+/// A name made safe to interpolate into a keymap hint: terminal-safe, collapsed
+/// to single spaces, and shortened. The collapse matters as much as the
+/// filtering — `keymap_hint_spans` splits segments on a double space and boxes a
+/// segment's leading token when it looks like a key, so a group named
+/// `"Ops  Esc quit"` would otherwise render a convincing fake `Esc` keycap.
+fn hint_safe_name(name: &str) -> String {
+    let collapsed = terminal_safe_text(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    shorten(&collapsed, 16)
 }
 
 /// The three states of the login screen: the create/login menu (no accounts),
@@ -2054,12 +2101,12 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
         }
         Screen::Login(LoginMode::NsecEntry) => "Enter submit  Esc back",
         Screen::GroupDetail => {
-            "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
+            "j/k move  a search+add  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
         }
         // The search screen has an internal focus the shared signature cannot
         // carry; `render_hints` calls `user_search_hint` instead. This arm keeps
         // `hints_line` total and returns the query-focus hint as the fallback.
-        Screen::UserSearch => user_search_hint(UserSearchFocus::Query),
+        Screen::UserSearch => USER_SEARCH_QUERY_HINT,
         Screen::Profile => "j/k move  Enter edit  f follow  x unfollow  Esc back",
         Screen::RelayHealth => "r refresh  j/k scroll  Esc back",
         Screen::Main => match focus {
@@ -2201,8 +2248,9 @@ fn looks_like_key(token: &str) -> bool {
 /// Render a per-focus keymap hint string (`"j/k move  Enter open  ..."`) as
 /// keycap+label spans: each `"  "`-separated segment becomes a boxed keycap for
 /// its leading key token followed by a dim label. A segment whose leading token
-/// is prose (not a key) renders entirely dim. The hint strings are trusted
-/// static keymaps, so no terminal-safe filtering is needed.
+/// is prose (not a key) renders entirely dim. The hint strings are keymaps this
+/// crate writes; the one interpolated value (the group a search is adding to)
+/// goes through `hint_safe_name` first, so nothing here has to filter.
 pub(crate) fn keymap_hint_spans(text: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, segment) in text.split("  ").filter(|s| !s.is_empty()).enumerate() {
