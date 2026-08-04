@@ -321,6 +321,11 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
 
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -328,17 +333,10 @@ jobs:
         # Multi-minute generated reliability batches and the adversarial
         # campaign run in the scheduled Simulator Nightly workflow. Independent
         # convergence checks run in their dedicated fast gate below.
-        run: |
-          cargo nextest run -p cgka-conformance-simulator --locked --profile ci \
-            -E 'not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate) and not (binary(canonical_scenarios) & (test(=convergence_chaos_family_generates_specs_with_semantic_expectations) | test(=convergence_chaos_family_seed_changes_scenarios) | test(=convergence_e2e_delivery_family_runs_generated_variants)))'
+        run: just simulator-smoke
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
-
-      - name: Install just
-        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
-        with:
-          tool: just
 
       - name: Verify convergence with independent models
         run: just convergence-verification-ci

@@ -7,10 +7,11 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
-  group: simulator-nightly
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,9 +53,7 @@ jobs:
       - name: Run complete simulator suite
         # Adversarial campaigns and independent convergence checks run below
         # with their required feature sets; exclude only those duplicates here.
-        run: |
-          cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked --profile ci \
-            -E 'not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate)'
+        run: just simulator-full
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
@@ -82,3 +81,15 @@ jobs:
           name: cgka-conformance-simulator-nightly-reports
           path: target/cgka-conformance-simulator-nightly-reports
           if-no-files-found: warn
+
+      - name: Report nightly failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          run_date="$(date -u +%F)"
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Simulator nightly failed (${run_date})" \
+            --body "The simulator nightly failed. Run: ${RUN_URL}"
