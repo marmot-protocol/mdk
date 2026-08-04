@@ -1201,6 +1201,37 @@ impl NodeProcess {
     }
 }
 
+fn decode_node_response(
+    line: &str,
+    request_id: &str,
+) -> Result<NodeResponseV1, ProcessOrchestratorError> {
+    let raw: serde_json::Value = serde_json::from_str(line).map_err(environment_error)?;
+    let protocol = raw.get("protocol").and_then(serde_json::Value::as_str);
+    let response_request_id = raw.get("request_id").and_then(serde_json::Value::as_str);
+    if protocol != Some(NODE_PROTOCOL_VERSION) || response_request_id != Some(request_id) {
+        return Err(ProcessOrchestratorError::new(
+            "node_protocol_mismatch",
+            "node response did not match the request",
+        ));
+    }
+    if raw
+        .pointer("/body/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("observation")
+        && raw
+            .pointer("/body/observation/schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(NODE_OBSERVATION_SCHEMA_VERSION)
+    {
+        return Err(ProcessOrchestratorError::new(
+            "node_observation_schema_mismatch",
+            "node observation schema is unsupported",
+        ));
+    }
+    let response: NodeResponseV1 = serde_json::from_value(raw).map_err(environment_error)?;
+    Ok(response)
+}
+
 fn process_subject_descriptor() -> SubjectDescriptor {
     SubjectDescriptor {
         adapter: "marmot_app_process".into(),
