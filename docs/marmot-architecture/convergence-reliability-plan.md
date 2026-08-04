@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-03
+updated: 2026-08-04
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -125,7 +125,7 @@ The baseline is useful scaffolding, but it is not yet the target reliability lab
 | 2. Scenario IR and retained relays | One adapter-neutral DSL/IR plus realistic offline/history sync | complete | One compiled case runs against reference, engine, and retained-relay adapters |
 | 3. Adversarial campaigns | Sustained real-world workloads, resource sweeps, incident import | complete | Headline workload families produce bounded, diagnosable results |
 | 4. Independent verification | Reference model, liveness model, mutation adequacy, protocol decision gate | complete | Model and tests detect seeded policy/lifecycle defects |
-| 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | not-started | The same case agrees in-process and across N processes |
+| 5. App and process simulation | Real projections and lifecycle in one or many isolated runtimes | complete | The same case agrees in-process and across N processes |
 | 6. Distributed campaigns | Container/VM/network/disk/version hardening and campaign operations | not-started | Repeatable soak and release campaigns retain actionable artifacts |
 
 ## Milestone 0: Assurance Foundation
@@ -956,7 +956,43 @@ just fast-ci
 
 ## Milestone 6: Distributed Campaigns And Operations
 
-### 6.1 Container and VM execution
+Milestone 6 strengthens and quantifies the assurance case; it does not claim an exhaustive proof that every possible
+production execution is correct. Completion means that the declared decision routes, adapters, failure dimensions,
+and bounded state spaces have evidence, and that residual assumptions and untested surfaces are explicit. Formal
+models prove the rules represented in those models, while campaigns test the implementation routes actually placed
+under observation. Neither substitutes for checking that every production decision route is represented.
+
+[MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) demonstrated the missing dimension this milestone must
+close: the same same-epoch conflict could be routed through pairwise fork recovery on a committing member and
+distributed convergence on an observing member, with the two seams applying different winner rules. A real-relay,
+four-VM soak found equal terminal epochs on incompatible cryptographic lineages. The existing bounded reference model
+represented one canonical selector but did not represent that route asymmetry. Milestone 6 therefore treats
+decision-route equivalence and cryptographic interoperability as first-class campaign properties rather than assuming
+that scaling the existing corpus is sufficient.
+
+### 6.1 Decision-route assurance closure
+
+- [ ] Inventory every production path that selects, rejects, defers, invalidates, replays, or applies a competing
+  commit, and map each site to the adopted canonical rule, reference-model transition, mutation sentinel, and campaign
+  family that exercises it.
+- [ ] Define and test route equivalence: for the same authenticated dependency-closed input set, the final canonical
+  result does not depend on whether input first passes through pairwise fork recovery, ordinary ingest, stored
+  convergence, retained-history replay, or crash/restart recovery.
+- [ ] Promote the #1236 incident into a permanent synthetic regression family with at least four participants,
+  simultaneous same-source-epoch committers, committer-versus-observer routing, ordering-key-versus-depth disagreement,
+  branch growth, application traffic, delivery permutations, and restarts around every durable transition.
+- [ ] Extend the independent selector/lifecycle models and mutation matrix with route choice, reconsiderable versus
+  terminal loser disposition, volatile routing history, restart, and deliberately inconsistent decision seams.
+- [ ] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
+  in every adapter that can expose them. Epoch, roster, profile, and visible projection equality are insufficient on
+  their own.
+- [ ] Require a durable disposition for every scenario application input: canonical projection, explicit invalidation,
+  retry/resend eligibility, or a named fail-closed outcome. Include sender-visible handling for application messages
+  invalidated by fork recovery.
+- [ ] Record which assurance claims each route-equivalence campaign covers and reopen a claim when a field, soak, or
+  mutation result falsifies one of its premises.
+
+### 6.2 Container and VM execution
 
 - [ ] Add containers before VMs.
 - [ ] Add network partition, latency, bandwidth, and loss controls.
@@ -965,7 +1001,7 @@ just fast-ci
 - [ ] Add mixed-build rolling upgrades.
 - [ ] Use VMs only for kernel, filesystem, network, or host-isolation behavior containers cannot represent.
 
-### 6.2 Execution lanes
+### 6.3 Execution lanes
 
 - [ ] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
 - [ ] Nightly lane: seed matrices, file-backed storage, crash matrix, retained relays, mutation subset.
@@ -973,7 +1009,7 @@ just fast-ci
 - [ ] Release-hardening lane: mixed-version and incident-derived corpus.
 - [ ] Define wall-clock, CPU, memory, disk, artifact-retention, and flake budgets for every lane.
 
-### 6.3 Failure corpus lifecycle
+### 6.4 Failure corpus lifecycle
 
 - [ ] Automatically save failing seeds/capsules.
 - [ ] Minimize semantically, not only by generic step removal.
@@ -983,10 +1019,17 @@ just fast-ci
 
 ### Milestone 6 Exit Gate
 
+- [ ] Every inventoried convergence decision route has a named model/test/campaign owner, and no unexplained
+  route-dependent outcome remains.
+- [ ] The #1236 regression family passes across engine, app-runtime, process, and distributed adapters with exact
+  cryptographic agreement, active decryptability, and complete application-input dispositions.
 - [ ] Campaigns are repeatable from saved configuration and artifact manifests.
 - [ ] A failing process/container run can be reduced into a smaller adapter when the defect is not layer-specific.
 - [ ] Resource and flake budgets prevent silent campaign degradation.
-- [ ] Release hardening produces a reviewed convergence evidence bundle.
+- [ ] Release hardening produces a reviewed convergence evidence bundle that lists covered decision routes, models,
+  adapters, mutation results, workload/constant boundaries, unresolved counterexamples, residual assumptions, and
+  untested surfaces. The bundle makes a scoped assurance claim rather than asserting universal implementation
+  correctness or universally optimal constants.
 
 ## Cross-Milestone Verification Matrix
 
@@ -1096,3 +1139,29 @@ incorrect result.
 | 2026-08-03 | 4.3 semantic mutation adequacy | Added nine simulator-only one-rule mutants spanning selection, witness handling, cutoff/frozen state, scheduling, output, publication, and retention; every mutant is killed and the checked matrix maps it to independent and production-shaped evidence | `mutation_adequacy` (3 tests); [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) |
 | 2026-08-03 | 4.4 protocol decision gate | Reverified adopted Marmot convergence commit `4ad4ae2`, classified every P/E/A ledger id, pinned all v1 policy values and the future required-component rule, and demonstrated operational non-interference across batch, wake-delay, and temporary-resource variants | `protocol_decision_gate` (5 tests); [`PROTOCOL_DECISIONS.md`](../../crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md); `just convergence-ledger-gate` |
 | 2026-08-03 | Milestone 4 completion verification | Completed every 4.1-4.4 item and exit condition without changing production convergence-engine behavior; the bounded independent, lifecycle, mutation, and protocol gates all pass alongside the full simulator, strict symbolic model, and repository-wide compile/lint gate | `just milestone4-ci`; `cargo test -p cgka-conformance-simulator --locked`; `just tamarin` (78 lemmas); `just fast-ci` |
+| 2026-08-04 | Milestone 5 app/process simulation | Added a production-shaped app-runtime adapter, versioned child-node protocol, multi-process orchestrator, projection/event observation, retained-relay repair, real pause/resume/kill/restart, cross-adapter comparison, and privacy-safe failure capsules; then replaced milestone-scoped module/test names with durable capability names | Commits `a3296b16` through `19d0d5f8`; `app_runtime_adapter`; `node_protocol`; `process_orchestrator`; `just fast-ci` |
+| 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
+
+## Post-Milestone 6 Cleanup
+
+Status: `not-started`. Perform this only after every Milestone 6 exit item has evidence, so cleanup does not obscure
+campaign history while the distributed machinery is still changing.
+
+- [ ] Inventory every tracked file whose basename contains `milestone`, case-insensitively.
+- [ ] Rename long-lived files after the capability or behavior they own, update module declarations, test targets,
+  `Justfile` recipes, CI, documentation links, and replay instructions, and preserve history with ordinary Git moves.
+- [ ] Rename `crates/cgka-conformance-simulator/tests/milestone3_campaigns.rs` to a durable adversarial-campaign name.
+- [ ] Delete obsolete milestone-only scaffolding and generated artifacts after confirming that no fixture, replay capsule,
+  CI lane, or documentation reference still depends on them.
+- [ ] Review milestone-numbered commands, scenario-family ids, test names, and output directories. Preserve versioned
+  external identifiers when compatibility requires it; otherwise give long-lived interfaces capability-based names.
+- [ ] Run the full affected simulator, app-runtime, process, distributed, formal, and repository fast-CI gates after
+  the renames.
+- [ ] Require this tracked-filename check to return no output and exit successfully:
+
+```sh
+test -z "$(git ls-files | awk -F/ 'tolower($NF) ~ /milestone/ { print }')"
+```
+
+Cleanup exit gate: no tracked file basename contains `milestone`, every retained long-lived artifact has a
+capability-based name, and all references plus verification lanes pass after the rename/delete sweep.
