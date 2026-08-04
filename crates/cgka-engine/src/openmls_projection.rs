@@ -1265,18 +1265,27 @@ fn replay_candidate_peel_context<S: StorageProvider>(
                     ))
                 })?
                 .ok_or(OpenMlsProjectionError::MissingGroup)?;
-            let source_epoch = EpochId(mls_group.epoch().as_u64());
-            let message_retention_seconds =
-                crate::app_components::message_retention_seconds_of_group(&mls_group)
-                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
-            let context =
-                crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
-                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
-            Ok(Some(CandidatePeelContext {
-                context,
-                source_epoch,
-                message_retention_seconds,
-            }))
+            if !mls_group.is_active() {
+                // A candidate ending in our authenticated removal remains a
+                // valid state-selection candidate, but an inactive OpenMLS
+                // group has no exporter secret and therefore cannot unlock
+                // later transport objects. Skip only this optional peel
+                // context; canonicalization still evaluates the path itself.
+                Ok(None)
+            } else {
+                let source_epoch = EpochId(mls_group.epoch().as_u64());
+                let message_retention_seconds =
+                    crate::app_components::message_retention_seconds_of_group(&mls_group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+                let context =
+                    crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+                Ok(Some(CandidatePeelContext {
+                    context,
+                    source_epoch,
+                    message_retention_seconds,
+                }))
+            }
         }
         // Candidate construction already rejected paths that cannot replay.
         // If a repeated materialization loses a race with retained state, skip

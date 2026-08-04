@@ -787,10 +787,10 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
                 // The race already settled before this candidate-route app was
-                // discovered. Keep the raw wrapper visibly deferred so a
-                // later genuine branch-context change can retry it; the app
+                // discovered. Try it against retained canonical history below:
+                // an offline canonical app can still decrypt and deliver, while
+                // a sibling-branch miss remains visibly transport-deferred and
                 // cannot reopen the completed race by itself.
-                return Ok(IngestOutcome::TransportDeferred { group_id });
             }
 
             // Pre-membership classification (mdk#339): an application
@@ -1127,6 +1127,14 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(IngestOutcome::LocalState {
                         state: LocalIngestState::Removed,
                     });
+                }
+                Err(e)
+                    if recovered_from_candidate_branch
+                        && msg_content_type == ContentType::Application
+                        && process_message_error_is_candidate_branch_decrypt_miss(&e) =>
+                {
+                    self.update_stored_message_state(&msg.id, MessageState::ConvergenceDeferred)?;
+                    return Ok(IngestOutcome::TransportDeferred { group_id });
                 }
                 Err(e) => {
                     if crate::app_components::is_parent_dependent_process_message_error(
@@ -2761,6 +2769,13 @@ fn process_message_error_is_too_distant_in_the_past<E>(err: &ProcessMessageError
             | ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
                 MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast),
             ))
+    )
+}
+
+fn process_message_error_is_candidate_branch_decrypt_miss<E>(err: &ProcessMessageError<E>) -> bool {
+    matches!(
+        err,
+        ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(_))
     )
 }
 

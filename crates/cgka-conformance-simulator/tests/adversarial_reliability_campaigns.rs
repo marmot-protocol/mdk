@@ -63,9 +63,10 @@ async fn assert_case(
         .collect::<Vec<_>>();
     assert!(
         report.expectation_failures.is_empty(),
-        "{} expectation failures: {:#?}; pending inputs: {pending_inputs:#?}",
+        "{} expectation failures: {:#?}; pending inputs: {pending_inputs:#?}; steps: {:#?}",
         case.family_name,
-        report.expectation_failures
+        report.expectation_failures,
+        report.step_log
     );
     assert!(
         report.invariant_failures.is_empty(),
