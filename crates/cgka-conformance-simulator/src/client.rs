@@ -1824,16 +1824,24 @@ impl HarnessClient {
         &self,
         client: String,
     ) -> Result<ClientStructuralProgress, EngineError> {
-        Ok(ClientStructuralProgress {
-            client,
-            engine: self
-                .default_group
+        // A scenario participant can have accepted a Welcome for a branch that
+        // was subsequently invalidated. Its remembered default group id then
+        // names no live group, which is a terminal non-membership state rather
+        // than a failure to observe the rest of the subject's progress.
+        let engine = if self.has_active_group() {
+            self.default_group
                 .as_ref()
                 .map(|group_id| {
                     self.engine()
                         .conformance_structural_progress_snapshot(group_id)
                 })
-                .transpose()?,
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ClientStructuralProgress {
+            client,
+            engine,
             scenario_inputs_pending: self.scenario_input_tracker.pending_count(),
         })
     }

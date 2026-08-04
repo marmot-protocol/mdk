@@ -1195,6 +1195,19 @@ impl MarmotAppRuntime {
         self.accounts.group_mls_state(account_ref, group_id).await
     }
 
+    /// Exact canonical state for synthetic conformance adapters only.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub async fn conformance_canonical_state_snapshot(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, AppError>
+    {
+        self.accounts
+            .conformance_canonical_state_snapshot(account_ref, group_id)
+            .await
+    }
+
     pub async fn enable_group_disbanding(
         &self,
         account_ref: &str,

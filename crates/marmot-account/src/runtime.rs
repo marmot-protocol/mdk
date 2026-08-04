@@ -127,6 +127,18 @@ where
         self.session.epoch_state(group_id)
     }
 
+    /// Capture exact canonical state for synthetic conformance adapters.
+    /// Production hosts do not compile this surface.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_canonical_state_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<cgka_session::ConformanceCanonicalStateSnapshot> {
+        Ok(self
+            .session
+            .conformance_canonical_state_snapshot(group_id)?)
+    }
+
     pub fn disband_request(
         &self,
         group_id: &GroupId,

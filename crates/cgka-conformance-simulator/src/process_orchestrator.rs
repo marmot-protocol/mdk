@@ -18,12 +18,14 @@ use crate::node_protocol::{
     NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
-    CompiledScenarioV2, ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec,
-    ScenarioStep, SubjectCapability, SubjectDescriptor, SubjectFailureCategory, compile_scenario,
-    preflight_compiled_scenario,
+    BidirectionalDecryptabilityObservation, DecryptabilityProbeSendStatus,
+    CompiledScenarioV2, DirectionalDecryptabilityProbe, ScenarioActionScheduleV2,
+    ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+    ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep, SubjectCapability, SubjectDescriptor,
+    SubjectFailureCategory, compile_scenario, preflight_compiled_scenario,
 };
 
-pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
+pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "2";
 const NODE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESS_QUIESCENCE_POLL: Duration = Duration::from_millis(100);
 
@@ -34,9 +36,17 @@ pub struct ProcessScenarioReportV1 {
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
     pub actions: Vec<ProcessActionResultV1>,
     pub observations: Vec<NodeObservationV1>,
+    pub application_dispositions: Vec<ProcessApplicationDispositionV1>,
+    pub decryptability_probes: Vec<BidirectionalDecryptabilityObservation>,
     pub lifecycle: Vec<ProcessLifecycleEventV1>,
     pub failure_capsules: Vec<PathBuf>,
     pub completed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessApplicationDispositionV1 {
+    pub participant: String,
+    pub entry: ScenarioInputLedgerEntry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +109,18 @@ pub struct ProcessOrchestrator {
     process_relays: BTreeMap<String, Vec<String>>,
     groups: BTreeMap<String, String>,
     lifecycle: Vec<ProcessLifecycleEventV1>,
+    application_inputs: BTreeMap<String, ProcessInputRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessInputRecord {
+    action_id: String,
+    sender: String,
+    payload: String,
+    logical_id: Option<String>,
+    origin_branch_id: Option<String>,
+    published: usize,
+    failed: bool,
 }
 
 struct NodeProcess {
@@ -182,6 +204,7 @@ impl ProcessOrchestrator {
             process_relays,
             groups: BTreeMap::new(),
             lifecycle: Vec::new(),
+            application_inputs: BTreeMap::new(),
         };
         for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
@@ -210,6 +233,8 @@ impl ProcessOrchestrator {
             canonical_schedule: schedule,
             actions: Vec::new(),
             observations: Vec::new(),
+            application_dispositions: Vec::new(),
+            decryptability_probes: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: false,
@@ -391,14 +416,8 @@ impl ProcessOrchestrator {
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 self.select_group(sender, &group).await?;
-                self.expect_ack(
-                    sender,
-                    NodeCommandV1::SendApplication {
-                        action_id: action_id.into(),
-                        payload: payload.clone(),
-                    },
-                )
-                .await?;
+                self.send_application_input(sender, action_id, payload)
+                    .await?;
                 Ok((vec![sender.clone()], ProcessActionStatusV1::Completed))
             }
             ScenarioStep::Leave { client } => {
@@ -442,7 +461,27 @@ impl ProcessOrchestrator {
             }
             ScenarioStep::Observe { clients } | ScenarioStep::ObserveExact { clients } => {
                 let observations = self.observe(clients, action_id).await?;
+                self.refresh_report_dispositions(report, &observations);
                 report.observations.extend(observations);
+                Ok((clients.clone(), ProcessActionStatusV1::Completed))
+            }
+            ScenarioStep::ProbeBidirectionalDecryptability { clients } => {
+                let probe = self
+                    .probe_bidirectional_decryptability(clients, action.schedule.source_step_index)
+                    .await?;
+                if !probe.succeeded() {
+                    return Err((
+                        None,
+                        NodeErrorV1 {
+                            code: "process_decryptability_probe_failed".into(),
+                            category: SubjectFailureCategory::Protocol,
+                            retryable: false,
+                            message: "one or more directed application probes did not decrypt"
+                                .into(),
+                        },
+                    ));
+                }
+                report.decryptability_probes.push(probe);
                 Ok((clients.clone(), ProcessActionStatusV1::Completed))
             }
             ScenarioStep::ObserveAdminPolicy { clients } => {
@@ -455,6 +494,7 @@ impl ProcessOrchestrator {
                 let observations = self
                     .await_quiescence(&labels, action_id, policy.max_iterations)
                     .await?;
+                self.refresh_report_dispositions(report, &observations);
                 report.observations.extend(observations);
                 Ok((labels, ProcessActionStatusV1::Completed))
             }
@@ -736,6 +776,252 @@ impl ProcessOrchestrator {
         }
     }
 
+    async fn send_application_input(
+        &mut self,
+        sender: &str,
+        action_id: &str,
+        payload: &str,
+    ) -> Result<Option<String>, (Option<String>, NodeErrorV1)> {
+        let result = self
+            .send(
+                sender,
+                NodeCommandV1::SendApplication {
+                    action_id: action_id.into(),
+                    payload: payload.into(),
+                },
+            )
+            .await;
+        match result {
+            Ok(NodeResponseBodyV1::Ack {
+                published,
+                application_message_id,
+                application_origin_branch_id,
+                ..
+            }) => {
+                self.application_inputs.insert(
+                    action_id.into(),
+                    ProcessInputRecord {
+                        action_id: action_id.into(),
+                        sender: sender.into(),
+                        payload: payload.into(),
+                        logical_id: application_message_id.clone(),
+                        origin_branch_id: application_origin_branch_id,
+                        published,
+                        failed: false,
+                    },
+                );
+                Ok(application_message_id)
+            }
+            Ok(body) => Err((Some(sender.into()), unexpected_response(body))),
+            Err(error) => {
+                self.application_inputs.insert(
+                    action_id.into(),
+                    ProcessInputRecord {
+                        action_id: action_id.into(),
+                        sender: sender.into(),
+                        payload: payload.into(),
+                        logical_id: None,
+                        origin_branch_id: None,
+                        published: 0,
+                        failed: true,
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn probe_bidirectional_decryptability(
+        &mut self,
+        clients: &[String],
+        step_index: usize,
+    ) -> Result<BidirectionalDecryptabilityObservation, (Option<String>, NodeErrorV1)> {
+        let unique = clients.iter().collect::<BTreeSet<_>>();
+        if clients.len() < 2 || unique.len() != clients.len() {
+            return Err((
+                None,
+                NodeErrorV1 {
+                    code: "invalid_probe_clients".into(),
+                    category: SubjectFailureCategory::ExpectedRefusal,
+                    retryable: false,
+                    message: "decryptability probe requires at least two unique clients".into(),
+                },
+            ));
+        }
+        let mut sends = BTreeMap::new();
+        for sender in clients {
+            let action_id = format!("probe-{step_index}-{sender}");
+            let payload = format!("cgka-decryptability-probe/v1/{step_index}/{sender}");
+            match self
+                .send_application_input(sender, &action_id, &payload)
+                .await
+            {
+                Ok(logical_id) => {
+                    sends.insert(
+                        sender.clone(),
+                        (
+                            action_id,
+                            payload,
+                            DecryptabilityProbeSendStatus::Published,
+                            logical_id,
+                        ),
+                    );
+                }
+                Err((_, error)) => {
+                    sends.insert(
+                        sender.clone(),
+                        (
+                            action_id,
+                            payload,
+                            DecryptabilityProbeSendStatus::Failed { error: error.code },
+                            None,
+                        ),
+                    );
+                }
+            }
+        }
+        let all_clients = self.running_labels();
+        self.catch_up(&all_clients, "decryptability-probe-catch-up", false)
+            .await?;
+        let observations = self
+            .observe(clients, "decryptability-probe-observe")
+            .await?;
+        let by_client = observations
+            .iter()
+            .map(|observation| (observation.participant.clone(), observation))
+            .collect::<BTreeMap<_, _>>();
+        let mut probes = Vec::with_capacity(clients.len() * (clients.len() - 1));
+        for sender in clients {
+            let (action_id, payload, status, logical_id) = &sends[sender];
+            for recipient in clients {
+                if sender == recipient {
+                    continue;
+                }
+                let recipient_ledger = by_client
+                    .get(recipient)
+                    .map(|observation| self.ledger_for(observation, action_id));
+                probes.push(DirectionalDecryptabilityProbe {
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    payload: payload.clone(),
+                    logical_id: logical_id.clone(),
+                    send_status: status.clone(),
+                    recipient_ledger,
+                });
+            }
+        }
+        Ok(BidirectionalDecryptabilityObservation {
+            step_index,
+            clients: clients.to_vec(),
+            probes,
+        })
+    }
+
+    fn refresh_report_dispositions(
+        &self,
+        report: &mut ProcessScenarioReportV1,
+        observations: &[NodeObservationV1],
+    ) {
+        for observation in observations {
+            for action_id in self.application_inputs.keys() {
+                let disposition = ProcessApplicationDispositionV1 {
+                    participant: observation.participant.clone(),
+                    entry: self.ledger_for(observation, action_id),
+                };
+                if let Some(existing) = report.application_dispositions.iter_mut().find(|item| {
+                    item.participant == disposition.participant
+                        && item.entry.scenario_id == disposition.entry.scenario_id
+                }) {
+                    *existing = disposition;
+                } else {
+                    report.application_dispositions.push(disposition);
+                }
+            }
+        }
+        report.application_dispositions.sort_by(|left, right| {
+            (&left.participant, &left.entry.scenario_id)
+                .cmp(&(&right.participant, &right.entry.scenario_id))
+        });
+    }
+
+    fn ledger_for(
+        &self,
+        observation: &NodeObservationV1,
+        action_id: &str,
+    ) -> ScenarioInputLedgerEntry {
+        let input = &self.application_inputs[action_id];
+        let visible = input.logical_id.as_ref().is_some_and(|id| {
+            observation
+                .application
+                .visible_message_ids
+                .iter()
+                .any(|value| value == id)
+        });
+        let invalidated = input.logical_id.as_ref().is_some_and(|id| {
+            observation
+                .application
+                .invalidated_message_ids
+                .iter()
+                .any(|value| value == id)
+        });
+        let current_branch_id = match &observation.canonical_state {
+            crate::ConformanceCanonicalStateSnapshot::Live(snapshot) => {
+                Some(snapshot.selected_branch_id.as_str())
+            }
+            crate::ConformanceCanonicalStateSnapshot::Disbanded(_) => None,
+        };
+        let (disposition, pending, delivered, rejected, invalidations) = if input.failed {
+            (
+                ScenarioInputDisposition::Rejected,
+                false,
+                0,
+                1,
+                vec!["app_runtime_send_failed".into()],
+            )
+        } else if invalidated
+            || input.origin_branch_id.as_deref().is_some()
+                && input.origin_branch_id.as_deref() != current_branch_id
+        {
+            (
+                ScenarioInputDisposition::Invalidated,
+                false,
+                0,
+                0,
+                vec!["fork_recovery".into()],
+            )
+        } else if visible {
+            (ScenarioInputDisposition::Delivered, false, 1, 0, Vec::new())
+        } else {
+            (ScenarioInputDisposition::Deferred, true, 0, 0, Vec::new())
+        };
+        ScenarioInputLedgerEntry {
+            scenario_id: input.action_id.clone(),
+            kind: ScenarioInputKind::Application,
+            sender: input.sender.clone(),
+            logical_id: input.logical_id.clone(),
+            payload: input.payload.clone(),
+            disposition,
+            send_attempts: 1,
+            send_accepted: usize::from(!input.failed),
+            send_queued: 0,
+            blocked_send_duration_us: 0,
+            published: input.published,
+            ingest_attempts: usize::from(visible || invalidated),
+            ingest_accepted: usize::from(visible),
+            transport_deferred: usize::from(!input.failed && !visible && !invalidated),
+            resource_refused: 0,
+            ignored: 0,
+            local_state: 0,
+            rejected,
+            ingest_errors: 0,
+            delivered,
+            deduplicated: 0,
+            expired: 0,
+            invalidated: invalidations,
+            pending,
+        }
+    }
+
     async fn catch_up(
         &mut self,
         clients: &[String],
@@ -791,7 +1077,10 @@ impl ProcessOrchestrator {
             let observations = self.observe(clients, action_id).await?;
             let commitments = observations
                 .iter()
-                .map(|observation| observation.protocol.state_commitment_sha256.as_str())
+                .map(|observation| {
+                    serde_json::to_string(&observation.canonical_state)
+                        .expect("canonical process snapshot is serializable")
+                })
                 .collect::<BTreeSet<_>>();
             if commitments.len() == 1
                 && observations
@@ -1180,6 +1469,8 @@ mod tests {
             canonical_schedule: Vec::new(),
             actions: Vec::new(),
             observations: Vec::new(),
+            application_dispositions: Vec::new(),
+            decryptability_probes: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: true,

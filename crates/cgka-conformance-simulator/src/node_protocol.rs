@@ -23,7 +23,8 @@ use tokio::sync::broadcast;
 
 use crate::app_runtime::{opaque_public_identity, public_protocol_projection};
 use crate::{
-    AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1, SubjectFailureCategory,
+    AppRuntimeApplicationProjectionV1, AppRuntimeProtocolProjectionV1,
+    ConformanceCanonicalStateSnapshot, SubjectFailureCategory,
 };
 
 pub const NODE_PROTOCOL_VERSION: &str = "marmot-convergence-node-v1";
@@ -134,6 +135,10 @@ pub enum NodeResponseBodyV1 {
         published: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_id_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        application_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        application_origin_branch_id: Option<String>,
     },
     Observation {
         action_id: String,
@@ -215,6 +220,9 @@ pub struct NodeObservationV1 {
     pub schema_version: String,
     pub participant: String,
     pub protocol: AppRuntimeProtocolProjectionV1,
+    /// Feature-gated exact canonical state commitment. No exporter secret or
+    /// engine storage enters the process protocol.
+    pub canonical_state: ConformanceCanonicalStateSnapshot,
     pub application: AppRuntimeApplicationProjectionV1,
     pub progress: NodeProgressV1,
 }
@@ -504,7 +512,24 @@ impl NodeServer {
                     .send_message(&state.account_id, &group_id, payload.into_bytes())
                     .await
                     .map_err(app_node_error)?;
-                Ok(ack(action_id, summary.published, None))
+                let exact = state
+                    .runtime
+                    .conformance_canonical_state_snapshot(&state.account_id, &group_id)
+                    .await
+                    .map_err(app_node_error)?;
+                let origin_branch_id = match exact {
+                    ConformanceCanonicalStateSnapshot::Live(snapshot) => {
+                        Some(snapshot.selected_branch_id)
+                    }
+                    ConformanceCanonicalStateSnapshot::Disbanded(_) => None,
+                };
+                Ok(NodeResponseBodyV1::Ack {
+                    action_id,
+                    published: summary.published,
+                    group_id_hex: None,
+                    application_message_id: summary.message_ids.first().cloned(),
+                    application_origin_branch_id: origin_branch_id,
+                })
             }
             NodeCommandV1::Leave { action_id } => {
                 let group_id = active_group(state)?;
@@ -680,6 +705,11 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
         .group_mls_state(&state.account_id, &group_id)
         .await
         .map_err(app_node_error)?;
+    let canonical_state = state
+        .runtime
+        .conformance_canonical_state_snapshot(&state.account_id, &group_id)
+        .await
+        .map_err(app_node_error)?;
     let reverse = state
         .accounts_by_participant
         .iter()
@@ -767,6 +797,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
         schema_version: NODE_OBSERVATION_SCHEMA_VERSION.into(),
         participant: state.participant.clone(),
         protocol,
+        canonical_state,
         application,
         progress: NodeProgressV1 {
             relay_inbound_events_seen: telemetry.metrics.inbound_events_seen,
@@ -929,6 +960,8 @@ fn ack(
         action_id: action_id.into(),
         published,
         group_id_hex,
+        application_message_id: None,
+        application_origin_branch_id: None,
     }
 }
 

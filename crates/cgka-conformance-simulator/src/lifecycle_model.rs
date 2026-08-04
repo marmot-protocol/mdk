@@ -298,6 +298,98 @@ impl LifecycleModel {
     }
 }
 
+/// Named production seam that first observed a competing commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionRouteKind {
+    OrdinaryIngest,
+    PairwiseForkRecovery,
+    StoredConvergence,
+    RetainedHistoryReplay,
+    CrashRestartRecovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RouteBranch {
+    pub id: u8,
+    pub effective_depth: u8,
+    /// Lower values win after depth, mirroring the deterministic ordering key.
+    pub ordering_key: u8,
+}
+
+/// Bounded lifecycle model for route choice and restart. Durable candidate
+/// input survives; the route-specific provisional winner is volatile.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RouteLifecycleState {
+    pub durable_branches: Vec<RouteBranch>,
+    pub volatile_route: Option<DecisionRouteKind>,
+    pub volatile_provisional_winner: Option<u8>,
+    pub canonical_winner: Option<u8>,
+    pub crashed: bool,
+}
+
+impl RouteLifecycleState {
+    pub fn new(mut durable_branches: Vec<RouteBranch>) -> Self {
+        durable_branches.sort_by_key(|branch| branch.id);
+        Self {
+            durable_branches,
+            volatile_route: None,
+            volatile_provisional_winner: None,
+            canonical_winner: None,
+            crashed: false,
+        }
+    }
+
+    pub fn observe_route(
+        mut self,
+        route: DecisionRouteKind,
+        provisional_winner: Option<u8>,
+    ) -> Self {
+        self.volatile_route = Some(route);
+        self.volatile_provisional_winner = provisional_winner;
+        self
+    }
+
+    pub fn crash(mut self) -> Self {
+        self.crashed = true;
+        self.volatile_route = None;
+        self.volatile_provisional_winner = None;
+        self
+    }
+
+    pub fn restart(mut self) -> Self {
+        self.crashed = false;
+        self
+    }
+
+    pub fn settle(mut self) -> Self {
+        if self.crashed {
+            return self;
+        }
+        self.canonical_winner = self
+            .durable_branches
+            .iter()
+            .max_by(|left, right| {
+                left.effective_depth
+                    .cmp(&right.effective_depth)
+                    .then_with(|| right.ordering_key.cmp(&left.ordering_key))
+            })
+            .map(|branch| branch.id);
+        self
+    }
+
+    /// Deliberately inconsistent seam used only by mutation adequacy: pairwise
+    /// routing terminalizes its provisional result instead of reconsidering the
+    /// complete durable candidate set.
+    pub(crate) fn settle_with_terminal_pairwise_loser(mut self) -> Self {
+        if self.volatile_route == Some(DecisionRouteKind::PairwiseForkRecovery) {
+            self.canonical_winner = self.volatile_provisional_winner;
+            return self;
+        }
+        self.settle()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleTrace {
     pub violated_assumption: Option<String>,

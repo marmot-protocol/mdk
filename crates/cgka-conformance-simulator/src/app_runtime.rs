@@ -1,9 +1,10 @@
 //! Black-box application-runtime adapter for convergence scenarios.
 //!
 //! This adapter deliberately uses only the public [`marmot_app::MarmotAppRuntime`]
-//! command and projection surfaces. It never opens the account session, engine
-//! storage, or conformance-only engine snapshots. Each participant owns a
-//! distinct restrictive root and one SQLCipher database.
+//! command and projection surfaces. Exact cryptographic observations cross a
+//! feature-gated, read-only app command that returns commitments but never raw
+//! secrets or storage. Each participant owns a distinct restrictive root and
+//! one SQLCipher database.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use async_trait::async_trait;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
-    MarmotAppRuntime,
+    MarmotAppRuntime, SendSummary,
 };
 use nostr_relay_builder::MockRelay;
 use serde::{Deserialize, Serialize};
@@ -22,14 +23,16 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use crate::{
-    ClientEventCounts, ClientObservation, ConvergenceSubject, ForkRecoveryObservation,
-    ScenarioAdminPolicyObservation, ScenarioInputLedgerEntry, SubjectCapability,
+    BidirectionalDecryptabilityObservation, ClientEventCounts, ClientObservation,
+    ConformanceCanonicalStateSnapshot, ConvergenceSubject, DecryptabilityProbeSendStatus,
+    DirectionalDecryptabilityProbe, ForkRecoveryObservation, ScenarioAdminPolicyObservation,
+    ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
     SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 
-pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
+pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRuntimeProtocolProjectionV1 {
@@ -73,6 +76,9 @@ pub struct AppRuntimeObservationV1 {
     pub schema_version: String,
     pub participant: String,
     pub protocol: AppRuntimeProtocolProjectionV1,
+    /// Feature-gated exact canonical state. It contains cryptographic
+    /// commitments and public protocol state, never exporter secrets.
+    pub canonical_state: ConformanceCanonicalStateSnapshot,
     pub application: AppRuntimeApplicationProjectionV1,
     pub local: AppRuntimeLocalDiagnosticsV1,
 }
@@ -92,6 +98,18 @@ struct Participant {
     runtime_events_observed: usize,
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
+    cached_exact: BTreeMap<String, ConformanceCanonicalStateSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct AppRuntimeInputRecord {
+    action_id: String,
+    sender: String,
+    payload: String,
+    logical_id: Option<String>,
+    origin_branch_id: Option<String>,
+    published: usize,
+    failed: bool,
 }
 
 impl Participant {
@@ -116,7 +134,9 @@ pub struct AppRuntimeHarness {
     relay_url: String,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
+    scenario_group_members: BTreeMap<String, BTreeSet<String>>,
     active_scenario_group: Option<String>,
+    application_inputs: BTreeMap<String, AppRuntimeInputRecord>,
 }
 
 impl AppRuntimeHarness {
@@ -162,6 +182,7 @@ impl AppRuntimeHarness {
                     runtime_events_observed: 0,
                     cached_members: BTreeMap::new(),
                     cached_epochs: BTreeMap::new(),
+                    cached_exact: BTreeMap::new(),
                 },
             );
         }
@@ -170,7 +191,9 @@ impl AppRuntimeHarness {
             relay_url,
             participants,
             scenario_groups: BTreeMap::new(),
+            scenario_group_members: BTreeMap::new(),
             active_scenario_group: None,
+            application_inputs: BTreeMap::new(),
         })
     }
 
@@ -247,6 +270,14 @@ impl AppRuntimeHarness {
         participant.online = true;
         participant.reopen_count = participant.reopen_count.saturating_add(1);
         Ok(())
+    }
+
+    fn active_group_members(&self) -> Vec<String> {
+        self.active_scenario_group
+            .as_ref()
+            .and_then(|group| self.scenario_group_members.get(group))
+            .map(|members| members.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub async fn observations(
@@ -377,6 +408,12 @@ impl AppRuntimeHarness {
             participant
                 .cached_epochs
                 .insert(group_label.clone(), state.epoch);
+            let exact = participant
+                .runtime()?
+                .conformance_canonical_state_snapshot(&participant.account_id, &group_id)
+                .await
+                .map_err(app_error)?;
+            participant.cached_exact.insert(group_label.clone(), exact);
             drain_runtime_events(participant);
         }
         Ok(())
@@ -432,6 +469,16 @@ impl AppRuntimeHarness {
             .group(&participant.account_id, &group_id_hex)
             .map_err(app_error)?
             .ok_or_else(|| SubjectError::new("unknown_group", "group projection is missing"))?;
+        let canonical_state = participant
+            .cached_exact
+            .get(&group_label)
+            .cloned()
+            .ok_or_else(|| {
+                SubjectError::new(
+                    "exact_state_unavailable",
+                    "exact app-runtime state has not been refreshed",
+                )
+            })?;
         let members = participant
             .cached_members
             .get(&group_label)
@@ -503,6 +550,7 @@ impl AppRuntimeHarness {
             schema_version: APP_RUNTIME_OBSERVATION_SCHEMA_VERSION.into(),
             participant: client.into(),
             protocol,
+            canonical_state,
             application: AppRuntimeApplicationProjectionV1 {
                 visible_message_ids: visible
                     .iter()
@@ -542,13 +590,14 @@ impl AppRuntimeHarness {
             .iter()
             .map(|client| {
                 let layered = self.layered_observation(client)?;
+                let scenario_input_ledger = self.application_ledger_for(&layered);
                 Ok(ClientObservation {
                     client: client.clone(),
                     epoch: layered.protocol.epoch,
                     member_count: layered.protocol.member_count,
                     group_name: layered.protocol.group_name,
-                    canonical_state: None,
-                    scenario_input_ledger: Vec::<ScenarioInputLedgerEntry>::new(),
+                    canonical_state: Some(layered.canonical_state.clone()),
+                    scenario_input_ledger,
                     pending_work: None,
                     event_counts: ClientEventCounts {
                         message_received: layered.application.visible_plaintexts.len(),
@@ -584,6 +633,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::ParticipantConnectivity,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
+                SubjectCapability::ExactConformanceObservation,
+                SubjectCapability::ActiveDecryptabilityProbe,
+                SubjectCapability::VirtualTime,
             ]),
         }
     }
@@ -631,7 +683,14 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .active_scenario_group
             .clone()
             .unwrap_or_else(|| "default".into());
-        self.scenario_groups.insert(group_label, group_id.clone());
+        self.scenario_groups
+            .insert(group_label.clone(), group_id.clone());
+        self.scenario_group_members.insert(
+            group_label,
+            std::iter::once(action.creator.to_owned())
+                .chain(action.invitees.iter().map(|invitee| (*invitee).to_owned()))
+                .collect(),
+        );
         self.apply_admin_set(action.creator, &group_id, action.initial_admins)
             .await?;
         Ok(())
@@ -649,6 +708,12 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .invite_members(&participant.account_id, &group_id, &invitees)
             .await
             .map_err(app_error)?;
+        if let Some(group) = &self.active_scenario_group {
+            self.scenario_group_members
+                .entry(group.clone())
+                .or_default()
+                .extend(action.invitees.iter().map(|invitee| (*invitee).to_owned()));
+        }
         Ok(())
     }
 
@@ -683,6 +748,13 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .remove_members(&participant.account_id, &group_id, &members)
             .await
             .map_err(app_error)?;
+        if let Some(group) = &self.active_scenario_group
+            && let Some(current) = self.scenario_group_members.get_mut(group)
+        {
+            for member in action.members {
+                current.remove(member);
+            }
+        }
         Ok(())
     }
 
@@ -710,18 +782,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectSendApplication<'_>,
     ) -> Result<(), SubjectError> {
-        let group_id = self.active_group()?;
-        let participant = self.participant(action.sender)?;
-        participant
-            .runtime()?
-            .send_message(
-                &participant.account_id,
-                &group_id,
-                action.payload.as_bytes().to_vec(),
-            )
+        self.send_application_input(action.action_id, action.sender, action.payload)
             .await
-            .map_err(app_error)?;
-        Ok(())
+            .map(|_| ())
     }
 
     async fn leave(&mut self, _action_id: &str, client: &str) -> Result<(), SubjectError> {
@@ -732,11 +795,16 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .leave_group(&participant.account_id, &group_id)
             .await
             .map_err(app_error)?;
+        if let Some(group) = &self.active_scenario_group
+            && let Some(current) = self.scenario_group_members.get_mut(group)
+        {
+            current.remove(client);
+        }
         Ok(())
     }
 
     fn deliver_all(&mut self) -> Result<(), SubjectError> {
-        block_on_subject(self.catch_up(&self.participants.keys().cloned().collect::<Vec<_>>()))
+        block_on_subject(self.catch_up(&self.active_group_members()))
     }
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
@@ -745,8 +813,87 @@ impl ConvergenceSubject for AppRuntimeHarness {
         self.refresh_cached_members(clients).await
     }
 
+    async fn advance_time(&mut self, delta_ms: u64) -> Result<(), SubjectError> {
+        tokio::time::sleep(Duration::from_millis(delta_ms)).await;
+        Ok(())
+    }
+
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
         self.legacy_observations(clients)
+    }
+
+    fn observe_exact(
+        &mut self,
+        clients: &[String],
+    ) -> Result<Vec<ClientObservation>, SubjectError> {
+        self.legacy_observations(clients)
+    }
+
+    async fn probe_bidirectional_decryptability(
+        &mut self,
+        clients: &[String],
+        step_index: usize,
+    ) -> Result<BidirectionalDecryptabilityObservation, SubjectError> {
+        let unique = clients.iter().collect::<BTreeSet<_>>();
+        if clients.len() < 2 || unique.len() != clients.len() {
+            return Err(SubjectError::new(
+                "invalid_probe_clients",
+                "bidirectional decryptability probe requires at least two unique clients",
+            ));
+        }
+        let mut sends = BTreeMap::new();
+        for sender in clients {
+            self.participant(sender)?;
+            let action_id = format!("probe-{step_index}-{sender}");
+            let payload = format!("cgka-decryptability-probe/v1/{step_index}/{sender}");
+            let result = self
+                .send_application_input(&action_id, sender, &payload)
+                .await;
+            let status = match result {
+                Ok(summary) => (
+                    DecryptabilityProbeSendStatus::Published,
+                    summary.message_ids.first().cloned(),
+                ),
+                Err(error) => (
+                    DecryptabilityProbeSendStatus::Failed { error: error.code },
+                    None,
+                ),
+            };
+            sends.insert(sender.clone(), (action_id, payload, status));
+        }
+        self.catch_up(&self.active_group_members()).await?;
+        let observations = self.legacy_observations(clients)?;
+        let by_client = observations
+            .into_iter()
+            .map(|observation| (observation.client.clone(), observation))
+            .collect::<BTreeMap<_, _>>();
+        let mut probes = Vec::with_capacity(clients.len() * (clients.len() - 1));
+        for sender in clients {
+            let (action_id, payload, (send_status, logical_id)) = &sends[sender];
+            for recipient in clients {
+                if sender == recipient {
+                    continue;
+                }
+                let recipient_ledger = by_client[recipient]
+                    .scenario_input_ledger
+                    .iter()
+                    .find(|entry| entry.scenario_id == *action_id)
+                    .cloned();
+                probes.push(DirectionalDecryptabilityProbe {
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    payload: payload.clone(),
+                    logical_id: logical_id.clone(),
+                    send_status: send_status.clone(),
+                    recipient_ledger,
+                });
+            }
+        }
+        Ok(BidirectionalDecryptabilityObservation {
+            step_index,
+            clients: clients.to_vec(),
+            probes,
+        })
     }
 
     fn observe_admin_policy(
@@ -826,6 +973,137 @@ impl ConvergenceSubject for AppRuntimeHarness {
 }
 
 impl AppRuntimeHarness {
+    async fn send_application_input(
+        &mut self,
+        action_id: &str,
+        sender: &str,
+        payload: &str,
+    ) -> Result<SendSummary, SubjectError> {
+        let group_id = self.active_group()?;
+        let participant = self.participant(sender)?;
+        let result = participant
+            .runtime()?
+            .send_message(
+                &participant.account_id,
+                &group_id,
+                payload.as_bytes().to_vec(),
+            )
+            .await;
+        match result {
+            Ok(summary) => {
+                let origin_branch_id = participant
+                    .runtime()?
+                    .conformance_canonical_state_snapshot(&participant.account_id, &group_id)
+                    .await
+                    .ok()
+                    .and_then(canonical_branch_id);
+                self.application_inputs.insert(
+                    action_id.to_owned(),
+                    AppRuntimeInputRecord {
+                        action_id: action_id.to_owned(),
+                        sender: sender.to_owned(),
+                        payload: payload.to_owned(),
+                        logical_id: summary.message_ids.first().cloned(),
+                        origin_branch_id,
+                        published: summary.published,
+                        failed: false,
+                    },
+                );
+                Ok(summary)
+            }
+            Err(error) => {
+                self.application_inputs.insert(
+                    action_id.to_owned(),
+                    AppRuntimeInputRecord {
+                        action_id: action_id.to_owned(),
+                        sender: sender.to_owned(),
+                        payload: payload.to_owned(),
+                        logical_id: None,
+                        origin_branch_id: None,
+                        published: 0,
+                        failed: true,
+                    },
+                );
+                Err(app_error(error))
+            }
+        }
+    }
+
+    fn application_ledger_for(
+        &self,
+        observation: &AppRuntimeObservationV1,
+    ) -> Vec<ScenarioInputLedgerEntry> {
+        let projection = &observation.application;
+        let current_branch_id = canonical_branch_id(observation.canonical_state.clone());
+        self.application_inputs
+            .values()
+            .map(|input| {
+                let visible = input.logical_id.as_ref().is_some_and(|id| {
+                    projection
+                        .visible_message_ids
+                        .iter()
+                        .any(|value| value == id)
+                });
+                let invalidated = input.logical_id.as_ref().is_some_and(|id| {
+                    projection
+                        .invalidated_message_ids
+                        .iter()
+                        .any(|value| value == id)
+                });
+                let (disposition, pending, delivered, rejected, invalidations) = if input.failed {
+                    (
+                        ScenarioInputDisposition::Rejected,
+                        false,
+                        0,
+                        1,
+                        vec!["app_runtime_send_failed".into()],
+                    )
+                } else if invalidated
+                    || input.origin_branch_id.is_some()
+                        && input.origin_branch_id != current_branch_id
+                {
+                    (
+                        ScenarioInputDisposition::Invalidated,
+                        false,
+                        0,
+                        0,
+                        vec!["fork_recovery".into()],
+                    )
+                } else if visible {
+                    (ScenarioInputDisposition::Delivered, false, 1, 0, Vec::new())
+                } else {
+                    (ScenarioInputDisposition::Deferred, true, 0, 0, Vec::new())
+                };
+                ScenarioInputLedgerEntry {
+                    scenario_id: input.action_id.clone(),
+                    kind: ScenarioInputKind::Application,
+                    sender: input.sender.clone(),
+                    logical_id: input.logical_id.clone(),
+                    payload: input.payload.clone(),
+                    disposition,
+                    send_attempts: 1,
+                    send_accepted: usize::from(!input.failed),
+                    send_queued: 0,
+                    blocked_send_duration_us: 0,
+                    published: input.published,
+                    ingest_attempts: usize::from(visible || invalidated),
+                    ingest_accepted: usize::from(visible),
+                    transport_deferred: usize::from(!input.failed && !visible && !invalidated),
+                    resource_refused: 0,
+                    ignored: 0,
+                    local_state: 0,
+                    rejected,
+                    ingest_errors: 0,
+                    delivered,
+                    deduplicated: 0,
+                    expired: 0,
+                    invalidated: invalidations,
+                    pending,
+                }
+            })
+            .collect()
+    }
+
     async fn apply_admin_set(
         &self,
         actor: &str,
@@ -946,6 +1224,13 @@ async fn compensate_admin_changes(
         }
     }
     app_error(original)
+}
+
+fn canonical_branch_id(state: ConformanceCanonicalStateSnapshot) -> Option<String> {
+    match state {
+        ConformanceCanonicalStateSnapshot::Live(snapshot) => Some(snapshot.selected_branch_id),
+        ConformanceCanonicalStateSnapshot::Disbanded(_) => None,
+    }
 }
 
 fn app_for_root(root: &Path, relay_url: &str) -> MarmotApp {

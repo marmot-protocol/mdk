@@ -111,6 +111,13 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    #[cfg(feature = "test-conformance-snapshot")]
+    ConformanceCanonicalStateSnapshot {
+        group_id: GroupId,
+        respond: oneshot::Sender<
+            Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, AppError>,
+        >,
+    },
     EnableGroupDisbanding {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -1136,6 +1143,11 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        #[cfg(feature = "test-conformance-snapshot")]
+        AccountWorkerCommand::ConformanceCanonicalStateSnapshot { group_id, respond } => {
+            let result = client.conformance_canonical_state_snapshot(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {

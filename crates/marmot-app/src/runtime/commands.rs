@@ -163,6 +163,26 @@ impl AccountManager {
         result
     }
 
+    /// Exact state commitment for synthetic conformance adapters only.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub async fn conformance_canonical_state_snapshot(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, AppError>
+    {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConformanceCanonicalStateSnapshot {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn enable_group_disbanding(
         &self,
         account_ref: &str,

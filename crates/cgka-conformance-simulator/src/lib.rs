@@ -44,6 +44,7 @@ pub mod reference_convergence;
 mod reference_subject;
 pub mod report;
 mod retained_relay;
+pub mod route_assurance;
 pub mod scenario;
 mod scenario_assertions;
 mod scenario_authoring;
@@ -121,6 +122,14 @@ pub use report::{
 pub use retained_relay::{
     RelayHistoryCompletenessClaimV2, RelaySyncObservationV2, RetainedRelaySubject,
     ScenarioRelayOrderV2, ScenarioRelaySyncModeV2,
+};
+pub use route_assurance::{
+    ACTIVE_DECRYPTABILITY_CLAIM, AssuranceClaimRecordV1, AssuranceClaimStatus,
+    COMPLETE_APPLICATION_DISPOSITION_CLAIM, DeeperBranch, EXACT_CRYPTOGRAPHIC_AGREEMENT_CLAIM,
+    ObserverDeliveryOrder, RECONSIDERABLE_LOSER_CLAIM, RESTART_INVARIANCE_CLAIM,
+    ROUTE_ASSURANCE_CLAIMS, ROUTE_EQUIVALENCE_CLAIM, RouteCampaignAdapter,
+    RouteEquivalenceCampaignV1, RouteRestartCheckpoint, generate_cross_route_regression_family,
+    scenario_for_route_adapter,
 };
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,

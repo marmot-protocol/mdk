@@ -1,0 +1,27 @@
+# Convergence decision-route matrix
+
+This matrix is the ownership index for every production seam that can select,
+reject, defer, invalidate, replay, or apply a competing commit. Route choice is
+transient: once the same authenticated dependency-closed durable input set is
+available, every route must produce the same canonical state and dispositions.
+
+| Route id | Production owner | Adopted rule | Independent transition | Mutation sentinel | Campaign or regression owner |
+| --- | --- | --- | --- | --- | --- |
+| `ordinary_ingest` | `crates/cgka-engine/src/message_processor/ingest.rs` (`commit_should_enter_convergence`, inbound apply transaction, and `convergence_ingest_outcome`) | Competing or stale eligible commits enter the shared retained convergence set; only authenticated terminal rejection may remove eligibility | `ReferenceDecisionRoute::OrdinaryIngest` | `cutoff_boundary_admission`, `output_invalidation` | `cross-route-1236/v1`, canonical scenario disposition tests |
+| `pairwise_fork_recovery` | `crates/cgka-engine/src/fork_recovery.rs` (`ForkRecoveryManager::resolve`, `resolve_fork_candidate`) | The pairwise ordering result is provisional; the displaced incumbent or candidate remains reconsiderable by the shared depth/witness selector | `ReferenceDecisionRoute::PairwiseForkRecovery`; `RouteLifecycleState::volatile_provisional_winner` | `pairwise_losing_branch_terminalization` | `pairwise_incumbent_defers_to_deeper_convergence_branch`, `pairwise_candidate_win_leaves_old_incumbent_reconsiderable`, `cross-route-1236/v1` |
+| `stored_convergence` | `crates/cgka-engine/src/distributed_convergence.rs` (`converge_stored_openmls_messages_with_time`) | Freeze a dependency-closed retained set, materialize every eligible branch, select once with the adopted comparator, then apply dispositions atomically | `ReferenceDecisionRoute::StoredConvergence` | `selector_comparison_order`, `frozen_member_persistence` | stored-convergence restart properties, `cross-route-1236/v1` |
+| `candidate_materialization` | `crates/cgka-engine/src/openmls_projection.rs` (`canonicalize_stored_openmls_messages_with_profile_policy`, retained-anchor/current replay, selected-branch apply) | Replay cannot silently drop an authenticated eligible branch; a missing dependency stays deferred and losing eligible input stays reconsiderable | `evaluate` dependency graph plus `ReferenceDisposition::DeferredLosingEligibleBranch` | `pairwise_losing_branch_terminalization`, `retained_history_expiration_boundary` | independent reference differential, replay budget repair, `cross-route-1236/v1` |
+| `retained_history_replay` | `crates/cgka-engine/src/message_processor/ingest.rs` retained-message admission plus `crates/cgka-engine/src/openmls_projection.rs` retained-anchor replay | Retained delivery order and duplicate transport shape do not change the canonical result; only named horizon/resource outcomes can refuse work | `ReferenceDecisionRoute::RetainedHistoryReplay` | `retained_history_expiration_boundary`, `witness_sender_epoch_deduplication` | retained-relay history equality campaigns and `cross-route-1236/v1` full-history pass |
+| `crash_restart_recovery` | `crates/cgka-engine/src/engine.rs` hydration, `crates/cgka-engine/src/distributed_convergence.rs` frozen-pass recovery, and `crates/cgka-engine/src/openmls_projection.rs` interrupted retained-anchor recovery | Durable candidate membership and frozen revision survive; volatile route hints and staged replay state do not | `ReferenceDecisionRoute::CrashRestartRecovery`; `RouteLifecycleState::crash`/`restart` | `frozen_member_persistence`, `scheduler_deadline_rearm`, `pairwise_losing_branch_terminalization` | durable-phase kill matrix and every `RouteRestartCheckpoint` in `cross-route-1236/v1` |
+| `application_disposition` | `crates/cgka-engine/src/message_processor/ingest.rs` event/disposition mapping and `crates/cgka-engine/src/openmls_projection.rs` selected-branch replay | Every scenario application input ends canonical, explicitly invalidated, retryable/deferred, or named fail-closed; fork-invalidated sender output remains visible as a disposition | `app_disposition` | `output_invalidation` | engine/app/process ledgers and active decryptability probes in `cross-route-1236/v1` |
+
+## Assurance claims
+
+The `route_assurance` catalog binds every `cross-route-1236/v1` case to these
+stable claims: `route-equivalence`, `reconsiderable-loser`,
+`restart-invariance`, `exact-cryptographic-agreement`,
+`active-bidirectional-decryptability`, and
+`complete-application-disposition`. A passing campaign may mark a claim
+covered. Any field, soak, mutation, or replay counterexample must call the
+claim lifecycle's `reopen` transition and attach the falsification class; a
+previous green run is not permanent evidence.

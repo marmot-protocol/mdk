@@ -12,6 +12,13 @@ test-policy-overrides = [
     "cgka-engine/test-policy-overrides",
     "cgka-session/test-policy-overrides",
 ]
+# Synthetic conformance-only exact-state observations. This is used by the
+# black-box app/process adapters and must never be enabled in app artifacts.
+test-conformance-snapshot = [
+    "cgka-engine/test-conformance-snapshot",
+    "cgka-session/test-conformance-snapshot",
+    "marmot-account/test-conformance-snapshot",
+]
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this
 # feature only adds the OTLP protobuf dependencies and the push transport.

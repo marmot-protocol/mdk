@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle_model::{
-    LifecycleActionKind, LifecycleModel, LifecycleMutation, LifecycleState, PassPhase,
+    DecisionRouteKind, LifecycleActionKind, LifecycleModel, LifecycleMutation, LifecycleState,
+    PassPhase, RouteBranch, RouteLifecycleState,
 };
 use crate::reference_convergence::{
     ReferenceAppMessage, ReferenceCandidate, ReferenceDisposition, ReferenceInput, ReferencePolicy,
@@ -50,6 +51,7 @@ semantic_mutations! {
     OutputInvalidation => "output_invalidation",
     PublicationAcknowledgement => "publication_acknowledgement",
     RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
+    PairwiseLosingBranchTerminalization => "pairwise_losing_branch_terminalization",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +86,36 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
         SemanticMutation::OutputInvalidation => output_invalidation_sentinel(),
         SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
+        SemanticMutation::PairwiseLosingBranchTerminalization => {
+            pairwise_loser_terminalization_sentinel()
+        }
     };
     MutationSentinelResult {
         mutation,
         baseline_observation,
         mutant_observation,
     }
+}
+
+fn pairwise_loser_terminalization_sentinel() -> (String, String) {
+    let routed = RouteLifecycleState::new(vec![
+        RouteBranch {
+            id: 1,
+            effective_depth: 1,
+            ordering_key: 0,
+        },
+        RouteBranch {
+            id: 2,
+            effective_depth: 2,
+            ordering_key: 1,
+        },
+    ])
+    .observe_route(DecisionRouteKind::PairwiseForkRecovery, Some(1));
+    let baseline = routed.clone().settle().canonical_winner;
+    let mutant = routed
+        .settle_with_terminal_pairwise_loser()
+        .canonical_winner;
+    (format!("winner:{baseline:?}"), format!("winner:{mutant:?}"))
 }
 
 fn candidate(id: &str, depth: u64, digest: u8) -> ReferenceCandidate {

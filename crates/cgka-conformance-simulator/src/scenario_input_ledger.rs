@@ -324,10 +324,12 @@ impl ScenarioInputTracker {
                 }
             }
             MessageState::ConvergenceDeferred => {
-                if !is_terminal(&entry.disposition) {
-                    entry.disposition = ScenarioInputDisposition::Deferred;
-                    entry.pending = false;
-                }
+                // The durable row is authoritative over an earlier ingest
+                // result such as `Stale(AlreadyAtEpoch)`. Pairwise recovery
+                // deliberately returns that public outcome while parking the
+                // losing commit for later distributed reconsideration.
+                entry.disposition = ScenarioInputDisposition::Deferred;
+                entry.pending = false;
             }
             MessageState::Sent => {
                 if kind == ScenarioInputKind::Application {
@@ -658,6 +660,34 @@ mod tests {
         );
         let entry = &tracker.snapshot()[0];
         assert_eq!(entry.disposition, ScenarioInputDisposition::Accepted);
+        assert!(!entry.pending);
+    }
+
+    #[test]
+    fn durable_convergence_deferred_overrides_pairwise_stale_observation() {
+        let mut tracker = ScenarioInputTracker::default();
+        let metadata = metadata(ScenarioInputKind::Commit);
+        tracker.record_ingest(
+            &metadata,
+            Ok(&IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(2),
+                    msg_epoch: EpochId(1),
+                },
+            }),
+        );
+        assert_eq!(
+            tracker.snapshot()[0].disposition,
+            ScenarioInputDisposition::Stale
+        );
+
+        tracker.record_storage_state(
+            &metadata.scenario_id,
+            metadata.kind,
+            MessageState::ConvergenceDeferred,
+        );
+        let entry = &tracker.snapshot()[0];
+        assert_eq!(entry.disposition, ScenarioInputDisposition::Deferred);
         assert!(!entry.pending);
     }
 

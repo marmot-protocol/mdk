@@ -116,6 +116,20 @@ pub struct AppClient {
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
 }
 
+#[cfg(feature = "test-conformance-snapshot")]
+impl AppClient {
+    /// Exact state commitment for synthetic conformance adapters only.
+    pub(crate) fn conformance_canonical_state_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot, AppError>
+    {
+        Ok(self
+            .runtime
+            .conformance_canonical_state_snapshot(group_id)?)
+    }
+}
+
 /// Cross the point-of-no-return for current-profile group creation without
 /// allowing repairable follow-up work to turn a canonical group into an
 /// apparent create failure. Returning `Err` after that boundary encourages a

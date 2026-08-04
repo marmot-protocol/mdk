@@ -17,7 +17,7 @@ test-policy-overrides = ["cgka-engine/test-policy-overrides"]
 [dependencies]
 cgka-traits.workspace = true
 cgka-engine = { workspace = true, features = ["test-conformance-snapshot"] }
-marmot-app.workspace = true
+marmot-app = { workspace = true, features = ["test-conformance-snapshot"] }
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 storage-sqlite = { workspace = true, features = ["test-conformance-replay"] }

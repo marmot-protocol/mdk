@@ -5,6 +5,12 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Synthetic conformance-only exact-state observations. Production hosts must
+# never enable this feature.
+test-conformance-snapshot = ["cgka-session/test-conformance-snapshot"]
+
 [dependencies]
 async-trait.workspace = true
 cgka-session.workspace = true

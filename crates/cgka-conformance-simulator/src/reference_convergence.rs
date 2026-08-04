@@ -159,6 +159,51 @@ pub struct ReferenceResult {
     pub materialized_branch_ids: BTreeSet<String>,
 }
 
+/// Production decision seam through which an authenticated dependency-closed
+/// input set first becomes visible. Route choice may affect transient work but
+/// must not change the canonical result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "route", rename_all = "snake_case")]
+pub enum ReferenceDecisionRoute {
+    OrdinaryIngest,
+    PairwiseForkRecovery { provisional_winner: String },
+    StoredConvergence,
+    RetainedHistoryReplay,
+    CrashRestartRecovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceRouteResult {
+    pub route: ReferenceDecisionRoute,
+    pub canonical: ReferenceResult,
+    /// Authenticated losing branches that remain eligible for a later pass.
+    pub reconsiderable_branch_ids: BTreeSet<String>,
+}
+
+/// Evaluate the same durable input set through a named production route.
+///
+/// Pairwise recovery is modeled as a provisional decision only: its displaced
+/// branch remains materializable until the shared canonical evaluator assigns
+/// a terminal disposition. This is the rule #1236 showed must be identical at
+/// every seam.
+pub fn evaluate_via_route(
+    input: &ReferenceInput,
+    route: ReferenceDecisionRoute,
+) -> ReferenceRouteResult {
+    let canonical = evaluate(input);
+    let reconsiderable_branch_ids = canonical
+        .materialized_branch_ids
+        .iter()
+        .filter(|branch| Some(*branch) != canonical.selected_branch_id.as_ref())
+        .cloned()
+        .collect();
+    ReferenceRouteResult {
+        route,
+        canonical,
+        reconsiderable_branch_ids,
+    }
+}
+
 #[derive(Clone)]
 struct MaterializedBranch {
     candidate: ReferenceCandidate,

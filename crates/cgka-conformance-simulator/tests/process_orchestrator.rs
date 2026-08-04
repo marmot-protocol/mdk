@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use cgka_conformance_simulator::process_orchestrator::ProcessOrchestrator;
+use cgka_conformance_simulator::process_orchestrator::{
+    PROCESS_SCENARIO_REPORT_SCHEMA_VERSION, ProcessOrchestrator,
+};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
     ScenarioSpec, ScenarioStep, ScenarioTopologyV2, compile_scenario, run_scenario_report,
@@ -478,7 +480,10 @@ fn process_cli_writes_a_private_versioned_report() {
     }
     let report: cgka_conformance_simulator::process_orchestrator::ProcessScenarioReportV1 =
         serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
-    assert_eq!(report.schema_version, "1");
+    assert_eq!(
+        report.schema_version,
+        PROCESS_SCENARIO_REPORT_SCHEMA_VERSION
+    );
     assert!(report.completed, "{report:#?}");
 }
 

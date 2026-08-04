@@ -8,6 +8,9 @@ publish.workspace = true
 [features]
 default = []
 test-policy-overrides = ["cgka-engine/test-policy-overrides"]
+# Synthetic conformance-only exact-state observations. Production hosts must
+# never enable this feature.
+test-conformance-snapshot = ["cgka-engine/test-conformance-snapshot"]
 
 [dependencies]
 cgka-engine.workspace = true

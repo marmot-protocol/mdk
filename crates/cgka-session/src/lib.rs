@@ -37,6 +37,9 @@ use marmot_forensics::{
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
+#[cfg(feature = "test-conformance-snapshot")]
+pub use cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot;
+
 const TRACE_TARGET: &str = "cgka_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
@@ -938,6 +941,16 @@ impl AccountDeviceSession {
 
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
         self.engine.epoch_state(group_id)
+    }
+
+    /// Capture the exact canonical state used only by synthetic conformance
+    /// adapters. The snapshot contains commitments, never exporter secrets.
+    #[cfg(feature = "test-conformance-snapshot")]
+    pub fn conformance_canonical_state_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<ConformanceCanonicalStateSnapshot, EngineError> {
+        self.engine.conformance_canonical_state_snapshot(group_id)
     }
 
     pub fn disband_request(
