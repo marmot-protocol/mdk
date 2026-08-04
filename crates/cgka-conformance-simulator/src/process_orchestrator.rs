@@ -218,9 +218,11 @@ impl ProcessOrchestrator {
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
-        preflight_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(|error| {
-            ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
-        })?;
+        preflight_process_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(
+            |error| {
+                ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
+            },
+        )?;
         let artifact_directory = artifact_directory.as_ref().to_path_buf();
         fs_private::create_dir_all_private(&artifact_directory).map_err(environment_error)?;
         let run_root = tempfile::Builder::new()
@@ -1255,6 +1257,27 @@ fn process_subject_descriptor() -> SubjectDescriptor {
     }
 }
 
+/// Preflight the canonical schedule against the process executor's actual
+/// capabilities. `AwaitQuiescence` is a semantic fixed-point gate here: the
+/// orchestrator polls real participant progress with a bounded wall-clock
+/// deadline, so it discharges that action without claiming arbitrary virtual
+/// time support. Other time-dependent actions remain rejected.
+fn preflight_process_compiled_scenario(
+    compiled: &CompiledScenarioV2,
+    descriptor: &SubjectDescriptor,
+) -> Result<(), crate::ScenarioRunError> {
+    let mut process_compiled = compiled.clone();
+    for action in &mut process_compiled.actions {
+        if matches!(action.step, ScenarioStep::AwaitQuiescence { .. }) {
+            action
+                .schedule
+                .required_capabilities
+                .remove(&SubjectCapability::VirtualTime);
+        }
+    }
+    preflight_compiled_scenario(&process_compiled, descriptor)
+}
+
 fn unexpected_response(_body: NodeResponseBodyV1) -> NodeErrorV1 {
     NodeErrorV1 {
         code: "unexpected_node_response".into(),
@@ -1407,5 +1430,42 @@ mod tests {
         );
         let error = render_node_arg("{shell}", "p", "r", host, child).unwrap_err();
         assert_eq!(error.code, "unknown_node_command_placeholder");
+    }
+    #[test]
+    fn observation_schema_is_rejected_before_typed_observation_decoding() {
+        let line = format!(
+            r#"{{"protocol":"{NODE_PROTOCOL_VERSION}","request_id":"request-1","participant":"alice","body":{{"type":"observation","action_id":"observe","observation":{{"schema_version":"1"}}}}}}"#
+        );
+        let error = decode_node_response(&line, "request-1").unwrap_err();
+        assert_eq!(error.code, "node_observation_schema_mismatch");
+    }
+
+    #[test]
+    fn process_preflight_supports_observed_quiescence_without_claiming_virtual_time() {
+        let descriptor = process_subject_descriptor();
+        assert!(!descriptor.supports(SubjectCapability::VirtualTime));
+
+        let await_spec = ScenarioSpec {
+            name: "process-observed-quiescence".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::AwaitQuiescence {
+                policy: Default::default(),
+            }],
+        };
+        let compiled = compile_scenario(&await_spec).unwrap();
+        preflight_process_compiled_scenario(&compiled, &descriptor).unwrap();
+
+        let advance_spec = ScenarioSpec {
+            name: "process-rejects-virtual-time".into(),
+            steps: vec![ScenarioStep::AdvanceTime { delta_ms: 1 }],
+            ..await_spec
+        };
+        let compiled = compile_scenario(&advance_spec).unwrap();
+        let error = preflight_process_compiled_scenario(&compiled, &descriptor)
+            .expect_err("arbitrary virtual-time actions remain unsupported");
+        assert_eq!(error.kind, "unsupported_subject_capability");
+        assert_eq!(error.step_index, Some(0));
     }
 }
