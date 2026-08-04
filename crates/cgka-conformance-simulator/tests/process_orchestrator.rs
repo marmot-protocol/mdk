@@ -1,3 +1,5 @@
+//! Long-lived multi-process convergence-orchestrator coverage.
+
 use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::process_orchestrator::ProcessOrchestrator;

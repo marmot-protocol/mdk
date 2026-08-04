@@ -1,3 +1,5 @@
+//! Long-lived coverage for the versioned convergence-node protocol.
+
 use std::collections::BTreeMap;
 
 use cgka_conformance_simulator::node_protocol::{

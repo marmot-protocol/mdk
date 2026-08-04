@@ -934,7 +934,7 @@ It does not query engine queues or child databases.
 - [x] Process kill/restart agrees with uninterrupted execution.
 - [x] Failure capsules identify participant, action, layer, and replay instructions without sensitive production logs.
 
-Milestone 5 is complete. `process_orchestrator_milestone5` drives one canonical scenario through the engine,
+Milestone 5 is complete. `process_orchestrator` drives one canonical scenario through the engine,
 `MarmotAppRuntime`, and a real child process and compares epoch, roster size, signed group profile, and the normalized
 public app/process commitment. A two-participant, two-relay scenario proves stable convergence and visible-message
 projection with no invalidated output. Its lifecycle variant performs real pause, resume, process-group kill, durable
@@ -947,9 +947,9 @@ Milestone 5 verification:
 
 ```sh
 cargo test -p cgka-conformance-simulator \
-  --test app_runtime_milestone5 \
-  --test node_protocol_milestone5 \
-  --test process_orchestrator_milestone5
+  --test app_runtime_adapter \
+  --test node_protocol \
+  --test process_orchestrator
 cargo clippy -p cgka-conformance-simulator --all-targets -- -D warnings
 just fast-ci
 ```

@@ -1,3 +1,5 @@
+//! Long-lived black-box coverage for the application-runtime adapter.
+
 use std::collections::BTreeSet;
 use std::time::Duration;
 
