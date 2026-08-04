@@ -619,6 +619,12 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 behaviors.insert(OracleBehavior::MemberRemoved);
             }
         }
+        TraceExpectation::ClientPayloadMultiset { payloads, .. } => {
+            behaviors.insert(OracleBehavior::ClientState);
+            if !payloads.is_empty() {
+                behaviors.insert(OracleBehavior::DeliveredPayload);
+            }
+        }
         TraceExpectation::ClientsConverged { member_count, .. } => {
             behaviors.insert(OracleBehavior::ClientConvergence);
             if member_count.is_some_and(|count| count >= 20) {

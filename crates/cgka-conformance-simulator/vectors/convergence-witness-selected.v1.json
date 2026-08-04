@@ -72,11 +72,12 @@
       "type": "client_state",
       "client": "carol",
       "epoch": 2,
-      "member_count": 4,
-      "received_payloads": [
-        "wA-1",
-        "wA-2"
-      ]
+      "member_count": 4
+    },
+    {
+      "type": "client_payload_multiset",
+      "client": "carol",
+      "payloads": ["wA-1", "wA-2"]
     }
   ]
 }

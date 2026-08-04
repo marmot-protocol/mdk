@@ -120,6 +120,12 @@ pub enum TraceExpectation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removed_members: Option<Vec<String>>,
     },
+    /// Require exactly these delivered payloads, including duplicate counts,
+    /// without asserting a total order across independent senders.
+    ClientPayloadMultiset {
+        client: String,
+        payloads: Vec<String>,
+    },
     ClientsConverged {
         clients: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +335,27 @@ impl TraceExpectation {
                 }),
                 None => missing_client(client, self, mismatches),
             },
+            TraceExpectation::ClientPayloadMultiset { client, payloads } => {
+                match client_legacy_observation(observed, client) {
+                    Some(observation) => {
+                        let mut expected = payloads.clone();
+                        let mut actual = observation.received_payloads.clone();
+                        expected.sort();
+                        actual.sort();
+                        if actual != expected {
+                            mismatches.push(ExpectationFailure {
+                                kind: "client_payload_multiset_mismatch".into(),
+                                message: format!(
+                                    "client {client} delivered payload multiset {actual:?}"
+                                ),
+                                expected: json!({"client": client, "payloads": expected}),
+                                actual: json!({"client": client, "payloads": actual}),
+                            });
+                        }
+                    }
+                    None => missing_client(client, self, mismatches),
+                }
+            }
             TraceExpectation::ClientsConverged {
                 clients,
                 epoch,
@@ -1424,6 +1451,27 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn client_payload_multiset_ignores_order_but_preserves_duplicate_counts() {
+        let mut latest = observation("alice", 2, 3);
+        latest.received_payloads = vec!["second".into(), "first".into(), "first".into()];
+        let observed = trace(vec![latest]);
+
+        let matching = TraceExpectation::ClientPayloadMultiset {
+            client: "alice".into(),
+            payloads: vec!["first".into(), "second".into(), "first".into()],
+        };
+        assert!(compare_trace_expectations(None, &[matching], &observed).is_empty());
+
+        let missing_duplicate = TraceExpectation::ClientPayloadMultiset {
+            client: "alice".into(),
+            payloads: vec!["first".into(), "second".into()],
+        };
+        let failures = compare_trace_expectations(None, &[missing_duplicate], &observed);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "client_payload_multiset_mismatch");
     }
 
     #[test]

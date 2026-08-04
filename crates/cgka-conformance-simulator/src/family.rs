@@ -2701,7 +2701,8 @@ fn add_strict_reliability_oracle(
         .iter()
         .flat_map(|expectation| match expectation {
             TraceExpectation::ClientsConverged { clients, .. } => clients.clone(),
-            TraceExpectation::ClientState { client, .. } => vec![client.clone()],
+            TraceExpectation::ClientState { client, .. }
+            | TraceExpectation::ClientPayloadMultiset { client, .. } => vec![client.clone()],
             _ => Vec::new(),
         })
         .collect::<BTreeSet<_>>()
