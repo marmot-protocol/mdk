@@ -1048,6 +1048,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidChatPin(_)
         | AppError::InvalidMessageDraft(_)
         | AppError::InvalidPublicKey
+        | AppError::UnexpectedPrivateKey
+        | AppError::IdentityKeyMismatch
         | AppError::InvalidKeyPackageEvent(_)
         | AppError::InvalidDirectorySearch(_)
         | AppError::InvalidGroupProfile(_)

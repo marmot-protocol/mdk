@@ -43,6 +43,7 @@ mod stream_workers;
 mod subscriptions;
 
 pub use lifecycle::{default_log_path, default_pid_path, default_socket_path};
+pub(crate) use protocol::send_execute;
 pub use protocol::{
     DaemonClient, DaemonClientError, DaemonOutgoingStreamReport, DaemonRuntimeActivityReport,
     DaemonStatus, DaemonStreamError, DaemonStreamResponse, DaemonStreamWatchReport,
@@ -429,9 +430,17 @@ async fn handle_daemon_connection(
             )
             .await;
         }
-        DaemonRequest::Execute { cli } => {
-            let _ = handle_execute_connection(cli, &mut stream, &defaults, state, events, &workers)
-                .await;
+        DaemonRequest::Execute { cli, import_nsec } => {
+            let _ = handle_execute_connection(
+                cli,
+                import_nsec,
+                &mut stream,
+                &defaults,
+                state,
+                events,
+                &workers,
+            )
+            .await;
         }
     }
 }
@@ -529,6 +538,7 @@ async fn handle_stream_watch_connection(
 
 async fn handle_execute_connection(
     mut cli: Box<Cli>,
+    mut import_nsec: Option<crate::ImportNsec>,
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
@@ -575,6 +585,7 @@ async fn handle_execute_connection(
     let refresh = app_runtime_refresh_after_execute(&cli);
     if let Some(output) = handle_app_runtime_account_setup_request(
         &cli,
+        &mut import_nsec,
         defaults,
         state.clone(),
         events.clone(),
@@ -594,7 +605,7 @@ async fn handle_execute_connection(
     }
     // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
     // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli).await;
+    let output = crate::run_cli_local(*cli, import_nsec).await;
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

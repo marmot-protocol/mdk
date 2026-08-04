@@ -1,6 +1,7 @@
 //! App-runtime hosting glue: reconciliation, event bridge, and hosted command dispatch.
 
 use super::*;
+use crate::ImportNsec;
 
 #[derive(Debug)]
 pub(crate) struct DaemonState {
@@ -72,25 +73,27 @@ pub(crate) async fn reconcile_and_clone_runtime(
 
 pub(crate) async fn handle_app_runtime_account_setup_request(
     cli: &Cli,
+    import_nsec: &mut Option<crate::ImportNsec>,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     workers: &SharedDaemonWorkers,
 ) -> Option<CliOutput> {
-    let request = match app_runtime_account_setup_request(cli) {
+    if !app_runtime_enabled(defaults) {
+        return None;
+    }
+    let mut request = match app_runtime_account_setup_request(cli, import_nsec.as_ref()) {
         Ok(Some(request)) => request,
         Ok(None) => return None,
         Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
     };
-    if !app_runtime_enabled(defaults) {
-        return None;
-    }
     let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::WnError::MissingRelay),
         ));
     };
+    request.import_nsec = import_nsec.take().map(ImportNsec::into_inner);
     // create_or_import_account drives relay I/O through the cloned runtime handle (internally
     // synchronized), so it runs off the workers lock.
     let output = runtime
@@ -327,14 +330,19 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
 
 pub(crate) fn app_runtime_account_setup_request(
     cli: &Cli,
+    import_nsec: Option<&crate::ImportNsec>,
 ) -> Result<Option<marmot_app::AccountSetupRequest>, crate::WnError> {
     match &cli.command {
         crate::Command::CreateIdentity => {
+            if import_nsec.is_some() {
+                return Err(crate::WnError::InvalidPublicKey);
+            }
             if cli.daemon_default_account_relays.is_empty() {
                 return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: None,
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
@@ -348,14 +356,15 @@ pub(crate) fn app_runtime_account_setup_request(
             ..
         } => {
             crate::validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
-            let Some(identity) = identity.clone() else {
+            if identity.is_none() && import_nsec.is_none() {
                 return Err(crate::WnError::MissingLoginIdentity);
-            };
-            if crate::is_nostr_secret(&identity) && cli.daemon_default_account_relays.is_empty() {
+            }
+            if import_nsec.is_some() && cli.daemon_default_account_relays.is_empty() {
                 return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
-                identity: Some(identity),
+                identity: identity.clone(),
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
@@ -386,6 +395,7 @@ pub(crate) fn app_runtime_account_setup_request(
             crate::validate_materialized_secret_identity("account create", identity, *nsec_stdin)?;
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: identity.clone(),
+                import_nsec: None,
                 default_relays: crate::relay_endpoints(default_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
