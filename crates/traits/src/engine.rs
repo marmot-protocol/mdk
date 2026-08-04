@@ -658,7 +658,8 @@ pub trait CgkaEngine: Send + Sync {
     /// Encrypt + prepare an outbound message or group operation.
     ///
     /// **State.** Group-state intents (commits, admin changes) are valid only
-    /// from `Stable`; any other state returns `InvalidTransition`.
+    /// from `Stable`; any other state returns `InvalidTransition`. The one
+    /// exception is [`SendIntent::Disband`] — see below.
     ///
     /// [`SendIntent::AppMessage`] is additionally accepted from every state
     /// that [`EpochState::is_awaiting_resolution`], because such a state owes
@@ -668,11 +669,17 @@ pub trait CgkaEngine: Send + Sync {
     /// [`SendResult::Queued`] returned; the engine re-prepares it against
     /// whatever canonical state the group lands on, so a message retained
     /// across an epoch change is encrypted under the *later* epoch. Terminal
-    /// states (`Unrecoverable`, `Disbanded`) still return `InvalidTransition`:
-    /// no outcome is owed there, so retention would promise a delivery nothing
-    /// can make.
+    /// states (`Unrecoverable`, `Disbanded`) still refuse it: no outcome is owed
+    /// there, so retention would promise a delivery nothing can make.
     ///
     /// Unresolved convergence input queues every intent kind the same way.
+    ///
+    /// [`SendIntent::Disband`] is not epoch-state gated at all: it only
+    /// persists the irreversible request, so `PendingPublish`, `Merging`, and
+    /// `Unrecoverable` all still accept it. Preparing its Commit keeps the
+    /// ordinary `Stable` requirement, so a halted group records the request
+    /// without acting on it. A `Disbanded` group refuses it like every other
+    /// intent.
     ///
     /// [`EpochState::is_awaiting_resolution`]:
     ///     crate::engine_state::EpochState::is_awaiting_resolution

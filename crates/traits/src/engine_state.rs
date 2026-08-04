@@ -285,8 +285,8 @@ impl EpochState {
     /// [`Self::is_awaiting_resolution`].
     ///
     /// `Unrecoverable` needs a verified repair path and `Disbanded` has no legal
-    /// exit at all, so neither will resolve on its own. Work may not be held for
-    /// a terminal group.
+    /// exit at all, so neither will resolve on its own. Deliverable work may not
+    /// be held for a terminal group.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,

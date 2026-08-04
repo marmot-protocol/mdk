@@ -196,8 +196,10 @@ If a group has unresolved convergence input, `send(intent)` MUST store the inten
 outcome, a merge, or a convergence decision. An application-message intent offered in one of those states MUST also be
 stored durably and returned as `SendResult::Queued` rather than refused, so a slow or failing group operation cannot
 discard a user's message. Group-state intents MUST keep the strict `Stable` requirement, because a second staged
-evolution has no epoch to apply to. `Unrecoverable` and `Disbanded` are terminal and MUST refuse every intent: nothing
-will resolve them, so retention there would promise a delivery the engine cannot make.
+evolution has no epoch to apply to. `Disbanded` is terminal and MUST refuse every intent. `Unrecoverable` MUST refuse
+every intent except `SendIntent::Disband`, which persists an irreversible request rather than retaining a delivery, and
+whose Commit preparation MUST still wait for `Stable`. Neither state resolves on its own, so retaining a delivery there
+would promise one the engine cannot make.
 
 Because retention stores the *intent*, not ciphertext, a message retained across an epoch change MUST be encrypted under
 the epoch it is regenerated at, never the epoch it was accepted at.
