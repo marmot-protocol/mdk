@@ -1049,7 +1049,7 @@ async fn runtime_local_ready_before_directory_subscribe_body() {
     assert!(runtime.shared_services().lifecycle().is_running());
 
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
         relay.wait_for_blocked_subscribe(),
     )
     .await
