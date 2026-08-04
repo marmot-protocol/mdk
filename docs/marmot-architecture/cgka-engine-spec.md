@@ -192,6 +192,19 @@ group. Auto-publish and explicit `send` paths now share the same publish-before-
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return
 `SendResult::Queued`.
 
+`PendingPublish`, `Merging`, and `Recovering` each owe their exit to something the sender does not control — a publish
+outcome, a merge, or a convergence decision. An application-message intent offered in one of those states MUST also be
+stored durably and returned as `SendResult::Queued` rather than refused, so a slow or failing group operation cannot
+discard a user's message. Group-state intents MUST keep the strict `Stable` requirement, because a second staged
+evolution has no epoch to apply to. `Unrecoverable` and `Disbanded` are terminal and MUST refuse every intent: nothing
+will resolve them, so retention there would promise a delivery the engine cannot make.
+
+Because retention stores the *intent*, not ciphertext, a message retained across an epoch change MUST be encrypted under
+the epoch it is regenerated at, never the epoch it was accepted at.
+
+When a publish outcome returns a group to `Stable`, the engine MUST schedule that group for convergence if it still
+holds durable outbound intents. Nothing else would release them.
+
 When the group becomes stable, the application calls:
 
 ```text
@@ -478,6 +491,7 @@ A conforming engine MUST pass scenario tests for:
 - commit older than retained anchor dropped as `BeyondAnchor`,
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app and commit intents queued while syncing,
+- app message retained across a pending publish and regenerated under the epoch the publish established,
 - queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.
