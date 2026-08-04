@@ -725,10 +725,19 @@ impl AppClient {
     /// also makes `sync_inner`'s own call belt-and-braces rather than
     /// load-bearing: the nested drain has already emptied the stash.)
     ///
-    /// Residual: the receive arm drops the whole client on a failed pass, which
-    /// discards this stash and the detector's `escalated` latch together, so a
-    /// fresh run re-escalates from its own first three arms. That is a coherent
-    /// loss of the session, not a silently swallowed report.
+    /// Residual: the receive arm drops the whole client on a failed pass, so the
+    /// replacement starts with an empty stash and a fresh detector; the
+    /// `epoch_stall_backfill_escalated` row recorded just before the push is the
+    /// only trace that outlives them, and only where audit logging is on (opt-in,
+    /// off by default). Re-escalating then costs a whole fresh three-arm run, and
+    /// only its first arm can land at the epoch the device already sits at — an
+    /// arm at an epoch already fired at is a `Skip` — so arms two and three each
+    /// need the local epoch to genuinely advance. A group that is still advancing
+    /// therefore re-escalates roughly two epochs later, delayed rather than lost;
+    /// a group frozen at one local epoch arms once and never escalates again.
+    /// That second case is a pre-existing blind spot of the arm counter, not a
+    /// rebuild artifact — a group frozen from its first arm never escalates in a
+    /// fresh process either — and is tracked for a follow-up.
     fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
         summary
             .epoch_stall_escalations

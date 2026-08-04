@@ -18,11 +18,20 @@
 //! that full-history replay cannot repair instead of retrying it silently.
 //!
 //! All of this state is process-local, like the stall counts it extends: a
-//! restart forgets an escalated run, so a group that is still stalled escalates
-//! once more on the next run it accumulates. That is the intended trade — the
-//! report is cheap and the group genuinely still needs repair — and the
-//! `epoch_stall_backfill_escalated` audit row the caller writes is the durable
-//! record of every escalation across restarts.
+//! restart — or the client rebuild the runtime performs after a failed receive
+//! pass — forgets an escalated run entirely. Re-escalating then costs a whole
+//! fresh run of [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] arms, and only the
+//! first of those can land at the epoch the device already sits at, because an
+//! arm at an epoch already fired at is skipped: every further arm needs a real
+//! local epoch advance. A group whose epoch is still advancing therefore
+//! escalates again two epochs later at the default threshold — delayed, not
+//! lost — while a group frozen at one local epoch arms once and never escalates
+//! again. That second case is a pre-existing blind spot of the arm counter, not
+//! a restart artifact — a group frozen from its first arm never escalates in a
+//! fresh process either — and is tracked for a follow-up. The
+//! `epoch_stall_backfill_escalated` audit row the caller writes is the only
+//! record that outlives the process, and only where audit logging is enabled
+//! (opt-in, off by default).
 //!
 //! The policy is deliberately I/O-free so it can be unit-tested in isolation;
 //! the recovery action it triggers — a full-history transport replay — lives in
