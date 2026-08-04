@@ -30,7 +30,7 @@ use cgka_traits::storage::{
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{EpochId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
@@ -2410,4 +2410,80 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
         MessageState::ConvergenceDeferred,
         "failing closed must not terminalize the parked own commit"
     );
+}
+
+#[tokio::test]
+async fn hydrate_advances_snapshot_allocator_past_skipped_fork_snapshots() {
+    // The hydrate-time rebuild only advanced the snapshot-name allocator for
+    // snapshots it actually REBUILT (via `record_applied`). A snapshot the
+    // scan parsed and then skipped — an orphan of a crash between snapshot
+    // creation and the apply, a below-horizon leftover, or one whose replay
+    // probe failed — left the allocator behind the highest counter on disk,
+    // so the first post-restart `fork-<epoch>-<counter>-…` name could collide
+    // with (and clobber) a snapshot that is still there.
+    let local_id = b"alloc-local".as_slice();
+    let (group_id, local_storage, _local_commit, _rival_root) =
+        forked_privileged_invites(local_id, b"alloc-rival", b"alloc-david", b"alloc-eve").await;
+
+    // An orphan fork snapshot at the CURRENT epoch: nothing in storage is an
+    // applied commit row for source epoch 2, so the hydrate scan parses this
+    // name and then skips it. Its counter is far above every counter the
+    // engine has minted so far.
+    let orphan_counter = 9_000_u64;
+    let orphan = format!("fork-2-{orphan_counter}-0123456789abcdef");
+    local_storage
+        .create_group_snapshot(&group_id, &orphan)
+        .unwrap();
+
+    // RESTART: the scan must observe the orphan's counter even though it
+    // rebuilds nothing from it.
+    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    let before: Vec<u64> = fork_snapshot_counters(&local_storage, &group_id);
+    assert!(before.contains(&orphan_counter));
+
+    // Any new commit mints the next fork snapshot name from the allocator.
+    let mut frank = build_client(b"alloc-frank");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    local
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap();
+
+    let after = fork_snapshot_counters(&local_storage, &group_id);
+    let minted: Vec<u64> = after
+        .iter()
+        .copied()
+        .filter(|counter| !before.contains(counter))
+        .collect();
+    assert!(
+        !minted.is_empty(),
+        "the new commit must mint a fresh fork snapshot"
+    );
+    assert!(
+        minted.iter().all(|counter| *counter > orphan_counter),
+        "post-restart names must be allocated above every counter on disk, \
+         including skipped ones; minted {minted:?} vs orphan {orphan_counter}"
+    );
+    assert!(
+        after.contains(&orphan_counter),
+        "the skipped orphan snapshot must not have been clobbered"
+    );
+}
+
+fn fork_snapshot_counters(storage: &SqliteAccountStorage, group_id: &GroupId) -> Vec<u64> {
+    storage
+        .list_group_snapshots(group_id)
+        .unwrap()
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix("fork-")?
+                .split('-')
+                .nth(1)?
+                .parse::<u64>()
+                .ok()
+        })
+        .collect()
 }

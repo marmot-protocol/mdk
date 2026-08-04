@@ -117,8 +117,16 @@ impl ForkRecoveryManager {
             .and_then(|suffix| suffix.split('-').nth(1))
             .and_then(|counter| counter.parse::<u64>().ok())
         {
-            self.snapshot_counter = self.snapshot_counter.max(counter);
+            self.observe_snapshot_counter_value(counter);
         }
+    }
+
+    /// [`Self::observe_snapshot_counter`] for a counter that has already been
+    /// parsed out of a durable snapshot name — used by the hydrate-time scan,
+    /// which must advance the allocator for EVERY snapshot it parses, not just
+    /// the ones it goes on to rebuild.
+    fn observe_snapshot_counter_value(&mut self, counter: u64) {
+        self.snapshot_counter = self.snapshot_counter.max(counter);
     }
 
     pub(crate) fn record_pending(
@@ -583,6 +591,14 @@ impl<S: StorageProvider> Engine<S> {
             ) else {
                 continue;
             };
+            // Advance the snapshot-name allocator for EVERY parsed durable
+            // name, before any filtering. Only rebuilt incumbents reach
+            // `record_applied` (which observes their counter); a snapshot
+            // skipped here as an orphan, dropped below the rewind horizon, or
+            // abandoned after a failed replay probe would otherwise leave the
+            // allocator behind the highest counter on disk, and the next
+            // `next_snapshot_name` after restart could mint a colliding name.
+            self.fork_recovery.observe_snapshot_counter_value(counter);
             let entry = newest_by_epoch
                 .entry(source_epoch)
                 .or_insert((counter, name.clone()));
@@ -648,9 +664,18 @@ impl<S: StorageProvider> Engine<S> {
             // Steady state holds one Processed commit per source epoch; if a
             // crash left more, prefer the own-stamped row (its ordering
             // metadata was authenticated at confirm time and needs no replay).
-            let entry = applied_by_epoch.entry(source_epoch).or_insert(row.clone());
-            if entry.2.is_none() && row.2.is_some() {
-                *entry = row;
+            // The vacant arm MOVES the row (the MLS payload is not cloned);
+            // the occupied arm only replaces when the newcomer is the
+            // own-stamped one.
+            match applied_by_epoch.entry(source_epoch) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(row);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if slot.get().2.is_none() && row.2.is_some() {
+                        slot.insert(row);
+                    }
+                }
             }
         }
 
