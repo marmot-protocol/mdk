@@ -150,7 +150,7 @@ pub fn generate_adversarial_reliability_case(seed: u64, case_index: u64) -> Gene
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1".into(),
+        generator_version: "2".into(),
         seed,
         case_index,
         subject,
@@ -170,7 +170,7 @@ pub fn generate_adversarial_reliability_sustained_regression(seed: u64) -> Gener
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1-regression".into(),
+        generator_version: "2-regression".into(),
         seed,
         case_index,
         subject,
@@ -214,7 +214,7 @@ fn adversarial_reliability_regression_case(
     add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name,
-        generator_version: "1-regression".into(),
+        generator_version: "2-regression".into(),
         seed,
         case_index,
         subject,

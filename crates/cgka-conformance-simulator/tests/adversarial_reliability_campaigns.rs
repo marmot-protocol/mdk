@@ -27,6 +27,22 @@ fn adversarial_reliability_catalog_covers_every_required_workload_shape() {
     }
 }
 
+#[test]
+fn generator_versions_track_the_renamed_output_contract() {
+    assert!(
+        generate_adversarial_reliability_family(7, 12)
+            .iter()
+            .all(|case| case.generator_version == "2")
+    );
+    for case in [
+        generate_adversarial_reliability_offline_regression(7),
+        generate_adversarial_reliability_sustained_regression(7),
+        generate_adversarial_reliability_self_update_regression(7),
+    ] {
+        assert_eq!(case.generator_version, "2-regression");
+    }
+}
+
 async fn assert_generated_case(case_index: usize) -> cgka_conformance_simulator::ScenarioReport {
     assert_case(&generate_adversarial_reliability_case(7, case_index as u64)).await
 }
