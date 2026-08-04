@@ -308,6 +308,29 @@ convergence-verification-ci:
     just tla-liveness
     just tla-liveness-counterexample
 
+# Validate the versioned execution-lane policy, all resource/retention/flake
+# budgets, and the release evidence-bundle completeness contract.
+convergence-lane-policy:
+    cargo nextest run -p convergence-campaign-runner --test lane_policy --locked
+
+# Capability-level lane entry points. The PR workflow runs the first lane as
+# separate parallel jobs; the scheduled workflows use the aggregate recipes.
+convergence-pr-lane: convergence-lane-policy simulator-smoke convergence-verification-ci
+
+convergence-nightly-lane: convergence-lane-policy simulator-full adversarial-reliability-ci convergence-verification-ci
+    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --test route_equivalence --locked
+    cargo nextest run -p convergence-campaign-runner --locked
+
+convergence-weekly-lane: convergence-nightly-lane
+    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 4 --case-timeout-secs 300 --out target/cgka-weekly-reliability --storage file
+
+# A release run must name the reviewed mixed-build/incident manifest rather
+# than silently falling back to a current-build-only campaign.
+convergence-release-hardening-lane manifest:
+    just convergence-weekly-lane
+    cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- validate "{{manifest}}"
+    cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- run "{{manifest}}"
+
 tracing-audit:
     cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 
