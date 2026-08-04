@@ -614,6 +614,45 @@ mod tests {
     }
 
     #[test]
+    fn only_states_owed_an_outcome_await_resolution() {
+        // The engine retains outbound application work across exactly these
+        // states, so the split has to stay a deliberate decision rather than a
+        // side effect of adding a variant. `Stable` awaits nothing; the two
+        // terminal states are owed nothing, and retaining work for them would
+        // promise a delivery that never happens.
+        let pending = EpochState::stable(EpochId(1))
+            .begin_pending(EpochId(2), handle(), pref())
+            .unwrap();
+        let merging = pending.clone().confirm_publish().unwrap();
+        let awaiting = [
+            pending,
+            merging,
+            EpochState::stable(EpochId(1)).detect_fork(vec![]),
+        ];
+        for state in awaiting {
+            assert!(
+                state.is_awaiting_resolution(),
+                "{} is owed an outcome",
+                state.name()
+            );
+            assert!(!state.is_stable());
+        }
+
+        let settled = [
+            EpochState::stable(EpochId(1)),
+            EpochState::stable(EpochId(1)).to_unrecoverable(),
+            EpochState::disbanded(EpochId(1)),
+        ];
+        for state in settled {
+            assert!(
+                !state.is_awaiting_resolution(),
+                "{} is not awaiting an outcome",
+                state.name()
+            );
+        }
+    }
+
+    #[test]
     fn invalid_transition_message_names_both_states() {
         let err = EpochState::stable(EpochId(0))
             .confirm_publish()
