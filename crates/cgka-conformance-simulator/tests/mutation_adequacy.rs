@@ -51,12 +51,20 @@ fn mutation_matrix_has_exactly_one_row_per_executable_mutant() {
         .iter()
         .map(|mutation| mutation.id())
         .collect();
+    let row_ids = matrix
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|rest| rest.split_once("` |"))
+                .map(|(id, _)| id)
+        })
+        .collect::<Vec<_>>();
     for id in &ids {
         assert_eq!(
-            matrix.matches(&format!("`{id}`")).count(),
+            row_ids.iter().filter(|row_id| *row_id == id).count(),
             1,
             "matrix must contain exactly one row for {id}"
         );
     }
-    assert_eq!(matrix.matches("| `").count(), ids.len());
+    assert_eq!(row_ids.len(), ids.len());
 }
