@@ -401,4 +401,37 @@ mod tests {
             other => panic!("unexpected FFI event: {other:?}"),
         }
     }
+
+    #[test]
+    fn epoch_stall_escalation_reaches_the_ffi_with_its_group_and_counts() {
+        // This conversion is the whole of an FFI host's view of a group that
+        // full-history replay cannot repair: the host cannot see the sync summary
+        // or the forensic row, so a field lost here is a repair prompt the user
+        // never gets. The group id is the one field that changes shape crossing
+        // the boundary, and it is what the host needs to name the group.
+        let event = MarmotAppEvent::EpochStallEscalated {
+            account_id_hex: "ac".repeat(32),
+            account_label: "bob".to_owned(),
+            group_id: GroupId::new(vec![0x33; 16]),
+            stalled_epoch: 12,
+            arms: 3,
+        };
+
+        match MarmotEventFfi::from(event) {
+            MarmotEventFfi::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                stalled_epoch,
+                arms,
+            } => {
+                assert_eq!(account_id_hex, "ac".repeat(32));
+                assert_eq!(account_label, "bob");
+                assert_eq!(group_id_hex, "33".repeat(16));
+                assert_eq!(stalled_epoch, 12);
+                assert_eq!(arms, 3);
+            }
+            other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
 }

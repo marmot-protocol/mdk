@@ -447,6 +447,41 @@ mod tests {
         );
     }
 
+    /// Pins the known blind spot named in [`GroupStall::observe_epoch`]: a run
+    /// ends on an *observation* at an epoch the device did not arm at, and an
+    /// epoch the detector is never told about cannot be that observation. This is
+    /// today's behavior, not the intended behavior — a device that recovers
+    /// cleanly through several epochs still has its next unrelated stall counted
+    /// as arm two, so a healthy device can be escalated. Closing the observation
+    /// gap is the tracked follow-up; until then this test is what makes the blind
+    /// spot visible instead of surprising, and it is the "before" side of that
+    /// change.
+    #[test]
+    fn an_epoch_advance_the_detector_never_observed_does_not_end_the_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // One arm at 10, then the device is carried to 13 by advances the
+        // detector is never told about — the convergence fold reaches no
+        // `observe_*` call, so nothing between the arm and the next stall records
+        // 11, 12 or 13.
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+
+        // The next stall is therefore the first observation since the arm, and it
+        // finds the detector still sitting at the epoch it armed at. The run
+        // continues even though the device passed through three epochs in between,
+        // and reaches its escalation threshold.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(13)),
+            BackfillDecision::Arm,
+            "an unobserved advance leaves the run open, so this is arm two"
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(14)),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+        );
+    }
+
     #[test]
     fn resource_refusal_arms_count_toward_the_same_run() {
         let mut detector = EpochStallDetector::new(1, 3);
