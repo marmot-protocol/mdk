@@ -1,5 +1,5 @@
 use cgka_conformance_simulator::{
-    HarnessStorageMode, ScenarioReport, generate_milestone3_adversarial_case,
+    HarnessStorageMode, ScenarioReport, generate_adversarial_reliability_case,
     run_generated_case_report_with_storage_mode,
 };
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,7 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
 
 async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
     let case_index = args.case_index.ok_or("worker requires --case-index")?;
-    let case = generate_milestone3_adversarial_case(args.seed, case_index as u64);
+    let case = generate_adversarial_reliability_case(args.seed, case_index as u64);
     let report = run_generated_case_report_with_storage_mode(&case, None, args.storage).await?;
     if let Some(parent) = args.out.parent() {
         fs_private::create_dir_all_private(parent)?;
@@ -143,7 +143,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     let mut seed = 7;
     let mut cases = 12;
     let mut case_index = None;
-    let mut out = PathBuf::from("target/cgka-milestone3-process-campaign");
+    let mut out = PathBuf::from("target/cgka-adversarial-reliability-process-campaign");
     let mut storage = HarnessStorageMode::TempFileBackedSqlite;
     let mut case_timeout = Duration::from_secs(300);
     let mut worker = false;

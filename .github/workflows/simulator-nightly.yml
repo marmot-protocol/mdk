@@ -50,20 +50,20 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run complete simulator suite
-        # Milestone 3 and 4 binaries run below with their required feature sets
-        # and model checks; exclude only those duplicate invocations here.
+        # Adversarial campaigns and independent convergence checks run below
+        # with their required feature sets; exclude only those duplicates here.
         run: |
           cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked --profile ci \
-            -E 'not binary(milestone3_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate)'
+            -E 'not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate)'
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
-      - name: Run Milestone 3 adversarial campaign gate
-        run: just milestone3-ci
+      - name: Run adversarial reliability campaigns
+        run: just adversarial-reliability-ci
 
-      - name: Run Milestone 4 independent verification gate
-        run: just milestone4-ci
+      - name: Verify convergence with independent models
+        run: just convergence-verification-ci
 
       - name: Run encrypted file-backed vector report
         run: |

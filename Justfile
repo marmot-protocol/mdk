@@ -256,17 +256,17 @@ conformance:
 conformance-slow:
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
-# Full Milestone 3 campaign gate: all catalog families, test-policy A/B and
+# Full adversarial reliability gate: all catalog families, test-policy A/B,
 # resource sweeps, sustained headline workloads, and the isolated process runner.
-milestone3-ci:
-    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked
-    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test milestone3_campaigns --locked -- --ignored
+adversarial-reliability-ci:
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked
+    cargo test -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked -- --ignored
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
-    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-milestone3-ci --storage file
+    cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-adversarial-reliability-ci --storage file
 
-# Independent model, lifecycle/fairness, mutation adequacy, and protocol
-# decision gates.
-milestone4-ci:
+# Independent convergence model, lifecycle/fairness, mutation adequacy, and
+# protocol decision gates.
+convergence-verification-ci:
     cargo nextest run -p cgka-conformance-simulator --test independent_reference_model --locked
     cargo nextest run -p cgka-conformance-simulator --test lifecycle_model --locked
     cargo nextest run -p cgka-conformance-simulator --test mutation_adequacy --locked
