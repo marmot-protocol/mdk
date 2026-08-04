@@ -648,11 +648,11 @@ impl<S: StorageProvider> Engine<S> {
                 }
             };
 
-            // The loaded group owns its state; release the provider's borrows
-            // before durable content-dedup and candidate-admission bookkeeping
-            // can mutate engine state. A fresh provider is installed
-            // immediately before OpenMLS processing.
-            drop(provider);
+            // The loaded group owns its state. The provider's final use is
+            // above, so non-lexical lifetimes release its storage borrow before
+            // durable content-dedup and candidate-admission bookkeeping mutates
+            // engine state. A fresh provider is installed immediately before
+            // OpenMLS processing.
 
             // foundation/wire-envelopes.md + protocol-core/inbound-processing.md:
             // the canonical dedup/replay id MUST be stable for the carried

@@ -32,6 +32,7 @@ expression: payload
       }
     },
     "stamp": {
+      "parent_group_context_sha256": "abcd",
       "committer": [
         238,
         238,

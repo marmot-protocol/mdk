@@ -305,6 +305,7 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
         },
     };
     let stamp = OwnCommitConvergenceStamp {
+        parent_group_context_sha256: Some("abcd".into()),
         committer: MemberId::new(vec![0xEE; 32]),
         priority: CommitOrderingPriority::Privileged,
         consumed_proposal_refs: vec!["0a0b".into()],
