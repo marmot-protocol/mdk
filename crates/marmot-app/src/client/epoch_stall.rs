@@ -70,6 +70,12 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 
 /// What one undecryptable-traffic observation decided.
+///
+/// `#[must_use]` because dropping a decision is unrecoverable, not merely
+/// wasteful: the detector latches `escalated` when it raises
+/// [`BackfillDecision::ArmAndEscalate`], so no later arm in the run raises it
+/// again. Every decision belongs in `AppClient::apply_backfill_decision`.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackfillDecision {
     /// Nothing to do: the group has not (yet) crossed its stall threshold, or a
@@ -333,8 +339,8 @@ mod tests {
         let mut detector = EpochStallDetector::new(1, 3);
         let g = group(0x01);
 
-        detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
-        detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
         assert_eq!(
             detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
             BackfillDecision::ArmAndEscalate { arms: 3 }
@@ -358,8 +364,8 @@ mod tests {
         let g = group(0x01);
 
         // Two arms into an unrecovered run.
-        detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
-        detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
 
         // The device then processes this group's traffic at 12 and moves on to 13
         // without ever stalling at 12 — it kept up with an epoch, which is as
@@ -410,23 +416,23 @@ mod tests {
         // A arms and the caller runs one account-wide replay, which suppresses
         // every tracked group at its current epoch — including B, which was
         // accumulating undecryptables but never armed.
-        detector.observe_undecryptable(a.clone(), "a1".into(), e);
+        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e);
         assert_eq!(
             detector.observe_undecryptable(a, "a2".into(), e),
             BackfillDecision::Arm
         );
-        detector.observe_undecryptable(b.clone(), "b1".into(), e);
+        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e);
         detector.mark_replayed();
 
         // B stalls at the next two epochs. Its run starts at the first of those
         // arms: the suppression it inherited was never a repair attempt of its
         // own, so it must not count toward escalating B.
-        detector.observe_undecryptable(b.clone(), "b2".into(), EpochId(6));
+        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), EpochId(6));
         assert_eq!(
             detector.observe_undecryptable(b.clone(), "b3".into(), EpochId(6)),
             BackfillDecision::Arm
         );
-        detector.observe_undecryptable(b.clone(), "b4".into(), EpochId(7));
+        let _ = detector.observe_undecryptable(b.clone(), "b4".into(), EpochId(7));
         assert_eq!(
             detector.observe_undecryptable(b, "b5".into(), EpochId(7)),
             BackfillDecision::ArmAndEscalate { arms: 2 }
@@ -463,8 +469,8 @@ mod tests {
         let g = group(0x01);
         let e = EpochId(19);
 
-        detector.observe_undecryptable(g.clone(), "m1".into(), e);
-        detector.observe_undecryptable(g.clone(), "m2".into(), e);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), e);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), e);
         assert!(
             detector
                 .observe_undecryptable(g.clone(), "m3".into(), e)
@@ -516,8 +522,8 @@ mod tests {
 
         // Group A crosses the threshold and the caller runs ONE account-wide
         // replay (which re-fetches every group's history, B included).
-        detector.observe_undecryptable(a.clone(), "a1".into(), e);
-        detector.observe_undecryptable(a.clone(), "a2".into(), e);
+        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e);
+        let _ = detector.observe_undecryptable(a.clone(), "a2".into(), e);
         assert!(
             detector
                 .observe_undecryptable(a.clone(), "a3".into(), e)
@@ -526,8 +532,8 @@ mod tests {
 
         // Group B was accumulating undecryptables at the same epoch in the same
         // drain but had not yet crossed the threshold.
-        detector.observe_undecryptable(b.clone(), "b1".into(), e);
-        detector.observe_undecryptable(b.clone(), "b2".into(), e);
+        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e);
+        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), e);
 
         detector.mark_replayed();
 
@@ -546,8 +552,8 @@ mod tests {
         let mut detector = stall_detector(3);
         let g = group(0x01);
 
-        detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(19));
-        detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(19));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(19));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(19));
         // The group advanced to epoch 20 — its commits are reaching us again, so
         // the earlier undecryptables must not count toward a stall at epoch 20.
         assert!(
