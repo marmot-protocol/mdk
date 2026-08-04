@@ -727,6 +727,22 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<bool, EngineError> {
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
+                // Discover everything decryptable under retained live and
+                // candidate branch contexts before freezing the active pass.
+                // Settling first would expose an already-queued deeper commit
+                // or app witness only in a follow-up generation, making the
+                // provisional branch depend on transport-wrapper order.
+                let _ = self.retry_deferred_peels(group_id).await?;
+                let fairness_slot_available =
+                    self.storage
+                        .convergence_pass(group_id)?
+                        .is_some_and(|pass| {
+                            pass.phase == cgka_traits::ConvergencePassPhase::Completed
+                                && pass.fairness_slot_available
+                        });
+                if fairness_slot_available {
+                    return Ok(true);
+                }
                 let result = self
                     .converge_stored_openmls_messages_with_time(
                         group_id,

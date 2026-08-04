@@ -1547,7 +1547,12 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             report.step_log,
             report.expectation_failures
         );
-        assert!(report.app_invalidation_observations.is_empty());
+        assert!(
+            report
+                .app_invalidation_observations
+                .iter()
+                .all(|observation| observation.reason == "losing_branch")
+        );
     }
 }
 
@@ -2609,8 +2614,8 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         );
     }
 
-    let deferred_trace = ScenarioTrace {
-        name: "convergence-e2e/deferred-losing-transport".into(),
+    let settled_trace = ScenarioTrace {
+        name: "convergence-e2e/settled-losing-transport".into(),
         pending_resolutions: vec![],
         errors: vec![],
         admin_policies: vec![],
@@ -2620,39 +2625,22 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
             observe_client_exact("frank", &mut frank),
         ],
     };
-    for observation in &deferred_trace.observations {
+    for observation in &settled_trace.observations {
         let pending = observation
             .pending_work
             .as_ref()
             .expect("exact pending snapshot");
-        assert!(
-            pending.engine.stored_transport_deferred_messages > 0,
-            "{} should expose the retained unpeeled transport object: {pending:#?}",
-            observation.client
-        );
-        assert!(
-            pending.scenario_inputs_pending > 0,
-            "{} should expose the unresolved scenario input: {pending:#?}",
-            observation.client
-        );
+        assert_eq!(pending.engine.stored_transport_deferred_messages, 0);
+        assert_eq!(pending.scenario_inputs_pending, 0);
     }
     let failures = compare_trace_expectations(
         None,
         &[TraceExpectation::NoPendingWork {
             clients: vec!["carol".into(), "frank".into()],
         }],
-        &deferred_trace,
+        &settled_trace,
     );
-    assert_eq!(
-        failures.len(),
-        2,
-        "each observer should fail quiescence while transport work remains: {failures:#?}"
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| failure.kind == "pending_work_remaining")
-    );
+    assert!(failures.is_empty(), "settled observers: {failures:#?}");
 }
 
 #[tokio::test]
@@ -2665,8 +2653,8 @@ async fn scenario_report_records_convergence_e2e_group_events() {
 
     assert!(report.invariant_failures.is_empty());
     assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
-    assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
-    assert!(report.app_invalidation_observations.is_empty());
+    assert_eq!(report.epoch_change_observations.len(), 2);
+    assert_eq!(report.app_invalidation_observations.len(), 2);
     assert!(
         report
             .step_log
@@ -2870,11 +2858,21 @@ fn assert_canonical_application_event(
             .any(|payload| payload == losing_payload),
         "{client} should not receive losing branch payload: {events:?}"
     );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. })),
-        "{client} invalidations: {events:?}"
+    let losing_invalidations = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GroupEvent::AppMessageInvalidated {
+                    reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        losing_invalidations, 1,
+        "{client} should explicitly retire the noncanonical app witness: {events:?}"
     );
     assert!(
         events.iter().any(|event| {
@@ -2900,11 +2898,10 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
                 assert_eq!(observation.added_members, vec!["david", "grace"]);
                 assert_eq!(
                     observation.epoch_changes,
-                    vec![
-                        EpochChangeObservation { from: 1, to: 2 },
-                        EpochChangeObservation { from: 2, to: 3 },
-                    ]
+                    vec![EpochChangeObservation { from: 1, to: 3 }]
                 );
+                assert_eq!(observation.app_invalidations.len(), 1);
+                assert_eq!(observation.app_invalidations[0].reason, "losing_branch");
             }
             [payload] if payload == "bob losing payload" => {
                 assert_eq!(observation.epoch, 2);
@@ -2918,7 +2915,12 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
             _ => panic!("unexpected convergence trace observation: {observation:?}"),
         }
         assert!(observation.removed_members.is_empty());
-        assert!(observation.app_invalidations.is_empty());
+        assert!(
+            observation
+                .app_invalidations
+                .iter()
+                .all(|invalidation| invalidation.reason == "losing_branch")
+        );
         assert!(observation.recoveries.is_empty());
     }
 }

@@ -370,6 +370,7 @@ impl<S: StorageProvider> Engine<S> {
                 monotonic_ms,
                 wall_ms: self.convergence_now().wall_ms,
             },
+            false,
         )
     }
 
@@ -379,7 +380,12 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message: TransportMessage,
     ) -> Result<(), OpenMlsProjectionError> {
-        self.buffer_openmls_convergence_message_with_time(group_id, message, self.convergence_now())
+        self.buffer_openmls_convergence_message_with_time(
+            group_id,
+            message,
+            self.convergence_now(),
+            false,
+        )
     }
 
     pub(crate) fn buffer_openmls_convergence_message_with_time(
@@ -387,6 +393,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message: TransportMessage,
         now: ConvergenceTime,
+        app_active_pass_only: bool,
     ) -> Result<(), OpenMlsProjectionError> {
         // Key the convergence store on the content-derived dedup id (SHA-256 of
         // the recovered MLS bytes), not the outer transport id (#238). This
@@ -427,7 +434,17 @@ impl<S: StorageProvider> Engine<S> {
             id: content_id.clone(),
             group_id: group_id.clone(),
             epoch: EpochId(source_epoch),
-            state: MessageState::Created,
+            // A candidate-route app may contribute to an already-open batch,
+            // but it must not become a fresh pass trigger merely because a
+            // completed pass still retains competing historical commit edges.
+            // `ConvergenceDeferred` remains eligible for later graph seeding
+            // while `ClassifiedConvergenceInput::can_start_pass` keeps this row
+            // from resurrecting a settled race on its own.
+            state: if app_active_pass_only {
+                MessageState::ConvergenceDeferred
+            } else {
+                MessageState::Created
+            },
             payload: StoredMessagePayload::openmls_wire(message)
                 .encode()
                 .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?,
@@ -438,8 +455,20 @@ impl<S: StorageProvider> Engine<S> {
         // intentionally blocked by an unstable local mutation owner.
         let (admission, opened) = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
-            let (admission, opened) =
-                self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
+            let (admission, opened) = if app_active_pass_only {
+                let admitted =
+                    self.admit_app_witness_to_active_pass_with_time(group_id, &content_id, now)?;
+                (
+                    if admitted {
+                        ConvergenceAdmissionOutcome::Admitted
+                    } else {
+                        ConvergenceAdmissionOutcome::Retained
+                    },
+                    false,
+                )
+            } else {
+                self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?
+            };
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
                 let mut group = storage.get_group(group_id)?;
                 group.unrecoverable = true;
@@ -461,48 +490,62 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Admit an application message that OpenMLS authenticated on the live
-    /// branch to a relevant collecting pass before ingest finalizes delivery.
-    /// Candidate-branch apps enter through the convergence buffer; without
-    /// this matching seam, provisional-live-branch apps could become
-    /// `Processed` outside the immutable batch and branch selection would
-    /// depend on transport order.
-    pub(crate) fn admit_authenticated_app_witness_with_time(
-        &mut self,
+    /// Admit a live-route application candidate to a relevant collecting pass
+    /// before mutating the live OpenMLS receive ratchet or projecting delivery.
+    /// Candidate-route apps enter through the convergence buffer; without this
+    /// matching seam, provisional-live-route apps could become `Processed`
+    /// outside the immutable batch and branch selection would depend on
+    /// transport order. Authentication still happens during branch
+    /// materialization before the candidate can contribute witness weight.
+    pub(crate) fn admit_app_witness_to_active_pass_with_time(
+        &self,
         group_id: &GroupId,
         message_id: &MessageId,
         now: ConvergenceTime,
-    ) -> Result<(), OpenMlsProjectionError> {
+    ) -> Result<bool, OpenMlsProjectionError> {
         // This seam only completes an already-open batch. It must not turn an
         // ordinary app arriving after a settled race into a fresh convergence
         // trigger; if the app precedes a candidate-branch input, that later
         // input opens and seeds a pass from all retained rows, including this
         // one.
-        if !self
+        let Some(pass) = self
             .storage
             .convergence_pass(group_id)
             .map_err(storage_projection_error)?
-            .is_some_and(|pass| pass.phase == ConvergencePassPhase::Collecting)
-        {
-            return Ok(());
+        else {
+            return Ok(false);
+        };
+        if pass.phase != ConvergencePassPhase::Collecting {
+            return Ok(false);
         }
-        let (admission, opened) =
+        if now.monotonic_ms >= pass.cutoff_monotonic_ms() {
+            // The immutable boundary belongs to the convergence scheduler.
+            // This app is late for the current batch and follows ordinary
+            // live delivery; do not freeze the pass from the ingest seam.
+            return Ok(false);
+        }
+
+        // A collecting pass can also represent a single, uncontested commit
+        // or some other unrelated convergence work. Do not let an ordinary
+        // live-branch application message become a member of that batch: app
+        // witnesses are relevant only when the pass already contains
+        // competing commit edges from an earlier source epoch.
+        let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
+            return Ok(false);
+        };
+        let context = ConvergenceInputContext::from_pass_members(&pass.members);
+        if !context.is_potentially_selection_relevant(candidate.input) {
+            return Ok(false);
+        }
+
+        let (admission, _opened) =
             self.admit_stored_message_to_convergence_pass(group_id, message_id, now)?;
-        if opened {
-            crate::test_crash_hooks::pause_if_requested("convergence-pass-collecting-durable");
-        }
         if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
-            let epoch = self
-                .storage
-                .get_group(group_id)
-                .map_err(storage_projection_error)?
-                .epoch;
-            self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
             return Err(OpenMlsProjectionError::Replay(
                 "frozen convergence pass failed integrity verification".into(),
             ));
         }
-        Ok(())
+        Ok(admission == ConvergenceAdmissionOutcome::Admitted)
     }
 
     fn admit_stored_message_to_convergence_pass(

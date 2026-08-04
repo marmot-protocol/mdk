@@ -738,6 +738,10 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
+            // The loaded group owns its state; release the provider's borrows
+            // before candidate admission mutates engine bookkeeping. A fresh
+            // provider is installed immediately before OpenMLS processing.
+            drop(provider);
 
             // A candidate branch context authenticates the outer transport
             // wrapper, but it does not replace the live OpenMLS group. Feed
@@ -753,21 +757,40 @@ impl<S: StorageProvider> Engine<S> {
                     &group_id,
                     openmls_msg.clone(),
                     now,
+                    msg_content_type == ContentType::Application,
                 )
                 .map_err(|error| {
                     EngineError::Backend(format!("buffer candidate-branch message: {error}"))
                 })?;
+                let admitted_to_active_pass = msg_content_type == ContentType::Application
+                    && self
+                        .storage
+                        .convergence_pass(&group_id)?
+                        .is_some_and(|pass| {
+                            pass.phase == cgka_traits::ConvergencePassPhase::Collecting
+                                && pass
+                                    .members
+                                    .iter()
+                                    .any(|member| member.message_id == msg.id)
+                        });
                 // Do not freeze a convergence pass here. Candidate contexts are
                 // only enabled while a caller is draining retained input, and
                 // converging after the first recovered row would make branch
                 // selection depend on transport order: later app witnesses in
-                // the same bounded drain would miss the frozen batch. The drain
-                // retires the raw wrapper and starts one pass after admitting all
-                // currently recoverable content rows.
-                return Ok(IngestOutcome::Buffered {
-                    group_id,
-                    epoch: current_epoch,
-                });
+                // the same bounded drain would miss the frozen batch. Admitted
+                // rows retire their raw wrappers together after the sweep; a
+                // late app that cannot join remains visibly transport-deferred.
+                if msg_content_type != ContentType::Application || admitted_to_active_pass {
+                    return Ok(IngestOutcome::Buffered {
+                        group_id,
+                        epoch: current_epoch,
+                    });
+                }
+                // The race already settled before this candidate-route app was
+                // discovered. Keep the raw wrapper visibly deferred so a
+                // later genuine branch-context change can retry it; the app
+                // cannot reopen the completed race by itself.
+                return Ok(IngestOutcome::TransportDeferred { group_id });
             }
 
             // Pre-membership classification (mdk#339): an application
@@ -827,6 +850,7 @@ impl<S: StorageProvider> Engine<S> {
                     &group_id,
                     openmls_msg.clone(),
                     now,
+                    false,
                 )
                 .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
@@ -845,6 +869,7 @@ impl<S: StorageProvider> Engine<S> {
                     &group_id,
                     openmls_msg.clone(),
                     now,
+                    false,
                 )
                 .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
                 let result = self
@@ -865,9 +890,34 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::Created,
             )?;
 
+            if msg_content_type == ContentType::Application
+                && self
+                    .admit_app_witness_to_active_pass_with_time(
+                        &group_id,
+                        &msg.id,
+                        candidate_admission_time.unwrap_or_else(|| self.convergence_now()),
+                    )
+                    .map_err(|error| {
+                        EngineError::Backend(format!("admit live app witness candidate: {error}"))
+                    })?
+            {
+                // Do not authenticate this copy against the live group first:
+                // OpenMLS private-message processing advances receive-ratchet
+                // state, so canonical replay would then see a duplicate and
+                // could not emit the selected app exactly once. The frozen
+                // batch authenticates it independently against every candidate
+                // and owns its final delivery or invalidation.
+                return Ok(IngestOutcome::Buffered {
+                    group_id,
+                    epoch: current_epoch,
+                });
+            }
+
             // Process via MLS. Commits may contain AppDataUpdate proposals,
             // which require the application to compute the resulting
             // AppDataDictionary before OpenMLS stages the commit.
+            let provider =
+                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
             let processed = match if msg_content_type == ContentType::Commit {
                 process_commit_with_app_data_updates(&mut mls_group, &provider, proto)
             } else {
@@ -1204,19 +1254,6 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         self.audit_group(&group_id, decoded);
                     }
-                    // Preserve app-witness order independence across the two
-                    // ingest routes. A live-branch app authenticated while a
-                    // competing-branch pass is collecting must join the same
-                    // frozen set as candidate-branch apps recovered below the
-                    // transport seam.
-                    self.admit_authenticated_app_witness_with_time(
-                        &group_id,
-                        &msg.id,
-                        candidate_admission_time.unwrap_or_else(|| self.convergence_now()),
-                    )
-                    .map_err(|error| {
-                        EngineError::Backend(format!("admit authenticated app witness: {error}"))
-                    })?;
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
                         sender,
