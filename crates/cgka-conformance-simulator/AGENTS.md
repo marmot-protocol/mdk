@@ -167,7 +167,7 @@ the property-test registry. This file is the agent-facing model.
 - **Module:** `src/bin/cgka-conformance-campaign.rs`
   - **Role:** Parent/worker campaign runner. Executes each generated case in an isolated child process and combines the
     durable scenario report with `wait4` wall/CPU/peak-RSS/write measurements. This is the engine campaign boundary for
-    real process isolation; it is not yet the app/CLI multi-process adapter planned for Milestone 5.
+    real process isolation; the app-runtime and child-process adapters are separate production-shaped boundaries.
 
 - **Module:** `src/bin/cgka-policy-casegen.rs`
   - **Role:** Policy-case generator CLI; reads `formal/tamarin/policy_cases.json` and parses/reasons over the bounded
