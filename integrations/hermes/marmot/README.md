@@ -47,16 +47,20 @@ One-line install:
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
 ```
 
+In guided setup, the allowed-message-sender prompt accepts one or more `npub` or
+raw hex public keys separated by commas. Leaving that prompt blank explicitly
+opens Marmot messaging to every sender by writing
+`MARMOT_ALLOW_ALL_USERS=true`.
+
 For repeatable noninteractive setup, pass the allowed inviter/welcomer and allowed
 message sender as either an `npub` or raw hex public key. `--allow-user` may be
-repeated to authorize multiple senders:
+repeated or given a comma-separated list to authorize multiple senders:
 
 ```sh
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
   bash -s -- --yes \
     --allow-welcomer npub1... \
-    --allow-user npub1... \
-    --allow-user 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    --allow-user npub1...,0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 Generated-identity onboarding is the default (and can be selected explicitly

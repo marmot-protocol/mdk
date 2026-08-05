@@ -95,6 +95,11 @@ cat >"$mock_bin/hermes" <<'EOF'
 if [ "${1:-}" = "--version" ]; then
     printf '%s\n' "Hermes 0.19.0"
 fi
+if [ "${1:-}" = "plugins" ] && [ "${2:-}" = "enable" ] && [ "${3:-}" = "marmot" ]; then
+    # Reproduce an interactive child that drains a curl-piped installer's stdin.
+    # The installer must isolate this command from its own source stream.
+    cat >/dev/null
+fi
 exit 0
 EOF
 
@@ -215,6 +220,13 @@ env_file="$case_root/hermes-home/.env"
 assert_env_contains "$env_file" "MARMOT_ALLOWED_USERS=$user_a"
 assert_env_contains "$env_file" "MARMOT_ALLOW_ALL_USERS=false"
 
+case_root="$fixture_root/comma-separated-users"
+run_installer "$case_root" --allow-user "$user_a,$user_b"
+env_file="$case_root/hermes-home/.env"
+[ -f "$env_file" ]
+assert_env_contains "$env_file" "MARMOT_ALLOWED_USERS=$user_a,$user_b"
+assert_env_contains "$env_file" "MARMOT_ALLOW_ALL_USERS=false"
+
 case_root="$fixture_root/reinstall-union"
 run_installer "$case_root" --allow-user "$user_a"
 env_file="$case_root/hermes-home/.env"
@@ -302,7 +314,7 @@ if command -v script >/dev/null 2>&1 \
     && command -v timeout >/dev/null 2>&1 \
     && script --version 2>&1 | grep -qi 'util-linux'; then
     guided_status=0
-    printf '\n\n\n\nn\nn\n%s\n\n' "$user_a" | timeout 10s script -qefc \
+    printf '\n\n\n\n' | timeout 10s script -qefc \
         "env -i HOME='$case_root/home' HERMES_HOME='$case_root/hermes-home' PATH=/usr/bin:/bin WN_AGENT_SHA=9.9.9 MARMOT_RELEASE_TAG=wn-agent-v9.9.9-test bash '$installer' --dry-run --hermes-home '$case_root/hermes-home' --allow-welcomer '$user_a'" \
         /dev/null >"$guided_log" 2>&1 || guided_status=$?
     if [ "$guided_status" -ne 0 ]; then
@@ -310,8 +322,13 @@ if command -v script >/dev/null 2>&1 \
         cat "$guided_log" >&2
         exit 1
     fi
-    if ! grep -Fq "Allow Marmot messages from any sender?" "$guided_log"; then
+    if ! grep -Fq "Allowed Marmot message senders, comma-separated npub or hex (blank allows all senders)" "$guided_log"; then
         echo "guided prompt output missing; captured log:" >&2
+        cat "$guided_log" >&2
+        exit 1
+    fi
+    if ! grep -Fq "would set MARMOT_ALLOW_ALL_USERS=true" "$guided_log"; then
+        echo "guided blank sender entry did not enable all senders; captured log:" >&2
         cat "$guided_log" >&2
         exit 1
     fi
