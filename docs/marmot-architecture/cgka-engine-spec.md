@@ -217,6 +217,12 @@ deliverable rather than a promise the engine cannot keep.
 When a publish outcome returns a group to `Stable`, the engine MUST schedule that group for convergence if it still
 holds durable outbound intents. Nothing else would release them.
 
+Releasing a retained intent is not ordered against a new send: a send accepted once the group is `Stable` publishes
+immediately if its convergence inputs have settled, while a retained intent waits for the next convergence drain, so a
+message accepted later MAY reach the transport first — by up to the settlement quiescence delay. Display order is
+unaffected, because the application timeline stamps a message when it is accepted rather than when it publishes;
+per-sender FIFO publication is not a protocol promise.
+
 When the group becomes stable, the application calls:
 
 ```text
