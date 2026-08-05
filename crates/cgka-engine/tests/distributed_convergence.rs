@@ -3747,6 +3747,192 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
 }
 
 #[tokio::test]
+async fn intent_retained_before_a_halt_is_delivered_after_a_verified_repair() {
+    // mdk#1106 pins that a halted group's queued work "must remain available
+    // after verified repair". This is the other half of that promise: the
+    // retained intent must actually reach the group once the repair lands.
+    //
+    // It can, because retention holds an *intent*, not ciphertext. The drain
+    // re-prepares the payload against whatever canonical state the group ended
+    // up on, so a message accepted before the halt is encrypted under the
+    // post-repair epoch and every current member can read it. Holding across
+    // the halt therefore promises a delivery the engine can keep.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained-across-repair".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    // Carol's message is accepted and retained before anything goes wrong.
+    let queue_time_epoch = carol.epoch(&group_id).unwrap();
+    let payload = app_payload_for(&carol, b"typed before the halt");
+    let intent_id = match carol
+        .queue_app_message(group_id.clone(), payload.clone())
+        .await
+        .expect("a non-terminal group retains an app message")
+    {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected durable retention, got {other:?}"),
+    };
+
+    // The group then halts Unrecoverable durably (mdk#971).
+    let mut halted_record = carol_storage.get_group(&group_id).unwrap();
+    halted_record.unrecoverable = true;
+    carol_storage.put_group(&halted_record).unwrap();
+
+    let blocked = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("the durable halt pauses the drain");
+    assert!(blocked.is_empty(), "nothing may publish while halted");
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .iter()
+            .map(|queued| queued.id.clone())
+            .collect::<Vec<_>>(),
+        vec![intent_id.clone()],
+        "already-accepted work must survive the halt for its one legal exit"
+    );
+
+    // The one legal exit: Alice removes Carol from the live branch and re-adds
+    // her with a fresh KeyPackage. Carol never ingests the removal, so her
+    // frozen record still lists her when the repair Welcome arrives.
+    let repair_kp = carol.fresh_key_package().await.unwrap();
+    let (_remove_commit, remove_pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![carol.self_id()],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(remove_pending).await.unwrap();
+    let (repair_pending, repair_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![repair_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected repair GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(repair_pending).await.unwrap();
+    carol
+        .join_welcome(repair_welcome)
+        .await
+        .expect("an authenticated replacement Welcome repairs Unrecoverable");
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "verified repair must clear the durable marker"
+    );
+
+    // A restart is the realistic shape: the repair may well land in a later
+    // session than the halt. Hydration must put the group back on the drain
+    // schedule because it still holds durable intents.
+    drop(carol);
+    let mut repaired = build_client_with_storage(b"carol", carol_storage.clone());
+    repaired
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds after repair");
+    assert!(
+        repaired
+            .drain_pending_convergence_groups()
+            .contains(&group_id),
+        "hydration must re-schedule a repaired group that still holds intents"
+    );
+
+    let repaired_epoch = repaired.epoch(&group_id).unwrap();
+    assert_eq!(
+        repaired_epoch,
+        alice.epoch(&group_id).unwrap(),
+        "the replacement Welcome installs the verified live state"
+    );
+    assert!(
+        repaired_epoch > queue_time_epoch,
+        "the repair must move the epoch, or re-encryption proves nothing: \
+         {queue_time_epoch:?} -> {repaired_epoch:?}"
+    );
+
+    let mut drained = repaired
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .expect("a repaired group drains its retained work");
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(
+        source_epoch, repaired_epoch,
+        "the retained intent must be encrypted under the post-repair epoch"
+    );
+
+    // And that is delivery, not bookkeeping: Alice, on the repaired branch,
+    // decrypts the message Carol wrote before the halt.
+    assert!(matches!(
+        alice.ingest(route(msg, &group_id)).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            GroupEvent::MessageReceived {
+                sender, payload, ..
+            } => Some((sender, payload)),
+            _ => None,
+        })
+        .expect("alice observes the retained message");
+    assert_eq!(received.0, repaired.self_id());
+    assert_eq!(app_content(&received.1), b"typed before the halt");
+
+    // The durable intent is retired only once the app confirms publication.
+    repaired
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("the drained intent is the one that was queued before the halt");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");
