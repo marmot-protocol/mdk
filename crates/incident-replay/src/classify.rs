@@ -329,11 +329,11 @@ impl HaltLifecycle<'_> {
     /// durable halt survives. See `docs/marmot-architecture/audit-logging.md`.)
     ///
     /// Absence fails closed in both directions: an unrepaired halt keeps its
-    /// quarantine, and so does a halt whose evidence cannot be ordered. Untimed
-    /// rows never clear anything — arming rule 5 needs no timestamps, but
-    /// *clearing* it does, and guessing here would turn a real halt into a
-    /// healthy verdict. This is also why untimed fixtures and
-    /// pre-instrumentation exports classify exactly as before.
+    /// quarantine, and so does a halt whose evidence cannot be ordered — arming
+    /// rule 5 needs no timestamps, but *clearing* it does. See
+    /// [`Self::halt_position_ms`] for when the halt's position is unknowable and
+    /// why guessing it is the one fail-open direction. This is also why untimed
+    /// fixtures and pre-instrumentation exports classify exactly as before.
     fn still_halted(&self) -> bool {
         if self.reasons.is_empty() {
             return false;
@@ -352,7 +352,8 @@ impl HaltLifecycle<'_> {
     /// newest timed row is a lower bound on the halt's position rather than the
     /// position itself, and a repair after that bound proves nothing. Reading the
     /// newest timed row as the answer is the one direction [`Self::still_halted`]
-    /// must not take — it clears a halt whose position is unknown.
+    /// must not take — on partially instrumented input it clears a live halt
+    /// whose position is unknown.
     fn halt_position_ms(&self) -> Option<u64> {
         if self.untimed_halt {
             return None;

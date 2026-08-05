@@ -56,10 +56,9 @@ pub const CONVERGENCE_NAME: &str = "convergence-incident/v1";
 /// A higher-precedence route quarantined, but a lower one reproduced an incident
 /// from the same export.
 const SUPERSEDED_ROUTE: &str = "superseded route";
-/// The [`IncidentScenarioArtifactV1::unavailable_fields`] entry for the same
-/// finding: the accepted archetype stands for the lower-precedence incident, and
-/// the contested convergence the export also carried is evidence it does not
-/// cover.
+/// The [`IncidentScenarioArtifactV1::unavailable_fields`] entry for that same
+/// finding, carried by the accepted artifact as well as the advisory — see
+/// [`fall_through_to_fork`] for why both.
 const CONTESTED_CONVERGENCE_REPLAY: &str = "contested_convergence_replay";
 /// A higher-precedence route quarantined and the fall-through could not rescue
 /// it either.
@@ -253,6 +252,14 @@ fn archetype(
 /// yields nothing, the convergence quarantine stays the primary — it is the
 /// higher-precedence incident, and demoting it would misreport which one the
 /// export is really about.
+///
+/// When it *does* upgrade, the superseded finding is said once and reported
+/// twice: as the stdout advisory and as the accepted artifact's own statement of
+/// what it does not cover. The artifact is what gets written to disk and read
+/// later as evidence, so a finding that lived only in `advisories` would die with
+/// the terminal, leaving an envelope that shows a clean accepted archetype with
+/// no trace of the higher-precedence incident that shared the export — failing
+/// the standard [`archetype_artifact`] already enforces on itself.
 fn fall_through_to_fork(
     export: &AgentStateExport,
     source_format: IncidentSourceFormatV1,
@@ -270,12 +277,6 @@ fn fall_through_to_fork(
     }
     match fork_route(export, source_format) {
         Ok(mut artifact) => {
-            // Said once, then reported twice: as the stdout advisory and as the
-            // accepted artifact's own statement of what it does not cover. The
-            // artifact is what gets written to disk and read later as evidence, so
-            // a finding that lives only in `advisories` dies with the terminal —
-            // and the envelope would show a clean accepted archetype with no trace
-            // of the higher-precedence incident that shared the export.
             let detail = format!("contested convergence could not be replayed: {superseded}");
             artifact
                 .unavailable_fields
@@ -286,9 +287,6 @@ fn fall_through_to_fork(
             });
             Outcome::Accepted(artifact)
         }
-        // No artifact exists on this path — both routes failed closed, so there is
-        // no accepted envelope for the finding to enter and the advisory is its
-        // only surface. Construction, not omission (AGENTS.md, `src/route.rs`).
         Err(fallback) => {
             advisories.push(Advisory {
                 label: FALLBACK_ROUTE,

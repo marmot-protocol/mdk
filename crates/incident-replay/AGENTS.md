@@ -112,16 +112,14 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     only *after* a failure — and one rule keeps it honest: a lower route may
     override a higher route's quarantine only by producing an accepted vector. A
     second quarantine never displaces the higher-precedence one; it becomes an
-    `advisory (fallback route):` instead. When the fall-through *does* produce an
-    accepted vector, the superseded finding is also written into that artifact's
-    `unavailable_fields` as `contested_convergence_replay`, with the same sentence
-    the advisory carries: the advisory is stdout, the artifact is what gets
-    persisted and read later as evidence, and an envelope showing a clean accepted
-    archetype with no trace of the higher-precedence incident that shared the
-    export fails the standard `archetype` already enforces on itself. The
-    `fallback route` finding has no such home by construction — both routes failed
-    closed, so there is no accepted artifact — and the advisory line is its only
-    surface. Vector names live here too: they are pipeline facts, not CLI ones.
+    `advisory (fallback route):` instead. When the fall-through *does* produce
+    an accepted vector, the superseded finding is also written into that
+    artifact's `unavailable_fields` as `contested_convergence_replay`, with the
+    same sentence the advisory carries (`fall_through_to_fork` carries the
+    argument for why the persisted envelope needs it too). The `fallback route`
+    finding has no such home by construction — both routes failed closed, so
+    there is no accepted artifact — and the advisory line is its only surface.
+    Vector names live here too: they are pipeline facts, not CLI ones.
 - **Module:** `src/main.rs`
   - **Role:** CLI — read one export file, detect its format, print the `Routing`.
     Reading and formatting only; route policy is `src/route.rs`. Exits 0 for any
@@ -206,14 +204,12 @@ Precedence, highest first:
    comparison are contract, not incident: a repair sharing the halt's
    millisecond does **not** clear it (a tie orders nothing, and the two orders
    mean opposite things), and **one untimed halt row makes the whole halt side
-   unorderable** — not just that row. The untimed row may be the newest halt
-   evidence there is, so the newest *timed* halt is only a lower bound on the
-   halt's position and a repair after that bound proves nothing; taking it as
-   the halt's position is the fail-open direction, clearing a live halt on
-   partially instrumented input. It therefore outranks rule 6, which it usually
-   explains: on the real 26a9f546 export the halted engine is exactly the one
-   rule 6 labelled `went dark`, and reporting the inference over the diagnosis
-   would send the operator to re-pull for a confirmation they already have.
+   unorderable** — not just that row (`HaltLifecycle::halt_position_ms` carries
+   the argument for why the newest *timed* halt is only a lower bound). Rule 5
+   outranks rule 6, which it usually explains: on the real 26a9f546 export the
+   halted engine is exactly the one rule 6 labelled `went dark`, and reporting
+   the inference over the diagnosis would send the operator to re-pull for a
+   confirmation they already have.
    A halt is a client failure, not a branch contest, so there is still nothing
    to replay. `halt_advisory` exposes the same computation verdict-independently,
    as `liveness_advisory` does for rule 6.
