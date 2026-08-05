@@ -2046,6 +2046,21 @@ fn nip65_relay_list_targets_only_include_write_capable_entries() {
 }
 
 #[test]
+fn relay_list_declaration_validation_does_not_apply_the_dial_route_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let declared = (0..17)
+        .map(|index| TransportEndpoint(format!("wss://relay-{index}.example")))
+        .collect::<Vec<_>>();
+
+    app.validate_account_relay_list_declarations(
+        &AccountRelayListBootstrap::new(declared, Vec::new()),
+        None,
+    )
+    .expect("published list size must not inherit the dial route's endpoint cap");
+}
+
+#[test]
 fn newer_all_read_nip65_list_clears_stale_write_targets() {
     let account_id = "11".repeat(32);
     let mut older = NostrTransportEvent::new_unsigned(

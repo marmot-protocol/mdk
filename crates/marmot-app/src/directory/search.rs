@@ -663,6 +663,7 @@ fn write_relays_from_record(
             .into_iter()
             .map(TransportEndpoint)
             .collect(),
+        "directory search write-relay discovery",
     );
     (!safe.is_empty()).then(|| {
         (

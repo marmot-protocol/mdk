@@ -262,19 +262,24 @@ impl MarmotApp {
             }
         }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
-        if relay_lists.nip65.relays.is_empty() {
+        let mut source_relays = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "key package directory fetch",
+        );
+        if source_relays.is_empty() {
+            source_relays = self.directory_source_relays(&[]);
+        }
+        if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
         let records = self
             .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
             .await?;
@@ -619,8 +624,10 @@ impl MarmotApp {
         &self.config.directory_search_fallback_seeds
     }
 
-    /// Narrow relay endpoints discovered from another account's published
-    /// relay list to the ones this device is willing to dial.
+    /// Narrow network-sourced relay-list endpoints to the ones this device is
+    /// willing to dial, whether the list belongs to this device's local account
+    /// or to another account. Published data remains untrusted in both cases;
+    /// filtering affects only the operation's route and never rewrites the list.
     ///
     /// Routes to the same host-safety rule configured endpoints face; see
     /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
@@ -628,9 +635,10 @@ impl MarmotApp {
     pub(crate) fn retain_safe_discovered_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
+        context: &str,
     ) -> Vec<TransportEndpoint> {
         self.relay_plane
-            .retain_safe_discovered_endpoints(endpoints, "directory write-relay discovery")
+            .retain_safe_discovered_endpoints(endpoints, context)
     }
 
     pub(crate) fn directory_source_relays(
