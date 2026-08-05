@@ -407,6 +407,79 @@ fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
 }
 
+#[derive(Clone, Debug)]
+struct TestExternalAccountSigner {
+    keys: nostr::Keys,
+}
+
+impl nostr::NostrSigner for TestExternalAccountSigner {
+    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
+        self.keys.backend()
+    }
+
+    fn get_public_key(
+        &self,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
+        self.keys.get_public_key()
+    }
+
+    fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
+        self.keys.sign_event(unsigned)
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_encrypt(public_key, content)
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        encrypted_content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_decrypt(public_key, encrypted_content)
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_encrypt(public_key, content)
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        payload: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_decrypt(public_key, payload)
+    }
+}
+
+impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for TestExternalAccountSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match test signer".into());
+        }
+        let event = request.proof_event().and_then(|event| {
+            event
+                .sign_with_keys(&self.keys)
+                .map_err(|err| err.to_string())
+        })?;
+        request.signature_from_signed_event(event)
+    }
+}
+
 async fn publish_nostr_event_at(
     home: &AccountHome,
     label: &str,
@@ -5778,6 +5851,153 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
         .unwrap()
         .expect("cached directory entry");
     assert_eq!(directory_entry.relay_lists, cached);
+}
+
+#[tokio::test]
+async fn import_ignores_retired_published_routes_without_rewriting_relay_lists() {
+    use nostr::prelude::ToBech32;
+
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let publisher_home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    let secret_hex = keys.secret_key().to_secret_hex();
+    let secret_nsec = keys.secret_key().to_bech32().unwrap();
+    publisher_home
+        .import_account("publisher", &secret_hex)
+        .unwrap();
+
+    let (_relay, relay_url) = mock_relay().await;
+    publish_account_relay_lists_at(
+        &publisher_home,
+        "publisher",
+        &relay_url,
+        "wss://relay.damus.io",
+        test_unix_now_seconds(),
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        relay_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let imported = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(secret_nsec)),
+            default_relays: vec![endpoint(&relay_url)],
+            bootstrap_relays: vec![endpoint(&relay_url)],
+            discovery_relays: vec![endpoint(&relay_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect("a retired published relay must not block account import");
+
+    assert!(imported.relay_lists.complete);
+    assert_eq!(
+        imported.relay_lists.nip65.relays,
+        vec!["wss://relay.damus.io"]
+    );
+    assert_eq!(
+        imported.relay_lists.inbox.relays,
+        vec!["wss://relay.damus.io"]
+    );
+    assert!(imported.key_package_bytes.is_some());
+    assert_eq!(
+        app.account_relay_list_status(&imported.account.label)
+            .unwrap(),
+        imported.relay_lists,
+        "runtime filtering must not rewrite or hide the published relay lists"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_lists() {
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let publisher_home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    publisher_home
+        .import_account("publisher", &keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    let (_relay, relay_url) = mock_relay().await;
+    publish_account_relay_lists_at(
+        &publisher_home,
+        "publisher",
+        &relay_url,
+        "wss://relay.nostr.band",
+        test_unix_now_seconds(),
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        relay_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let logged_in = runtime
+        .login_external_signer(
+            keys.public_key().to_hex(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&relay_url)],
+                bootstrap_relays: vec![endpoint(&relay_url)],
+                discovery_relays: vec![endpoint(&relay_url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .expect("a retired published relay must not block external-signer login");
+
+    assert!(logged_in.account.external_signing);
+    assert!(!logged_in.account.local_signing);
+    assert!(logged_in.relay_lists.complete);
+    assert_eq!(
+        logged_in.relay_lists.nip65.relays,
+        vec!["wss://relay.nostr.band"]
+    );
+    assert_eq!(
+        logged_in.relay_lists.inbox.relays,
+        vec!["wss://relay.nostr.band"]
+    );
+    assert!(logged_in.key_package_bytes.is_some());
+    assert_eq!(
+        app.account_relay_list_status(&logged_in.account.label)
+            .unwrap(),
+        logged_in.relay_lists,
+        "runtime filtering must not rewrite or hide external accounts' published relay lists"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn relay_list_edits_reject_retired_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (_seed, app, seed_url) = mock_app(&dir).await;
+
+    let result = app
+        .set_account_inbox_relays(
+            "alice",
+            vec![endpoint(&seed_url), endpoint("wss://relay.nostr.band")],
+            vec![endpoint(&seed_url)],
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AppError::RelayDirectory(message)) if message.contains("retired"))
+    );
 }
 
 #[tokio::test]

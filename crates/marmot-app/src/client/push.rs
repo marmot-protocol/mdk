@@ -505,13 +505,15 @@ impl AppClient {
         } else {
             Vec::new()
         };
-        Ok(notifications::select_notification_trigger_relays(
-            &record_relay_hints,
-            &server_inbox_relays,
-        )
-        .into_iter()
-        .map(TransportEndpoint)
-        .collect())
+        Ok(self.app.retain_safe_discovered_endpoints(
+            notifications::select_notification_trigger_relays(
+                &record_relay_hints,
+                &server_inbox_relays,
+            )
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect(),
+        ))
     }
 
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {

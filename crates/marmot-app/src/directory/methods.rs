@@ -262,19 +262,20 @@ impl MarmotApp {
             }
         }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
-        if relay_lists.nip65.relays.is_empty() {
+        let source_relays = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+        );
+        if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
         let records = self
             .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
             .await?;
@@ -630,7 +631,7 @@ impl MarmotApp {
         endpoints: Vec<TransportEndpoint>,
     ) -> Vec<TransportEndpoint> {
         self.relay_plane
-            .retain_safe_discovered_endpoints(endpoints, "directory write-relay discovery")
+            .retain_safe_discovered_endpoints(endpoints, "published relay-list route")
     }
 
     pub(crate) fn directory_source_relays(

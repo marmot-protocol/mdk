@@ -1665,6 +1665,32 @@ impl MarmotApp {
         if bootstrap.default_relays.is_empty() && !has_directional_nip65_relays {
             return Err(AppError::MissingDefaultRelays);
         }
+        self.relay_plane
+            .sanitize_relay_endpoints(
+                bootstrap.default_relays.clone(),
+                "account relay-list declaration",
+            )
+            .map_err(AppError::RelayDirectory)?;
+        self.relay_plane
+            .sanitize_relay_endpoints(
+                bootstrap.bootstrap_relays.clone(),
+                "account relay-list publication",
+            )
+            .map_err(AppError::RelayDirectory)?;
+        if let Some(relays) = nip65_relay_set {
+            self.relay_plane
+                .sanitize_relay_endpoints(
+                    relays.read_relays.clone(),
+                    "account NIP-65 read-relay declaration",
+                )
+                .map_err(AppError::RelayDirectory)?;
+            self.relay_plane
+                .sanitize_relay_endpoints(
+                    relays.write_relays.clone(),
+                    "account NIP-65 write-relay declaration",
+                )
+                .map_err(AppError::RelayDirectory)?;
+        }
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
@@ -1715,11 +1741,13 @@ impl MarmotApp {
             .await
     }
 
-    /// Outbox routing for account-scoped events. Prefers the account's own
-    /// declared NIP-65 write relays (read from the local relay-list cache, no
-    /// network), so e.g. republishing your relay lists / profile goes to *your*
-    /// relays rather than whatever defaults the caller passed. Falls back to
-    /// `fallback` only when the account has no NIP-65 list yet (cold start).
+    /// Outbox routing for account-scoped events. Prefers the safe subset of the
+    /// account's declared NIP-65 write relays (read from the local relay-list
+    /// cache, no network), so e.g. republishing your relay lists / profile goes
+    /// to *your* relays rather than whatever defaults the caller passed. Falls
+    /// back to `fallback` when the account has no usable NIP-65 relay. Filtering
+    /// here affects only the operation's route; it does not rewrite the cached
+    /// or published relay list.
     fn outbox_endpoints(
         &self,
         account_id_hex: &str,
@@ -1729,11 +1757,9 @@ impl MarmotApp {
             .account_relay_list_status_for_account_id(account_id_hex)
             .map(|status| status.nip65.relays)
             .unwrap_or_default();
-        if nip65.is_empty() {
-            fallback
-        } else {
-            nip65.into_iter().map(TransportEndpoint).collect()
-        }
+        let safe = self
+            .retain_safe_discovered_endpoints(nip65.into_iter().map(TransportEndpoint).collect());
+        if safe.is_empty() { fallback } else { safe }
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -2771,17 +2797,20 @@ impl MarmotApp {
             if entry.relay_lists.inbox.relays.is_empty() {
                 continue;
             }
-            inbox_routes
-                .entry(MemberId::new(hex::decode(entry.account_id_hex)?))
-                .or_insert_with(|| {
-                    entry
-                        .relay_lists
-                        .inbox
-                        .relays
-                        .into_iter()
-                        .map(TransportEndpoint)
-                        .collect()
-                });
+            let endpoints = self.retain_safe_discovered_endpoints(
+                entry
+                    .relay_lists
+                    .inbox
+                    .relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            );
+            if !endpoints.is_empty() {
+                inbox_routes
+                    .entry(MemberId::new(hex::decode(entry.account_id_hex)?))
+                    .or_insert(endpoints);
+            }
         }
 
         let account = self.account_home().account(&state.label)?;
@@ -3244,37 +3273,37 @@ impl MarmotApp {
                     .await?;
             }
         }
-        if relay_lists.nip65.relays.is_empty() {
+        let source_relays = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+        );
+        if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,
             ]));
         }
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
 
-        if !source_relays.is_empty() {
-            let mut relay_records = self
-                .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-                .await?;
-            sort_directory_records(&mut relay_records);
-            for record in relay_records {
-                match key_package_from_record(record) {
-                    Ok(fetched) => {
-                        packages.push(account_key_package_record_from_fetched(fetched));
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "marmot_app::key_packages",
-                            method = "account_key_package_records",
-                            error_kind = err.privacy_safe_kind(),
-                            "skipping invalid key package event while listing account packages"
-                        );
-                    }
+        let mut relay_records = self
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => {
+                    packages.push(account_key_package_record_from_fetched(fetched));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "account_key_package_records",
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
                 }
             }
         }
@@ -3559,29 +3588,33 @@ impl MarmotApp {
                 return validated_cached_key_package(&account_id, &key_package);
             }
             if !entry.relay_lists.nip65.relays.is_empty() {
-                let source_relays = entry
-                    .relay_lists
-                    .nip65
-                    .relays
-                    .iter()
-                    .cloned()
-                    .map(TransportEndpoint)
-                    .collect::<Vec<_>>();
-                let records = self
-                    .fetch_key_package_events_for_account_id(&account_id, &source_relays)
-                    .await?;
-                let mut fetched = fresh_or_cached_key_package(
-                    &account_id,
-                    latest_fresh_key_package_from_records(
+                let source_relays = self.retain_safe_discovered_endpoints(
+                    entry
+                        .relay_lists
+                        .nip65
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                );
+                if !source_relays.is_empty() {
+                    let records = self
+                        .fetch_key_package_events_for_account_id(&account_id, &source_relays)
+                        .await?;
+                    let mut fetched = fresh_or_cached_key_package(
                         &account_id,
-                        records,
-                        self.directory_freshness(),
-                    )?,
-                    Some(entry.clone()),
-                )?;
-                fetched.relay_lists = entry.relay_lists;
-                self.remember_directory_key_package(&fetched)?;
-                return Ok(fetched.key_package);
+                        latest_fresh_key_package_from_records(
+                            &account_id,
+                            records,
+                            self.directory_freshness(),
+                        )?,
+                        Some(entry.clone()),
+                    )?;
+                    fetched.relay_lists = entry.relay_lists;
+                    self.remember_directory_key_package(&fetched)?;
+                    return Ok(fetched.key_package);
+                }
             }
         }
 
@@ -3910,13 +3943,18 @@ impl MarmotApp {
         relay_lists: &AccountRelayListStatus,
     ) -> Vec<TransportEndpoint> {
         if !relay_lists.inbox.relays.is_empty() {
-            return relay_lists
-                .inbox
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect();
+            let safe = self.retain_safe_discovered_endpoints(
+                relay_lists
+                    .inbox
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+            );
+            if !safe.is_empty() {
+                return safe;
+            }
         }
         let _ = label;
         self.relay_endpoints()
@@ -3929,15 +3967,21 @@ impl MarmotApp {
         // KeyPackages publish to (and are fetched from) the account's NIP-65
         // (kind 10002) outbox relays; there is no dedicated KeyPackage relay
         // list. Fall back to the configured default relays when the account has
-        // no NIP-65 list yet.
+        // no usable NIP-65 relay. This runtime fallback is not published as a
+        // replacement for the account's relay list.
         if !relay_lists.nip65.relays.is_empty() {
-            return relay_lists
-                .nip65
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect();
+            let safe = self.retain_safe_discovered_endpoints(
+                relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+            );
+            if !safe.is_empty() {
+                return safe;
+            }
         }
         self.relay_endpoints()
     }
