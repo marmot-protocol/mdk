@@ -1326,8 +1326,14 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update((name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
         }
-        let records = self.storage.list_messages(group_id, retained_floor)?;
-        let mut deferred_row_ids = records
+        // Quarantine persists raw transport rows at epoch zero because no
+        // validated group epoch is available yet. Those rows must still
+        // participate after the live group advances beyond the rewind floor;
+        // otherwise a newly admitted row can leave an old no-progress gate
+        // closed. The retained floor applies only to candidate commits.
+        let mut deferred_row_ids = self
+            .storage
+            .list_messages(group_id, EpochId(0))?
             .iter()
             .filter(|record| record.state == MessageState::PeelDeferred)
             .map(|record| record.id.as_slice().to_vec())
@@ -1338,6 +1344,7 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update((message_id.len() as u64).to_be_bytes());
             hasher.update(message_id);
         }
+        let records = self.storage.list_messages(group_id, retained_floor)?;
         let mut candidate_rows = records
             .into_iter()
             .filter(|record| {

@@ -23,7 +23,7 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
@@ -69,12 +69,14 @@ fn content_id(msg: &TransportMessage) -> MessageId {
 #[derive(Clone)]
 struct CountingEpochGatePeeler {
     peel_attempts: Arc<Mutex<HashMap<MessageId, u64>>>,
+    forced_deferred: Arc<Mutex<HashSet<MessageId>>>,
 }
 
 impl CountingEpochGatePeeler {
     fn new() -> Self {
         Self {
             peel_attempts: Arc::new(Mutex::new(HashMap::new())),
+            forced_deferred: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -85,6 +87,10 @@ impl CountingEpochGatePeeler {
             .get(id)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn force_deferred(&self, id: MessageId) {
+        self.forced_deferred.lock().unwrap().insert(id);
     }
 }
 
@@ -101,6 +107,9 @@ impl TransportPeeler for CountingEpochGatePeeler {
             .unwrap()
             .entry(msg.id.clone())
             .or_insert(0) += 1;
+        if self.forced_deferred.lock().unwrap().contains(&msg.id) {
+            return Err(PeelerError::DecryptFailed);
+        }
         if let Ok(projection) = project_mls_message(&msg.payload)
             && let Some(source_epoch) = projection.source_epoch
             && ctx.epoch().0 < source_epoch
@@ -430,6 +439,91 @@ async fn deferred_peel_not_retried_while_context_unchanged() {
         "row stays retained while the context is unchanged"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+}
+
+/// Quarantine stores raw deferred transport at epoch zero. Once the live
+/// group has advanced beyond the rewind floor, admitting such a row must still
+/// change the no-progress fingerprint and reopen the bounded retry sweep.
+#[tokio::test]
+async fn epoch_zero_deferred_row_reopens_gate_past_retained_floor() {
+    let (mut engine, storage, peeler) = build_counting_client(b"alice");
+    let (group_id, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "epoch-zero-fingerprint".into(),
+            description: "".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![engine.self_id()],
+        })
+        .await
+        .unwrap();
+    let pending = match created {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    engine.confirm_published(pending).await.unwrap();
+
+    for revision in 0..7 {
+        let (message, pending) = evolution(
+            engine
+                .send(SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some(format!("revision-{revision}")),
+                    description: None,
+                })
+                .await
+                .unwrap(),
+        );
+        drop(message);
+        engine.confirm_published(pending).await.unwrap();
+    }
+    assert!(
+        engine.epoch(&group_id).unwrap().0
+            > CanonicalizationPolicy::default()
+                .convergence
+                .max_rewind_commits,
+        "test requires epoch zero to fall below the retained candidate floor"
+    );
+
+    let make_opaque = |label: &[u8]| TransportMessage {
+        id: hash_id(label),
+        payload: label.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+
+    let first = make_opaque(b"first-gated-row");
+    peeler.force_deferred(first.id.clone());
+    assert!(matches!(
+        engine.ingest(first.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    engine.retry_deferred_peels(&group_id).await.unwrap();
+    let first_gated_attempts = peeler.attempts_for(&first.id);
+    engine.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(peeler.attempts_for(&first.id), first_gated_attempts);
+
+    let quarantined = make_opaque(b"epoch-zero-quarantine-row");
+    peeler.force_deferred(quarantined.id.clone());
+    assert!(matches!(
+        engine.ingest(quarantined.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let attempts_before_retry = peeler.attempts_for(&quarantined.id);
+    let mut record = storage.get_message(&quarantined.id).unwrap();
+    record.epoch = EpochId(0);
+    storage.put_message(&record).unwrap();
+
+    engine.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(
+        peeler.attempts_for(&quarantined.id) > attempts_before_retry,
+        "an epoch-zero deferred row must reopen the no-progress gate"
+    );
 }
 
 /// The gate must not block legitimate retries: once the epoch advances, the
