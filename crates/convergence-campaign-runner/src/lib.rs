@@ -46,7 +46,11 @@ impl std::error::Error for RunnerError {}
 pub fn load_manifest(path: &Path) -> Result<DistributedCampaignManifestV1, RunnerError> {
     let bytes =
         std::fs::read(path).map_err(|error| RunnerError::environment("manifest_read", error))?;
-    let manifest = match path.extension().and_then(|value| value.to_str()) {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    let manifest = match extension.as_deref() {
         Some("yaml" | "yml") => serde_yaml_ng::from_slice(&bytes)
             .map_err(|error| RunnerError::environment("manifest_parse", error))?,
         _ => serde_json::from_slice(&bytes)

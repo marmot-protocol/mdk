@@ -241,13 +241,19 @@ impl ProcessOrchestrator {
         };
         let mut relays = BTreeMap::new();
         let relay_urls = if let Some(relay_urls) = external_relay_urls {
-            for label in &relay_labels {
-                if !relay_urls.contains_key(label) {
-                    return Err(ProcessOrchestratorError::new(
-                        "missing_external_relay",
-                        "external relay map does not cover the scenario topology",
-                    ));
-                }
+            let expected = relay_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let actual = relay_urls
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if actual != expected {
+                return Err(ProcessOrchestratorError::new(
+                    "missing_external_relay",
+                    "external relay map must exactly match the scenario topology",
+                ));
             }
             relay_urls
         } else {
@@ -309,12 +315,17 @@ impl ProcessOrchestrator {
         self.run_root.path()
     }
 
-    pub fn run_token(&self) -> &str {
+    pub fn run_token(&self) -> Result<&str, ProcessOrchestratorError> {
         self.run_root
             .path()
             .file_name()
             .and_then(|value| value.to_str())
-            .expect("tempfile run roots have UTF-8 final components")
+            .ok_or_else(|| {
+                ProcessOrchestratorError::new(
+                    "invalid_run_root",
+                    "process run root has no UTF-8 final component",
+                )
+            })
     }
 
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
@@ -667,17 +678,7 @@ impl ProcessOrchestrator {
         action_id: &str,
     ) -> Result<(), ProcessOrchestratorError> {
         let client_token = process_participant_token(client);
-        let run_token = self
-            .run_root
-            .path()
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                ProcessOrchestratorError::new(
-                    "invalid_run_root",
-                    "process run root has no UTF-8 final component",
-                )
-            })?;
+        let run_token = self.run_token()?;
         let root = self
             .run_root
             .path()
@@ -1238,7 +1239,6 @@ fn process_subject_descriptor() -> SubjectDescriptor {
             SubjectCapability::EventObservation,
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
-            SubjectCapability::VirtualTime,
             SubjectCapability::OutboundPublication,
             SubjectCapability::StructuralProgress,
             SubjectCapability::ParticipantConnectivity,

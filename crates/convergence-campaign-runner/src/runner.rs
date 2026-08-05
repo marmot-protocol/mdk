@@ -14,12 +14,13 @@ use tokio::time::timeout;
 
 use crate::manifest::{DistributedBackendV1, DistributedCampaignManifestV1};
 use crate::plan::{
-    DistributedExecutionPlanV1, NODE_RELAY_PROXY_LISTEN, PlannedCommandV1, build_execution_plan,
+    DistributedExecutionPlanV1, NODE_RELAY_PROXY_LISTEN, PlannedCommandV1, PlannedFaultV1,
+    build_execution_plan,
 };
 use crate::{RunnerError, container_node_launch, verify_manifest_inputs};
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
-const INFRASTRUCTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+pub const INFRASTRUCTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedRunReceiptV1 {
@@ -85,14 +86,17 @@ fn validate_scenario_binding(
     }
     let compiled = compile_scenario(scenario)
         .map_err(|error| RunnerError::environment("scenario_compile", error))?;
-    let barriers = compiled
-        .actions
-        .iter()
-        .filter_map(|action| match &action.step {
-            cgka_conformance_simulator::ScenarioStep::Barrier { name } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut barriers = std::collections::BTreeSet::new();
+    for action in &compiled.actions {
+        if let cgka_conformance_simulator::ScenarioStep::Barrier { name } = &action.step
+            && !barriers.insert(name.as_str())
+        {
+            return Err(RunnerError::validation(
+                "duplicate_scenario_barrier",
+                "canonical scenario barrier names must be unique",
+            ));
+        }
+    }
     for fault in &manifest.faults {
         if !barriers.contains(fault.at_barrier.as_str()) {
             return Err(RunnerError::validation(
@@ -295,11 +299,16 @@ async fn run_container_scenario(
         error: RunnerError::environment("container_node_launch", error),
         run_token: None,
     })?;
-    let run_token = orchestrator.run_token().to_owned();
+    let run_token = orchestrator
+        .run_token()
+        .map_err(|error| ContainerScenarioFailure {
+            error: RunnerError::environment("container_run_token", error),
+            run_token: None,
+        })?
+        .to_owned();
     let host_run_root = orchestrator.run_root().to_path_buf();
     let mut hook = ContainerFaultHook {
-        commands: plan.fault_commands.clone(),
-        rollbacks: plan.fault_rollbacks.clone(),
+        faults: plan.faults.clone(),
         run_token: run_token.clone(),
         host_run_root,
         receipts,
@@ -368,8 +377,7 @@ fn lower_container_host_faults(
 }
 
 struct ContainerFaultHook<'a> {
-    commands: BTreeMap<String, Vec<PlannedCommandV1>>,
-    rollbacks: BTreeMap<String, Vec<PlannedCommandV1>>,
+    faults: BTreeMap<String, Vec<PlannedFaultV1>>,
     run_token: String,
     host_run_root: PathBuf,
     receipts: &'a mut Vec<CommandReceiptV1>,
@@ -378,58 +386,71 @@ struct ContainerFaultHook<'a> {
 #[async_trait::async_trait]
 impl ProcessBarrierHook for ContainerFaultHook<'_> {
     async fn before_barrier(&mut self, name: &str) -> Result<(), ProcessOrchestratorError> {
-        let commands = self.commands.remove(name).unwrap_or_default();
-        let rollbacks = self.rollbacks.remove(name).unwrap_or_default();
-        for command in commands {
-            match execute(
-                &command,
-                CommandContext {
-                    run_token: Some(&self.run_token),
-                    host_run_root: Some(&self.host_run_root),
-                },
-            )
-            .await
-            {
-                Ok(receipt) => self.receipts.push(receipt),
-                Err(failure) => {
-                    if let Some(receipt) = failure.receipt {
-                        self.receipts.push(receipt);
-                    }
-                    let original_error = failure.error;
-                    let mut rollback_failed = false;
-                    for rollback in &rollbacks {
-                        match execute(
-                            rollback,
-                            CommandContext {
-                                run_token: Some(&self.run_token),
-                                host_run_root: Some(&self.host_run_root),
-                            },
-                        )
-                        .await
-                        {
-                            Ok(receipt) => self.receipts.push(receipt),
-                            Err(rollback_failure) => {
-                                if let Some(receipt) = rollback_failure.receipt {
-                                    self.receipts.push(receipt);
-                                }
-                                rollback_failed = true;
-                            }
+        let faults = self.faults.remove(name).unwrap_or_default();
+        let mut applied_rollbacks = Vec::<Vec<PlannedCommandV1>>::new();
+        for fault in faults {
+            for command in &fault.commands {
+                match self.execute_fault_command(command).await {
+                    Ok(()) => {}
+                    Err(original_error) => {
+                        applied_rollbacks.push(fault.rollbacks);
+                        let rollback_failed = self.rollback_faults(applied_rollbacks).await;
+                        if rollback_failed {
+                            return Err(ProcessOrchestratorError::new(
+                                "distributed_fault_rollback",
+                                "distributed fault failed and compensation did not restore the prior state",
+                            ));
                         }
-                    }
-                    if rollback_failed {
                         return Err(ProcessOrchestratorError::new(
-                            "distributed_fault_rollback",
-                            "distributed fault failed and its compensation did not restore the prior state",
+                            "distributed_fault",
+                            original_error.to_string(),
                         ));
                     }
-                    return Err(ProcessOrchestratorError::new(
-                        "distributed_fault",
-                        original_error.to_string(),
-                    ));
+                }
+            }
+            applied_rollbacks.push(fault.rollbacks);
+        }
+        Ok(())
+    }
+}
+
+impl ContainerFaultHook<'_> {
+    async fn execute_fault_command(
+        &mut self,
+        command: &PlannedCommandV1,
+    ) -> Result<(), RunnerError> {
+        match execute(
+            command,
+            CommandContext {
+                run_token: Some(&self.run_token),
+                host_run_root: Some(&self.host_run_root),
+            },
+        )
+        .await
+        {
+            Ok(receipt) => {
+                self.receipts.push(receipt);
+                Ok(())
+            }
+            Err(failure) => {
+                if let Some(receipt) = failure.receipt {
+                    self.receipts.push(receipt);
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    async fn rollback_faults(&mut self, applied: Vec<Vec<PlannedCommandV1>>) -> bool {
+        let mut rollback_failed = false;
+        for rollbacks in applied.into_iter().rev() {
+            for rollback in &rollbacks {
+                if self.execute_fault_command(rollback).await.is_err() {
+                    rollback_failed = true;
                 }
             }
         }
-        Ok(())
+        rollback_failed
     }
 }
 
@@ -701,16 +722,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut receipts = Vec::new();
         let mut hook = ContainerFaultHook {
-            commands: BTreeMap::from([(
+            faults: BTreeMap::from([(
                 "fault".into(),
-                vec![
-                    planned("completed_mutation", "true", Vec::new()),
-                    planned("failed_mutation", "false", Vec::new()),
-                ],
-            )]),
-            rollbacks: BTreeMap::from([(
-                "fault".into(),
-                vec![planned("restore_prior_state", "true", Vec::new())],
+                vec![PlannedFaultV1 {
+                    manifest_index: 0,
+                    commands: vec![
+                        planned("completed_mutation", "true", Vec::new()),
+                        planned("failed_mutation", "false", Vec::new()),
+                    ],
+                    rollbacks: vec![planned("restore_prior_state", "true", Vec::new())],
+                }],
             )]),
             run_token: "test-run".into(),
             host_run_root: root.path().into(),
@@ -737,16 +758,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut receipts = Vec::new();
         let mut hook = ContainerFaultHook {
-            commands: BTreeMap::from([(
+            faults: BTreeMap::from([(
                 "fault".into(),
-                vec![planned("failed_mutation", "false", Vec::new())],
-            )]),
-            rollbacks: BTreeMap::from([(
-                "fault".into(),
-                vec![
-                    planned("failed_restore", "false", Vec::new()),
-                    planned("remaining_restore", "true", Vec::new()),
-                ],
+                vec![PlannedFaultV1 {
+                    manifest_index: 0,
+                    commands: vec![planned("failed_mutation", "false", Vec::new())],
+                    rollbacks: vec![
+                        planned("failed_restore", "false", Vec::new()),
+                        planned("remaining_restore", "true", Vec::new()),
+                    ],
+                }],
             )]),
             run_token: "test-run".into(),
             host_run_root: root.path().into(),
@@ -769,6 +790,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_barrier_rolls_back_only_started_faults_in_reverse_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut receipts = Vec::new();
+        let mut hook = ContainerFaultHook {
+            faults: BTreeMap::from([(
+                "fault".into(),
+                vec![
+                    PlannedFaultV1 {
+                        manifest_index: 0,
+                        commands: vec![planned("first_mutation", "true", Vec::new())],
+                        rollbacks: vec![planned("undo_first", "true", Vec::new())],
+                    },
+                    PlannedFaultV1 {
+                        manifest_index: 1,
+                        commands: vec![planned("second_mutation", "false", Vec::new())],
+                        rollbacks: vec![planned("undo_second", "true", Vec::new())],
+                    },
+                    PlannedFaultV1 {
+                        manifest_index: 2,
+                        commands: vec![planned("unstarted_mutation", "true", Vec::new())],
+                        rollbacks: vec![planned("must_not_run", "false", Vec::new())],
+                    },
+                ],
+            )]),
+            run_token: "test-run".into(),
+            host_run_root: root.path().into(),
+            receipts: &mut receipts,
+        };
+
+        let error = hook.before_barrier("fault").await.unwrap_err();
+        assert_eq!(error.code, "distributed_fault");
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.purpose.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "first_mutation",
+                "second_mutation",
+                "undo_second",
+                "undo_first",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_vm_command_writes_an_incomplete_receipt() {
         let root = tempfile::tempdir().unwrap();
         let manifest = manifest(
@@ -786,8 +853,7 @@ mod tests {
             campaign_id: manifest.campaign_id.clone(),
             backend: "virtual_machine".into(),
             setup: Vec::new(),
-            fault_commands: BTreeMap::new(),
-            fault_rollbacks: BTreeMap::new(),
+            faults: BTreeMap::new(),
             cleanup: Vec::new(),
             vm_driver: Some(planned("failing_vm_driver", "false", Vec::new())),
         };
@@ -809,6 +875,7 @@ mod tests {
             DistributedBackendV1::Container(ContainerBackendV1 {
                 runtime: OciRuntimeV1::Docker,
                 namespace: "receipt-test".into(),
+                allow_mutable_image_references: true,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -821,8 +888,7 @@ mod tests {
             campaign_id: manifest.campaign_id.clone(),
             backend: "container".into(),
             setup: vec![planned("failing_setup", "false", Vec::new())],
-            fault_commands: BTreeMap::new(),
-            fault_rollbacks: BTreeMap::new(),
+            faults: BTreeMap::new(),
             cleanup: Vec::new(),
             vm_driver: None,
         };
@@ -853,6 +919,7 @@ mod tests {
             DistributedBackendV1::Container(ContainerBackendV1 {
                 runtime: OciRuntimeV1::Docker,
                 namespace: "crash-lowering".into(),
+                allow_mutable_image_references: true,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -949,6 +1016,7 @@ mod tests {
             DistributedBackendV1::Container(ContainerBackendV1 {
                 runtime: OciRuntimeV1::Docker,
                 namespace: "relay-validation".into(),
+                allow_mutable_image_references: true,
                 default_participant_image: "unused".into(),
                 relay_image: "unused".into(),
                 relay_command: vec!["unused".into()],
@@ -966,5 +1034,43 @@ mod tests {
             .collect();
         let error = validate_scenario_binding(&manifest, &scenario).unwrap_err();
         assert_eq!(error.code, "multiple_container_relays_unsupported");
+    }
+
+    #[test]
+    fn container_binding_rejects_duplicate_barrier_names() {
+        let root = tempfile::tempdir().unwrap();
+        let mut scenario = ScenarioSpec {
+            name: "duplicate-barrier".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: Default::default(),
+            steps: vec![
+                cgka_conformance_simulator::ScenarioStep::Barrier {
+                    name: "repeat".into(),
+                },
+                cgka_conformance_simulator::ScenarioStep::Barrier {
+                    name: "repeat".into(),
+                },
+            ],
+        };
+        let manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "duplicate-barrier".into(),
+                allow_mutable_image_references: true,
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        scenario.clients = manifest
+            .participants
+            .iter()
+            .map(|participant| participant.id.clone())
+            .collect();
+        let error = validate_scenario_binding(&manifest, &scenario).unwrap_err();
+        assert_eq!(error.code, "duplicate_scenario_barrier");
     }
 }

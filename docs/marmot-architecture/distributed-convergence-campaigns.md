@@ -54,6 +54,20 @@ Build the current Linux campaign image from the repository root:
 docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 ```
 
+The campaign image pins both base-image indexes and the Debian package snapshot. Update the digest, dated tag, and
+snapshot timestamp together during an explicit dependency refresh. The resulting image also stores the resolved
+runtime package set at `/usr/local/share/campaign-runtime-packages.txt`. Participant containers run as the invoking
+non-root host identity so their private bind-mounted run roots remain writable; only short-lived network fault
+injectors explicitly select UID 0 together with their narrowly scoped `NET_ADMIN` capability.
+
+Container manifests require `NAME@sha256:DIGEST` references for the relay, default participant, and mixed-build
+overrides. A local developer using an image such as `marmot-conformance:local` must deliberately set
+`allow_mutable_image_references: true`; evidence from that run therefore cannot be mistaken for a digest-pinned run.
+
+Keep local or incident-derived manifests under `campaign-local/` and run artifacts under `campaign-output/` (or the
+already ignored incident directories). These paths are excluded from the Docker build context, and the campaign
+Dockerfile copies only workspace build inputs into the builder stage.
+
 Then validate, inspect, and run a pinned manifest:
 
 ```sh

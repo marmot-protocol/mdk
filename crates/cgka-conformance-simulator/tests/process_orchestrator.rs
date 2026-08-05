@@ -1,8 +1,8 @@
 //! Long-lived multi-process convergence-orchestrator coverage.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_conformance_simulator::process_orchestrator::ProcessOrchestrator;
+use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
     ScenarioSpec, ScenarioStep, ScenarioTopologyV2, compile_scenario, run_scenario_report,
@@ -440,6 +440,39 @@ async fn unsupported_process_capabilities_fail_before_launch() {
         Err(error) => error,
     };
     assert_eq!(error.code, "process_capability_preflight");
+    assert!(
+        error
+            .message
+            .contains(&format!("scenario step {}", spec.steps.len() - 1)),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("omit_message"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn external_relay_map_must_exactly_match_topology() {
+    let spec = process_scenario("external-relay-map", false);
+    let artifacts = tempfile::tempdir().unwrap();
+    let error = match ProcessOrchestrator::launch_with(
+        ProcessNodeLaunchV1::executable(env!("CARGO_BIN_EXE_cgka-conformance-node")),
+        Some(BTreeMap::from([
+            ("relay:a".into(), "ws://127.0.0.1:1".into()),
+            ("relay:b".into(), "ws://127.0.0.1:2".into()),
+            ("relay:unexpected".into(), "ws://127.0.0.1:3".into()),
+        ])),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    {
+        Ok(mut orchestrator) => {
+            orchestrator.shutdown().await;
+            panic!("relay entries outside the topology launched participant processes")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "missing_external_relay");
 }
 
 #[test]

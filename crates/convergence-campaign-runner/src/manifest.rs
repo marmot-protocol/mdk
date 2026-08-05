@@ -48,6 +48,10 @@ pub struct ContainerBackendV1 {
     pub runtime: OciRuntimeV1,
     /// Safe, operator-selected namespace for the runtime network and relay.
     pub namespace: String,
+    /// Local development may opt out explicitly; hardened campaigns require
+    /// every image reference to carry an immutable sha256 manifest digest.
+    #[serde(default)]
+    pub allow_mutable_image_references: bool,
     pub default_participant_image: String,
     pub relay_image: String,
     #[serde(default = "default_relay_command")]
@@ -170,6 +174,12 @@ pub enum FaultPeerV1 {
 
 impl DistributedCampaignManifestV1 {
     pub fn validate(&self) -> Result<(), RunnerError> {
+        if self.output_dir.as_os_str().is_empty() {
+            return Err(RunnerError::validation(
+                "output_dir",
+                "campaign output_dir must be non-empty",
+            ));
+        }
         if self.schema_version != DISTRIBUTED_CAMPAIGN_MANIFEST_VERSION {
             return Err(RunnerError::validation(
                 "unsupported_manifest_version",
@@ -199,6 +209,16 @@ impl DistributedCampaignManifestV1 {
         for participant in &self.participants {
             validate_identifier("participant", &participant.id)?;
             validate_identifier("build_id", &participant.build_id)?;
+            if participant
+                .container_image
+                .as_deref()
+                .is_some_and(|image| image.trim().is_empty())
+            {
+                return Err(RunnerError::validation(
+                    "participant_container_image",
+                    "participant container_image overrides must be non-empty",
+                ));
+            }
             if !participants.insert(participant.id.as_str()) {
                 return Err(RunnerError::validation(
                     "duplicate_participant",
@@ -221,14 +241,29 @@ impl DistributedCampaignManifestV1 {
         match &self.backend {
             DistributedBackendV1::Container(container) => {
                 validate_identifier("container_namespace", &container.namespace)?;
-                if container.default_participant_image.is_empty()
-                    || container.relay_image.is_empty()
+                if container.default_participant_image.trim().is_empty()
+                    || container.relay_image.trim().is_empty()
                     || container.relay_command.is_empty()
                     || container.node_command.is_empty()
                 {
                     return Err(RunnerError::validation(
                         "container_image_or_command",
                         "container images and argv commands must be non-empty",
+                    ));
+                }
+                if !container.allow_mutable_image_references
+                    && std::iter::once(container.default_participant_image.as_str())
+                        .chain(std::iter::once(container.relay_image.as_str()))
+                        .chain(
+                            self.participants
+                                .iter()
+                                .filter_map(|participant| participant.container_image.as_deref()),
+                        )
+                        .any(|image| !is_digest_pinned_image(image))
+                {
+                    return Err(RunnerError::validation(
+                        "mutable_container_image",
+                        "container images must use NAME@sha256:DIGEST unless the manifest explicitly enables mutable local references",
                     ));
                 }
                 if self
@@ -276,17 +311,30 @@ impl DistributedCampaignManifestV1 {
     pub fn required_vm_capabilities(&self) -> BTreeSet<VirtualMachineCapabilityV1> {
         self.faults
             .iter()
-            .filter_map(|fault| match fault.action {
-                DistributedFaultV1::SlowBlockDevice { .. } => {
-                    Some(VirtualMachineCapabilityV1::BlockDeviceLatency)
-                }
-                _ => None,
-            })
+            .filter_map(|fault| fault.action.required_vm_capability())
             .collect()
     }
 }
 
 impl DistributedFaultV1 {
+    fn required_vm_capability(&self) -> Option<VirtualMachineCapabilityV1> {
+        match self {
+            Self::NetworkPartition { .. }
+            | Self::NetworkHeal { .. }
+            | Self::NetworkShape { .. }
+            | Self::NetworkReset { .. } => Some(VirtualMachineCapabilityV1::KernelNetworkIsolation),
+            Self::FillDisk { .. }
+            | Self::ReleaseDisk { .. }
+            | Self::DatabaseContention { .. }
+            | Self::StopDatabaseContention { .. } => {
+                Some(VirtualMachineCapabilityV1::FilesystemFaults)
+            }
+            Self::CrashParticipantHost { .. } => Some(VirtualMachineCapabilityV1::HostIsolation),
+            Self::SlowBlockDevice { .. } => Some(VirtualMachineCapabilityV1::BlockDeviceLatency),
+            Self::RestartRelay => None,
+        }
+    }
+
     fn participants(&self) -> Vec<&str> {
         match self {
             Self::NetworkPartition { participant, peer }
@@ -361,4 +409,11 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), RunnerError> {
         ));
     }
     Ok(())
+}
+
+fn is_digest_pinned_image(image: &str) -> bool {
+    let Some((name, digest)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty() && digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

@@ -22,12 +22,19 @@ pub struct DistributedExecutionPlanV1 {
     pub campaign_id: String,
     pub backend: String,
     pub setup: Vec<PlannedCommandV1>,
-    pub fault_commands: BTreeMap<String, Vec<PlannedCommandV1>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fault_rollbacks: BTreeMap<String, Vec<PlannedCommandV1>>,
+    pub faults: BTreeMap<String, Vec<PlannedFaultV1>>,
     pub cleanup: Vec<PlannedCommandV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_driver: Option<PlannedCommandV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedFaultV1 {
+    pub manifest_index: usize,
+    pub commands: Vec<PlannedCommandV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollbacks: Vec<PlannedCommandV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +105,7 @@ pub fn build_execution_plan(
                 campaign_id: manifest.campaign_id.clone(),
                 backend: "virtual_machine".into(),
                 setup: Vec::new(),
-                fault_commands: BTreeMap::new(),
-                fault_rollbacks: BTreeMap::new(),
+                faults: BTreeMap::new(),
                 cleanup: Vec::new(),
                 vm_driver: Some(PlannedCommandV1::exact(
                     "run_external_vm_campaign",
@@ -153,30 +159,26 @@ fn container_plan(
         ),
     ];
 
-    let mut fault_commands = BTreeMap::<String, Vec<PlannedCommandV1>>::new();
-    let mut fault_rollbacks = BTreeMap::<String, Vec<PlannedCommandV1>>::new();
-    for fault in &manifest.faults {
-        fault_commands
+    let mut faults = BTreeMap::<String, Vec<PlannedFaultV1>>::new();
+    for (manifest_index, fault) in manifest.faults.iter().enumerate() {
+        faults
             .entry(fault.at_barrier.clone())
             .or_default()
-            .extend(container_fault_commands(
-                runtime,
-                &relay,
-                &container.default_participant_image,
-                &fault.action,
-            ));
-        let rollback = container_fault_rollback_commands(
-            runtime,
-            &relay,
-            &container.default_participant_image,
-            &fault.action,
-        );
-        if !rollback.is_empty() {
-            fault_rollbacks
-                .entry(fault.at_barrier.clone())
-                .or_default()
-                .extend(rollback);
-        }
+            .push(PlannedFaultV1 {
+                manifest_index,
+                commands: container_fault_commands(
+                    runtime,
+                    &relay,
+                    &container.default_participant_image,
+                    &fault.action,
+                ),
+                rollbacks: container_fault_rollback_commands(
+                    runtime,
+                    &relay,
+                    &container.default_participant_image,
+                    &fault.action,
+                ),
+            });
     }
     let cleanup = vec![
         PlannedCommandV1::idempotent(
@@ -195,8 +197,7 @@ fn container_plan(
         campaign_id: manifest.campaign_id.clone(),
         backend: "container".into(),
         setup,
-        fault_commands,
-        fault_rollbacks,
+        faults,
         cleanup,
         vm_driver: None,
     })
@@ -215,6 +216,7 @@ pub fn container_node_launch(
     let runtime = container.runtime.executable();
     let network = format!("{}-network", container.namespace);
     let relay = format!("{}-relay", container.namespace);
+    let participant_user = participant_container_user()?;
     let mut args_by_participant = BTreeMap::new();
     for participant in &manifest.participants {
         let image = participant
@@ -231,6 +233,8 @@ pub fn container_node_launch(
                 "{run_token}-{participant}".into(),
                 "--network".into(),
                 network.clone(),
+                "--user".into(),
+                participant_user.clone(),
                 "--mount".into(),
                 "type=bind,src={host_run_root},dst={child_run_root}".into(),
                 image.clone(),
@@ -764,6 +768,8 @@ fn network_exec(
                 "--rm".into(),
                 "--network".into(),
                 format!("container:{participant_container}"),
+                "--user".into(),
+                "0:0".into(),
                 "--cap-drop".into(),
                 "ALL".into(),
                 "--cap-add".into(),
@@ -774,6 +780,24 @@ fn network_exec(
         ]
         .concat(),
     )
+}
+
+#[cfg(unix)]
+fn participant_container_user() -> Result<String, RunnerError> {
+    // SAFETY: libc exposes these process identity getters without preconditions.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if uid == 0 {
+        return Err(RunnerError::validation(
+            "root_participant_unsupported",
+            "container participants must run as a non-root host identity",
+        ));
+    }
+    Ok(format!("{uid}:{gid}"))
+}
+
+#[cfg(not(unix))]
+fn participant_container_user() -> Result<String, RunnerError> {
+    Ok("65532:65532".into())
 }
 
 fn network_exec_accepting(

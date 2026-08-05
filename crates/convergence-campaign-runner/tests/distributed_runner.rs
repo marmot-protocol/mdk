@@ -4,7 +4,7 @@ use convergence_campaign_runner::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
     DistributedParticipantV1, FaultPeerV1, OciRuntimeV1, ScenarioArtifactV1, ScheduledFaultV1,
     VirtualMachineBackendV1, VirtualMachineCapabilityV1, build_execution_plan,
-    container_node_launch, verify_manifest_inputs,
+    container_node_launch, load_manifest, verify_manifest_inputs,
 };
 use sha2::Digest;
 
@@ -36,6 +36,7 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
         backend: DistributedBackendV1::Container(ContainerBackendV1 {
             runtime: OciRuntimeV1::Docker,
             namespace: "marmot-campaign-test".into(),
+            allow_mutable_image_references: true,
             default_participant_image: "marmot-conformance:current".into(),
             relay_image: "marmot-conformance:current".into(),
             relay_command: vec!["cgka-conformance-relay".into()],
@@ -104,6 +105,20 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
     (root, manifest)
 }
 
+fn fault_commands<'a>(
+    plan: &'a convergence_campaign_runner::DistributedExecutionPlanV1,
+    barrier: &str,
+) -> &'a [convergence_campaign_runner::PlannedCommandV1] {
+    &plan.faults[barrier][0].commands
+}
+
+fn fault_rollbacks<'a>(
+    plan: &'a convergence_campaign_runner::DistributedExecutionPlanV1,
+    barrier: &str,
+) -> &'a [convergence_campaign_runner::PlannedCommandV1] {
+    &plan.faults[barrier][0].rollbacks
+}
+
 #[test]
 fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     let (_root, manifest) = container_manifest();
@@ -122,9 +137,9 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         "database-contention",
         "host-crash",
     ] {
-        assert!(plan.fault_commands.contains_key(barrier), "{barrier}");
+        assert!(plan.faults.contains_key(barrier), "{barrier}");
     }
-    let contention = &plan.fault_commands["database-contention"][0];
+    let contention = &fault_commands(&plan, "database-contention")[0];
     let timeout_index = contention
         .args
         .iter()
@@ -134,18 +149,22 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     for command in plan
         .setup
         .iter()
-        .chain(plan.fault_commands.values().flatten())
-        .chain(plan.fault_rollbacks.values().flatten())
+        .chain(
+            plan.faults
+                .values()
+                .flatten()
+                .flat_map(|fault| fault.commands.iter().chain(fault.rollbacks.iter())),
+        )
         .chain(&plan.cleanup)
     {
         assert_ne!(command.program, "sh");
         assert_ne!(command.program, "bash");
         assert!(!command.args.iter().any(|arg| arg == "-c"));
     }
-    let shape = &plan.fault_commands["shape"][0];
+    let shape = &fault_commands(&plan, "shape")[0];
     assert!(shape.args.contains(&"1.25%".into()));
     assert!(shape.args.contains(&"512kbit".into()));
-    let partition = &plan.fault_commands["partition"];
+    let partition = fault_commands(&plan, "partition");
     assert!(partition.iter().all(|command| {
         command
             .args
@@ -165,6 +184,12 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
             .iter()
             .any(|command| { command.args.iter().any(|argument| argument == "OUTPUT") })
     );
+    assert!(partition.iter().all(|command| {
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--user", "0:0"])
+    }));
     assert_eq!(
         partition
             .iter()
@@ -172,13 +197,13 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
             .count(),
         1
     );
-    let heal = &plan.fault_commands["heal"];
+    let heal = fault_commands(&plan, "heal");
     assert!(
         partition
             .iter()
             .chain(heal)
-            .chain(&plan.fault_rollbacks["partition"])
-            .chain(&plan.fault_rollbacks["heal"])
+            .chain(fault_rollbacks(&plan, "partition"))
+            .chain(fault_rollbacks(&plan, "heal"))
             .all(|command| command.success_exit_codes != [0, 1, 2])
     );
     for purpose in [
@@ -235,16 +260,16 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         );
     }
     assert!(
-        plan.fault_rollbacks["partition"]
+        fault_rollbacks(&plan, "partition")
             .iter()
             .any(|command| command.purpose == "verify_outbound_partition_healed")
     );
     assert!(
-        plan.fault_rollbacks["heal"]
+        fault_rollbacks(&plan, "heal")
             .iter()
             .any(|command| command.purpose == "verify_outbound_partition_active")
     );
-    let release = &plan.fault_commands["disk-release"][0];
+    let release = &fault_commands(&plan, "disk-release")[0];
     assert_eq!(release.program, "rm");
     assert!(
         release
@@ -259,6 +284,85 @@ fn scenario_digest_accepts_uppercase_hex() {
     let (_root, mut manifest) = container_manifest();
     manifest.scenario.sha256.make_ascii_uppercase();
     verify_manifest_inputs(&manifest).unwrap();
+}
+
+#[test]
+fn uppercase_yaml_extension_uses_the_yaml_parser() {
+    let (root, manifest) = container_manifest();
+    let path = root.path().join("campaign.YAML");
+    fs_private::write_private(
+        &path,
+        serde_yaml_ng::to_string(&manifest).unwrap().as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(load_manifest(&path).unwrap(), manifest);
+}
+
+#[test]
+fn manifest_rejects_empty_output_and_participant_image_override() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.output_dir = std::path::PathBuf::new();
+    assert_eq!(manifest.validate().unwrap_err().code, "output_dir");
+
+    let (root, mut manifest) = container_manifest();
+    manifest.participants[0].container_image = Some("  ".into());
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "participant_container_image"
+    );
+    drop(root);
+}
+
+#[test]
+fn mutable_container_images_require_an_explicit_local_opt_out() {
+    let (_root, mut manifest) = container_manifest();
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.allow_mutable_image_references = false;
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "mutable_container_image"
+    );
+
+    let digest = "ab".repeat(32);
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.default_participant_image = format!("marmot-conformance@sha256:{digest}");
+    container.relay_image = format!("marmot-conformance@sha256:{digest}");
+    for participant in &mut manifest.participants {
+        participant.container_image = Some(format!("marmot-conformance@sha256:{digest}"));
+    }
+    manifest.validate().unwrap();
+}
+
+#[test]
+fn faults_sharing_a_barrier_keep_distinct_compensation_boundaries() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![
+        ScheduledFaultV1 {
+            at_barrier: "shared".into(),
+            action: DistributedFaultV1::NetworkShape {
+                participant: "alice".into(),
+                latency_ms: 10,
+                jitter_ms: 0,
+                loss_basis_points: 0,
+                bandwidth_kbit: 1000,
+            },
+        },
+        ScheduledFaultV1 {
+            at_barrier: "shared".into(),
+            action: DistributedFaultV1::FillDisk {
+                participant: "bob".into(),
+                bytes: 1024,
+            },
+        },
+    ];
+    let plan = build_execution_plan(&manifest).unwrap();
+    assert_eq!(plan.faults["shared"].len(), 2);
+    assert_eq!(plan.faults["shared"][0].manifest_index, 0);
+    assert_eq!(plan.faults["shared"][1].manifest_index, 1);
 }
 
 #[cfg(unix)]
@@ -303,6 +407,11 @@ fn mixed_builds_select_an_exact_image_per_participant() {
     );
     assert!(launch.args_by_participant.values().all(|args| {
         args.windows(2).any(|window| {
+            window[0] == "--user" && window[1] != "0:0" && !window[1].starts_with("0:")
+        })
+    }));
+    assert!(launch.args_by_participant.values().all(|args| {
+        args.windows(2).any(|window| {
             window
                 == [
                     "--relay-proxy-listen".to_owned(),
@@ -342,7 +451,7 @@ fn slow_block_devices_require_a_capable_vm_backend() {
     assert_eq!(error.code, "vm_required_for_block_latency");
 
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
-        driver: "/opt/darkmatter-automated-testing/scripts/dmvm.rb".into(),
+        driver: "/usr/local/bin/cgka-vm-campaign".into(),
         driver_args: vec![
             "campaign".into(),
             "--scenario".into(),
@@ -359,6 +468,53 @@ fn slow_block_devices_require_a_capable_vm_backend() {
     let plan = build_execution_plan(&manifest).unwrap();
     assert_eq!(plan.backend, "virtual_machine");
     assert!(plan.vm_driver.unwrap().args.contains(&"2".into()));
+}
+
+#[test]
+fn vm_faults_require_each_backend_capability_they_use() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![
+        ScheduledFaultV1 {
+            at_barrier: "network".into(),
+            action: DistributedFaultV1::NetworkReset {
+                participant: "alice".into(),
+            },
+        },
+        ScheduledFaultV1 {
+            at_barrier: "filesystem".into(),
+            action: DistributedFaultV1::FillDisk {
+                participant: "alice".into(),
+                bytes: 1024,
+            },
+        },
+        ScheduledFaultV1 {
+            at_barrier: "host".into(),
+            action: DistributedFaultV1::CrashParticipantHost {
+                participant: "bob".into(),
+            },
+        },
+    ];
+    let required = BTreeSet::from([
+        VirtualMachineCapabilityV1::KernelNetworkIsolation,
+        VirtualMachineCapabilityV1::FilesystemFaults,
+        VirtualMachineCapabilityV1::HostIsolation,
+    ]);
+    assert_eq!(manifest.required_vm_capabilities(), required);
+    manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver: "/tmp/driver".into(),
+        driver_args: Vec::new(),
+        timeout_seconds: 7_200,
+        capabilities: BTreeSet::from([VirtualMachineCapabilityV1::HostIsolation]),
+    });
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "missing_vm_capability"
+    );
+    let DistributedBackendV1::VirtualMachine(vm) = &mut manifest.backend else {
+        unreachable!();
+    };
+    vm.capabilities = required;
+    manifest.validate().unwrap();
 }
 
 #[test]

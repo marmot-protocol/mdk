@@ -3,8 +3,11 @@ use std::process::{ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
-    DistributedBackendV1, build_execution_plan, load_manifest, run_manifest, verify_manifest_inputs,
+    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, load_manifest,
+    run_manifest, verify_manifest_inputs,
 };
+use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Debug, Parser)]
 #[command(name = "cgka-distributed-campaign")]
@@ -68,12 +71,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 DistributedBackendV1::VirtualMachine(vm) => vm.driver.clone(),
             };
-            let status = std::process::Command::new(program)
+            let mut command = Command::new(program);
+            command
                 .arg("--version")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()?;
+                .kill_on_drop(true);
+            let status = timeout(INFRASTRUCTURE_COMMAND_TIMEOUT, command.status())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend version probe timed out",
+                    )
+                })??;
             if !status.success() {
                 return Err("selected execution backend failed its version probe".into());
             }
