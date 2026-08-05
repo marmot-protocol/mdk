@@ -112,13 +112,23 @@ impl ForkRecoveryManager {
     /// disk (a `create_group_snapshot` under an existing name would fail or
     /// clobber, depending on the backend).
     fn observe_snapshot_counter(&mut self, snapshot_name: &str) {
-        if let Some(counter) = snapshot_name
-            .strip_prefix("fork-")
-            .and_then(|suffix| suffix.split('-').nth(1))
-            .and_then(|counter| counter.parse::<u64>().ok())
-        {
-            self.observe_snapshot_counter_value(counter);
-        }
+        // Real fork snapshots are `fork-<epoch>-<counter>-<digest>`. Require
+        // the epoch field to parse as a number too: transient
+        // `fork-probe-<epoch>-<digest>` guard names share the `fork-` prefix,
+        // and taking `.nth(1)` alone would mis-read their EPOCH field as a
+        // counter (the same mis-parse the hydrate scan and the
+        // `fork_snapshot_counters` test helper already guard against).
+        let Some(suffix) = snapshot_name.strip_prefix("fork-") else {
+            return;
+        };
+        let mut parts = suffix.split('-');
+        let (Some(_source_epoch), Some(counter)) = (
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+        ) else {
+            return;
+        };
+        self.observe_snapshot_counter_value(counter);
     }
 
     /// [`Self::observe_snapshot_counter`] for a counter that has already been
@@ -153,6 +163,10 @@ impl ForkRecoveryManager {
 
     fn peek_pending(&self, pending: PendingStateRef) -> Option<MessageId> {
         self.pending.get(&pending).map(|r| r.storage_id.clone())
+    }
+
+    fn peek_pending_snapshot(&self, pending: PendingStateRef) -> Option<String> {
+        self.pending.get(&pending).map(|r| r.snapshot_name.clone())
     }
 
     fn promote_pending(&mut self, pending: PendingStateRef) -> Option<MessageId> {
@@ -406,6 +420,19 @@ impl<S: StorageProvider> Engine<S> {
         self.fork_recovery.peek_pending(pending)
     }
 
+    /// Read the fork-recovery snapshot name a pending entry owns, without
+    /// consuming the record. `do_confirm_published` persists this name in the
+    /// [`cgka_traits::message::OwnCommitConvergenceStamp`] so the hydrate-time
+    /// routing rebuild can MATCH the (own commit → fork snapshot) pairing
+    /// against durable evidence instead of inferring it from snapshot-name
+    /// recency.
+    pub(crate) fn peek_pending_snapshot_name_for_recovery(
+        &self,
+        pending: PendingStateRef,
+    ) -> Option<String> {
+        self.fork_recovery.peek_pending_snapshot(pending)
+    }
+
     pub(crate) fn forget_pending_commit_for_recovery(
         &mut self,
         pending: PendingStateRef,
@@ -553,8 +580,12 @@ impl<S: StorageProvider> Engine<S> {
     ///   `Processed` commit row whose MLS wire bytes carry that epoch;
     /// - an own commit's ordering metadata comes from its confirm-time
     ///   [`cgka_traits::message::OwnCommitConvergenceStamp`] (MLS cannot
-    ///   replay a device's own commit), an inbound commit's from replaying it
-    ///   against the fork snapshot (the same probe the pairwise router uses);
+    ///   replay a device's own commit), and its snapshot pairing from the
+    ///   stamp's recorded `fork_snapshot_name` (matched against the on-disk
+    ///   names; a stamp predating the field falls back to newest-at-epoch
+    ///   inference). An inbound commit's metadata comes from replaying it
+    ///   against the fork snapshot (the same probe the pairwise router uses),
+    ///   which incidentally proves its pairing;
     /// - `committed_from` is re-owned only for epochs whose stored applied
     ///   evidence includes a stamped own-commit row, and only alongside a
     ///   rebuilt incumbent — so the pairwise router can never be steered into
@@ -575,8 +606,12 @@ impl<S: StorageProvider> Engine<S> {
         let pending_snapshots = self.fork_recovery.pending_snapshot_names(group_id);
         // Newest fork snapshot per source epoch (mirrors `newest_fork_snapshot`
         // in the pending-publish hydration path). Names that fail to parse —
-        // including transient `fork-probe-…` guards — are ignored.
+        // including transient `fork-probe-…` guards — are ignored. All parsed
+        // non-pending names are also kept per epoch so an own-commit stamp
+        // that RECORDS its snapshot name can be matched exactly, even when a
+        // newer snapshot exists at the same epoch.
         let mut newest_by_epoch: BTreeMap<u64, (u64, String)> = BTreeMap::new();
+        let mut scanned_names_by_epoch: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
         for name in self.storage.list_group_snapshots(group_id)? {
             if pending_snapshots.contains(&name) {
                 continue;
@@ -599,6 +634,10 @@ impl<S: StorageProvider> Engine<S> {
             // allocator behind the highest counter on disk, and the next
             // `next_snapshot_name` after restart could mint a colliding name.
             self.fork_recovery.observe_snapshot_counter_value(counter);
+            scanned_names_by_epoch
+                .entry(source_epoch)
+                .or_default()
+                .insert(name.clone());
             let entry = newest_by_epoch
                 .entry(source_epoch)
                 .or_insert((counter, name.clone()));
@@ -715,8 +754,42 @@ impl<S: StorageProvider> Engine<S> {
                 // it; the horizon prune retires it once the group advances.
                 continue;
             };
+            let mut snapshot_name = snapshot_name;
             let (priority, committer) = match stamp {
-                Some(stamp) => (stamp.priority, stamp.committer),
+                Some(stamp) => {
+                    // An inbound commit proves its snapshot pairing by
+                    // replaying against it (the probe below). An own commit
+                    // cannot be replayed, so its pairing is proven by MATCH:
+                    // the confirm-time stamp records the snapshot name its
+                    // recovery record owned, and the rebuild adopts exactly
+                    // that snapshot — it is the snapshot, not the ordering
+                    // key, that a later `resolve()` rolls back to. A recorded
+                    // name that is no longer on disk (or is owned by a
+                    // restored pending publish) means the pairing cannot be
+                    // proven; leave the epoch on the convergence path rather
+                    // than pair the commit with a snapshot it never owned.
+                    // Stamps written before the field existed fall back to
+                    // the newest-snapshot inference below, which is safe
+                    // today only by exclusion (pending-owned snapshots are
+                    // skipped and a displaced incumbent is parked, not left
+                    // `Processed`) — the recorded name makes it exact.
+                    if let Some(recorded) = stamp.fork_snapshot_name {
+                        let retained = scanned_names_by_epoch
+                            .get(&source_epoch_raw)
+                            .is_some_and(|names| names.contains(&recorded));
+                        if !retained {
+                            tracing::warn!(
+                                target: "cgka_engine::fork_recovery",
+                                method = "rebuild_fork_routing_state_on_hydrate",
+                                source_epoch = source_epoch.0,
+                                "own-commit stamp names a fork snapshot that is no longer retained; not rebuilding this incumbent"
+                            );
+                            continue;
+                        }
+                        snapshot_name = recorded;
+                    }
+                    (stamp.priority, stamp.committer)
+                }
                 None => match self.probe_commit_ordering_metadata_for_recovery(
                     group_id,
                     source_epoch,
@@ -845,6 +918,32 @@ mod tests {
             self.release_attempts.lock().unwrap().push(name.to_string());
             Err(StorageError::Backend("release failed".into()))
         }
+    }
+
+    #[test]
+    fn observe_snapshot_counter_ignores_fork_probe_guard_names() {
+        let mut manager = ForkRecoveryManager::default();
+        let group_id = GroupId::new(b"group".to_vec());
+
+        // `fork-probe-<epoch>-<digest>` shares the `fork-` prefix; its epoch
+        // field (7) sits exactly where a real name's counter would be, and
+        // must not advance the allocator.
+        manager.observe_snapshot_counter("fork-probe-7-aabbccdd00112233");
+        // A name whose epoch field is not numeric must be ignored too.
+        manager.observe_snapshot_counter("fork-x-9-aabbccdd00112233");
+        let first = manager.next_snapshot_name(&group_id, EpochId(1));
+        assert!(
+            first.starts_with("fork-1-1-"),
+            "allocator advanced by a non-fork name: {first}"
+        );
+
+        // A real durable name does advance it past its counter.
+        manager.observe_snapshot_counter("fork-3-9-0011223344556677");
+        let next = manager.next_snapshot_name(&group_id, EpochId(3));
+        assert!(
+            next.starts_with("fork-3-10-"),
+            "allocator did not advance past a real durable counter: {next}"
+        );
     }
 
     #[test]

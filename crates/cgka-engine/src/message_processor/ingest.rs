@@ -2327,6 +2327,25 @@ impl<S: StorageProvider> Engine<S> {
             source_epoch.0,
             hex::encode(&digest[..8])
         );
+        // Enforce the "fork probes are serialized per group" invariant that
+        // `recover_interrupted_fork_probe` depends on: with at most one probe
+        // snapshot ever live, a surviving one after a crash unambiguously
+        // holds the newer live state. Refuse to open a second probe rather
+        // than create the multi-probe ambiguity that recovery can only fail
+        // closed on (quarantine). Probes run on the ingest and hydrate paths,
+        // both `&mut self`-serialized, so this should be unreachable — it
+        // turns a prose invariant into a checked one.
+        let existing_probe = self
+            .storage
+            .list_group_snapshots(group_id)
+            .map_err(|error| ForkProbeError::Engine(error.into()))?
+            .into_iter()
+            .any(|name| name.starts_with(crate::openmls_projection::FORK_PROBE_SNAPSHOT_PREFIX));
+        if existing_probe {
+            return Err(ForkProbeError::Engine(EngineError::Backend(
+                "fork-recovery ordering probe already in progress for this group".into(),
+            )));
+        }
         let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), probe_snapshot)
             .map_err(|error| ForkProbeError::Engine(error.into()))?;
         self.storage

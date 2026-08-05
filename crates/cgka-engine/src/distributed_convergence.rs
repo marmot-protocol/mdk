@@ -727,19 +727,34 @@ impl<S: StorageProvider> Engine<S> {
         let ceiling = base_epoch
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
-        for (message_id, source_epoch) in
-            retire_stale_convergence_deferred_commits(&self.storage, group_id, floor)?
-        {
+        for retired in retire_stale_convergence_deferred_commits(&self.storage, group_id, floor)? {
             self.audit_group(
                 group_id,
                 crate::audit_helpers::message_state_transition_event(
-                    hex::encode(message_id.as_slice()),
+                    hex::encode(retired.message_id.as_slice()),
                     Some(MessageState::ConvergenceDeferred),
                     MessageState::EpochInvalidated,
-                    Some(source_epoch),
+                    Some(retired.source_epoch),
                     "beyond_retained_anchor",
                 ),
             );
+            if retired.own_commit {
+                // A parked commit this device itself published aged out
+                // without ever being realized: the residual divergence the
+                // fail-closed anchor paths accept is now permanent for this
+                // branch, and on every other group surface the node looks
+                // healthy. Surface it beyond the audit row — this class of
+                // split was originally found only by diffing soak-fleet audit
+                // logs. Privacy-safe: aggregate reason only, no group or
+                // message identifiers.
+                tracing::warn!(
+                    target: "cgka_engine::distributed_convergence",
+                    method = "seed_convergence_pass_members",
+                    reason = "own_commit_retired_unrealized",
+                    "an own commit aged out of the retained candidate graph without being realized; this node may be permanently diverged from its fleet on this group"
+                );
+                self.engine_metrics.note_own_commit_retired_unrealized();
+            }
         }
         let projected = self
             .storage
@@ -1359,6 +1374,21 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage
                     .put_convergence_pass(&pass)
                     .map_err(storage_projection_error)?;
+                // Operator-visible residual-divergence signal (beyond the
+                // audit row below): the fleet may have settled on a branch
+                // rooted at this node's own commit that this node can no
+                // longer realize. Left undetected, the node completes every
+                // pass on its own branch and looks healthy on every group
+                // surface while permanently split. Privacy-safe: aggregate
+                // reason only, no group or message identifiers.
+                tracing::warn!(
+                    target: "cgka_engine::distributed_convergence",
+                    method = "converge_stored_openmls_messages",
+                    reason = "anchor_lineage_mismatch",
+                    "selected own-commit branch is locally unrealizable; pass completed unapplied and this node may be diverged from its fleet"
+                );
+                self.engine_metrics
+                    .note_own_branch_unrealizable_blocked_pass();
                 self.audit_group_with_context(
                     group_id,
                     convergence_run_context(&run_id, ConvergencePhase::Blocked),

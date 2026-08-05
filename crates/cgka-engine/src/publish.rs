@@ -90,6 +90,7 @@ impl<S: StorageProvider> Engine<S> {
         // publish-confirm call), so re-attach it explicitly.
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+        let pending_fork_snapshot_name = self.peek_pending_snapshot_name_for_recovery(pending);
         let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -136,10 +137,18 @@ impl<S: StorageProvider> Engine<S> {
                         // cannot re-derive priority or consumed proposal refs
                         // from the wire bytes later (MLS refuses to process
                         // own commits), so this is the only durable source.
-                        own_commit_stamp = Some(crate::openmls_projection::own_commit_stamp(
+                        let mut stamp = crate::openmls_projection::own_commit_stamp(
                             staged,
                             self.identity.self_id().clone(),
-                        )?);
+                        )?;
+                        // Bind the stamp to the exact fork snapshot this
+                        // commit's recovery record owns. The hydrate-time
+                        // routing rebuild uses this to prove the
+                        // (own commit → fork snapshot) pairing rather than
+                        // pairing the commit with whatever snapshot happens
+                        // to be newest at its source epoch.
+                        stamp.fork_snapshot_name = pending_fork_snapshot_name.clone();
+                        own_commit_stamp = Some(stamp);
                     }
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
                     crate::openmls_projection::mark_consumed_proposal_records_processed(

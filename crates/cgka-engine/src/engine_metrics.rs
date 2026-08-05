@@ -178,7 +178,7 @@ struct LastAppliedBranch {
 /// Held by `Engine<S>` and incremented at the convergence apply site. Exposed
 /// to callers as an [`EngineMetricsSnapshot`] via `Engine::engine_metrics`.
 /// Diagnostic only; never an input to convergence or branch selection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct EngineMetrics {
     /// Settle episodes: times a group reached `Settled` and applied a branch,
     /// summed across groups. Denominator of `observed_reorg_rate`.
@@ -215,6 +215,23 @@ pub struct EngineMetrics {
     admin_reservation_prepared: u64,
     /// One-attempt reservations consumed by a failed preparation.
     admin_reservation_failed: u64,
+    /// Convergence passes completed unapplied because the selected branch was
+    /// rooted at this device's own commit whose retained anchor no longer
+    /// holds that commit's post-merge state (apply-time
+    /// `AnchorLineageMismatch`). Residual-divergence signal: a non-zero value
+    /// means this node may sit on a branch the rest of the fleet abandoned —
+    /// see `own_commits_retired_unrealized` for when that split becomes
+    /// permanent.
+    own_branch_unrealizable_blocked_passes: u64,
+    /// Parked own commits terminalized at the retirement horizon without ever
+    /// being realized (their branch stayed unprovable until it aged out).
+    /// Each count is a permanently completed residual divergence on some
+    /// group: this node terminalized a commit of its own that the winning
+    /// branch never contained. On every other group surface such a node looks
+    /// healthy — this counter (with its paired warn-level trace and audit
+    /// rows) is the operator-visible trace. Atomic because the retirement
+    /// sweep runs on a `&self` seeding path.
+    own_commits_retired_unrealized: std::sync::atomic::AtomicU64,
     /// Per-group completion time of the last applied pass, in-memory only
     /// (never snapshotted); feeds `generation_gap_ms`.
     last_pass_completed_at_ms: HashMap<GroupId, u64>,
@@ -234,6 +251,8 @@ impl Default for EngineMetrics {
             admin_reservation_hold_observations: 0,
             admin_reservation_prepared: 0,
             admin_reservation_failed: 0,
+            own_branch_unrealizable_blocked_passes: 0,
+            own_commits_retired_unrealized: std::sync::atomic::AtomicU64::new(0),
             last_pass_completed_at_ms: HashMap::new(),
         }
     }
@@ -327,6 +346,21 @@ impl EngineMetrics {
         self.admin_reservation_hold_observations += 1;
     }
 
+    /// Record a convergence pass completed unapplied because the selected
+    /// branch — rooted at this device's own parked commit — failed the
+    /// apply-time anchor lineage proof (residual-divergence warning signal).
+    pub fn note_own_branch_unrealizable_blocked_pass(&mut self) {
+        self.own_branch_unrealizable_blocked_passes += 1;
+    }
+
+    /// Record a parked own commit terminalized at the retirement horizon
+    /// without ever being realized: a residual divergence became permanent.
+    /// `&self` because the retirement sweep runs while seeding a pass.
+    pub fn note_own_commit_retired_unrealized(&self) {
+        self.own_commits_retired_unrealized
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Record the outcome of the one-attempt admin reservation.
     pub fn note_admin_reservation_attempt(&mut self, prepared: bool) {
         if prepared {
@@ -358,6 +392,10 @@ impl EngineMetrics {
             admin_reservation_hold_observations: self.admin_reservation_hold_observations,
             admin_reservation_prepared: self.admin_reservation_prepared,
             admin_reservation_failed: self.admin_reservation_failed,
+            own_branch_unrealizable_blocked_passes: self.own_branch_unrealizable_blocked_passes,
+            own_commits_retired_unrealized: self
+                .own_commits_retired_unrealized
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -390,6 +428,15 @@ pub struct EngineMetricsSnapshot {
     pub admin_reservation_prepared: u64,
     /// One-attempt admin reservations consumed by a failed preparation.
     pub admin_reservation_failed: u64,
+    /// Passes completed unapplied because an own-commit branch failed its
+    /// apply-time anchor lineage proof. Residual-divergence warning: this
+    /// node may hold a branch the fleet abandoned.
+    pub own_branch_unrealizable_blocked_passes: u64,
+    /// Parked own commits terminalized at the retirement horizon without
+    /// ever being realized. Each one is a residual divergence made permanent
+    /// — a node that looks healthy on every group surface but split from the
+    /// fleet's branch.
+    pub own_commits_retired_unrealized: u64,
 }
 
 impl EngineMetricsSnapshot {

@@ -478,6 +478,10 @@ pub(crate) fn own_commit_stamp(
         priority,
         consumed_proposal_refs,
         post_commit_tree_marker: None,
+        // Filled in by the caller from the pending fork-recovery record: the
+        // snapshot pairing is confirm-path bookkeeping, not derivable from the
+        // staged commit.
+        fork_snapshot_name: None,
     })
 }
 
@@ -658,11 +662,23 @@ pub fn project_mls_message(
 /// terminal disposition, leaving it `ConvergenceDeferred` forever. Malformed,
 /// non-OpenMLS, and non-commit rows remain untouched: this maintenance path
 /// must not turn old unrelated storage damage into a convergence failure.
+/// One commit retired below the retained-anchor horizon by
+/// [`retire_stale_convergence_deferred_commits`].
+pub(crate) struct RetiredDeferredCommit {
+    pub(crate) message_id: MessageId,
+    pub(crate) source_epoch: EpochId,
+    /// The retired row carried an own-commit convergence stamp: this device
+    /// published and confirmed it, and it aged out without ever being
+    /// realized. Retiring such a row completes a residual divergence — the
+    /// caller surfaces it as an operator-visible diagnostic.
+    pub(crate) own_commit: bool,
+}
+
 pub(crate) fn retire_stale_convergence_deferred_commits<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
-) -> Result<Vec<(MessageId, EpochId)>, OpenMlsProjectionError> {
+) -> Result<Vec<RetiredDeferredCommit>, OpenMlsProjectionError> {
     storage.with_transaction(|storage| {
         let records = storage.list_messages(group_id, EpochId(0))?;
         let mut retired = Vec::new();
@@ -690,7 +706,11 @@ pub(crate) fn retire_stale_convergence_deferred_commits<S: StorageProvider>(
             }
 
             storage.update_message_state(&record.id, MessageState::EpochInvalidated)?;
-            retired.push((record.id, EpochId(source_epoch)));
+            retired.push(RetiredDeferredCommit {
+                own_commit: payload.own_commit_stamp().is_some(),
+                message_id: record.id,
+                source_epoch: EpochId(source_epoch),
+            });
         }
 
         Ok(retired)
@@ -2102,11 +2122,16 @@ pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
 /// cancellation, but it cannot run on process termination. A surviving
 /// `fork-probe-` snapshot therefore always contains the newer live state that
 /// must win on the next open; the on-disk OpenMLS state is stranded at the
-/// rolled-back fork snapshot. More than one probe snapshot is not expected:
-/// fork probes are serialized per group and hydrate runs before any new work
-/// (the same invariant [`recover_interrupted_retained_anchor_probe`] relies
-/// on). If storage contains several, fail closed instead of guessing which
-/// live state is newest.
+/// rolled-back fork snapshot. More than one probe snapshot cannot occur
+/// without an invariant break: fork probes are serialized per group —
+/// enforced at probe creation, which refuses to open a probe while another
+/// probe snapshot exists — and hydrate runs before any new work (the same
+/// invariant [`recover_interrupted_retained_anchor_probe`] relies on). If
+/// storage nevertheless contains several, fail closed (the caller
+/// quarantines) instead of guessing which live state is newest. This
+/// quarantine is deliberate and does not contradict the hydrate rebuild's
+/// "must not quarantine a healthy group" rule: a multi-probe group is not
+/// healthy, its live state is genuinely ambiguous.
 ///
 /// [`SnapshotRollbackGuard`]: crate::snapshot_guard::SnapshotRollbackGuard
 /// [`Engine::probe_commit_ordering_metadata_for_recovery`]: crate::message_processor::ingest::Engine::probe_commit_ordering_metadata_for_recovery
@@ -2754,6 +2779,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             // of getting their own live branch pruned and terminalized.
             if !own_commits.is_canonical(&projection.message_digest) {
                 let Some(expected_marker) = stamp.post_commit_tree_marker.as_deref() else {
+                    // Operator-visible residual-divergence signal: pruning a
+                    // parked own commit's branch here means peers that
+                    // applied it may settle on a branch this node can never
+                    // realize, while every group surface on this node still
+                    // looks healthy. Privacy-safe: aggregate reason only.
+                    tracing::warn!(
+                        target: "cgka_engine::openmls_projection",
+                        method = "replay_openmls_messages_prevalidated",
+                        reason = "own_commit_stamp_without_marker",
+                        "pruning a parked own-commit branch: its pre-marker stamp cannot prove the retained anchor; this node may diverge from peers that applied the commit"
+                    );
                     return Err(OpenMlsProjectionError::Replay(format!(
                         "own commit at epoch {source_epoch} carries no post-merge marker; \
                          its anchor cannot be proven"
@@ -2762,6 +2798,15 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 let actual_marker = own_commit_post_merge_tree_marker(&mls_group)
                     .map_err(|e| OpenMlsProjectionError::Replay(format!("anchor marker: {e}")))?;
                 if actual_marker != expected_marker {
+                    // Same residual-divergence signal for a clobbered anchor
+                    // caught at materialization (a peer commit landing on the
+                    // same epoch replaced the anchor's contents).
+                    tracing::warn!(
+                        target: "cgka_engine::openmls_projection",
+                        method = "replay_openmls_messages_prevalidated",
+                        reason = "own_commit_anchor_clobbered",
+                        "pruning a parked own-commit branch: its retained anchor no longer holds the commit's post-merge state; this node may diverge from peers that applied the commit"
+                    );
                     return Err(OpenMlsProjectionError::Replay(format!(
                         "retained anchor at epoch {resulting_epoch} does not hold this own \
                          commit's post-merge state"
@@ -3433,6 +3478,7 @@ mod anchor_prefix_lineage_tests {
             priority: CommitOrderingPriority::Privileged,
             consumed_proposal_refs: Vec::new(),
             post_commit_tree_marker,
+            fork_snapshot_name: None,
         };
         MessageRecord {
             id: MessageId::new(id.to_vec()),

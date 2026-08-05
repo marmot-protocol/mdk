@@ -45,6 +45,22 @@ pub struct OwnCommitConvergenceStamp {
     /// field. Absent means "cannot be proven", and the fast path is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_commit_tree_marker: Option<String>,
+    /// Name of the pre-commit fork-recovery snapshot (`fork-<epoch>-<counter>-…`)
+    /// this commit's pairwise-recovery record owned when it was published,
+    /// captured at confirm time from the same record `resolve()` would roll
+    /// back to. The hydrate-time fork-routing rebuild pairs an own-commit
+    /// incumbent with a fork snapshot by MATCHING this name against the
+    /// snapshots still on disk, instead of inferring the pairing from
+    /// "newest snapshot at the source epoch" — a name-based inference that is
+    /// exactly the kind of unproven identity claim the post-merge marker
+    /// exists to eliminate. It is the snapshot, not the ordering key, that a
+    /// later `resolve()` rewinds to, so the pairing must be exact.
+    ///
+    /// `Option` because rows stamped by older engine versions predate the
+    /// field. Absent means the rebuild falls back to the newest-snapshot
+    /// inference for this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_snapshot_name: Option<String>,
 }
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].

@@ -2631,3 +2631,383 @@ async fn hydrate_recovers_interrupted_fork_probe_snapshot() {
         "the recovered fork-probe snapshot must be released"
     );
 }
+
+/// Observable form of the invariant the `is_canonical` carve-out in own-branch
+/// materialization rests on: a `Processed` commit row means "applied on this
+/// device's live canonical chain", so there is at most one `Processed` commit
+/// per source epoch, every `Processed` commit sits below the live tip — and in
+/// particular no own-stamped `Processed` row can survive off the chain.
+/// `PrevalidatedOwnCommits` builds its canonical set from exactly these rows
+/// and exempts them from the anchor lineage proof (the apply skips them via
+/// its already-applied prefix), so a displaced own commit left `Processed`
+/// would materialize a branch from an unproven anchor. Every displacement
+/// mechanism must therefore move the loser out of `Processed` in the same
+/// durable unit: the pairwise `resolve()` re-persists it
+/// `ConvergenceDeferred`, and a convergence reorg re-disposes the whole
+/// horizon from the captured live records.
+fn assert_processed_commit_rows_form_the_live_chain(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    tip: u64,
+    context: &str,
+) {
+    use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
+    use cgka_traits::message::StoredMessagePayload;
+    use std::collections::BTreeMap;
+
+    let mut processed_by_epoch: BTreeMap<u64, Vec<MessageId>> = BTreeMap::new();
+    for record in storage.list_messages(group_id, EpochId(0)).unwrap() {
+        if record.state != MessageState::Processed {
+            continue;
+        }
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            continue;
+        };
+        let Some(message) = payload.as_openmls_wire() else {
+            continue;
+        };
+        let Ok(projection) = project_mls_message(&message.payload) else {
+            continue;
+        };
+        if projection.kind != OpenMlsContentKind::Commit {
+            continue;
+        }
+        let Some(source_epoch) = projection.source_epoch else {
+            continue;
+        };
+        assert!(
+            source_epoch < tip,
+            "{context}: a Processed commit at source epoch {source_epoch} sits at or above \
+             the live tip {tip} — it cannot be on the applied chain"
+        );
+        if payload.own_commit_stamp().is_some() {
+            assert!(
+                source_epoch < tip,
+                "{context}: an own-stamped Processed commit at source epoch {source_epoch} \
+                 is off the live chain (tip {tip})"
+            );
+        }
+        processed_by_epoch
+            .entry(source_epoch)
+            .or_default()
+            .push(record.id.clone());
+    }
+    for (source_epoch, ids) in &processed_by_epoch {
+        assert!(
+            ids.len() <= 1,
+            "{context}: {} Processed commit rows share source epoch {source_epoch} — a \
+             displaced commit was left Processed instead of being parked: {ids:?}",
+            ids.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn processed_own_commit_rows_never_survive_off_the_live_chain() {
+    // Pins the invariant `assert_processed_commit_rows_form_the_live_chain`
+    // documents, across BOTH mechanisms that move an own commit off the live
+    // chain:
+    //   (a) a pairwise CandidateWins displacement — `resolve()` must park the
+    //       own incumbent `ConvergenceDeferred`, never leave it `Processed`
+    //       on the abandoned branch;
+    //   (b) a convergence reorg back onto the own-commit branch — the
+    //       displaced rival-branch commits must leave `Processed` while the
+    //       own commit returns to it.
+    // If either mechanism ever leaks a `Processed` own-commit row off the
+    // chain, the `is_canonical` lineage-proof exemption in own-branch
+    // materialization becomes unsound (see the carve-out comment in
+    // `openmls_projection`), so this test failing means that exemption must
+    // be revisited, not the test weakened.
+    use cgka_traits::ingest::IngestOutcome;
+
+    // Privileged same-epoch commits order by committer identity: the rival's
+    // identity must sort BEFORE X's so the inbound candidate B wins.
+    let first = b"chain-first".as_slice();
+    let second = b"chain-second".as_slice();
+    let (rival_id, x_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let (mut x, x_storage) = build_client_with_storage(x_id);
+    let mut rival = build_client(rival_id);
+    let (mut y, _y_storage) = build_client_with_storage(b"chain-y");
+    let mut david = build_client(b"chain-david");
+    let mut eve = build_client(b"chain-eve");
+    let mut frank = build_client(b"chain-frank");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let y_kp = y.fresh_key_package().await.unwrap();
+    let (group_id, create) = x
+        .create_group(CreateGroupRequest {
+            name: "processed-own-chain".into(),
+            description: String::new(),
+            members: vec![rival_kp, y_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![rival.self_id(), y.self_id()],
+        })
+        .await
+        .unwrap();
+    let (rival_welcome, y_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            x.confirm_published(pending).await.unwrap();
+            let y_welcome = welcomes.remove(1);
+            (welcomes.remove(0), y_welcome)
+        }
+        _ => unreachable!(),
+    };
+    rival.join_welcome(rival_welcome).await.unwrap();
+    y.join_welcome(y_welcome).await.unwrap();
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // X's own commit A (invite david) and the rival's competing B (invite
+    // eve), both from epoch 1.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let commit_a = match x
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            x.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    // Baseline: A is X's own confirmed commit ON the chain.
+    let a_row = x_storage.get_message(&commit_a.id).unwrap();
+    assert_eq!(a_row.state, MessageState::Processed);
+    assert_processed_commit_rows_form_the_live_chain(
+        &x_storage,
+        &group_id,
+        x.epoch(&group_id).unwrap().0,
+        "after own confirm",
+    );
+
+    let commit_b = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let a_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(x_id)),
+        &commit_a.payload,
+    );
+    let b_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &commit_b.payload,
+    );
+    assert!(
+        b_key < a_key,
+        "identity choice must make the inbound candidate win the pairwise race"
+    );
+
+    // (a) B displaces A pairwise: the own commit must leave `Processed` in
+    // the same durable unit that rolls the chain onto B.
+    x.ingest(route(commit_b.clone())).await.unwrap();
+    x.drain_events();
+    assert_eq!(x.epoch(&group_id).unwrap().0, 2);
+    let displaced = x_storage.get_message(&commit_a.id).unwrap();
+    assert_eq!(
+        displaced.state,
+        MessageState::ConvergenceDeferred,
+        "the displaced own incumbent must be parked, never left Processed off-chain"
+    );
+    assert_processed_commit_rows_form_the_live_chain(
+        &x_storage,
+        &group_id,
+        x.epoch(&group_id).unwrap().0,
+        "after pairwise displacement",
+    );
+
+    // (b) Y grows the A-branch deeper; X reorgs back onto it through
+    // convergence. Now B is the commit leaving the chain.
+    y.ingest(route(commit_a.clone())).await.unwrap();
+    y.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("A settles on Y through convergence");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let follow_on = match y
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            y.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let outcome = x.ingest(route(follow_on)).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the A-branch follow-on must enter the convergence pass, got {outcome:?}"
+    );
+    x.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("reorg back onto the deeper A-branch");
+    assert_eq!(x.epoch(&group_id).unwrap().0, 3);
+
+    // The own commit is back on the chain, uniquely `Processed` at epoch 1 —
+    // and the displaced rival commit did NOT stay `Processed` beside it.
+    let a_after = x_storage.get_message(&commit_a.id).unwrap();
+    assert_eq!(
+        a_after.state,
+        MessageState::Processed,
+        "the reorged-onto own commit must be Processed again"
+    );
+    // The rival commit's stored row may be re-keyed by content id on the
+    // convergence path, so find it by its wire payload rather than by the
+    // transport id.
+    let b_rows: Vec<_> = x_storage
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            cgka_traits::message::StoredMessagePayload::decode(&record.payload)
+                .ok()
+                .and_then(|payload| payload.as_openmls_wire().cloned())
+                .is_some_and(|message| message.payload == commit_b.payload)
+        })
+        .collect();
+    assert!(
+        !b_rows.is_empty(),
+        "the displaced rival commit's stored row must still exist"
+    );
+    for b_row in &b_rows {
+        assert_ne!(
+            b_row.state,
+            MessageState::Processed,
+            "the rival commit displaced by the reorg must not survive Processed off-chain"
+        );
+    }
+    assert_processed_commit_rows_form_the_live_chain(
+        &x_storage,
+        &group_id,
+        x.epoch(&group_id).unwrap().0,
+        "after convergence reorg onto the own-commit branch",
+    );
+}
+
+#[tokio::test]
+async fn restarted_incumbent_pairs_with_stamped_snapshot_not_newest_at_epoch() {
+    // The hydrate-time rebuild used to pair an own-commit incumbent with the
+    // NEWEST `fork-<epoch>-…` snapshot at its source epoch — an inference
+    // from name recency, where an inbound commit proves its pairing by
+    // replaying against the snapshot. The confirm-time stamp now records the
+    // snapshot name its recovery record owns, and the rebuild matches that
+    // name instead. This test plants a DECOY snapshot at the same source
+    // epoch with a higher counter, captured from the post-commit (epoch 2)
+    // state: recency-based pairing would adopt it, and the later pairwise
+    // rollback would land on the wrong epoch entirely. The recorded name must
+    // win — the restarted loser still rolls back onto the winning rival
+    // through the snapshot its own commit actually owns.
+    let first = b"stamp-pair-first".as_slice();
+    let second = b"stamp-pair-second".as_slice();
+    // Local must LOSE the pairwise race so the rollback actually runs.
+    let (local_id, rival_id) = if pad32(first) < pad32(second) {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    let (group_id, local_storage, local_commit, rival_root) =
+        forked_privileged_invites(local_id, rival_id, b"stamp-pair-david", b"stamp-pair-eve").await;
+
+    let local_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(local_id)),
+        &local_commit.payload,
+    );
+    let rival_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &rival_root.payload,
+    );
+    assert!(
+        rival_key < local_key,
+        "identity choice must make the inbound rival win the pairwise race"
+    );
+
+    // The decoy: a snapshot named for source epoch 1 with a counter above any
+    // the engine has minted, but capturing the LIVE post-commit state
+    // (epoch 2). Under newest-at-epoch inference the rebuild would hand this
+    // to the own-commit incumbent, and `resolve()`'s rollback would "rewind"
+    // onto epoch-2 state where the rival's epoch-1 commit can never apply.
+    local_storage
+        .create_group_snapshot(&group_id, "fork-1-9000-00112233aabbccdd")
+        .unwrap();
+
+    // RESTART: the rebuild must pair the stamped own commit with the snapshot
+    // its stamp records, ignoring the newer decoy.
+    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+    let _ = local.drain_events();
+
+    local
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..rival_root.clone()
+        })
+        .await
+        .unwrap();
+    let events = local.drain_events();
+    let (source_epoch, recovered_epoch, winner, invalidated) = extract_fork_recovered(
+        &events, &group_id,
+    )
+    .expect("the restarted loser must roll back through its own stamped snapshot, not the decoy");
+    assert_eq!(source_epoch.0, 1);
+    assert_eq!(recovered_epoch.0, 2);
+    assert_eq!(winner, &rival_key);
+    assert_eq!(invalidated, &local_key);
+    assert_eq!(local.epoch(&group_id).unwrap().0, 2);
+
+    // The rollback landed on the true pre-commit state: the rival branch
+    // applied, the abandoned local branch's invitee is gone.
+    let members: Vec<_> = local
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert!(
+        members.contains(&MemberId::new(pad32(b"stamp-pair-eve"))),
+        "rival branch's invitee must be present after the rollback"
+    );
+    assert!(
+        !members.contains(&MemberId::new(pad32(b"stamp-pair-david"))),
+        "the abandoned local branch's invitee must be gone"
+    );
+}

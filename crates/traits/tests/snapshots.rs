@@ -309,9 +309,11 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
         priority: CommitOrderingPriority::Privileged,
         consumed_proposal_refs: vec!["0a0b".into()],
         // `None` on purpose: this is the shape of every row written before
-        // `post_commit_tree_marker` existed, and `skip_serializing_if` must
-        // keep the stored bytes byte-identical for them.
+        // `post_commit_tree_marker` / `fork_snapshot_name` existed, and
+        // `skip_serializing_if` must keep the stored bytes byte-identical for
+        // them.
         post_commit_tree_marker: None,
+        fork_snapshot_name: None,
     };
     let payload = StoredMessagePayload::own_commit_wire(message.clone(), stamp.clone());
 
@@ -330,6 +332,7 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
     // retained-anchor fast path).
     let marked = OwnCommitConvergenceStamp {
         post_commit_tree_marker: Some("ab".repeat(32)),
+        fork_snapshot_name: Some("fork-3-7-0011223344556677".into()),
         ..stamp.clone()
     };
     let marked_payload = StoredMessagePayload::own_commit_wire(message, marked.clone());

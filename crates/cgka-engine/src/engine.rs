@@ -1576,9 +1576,20 @@ impl<S: StorageProvider> Engine<S> {
         // the pending-publish restore above (a restored pending owns the
         // newest fork snapshot at its source epoch). Best-effort: a failed
         // rebuild only forfeits the pairwise fast path — distributed
-        // convergence still resolves the fork — so it must not quarantine a
-        // healthy group. Skipped while Unrecoverable: ingest is halted there
-        // and the rebuild's probe replay would touch frozen state.
+        // convergence still resolves the fork — so a rebuild error must not
+        // quarantine a healthy group. This is a different obligation from
+        // `recover_interrupted_fork_probe`, which ran earlier in this
+        // hydration and quarantines by design: a surviving `fork-probe-`
+        // snapshot means live state is stranded mid-rollback, and several of
+        // them means ambiguous state (the serialized-probe invariant is
+        // enforced at probe creation in
+        // `probe_commit_ordering_metadata_for_recovery`, so multiple probes
+        // is an invariant break, not a healthy group). A probe the rebuild
+        // itself starts is covered on THIS path by its `SnapshotRollbackGuard`
+        // — an in-process failure rolls back and releases here, never
+        // reaching the recovery arm. Skipped while Unrecoverable: ingest is
+        // halted there and the rebuild's probe replay would touch frozen
+        // state.
         if !group.unrecoverable
             && let Err(error) = self.rebuild_fork_routing_state_on_hydrate(group_id)
         {

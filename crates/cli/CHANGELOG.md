@@ -36,6 +36,20 @@ versioning through the workspace version in the root `Cargo.toml`.
   the anchor lineage check for each other.
   ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
 
+- The residual divergence those fail-closed paths accept — a node
+  terminalizing its own unrealizable commit and staying on a branch the fleet
+  abandoned — is now operator-visible instead of audit-log-only: warn-level
+  structured tracing fires when an own-commit branch is pruned or blocked and
+  when a parked own commit ages out unrealized, and the engine metrics
+  snapshot gains `own_branch_unrealizable_blocked_passes` and
+  `own_commits_retired_unrealized` counters. The own-commit convergence stamp
+  additionally records the fork snapshot name its recovery record owns, so
+  the hydrate-time fork-routing rebuild proves the (own commit → snapshot)
+  pairing by exact match instead of inferring it from snapshot-name recency,
+  and refuses to open a second concurrent fork-recovery ordering probe —
+  turning the "fork probes are serialized per group" invariant that
+  interrupted-probe recovery relies on into a checked one.
+
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
   formatting. The TUI group diagnostics panel no longer retains or renders raw
