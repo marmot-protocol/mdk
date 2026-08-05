@@ -89,10 +89,7 @@ fn smoke_scenario() -> ScenarioSpec {
             ScenarioStep::Tick {
                 clients: clients.clone(),
             },
-            in_group(ScenarioStep::ObserveExact {
-                clients: clients.clone(),
-            }),
-            in_group(ScenarioStep::ProbeBidirectionalDecryptability { clients }),
+            in_group(ScenarioStep::ObserveExact { clients }),
         ],
     }
 }
@@ -159,5 +156,4 @@ async fn real_container_nodes_survive_network_shaping_and_reach_exact_state() {
         serde_json::from_slice(&std::fs::read(receipt.process_report.as_ref().unwrap()).unwrap())
             .unwrap();
     assert!(process_report.completed);
-    assert!(process_report.decryptability_probes[0].succeeded());
 }

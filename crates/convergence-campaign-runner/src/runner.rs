@@ -906,11 +906,36 @@ mod tests {
     #[test]
     fn container_binding_rejects_multi_relay_topologies() {
         let root = tempfile::tempdir().unwrap();
-        let mut scenario = cgka_conformance_simulator::generate_cross_route_regression_family()
-            .into_iter()
-            .next()
-            .unwrap()
-            .scenario;
+        let mut scenario = ScenarioSpec {
+            name: "multi-relay-binding".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: cgka_conformance_simulator::ScenarioTopologyV2 {
+                accounts: vec![cgka_conformance_simulator::ScenarioAccountV2 {
+                    id: "alice".into(),
+                    roles: vec!["member".into()],
+                }],
+                devices: vec![cgka_conformance_simulator::ScenarioDeviceV2 {
+                    id: "device:alice".into(),
+                    account: "alice".into(),
+                    process: "process:alice".into(),
+                    client: "alice".into(),
+                }],
+                processes: vec![cgka_conformance_simulator::ScenarioProcessV2 {
+                    id: "process:alice".into(),
+                    binary_version: "test".into(),
+                    policy_version: "test".into(),
+                    relays: vec!["relay:primary".into()],
+                }],
+                relays: vec![cgka_conformance_simulator::ScenarioRelayV2 {
+                    id: "relay:primary".into(),
+                    implementation_version: "test".into(),
+                    policy_version: "test".into(),
+                }],
+                ..Default::default()
+            },
+            steps: Vec::new(),
+        };
         scenario
             .topology
             .relays

@@ -14,13 +14,11 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::node_protocol::{
-    NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1, NodeFailureCapsuleV1, NodeObservationV1,
-    NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
+    NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
+    NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
-    BidirectionalDecryptabilityObservation, CompiledScenarioV2, DecryptabilityProbeSendStatus,
-    DirectionalDecryptabilityProbe, ScenarioActionScheduleV2, ScenarioInputDisposition,
-    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioRelaySyncModeV2, ScenarioSpec,
+    CompiledScenarioV2, ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec,
     ScenarioStep, SubjectCapability, SubjectDescriptor, SubjectFailureCategory, compile_scenario,
     preflight_compiled_scenario,
 };
@@ -1192,13 +1190,7 @@ impl NodeProcess {
                 "node closed stdout before responding",
             ));
         }
-        let response: NodeResponseV1 = serde_json::from_str(&line).map_err(environment_error)?;
-        if response.protocol != NODE_PROTOCOL_VERSION || response.request_id != request_id {
-            return Err(ProcessOrchestratorError::new(
-                "node_protocol_mismatch",
-                "node response did not match the request",
-            ));
-        }
+        let response = decode_node_response(&line, &request_id)?;
         Ok(response.body)
     }
 }

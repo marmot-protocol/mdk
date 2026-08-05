@@ -73,6 +73,10 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Tracked assurance, constant review, simulator architecture, verification gates, workload
     campaigns, and the path from an engine black box to app/process/container simulation.
 
+- **Doc:** [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md)
+  - **What it covers:** Container-first distributed campaign operation, the narrow VM escalation boundary, reproducible
+    manifests, private evidence, and the scope of distributed test claims.
+
 - **Doc:** [`overview/whitenoise-integration-map.md`](./overview/whitenoise-integration-map.md)
   - **What it covers:** First shim map from whitenoise-rs account/relay flows to the current engine/session/account
     boundary.
