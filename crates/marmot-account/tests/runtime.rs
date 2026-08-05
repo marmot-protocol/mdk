@@ -3669,20 +3669,21 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     );
     // Rollback compensated the staged evolution in the same transaction, so the
     // obligation has nothing left to re-publish and must re-stage rather than
-    // cling to an event that reached no one. Drive maintenance until it does:
-    // this is the liveness half of the bound, and without it a rejected
-    // publication would leave the rotation permanently owed.
-    let mut elapsed_ms = 60_000_u64;
-    for _ in 0..8 {
-        adapter.accept_next(1);
-        wall.set(wall.now().0.saturating_add(300));
-        elapsed_ms = elapsed_ms.saturating_add(300_000);
-        monotonic.set_millis(elapsed_ms);
-        runtime.run_due_maintenance().await.unwrap();
-        if runtime.session().epoch(&group_id).unwrap().0 > source_epoch.0 {
-            break;
-        }
-    }
+    // cling to an event that reached no one. That is the liveness half of the
+    // bound: without it a rejected publication leaves the rotation permanently
+    // owed.
+    //
+    // The very next maintenance run must do it, with the clock exactly where
+    // the rejection left it, and asserting that is the point. Nothing on this
+    // path can legitimately delay the re-stage: `not_before` is only written by
+    // the quiet-period arm, which a due obligation in `PendingPublication` never
+    // reaches, and the re-staged commit gets a fresh fanout whose targets have
+    // no `last_attempt_at`, so the 30s→1h per-target retry backoff has nothing
+    // to measure from. Pinning the immediate re-stage means any future backoff
+    // introduced here fails loudly instead of hiding behind a clock the test
+    // advanced for it.
+    adapter.accept_next(1);
+    runtime.run_due_maintenance().await.unwrap();
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
         source_epoch.0 + 1,
