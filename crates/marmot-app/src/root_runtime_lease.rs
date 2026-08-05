@@ -50,7 +50,6 @@ impl MarmotRootRuntimeLease {
 
         #[cfg(unix)]
         {
-            let path = root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE);
             match prepared_root.try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(
                 MARMOT_ROOT_RUNTIME_LOCK_FILE,
             )) {
@@ -60,10 +59,7 @@ impl MarmotRootRuntimeLease {
                 }
                 Err(error) => Err(AppError::Io(io::Error::new(
                     error.kind(),
-                    format!(
-                        "acquire Marmot root runtime lease at {}: {error}",
-                        path.display()
-                    ),
+                    format!("acquire Marmot root runtime lease: {error}"),
                 ))),
             }
         }
@@ -164,12 +160,22 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target_file = parent.path().join("target-file");
         std::fs::write(&target_file, b"unchanged").unwrap();
+        std::fs::set_permissions(&target_file, std::fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&target_file, root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE)).unwrap();
         assert!(matches!(
             MarmotRootRuntimeLease::try_acquire(&root),
             Err(AppError::Io(_))
         ));
-        assert_eq!(std::fs::read(target_file).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"unchanged");
+        assert_eq!(
+            std::fs::metadata(&target_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644,
+            "symlink target mode must not be tightened"
+        );
     }
 
     #[test]

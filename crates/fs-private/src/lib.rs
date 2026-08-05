@@ -63,7 +63,10 @@ fn finish_private_exclusive_file_lease(
 ) -> io::Result<PrivateExclusiveFileLease> {
     use std::os::fd::AsRawFd;
 
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_context("read private lease file metadata", path, error))?;
+    if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -139,11 +142,12 @@ impl PreparedDirectory {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
-        if !matches!(
-            Path::new(name).components().next(),
-            Some(std::path::Component::Normal(_))
-        ) || Path::new(name).components().count() != 1
-        {
+        let mut name_components = Path::new(name).components();
+        let single_normal = matches!(
+            (name_components.next(), name_components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if !single_normal {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private lease name must be one non-empty path component",
@@ -227,11 +231,17 @@ pub fn prepare_directory_path(
     let normalized_path = resolve_root_owned_alias(path)?;
     let path = normalized_path.as_deref().unwrap_or(path);
 
+    #[cfg(not(target_vendor = "apple"))]
     let mut components = Vec::<OsString>::new();
+    let mut has_normal_component = false;
     for component in path.components() {
         match component {
             Component::RootDir | Component::CurDir => {}
-            Component::Normal(component) => components.push(component.to_owned()),
+            Component::Normal(_component) => {
+                has_normal_component = true;
+                #[cfg(not(target_vendor = "apple"))]
+                components.push(_component.to_owned());
+            }
             Component::ParentDir => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -246,7 +256,7 @@ pub fn prepare_directory_path(
             }
         }
     }
-    if components.is_empty() && policy == ExistingDirectoryMode::Enforce {
+    if !has_normal_component && policy == ExistingDirectoryMode::Enforce {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refusing to change the current or root directory mode",
@@ -1022,11 +1032,14 @@ mod unix_tests {
         )
         .expect("prepare root");
 
-        for name in ["", ".", "..", "child/lock"] {
-            assert!(
-                prepared
-                    .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(name))
-                    .is_err()
+        for name in ["", ".", "..", "child/lock", "/etc/passwd", "../escape"] {
+            let error = prepared
+                .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(name))
+                .expect_err("invalid lease name must be rejected");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "name {name:?} must be rejected by name validation"
             );
         }
 
