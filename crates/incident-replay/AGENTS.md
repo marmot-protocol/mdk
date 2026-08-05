@@ -155,18 +155,20 @@ Precedence, highest first:
 5. **Quarantine `unrecoverable_halt`** — an engine recorded halting
    unrecoverably, so its group stays blocked until a verified repair clears the
    marker. Two audit surfaces arm it, and the reason string from whichever fired
-   is reported per engine — **causes first-class, re-assertions only when there is
-   no cause**. `already_unrecoverable` (emitted on every convergence attempt
-   against an already-halted group) and `hydrate_unrecoverable_group` (every
-   session open over one) *arm* the gate like any other reason, because a window
-   of nothing but re-assertions is still a live halt, but they never say why the
-   engine stopped: beside a real cause they are noise in the line an operator
-   reads first, and `BTreeSet` order puts `already_unrecoverable` ahead of the
-   diagnosis. Once the cause is known they add nothing — that a halt is durable
-   and still being retried is what rule 5 *means*. When re-assertions are all the
-   export has (the real 26a9f546 shape: the halt predates the window) they are
-   reported, because the engine still has to be named and "the halt stands, cause
-   not in this window" is the honest reading. The two surfaces are
+   is reported per engine — **causes first-class, non-causes only when there is
+   no cause**. Three strings name no cause. `already_unrecoverable` (emitted on
+   every convergence attempt against an already-halted group) and
+   `hydrate_unrecoverable_group` (every session open over one) *arm* the gate
+   like any other reason, because a window of nothing but re-assertions is still
+   a live halt, but they never say why the engine stopped: beside a real cause
+   they are noise in the line an operator reads first, and `BTreeSet` order puts
+   `already_unrecoverable` ahead of the diagnosis. Once the cause is known they
+   add nothing — that a halt is durable and still being retried is what rule 5
+   *means*. `unspecified` — the stand-in for a halt row that carried no reason at
+   all — names even less and ranks with them. When non-causes are all the export
+   has (the real 26a9f546 shape: the halt predates the window) they are reported,
+   because the engine still has to be named and "the halt stands, cause not in
+   this window" is the honest reading. The two surfaces are
    `convergence_run_state` with `phase: unrecoverable`
    (mdk#1110 — reason `frozen_pass_integrity_failure` from `error_kind:
    frozen_member_integrity`, and the reason-less `error_kind:

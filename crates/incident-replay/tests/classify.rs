@@ -374,6 +374,44 @@ fn a_halt_that_predates_the_export_reports_its_re_assertions() {
 }
 
 #[test]
+fn an_unspecified_halt_reason_ranks_below_a_cause_and_beside_a_re_assertion() {
+    // `unspecified` is the stand-in both halt arms substitute for a row that named
+    // nothing, so it names a cause even less than a re-assertion does. It belongs
+    // in the same fallback tier, and this fixture pins both directions of that
+    // tier at once — one engine per direction, one stand-in from each arm.
+    //
+    // `engine-a` (stand-in from the `epoch_state_changed` arm) has no cause at
+    // all, so everything it recorded is reported: dropping the stand-in would
+    // silence nothing, but ranking it *above* the re-assertions would report
+    // `unspecified` alone and hide the two strings that at least name the surface
+    // the halt was re-asserted on. `engine-b` (stand-in from the
+    // `convergence_run_state` arm) recorded a real cause, so the whole tier is
+    // suppressed: `unspecified` beside a diagnosis is pure noise in the line the
+    // operator reads first.
+    assert_eq!(
+        classify(&load("quarantine-unspecified-among-re-assertions.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![
+                    HaltedEngine {
+                        engine_id: "engine-a".into(),
+                        reasons: vec![
+                            "already_unrecoverable".into(),
+                            "hydrate_unrecoverable_group".into(),
+                            "unspecified".into(),
+                        ],
+                    },
+                    HaltedEngine {
+                        engine_id: "engine-b".into(),
+                        reasons: vec!["frozen_pass_integrity_failure".into()],
+                    },
+                ],
+            }
+        }
+    );
+}
+
+#[test]
 fn a_verified_repair_after_a_halt_clears_the_halt() {
     // The halt is a state, not a permanent record: rule 5 says the group stays
     // blocked "until a verified repair clears the marker", and there is exactly

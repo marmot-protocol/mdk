@@ -417,21 +417,21 @@ fn unrecoverable_halt(export: &AgentStateExport) -> Option<QuarantineReason> {
     (!engines.is_empty()).then_some(QuarantineReason::UnrecoverableHalt { engines })
 }
 
-/// One engine's halt reasons as the operator should read them: its causes, or its
-/// re-assertions when it recorded no cause.
+/// One engine's halt reasons as the operator should read them: its causes, or
+/// everything it recorded when it recorded no cause.
 ///
-/// A re-assertion never names why the engine stopped (see
-/// [`export::is_halt_re_assertion`]), so beside a real cause it is noise in the
-/// line an operator reads first. It is not dropped unconditionally, because a
-/// halt that predates the export window leaves nothing *but* re-assertions and
-/// that engine still has to be named — which is also the honest report for it:
-/// this export shows the halt standing, not what caused it.
+/// A non-cause never names why the engine stopped (see
+/// [`export::is_halt_cause`]), so beside a real cause it is noise in the line an
+/// operator reads first. Non-causes are not dropped unconditionally, because a
+/// halt that predates the export window leaves nothing *but* non-causes and that
+/// engine still has to be named — which is also the honest report for it: this
+/// export shows the halt standing, not what caused it.
 ///
-/// [`export::is_halt_re_assertion`]: crate::export::is_halt_re_assertion
+/// [`export::is_halt_cause`]: crate::export::is_halt_cause
 fn reported_halt_reasons(reasons: &BTreeSet<&str>) -> Vec<String> {
     let causes: Vec<String> = reasons
         .iter()
-        .filter(|reason| !crate::export::is_halt_re_assertion(reason))
+        .filter(|reason| crate::export::is_halt_cause(reason))
         .map(|reason| (*reason).to_owned())
         .collect();
     if causes.is_empty() {
