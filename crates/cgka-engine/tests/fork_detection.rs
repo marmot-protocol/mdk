@@ -185,16 +185,27 @@ fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<Sql
 /// (see `strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent`)
 /// instead of letting it race the incumbent.
 fn reopen_legacy_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
-    let mut engine = EngineBuilder::new(storage)
+    let mut engine = reopen_legacy_client_unhydrated(id, storage);
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine
+}
+
+/// [`reopen_legacy_client`] without the hydration step, for tests whose
+/// subject IS the first `hydrate_stable_groups_from_storage` call after a
+/// simulated crash — hydrating during setup would perform the recovery before
+/// the assertion under test.
+fn reopen_legacy_client_unhydrated(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
-        .unwrap();
-    engine.hydrate_stable_groups_from_storage().unwrap();
-    engine
+        .unwrap()
 }
 
 fn raw_self_update_commit(
@@ -1895,22 +1906,21 @@ async fn restarted_incumbent_rolls_back_to_winning_rival_via_rebuilt_snapshot() 
             _ => None,
         })
         .expect("ForkRecovered carries the invalidated commit's storage id");
-    match local_storage.get_message(&invalidated_commit_id) {
-        Ok(record) => {
-            assert_eq!(
-                record.state,
-                MessageState::ConvergenceDeferred,
-                "the displaced incumbent must stay reconsiderable after a restart-path rollback"
-            );
-            assert_eq!(
-                record.epoch,
-                EpochId(1),
-                "the parked incumbent must be keyed by its source epoch"
-            );
-        }
-        Err(cgka_traits::storage::StorageError::NotFound) => {}
-        Err(other) => panic!("unexpected storage error: {other:?}"),
-    }
+    // Displacement is atomic: the parked row is re-persisted in the same
+    // transaction as the rollback, so the id the event names must resolve.
+    let record = local_storage
+        .get_message(&invalidated_commit_id)
+        .expect("the displaced incumbent's parked row must exist");
+    assert_eq!(
+        record.state,
+        MessageState::ConvergenceDeferred,
+        "the displaced incumbent must stay reconsiderable after a restart-path rollback"
+    );
+    assert_eq!(
+        record.epoch,
+        EpochId(1),
+        "the parked incumbent must be keyed by its source epoch"
+    );
 }
 
 #[tokio::test]
@@ -2542,6 +2552,11 @@ fn fork_snapshot_counters(storage: &SqliteAccountStorage, group_id: &GroupId) ->
         .unwrap()
         .iter()
         .filter_map(|name| {
+            // `fork-probe-…` guards share the `fork-` prefix but carry no
+            // epoch/counter fields; parsing one would read "probe" garbage.
+            if name.starts_with("fork-probe-") {
+                return None;
+            }
             name.strip_prefix("fork-")?
                 .split('-')
                 .nth(1)?
@@ -2589,8 +2604,10 @@ async fn hydrate_recovers_interrupted_fork_probe_snapshot() {
     );
 
     // RESTART: hydration must detect the `fork-probe-` snapshot, restore the
-    // captured live state, and release the probe snapshot.
-    let mut local = reopen_legacy_client(local_id, local_storage.clone());
+    // captured live state, and release the probe snapshot. The reopen must
+    // NOT hydrate during setup — the explicit call below is the recovery
+    // under test.
+    let mut local = reopen_legacy_client_unhydrated(local_id, local_storage.clone());
     local
         .hydrate_stable_groups_from_storage()
         .expect("hydrate recovers the interrupted fork probe");

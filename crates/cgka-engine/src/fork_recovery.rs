@@ -611,8 +611,13 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let current_epoch = self.storage.get_group(group_id)?.epoch;
+        // Ungated: this rebuild also runs inside
+        // `retry_hydrate_quarantined_group`, where the group stays quarantined
+        // until hydration succeeds — the gated read maps quarantine to
+        // `MissingGroup` and would forfeit the pairwise fast-path rebuild on
+        // every quarantine-retry hydration.
         let policy = self
-            .convergence_policy_for_group(group_id)
+            .convergence_policy_for_group_ungated(group_id)
             .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
         let oldest_retained_epoch = EpochId(
             current_epoch

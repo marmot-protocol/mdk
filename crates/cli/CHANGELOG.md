@@ -34,6 +34,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   (epoch, tree hash, confirmed transcript hash), so two lineages that share a
   ratchet tree — e.g. across group-data-only commits — can no longer satisfy
   the anchor lineage check for each other.
+  ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
 
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
