@@ -161,8 +161,11 @@ pub enum MarmotKitError {
     /// retracted the optimistic local row; this variant is typed rather than
     /// the untyped [`MarmotKitError::Runtime`] bucket so the host can say the
     /// group is stuck instead of reporting an opaque failure. Unlike
-    /// [`MarmotKitError::StorageBusy`] it is not worth an automatic retry: the
-    /// queue cannot drain until the group's stalled publication resolves.
+    /// [`MarmotKitError::StorageBusy`] it is not worth an automatic retry:
+    /// whatever the group is waiting on — a stalled publication, unsettled
+    /// convergence input, or an inactive transport — clears on its own schedule,
+    /// not on a timer this call could pick. Prompt the user to resend once the
+    /// group is sending again.
     #[error("group {group_id_hex} has too many messages waiting to be sent")]
     GroupSendQueueFull { group_id_hex: String },
     #[error("marmot runtime error: {details}")]

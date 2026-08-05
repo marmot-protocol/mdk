@@ -61,9 +61,12 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// deferred-peel cap above, these rows are not peer-mintable — every one
 /// originates from a local `send` — so this bounds a runaway local sender
 /// rather than a flood. It is enforced in `queue_outbound_intent`, the sole
-/// insertion point for the queue, so it covers both retention paths: a group
-/// resolving a locally staged publication and a `Stable` group whose
-/// convergence inputs have not settled.
+/// insertion point for the queue, so it covers every path that retains: a group
+/// resolving a locally staged publication, a `Stable` group whose convergence
+/// inputs have not settled, and the offline outbox — `queue_app_message`, which
+/// the app calls when the account is not active (mdk#1158). The last is the one
+/// a user drives directly: 256 sends into one group across a single offline
+/// stretch, and the 257th is refused rather than queued.
 ///
 /// The first of those can hold indefinitely — a publication whose exposure is
 /// ambiguous is never rolled back, and the transport fanout row that would
@@ -84,6 +87,14 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// drops work it already accepted — that is the difference from the
 /// deferred-peel cap, which may drop because transport redelivery is its
 /// recovery path.
+///
+/// Capacity is reclaimed on confirmation, not on drain. A drained row is
+/// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
+/// intent, inside `confirm_published` — so a payload that was prepared and
+/// published but never acknowledged still holds its slot and is re-prepared on
+/// the next drain. A group whose transport keeps failing therefore sits at the
+/// cap: its rows keep being re-attempted, but nothing frees a slot until a
+/// publish is accepted by at least one endpoint.
 pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 
 /// Upper bound on `PeelDeferred` rows re-attempted per retry sweep
