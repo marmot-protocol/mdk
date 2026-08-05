@@ -197,6 +197,22 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         );
     }
     for purpose in [
+        "heal_inbound_network_partition",
+        "heal_outbound_network_partition",
+        "flush_network_partition_chain",
+        "remove_network_partition_chain",
+        "remove_network_partition_peer_set",
+    ] {
+        assert_eq!(
+            heal.iter()
+                .find(|command| command.purpose == purpose)
+                .unwrap()
+                .success_exit_codes,
+            [0],
+            "{purpose}"
+        );
+    }
+    for purpose in [
         "verify_inbound_partition_healed",
         "verify_outbound_partition_healed",
         "verify_network_partition_chain_removed",
