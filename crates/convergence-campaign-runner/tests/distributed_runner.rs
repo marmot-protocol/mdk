@@ -95,6 +95,12 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
                 },
             },
             ScheduledFaultV1 {
+                at_barrier: "database-contention-stop".into(),
+                action: DistributedFaultV1::StopDatabaseContention {
+                    participant: "bob".into(),
+                },
+            },
+            ScheduledFaultV1 {
                 at_barrier: "host-crash".into(),
                 action: DistributedFaultV1::CrashParticipantHost {
                     participant: "bob".into(),
@@ -128,6 +134,18 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     assert_eq!(plan.backend, "container");
     assert_eq!(plan.setup.len(), 2);
     assert_eq!(plan.cleanup.len(), 2);
+    assert!(plan.setup.iter().all(|command| {
+        command
+            .args
+            .iter()
+            .any(|argument| argument.contains("{resource_token}"))
+    }));
+    assert!(plan.cleanup.iter().all(|command| {
+        command
+            .args
+            .iter()
+            .any(|argument| argument.contains("{resource_token}"))
+    }));
     assert!(plan.setup[1].args.windows(2).any(|window| {
         window
             == [
@@ -143,6 +161,7 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         "disk-full",
         "disk-release",
         "database-contention",
+        "database-contention-stop",
         "host-crash",
     ] {
         assert!(plan.faults.contains_key(barrier), "{barrier}");
@@ -154,6 +173,10 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
         .position(|argument| argument == "--timeout")
         .unwrap();
     assert_eq!(contention.args[timeout_index + 1], "5s");
+    assert_eq!(
+        fault_commands(&plan, "database-contention-stop")[0].success_exit_codes,
+        [0, 1]
+    );
     for command in plan
         .setup
         .iter()
@@ -431,9 +454,12 @@ fn vm_plan_rejects_non_utf8_argv_paths() {
         },
     }];
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
         driver: "/tmp/driver".into(),
         driver_args: vec!["{scenario}".into()],
+        cleanup_args: vec!["cleanup".into(), "{manifest}".into()],
         timeout_seconds: 7_200,
+        cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
     manifest.scenario.path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
@@ -444,7 +470,13 @@ fn vm_plan_rejects_non_utf8_argv_paths() {
 #[test]
 fn mixed_builds_select_an_exact_image_per_participant() {
     let (_root, manifest) = container_manifest();
-    let launch = container_node_launch(&manifest).unwrap();
+    assert_eq!(
+        container_node_launch(&manifest, "bad:token")
+            .unwrap_err()
+            .code,
+        "unsafe_resource_token"
+    );
+    let launch = container_node_launch(&manifest, "resource-test").unwrap();
     assert!(launch.args_by_participant["alice"].contains(&"marmot-conformance:current".into()));
     assert!(launch.args_by_participant["bob"].contains(&"marmot-conformance:previous".into()));
     assert_eq!(
@@ -461,6 +493,15 @@ fn mixed_builds_select_an_exact_image_per_participant() {
         args.iter()
             .any(|argument| argument == "--allow-cleartext-isolated-relay")
             && !args.iter().any(|argument| argument == "--relay-proxy")
+    }));
+    assert!(launch.args_by_participant.values().all(|args| {
+        args.windows(2).any(|window| {
+            window
+                == [
+                    "--network".to_owned(),
+                    "marmot-campaign-test-resource-test-network".to_owned(),
+                ]
+        })
     }));
     assert!(launch.args_by_participant.values().all(|args| {
         args.windows(2).any(|window| {
@@ -508,6 +549,7 @@ fn slow_block_devices_require_a_capable_vm_backend() {
     assert_eq!(error.code, "vm_required_for_block_latency");
 
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
         driver: "/usr/local/bin/cgka-vm-campaign".into(),
         driver_args: vec![
             "campaign".into(),
@@ -518,13 +560,29 @@ fn slow_block_devices_require_a_capable_vm_backend() {
             "--output".into(),
             "{output_dir}".into(),
         ],
+        cleanup_args: vec![
+            "cleanup".into(),
+            "--manifest".into(),
+            "{manifest}".into(),
+            "--output".into(),
+            "{output_dir}".into(),
+        ],
         timeout_seconds: 7_200,
+        cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
     manifest.validate().unwrap();
     let plan = build_execution_plan(&manifest).unwrap();
     assert_eq!(plan.backend, "virtual_machine");
-    assert!(plan.vm_driver.unwrap().args.contains(&"2".into()));
+    assert!(plan.vm_driver.as_ref().unwrap().args.contains(&"2".into()));
+    assert_eq!(plan.cleanup.len(), 1);
+    assert_eq!(plan.cleanup[0].purpose, "cleanup_external_vm_campaign");
+    assert!(
+        plan.cleanup[0]
+            .args
+            .iter()
+            .any(|argument| argument.ends_with("normalized-manifest.json"))
+    );
 }
 
 #[test]
@@ -558,9 +616,12 @@ fn vm_faults_require_each_backend_capability_they_use() {
     ]);
     assert_eq!(manifest.required_vm_capabilities(), required);
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
         driver: "/tmp/driver".into(),
         driver_args: Vec::new(),
+        cleanup_args: vec!["cleanup".into(), "{manifest}".into()],
         timeout_seconds: 7_200,
+        cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::HostIsolation]),
     });
     assert_eq!(
@@ -579,9 +640,12 @@ fn vm_backend_is_rejected_when_containers_can_represent_the_campaign() {
     let (_root, mut manifest) = container_manifest();
     manifest.faults.clear();
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
         driver: "/tmp/driver".into(),
         driver_args: Vec::new(),
+        cleanup_args: vec!["cleanup".into(), "{manifest}".into()],
         timeout_seconds: 7_200,
+        cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::HostIsolation]),
     });
     let error = manifest.validate().unwrap_err();
@@ -599,11 +663,56 @@ fn vm_backend_requires_a_campaign_scale_timeout() {
         },
     }];
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
         driver: "/tmp/driver".into(),
         driver_args: Vec::new(),
+        cleanup_args: vec!["cleanup".into(), "{manifest}".into()],
         timeout_seconds: 0,
+        cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
     let error = manifest.validate().unwrap_err();
     assert_eq!(error.code, "vm_timeout");
+}
+
+#[test]
+fn vm_backend_requires_the_versioned_cleanup_contract() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![ScheduledFaultV1 {
+        at_barrier: "slow-disk".into(),
+        action: DistributedFaultV1::SlowBlockDevice {
+            participant: "alice".into(),
+            latency_ms: 50,
+        },
+    }];
+    manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "0".into(),
+        driver: "/tmp/driver".into(),
+        driver_args: Vec::new(),
+        cleanup_args: vec!["cleanup".into()],
+        timeout_seconds: 7_200,
+        cleanup_timeout_seconds: 300,
+        capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
+    });
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "vm_driver_contract_version"
+    );
+
+    {
+        let DistributedBackendV1::VirtualMachine(vm) = &mut manifest.backend else {
+            unreachable!();
+        };
+        vm.driver_contract_version = "1".into();
+        vm.cleanup_args.clear();
+    }
+    assert_eq!(manifest.validate().unwrap_err().code, "vm_cleanup_contract");
+    {
+        let DistributedBackendV1::VirtualMachine(vm) = &mut manifest.backend else {
+            unreachable!();
+        };
+        vm.cleanup_args.push("cleanup".into());
+        vm.cleanup_timeout_seconds = 0;
+    }
+    assert_eq!(manifest.validate().unwrap_err().code, "vm_cleanup_contract");
 }

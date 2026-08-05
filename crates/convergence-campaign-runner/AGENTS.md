@@ -25,6 +25,8 @@ rejecting public or loopback addresses.
 
 - Construct every external command as an argv array. Never accept shell
   fragments from manifests.
+- Include the runner-generated resource token in every container network and
+  relay name; cleanup must never target namespace-only shared names.
 - Apply fault mutations transactionally: on failure, attempt every applicable
   rollback, retain every receipt, and fail closed when compensation is
   incomplete.
@@ -38,6 +40,9 @@ rejecting public or loopback addresses.
 - Keep manifests and shareable evidence free of account ids, group ids,
   pubkeys, relay URLs, payloads, ciphertext, plaintext, credentials, and key
   material. Create artifacts through `fs-private`.
+- VM lifecycle contract v1 always runs its idempotent cleanup command under an
+  independent timeout after success, failure, or timeout and records the
+  result. Never treat killing only the immediate driver process as cleanup.
 
 ## Verification
 

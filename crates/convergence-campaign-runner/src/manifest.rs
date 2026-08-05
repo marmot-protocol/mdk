@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::RunnerError;
 
 pub const DISTRIBUTED_CAMPAIGN_MANIFEST_VERSION: &str = "1";
+pub const VM_DRIVER_CONTRACT_VERSION: &str = "1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedCampaignManifestV1 {
@@ -95,15 +96,23 @@ impl OciRuntimeV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualMachineBackendV1 {
+    /// Versioned lifecycle contract implemented by the external driver.
+    pub driver_contract_version: String,
     /// External VM harness. The MDK runner owns the manifest/evidence contract;
     /// provisioning remains in the dedicated multi-VM repository.
     pub driver: PathBuf,
     #[serde(default)]
     pub driver_args: Vec<String>,
+    /// Idempotent cancellation/cleanup invocation on the same driver. The
+    /// runner executes it after success, failure, or timeout.
+    pub cleanup_args: Vec<String>,
     /// Campaign-scale wall timeout for the synchronous external driver. This
     /// is deliberately distinct from the short infrastructure-command timeout
     /// used for setup and fault mutations.
     pub timeout_seconds: u64,
+    /// Independent bound for cleanup so a timed-out campaign cannot consume
+    /// the entire cleanup window.
+    pub cleanup_timeout_seconds: u64,
     pub capabilities: BTreeSet<VirtualMachineCapabilityV1>,
 }
 
@@ -309,6 +318,12 @@ impl DistributedCampaignManifestV1 {
                 }
             }
             DistributedBackendV1::VirtualMachine(vm) => {
+                if vm.driver_contract_version != VM_DRIVER_CONTRACT_VERSION {
+                    return Err(RunnerError::validation(
+                        "vm_driver_contract_version",
+                        "virtual-machine driver lifecycle contract version is unsupported",
+                    ));
+                }
                 if vm.driver.as_os_str().is_empty() {
                     return Err(RunnerError::validation(
                         "vm_driver",
@@ -319,6 +334,18 @@ impl DistributedCampaignManifestV1 {
                     return Err(RunnerError::validation(
                         "vm_timeout",
                         "virtual-machine campaign timeout must be nonzero",
+                    ));
+                }
+                if vm.cleanup_args.is_empty()
+                    || vm.cleanup_timeout_seconds == 0
+                    || !vm
+                        .cleanup_args
+                        .iter()
+                        .any(|argument| argument.contains("{manifest}"))
+                {
+                    return Err(RunnerError::validation(
+                        "vm_cleanup_contract",
+                        "virtual-machine drivers require idempotent cleanup argv targeting {manifest} and a nonzero cleanup timeout",
                     ));
                 }
                 let required = self.required_vm_capabilities();

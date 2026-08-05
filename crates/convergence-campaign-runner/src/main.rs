@@ -4,7 +4,7 @@ use std::process::{ExitCode, Stdio};
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
     DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, load_manifest,
-    run_manifest, verify_manifest_inputs,
+    run_manifest, validate_scenario_bytes, verify_manifest_inputs,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -49,12 +49,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Validate { manifest } => {
             let manifest = load_manifest(&manifest)?;
-            verify_manifest_inputs(&manifest)?;
+            let scenario = verify_manifest_inputs(&manifest)?;
+            validate_scenario_bytes(&manifest, &scenario)?;
             println!("valid {}", manifest.campaign_id);
         }
         Commands::Plan { manifest, output } => {
             let manifest = load_manifest(&manifest)?;
-            verify_manifest_inputs(&manifest)?;
+            let scenario = verify_manifest_inputs(&manifest)?;
+            validate_scenario_bytes(&manifest, &scenario)?;
             let bytes = serde_json::to_vec_pretty(&build_execution_plan(&manifest)?)?;
             if let Some(path) = output {
                 fs_private::write_private(&path, &bytes)?;
@@ -64,7 +66,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Doctor { manifest } => {
             let manifest = load_manifest(&manifest)?;
-            verify_manifest_inputs(&manifest)?;
+            let scenario = verify_manifest_inputs(&manifest)?;
+            validate_scenario_bytes(&manifest, &scenario)?;
             let program = match &manifest.backend {
                 DistributedBackendV1::Container(container) => {
                     PathBuf::from(container.runtime.executable())

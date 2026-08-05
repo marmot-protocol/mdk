@@ -52,11 +52,20 @@ fn default_success_codes() -> Vec<i32> {
 
 impl PlannedCommandV1 {
     fn exact(purpose: impl Into<String>, program: impl Into<String>, args: Vec<String>) -> Self {
+        Self::accepting(purpose, program, args, vec![0])
+    }
+
+    fn accepting(
+        purpose: impl Into<String>,
+        program: impl Into<String>,
+        args: Vec<String>,
+        success_exit_codes: Vec<i32>,
+    ) -> Self {
         Self {
             purpose: purpose.into(),
             program: program.into(),
             args,
-            success_exit_codes: vec![0],
+            success_exit_codes,
         }
     }
 
@@ -86,27 +95,34 @@ pub fn build_execution_plan(
             let scenario = utf8_path(&manifest.scenario.path, "scenario")?;
             let output_dir = utf8_path(&manifest.output_dir, "output_dir")?;
             let driver = utf8_path(&vm.driver, "vm_driver")?;
-            let args = vm
-                .driver_args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .replace("{manifest}", normalized_manifest)
-                        .replace("{scenario}", scenario)
-                        .replace("{output_dir}", output_dir)
-                        .replace(
-                            "{participant_count}",
-                            &manifest.participants.len().to_string(),
-                        )
-                })
-                .collect();
+            let render_args = |args: &[String]| {
+                args.iter()
+                    .map(|argument| {
+                        argument
+                            .replace("{manifest}", normalized_manifest)
+                            .replace("{scenario}", scenario)
+                            .replace("{output_dir}", output_dir)
+                            .replace("{campaign_id}", &manifest.campaign_id)
+                            .replace(
+                                "{participant_count}",
+                                &manifest.participants.len().to_string(),
+                            )
+                    })
+                    .collect()
+            };
+            let args = render_args(&vm.driver_args);
+            let cleanup_args = render_args(&vm.cleanup_args);
             Ok(DistributedExecutionPlanV1 {
                 schema_version: DISTRIBUTED_EXECUTION_PLAN_VERSION.into(),
                 campaign_id: manifest.campaign_id.clone(),
                 backend: "virtual_machine".into(),
                 setup: Vec::new(),
                 faults: BTreeMap::new(),
-                cleanup: Vec::new(),
+                cleanup: vec![PlannedCommandV1::exact(
+                    "cleanup_external_vm_campaign",
+                    driver,
+                    cleanup_args,
+                )],
                 vm_driver: Some(PlannedCommandV1::exact(
                     "run_external_vm_campaign",
                     driver,
@@ -122,8 +138,8 @@ fn container_plan(
     container: &ContainerBackendV1,
 ) -> Result<DistributedExecutionPlanV1, RunnerError> {
     let runtime = container.runtime.executable();
-    let network = format!("{}-network", container.namespace);
-    let relay = format!("{}-relay", container.namespace);
+    let network = format!("{}-{{resource_token}}-network", container.namespace);
+    let relay = format!("{}-{{resource_token}}-relay", container.namespace);
     let label = format!("io.marmot.convergence={}", manifest.campaign_id);
     let setup = vec![
         PlannedCommandV1::exact(
@@ -207,8 +223,20 @@ fn container_plan(
 
 pub fn container_node_launch(
     manifest: &DistributedCampaignManifestV1,
+    resource_token: &str,
 ) -> Result<ProcessNodeLaunchV1, RunnerError> {
     manifest.validate()?;
+    if resource_token.is_empty()
+        || resource_token.len() > 64
+        || !resource_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(RunnerError::validation(
+            "unsafe_resource_token",
+            "container resource token must use 1-64 alphanumeric or hyphen characters",
+        ));
+    }
     let DistributedBackendV1::Container(container) = &manifest.backend else {
         return Err(RunnerError::validation(
             "container_backend_required",
@@ -216,7 +244,7 @@ pub fn container_node_launch(
         ));
     };
     let runtime = container.runtime.executable();
-    let network = format!("{}-network", container.namespace);
+    let network = format!("{}-{resource_token}-network", container.namespace);
     let participant_user = participant_container_user()?;
     let mut args_by_participant = BTreeMap::new();
     for participant in &manifest.participants {
@@ -385,7 +413,7 @@ fn container_fault_commands(
             ],
         )],
         DistributedFaultV1::StopDatabaseContention { participant } => {
-            vec![PlannedCommandV1::idempotent(
+            vec![PlannedCommandV1::accepting(
                 "stop_database_contention",
                 runtime,
                 vec![
@@ -395,6 +423,7 @@ fn container_fault_commands(
                     "-x".into(),
                     "stress-ng".into(),
                 ],
+                vec![0, 1],
             )]
         }
         DistributedFaultV1::SlowBlockDevice { .. } => Vec::new(),

@@ -9,6 +9,7 @@ use cgka_conformance_simulator::process_orchestrator::{
 };
 use cgka_conformance_simulator::{ScenarioSpec, compile_scenario};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -21,6 +22,35 @@ use crate::{RunnerError, container_node_launch, verify_manifest_inputs};
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
 pub const INFRASTRUCTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct ContainerResourceLease {
+    _guard: tempfile::TempDir,
+    token: String,
+}
+
+impl ContainerResourceLease {
+    fn acquire() -> Result<Self, RunnerError> {
+        let guard = tempfile::Builder::new()
+            .prefix("marmot-campaign-resource-")
+            .tempdir()
+            .map_err(|error| RunnerError::environment("container_resource_token", error))?;
+        let name = guard
+            .path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                RunnerError::validation(
+                    "container_resource_token",
+                    "container resource lease has no UTF-8 name",
+                )
+            })?;
+        let digest = Sha256::digest(name.as_bytes());
+        Ok(Self {
+            _guard: guard,
+            token: format!("run-{}", hex::encode(&digest[..16])),
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedRunReceiptV1 {
@@ -47,9 +77,7 @@ pub async fn run_manifest(
 ) -> Result<DistributedRunReceiptV1, RunnerError> {
     let scenario_bytes = verify_manifest_inputs(manifest)?;
     let plan = build_execution_plan(manifest)?;
-    let scenario: ScenarioSpec = serde_json::from_slice(&scenario_bytes)
-        .map_err(|error| RunnerError::environment("scenario_parse", error))?;
-    validate_scenario_binding(manifest, &scenario)?;
+    let scenario = validate_scenario_bytes(manifest, &scenario_bytes)?;
     fs_private::create_dir_all_private(&manifest.output_dir)
         .map_err(|error| RunnerError::environment("output_directory", error))?;
     fs_private::write_private(
@@ -62,6 +90,18 @@ pub async fn run_manifest(
         DistributedBackendV1::Container(_) => run_container(manifest, &plan, &scenario).await,
         DistributedBackendV1::VirtualMachine(_) => run_vm(manifest, &plan).await,
     }
+}
+
+/// Parse the pinned canonical scenario and run all cross-manifest scheduling
+/// checks used by both CLI validation and execution.
+pub fn validate_scenario_bytes(
+    manifest: &DistributedCampaignManifestV1,
+    scenario_bytes: &[u8],
+) -> Result<ScenarioSpec, RunnerError> {
+    let scenario: ScenarioSpec = serde_json::from_slice(scenario_bytes)
+        .map_err(|error| RunnerError::environment("scenario_parse", error))?;
+    validate_scenario_binding(manifest, &scenario)?;
+    Ok(scenario)
 }
 
 fn validate_scenario_binding(
@@ -138,10 +178,20 @@ fn validate_partition_restart_order(
     for fault in faults {
         match &fault.action {
             crate::DistributedFaultV1::NetworkPartition { participant, peer } => {
-                active.insert((participant.clone(), fault_peer_key(peer)));
+                if !active.insert((participant.clone(), fault_peer_key(peer))) {
+                    return Err(RunnerError::validation(
+                        "duplicate_network_partition",
+                        "a participant/peer partition cannot be applied again before it is healed",
+                    ));
+                }
             }
             crate::DistributedFaultV1::NetworkHeal { participant, peer } => {
-                active.remove(&(participant.clone(), fault_peer_key(peer)));
+                if !active.remove(&(participant.clone(), fault_peer_key(peer))) {
+                    return Err(RunnerError::validation(
+                        "unmatched_network_heal",
+                        "a network heal requires a preceding active partition for the same participant and peer",
+                    ));
+                }
             }
             crate::DistributedFaultV1::CrashParticipantHost { participant }
                 if active.iter().any(|(subject, peer)| {
@@ -171,16 +221,33 @@ async fn run_container(
     plan: &DistributedExecutionPlanV1,
     scenario: &ScenarioSpec,
 ) -> Result<DistributedRunReceiptV1, RunnerError> {
+    let resource_lease = ContainerResourceLease::acquire()?;
+    let resource_token = resource_lease.token.as_str();
     let mut receipts = Vec::new();
     let mut cleanup_failures = Vec::new();
     for command in &plan.setup {
-        match execute(command, CommandContext::default()).await {
+        match execute(
+            command,
+            CommandContext {
+                resource_token: Some(resource_token),
+                ..Default::default()
+            },
+        )
+        .await
+        {
             Ok(receipt) => receipts.push(receipt),
             Err(failure) => {
                 if let Some(receipt) = failure.receipt {
                     receipts.push(receipt);
                 }
-                cleanup(plan, None, &mut receipts, &mut cleanup_failures).await;
+                cleanup(
+                    plan,
+                    resource_token,
+                    None,
+                    &mut receipts,
+                    &mut cleanup_failures,
+                )
+                .await;
                 let receipt = DistributedRunReceiptV1 {
                     schema_version: DISTRIBUTED_RUN_RECEIPT_VERSION.into(),
                     campaign_id: manifest.campaign_id.clone(),
@@ -196,7 +263,8 @@ async fn run_container(
         }
     }
 
-    let result = run_container_scenario(manifest, plan, scenario, &mut receipts).await;
+    let result =
+        run_container_scenario(manifest, plan, scenario, resource_token, &mut receipts).await;
     let run_token = match &result {
         Ok(result) => Some(result.run_token.as_str()),
         Err(failure) => failure.run_token.as_deref(),
@@ -204,7 +272,14 @@ async fn run_container(
     if let Some(run_token) = run_token {
         cleanup_participants(manifest, run_token, &mut receipts, &mut cleanup_failures).await;
     }
-    cleanup(plan, run_token, &mut receipts, &mut cleanup_failures).await;
+    cleanup(
+        plan,
+        resource_token,
+        run_token,
+        &mut receipts,
+        &mut cleanup_failures,
+    )
+    .await;
 
     let process_report = if let Ok(result) = &result {
         let path = manifest.output_dir.join("process-report.json");
@@ -257,13 +332,15 @@ async fn run_container_scenario(
     manifest: &DistributedCampaignManifestV1,
     plan: &DistributedExecutionPlanV1,
     scenario: &ScenarioSpec,
+    resource_token: &str,
     receipts: &mut Vec<CommandReceiptV1>,
 ) -> Result<ContainerScenarioResult, ContainerScenarioFailure> {
-    let node_launch =
-        container_node_launch(manifest).map_err(|error| ContainerScenarioFailure {
+    let node_launch = container_node_launch(manifest, resource_token).map_err(|error| {
+        ContainerScenarioFailure {
             error,
             run_token: None,
-        })?;
+        }
+    })?;
     let scenario = lower_container_host_faults(manifest, scenario).map_err(|error| {
         ContainerScenarioFailure {
             error,
@@ -309,6 +386,7 @@ async fn run_container_scenario(
     let host_run_root = orchestrator.run_root().to_path_buf();
     let mut hook = ContainerFaultHook {
         faults: plan.faults.clone(),
+        resource_token: resource_token.to_owned(),
         run_token: run_token.clone(),
         host_run_root,
         receipts,
@@ -378,6 +456,7 @@ fn lower_container_host_faults(
 
 struct ContainerFaultHook<'a> {
     faults: BTreeMap<String, Vec<PlannedFaultV1>>,
+    resource_token: String,
     run_token: String,
     host_run_root: PathBuf,
     receipts: &'a mut Vec<CommandReceiptV1>,
@@ -422,6 +501,7 @@ impl ContainerFaultHook<'_> {
         match execute(
             command,
             CommandContext {
+                resource_token: Some(&self.resource_token),
                 run_token: Some(&self.run_token),
                 host_run_root: Some(&self.host_run_root),
             },
@@ -461,8 +541,10 @@ async fn run_vm(
     let command = plan.vm_driver.as_ref().ok_or_else(|| {
         RunnerError::validation("vm_plan", "VM plan is missing its external driver")
     })?;
-    let timeout_seconds = match &manifest.backend {
-        DistributedBackendV1::VirtualMachine(vm) => vm.timeout_seconds,
+    let (timeout_seconds, cleanup_timeout_seconds) = match &manifest.backend {
+        DistributedBackendV1::VirtualMachine(vm) => {
+            (vm.timeout_seconds, vm.cleanup_timeout_seconds)
+        }
         DistributedBackendV1::Container(_) => {
             return Err(RunnerError::validation(
                 "vm_backend",
@@ -470,26 +552,57 @@ async fn run_vm(
             ));
         }
     };
+    if plan.cleanup.is_empty() {
+        return Err(RunnerError::validation(
+            "vm_cleanup_plan",
+            "VM plan is missing its required cleanup command",
+        ));
+    }
     let executed = execute_with_timeout(
         command,
         CommandContext::default(),
         Duration::from_secs(timeout_seconds),
     )
     .await;
-    let (command_receipts, error) = match executed {
+    let (mut command_receipts, error) = match executed {
         Ok(receipt) => (vec![receipt], None),
         Err(failure) => (failure.receipt.into_iter().collect(), Some(failure.error)),
     };
+    let mut cleanup_failures = Vec::new();
+    for cleanup in &plan.cleanup {
+        match execute_with_timeout(
+            cleanup,
+            CommandContext::default(),
+            Duration::from_secs(cleanup_timeout_seconds),
+        )
+        .await
+        {
+            Ok(receipt) => command_receipts.push(receipt),
+            Err(failure) => {
+                if let Some(receipt) = failure.receipt {
+                    command_receipts.push(receipt);
+                }
+                cleanup_failures.push(failure.error.code);
+            }
+        }
+    }
+    let completed = error.is_none() && cleanup_failures.is_empty();
     let receipt = DistributedRunReceiptV1 {
         schema_version: DISTRIBUTED_RUN_RECEIPT_VERSION.into(),
         campaign_id: manifest.campaign_id.clone(),
         backend: "virtual_machine".into(),
         command_receipts,
         process_report: None,
-        cleanup_failures: Vec::new(),
-        completed: error.is_none(),
+        cleanup_failures,
+        completed,
     };
     write_receipt(manifest, &receipt)?;
+    if !receipt.cleanup_failures.is_empty() {
+        return Err(RunnerError::validation(
+            "vm_cleanup_failed",
+            "virtual-machine cleanup did not complete successfully",
+        ));
+    }
     if let Some(error) = error {
         return Err(error);
     }
@@ -530,6 +643,7 @@ async fn cleanup_participants(
 
 async fn cleanup(
     plan: &DistributedExecutionPlanV1,
+    resource_token: &str,
     run_token: Option<&str>,
     receipts: &mut Vec<CommandReceiptV1>,
     failures: &mut Vec<String>,
@@ -538,6 +652,7 @@ async fn cleanup(
         match execute(
             command,
             CommandContext {
+                resource_token: Some(resource_token),
                 run_token,
                 host_run_root: None,
             },
@@ -557,10 +672,12 @@ async fn cleanup(
 
 #[derive(Clone, Copy, Default)]
 struct CommandContext<'a> {
+    resource_token: Option<&'a str>,
     run_token: Option<&'a str>,
     host_run_root: Option<&'a Path>,
 }
 
+#[derive(Debug)]
 struct CommandFailure {
     error: RunnerError,
     receipt: Option<CommandReceiptV1>,
@@ -573,14 +690,23 @@ async fn execute(
     execute_with_timeout(command, context, INFRASTRUCTURE_COMMAND_TIMEOUT).await
 }
 
-async fn execute_with_timeout(
+fn render_command_args(
     command: &PlannedCommandV1,
     context: CommandContext<'_>,
-    command_timeout: Duration,
-) -> Result<CommandReceiptV1, CommandFailure> {
+) -> Result<Vec<String>, CommandFailure> {
     let mut args = Vec::with_capacity(command.args.len());
     for argument in &command.args {
         let mut rendered = argument.clone();
+        if rendered.contains("{resource_token}") {
+            let token = context.resource_token.ok_or_else(|| CommandFailure {
+                error: RunnerError::validation(
+                    "missing_resource_token",
+                    format!("{} requires an unavailable resource token", command.purpose),
+                ),
+                receipt: None,
+            })?;
+            rendered = rendered.replace("{resource_token}", token);
+        }
         if rendered.contains("{run_token}") {
             let token = context.run_token.ok_or_else(|| CommandFailure {
                 error: RunnerError::validation(
@@ -610,6 +736,15 @@ async fn execute_with_timeout(
         }
         args.push(rendered);
     }
+    Ok(args)
+}
+
+async fn execute_with_timeout(
+    command: &PlannedCommandV1,
+    context: CommandContext<'_>,
+    command_timeout: Duration,
+) -> Result<CommandReceiptV1, CommandFailure> {
+    let args = render_command_args(command, context)?;
     let mut child = Command::new(&command.program);
     child
         .args(args)
@@ -621,7 +756,11 @@ async fn execute_with_timeout(
         .await
         .map_err(|_| CommandFailure {
             error: RunnerError::validation("command_timeout", &command.purpose),
-            receipt: None,
+            receipt: Some(CommandReceiptV1 {
+                purpose: command.purpose.clone(),
+                exit_code: None,
+                accepted: false,
+            }),
         })?
         .map_err(|error| CommandFailure {
             error: RunnerError::environment("command_spawn", error),
@@ -703,6 +842,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concurrent_container_leases_render_disjoint_resource_names() {
+        let first = ContainerResourceLease::acquire().unwrap();
+        let second = ContainerResourceLease::acquire().unwrap();
+        assert_ne!(first.token, second.token);
+        let command = planned(
+            "resource_name",
+            "unused",
+            vec!["campaign-{resource_token}-network".into()],
+        );
+        let first_args = render_command_args(
+            &command,
+            CommandContext {
+                resource_token: Some(&first.token),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second_args = render_command_args(
+            &command,
+            CommandContext {
+                resource_token: Some(&second.token),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(first_args, second_args);
+    }
+
     #[tokio::test]
     async fn missing_run_token_fails_before_spawning_a_command() {
         let command = planned(
@@ -733,6 +901,7 @@ mod tests {
                     rollbacks: vec![planned("restore_prior_state", "true", Vec::new())],
                 }],
             )]),
+            resource_token: "resource-test".into(),
             run_token: "test-run".into(),
             host_run_root: root.path().into(),
             receipts: &mut receipts,
@@ -769,6 +938,7 @@ mod tests {
                     ],
                 }],
             )]),
+            resource_token: "resource-test".into(),
             run_token: "test-run".into(),
             host_run_root: root.path().into(),
             receipts: &mut receipts,
@@ -814,6 +984,7 @@ mod tests {
                     },
                 ],
             )]),
+            resource_token: "resource-test".into(),
             run_token: "test-run".into(),
             host_run_root: root.path().into(),
             receipts: &mut receipts,
@@ -841,9 +1012,12 @@ mod tests {
         let manifest = manifest(
             root.path(),
             DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+                driver_contract_version: "1".into(),
                 driver: "false".into(),
                 driver_args: Vec::new(),
+                cleanup_args: vec!["cleanup".into()],
                 timeout_seconds: 5,
+                cleanup_timeout_seconds: 5,
                 capabilities: BTreeSet::new(),
             }),
         );
@@ -854,7 +1028,7 @@ mod tests {
             backend: "virtual_machine".into(),
             setup: Vec::new(),
             faults: BTreeMap::new(),
-            cleanup: Vec::new(),
+            cleanup: vec![planned("cleanup_vm_driver", "true", Vec::new())],
             vm_driver: Some(planned("failing_vm_driver", "false", Vec::new())),
         };
         let error = run_vm(&manifest, &plan).await.unwrap_err();
@@ -863,8 +1037,85 @@ mod tests {
             serde_json::from_slice(&std::fs::read(receipt_path(&manifest.output_dir)).unwrap())
                 .unwrap();
         assert!(!receipt.completed);
-        assert_eq!(receipt.command_receipts.len(), 1);
+        assert_eq!(receipt.command_receipts.len(), 2);
         assert!(!receipt.command_receipts[0].accepted);
+        assert!(receipt.command_receipts[1].accepted);
+        assert!(receipt.cleanup_failures.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_vm_driver_runs_and_records_bounded_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = manifest(
+            root.path(),
+            DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+                driver_contract_version: "1".into(),
+                driver: "sleep".into(),
+                driver_args: vec!["5".into()],
+                cleanup_args: vec!["cleanup".into()],
+                timeout_seconds: 1,
+                cleanup_timeout_seconds: 5,
+                capabilities: BTreeSet::new(),
+            }),
+        );
+        fs_private::create_dir_all_private(&manifest.output_dir).unwrap();
+        let plan = DistributedExecutionPlanV1 {
+            schema_version: "1".into(),
+            campaign_id: manifest.campaign_id.clone(),
+            backend: "virtual_machine".into(),
+            setup: Vec::new(),
+            faults: BTreeMap::new(),
+            cleanup: vec![planned("cleanup_vm_driver", "true", Vec::new())],
+            vm_driver: Some(planned("timed_vm_driver", "sleep", vec!["5".into()])),
+        };
+        let error = run_vm(&manifest, &plan).await.unwrap_err();
+        assert_eq!(error.code, "command_timeout");
+        let receipt: DistributedRunReceiptV1 =
+            serde_json::from_slice(&std::fs::read(receipt_path(&manifest.output_dir)).unwrap())
+                .unwrap();
+        assert!(!receipt.completed);
+        assert_eq!(receipt.command_receipts.len(), 2);
+        assert_eq!(receipt.command_receipts[0].exit_code, None);
+        assert!(!receipt.command_receipts[0].accepted);
+        assert!(receipt.command_receipts[1].accepted);
+        assert!(receipt.cleanup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_vm_cleanup_is_recorded_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = manifest(
+            root.path(),
+            DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+                driver_contract_version: "1".into(),
+                driver: "true".into(),
+                driver_args: Vec::new(),
+                cleanup_args: vec!["cleanup".into()],
+                timeout_seconds: 5,
+                cleanup_timeout_seconds: 5,
+                capabilities: BTreeSet::new(),
+            }),
+        );
+        fs_private::create_dir_all_private(&manifest.output_dir).unwrap();
+        let plan = DistributedExecutionPlanV1 {
+            schema_version: "1".into(),
+            campaign_id: manifest.campaign_id.clone(),
+            backend: "virtual_machine".into(),
+            setup: Vec::new(),
+            faults: BTreeMap::new(),
+            cleanup: vec![planned("cleanup_vm_driver", "false", Vec::new())],
+            vm_driver: Some(planned("successful_vm_driver", "true", Vec::new())),
+        };
+        let error = run_vm(&manifest, &plan).await.unwrap_err();
+        assert_eq!(error.code, "vm_cleanup_failed");
+        let receipt: DistributedRunReceiptV1 =
+            serde_json::from_slice(&std::fs::read(receipt_path(&manifest.output_dir)).unwrap())
+                .unwrap();
+        assert!(!receipt.completed);
+        assert_eq!(receipt.cleanup_failures, ["command_failed"]);
+        assert!(receipt.command_receipts[0].accepted);
+        assert!(!receipt.command_receipts[1].accepted);
     }
 
     #[tokio::test]
@@ -1076,5 +1327,86 @@ mod tests {
             .collect();
         let error = validate_scenario_binding(&manifest, &scenario).unwrap_err();
         assert_eq!(error.code, "duplicate_scenario_barrier");
+    }
+
+    #[test]
+    fn container_binding_rejects_unmatched_network_heal() {
+        let root = tempfile::tempdir().unwrap();
+        let scenario = ScenarioSpec {
+            name: "unmatched-heal".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: Default::default(),
+            steps: vec![cgka_conformance_simulator::ScenarioStep::Barrier {
+                name: "heal".into(),
+            }],
+        };
+        let mut manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "unmatched-heal".into(),
+                allow_mutable_image_references: true,
+                allow_cleartext_isolated_relay: true,
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        manifest.faults = vec![ScheduledFaultV1 {
+            at_barrier: "heal".into(),
+            action: DistributedFaultV1::NetworkHeal {
+                participant: "alice".into(),
+                peer: crate::FaultPeerV1::Relay,
+            },
+        }];
+        let scenario_bytes = serde_json::to_vec(&scenario).unwrap();
+        let error = validate_scenario_bytes(&manifest, &scenario_bytes).unwrap_err();
+        assert_eq!(error.code, "unmatched_network_heal");
+    }
+
+    #[test]
+    fn container_binding_rejects_duplicate_active_partition() {
+        let root = tempfile::tempdir().unwrap();
+        let scenario = ScenarioSpec {
+            name: "duplicate-partition".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into()],
+            topology: Default::default(),
+            steps: vec![
+                cgka_conformance_simulator::ScenarioStep::Barrier {
+                    name: "partition-one".into(),
+                },
+                cgka_conformance_simulator::ScenarioStep::Barrier {
+                    name: "partition-two".into(),
+                },
+            ],
+        };
+        let mut manifest = manifest(
+            root.path(),
+            DistributedBackendV1::Container(ContainerBackendV1 {
+                runtime: OciRuntimeV1::Docker,
+                namespace: "duplicate-partition".into(),
+                allow_mutable_image_references: true,
+                allow_cleartext_isolated_relay: true,
+                default_participant_image: "unused".into(),
+                relay_image: "unused".into(),
+                relay_command: vec!["unused".into()],
+                node_command: vec!["unused".into()],
+            }),
+        );
+        manifest.faults = ["partition-one", "partition-two"]
+            .into_iter()
+            .map(|at_barrier| ScheduledFaultV1 {
+                at_barrier: at_barrier.into(),
+                action: DistributedFaultV1::NetworkPartition {
+                    participant: "alice".into(),
+                    peer: crate::FaultPeerV1::Relay,
+                },
+            })
+            .collect();
+        let error = validate_scenario_binding(&manifest, &scenario).unwrap_err();
+        assert_eq!(error.code, "duplicate_network_partition");
     }
 }

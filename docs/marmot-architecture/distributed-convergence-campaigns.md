@@ -22,6 +22,10 @@ shell fragments. Because container participants communicate through the relay ra
 participant-to-participant partition selectors are rejected instead of recording a vacuous fault; use the VM backend
 when direct peer-network isolation is part of the scenario.
 
+Each container invocation acquires a unique runtime resource token. Network and relay names combine the operator
+namespace with that token; setup failure and cleanup therefore cannot address a concurrent campaign's resources even
+when both manifests select the same namespace. Participant process names retain their separate process-run token.
+
 The image's test relay and loopback proxy live in the campaign-runner crate. A container manifest must record
 `allow_cleartext_isolated_relay: true` as explicit operator approval before the runner enables the cleartext test hop.
 The proxy binds only to loopback and has no configurable upstream: it can dial only the fixed
@@ -35,6 +39,13 @@ unless the campaign requests behavior that the container backend cannot faithful
 latency. Driver capability declarations make the reason for escalation reviewable. Provisioning belongs in the
 dedicated multi-VM harness rather than this repository.
 
+VM driver lifecycle contract v1 contains two argv-only invocations on the same driver: the campaign action and an
+idempotent cancellation/cleanup action. The runner executes cleanup after success, failure, or campaign timeout under
+its own nonzero timeout, records its receipt, and fails closed if cleanup does not complete. The external driver owns
+termination of descendants and cleanup of infrastructure created through local or remote APIs; killing the immediate
+driver child is not considered sufficient cleanup. Cleanup argv must contain `{manifest}`, which resolves to the
+normalized manifest so the driver targets the exact versioned ownership record rather than global infrastructure.
+
 ## Reproducibility and artifacts
 
 Every manifest contains:
@@ -47,6 +58,7 @@ Every manifest contains:
 - an operator-selected private output directory.
 
 `validate` checks the manifest, participant-to-scenario binding, digest, fault parameters, and backend suitability.
+It also rejects a heal without a matching active partition and a duplicate partition that has not first been healed.
 `plan` emits the exact normalized command plan without running it. `run` first writes the normalized manifest with
 owner-only permissions, then writes the process report and distributed run receipt. Container cleanup is attempted on
 both success and failure and cleanup failures remain visible in the receipt.

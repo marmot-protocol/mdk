@@ -27,6 +27,16 @@ isolated OCI network; it resolves and pins that authorized alias and rejects
 addresses outside an RFC 1918 or IPv6 unique-local network. This exception is
 never a general-purpose or production relay dial path.
 
+Every container invocation acquires a unique resource lease. Relay and network
+names include that unguessable run component, so setup failure and cleanup can
+never target a concurrent campaign that chose the same operator namespace.
+
+VM drivers implement lifecycle contract v1: the manifest supplies ordinary run
+argv plus separate idempotent cleanup argv and a cleanup timeout. The runner
+invokes cleanup after success, failure, or timeout and records both its command
+receipt and any cleanup failure. Cleanup argv must include `{manifest}` so the
+driver receives the normalized, versioned ownership record for the exact run.
+
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
 
