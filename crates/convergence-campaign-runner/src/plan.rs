@@ -266,7 +266,14 @@ fn container_fault_commands(
         DistributedFaultV1::NetworkHeal { participant, peer } => {
             let container = participant_container(participant);
             let peer = peer_container(peer, relay);
-            network_heal_commands(runtime, fault_injector_image, container, participant, peer)
+            network_heal_commands(
+                runtime,
+                fault_injector_image,
+                container,
+                participant,
+                peer,
+                false,
+            )
         }
         DistributedFaultV1::NetworkShape {
             participant,
@@ -397,6 +404,7 @@ fn container_fault_rollback_commands(
             participant_container(participant),
             participant,
             peer_container(peer, relay),
+            true,
         ),
         DistributedFaultV1::NetworkHeal { participant, peer } => network_partition_commands(
             runtime,
@@ -618,9 +626,11 @@ fn network_heal_commands(
     container: String,
     participant: &str,
     peer: String,
+    allow_absence: bool,
 ) -> Vec<PlannedCommandV1> {
     let chain = partition_chain(participant, &peer);
     let peer_set = partition_set(participant, &peer);
+    let mutation_success_codes = if allow_absence { vec![0, 1] } else { vec![0] };
     vec![
         network_exec_accepting(
             runtime,
@@ -634,7 +644,7 @@ fn network_heal_commands(
                 "-j".into(),
                 chain.clone(),
             ],
-            vec![0, 1],
+            mutation_success_codes.clone(),
         ),
         network_exec_accepting(
             runtime,
@@ -648,7 +658,7 @@ fn network_heal_commands(
                 "-j".into(),
                 chain.clone(),
             ],
-            vec![0, 1],
+            mutation_success_codes.clone(),
         ),
         network_exec_accepting(
             runtime,
@@ -684,7 +694,7 @@ fn network_heal_commands(
             container.clone(),
             "flush_network_partition_chain",
             vec!["iptables".into(), "-F".into(), chain.clone()],
-            vec![0, 1],
+            mutation_success_codes.clone(),
         ),
         network_exec_accepting(
             runtime,
@@ -692,7 +702,7 @@ fn network_heal_commands(
             container.clone(),
             "remove_network_partition_chain",
             vec!["iptables".into(), "-X".into(), chain.clone()],
-            vec![0, 1],
+            mutation_success_codes.clone(),
         ),
         network_exec_accepting(
             runtime,
@@ -708,7 +718,7 @@ fn network_heal_commands(
             container.clone(),
             "remove_network_partition_peer_set",
             vec!["ipset".into(), "destroy".into(), peer_set.clone()],
-            vec![0, 1],
+            mutation_success_codes,
         ),
         network_exec_accepting(
             runtime,
