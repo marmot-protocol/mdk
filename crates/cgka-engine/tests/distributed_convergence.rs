@@ -3674,10 +3674,13 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         "send must report Unrecoverable; got {send_err:?}"
     );
 
-    // The durable-retention path observes the same terminal boundary. States
-    // that merely await a publish outcome retain an app message and release it
-    // later; a halted group owes no outcome, so retaining here would promise a
-    // delivery nothing can ever make.
+    // The durable-retention path observes the same terminal boundary: a halted
+    // group accepts no *new* work. That is a narrower claim than it looks —
+    // intents accepted before the halt are held for the one legal exit and are
+    // delivered after a verified repair, which
+    // `intent_retained_before_a_halt_is_delivered_after_a_verified_repair`
+    // pins. Refusing here keeps the queue to work the engine accepted while it
+    // still had a live epoch to accept it against.
     let queue_err = restarted
         .queue_app_message(
             group_id.clone(),

@@ -222,6 +222,11 @@ pub enum EpochState {
         epoch: EpochId,
     },
     PendingPublish(PendingPublish),
+    /// A confirmed publication whose Commit has not been merged into local MLS
+    /// state yet. Never stored or observable in practice:
+    /// `EpochManager::confirm_publish` builds it and consumes it in the same
+    /// expression, so no gate ever sees a group in this state. It exists so the
+    /// two halves of resolving a publication stay distinct transitions.
     Merging(Merging),
     Recovering(Recovering),
     /// The client cannot safely select a branch from its retained local
@@ -266,27 +271,35 @@ impl EpochState {
         matches!(self, EpochState::Stable { .. } | EpochState::Recovering(_))
     }
 
-    /// Whether this state is a step whose exit is already owed by another
-    /// party: `PendingPublish` awaits a publish outcome, `Merging` awaits its
-    /// merge, and `Recovering` awaits a convergence decision.
+    /// Whether this state is a transient step in resolving a publication this
+    /// client staged: `PendingPublish` awaits the transport outcome, `Merging`
+    /// awaits the local merge that outcome authorizes. Neither exit is
+    /// something the sender controls, and both can take minutes when relays
+    /// misbehave. This is the boundary outbound application work is retained
+    /// across — see `CgkaEngine::send`.
     ///
-    /// `Stable` awaits nothing, and `Unrecoverable` / `Disbanded` are terminal:
-    /// no outcome is owed, so work held for them would be held forever. This is
-    /// the boundary outbound application work is retained across — see
-    /// `CgkaEngine::send`.
-    pub fn is_awaiting_resolution(&self) -> bool {
-        matches!(
-            self,
-            EpochState::PendingPublish(_) | EpochState::Merging(_) | EpochState::Recovering(_)
-        )
+    /// `Recovering` is deliberately outside this predicate even though it, too,
+    /// awaits an exit. Its exit is a convergence decision over remote branches
+    /// rather than a publication this client staged, and it may settle into a
+    /// terminal state instead of `Stable`. Retaining application work across it
+    /// is a separate lifecycle question (mdk#1177 scoped this boundary to a
+    /// stalled local publication), so a send while `Recovering` keeps reporting
+    /// the illegal transition it always has.
+    pub fn is_resolving_local_publish(&self) -> bool {
+        matches!(self, EpochState::PendingPublish(_) | EpochState::Merging(_))
     }
 
-    /// Whether this state is terminal — the exact complement of `Stable` plus
-    /// [`Self::is_awaiting_resolution`].
+    /// Whether this state is terminal: `Unrecoverable` needs a verified repair
+    /// path and `Disbanded` has no legal exit at all, so neither resolves on its
+    /// own.
     ///
-    /// `Unrecoverable` needs a verified repair path and `Disbanded` has no legal
-    /// exit at all, so neither will resolve on its own. Deliverable work may not
-    /// be held for a terminal group.
+    /// Terminal means *no new work is accepted*, not that accepted work is
+    /// discarded. Intents retained before the halt persist for the one legal
+    /// exit — a verified repair returns an `Unrecoverable` group to `Stable`,
+    /// and because retention stores the intent rather than ciphertext, the drain
+    /// re-prepares them under the post-repair epoch (mdk#1106). `Disbanded` is
+    /// the exception, and only because its Commit purges the queue in the same
+    /// transaction that writes the tombstone.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -627,13 +640,12 @@ mod tests {
     }
 
     #[test]
-    fn only_states_owed_an_outcome_await_resolution() {
+    fn only_a_locally_staged_publish_retains_outbound_work() {
         // The engine retains outbound application work across exactly the
-        // states that are owed an outcome by someone else, so this split has to
+        // states a publication it staged passes through, so this split has to
         // stay a deliberate decision rather than something a new variant joins
-        // by accident. `Stable` is owed nothing because it needs nothing, and
-        // holding work for a terminal group would promise a delivery that never
-        // happens.
+        // by accident. `Stable` needs no retention, and a terminal state accepts
+        // no new work at all.
         let pending = EpochState::stable(EpochId(1))
             .begin_pending(EpochId(2), handle(), pref())
             .unwrap();
@@ -641,30 +653,46 @@ mod tests {
             (EpochState::stable(EpochId(1)), false),
             (pending.clone(), true),
             (pending.confirm_publish().unwrap(), true),
-            (EpochState::stable(EpochId(1)).detect_fork(vec![]), true),
+            (EpochState::stable(EpochId(1)).detect_fork(vec![]), false),
             (EpochState::stable(EpochId(1)).to_unrecoverable(), false),
             (EpochState::disbanded(EpochId(1)), false),
         ];
 
-        for (state, awaits_an_outcome) in cases {
+        for (state, retains_outbound_work) in cases {
             assert_eq!(
-                state.is_awaiting_resolution(),
-                awaits_an_outcome,
+                state.is_resolving_local_publish(),
+                retains_outbound_work,
                 "{} is misclassified",
                 state.name()
             );
-            // Stable / awaiting / terminal must partition the machine, so a
-            // caller may reason with any one of them and get the same answer.
-            assert_eq!(
-                [state.is_stable(), awaits_an_outcome, state.is_terminal()]
-                    .iter()
-                    .filter(|holds| **holds)
-                    .count(),
-                1,
-                "{} must be exactly one of stable / awaiting / terminal",
+            // The three classifications never overlap, so a caller may reason
+            // with any one of them without consulting the others.
+            assert!(
+                [
+                    state.is_stable(),
+                    retains_outbound_work,
+                    state.is_terminal()
+                ]
+                .iter()
+                .filter(|holds| **holds)
+                .count()
+                    <= 1,
+                "{} must not be more than one of stable / resolving a publish / terminal",
                 state.name()
             );
         }
+
+        // They do not partition the machine either: `Recovering` is the one
+        // state in none of the three buckets. That is the carve-out above, and
+        // a future variant landing here needs its own deliberate answer rather
+        // than inheriting one from a negation.
+        let recovering = EpochState::stable(EpochId(1)).detect_fork(vec![]);
+        assert!(
+            !recovering.is_stable()
+                && !recovering.is_resolving_local_publish()
+                && !recovering.is_terminal(),
+            "Recovering must stay unclassified; classifying it is a policy change"
+        );
     }
 
     #[test]

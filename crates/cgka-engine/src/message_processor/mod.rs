@@ -320,14 +320,25 @@ impl<S: StorageProvider> Engine<S> {
             payload,
         };
         self.validate_send_acceptance(&intent)?;
+        // Same retention boundary as `send`: a publication this client staged
+        // holds the payload, every other non-`Stable` state refuses it.
+        //
+        // For the two terminal states this is defense in depth —
+        // `validate_send_acceptance` above already refused them, `Unrecoverable`
+        // through the durable halt sync (which consults the in-memory map first)
+        // and `Disbanded` through the write-once tombstone written in the same
+        // transaction that purges the queue. Re-checking the epoch state catches
+        // a divergence between it and those durable markers rather than trusting
+        // one of the two.
         if let Some(state) = self.epoch_manager.state(&group_id)
-            && state.is_terminal()
+            && !state.is_stable()
+            && !state.is_resolving_local_publish()
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: state.name(),
                     to: "queue_app_message",
-                    reason: "queue_app_message requires a non-terminal group state",
+                    reason: "queue_app_message requires Stable or an unresolved local publish",
                 },
             ));
         }
@@ -585,8 +596,8 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(state) = self.epoch_manager.state(group_id)
             && !state.is_stable()
         {
-            // A state awaiting resolution owes its exit to a publish outcome, a
-            // merge, or a convergence decision — all of which can take minutes
+            // A publication this client staged owes its exit to a transport
+            // outcome and then a local merge, both of which can take minutes
             // when relays misbehave. Retain application payloads across that
             // window so a stalled group operation cannot make a user's message
             // vanish; the drain re-prepares them from whatever canonical state
@@ -595,10 +606,10 @@ impl<S: StorageProvider> Engine<S> {
             // Group-state intents keep the strict `Stable` requirement: a
             // second staged evolution has no epoch to apply to, and the
             // per-intent guards in `do_send_ready` report that as the illegal
-            // transition it is. Terminal states retain nothing.
-            return Ok(
-                matches!(intent, SendIntent::AppMessage { .. }) && state.is_awaiting_resolution()
-            );
+            // transition it is. `Recovering` and the terminal states retain
+            // nothing — see `EpochState::is_resolving_local_publish`.
+            return Ok(matches!(intent, SendIntent::AppMessage { .. })
+                && state.is_resolving_local_publish());
         }
 
         let now_ms = self.convergence_now_ms();

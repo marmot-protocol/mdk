@@ -192,17 +192,27 @@ group. Auto-publish and explicit `send` paths now share the same publish-before-
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return
 `SendResult::Queued`.
 
-`PendingPublish`, `Merging`, and `Recovering` each owe their exit to something the sender does not control — a publish
-outcome, a merge, or a convergence decision. An application-message intent offered in one of those states MUST also be
-stored durably and returned as `SendResult::Queued` rather than refused, so a slow or failing group operation cannot
-discard a user's message. Group-state intents MUST keep the strict `Stable` requirement, because a second staged
-evolution has no epoch to apply to. `Disbanded` is terminal and MUST refuse every intent. `Unrecoverable` MUST refuse
-every intent except `SendIntent::Disband`, which persists an irreversible request rather than retaining a delivery, and
-whose Commit preparation MUST still wait for `Stable`. Neither state resolves on its own, so retaining a delivery there
-would promise one the engine cannot make.
+`PendingPublish` and `Merging` are the two steps of resolving a publication this client staged, and neither exit is
+something the sender controls — a transport outcome, then the local merge that outcome authorizes. An
+application-message intent offered in one of those states MUST also be stored durably and returned as
+`SendResult::Queued` rather than refused, so a slow or failing publication cannot discard a user's message. Group-state
+intents MUST keep the strict `Stable` requirement, because a second staged evolution has no epoch to apply to.
+`Recovering` awaits a convergence decision over remote branches rather than a local publication; whether application
+work is retained across it is a separate lifecycle question and MUST NOT be assumed from this rule.
+
+`Disbanded` is terminal and MUST refuse every intent. `Unrecoverable` MUST refuse every intent except
+`SendIntent::Disband`, which persists an irreversible request rather than retaining a delivery, and whose Commit
+preparation MUST still wait for `Stable`. Neither state resolves on its own, so neither may accept new work.
+
+Refusing new work is not discarding accepted work. Intents retained before a group entered a terminal state MUST persist
+for that state's one legal exit: a verified repair returns an `Unrecoverable` group to `Stable`, and the drain then
+prepares the retained intents under the post-repair epoch. They MUST NOT be purged on the transition into
+`Unrecoverable`. `Disbanded` is the sole exception, and only because its terminal Commit purges the queue in the same
+transaction that writes the tombstone.
 
 Because retention stores the *intent*, not ciphertext, a message retained across an epoch change MUST be encrypted under
-the epoch it is regenerated at, never the epoch it was accepted at.
+the epoch it is regenerated at, never the epoch it was accepted at. That is what makes holding across a halt
+deliverable rather than a promise the engine cannot keep.
 
 When a publish outcome returns a group to `Stable`, the engine MUST schedule that group for convergence if it still
 holds durable outbound intents. Nothing else would release them.

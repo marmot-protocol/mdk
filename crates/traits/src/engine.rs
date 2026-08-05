@@ -661,16 +661,22 @@ pub trait CgkaEngine: Send + Sync {
     /// from `Stable`; any other state returns `InvalidTransition`. The one
     /// exception is [`SendIntent::Disband`] — see below.
     ///
-    /// [`SendIntent::AppMessage`] is additionally accepted from every state
-    /// that [`EpochState::is_awaiting_resolution`], because such a state owes
-    /// its exit to a publish outcome, a merge, or a convergence decision — none
-    /// of which the user who is typing controls, and all of which can take
-    /// minutes when relays misbehave. The payload is stored and
+    /// [`SendIntent::AppMessage`] is additionally accepted while
+    /// [`EpochState::is_resolving_local_publish`], because a publication this
+    /// client staged owes its exit to a transport outcome and then a local
+    /// merge — neither of which the user who is typing controls, and both of
+    /// which can take minutes when relays misbehave. The payload is stored and
     /// [`SendResult::Queued`] returned; the engine re-prepares it against
     /// whatever canonical state the group lands on, so a message retained
-    /// across an epoch change is encrypted under the *later* epoch. Terminal
-    /// states (`Unrecoverable`, `Disbanded`) still refuse it: no outcome is owed
-    /// there, so retention would promise a delivery nothing can make.
+    /// across an epoch change is encrypted under the *later* epoch.
+    ///
+    /// Every other non-`Stable` state refuses it. `Recovering` awaits a
+    /// convergence decision over remote branches rather than a local
+    /// publication, which is a separate retention question; terminal states
+    /// (`Unrecoverable`, `Disbanded`) accept no new work at all. Refusal here is
+    /// about *new* work: intents already retained when a group halts persist for
+    /// its one legal exit, and a drain after a verified repair prepares them
+    /// under the post-repair epoch.
     ///
     /// Unresolved convergence input queues every intent kind the same way.
     ///
@@ -681,8 +687,8 @@ pub trait CgkaEngine: Send + Sync {
     /// without acting on it. A `Disbanded` group refuses it like every other
     /// intent.
     ///
-    /// [`EpochState::is_awaiting_resolution`]:
-    ///     crate::engine_state::EpochState::is_awaiting_resolution
+    /// [`EpochState::is_resolving_local_publish`]:
+    ///     crate::engine_state::EpochState::is_resolving_local_publish
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
 
     /// Durably accept an application-message intent without preparing MLS or
@@ -692,9 +698,10 @@ pub trait CgkaEngine: Send + Sync {
     /// account whose transport is not active. The same authoritative
     /// quarantine, disband, removal, unrecoverable, leave, and epoch-state
     /// gates as [`Self::send`] still apply — including its retention boundary:
-    /// states awaiting resolution accept the payload, terminal states refuse
-    /// it. On success the group is scheduled for convergence so the intent is
-    /// regenerated from current canonical state before publication.
+    /// a state resolving a local publication accepts the payload, every other
+    /// non-`Stable` state refuses it. On success the group is scheduled for
+    /// convergence so the intent is regenerated from current canonical state
+    /// before publication.
     async fn queue_app_message(
         &mut self,
         group_id: GroupId,
