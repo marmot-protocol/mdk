@@ -516,11 +516,15 @@ impl<S: StorageProvider> Engine<S> {
     /// Put a group back on the runtime's drain list when it still holds durable
     /// outbound intents.
     ///
-    /// A publish outcome is the only exit from `PendingPublish`, and the
-    /// application payloads retained across that window are released by the
-    /// next convergence drain (`converge_and_drain_queued_outbound_intents`).
-    /// Nothing else schedules them once the group is Stable again, so the
-    /// outcome must.
+    /// The application payloads retained while a publication resolves are
+    /// released by the next convergence drain
+    /// (`converge_and_drain_queued_outbound_intents`), and in this process
+    /// nothing but a publish outcome arranges that: the caller gates hold the
+    /// group still while it is `PendingPublish` — ingest buffers rather than
+    /// advances the state, and the drain and send paths both return early on
+    /// non-`Stable` — so no other seam reaches the drain. (Across a restart,
+    /// session-open hydration re-arms the drain from the same durable queue
+    /// whatever state the group landed in.)
     ///
     /// Best-effort by construction: this runs after the outcome is durable, so
     /// a transient backend lock here must not fail an already-committed
