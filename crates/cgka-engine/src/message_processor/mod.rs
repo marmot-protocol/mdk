@@ -608,6 +608,12 @@ impl<S: StorageProvider> Engine<S> {
             // per-intent guards in `do_send_ready` report that as the illegal
             // transition it is. `Recovering` and the terminal states retain
             // nothing — see `EpochState::is_resolving_local_publish`.
+            //
+            // Excluding the terminal states here is defense in depth: `do_send`
+            // runs `validate_send_acceptance` before reaching this method, and
+            // its durable halt and tombstone gates already refused them. Same
+            // shape as the terminal re-check in
+            // `converge_and_drain_queued_outbound_intents`.
             return Ok(matches!(intent, SendIntent::AppMessage { .. })
                 && state.is_resolving_local_publish());
         }

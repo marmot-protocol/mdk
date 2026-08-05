@@ -3681,6 +3681,13 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
     // `intent_retained_before_a_halt_is_delivered_after_a_verified_repair`
     // pins. Refusing here keeps the queue to work the engine accepted while it
     // still had a live epoch to accept it against.
+    //
+    // The whole gate is pinned, not just `from`. `queue_app_message` passes two
+    // gates that both report `from: "Unrecoverable"` — the durable halt sync in
+    // `validate_send_acceptance` and the retention-boundary check after it — so
+    // matching `from` alone cannot tell which one fired, and reordering them
+    // would keep this test green while moving the refusal behind the retention
+    // check. Pinning `to` and `reason` makes that reordering fail loudly.
     let queue_err = restarted
         .queue_app_message(
             group_id.clone(),
@@ -3688,13 +3695,21 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         )
         .await
         .expect_err("queue_app_message must refuse Unrecoverable");
-    assert!(
-        matches!(
-            queue_err,
-            cgka_traits::error::EngineError::InvalidTransition(ref t)
-                if t.from == "Unrecoverable"
+    let cgka_traits::error::EngineError::InvalidTransition(queue_transition) = queue_err else {
+        panic!("queue_app_message must report an illegal transition; got {queue_err:?}")
+    };
+    assert_eq!(
+        (
+            queue_transition.from,
+            queue_transition.to,
+            queue_transition.reason
         ),
-        "queue_app_message must report Unrecoverable; got {queue_err:?}"
+        (
+            "Unrecoverable",
+            "app_message",
+            "group is Unrecoverable pending verified repair"
+        ),
+        "the durable halt sync must be the gate that refuses, ahead of the retention boundary"
     );
 
     // A verified replacement Welcome must be able to repair a frozen active
