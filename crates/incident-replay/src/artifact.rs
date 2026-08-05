@@ -349,7 +349,7 @@ fn with_byte_replay_unavailable(
     unavailable_fields
 }
 
-fn unavailable(field: &str, reason: &str) -> UnavailableEvidenceV1 {
+pub(crate) fn unavailable(field: &str, reason: &str) -> UnavailableEvidenceV1 {
     UnavailableEvidenceV1 {
         field: field.into(),
         reason: reason.into(),

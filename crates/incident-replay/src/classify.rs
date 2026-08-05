@@ -146,7 +146,8 @@ impl fmt::Display for QuarantineReason {
 pub struct HaltedEngine {
     /// The engine that halted.
     pub engine_id: String,
-    /// Every distinct halt reason it recorded, deduplicated and in sort order.
+    /// Why it halted, deduplicated and in sort order: the causes it recorded, or
+    /// its re-assertions when it recorded no cause. See [`reported_halt_reasons`].
     pub reasons: Vec<String>,
 }
 
@@ -301,8 +302,11 @@ pub fn halt_advisory(export: &AgentStateExport) -> Option<QuarantineReason> {
 struct HaltLifecycle<'a> {
     /// Every distinct reason the engine gave for halting this group.
     reasons: BTreeSet<&'a str>,
-    /// The newest halt row's timestamp, when the halt rows carry one.
+    /// The newest *timed* halt row's timestamp. Only the halt's position when
+    /// every halt row carried a clock — see [`HaltLifecycle::halt_position_ms`].
     last_halt_ms: Option<u64>,
+    /// Whether any halt row carried no clock at all.
+    untimed_halt: bool,
     /// The newest verified-repair row's timestamp, when it carries one.
     last_repair_ms: Option<u64>,
 }
@@ -334,10 +338,26 @@ impl HaltLifecycle<'_> {
         if self.reasons.is_empty() {
             return false;
         }
-        match (self.last_halt_ms, self.last_repair_ms) {
+        match (self.halt_position_ms(), self.last_repair_ms) {
             (Some(halt), Some(repair)) => repair <= halt,
             _ => true,
         }
+    }
+
+    /// Where the halt sits on the engine's clock, or `None` when its evidence
+    /// cannot be placed there at all.
+    ///
+    /// One untimed halt row makes the *whole* halt side unorderable, not just
+    /// that row: the untimed row may be the newest evidence of the halt, so the
+    /// newest timed row is a lower bound on the halt's position rather than the
+    /// position itself, and a repair after that bound proves nothing. Reading the
+    /// newest timed row as the answer is the one direction [`Self::still_halted`]
+    /// must not take — it clears a halt whose position is unknown.
+    fn halt_position_ms(&self) -> Option<u64> {
+        if self.untimed_halt {
+            return None;
+        }
+        self.last_halt_ms
     }
 }
 
@@ -364,7 +384,10 @@ fn unrecoverable_halt(export: &AgentStateExport) -> Option<QuarantineReason> {
         if let Some(reason) = event.kind.unrecoverable_halt_reason() {
             let lifecycle = lifecycles.entry(group_scope).or_default();
             lifecycle.reasons.insert(reason);
-            lifecycle.last_halt_ms = lifecycle.last_halt_ms.max(event.wall_time_ms);
+            match event.wall_time_ms {
+                Some(ms) => lifecycle.last_halt_ms = lifecycle.last_halt_ms.max(Some(ms)),
+                None => lifecycle.untimed_halt = true,
+            }
         } else if event.kind.is_verified_repair() {
             // Recorded even when no halt has been seen yet: the fold is over
             // timestamps, not file order, so a repair may legitimately arrive
@@ -388,10 +411,33 @@ fn unrecoverable_halt(export: &AgentStateExport) -> Option<QuarantineReason> {
         .into_iter()
         .map(|(engine_id, reasons)| HaltedEngine {
             engine_id: engine_id.to_owned(),
-            reasons: reasons.into_iter().map(str::to_owned).collect(),
+            reasons: reported_halt_reasons(&reasons),
         })
         .collect();
     (!engines.is_empty()).then_some(QuarantineReason::UnrecoverableHalt { engines })
+}
+
+/// One engine's halt reasons as the operator should read them: its causes, or its
+/// re-assertions when it recorded no cause.
+///
+/// A re-assertion never names why the engine stopped (see
+/// [`export::is_halt_re_assertion`]), so beside a real cause it is noise in the
+/// line an operator reads first. It is not dropped unconditionally, because a
+/// halt that predates the export window leaves nothing *but* re-assertions and
+/// that engine still has to be named — which is also the honest report for it:
+/// this export shows the halt standing, not what caused it.
+///
+/// [`export::is_halt_re_assertion`]: crate::export::is_halt_re_assertion
+fn reported_halt_reasons(reasons: &BTreeSet<&str>) -> Vec<String> {
+    let causes: Vec<String> = reasons
+        .iter()
+        .filter(|reason| !crate::export::is_halt_re_assertion(reason))
+        .map(|reason| (*reason).to_owned())
+        .collect();
+    if causes.is_empty() {
+        return reasons.iter().map(|reason| (*reason).to_owned()).collect();
+    }
+    causes
 }
 
 /// Per-engine activity, folded from the event log.

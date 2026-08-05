@@ -44,6 +44,29 @@ const VERIFIED_REPAIR_REASON: &str = "join_welcome_repair";
 /// on the floor should one ever not.
 const UNSPECIFIED_HALT_REASON: &str = "unspecified";
 
+/// Halt reasons that re-assert an existing halt instead of naming its cause.
+///
+/// `already_unrecoverable` is emitted on every convergence attempt against an
+/// already-halted group (`cgka-engine/src/distributed_convergence.rs`) and
+/// `hydrate_unrecoverable_group` on every session open over one
+/// (`cgka-engine/src/engine.rs`). Both are the halt restating itself — the
+/// property rule 5's newest-wins clearing relies on — so they arm the gate like
+/// any other halt reason. Neither says why the engine stopped. See
+/// [`is_halt_re_assertion`] for what that means for reporting.
+const HALT_RE_ASSERTION_REASONS: [&str; 2] =
+    ["already_unrecoverable", "hydrate_unrecoverable_group"];
+
+/// Whether `reason` only re-asserts a halt rather than naming its cause.
+///
+/// Purely a reporting distinction: rule 5 arms on any halt reason, and a window
+/// carrying nothing but re-assertions is still a live halt. It exists because
+/// `reasons` is the first thing an operator reads, and once a cause is known a
+/// re-assertion adds nothing — that the halt is durable and still being retried
+/// is what rule 5 *means*, not a separate finding.
+pub(crate) fn is_halt_re_assertion(reason: &str) -> bool {
+    HALT_RE_ASSERTION_REASONS.contains(&reason)
+}
+
 /// A parsed export, reduced to the classifier's inputs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentStateExport {

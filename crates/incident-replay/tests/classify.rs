@@ -302,10 +302,13 @@ fn a_group_hydrated_into_the_unrecoverable_state_quarantines() {
 }
 
 #[test]
-fn both_halt_surfaces_on_one_engine_report_one_entry_per_reason() {
+fn both_halt_surfaces_on_one_engine_fold_into_one_report() {
     // An engine that halts mid-pass and then hydrates back into the halt records
-    // both surfaces, repeatedly. The report is per engine, with each distinct
-    // reason once: a halt is a state, not a count, so repetition is not severity.
+    // both surfaces, repeatedly. It is still one halted engine: a halt is a state,
+    // not a count, so repetition is neither severity nor a second entry. What
+    // remains is the cause — the two hydrate rows only re-assert the halt the
+    // frozen-pass failure already explained (see
+    // `a_halt_cause_is_reported_without_its_re_assertions`).
     let export = load("quarantine-repeated-halt.json");
     assert_eq!(
         classify(&export),
@@ -313,8 +316,55 @@ fn both_halt_surfaces_on_one_engine_report_one_entry_per_reason() {
             reason: QuarantineReason::UnrecoverableHalt {
                 engines: vec![HaltedEngine {
                     engine_id: "engine-a".into(),
+                    reasons: vec!["frozen_pass_integrity_failure".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_halt_cause_is_reported_without_its_re_assertions() {
+    // `reasons` is the first thing an operator reads, and two of the strings that
+    // reach it never name a cause: `already_unrecoverable` is emitted on *every*
+    // convergence attempt against an already-halted group, and
+    // `hydrate_unrecoverable_group` on every session open over one. They are the
+    // halt re-asserting itself — which is why newest-wins clearing works at all —
+    // but next to a real cause they are noise, and `BTreeSet` order puts
+    // `already_unrecoverable` first, ahead of the diagnosis. Neither adds anything
+    // once the cause is known: every halt stands until a verified repair, so
+    // "durable" and "still being retried" are rule 5, not findings.
+    assert_eq!(
+        classify(&load("quarantine-halt-cause-among-re-assertions.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["frozen_pass_integrity_failure".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_halt_that_predates_the_export_reports_its_re_assertions() {
+    // The real 26a9f546 shape: the halt happened before the export window, so
+    // every row in it is a re-assertion and there is no cause to promote. The
+    // demotion must not silence the engine — an export of nothing but
+    // re-assertions is still a live halt, and rule 5 has to name the device.
+    // Reporting them is also the honest answer: this export shows the halt
+    // standing, not what caused it, and the operator's next move is to widen the
+    // window rather than to treat a re-assertion as the diagnosis. Each distinct
+    // reason appears once however many rows carried it.
+    assert_eq!(
+        classify(&load("quarantine-halt-re-asserted-only.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
                     reasons: vec![
-                        "frozen_pass_integrity_failure".into(),
+                        "already_unrecoverable".into(),
                         "hydrate_unrecoverable_group".into(),
                     ],
                 }],
@@ -394,6 +444,49 @@ fn an_untimed_repair_does_not_clear_a_halt() {
     // closed — a missed repair costs a re-pull, a missed halt costs the incident.
     assert_eq!(
         classify(&load("quarantine-untimed-halt-with-repair.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn one_untimed_halt_row_among_timed_ones_still_blocks_a_later_repair() {
+    // Mixed instrumentation: the same engine and group recorded an untimed halt, a
+    // timed halt, and then a repair newer than the *timed* halt. The untimed row
+    // may be the newest evidence of all — nothing in the export says otherwise —
+    // so the halt is unorderable and stands, exactly as when no halt row carries a
+    // clock at all. Reading the newest timed halt as *the* halt position is the
+    // fail-open direction: it lets a repair clear a halt whose real position is
+    // unknown, turning a live halt into a healthy verdict on partially
+    // instrumented input.
+    assert_eq!(
+        classify(&load("quarantine-partially-timed-halt-with-repair.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::UnrecoverableHalt {
+                engines: vec![HaltedEngine {
+                    engine_id: "engine-a".into(),
+                    reasons: vec!["hydrate_unrecoverable_group".into()],
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn a_repair_sharing_the_halt_millisecond_does_not_clear_it() {
+    // The other boundary of the same comparison: both rows carry a clock, and it
+    // is the same one. A millisecond is coarser than the two transitions, so a
+    // tie says only that they landed in the same tick — not which came first —
+    // and the two orders have opposite meanings. Strictly-after is therefore the
+    // rule, and a tie fails closed like any other unorderable pair.
+    assert_eq!(
+        classify(&load("quarantine-halt-and-repair-at-one-instant.json")),
         Verdict::Quarantine {
             reason: QuarantineReason::UnrecoverableHalt {
                 engines: vec![HaltedEngine {
