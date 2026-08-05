@@ -11,7 +11,7 @@
 
 use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Owner-only mode for files holding private data.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -47,19 +47,33 @@ pub struct PrivateExclusiveFileLease {
 pub fn try_acquire_private_exclusive_file_lease(
     path: &Path,
 ) -> io::Result<PrivateExclusiveFileLease> {
-    use std::os::fd::AsRawFd;
-
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     set_private_file_mode(&mut options);
-    let file = options.open(path)?;
+    let file = options
+        .open(path)
+        .map_err(|error| io_context("open private lease file", path, error))?;
+    finish_private_exclusive_file_lease(file, path)
+}
+
+#[cfg(unix)]
+fn finish_private_exclusive_file_lease(
+    file: std::fs::File,
+    path: &Path,
+) -> io::Result<PrivateExclusiveFileLease> {
+    use std::os::fd::AsRawFd;
+
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "private lease target must be a regular file",
+            format!(
+                "validate private lease file at {}: target must be a regular file",
+                path.display()
+            ),
         ));
     }
-    set_handle_private(&file)?;
+    set_handle_private(&file)
+        .map_err(|error| io_context("set private lease file mode", path, error))?;
 
     loop {
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -70,7 +84,7 @@ pub fn try_acquire_private_exclusive_file_lease(
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        return Err(error);
+        return Err(io_context("acquire nonblocking private lease", path, error));
     }
 }
 
@@ -91,7 +105,8 @@ pub enum ExistingDirectoryMode {
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct PreparedDirectory {
-    _directory: std::fs::File,
+    directory: std::fs::File,
+    path: PathBuf,
     mode: u32,
     uid: libc::uid_t,
     created: bool,
@@ -113,16 +128,66 @@ impl PreparedDirectory {
     pub fn was_created(&self) -> bool {
         self.created
     }
+
+    /// Try to acquire a private lease file directly beneath this verified
+    /// directory without resolving the directory pathname again.
+    pub fn try_acquire_private_exclusive_file_lease(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<PrivateExclusiveFileLease> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        if !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || Path::new(name).components().count() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lease name must be one non-empty path component",
+            ));
+        }
+        let name_c = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lease name contains a NUL byte",
+            )
+        })?;
+        let path = self.path.join(name);
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::c_uint::try_from(PRIVATE_FILE_MODE).expect("0600 fits c_uint"),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_context(
+                "open private lease file relative to prepared directory",
+                &path,
+                io::Error::last_os_error(),
+            ));
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        finish_private_exclusive_file_lease(file, &path)
+    }
 }
 
-/// Open or create every component of `path` relative to directory
-/// descriptors, refusing symlinks at every step.
+/// Open or create `path` while refusing symlinks.
 ///
 /// Missing components are created at `mode` (subject only to a temporarily
 /// more-restrictive umask) and immediately brought to the requested mode via
 /// `fchmod`. Existing ancestors are never chmodded. The leaf follows `policy`,
 /// allowing owned directories to be enforced while externally managed socket
-/// parents are preserved and validated by the caller.
+/// parents are preserved and validated by the caller. Apple platforms open the
+/// complete authorized path (or deepest complete existing ancestor) with
+/// `O_NOFOLLOW_ANY`, then operate descriptor-relative below that anchor. This
+/// avoids independently opening sandbox-managed ancestors such as `/private`
+/// and `/private/var` on physical iOS. Other Unix platforms retain the
+/// component-by-component descriptor walk from `/` or `.`.
 #[cfg(unix)]
 pub fn prepare_directory_path(
     path: &Path,
@@ -153,6 +218,12 @@ pub fn prepare_directory_path(
     // every caller-controlled component below it is still opened with
     // `O_NOFOLLOW`. Without this narrow normalization, ordinary temp-backed
     // homes could never use the descriptor walk.
+    // iOS App Group APIs return the canonical `/private/...` spelling. Avoid
+    // even probing its first sandbox-managed ancestor independently; the
+    // complete-path open below is the authorization boundary.
+    #[cfg(target_os = "ios")]
+    let normalized_path: Option<PathBuf> = None;
+    #[cfg(not(target_os = "ios"))]
     let normalized_path = resolve_root_owned_alias(path)?;
     let path = normalized_path.as_deref().unwrap_or(path);
 
@@ -182,20 +253,30 @@ pub fn prepare_directory_path(
         ));
     }
 
-    let start = if path.is_absolute() {
-        Path::new("/")
-    } else {
-        Path::new(".")
+    #[cfg(target_vendor = "apple")]
+    let (mut current, components, mut current_path) = open_apple_authorized_ancestor(path)?;
+    #[cfg(not(target_vendor = "apple"))]
+    let (mut current, mut current_path): (OwnedFd, PathBuf) = {
+        let start = if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        };
+        let mut options = OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let directory = options
+            .open(start)
+            .map(Into::into)
+            .map_err(|error| io_context("open directory-walk anchor", start, error))?;
+        (directory, start.to_owned())
     };
-    let mut options = OpenOptions::new();
-    use std::os::unix::fs::OpenOptionsExt;
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut current: OwnedFd = options.open(start)?.into();
     let mut leaf_created = false;
 
     for (index, component) in components.iter().enumerate() {
+        let component_path = current_path.join(component);
         let component = CString::new(component.as_bytes()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -214,34 +295,106 @@ pub fn prepare_directory_path(
                 } else {
                     let mkdir_error = io::Error::last_os_error();
                     if mkdir_error.kind() != io::ErrorKind::AlreadyExists {
-                        return Err(mkdir_error);
+                        return Err(io_context(
+                            "create directory component",
+                            &component_path,
+                            mkdir_error,
+                        ));
                     }
                 }
-                open_directory_at(current.as_raw_fd(), &component)?
+                open_directory_at(current.as_raw_fd(), &component).map_err(|error| {
+                    io_context(
+                        "open newly created directory component",
+                        &component_path,
+                        error,
+                    )
+                })?
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(io_context(
+                    "open directory component",
+                    &component_path,
+                    error,
+                ));
+            }
         };
         if created {
-            fchmod_directory(next.as_raw_fd(), platform_mode)?;
+            fchmod_directory(next.as_raw_fd(), platform_mode).map_err(|error| {
+                io_context("set created directory mode", &component_path, error)
+            })?;
         }
         if index + 1 == components.len() {
             leaf_created = created;
         }
         current = next;
+        current_path = component_path;
     }
 
     if policy == ExistingDirectoryMode::Enforce && !leaf_created {
-        fchmod_directory(current.as_raw_fd(), platform_mode)?;
+        fchmod_directory(current.as_raw_fd(), platform_mode)
+            .map_err(|error| io_context("set existing directory mode", path, error))?;
     }
 
     let directory = std::fs::File::from(current);
-    let metadata = directory.metadata()?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| io_context("read prepared directory metadata", path, error))?;
     let prepared = PreparedDirectory {
         mode: metadata.mode() & MAX_MODE,
         uid: metadata.uid(),
         created: leaf_created,
-        _directory: directory,
+        directory,
+        path: path.to_owned(),
     };
+
+    #[cfg(target_vendor = "apple")]
+    fn open_apple_authorized_ancestor(
+        path: &Path,
+    ) -> io::Result<(OwnedFd, Vec<OsString>, PathBuf)> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut candidate = path.to_owned();
+        let mut missing = Vec::new();
+        loop {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC);
+            match options.open(&candidate) {
+                Ok(directory) => {
+                    missing.reverse();
+                    return Ok((directory.into(), missing, candidate));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let Some(name) = candidate.file_name() else {
+                        return Err(io_context(
+                            "open authorized directory anchor",
+                            &candidate,
+                            error,
+                        ));
+                    };
+                    missing.push(name.to_owned());
+                    if !candidate.pop() {
+                        return Err(io_context(
+                            "locate authorized directory anchor",
+                            path,
+                            error,
+                        ));
+                    }
+                    if candidate.as_os_str().is_empty() {
+                        candidate.push(".");
+                    }
+                }
+                Err(error) => {
+                    return Err(io_context(
+                        "open complete authorized directory path",
+                        &candidate,
+                        error,
+                    ));
+                }
+            }
+        }
+    }
 
     fn open_directory_at(parent: libc::c_int, component: &CString) -> io::Result<OwnedFd> {
         let descriptor = unsafe {
@@ -265,6 +418,7 @@ pub fn prepare_directory_path(
         }
     }
 
+    #[cfg(not(target_os = "ios"))]
     fn resolve_root_owned_alias(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
         use std::os::unix::fs::MetadataExt;
         use std::path::Component;
@@ -300,6 +454,13 @@ pub fn prepare_directory_path(
     }
 
     Ok(prepared)
+}
+
+fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} at {}: {error}", path.display()),
+    )
 }
 
 /// Configure `options` to create files owner-only (0600). No-op off Unix.
@@ -820,6 +981,68 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
         assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn prepared_directory_lease_is_private_nonblocking_and_descriptor_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("marmot");
+        let prepared = prepare_directory_path(&root, 0o700, ExistingDirectoryMode::Enforce)
+            .expect("prepare fresh root");
+        let name = std::ffi::OsStr::new(".runtime.lock");
+
+        let first = prepared
+            .try_acquire_private_exclusive_file_lease(name)
+            .expect("acquire initial lease");
+        assert_eq!(mode_of(&root), 0o700);
+        assert_eq!(mode_of(&root.join(name)), 0o600);
+
+        let blocked = prepared
+            .try_acquire_private_exclusive_file_lease(name)
+            .expect_err("second owner must not block");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        drop(
+            prepared
+                .try_acquire_private_exclusive_file_lease(name)
+                .expect("released lease can be reacquired"),
+        );
+    }
+
+    #[test]
+    fn prepared_directory_lease_rejects_invalid_names_and_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = prepare_directory_path(
+            dir.path(),
+            PRIVATE_DIR_MODE,
+            ExistingDirectoryMode::Preserve,
+        )
+        .expect("prepare root");
+
+        for name in ["", ".", "..", "child/lock"] {
+            assert!(
+                prepared
+                    .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(name))
+                    .is_err()
+            );
+        }
+
+        let target = dir.path().join("target");
+        let link = dir.path().join("lease-link");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            prepared
+                .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new("lease-link"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(mode_of(&target), 0o644);
     }
 
     #[test]

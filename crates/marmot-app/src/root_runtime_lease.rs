@@ -40,7 +40,7 @@ impl MarmotRootRuntimeLease {
     pub fn try_acquire(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref();
         #[cfg(unix)]
-        fs_private::prepare_directory_path(
+        let prepared_root = fs_private::prepare_directory_path(
             root,
             fs_private::PRIVATE_DIR_MODE,
             fs_private::ExistingDirectoryMode::Preserve,
@@ -51,12 +51,20 @@ impl MarmotRootRuntimeLease {
         #[cfg(unix)]
         {
             let path = root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE);
-            match fs_private::try_acquire_private_exclusive_file_lease(&path) {
+            match prepared_root.try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(
+                MARMOT_ROOT_RUNTIME_LOCK_FILE,
+            )) {
                 Ok(lease) => Ok(Self { _lease: lease }),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     Err(AppError::RuntimeBusy)
                 }
-                Err(error) => Err(AppError::Io(error)),
+                Err(error) => Err(AppError::Io(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "acquire Marmot root runtime lease at {}: {error}",
+                        path.display()
+                    ),
+                ))),
             }
         }
 
@@ -76,6 +84,28 @@ mod tests {
     use crate::{MarmotApp, MarmotAppConfig};
     use marmot_account::AccountHome;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn root_lease_creates_a_private_root_and_lock_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("Marmot");
+
+        let lease = MarmotRootRuntimeLease::try_acquire(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            fs_private::PRIVATE_DIR_MODE
+        );
+        assert_eq!(
+            std::fs::metadata(root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            fs_private::PRIVATE_FILE_MODE
+        );
+        drop(lease);
+    }
 
     #[test]
     fn second_root_lease_is_busy_until_every_owner_drops() {
@@ -113,6 +143,33 @@ mod tests {
             & 0o7777;
         assert_eq!(lock_mode, fs_private::PRIVATE_FILE_MODE);
         drop(lease);
+    }
+
+    #[test]
+    fn root_lease_rejects_symlink_root_and_lock_file() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target_root = parent.path().join("target-root");
+        let linked_root = parent.path().join("linked-root");
+        std::fs::create_dir(&target_root).unwrap();
+        symlink(&target_root, &linked_root).unwrap();
+        assert!(matches!(
+            MarmotRootRuntimeLease::try_acquire(&linked_root),
+            Err(AppError::Io(_))
+        ));
+        assert!(!target_root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE).exists());
+
+        let root = parent.path().join("real-root");
+        std::fs::create_dir(&root).unwrap();
+        let target_file = parent.path().join("target-file");
+        std::fs::write(&target_file, b"unchanged").unwrap();
+        symlink(&target_file, root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE)).unwrap();
+        assert!(matches!(
+            MarmotRootRuntimeLease::try_acquire(&root),
+            Err(AppError::Io(_))
+        ));
+        assert_eq!(std::fs::read(target_file).unwrap(), b"unchanged");
     }
 
     #[test]
