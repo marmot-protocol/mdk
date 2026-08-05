@@ -24,6 +24,16 @@ pub const ROUTE_ASSURANCE_CLAIMS: &[&str] = &[
     COMPLETE_APPLICATION_DISPOSITION_CLAIM,
 ];
 
+/// Claims the portable scenario itself demonstrates on every production-shaped
+/// adapter. Route equivalence and loser reconsideration additionally require
+/// engine evidence that the competing fork was actually staged.
+pub const PORTABLE_ROUTE_SCENARIO_CLAIMS: &[&str] = &[
+    RESTART_INVARIANCE_CLAIM,
+    EXACT_CRYPTOGRAPHIC_AGREEMENT_CLAIM,
+    ACTIVE_DECRYPTABILITY_CLAIM,
+    COMPLETE_APPLICATION_DISPOSITION_CLAIM,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeeperBranch {
@@ -84,6 +94,21 @@ pub enum RouteCampaignAdapter {
     AppRuntime,
     Process,
     Distributed,
+}
+
+pub fn covered_claims_for_route_adapter(
+    campaign: &RouteEquivalenceCampaignV1,
+    adapter: RouteCampaignAdapter,
+) -> Vec<String> {
+    match adapter {
+        RouteCampaignAdapter::Engine => ROUTE_ASSURANCE_CLAIMS
+            .iter()
+            .map(|claim| (*claim).to_owned())
+            .collect(),
+        RouteCampaignAdapter::AppRuntime
+        | RouteCampaignAdapter::Process
+        | RouteCampaignAdapter::Distributed => campaign.covered_claims.clone(),
+    }
 }
 
 /// Lower adapter-owned publication/history mechanics while preserving the
@@ -211,7 +236,7 @@ pub fn generate_cross_route_regression_family() -> Vec<RouteEquivalenceCampaignV
                     deeper_branch,
                     observer_delivery_order,
                     restart_checkpoint,
-                    covered_claims: ROUTE_ASSURANCE_CLAIMS
+                    covered_claims: PORTABLE_ROUTE_SCENARIO_CLAIMS
                         .iter()
                         .map(|claim| (*claim).into())
                         .collect(),

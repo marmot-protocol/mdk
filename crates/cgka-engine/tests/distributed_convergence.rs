@@ -2457,13 +2457,14 @@ async fn pass_opens_while_app_message_intents_are_queued() {
     );
     assert!(completed.fairness_slot_available);
 
+    let queued_app_payload = app_payload_for(&carol, b"queued-chat");
     queue_intent(
         &carol_storage,
         &group_id,
         b"queued-app-message",
         SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: b"queued-chat".to_vec(),
+            payload: queued_app_payload,
         },
         1_000_001,
     );
@@ -2484,6 +2485,16 @@ async fn pass_opens_while_app_message_intents_are_queued() {
         .unwrap();
     assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    // Marmot makes no application-send progress claim under infinite valid
+    // selection input. Once this finite input closes and catch-up settles, the
+    // ordinary queue drain publishes the waiting application message.
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_001)
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(drained[0], SendResult::ApplicationMessage { .. }));
 }
 
 /// The spec's one-attempt rule (convergence.md, marmot#375): a queued

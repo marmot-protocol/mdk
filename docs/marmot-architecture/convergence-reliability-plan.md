@@ -248,6 +248,7 @@ Categories:
 | E6 | `CANDIDATE_REPLAY_BUDGET_FLOOR` | 32 probes | resource | Gives small passes minimum replay headroom | Same as E5 | intended no | Small/large boundary matrix |
 | E7 | self-remove auto-commit jitter | 10 ms + [0, 40] ms (10–50 ms inclusive) | scheduler | Reduces synchronized automatic self-remove commits | Jitter changes ordering only, not admissible final behavior after closure | intended no | Seeded schedule invariance and collision tests |
 | E8 | `MAX_DEFERRED_PEEL_RESIDENCE_MS` | 30 days | resource, scheduler | Durably bounds opaque local transport residence across stable contexts and restart | Release is `resource_refused`, exact-ID redelivery remains eligible, and backwards wall movement cannot expire early | may affect locally available input until refetch | First-join opaque reproducer, restart/backwards-clock test, redelivery, and app backfill signal |
+| E9 | `MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN` | 64 attempts | resource, scheduler | Bounds reconstructed candidate-branch peel contexts across the complete multi-pass drain, rather than once per inner sweep | Unattempted rows remain durable and scheduled; the cursor resumes on a later drain without selecting from partial evidence | intended no after finite input and repeated drains | Candidate-context flood, cumulative engine counter, and later-drain progress |
 
 #### App scheduler and input-recovery bounds
 
@@ -285,7 +286,7 @@ future inventory revision should encode machine-checked expected values where th
 | P5 | `canonicalization.rs`; `convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input`; `input_at_effective_cutoff_is_retained_for_the_next_generation`; collecting-pass restart test | M3.1 sustained flood; M3.2 eventual fixed-point comparison |
 | P6, P7, P8 | `convergence.rs`; generated policy cases; Tamarin score/bound lemmas; multi-device witness-deduplication replay probe | M3.1 group-size/device/Sybil sweeps; M4.1 independent reference |
 | E1 | `message_processor/mod.rs`; existing multi-pass integration flows | M3.1 force exhaustion, verify durable continuation and no partial settle |
-| E2, E3, E4, E8 | `message_processor/mod.rs`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `deferred_peel_residence_survives_restart_and_backward_clock`; `peel_deferred_rows_capped_per_group_under_flood`; `resource_refusal_signals_immediately_once_per_epoch`; strict first-join chaos case; deferred retry/context tests | M3.1 fairness/restart/redelivery campaign |
+| E2, E3, E4, E8, E9 | `message_processor/mod.rs`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `deferred_peel_residence_survives_restart_and_backward_clock`; `peel_deferred_rows_capped_per_group_under_flood`; `candidate_context_materialization_is_bounded_per_drain`; `resource_refusal_signals_immediately_once_per_epoch`; strict first-join chaos case; deferred retry/context tests | M3.1 fairness/restart/redelivery campaign and M6 route hardening |
 | E5, E6 | `openmls_projection.rs`; `for_pass_scales_with_commits_and_rewind_and_keeps_a_floor`; `for_pass_saturates_instead_of_overflowing`; `consume_fails_closed_when_exhausted` | M3.1 branch-explosion end-to-end recovery; M4.3 mutation |
 | E7 | `message_processor/mod.rs`; `reopen_preserves_deferred_selfremove_auto_commit` | M3.1 deterministic jitter/collision schedules |
 | A1, A2, A4, A5 | `account_worker.rs`; clamp, re-arm, collecting, pending-outbound, cutoff-order, and backoff scheduler tests | M3.2 virtual-time scheduler invariance; M4.2 lifecycle model |
@@ -1015,6 +1016,11 @@ the simultaneous same-source-epoch roots required to count as #1236 regression e
 database contention, and mixed-image operations have deterministic command-plan coverage and are scheduled for
 infrastructure-capable execution lanes.
 
+Each VM manifest supplies its own nonzero `timeout_seconds`; VM-driver execution is not constrained by the runner's
+short infrastructure-command timeout. Container nodes receive an explicit relay-proxy listen address, so the runner
+and node cannot drift through an implicit port default, and database-contention durations are validated and emitted
+in the whole-second syntax accepted by `stress-ng`.
+
 ### 6.3 Execution lanes
 
 - [x] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
@@ -1070,6 +1076,13 @@ one historical run is permanently representative or that the engine is universal
 still has to execute the lane, satisfy its budgets, review any counterexamples, and retain the resulting bundle. A new
 production route, protocol rule, adapter behavior, field incident, or mutation survivor reopens the corresponding
 claim.
+
+One upgrade limitation remains explicit: own-commit stamps written before parent/result lineage hashes were persisted
+cannot prove that an epoch-only anchor belongs to the candidate being materialized. The engine therefore fails closed:
+it does not treat the legacy stamp as an anchor-verified prefix, and it leaves the durable message available for later
+repair rather than risking a cross-lineage application. This can delay progress for an upgraded device whose only
+usable anchor is such a legacy stamp; safely eliminating that gap requires authenticated lineage evidence, not an
+epoch-only compatibility heuristic.
 
 ## Cross-Milestone Verification Matrix
 
@@ -1187,6 +1200,7 @@ incorrect result.
 | 2026-08-04 | 6.2 container and VM execution | Added the container-first distributed runner, barrier-bound network/relay/participant/disk/database faults, mixed-image participants, real OCI regressions, and a capability-gated external VM-driver boundary for behavior containers cannot represent | `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
 | 2026-08-04 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
 | 2026-08-04 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis | `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
+| 2026-08-05 | Milestone 6 review hardening | Made candidate-win fork displacement transactional while preserving non-descendant dispositions and queued work; bounded candidate-context construction across a complete drain; documented finite-input fairness and legacy-stamp fail-closed behavior; scoped route claims to adapter capabilities; made offline exact-state refusal explicit; and hardened distributed timeout, proxy-listen, and contention-duration contracts | `candidate_win_restores_non_descendant_states_and_queued_work`; `candidate_context_materialization_is_bounded_per_drain`; `pass_opens_while_app_message_intents_are_queued`; `legacy_serialized_stamp_is_not_treated_as_anchor_verified`; `route_equivalence`; `distributed_runner` |
 
 ## Post-Milestone 6 Cleanup
 

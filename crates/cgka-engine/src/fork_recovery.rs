@@ -48,6 +48,10 @@ pub(crate) enum ForkResolution {
         /// `MessageId` of the now-displaced incumbent, for the storage
         /// write that parks its row `ConvergenceDeferred`.
         invalidated_storage_id: MessageId,
+        /// The displaced row actually parked by the atomic transition. A
+        /// missing incumbent row must not produce a fictional state-change
+        /// audit entry.
+        parked: Option<MessageId>,
     },
     IncumbentWins {
         /// Ordering key of the commit this node kept. Carried so the
@@ -152,7 +156,7 @@ impl ForkRecoveryManager {
             .insert((record.group_id.clone(), record.source_epoch), record);
     }
 
-    fn resolve<S: MessageStorage>(
+    fn resolve<S: StorageProvider>(
         &mut self,
         storage: &S,
         group_id: &GroupId,
@@ -178,76 +182,14 @@ impl ForkRecoveryManager {
             });
         }
 
-        // Capture the incumbent's stored row BEFORE the rollback: the
-        // pre-commit snapshot predates the incumbent's own persist, so the
-        // rollback below sweeps its row away entirely. Re-persisting it
-        // afterwards (parked, see below) is what keeps the displaced branch
-        // reconsiderable.
-        let displaced_incumbent_row = match storage.get_message(&incumbent.storage_id) {
-            Ok(record) => Some(record),
-            Err(StorageError::NotFound) => None,
-            Err(e) => return Err(EngineError::Storage(e)),
-        };
-        // The pre-commit snapshot also predates every local descendant of the
-        // incumbent root. Preserve authenticated descendant commits before the
-        // rollback so a branch that already grew locally does not lose the
-        // very evidence that makes it canonical. This matters when the outer
-        // transport echo is withheld or delayed: OpenMLS cannot process our
-        // own commit again, so the confirm-time convergence stamp on this row
-        // is the only replayable representation of that descendant.
-        let mut displaced_descendant_commits = storage
-            .list_messages(group_id, source_epoch)?
-            .into_iter()
-            .filter(|record| record.id != incumbent.storage_id)
-            .filter_map(|mut record| {
-                let payload = StoredMessagePayload::decode(&record.payload).ok()?;
-                let message = payload.as_openmls_wire()?;
-                if message.payload.as_slice() == candidate_mls_bytes {
-                    return None;
-                }
-                let projection =
-                    crate::openmls_projection::project_mls_message(&message.payload).ok()?;
-                let projected_source_epoch = projection.source_epoch?;
-                if projection.kind != crate::openmls_projection::OpenMlsContentKind::Commit
-                    || projected_source_epoch <= source_epoch.0
-                {
-                    return None;
-                }
-                record.epoch = EpochId(projected_source_epoch);
-                // Unlike the displaced root, a descendant is new branch-growth
-                // evidence that must open the next convergence generation.
-                // `ConvergenceDeferred` is reconsiderable only when some new
-                // Created/Retryable edge opens a pass; using it here would
-                // leave a locally-authored deeper branch parked forever after
-                // the rollback removed its canonical status.
-                record.state = MessageState::Retryable;
-                Some(record)
-            })
-            .collect::<Vec<_>>();
-        displaced_descendant_commits
-            .sort_by(|left, right| left.id.as_slice().cmp(right.id.as_slice()));
-        storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
-
-        // Ordering rationale (recoverability). The displaced row is
-        // re-persisted BEFORE the recovery snapshot is released and before
-        // the in-memory incumbent is dropped. The rollback sweeps the
-        // incumbent's row away, so a failure between rollback and re-persist
-        // must stay retryable: with this order it returns `Err` while the
-        // snapshot is still retained and `self.incumbents` still holds the
-        // record that names it, so the caller fails closed and a later
-        // resolve can redo the rollback + re-persist. Releasing or forgetting
-        // first would lose the displaced branch permanently (row swept,
-        // snapshot gone, record gone). The in-memory removal is therefore the
-        // last step — the point of no return.
-        //
-        // The snapshot operations necessarily sit OUTSIDE any storage
-        // transaction: create/rollback/release drive their own SQLite
-        // transactions (see the boundary comment in
-        // `openmls_projection::apply_openmls_canonicalization_result_inner`).
-        // The re-persist is a single-row write and is already atomic on its
-        // own, so there is no multi-write group here worth wrapping in
-        // `with_transaction` — and this manager is generic over
-        // `MessageStorage`, which does not expose one.
+        // Capture, rewind, restore and release are one durable transition.
+        // SQLite snapshot operations join an outer `with_transaction`; if any
+        // restore fails, the rollback itself is undone and the complete live
+        // state plus retained recovery snapshot remain available for retry.
+        // This is required because the pre-commit snapshot predates not only
+        // the incumbent row but every later message and queued outbound intent.
+        // Rebuilding selected rows outside a transaction can both tear the
+        // input set and make the lost branch impossible to recover.
         //
         // Park the pairwise-losing incumbent `ConvergenceDeferred`, not
         // terminally `EpochInvalidated` — the mirror of the incumbent-wins
@@ -266,25 +208,77 @@ impl ForkRecoveryManager {
         // ordering stamp (`stamp_processed_own_commit_record`) that replay
         // needs to rebuild the ordering key (MLS refuses to process own
         // commits).
-        if let Some(mut record) = displaced_incumbent_row {
-            record.epoch = incumbent.source_epoch;
-            record.state = MessageState::ConvergenceDeferred;
-            storage.put_message(&record)?;
-        }
-        for record in displaced_descendant_commits {
-            storage.put_message(&record)?;
-        }
+        let snapshot_name = incumbent.snapshot_name.clone();
+        let incumbent_storage_id = incumbent.storage_id.clone();
+        let incumbent_source_epoch = incumbent.source_epoch;
+        let parked =
+            storage.with_transaction(|storage| -> Result<Option<MessageId>, EngineError> {
+                let mut live_messages = storage.list_messages(group_id, EpochId(0))?;
+                let live_queued_outbound = storage.list_queued_outbound_intents(group_id)?;
+                let mut parked = None;
 
-        match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(EngineError::Storage(e)),
-        }
+                for record in &mut live_messages {
+                    if record.id == incumbent_storage_id {
+                        record.epoch = incumbent_source_epoch;
+                        record.state = MessageState::ConvergenceDeferred;
+                        parked = Some(record.id.clone());
+                        continue;
+                    }
+
+                    // `Processed` is the durable proof that this later commit was
+                    // on the live incumbent lineage. Re-open only those canonical
+                    // descendants after rewinding their parent. Other eligible,
+                    // deferred, and terminal rows are restored with their existing
+                    // dispositions; epoch ordering alone must never resurrect a
+                    // rejected sibling branch.
+                    if record.state != MessageState::Processed {
+                        continue;
+                    }
+                    let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                        continue;
+                    };
+                    let Some(message) = payload.as_openmls_wire() else {
+                        continue;
+                    };
+                    if message.payload.as_slice() == candidate_mls_bytes {
+                        continue;
+                    }
+                    let Ok(projection) =
+                        crate::openmls_projection::project_mls_message(&message.payload)
+                    else {
+                        continue;
+                    };
+                    let Some(projected_source_epoch) = projection.source_epoch else {
+                        continue;
+                    };
+                    if projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
+                        && projected_source_epoch > source_epoch.0
+                    {
+                        record.epoch = EpochId(projected_source_epoch);
+                        record.state = MessageState::Retryable;
+                    }
+                }
+
+                storage.rollback_group_to_snapshot(group_id, &snapshot_name)?;
+                for record in &live_messages {
+                    storage.put_message(record)?;
+                }
+                for queued in &live_queued_outbound {
+                    storage.put_queued_outbound_intent(queued)?;
+                }
+                match storage.release_group_snapshot(group_id, &snapshot_name) {
+                    Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                    Err(error) => return Err(EngineError::Storage(error)),
+                }
+                Ok(parked)
+            })?;
         self.incumbents.remove(&key);
 
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
             invalidated: incumbent.ordering_key,
             invalidated_storage_id: incumbent.storage_id,
+            parked,
         })
     }
 
@@ -461,24 +455,22 @@ impl<S: StorageProvider> Engine<S> {
                 invalidated_msg_id,
             },
         );
-        if let ForkResolution::CandidateWins {
-            invalidated_storage_id,
-            ..
-        } = &resolution
-        {
+        if let ForkResolution::CandidateWins { parked, .. } = &resolution {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
             // `ForkRecoveryManager::resolve` parked the displaced incumbent's
             // row `ConvergenceDeferred` at its source epoch (captured before
             // the rollback swept it); record the transition for forensics.
-            self.audit_group(
-                group_id,
-                crate::audit_helpers::message_state_changed_event(
-                    hex::encode(invalidated_storage_id.as_slice()),
-                    MessageState::ConvergenceDeferred,
-                    "fork_loser",
-                ),
-            );
+            if let Some(parked) = parked {
+                self.audit_group(
+                    group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(parked.as_slice()),
+                        MessageState::ConvergenceDeferred,
+                        "fork_loser",
+                    ),
+                );
+            }
         }
         Ok(resolution)
     }
@@ -511,9 +503,14 @@ impl<S: StorageProvider> Engine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::engine::SendIntent;
+    use cgka_traits::group::{Group, ProtocolProfile};
     use cgka_traits::message::{MessageRecord, MessageState};
-    use cgka_traits::storage::StorageResult;
+    use cgka_traits::storage::{
+        GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageResult,
+    };
     use std::sync::Mutex;
+    use storage_sqlite::SqliteAccountStorage;
 
     #[derive(Default)]
     struct HardFailingReleaseStorage {
@@ -610,6 +607,105 @@ mod tests {
         assert_eq!(
             manager.recovery_snapshot_name(&group_id, EpochId(1)),
             Some("fork-1".to_string())
+        );
+    }
+
+    #[test]
+    fn candidate_win_restores_non_descendant_states_and_queued_work() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = GroupId::new(b"group".to_vec());
+        storage
+            .put_group(&Group {
+                id: group_id.clone(),
+                name: "fork restore".into(),
+                description: String::new(),
+                epoch: EpochId(1),
+                members: Vec::new(),
+                required_capabilities: Default::default(),
+                protocol_profile: ProtocolProfile::Legacy,
+                removed: false,
+                unrecoverable: false,
+                disbanded: None,
+                join_epoch: EpochId(0),
+            })
+            .unwrap();
+        storage.create_group_snapshot(&group_id, "fork-1").unwrap();
+
+        let record = |id: &[u8], epoch, state| MessageRecord {
+            id: MessageId::new(id.to_vec()),
+            group_id: group_id.clone(),
+            epoch: EpochId(epoch),
+            state,
+            payload: vec![epoch as u8],
+            deferred_peel: None,
+        };
+        let incumbent = record(b"incumbent", 1, MessageState::Processed);
+        let terminal_sibling = record(b"terminal-sibling", 2, MessageState::Failed);
+        let pending_sibling = record(b"pending-sibling", 2, MessageState::Retryable);
+        storage.put_message(&incumbent).unwrap();
+        storage.put_message(&terminal_sibling).unwrap();
+        storage.put_message(&pending_sibling).unwrap();
+        let queued = QueuedOutboundIntent {
+            id: MessageId::new(b"queued".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"queued".to_vec(),
+            },
+            created_at_ms: 1,
+        };
+        storage.put_queued_outbound_intent(&queued).unwrap();
+
+        let mut manager = ForkRecoveryManager::default();
+        let incumbent_key = CommitOrderingKey::from_commit_bytes(
+            EpochId(1),
+            CommitOrderingPriority::Ordinary,
+            MemberId::new(vec![0xff; 32]),
+            b"incumbent-commit",
+        );
+        manager.record_applied(CommitRecoveryRecord {
+            group_id: group_id.clone(),
+            source_epoch: EpochId(1),
+            ordering_key: incumbent_key.clone(),
+            storage_id: incumbent.id.clone(),
+            snapshot_name: "fork-1".into(),
+        });
+        let candidate_committer = MemberId::new(vec![0; 32]);
+        let candidate_key = CommitOrderingKey::from_commit_bytes(
+            EpochId(1),
+            CommitOrderingPriority::Ordinary,
+            candidate_committer.clone(),
+            b"candidate-commit",
+        );
+        assert!(candidate_key < incumbent_key);
+
+        let resolution = manager
+            .resolve(
+                &storage,
+                &group_id,
+                EpochId(1),
+                CommitOrderingPriority::Ordinary,
+                candidate_committer,
+                b"candidate-commit",
+            )
+            .unwrap();
+        assert!(matches!(resolution, ForkResolution::CandidateWins { .. }));
+        assert_eq!(
+            storage.get_message(&incumbent.id).unwrap().state,
+            MessageState::ConvergenceDeferred
+        );
+        assert_eq!(
+            storage.get_message(&terminal_sibling.id).unwrap().state,
+            MessageState::Failed,
+            "terminal sibling must not be resurrected by epoch ordering"
+        );
+        assert_eq!(
+            storage.get_message(&pending_sibling.id).unwrap().state,
+            MessageState::Retryable
+        );
+        assert_eq!(
+            storage.list_queued_outbound_intents(&group_id).unwrap(),
+            vec![queued]
         );
     }
 }

@@ -223,6 +223,11 @@ hide different exporter state, and device-local `local_was_committer_leaf` metad
 terminal clients. The engine interface is enabled only for this simulator through `test-conformance-snapshot`; it
 exposes the commitment, never the raw exporter secret.
 
+The app-runtime adapter's exact-state observation is an online engine query, not a cache contract. Taking a participant
+offline clears its last exact snapshot, and `observe_exact` returns the typed `exact_state_unavailable` expected refusal
+until that runtime reconnects and refreshes. Scenarios that need an offline local projection must add a separately
+named projection observation instead of silently reusing stale canonical state.
+
 The scenario-input ledger gives every commit, proposal, and application action a stable scenario id, then joins it to
 the outer transport id and content-derived MLS id; application entries also retain the inner Marmot event id for
 delivery correlation. Per client it distinguishes send attempt/acceptance/queue/publication, protocol acceptance,

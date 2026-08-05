@@ -325,6 +325,10 @@ pub struct Engine<S: StorageProvider> {
     /// released without terminal deduplication. Field (not a const) so tests
     /// can exhaust it quickly via [`Self::set_deferred_peel_retry_budget`].
     pub(crate) deferred_peel_retry_budget: u32,
+    /// Cumulative candidate-branch context reconstruction attempts. This is a
+    /// privacy-safe resource counter used by conformance campaigns to verify
+    /// the aggregate per-drain ceiling.
+    pub(crate) candidate_peel_context_materialization_count: u64,
     /// Durable local residence budget for a `PeelDeferred` row. Field (not a
     /// const) so deterministic tests can advance a short deadline.
     pub(crate) deferred_peel_residence_ms: u64,
@@ -582,6 +586,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
             deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
+            candidate_peel_context_materialization_count: 0,
             deferred_peel_residence_ms: crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
         })
     }
@@ -695,6 +700,12 @@ impl<S: StorageProvider> Engine<S> {
     #[cfg(feature = "test-conformance-snapshot")]
     pub fn conformance_replay_probe_count(&self) -> u64 {
         self.conformance_replay_probe_count
+    }
+
+    /// Cumulative candidate-branch context reconstructions performed by
+    /// deferred transport peeling since this engine opened.
+    pub fn candidate_peel_context_materialization_count(&self) -> u64 {
+        self.candidate_peel_context_materialization_count
     }
 
     /// Return the transport and content-derived ids for a durable synthetic

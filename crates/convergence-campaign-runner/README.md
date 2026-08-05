@@ -21,6 +21,11 @@ public relay endpoints. Campaign artifacts are written with owner-only modes.
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
 
+Virtual-machine manifests set a nonzero `timeout_seconds` for the complete
+external-driver invocation. Container database-contention durations are
+positive whole seconds, and every generated node command receives an explicit
+relay-proxy listen address in addition to the upstream relay address.
+
 Failed distributed executions append a privacy-safe entry to the private
 `failure-corpus.v1.json` in the campaign output directory. `index-capsule` and
 `index-node-capsule` add simulator or process failures, `classify-failure`

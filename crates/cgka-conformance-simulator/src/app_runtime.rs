@@ -5,6 +5,12 @@
 //! feature-gated, read-only app command that returns commitments but never raw
 //! secrets or storage. Each participant owns a distinct restrictive root and
 //! one SQLCipher database.
+//!
+//! Exact canonical observation is intentionally online-only. Taking a
+//! participant offline clears its last exact snapshot so scenarios cannot
+//! mistake stale state for a fresh black-box observation. Offline local
+//! projection/diagnostic inspection needs a separately named subject operation
+//! rather than weakening `observe_exact`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -467,22 +473,23 @@ impl AppRuntimeHarness {
             .collect::<BTreeMap<_, _>>();
         let participant = self.participant_mut(client)?;
         drain_runtime_events(participant);
+        let canonical_state = participant
+            .cached_exact
+            .get(&group_label)
+            .cloned()
+            .ok_or_else(|| {
+                SubjectError::classified(
+                    SubjectFailureCategory::ExpectedRefusal,
+                    "exact_state_unavailable",
+                    "exact app-runtime state is unavailable while offline or before refresh",
+                )
+            })?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let group = participant
             .app
             .group(&participant.account_id, &group_id_hex)
             .map_err(app_error)?
             .ok_or_else(|| SubjectError::new("unknown_group", "group projection is missing"))?;
-        let canonical_state = participant
-            .cached_exact
-            .get(&group_label)
-            .cloned()
-            .ok_or_else(|| {
-                SubjectError::new(
-                    "exact_state_unavailable",
-                    "exact app-runtime state has not been refreshed",
-                )
-            })?;
         let members = participant
             .cached_members
             .get(&group_label)
@@ -1530,11 +1537,18 @@ mod tests {
                 "main".into(),
                 ConformanceCanonicalStateSnapshot::Live(Box::default()),
             );
+        harness.active_scenario_group = Some("main".into());
+        harness
+            .scenario_groups
+            .insert("main".into(), GroupId::new(vec![1]));
         harness.set_online("alice", false).await.unwrap();
         assert!(
             harness.participants["alice"].cached_exact.is_empty(),
             "offline observations must not reuse an earlier exact snapshot"
         );
+        let error = harness.layered_observation("alice").unwrap_err();
+        assert_eq!(error.code, "exact_state_unavailable");
+        assert_eq!(error.category, SubjectFailureCategory::ExpectedRefusal);
         harness.set_online("bob", false).await.unwrap();
     }
 }

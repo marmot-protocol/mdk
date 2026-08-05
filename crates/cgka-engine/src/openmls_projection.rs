@@ -2877,9 +2877,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
             });
             // The exact parent GroupContext match above re-confirms the
-            // lineage before the anchor rollforward. Keep that fact explicit
-            // for a subsequent stamped own commit in the same path.
-            prefix_canonical = true;
+            // lineage before the anchor rollforward. `prefix_canonical` was
+            // already true on entry and remains true for a subsequent stamped
+            // own commit in the same path.
             continue;
         }
         let processed = match if projection.kind == OpenMlsContentKind::Commit {
@@ -3633,5 +3633,41 @@ mod own_commit_lineage_tests {
             AnchorRealizableOwnPrefix::default().resulting_epoch
         );
         assert!(prefix.commit_ids.is_empty());
+    }
+
+    #[test]
+    fn legacy_serialized_stamp_is_not_treated_as_anchor_verified() {
+        let storage = storage_with_anchor();
+        let mut record = own_commit_row(b"legacy-commit", 1);
+        let payload = StoredMessagePayload::decode(&record.payload).unwrap();
+        let message = payload.as_openmls_wire().unwrap().clone();
+        let legacy_stamp = OwnCommitConvergenceStamp {
+            parent_group_context_sha256: None,
+            resulting_group_context_sha256: None,
+            committer: MemberId::new(vec![1u8; 32]),
+            priority: CommitOrderingPriority::Privileged,
+            consumed_proposal_refs: Vec::new(),
+        };
+        record.payload = StoredMessagePayload::own_commit_wire(message, legacy_stamp)
+            .encode()
+            .unwrap();
+        storage.put_message(&record).unwrap();
+
+        let prefix = anchor_realizable_own_commit_prefix_with(
+            &storage,
+            &group_id(),
+            &result_accepting(b"legacy-commit"),
+            &BTreeSet::new(),
+            |_, _, _, stamp| Ok(own_commit_stamp_result_matches(stamp, "result")),
+        )
+        .unwrap();
+
+        assert!(prefix.commit_ids.is_empty());
+        assert_eq!(prefix.resulting_epoch, None);
+        assert_eq!(
+            storage.get_message(&record.id).unwrap(),
+            record,
+            "refusing an unverifiable legacy anchor must not mutate its durable row"
+        );
     }
 }

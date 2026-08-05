@@ -5,7 +5,9 @@
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
-use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
+use cgka_engine::message_processor::{
+    MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN, MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
+};
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
@@ -460,6 +462,46 @@ async fn deferred_peel_retries_after_epoch_advance() {
     assert_eq!(
         carol_storage.get_message(&commit3.id).unwrap().state,
         MessageState::Processed
+    );
+}
+
+/// Repeated sweeps inside one convergence drain share one candidate-context
+/// materialization budget rather than multiplying the expensive graph replay
+/// by the 16-pass convergence loop.
+#[tokio::test]
+async fn candidate_context_materialization_is_bounded_per_drain() {
+    let (mut alice, mut carol, storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let mut deferred = Vec::new();
+    for index in 0..(MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN + 1) {
+        let message = send_app(&mut alice, &group_id, &format!("opaque-{index}")).await;
+        assert!(matches!(
+            carol.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        deferred.push(message);
+    }
+
+    let before = carol.candidate_peel_context_materialization_count();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let materializations = carol
+        .candidate_peel_context_materialization_count()
+        .saturating_sub(before);
+
+    assert_eq!(
+        materializations,
+        MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN as u64
+    );
+    assert!(
+        deferred.iter().any(|message| {
+            storage
+                .get_message(&message.id)
+                .is_ok_and(|record| record.state == MessageState::PeelDeferred)
+        }),
+        "budget exhaustion must leave unattempted rows durable for a later drain"
     );
 }
 

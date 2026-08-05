@@ -5,81 +5,17 @@ use std::collections::BTreeSet;
 use cgka_conformance_simulator::lifecycle_model::{
     DecisionRouteKind, RouteBranch, RouteLifecycleState,
 };
-use cgka_conformance_simulator::reference_convergence::{
-    ReferenceCandidate, ReferenceDecisionRoute, ReferenceInput, ReferencePolicy, ReferencePriority,
-    WitnessMode, evaluate_via_route,
-};
 use cgka_conformance_simulator::{
     APP_RUNTIME_OBSERVATION_SCHEMA_VERSION, AppRuntimeHarness, AssuranceClaimRecordV1,
-    AssuranceClaimStatus, ROUTE_ASSURANCE_CLAIMS, RouteCampaignAdapter, RouteRestartCheckpoint,
-    ScenarioInputDisposition, generate_cross_route_regression_family, run_scenario_report,
+    AssuranceClaimStatus, PORTABLE_ROUTE_SCENARIO_CLAIMS, ROUTE_ASSURANCE_CLAIMS,
+    RouteCampaignAdapter, RouteRestartCheckpoint, ScenarioInputDisposition,
+    covered_claims_for_route_adapter, generate_cross_route_regression_family, run_scenario_report,
     run_scenario_report_with_subject, scenario_for_route_adapter,
 };
 #[cfg(feature = "test-policy-overrides")]
 use cgka_conformance_simulator::{EngineHarnessSubject, HarnessStorageMode};
 #[cfg(feature = "test-policy-overrides")]
 use cgka_traits::group::ProtocolProfile;
-
-fn route_input() -> ReferenceInput {
-    ReferenceInput {
-        current_tip_epoch: 3,
-        retained_anchor_epoch: 1,
-        candidates: vec![
-            ReferenceCandidate {
-                id: "ordering-winner".into(),
-                fork_epoch: 1,
-                tip_epoch: 2,
-                tip_priority: ReferencePriority::Ordinary,
-                tip_committer: vec![0],
-                tip_digest: [0; 32],
-                app_witnesses: Vec::new(),
-            },
-            ReferenceCandidate {
-                id: "deeper-winner".into(),
-                fork_epoch: 1,
-                tip_epoch: 3,
-                tip_priority: ReferencePriority::Ordinary,
-                tip_committer: vec![1],
-                tip_digest: [1; 32],
-                app_witnesses: Vec::new(),
-            },
-        ],
-        commits: Vec::new(),
-        proposals: Vec::new(),
-        app_messages: Vec::new(),
-        policy: ReferencePolicy::default(),
-        witness_mode: WitnessMode::Enabled,
-    }
-}
-
-#[test]
-fn every_decision_route_reaches_the_same_reference_result() {
-    let input = route_input();
-    let routes = [
-        ReferenceDecisionRoute::OrdinaryIngest,
-        ReferenceDecisionRoute::PairwiseForkRecovery {
-            provisional_winner: "ordering-winner".into(),
-        },
-        ReferenceDecisionRoute::StoredConvergence,
-        ReferenceDecisionRoute::RetainedHistoryReplay,
-        ReferenceDecisionRoute::CrashRestartRecovery,
-    ];
-    let results = routes
-        .into_iter()
-        .map(|route| evaluate_via_route(&input, route))
-        .collect::<Vec<_>>();
-    for result in &results {
-        assert_eq!(
-            result.canonical.selected_branch_id.as_deref(),
-            Some("deeper-winner")
-        );
-        assert_eq!(
-            result.reconsiderable_branch_ids,
-            BTreeSet::from(["ordering-winner".into()])
-        );
-        assert_eq!(result.canonical, results[0].canonical);
-    }
-}
 
 #[test]
 fn route_choice_and_restart_do_not_change_the_canonical_winner() {
@@ -138,15 +74,40 @@ fn cross_route_catalog_covers_the_full_incident_matrix_and_reopens_claims() {
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
-            ROUTE_ASSURANCE_CLAIMS
+            PORTABLE_ROUTE_SCENARIO_CLAIMS
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>()
         );
         cgka_conformance_simulator::compile_scenario(&campaign.scenario).unwrap();
+        assert_eq!(
+            covered_claims_for_route_adapter(campaign, RouteCampaignAdapter::Engine)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            ROUTE_ASSURANCE_CLAIMS
+                .iter()
+                .map(|claim| (*claim).to_owned())
+                .collect::<BTreeSet<_>>()
+        );
+        for adapter in [
+            RouteCampaignAdapter::AppRuntime,
+            RouteCampaignAdapter::Process,
+            RouteCampaignAdapter::Distributed,
+        ] {
+            assert_eq!(
+                covered_claims_for_route_adapter(campaign, adapter)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                PORTABLE_ROUTE_SCENARIO_CLAIMS
+                    .iter()
+                    .map(|claim| (*claim).to_owned())
+                    .collect::<BTreeSet<_>>()
+            );
+        }
     }
 
-    let mut claim = AssuranceClaimRecordV1::open("route-equivalence");
+    let mut claim =
+        AssuranceClaimRecordV1::open(cgka_conformance_simulator::RESTART_INVARIANCE_CLAIM);
     claim.cover(&campaigns[0].campaign_id);
     assert_eq!(claim.status, AssuranceClaimStatus::Covered);
     claim.reopen("field_counterexample");

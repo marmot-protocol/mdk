@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnCommitConvergenceStamp {
     /// SHA-256 of the confirmed parent GroupContext from which this commit was
-    /// authored. Older unstamped-parent rows decode as `None` and are not
-    /// eligible for the anchor-rollforward fast path.
+    /// authored. Older unstamped-parent rows decode as `None` and fail closed:
+    /// they remain durable but are not eligible for anchor rollforward because
+    /// the epoch-only snapshot cannot prove lineage after an upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_group_context_sha256: Option<String>,
     /// SHA-256 of the confirmed GroupContext after this commit merged. The

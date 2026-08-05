@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-04
+updated: 2026-08-05
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -25,6 +25,12 @@ then invokes an external driver using a versioned manifest and artifact-director
 unless the campaign requests behavior that the container backend cannot faithfully provide, currently block-device
 latency. Driver capability declarations make the reason for escalation reviewable. Provisioning belongs in the
 dedicated multi-VM harness rather than this repository.
+
+The VM backend has an explicit nonzero `timeout_seconds` in every manifest. That timeout applies to the external VM
+driver as a whole; the shorter runner infrastructure timeout remains limited to individual container setup and fault
+commands. Container nodes likewise receive both the upstream relay address and an explicit relay-proxy listen address,
+so orchestration does not depend on a hidden node port default. Database-contention durations must be positive whole
+seconds and are passed to `stress-ng` with its documented `s` suffix.
 
 ## Reproducibility and artifacts
 

@@ -124,6 +124,13 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     ] {
         assert!(plan.fault_commands.contains_key(barrier), "{barrier}");
     }
+    let contention = &plan.fault_commands["database-contention"][0];
+    let timeout_index = contention
+        .args
+        .iter()
+        .position(|argument| argument == "--timeout")
+        .unwrap();
+    assert_eq!(contention.args[timeout_index + 1], "5s");
     for command in plan
         .setup
         .iter()
@@ -270,6 +277,7 @@ fn vm_plan_rejects_non_utf8_argv_paths() {
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
         driver: "/tmp/driver".into(),
         driver_args: vec!["{scenario}".into()],
+        timeout_seconds: 7_200,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
     manifest.scenario.path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
@@ -293,6 +301,31 @@ fn mixed_builds_select_an_exact_image_per_participant() {
             .values()
             .all(|args| !args.iter().any(|arg| arg == "NET_ADMIN"))
     );
+    assert!(launch.args_by_participant.values().all(|args| {
+        args.windows(2).any(|window| {
+            window
+                == [
+                    "--relay-proxy-listen".to_owned(),
+                    "127.0.0.1:18080".to_owned(),
+                ]
+        })
+    }));
+}
+
+#[test]
+fn database_contention_requires_whole_second_duration() {
+    let (_root, mut manifest) = container_manifest();
+    let contention = manifest
+        .faults
+        .iter_mut()
+        .find(|fault| fault.at_barrier == "database-contention")
+        .unwrap();
+    let DistributedFaultV1::DatabaseContention { duration_ms, .. } = &mut contention.action else {
+        unreachable!();
+    };
+    *duration_ms = 1_500;
+    let error = manifest.validate().unwrap_err();
+    assert_eq!(error.code, "database_contention_duration");
 }
 
 #[test]
@@ -319,6 +352,7 @@ fn slow_block_devices_require_a_capable_vm_backend() {
             "--output".into(),
             "{output_dir}".into(),
         ],
+        timeout_seconds: 7_200,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
     manifest.validate().unwrap();
@@ -334,8 +368,29 @@ fn vm_backend_is_rejected_when_containers_can_represent_the_campaign() {
     manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
         driver: "/tmp/driver".into(),
         driver_args: Vec::new(),
+        timeout_seconds: 7_200,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::HostIsolation]),
     });
     let error = manifest.validate().unwrap_err();
     assert_eq!(error.code, "unnecessary_vm_backend");
+}
+
+#[test]
+fn vm_backend_requires_a_campaign_scale_timeout() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![ScheduledFaultV1 {
+        at_barrier: "slow-disk".into(),
+        action: DistributedFaultV1::SlowBlockDevice {
+            participant: "alice".into(),
+            latency_ms: 50,
+        },
+    }];
+    manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver: "/tmp/driver".into(),
+        driver_args: Vec::new(),
+        timeout_seconds: 0,
+        capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
+    });
+    let error = manifest.validate().unwrap_err();
+    assert_eq!(error.code, "vm_timeout");
 }

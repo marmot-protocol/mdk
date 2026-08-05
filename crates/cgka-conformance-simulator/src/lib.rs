@@ -126,9 +126,10 @@ pub use retained_relay::{
 pub use route_assurance::{
     ACTIVE_DECRYPTABILITY_CLAIM, AssuranceClaimRecordV1, AssuranceClaimStatus,
     COMPLETE_APPLICATION_DISPOSITION_CLAIM, DeeperBranch, EXACT_CRYPTOGRAPHIC_AGREEMENT_CLAIM,
-    ObserverDeliveryOrder, RECONSIDERABLE_LOSER_CLAIM, RESTART_INVARIANCE_CLAIM,
-    ROUTE_ASSURANCE_CLAIMS, ROUTE_EQUIVALENCE_CLAIM, RouteCampaignAdapter,
-    RouteEquivalenceCampaignV1, RouteRestartCheckpoint, generate_cross_route_regression_family,
+    ObserverDeliveryOrder, PORTABLE_ROUTE_SCENARIO_CLAIMS, RECONSIDERABLE_LOSER_CLAIM,
+    RESTART_INVARIANCE_CLAIM, ROUTE_ASSURANCE_CLAIMS, ROUTE_EQUIVALENCE_CLAIM,
+    RouteCampaignAdapter, RouteEquivalenceCampaignV1, RouteRestartCheckpoint,
+    covered_claims_for_route_adapter, generate_cross_route_regression_family,
     scenario_for_route_adapter,
 };
 pub use scenario::{

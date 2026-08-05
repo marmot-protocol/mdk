@@ -63,6 +63,12 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// events are never blocked behind irrelevant history.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
+/// Aggregate candidate-branch context reconstructions allowed during one
+/// convergence/outbound drain. The row-sweep and per-row retry limits bound
+/// storage work; this separate ceiling prevents the repeated sweeps in a
+/// 16-pass drain from multiplying full candidate-graph replay work.
+pub const MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN: usize = 64;
+
 /// Per-group deferred-peel retry lifecycle state (mdk#339). Held on the
 /// engine in `Engine::deferred_peel`; in-memory by design (see the field doc).
 #[derive(Default)]
@@ -103,13 +109,10 @@ impl DeferredPeelGroupState {
 
     fn note_row_persisted(&mut self) {
         self.deferred_rows += 1;
-        // The direct ingest attempt used only the canonical and retained
-        // past-epoch contexts. A newly retained ciphertext has not yet been
-        // tried against reconstructed competing branch-tip contexts, even if
-        // the group's context fingerprint itself is unchanged. Reopen the
-        // bounded sweep so this row receives that one lifecycle-governed
-        // attempt; its durable per-row fingerprint prevents repeated work.
-        self.gate = None;
+        // Do not clear the group gate here. Deferred row ids participate in
+        // the context fingerprint, so a genuinely new row changes the key and
+        // reopens the sweep without discarding an otherwise useful gate on
+        // every persistence bookkeeping call.
     }
 }
 
@@ -729,6 +732,7 @@ impl<S: StorageProvider> Engine<S> {
             monotonic_ms: now_ms,
             wall_ms: self.convergence_now().wall_ms,
         };
+        let mut candidate_context_budget = MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN;
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
                 // Discover everything decryptable under retained live and
@@ -749,7 +753,13 @@ impl<S: StorageProvider> Engine<S> {
                         })?
                         .is_some_and(|group| group.is_active());
                 if openmls_group_active {
-                    let _ = self.retry_deferred_peels_with_time(group_id, now).await?;
+                    let _ = self
+                        .retry_deferred_peels_with_time(
+                            group_id,
+                            now,
+                            &mut candidate_context_budget,
+                        )
+                        .await?;
                     if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                         return Ok(true);
                     }
@@ -766,14 +776,20 @@ impl<S: StorageProvider> Engine<S> {
                 // Retry one deferred-peel sweep first so newly available
                 // canonical context is visible. Application sends do not own
                 // this reservation and must finish catch-up before publishing.
-                let _ = self.retry_deferred_peels_with_time(group_id, now).await?;
+                let _ = self
+                    .retry_deferred_peels_with_time(group_id, now, &mut candidate_context_budget)
+                    .await?;
                 if self.convergence_fairness_slot_reserved_for_admin(group_id)? {
                     return Ok(true);
                 }
                 continue;
             }
 
-            if self.retry_deferred_peels_with_time(group_id, now).await? == 0 {
+            if self
+                .retry_deferred_peels_with_time(group_id, now, &mut candidate_context_budget)
+                .await?
+                == 0
+            {
                 return Ok(!self.has_unresolved_convergence_inputs(group_id)?);
             }
         }
@@ -785,6 +801,9 @@ impl<S: StorageProvider> Engine<S> {
     /// is actively held by queued administrative group-state work. The durable
     /// fairness bit alone is not sufficient: application sends do not own the
     /// reservation and must not use it to bypass retained inbound commits.
+    /// There is no application-send progress bound while valid
+    /// selection-relevant commits continue without bound; once that input
+    /// closes, the ordinary settled drain publishes the queued application.
     fn convergence_fairness_slot_reserved_for_admin(
         &self,
         group_id: &GroupId,
@@ -953,13 +972,16 @@ impl<S: StorageProvider> Engine<S> {
     ///   backlog never starves current-event processing.
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
         let now = self.convergence_now();
-        self.retry_deferred_peels_with_time(group_id, now).await
+        let mut candidate_context_budget = MAX_CANDIDATE_CONTEXT_MATERIALIZATIONS_PER_DRAIN;
+        self.retry_deferred_peels_with_time(group_id, now, &mut candidate_context_budget)
+            .await
     }
 
     async fn retry_deferred_peels_with_time(
         &mut self,
         group_id: &GroupId,
         now: crate::convergence_clock::ConvergenceTime,
+        candidate_context_budget: &mut usize,
     ) -> Result<usize, EngineError> {
         // A quarantined group has no epoch_manager entry, so the Stable gate
         // below would fall through and re-ingest its retained rows against
@@ -1058,10 +1080,12 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let end = (start + MAX_DEFERRED_ROWS_PER_SWEEP).min(total);
+        let mut examined_end = start;
         let mut progressed = 0usize;
         let mut terminal = 0usize;
         let mut buffered_convergence_input = false;
-        for mut record in deferred[start..end].iter().cloned() {
+        for (offset, mut record) in deferred[start..end].iter().cloned().enumerate() {
+            let row_end = start + offset + 1;
             let lifecycle = record
                 .deferred_peel
                 .as_mut()
@@ -1069,6 +1093,7 @@ impl<S: StorageProvider> Engine<S> {
             // A restart loses the in-memory group gate, but the durable row
             // still proves this exact context was already attempted.
             if lifecycle.last_context_fingerprint == Some(fingerprint) {
+                examined_end = row_end;
                 continue;
             }
             if lifecycle.distinct_context_attempts >= retry_budget {
@@ -1078,8 +1103,18 @@ impl<S: StorageProvider> Engine<S> {
                     crate::message_disposition::MessageDisposition::RetryBudgetRefused,
                 )?;
                 terminal += 1;
+                examined_end = row_end;
                 continue;
             }
+            if *candidate_context_budget == 0 {
+                // Keep the cursor on this unattempted row and schedule a later
+                // drain. This is a resource scheduling boundary, not a
+                // terminal message disposition.
+                self.schedule_pending_convergence_group(group_id);
+                break;
+            }
+            *candidate_context_budget -= 1;
+            examined_end = row_end;
             lifecycle.distinct_context_attempts =
                 lifecycle.distinct_context_attempts.saturating_add(1);
             lifecycle.last_context_fingerprint = Some(fingerprint);
@@ -1196,11 +1231,15 @@ impl<S: StorageProvider> Engine<S> {
         let queue_depth = {
             let state = self.deferred_peel.entry(group_id.clone()).or_default();
             state.cycle_progressed |= progressed > 0;
-            state.cursor = if end >= total { 0 } else { end };
+            state.cursor = if examined_end >= total {
+                0
+            } else {
+                examined_end
+            };
             // Arm the gate only after a full cycle over the backlog made no
             // progress — a bounded sweep must never permanently skip rows it
             // has not attempted under this context.
-            if end >= total && !state.cycle_progressed {
+            if examined_end >= total && !state.cycle_progressed {
                 state.gate = Some(fingerprint);
             }
             state.deferred_rows
@@ -1208,7 +1247,7 @@ impl<S: StorageProvider> Engine<S> {
         tracing::info!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
-            rows_attempted = (end - start) as u64,
+            rows_attempted = (examined_end - start) as u64,
             backlog = total as u64,
             progressed = progressed as u64,
             terminal = terminal as u64,
@@ -1287,9 +1326,19 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update((name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
         }
-        let mut candidate_rows = self
-            .storage
-            .list_messages(group_id, retained_floor)?
+        let records = self.storage.list_messages(group_id, retained_floor)?;
+        let mut deferred_row_ids = records
+            .iter()
+            .filter(|record| record.state == MessageState::PeelDeferred)
+            .map(|record| record.id.as_slice().to_vec())
+            .collect::<Vec<_>>();
+        deferred_row_ids.sort();
+        for message_id in deferred_row_ids {
+            hasher.update(b"deferred");
+            hasher.update((message_id.len() as u64).to_be_bytes());
+            hasher.update(message_id);
+        }
+        let mut candidate_rows = records
             .into_iter()
             .filter(|record| {
                 matches!(
@@ -1304,18 +1353,13 @@ impl<S: StorageProvider> Engine<S> {
                         projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
                     })
             })
-            .map(|record| {
-                (
-                    record.id.as_slice().to_vec(),
-                    crate::audit_helpers::message_state_str(record.state),
-                )
-            })
+            .map(|record| record.id.as_slice().to_vec())
             .collect::<Vec<_>>();
         candidate_rows.sort();
-        for (message_id, state) in candidate_rows {
+        for message_id in candidate_rows {
+            hasher.update(b"candidate");
             hasher.update((message_id.len() as u64).to_be_bytes());
             hasher.update(message_id);
-            hasher.update(state.as_bytes());
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&hasher.finalize());
@@ -1701,5 +1745,23 @@ mod deferred_peel_accounting_tests {
 
         state.note_row_persisted();
         assert_eq!(state.deferred_rows, 1);
+        assert_eq!(
+            state.gate, None,
+            "a newly initialized state has no gate to discard"
+        );
+    }
+
+    #[test]
+    fn persisted_row_keeps_existing_group_gate() {
+        let gate = [7_u8; 32];
+        let mut state = DeferredPeelGroupState {
+            gate: Some(gate),
+            counted: true,
+            ..Default::default()
+        };
+
+        state.note_row_persisted();
+
+        assert_eq!(state.gate, Some(gate));
     }
 }

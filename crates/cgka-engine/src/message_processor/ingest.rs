@@ -1072,6 +1072,7 @@ impl<S: StorageProvider> Engine<S> {
                                 winner,
                                 invalidated,
                                 invalidated_storage_id,
+                                ..
                             } => {
                                 pending_recovery =
                                     Some((msg_epoch, winner, invalidated, invalidated_storage_id));
@@ -2547,7 +2548,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     async fn try_peel_group_message_from_available_snapshots(
-        &self,
+        &mut self,
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
@@ -2631,6 +2632,9 @@ impl<S: StorageProvider> Engine<S> {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
         };
+        self.candidate_peel_context_materialization_count = self
+            .candidate_peel_context_materialization_count
+            .saturating_add(1);
         let branch_contexts = match stored_candidate_peel_contexts(
             &self.storage,
             group_id,
