@@ -159,6 +159,21 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
+                    // Fingerprint the state this commit just PRODUCED. The
+                    // retained anchor captured below is name-keyed by resulting
+                    // epoch and is REPLACED by every later capture at that
+                    // epoch, so an anchor's name never proves whose post-merge
+                    // state it holds. This marker is what lets a later
+                    // retained-anchor rewind positively verify it landed on
+                    // this commit's lineage
+                    // (`openmls_projection::verify_rewound_anchor_lineage`).
+                    if let Some(stamp) = own_commit_stamp.as_mut() {
+                        stamp.post_commit_tree_marker = Some(
+                            crate::openmls_projection::own_commit_post_merge_tree_marker(
+                                &mls_group,
+                            )?,
+                        );
+                    }
                 }
 
                 // Now the MLS group is at the new epoch. Mirror the Marmot
