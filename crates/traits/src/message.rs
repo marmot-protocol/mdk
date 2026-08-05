@@ -29,6 +29,22 @@ pub struct OwnCommitConvergenceStamp {
     pub priority: CommitOrderingPriority,
     /// Hex-encoded proposal references the commit consumed, in sorted order.
     pub consumed_proposal_refs: Vec<String>,
+    /// Hex-encoded fingerprint of the group state this commit PRODUCED,
+    /// captured immediately after the confirm-time merge:
+    /// `SHA-256(marker version || ciphersuite || TLS(exported ratchet tree))`
+    /// (see `cgka_engine::group_lifecycle::compute_validated_tree_marker`).
+    ///
+    /// This is the positive identity proof for the retained-anchor fast path.
+    /// Retained anchors (`openmls-retained-anchor-<N>`) are keyed by resulting
+    /// epoch ALONE and are replaced by every capture at that epoch, so an
+    /// anchor's NAME never proves whose post-merge state it holds. Rewinding
+    /// to the anchor and recomputing this marker does: it is content-bound to
+    /// the exact ratchet tree, so only the state this commit produced matches.
+    ///
+    /// `Option` because rows stamped by older engine versions predate the
+    /// field. Absent means "cannot be proven", and the fast path is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_commit_tree_marker: Option<String>,
 }
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].

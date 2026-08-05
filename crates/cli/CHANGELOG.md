@@ -65,7 +65,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   keyed by its source epoch) so a later convergence pass adopts the same
   branch everywhere, and `fork_resolution` audit rows now record the kept
   incumbent's commit digest so cross-member convergence is provable from
-  forensic logs. ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
+  forensic logs. Adopting such a branch again rewinds to a retained snapshot,
+  and that rewind is now verified against a fingerprint of the state the
+  member's own commit produced, so a snapshot that a later commit on the same
+  epoch replaced can never be mistaken for it — the reorg is refused instead of
+  installing a lineage no member ever held. Displacing the losing branch is
+  also a single durable transaction now, so an interrupted resolution can no
+  longer drop it without a trace.
+  ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
 
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed

@@ -940,6 +940,7 @@ impl<S: StorageProvider> Engine<S> {
                                 winner,
                                 invalidated,
                                 invalidated_storage_id,
+                                ..
                             } => {
                                 pending_recovery =
                                     Some((msg_epoch, winner, invalidated, invalidated_storage_id));
@@ -963,9 +964,22 @@ impl<S: StorageProvider> Engine<S> {
                                 // can still select its branch once follow-on
                                 // commits arrive — while staying out of the
                                 // linear pending replay, which would choke on
-                                // a cross-branch commit. If its branch loses
-                                // in convergence too, it is re-classified
-                                // terminal (`LosingBranch`) there.
+                                // a cross-branch commit.
+                                //
+                                // If its branch loses in convergence too, the
+                                // commit is NOT terminalized there: an
+                                // eligible-but-unselected branch's commits are
+                                // re-deferred `ConvergenceDeferred`
+                                // (`NonSelectedEligibleBranch` in
+                                // `classify_losing_materialized_candidate_commits`)
+                                // and stay reconsiderable in later passes.
+                                // (`LosingBranch` is an APP-message
+                                // invalidation reason, not a commit
+                                // disposition.) Commits go terminal only at
+                                // the rewind horizon —
+                                // `BeyondRollbackHorizon`/`BeyondAnchor`, or
+                                // the `beyond_retained_anchor` retirement in
+                                // `seed_convergence_pass_members`.
                                 //
                                 // Re-persist the full row (not just the state):
                                 // the row was stored above under this node's

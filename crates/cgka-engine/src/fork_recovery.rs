@@ -48,6 +48,11 @@ pub(crate) enum ForkResolution {
         /// `MessageId` of the now-displaced incumbent, for the storage
         /// write that parks its row `ConvergenceDeferred`.
         invalidated_storage_id: MessageId,
+        /// The row `resolve` actually re-persisted `ConvergenceDeferred`, if
+        /// any. `None` when the incumbent had no stored row to capture before
+        /// the rollback (`get_message` → `NotFound`), in which case nothing was
+        /// parked and no `message_state_changed` audit row may claim otherwise.
+        parked: Option<MessageId>,
     },
     IncumbentWins {
         /// Ordering key of the commit this node kept. Carried so the
@@ -152,7 +157,14 @@ impl ForkRecoveryManager {
             .insert((record.group_id.clone(), record.source_epoch), record);
     }
 
-    fn resolve<S: MessageStorage>(
+    /// Decide the pairwise race and, when the candidate wins, displace the
+    /// incumbent atomically.
+    ///
+    /// Bounded by `StorageProvider` rather than `MessageStorage` specifically
+    /// so the displacement can run inside `with_transaction`: capture,
+    /// rollback, re-persist and release are one durable unit. Nothing weaker
+    /// works — see the ordering comment below.
+    fn resolve<S: StorageProvider>(
         &mut self,
         storage: &S,
         group_id: &GroupId,
@@ -178,38 +190,31 @@ impl ForkRecoveryManager {
             });
         }
 
-        // Capture the incumbent's stored row BEFORE the rollback: the
-        // pre-commit snapshot predates the incumbent's own persist, so the
-        // rollback below sweeps its row away entirely. Re-persisting it
-        // afterwards (parked, see below) is what keeps the displaced branch
-        // reconsiderable.
-        let displaced_incumbent_row = match storage.get_message(&incumbent.storage_id) {
-            Ok(record) => Some(record),
-            Err(StorageError::NotFound) => None,
-            Err(e) => return Err(EngineError::Storage(e)),
-        };
-        storage.rollback_group_to_snapshot(group_id, &incumbent.snapshot_name)?;
-
-        // Ordering rationale (recoverability). The displaced row is
-        // re-persisted BEFORE the recovery snapshot is released and before
-        // the in-memory incumbent is dropped. The rollback sweeps the
-        // incumbent's row away, so a failure between rollback and re-persist
-        // must stay retryable: with this order it returns `Err` while the
-        // snapshot is still retained and `self.incumbents` still holds the
-        // record that names it, so the caller fails closed and a later
-        // resolve can redo the rollback + re-persist. Releasing or forgetting
-        // first would lose the displaced branch permanently (row swept,
-        // snapshot gone, record gone). The in-memory removal is therefore the
-        // last step — the point of no return.
+        // Atomicity rationale (durability of the displaced branch). Capture,
+        // rollback, re-persist and release are ONE durable unit.
         //
-        // The snapshot operations necessarily sit OUTSIDE any storage
-        // transaction: create/rollback/release drive their own SQLite
-        // transactions (see the boundary comment in
-        // `openmls_projection::apply_openmls_canonicalization_result_inner`).
-        // The re-persist is a single-row write and is already atomic on its
-        // own, so there is no multi-write group here worth wrapping in
-        // `with_transaction` — and this manager is generic over
-        // `MessageStorage`, which does not expose one.
+        // They have to be. The rollback sweeps the incumbent's stored row away
+        // (the pre-commit snapshot predates that row's own persist), so if the
+        // re-persist failed on its own the displaced branch would be gone with
+        // no way back: a later `resolve` cannot repair it, because (1) the
+        // rollback already removed the row so the capture would read
+        // `NotFound` and silently park nothing, and (2) there typically IS no
+        // later resolve — storage now sits at the pre-incumbent epoch, so a
+        // redelivery of the same candidate applies cleanly with no WrongEpoch
+        // and no fork resolution at all. The branch would vanish silently.
+        //
+        // SQLite snapshot ops JOIN an outer transaction rather than driving
+        // their own (`storage_sqlite::storage::snapshots::
+        // snapshot_rollback_joins_outer_transaction` /
+        // `snapshot_create_joins_outer_transaction`), which is what makes this
+        // grouping possible; `apply_openmls_canonicalization_result` relies on
+        // the same property. A failure anywhere inside therefore unwinds the
+        // rollback too, leaving the incumbent applied, its row intact and its
+        // snapshot retained — genuinely retryable.
+        //
+        // The in-memory `incumbents.remove` stays OUTSIDE, after the commit:
+        // it is the point of no return and must not be reached for a
+        // transaction that rolled back.
         //
         // Park the pairwise-losing incumbent `ConvergenceDeferred`, not
         // terminally `EpochInvalidated` — the mirror of the incumbent-wins
@@ -219,8 +224,19 @@ impl ForkRecoveryManager {
         // and every convergence-only node reorgs onto it. A terminal (or
         // missing) row is excluded from convergence input, so this node could
         // never materialize that branch's root and would diverge from the
-        // fleet forever. If the incumbent's branch also loses in convergence,
-        // it is re-classified terminal there (`LosingBranch`).
+        // fleet forever.
+        //
+        // If the incumbent's branch loses in convergence too, its commits are
+        // NOT terminalized there: an eligible-but-unselected branch's commits
+        // are re-deferred `ConvergenceDeferred`
+        // (`NonSelectedEligibleBranch` in
+        // `classify_losing_materialized_candidate_commits`), so they stay
+        // reconsiderable pass after pass. (`LosingBranch` is an APP-message
+        // invalidation reason, not a commit disposition.) Terminalization
+        // happens only at the rewind horizon —
+        // `BeyondRollbackHorizon`/`BeyondAnchor`, or the
+        // `beyond_retained_anchor` retirement in
+        // `seed_convergence_pass_members`.
         //
         // The row is re-keyed at the commit's SOURCE epoch (convergence
         // derives its rewind target from `record.epoch`) and its payload is
@@ -228,22 +244,41 @@ impl ForkRecoveryManager {
         // ordering stamp (`stamp_processed_own_commit_record`) that replay
         // needs to rebuild the ordering key (MLS refuses to process own
         // commits).
-        if let Some(mut record) = displaced_incumbent_row {
-            record.epoch = incumbent.source_epoch;
-            record.state = MessageState::ConvergenceDeferred;
-            storage.put_message(&record)?;
-        }
+        let snapshot_name = incumbent.snapshot_name.clone();
+        let incumbent_storage_id = incumbent.storage_id.clone();
+        let incumbent_source_epoch = incumbent.source_epoch;
+        let parked =
+            storage.with_transaction(|storage| -> Result<Option<MessageId>, EngineError> {
+                let displaced_incumbent_row = match storage.get_message(&incumbent_storage_id) {
+                    Ok(record) => Some(record),
+                    Err(StorageError::NotFound) => None,
+                    Err(e) => return Err(EngineError::Storage(e)),
+                };
+                storage.rollback_group_to_snapshot(group_id, &snapshot_name)?;
 
-        match storage.release_group_snapshot(group_id, &incumbent.snapshot_name) {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(EngineError::Storage(e)),
-        }
+                let parked = match displaced_incumbent_row {
+                    Some(mut record) => {
+                        record.epoch = incumbent_source_epoch;
+                        record.state = MessageState::ConvergenceDeferred;
+                        storage.put_message(&record)?;
+                        Some(record.id)
+                    }
+                    None => None,
+                };
+
+                match storage.release_group_snapshot(group_id, &snapshot_name) {
+                    Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                    Err(e) => return Err(EngineError::Storage(e)),
+                }
+                Ok(parked)
+            })?;
         self.incumbents.remove(&key);
 
         Ok(ForkResolution::CandidateWins {
             winner: candidate_key,
             invalidated: incumbent.ordering_key,
             invalidated_storage_id: incumbent.storage_id,
+            parked,
         })
     }
 
@@ -420,24 +455,25 @@ impl<S: StorageProvider> Engine<S> {
                 invalidated_msg_id,
             },
         );
-        if let ForkResolution::CandidateWins {
-            invalidated_storage_id,
-            ..
-        } = &resolution
-        {
+        if let ForkResolution::CandidateWins { parked, .. } = &resolution {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
-            // `ForkRecoveryManager::resolve` parked the displaced incumbent's
-            // row `ConvergenceDeferred` at its source epoch (captured before
-            // the rollback swept it); record the transition for forensics.
-            self.audit_group(
-                group_id,
-                crate::audit_helpers::message_state_changed_event(
-                    hex::encode(invalidated_storage_id.as_slice()),
-                    MessageState::ConvergenceDeferred,
-                    "fork_loser",
-                ),
-            );
+            // Record the transition for forensics — but ONLY for a row that
+            // was really re-persisted. `resolve` parks nothing when the
+            // incumbent had no stored row to capture before the rollback, and
+            // a `message_state_changed` row naming a msg_id that has no
+            // storage row would make the audit log describe a transition that
+            // never happened.
+            if let Some(parked) = parked {
+                self.audit_group(
+                    group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(parked.as_slice()),
+                        MessageState::ConvergenceDeferred,
+                        "fork_loser",
+                    ),
+                );
+            }
         }
         Ok(resolution)
     }

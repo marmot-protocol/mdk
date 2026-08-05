@@ -308,6 +308,10 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
         committer: MemberId::new(vec![0xEE; 32]),
         priority: CommitOrderingPriority::Privileged,
         consumed_proposal_refs: vec!["0a0b".into()],
+        // `None` on purpose: this is the shape of every row written before
+        // `post_commit_tree_marker` existed, and `skip_serializing_if` must
+        // keep the stored bytes byte-identical for them.
+        post_commit_tree_marker: None,
     };
     let payload = StoredMessagePayload::own_commit_wire(message.clone(), stamp.clone());
 
@@ -319,6 +323,25 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
     assert_eq!(decoded.as_openmls_wire().unwrap(), &message);
     assert_eq!(decoded.own_commit_stamp().unwrap(), &stamp);
     assert!(decoded.as_raw_transport().is_none());
+
+    // With the marker present the field round-trips; and the stored bytes of
+    // the marker-less stamp above must still decode to `None`, so rows written
+    // by older engine versions stay readable (they simply cannot use the
+    // retained-anchor fast path).
+    let marked = OwnCommitConvergenceStamp {
+        post_commit_tree_marker: Some("ab".repeat(32)),
+        ..stamp.clone()
+    };
+    let marked_payload = StoredMessagePayload::own_commit_wire(message, marked.clone());
+    let decoded_marked = StoredMessagePayload::decode(&marked_payload.encode().unwrap()).unwrap();
+    assert_eq!(decoded_marked.own_commit_stamp().unwrap(), &marked);
+    assert!(
+        decoded
+            .own_commit_stamp()
+            .unwrap()
+            .post_commit_tree_marker
+            .is_none()
+    );
 }
 
 #[test]
