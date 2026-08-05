@@ -91,6 +91,10 @@ pub struct VirtualMachineBackendV1 {
     pub driver: PathBuf,
     #[serde(default)]
     pub driver_args: Vec<String>,
+    /// Campaign-scale wall timeout for the synchronous external driver. This
+    /// is deliberately distinct from the short infrastructure-command timeout
+    /// used for setup and fault mutations.
+    pub timeout_seconds: u64,
     pub capabilities: BTreeSet<VirtualMachineCapabilityV1>,
 }
 
@@ -245,6 +249,12 @@ impl DistributedCampaignManifestV1 {
                         "virtual-machine backend requires an external driver",
                     ));
                 }
+                if vm.timeout_seconds == 0 {
+                    return Err(RunnerError::validation(
+                        "vm_timeout",
+                        "virtual-machine campaign timeout must be nonzero",
+                    ));
+                }
                 let required = self.required_vm_capabilities();
                 if required.is_empty() {
                     return Err(RunnerError::validation(
@@ -327,6 +337,12 @@ impl DistributedFaultV1 {
                 "fault_magnitude",
                 "disk fault magnitudes and contention workers must be nonzero",
             )),
+            Self::DatabaseContention { duration_ms, .. } if duration_ms % 1_000 != 0 => {
+                Err(RunnerError::validation(
+                    "database_contention_duration",
+                    "database contention duration must be a whole number of seconds",
+                ))
+            }
             _ => Ok(()),
         }
     }

@@ -13,7 +13,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::manifest::{DistributedBackendV1, DistributedCampaignManifestV1};
-use crate::plan::{DistributedExecutionPlanV1, PlannedCommandV1, build_execution_plan};
+use crate::plan::{
+    DistributedExecutionPlanV1, NODE_RELAY_PROXY_LISTEN, PlannedCommandV1, build_execution_plan,
+};
 use crate::{RunnerError, container_node_launch, verify_manifest_inputs};
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
@@ -280,7 +282,7 @@ async fn run_container_scenario(
     };
     let relay_urls = relay_labels
         .into_iter()
-        .map(|label| (label, "ws://127.0.0.1:18080".into()))
+        .map(|label| (label, format!("ws://{NODE_RELAY_PROXY_LISTEN}")))
         .collect::<BTreeMap<_, _>>();
     let mut orchestrator = ProcessOrchestrator::launch_with(
         node_launch,
@@ -438,7 +440,21 @@ async fn run_vm(
     let command = plan.vm_driver.as_ref().ok_or_else(|| {
         RunnerError::validation("vm_plan", "VM plan is missing its external driver")
     })?;
-    let executed = execute(command, CommandContext::default()).await;
+    let timeout_seconds = match &manifest.backend {
+        DistributedBackendV1::VirtualMachine(vm) => vm.timeout_seconds,
+        DistributedBackendV1::Container(_) => {
+            return Err(RunnerError::validation(
+                "vm_backend",
+                "VM runner requires a virtual-machine backend",
+            ));
+        }
+    };
+    let executed = execute_with_timeout(
+        command,
+        CommandContext::default(),
+        Duration::from_secs(timeout_seconds),
+    )
+    .await;
     let (command_receipts, error) = match executed {
         Ok(receipt) => (vec![receipt], None),
         Err(failure) => (failure.receipt.into_iter().collect(), Some(failure.error)),
@@ -533,6 +549,14 @@ async fn execute(
     command: &PlannedCommandV1,
     context: CommandContext<'_>,
 ) -> Result<CommandReceiptV1, CommandFailure> {
+    execute_with_timeout(command, context, INFRASTRUCTURE_COMMAND_TIMEOUT).await
+}
+
+async fn execute_with_timeout(
+    command: &PlannedCommandV1,
+    context: CommandContext<'_>,
+    command_timeout: Duration,
+) -> Result<CommandReceiptV1, CommandFailure> {
     let mut args = Vec::with_capacity(command.args.len());
     for argument in &command.args {
         let mut rendered = argument.clone();
@@ -572,7 +596,7 @@ async fn execute(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let status = timeout(INFRASTRUCTURE_COMMAND_TIMEOUT, child.status())
+    let status = timeout(command_timeout, child.status())
         .await
         .map_err(|_| CommandFailure {
             error: RunnerError::validation("command_timeout", &command.purpose),
@@ -752,6 +776,7 @@ mod tests {
             DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
                 driver: "false".into(),
                 driver_args: Vec::new(),
+                timeout_seconds: 5,
                 capabilities: BTreeSet::new(),
             }),
         );

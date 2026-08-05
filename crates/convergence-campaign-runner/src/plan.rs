@@ -14,6 +14,7 @@ use crate::manifest::{
 };
 
 pub const DISTRIBUTED_EXECUTION_PLAN_VERSION: &str = "1";
+pub(crate) const NODE_RELAY_PROXY_LISTEN: &str = "127.0.0.1:18080";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedExecutionPlanV1 {
@@ -236,7 +237,12 @@ pub fn container_node_launch(
             ],
             [
                 container.node_command.clone(),
-                vec!["--relay-proxy".into(), format!("{relay}:8080")],
+                vec![
+                    "--relay-proxy".into(),
+                    format!("{relay}:8080"),
+                    "--relay-proxy-listen".into(),
+                    NODE_RELAY_PROXY_LISTEN.into(),
+                ],
             ]
             .concat(),
         ]
@@ -371,7 +377,7 @@ fn container_fault_commands(
                 "--temp-path".into(),
                 participant_state_path(participant),
                 "--timeout".into(),
-                format!("{duration_ms}ms"),
+                format!("{}s", duration_ms / 1_000),
             ],
         )],
         DistributedFaultV1::StopDatabaseContention { participant } => {
