@@ -1426,7 +1426,7 @@ mod tests {
     #[test]
     fn observation_schema_is_rejected_before_typed_observation_decoding() {
         let line = format!(
-            r#"{{"protocol":"{NODE_PROTOCOL_VERSION}","request_id":"request-1","participant":"alice","body":{{"type":"observation","action_id":"observe","observation":{{"schema_version":"1"}}}}}}"#
+            r#"{{"protocol":"{NODE_PROTOCOL_VERSION}","request_id":"request-1","participant":"alice","body":{{"type":"observation","action_id":"observe","observation":{{"schema_version":"0"}}}}}}"#
         );
         let error = decode_node_response(&line, "request-1").unwrap_err();
         assert_eq!(error.code, "node_observation_schema_mismatch");

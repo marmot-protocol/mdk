@@ -10,6 +10,14 @@ description = "Container-first and VM-delegating distributed convergence campaig
 name = "cgka-distributed-campaign"
 path = "src/main.rs"
 
+[[bin]]
+name = "cgka-conformance-node"
+path = "src/bin/cgka-conformance-node.rs"
+
+[[bin]]
+name = "cgka-conformance-relay"
+path = "src/bin/cgka-conformance-relay.rs"
+
 [dependencies]
 cgka-conformance-simulator.workspace = true
 async-trait.workspace = true
@@ -17,12 +25,15 @@ clap.workspace = true
 fs-private.workspace = true
 hex.workspace = true
 libc.workspace = true
+nostr-relay-builder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt-multi-thread", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

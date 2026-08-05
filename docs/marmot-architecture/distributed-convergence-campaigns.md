@@ -16,9 +16,16 @@ process adapter.
 ## Backend boundary
 
 Containers are the default distributed backend. They cover process isolation, retained-relay restart, participant
-restart, network partition/heal, latency, jitter, bandwidth, loss, disk pressure, database contention, and
+restart, participant-to-relay network partition/heal, latency, jitter, bandwidth, loss, disk pressure, database contention, and
 participant-specific images for mixed-build runs. Commands are constructed as argv arrays; manifests cannot inject
-shell fragments.
+shell fragments. Because container participants communicate through the relay rather than directly to one another,
+participant-to-participant partition selectors are rejected instead of recording a vacuous fault; use the VM backend
+when direct peer-network isolation is part of the scenario.
+
+The image's test relay and loopback proxy live in the campaign-runner crate. The proxy is enabled only by an explicit
+isolated-container-network flag, binds only to loopback, resolves and pins its upstream address, and rejects public,
+loopback, or otherwise non-private upstream addresses. The resulting cleartext hop is an explicitly local test
+boundary inside the runner-created OCI network, not an approved production dial path.
 
 VMs are an explicit escalation, not a parallel implementation. The MDK runner validates and normalizes the campaign,
 then invokes an external driver using a versioned manifest and artifact-directory contract. A VM manifest is rejected
@@ -41,6 +48,10 @@ Every manifest contains:
 `plan` emits the exact normalized command plan without running it. `run` first writes the normalized manifest with
 owner-only permissions, then writes the process report and distributed run receipt. Container cleanup is attempted on
 both success and failure and cleanup failures remain visible in the receipt.
+
+External container faults run immediately before the named barrier. Host crash faults are different: the runner lowers
+them into scenario-owned process crash and restart actions immediately after the named barrier, so evidence describes
+the lifecycle transition at the same deterministic schedule position on every run.
 
 Synthetic campaign manifests and reports must not contain production account ids, group ids, pubkeys, relay URLs,
 message content, ciphertext, plaintext, or key material. Incident-derived inputs remain local sensitive artifacts and

@@ -242,6 +242,7 @@ pub fn container_node_launch(
             [
                 container.node_command.clone(),
                 vec![
+                    "--allow-isolated-container-network".into(),
                     "--relay-proxy".into(),
                     format!("{relay}:8080"),
                     "--relay-proxy-listen".into(),

@@ -113,7 +113,10 @@ pub enum VirtualMachineCapabilityV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledFaultV1 {
-    /// Faults are applied before the named canonical Scenario IR barrier.
+    /// External faults are applied before the named canonical Scenario IR
+    /// barrier. `CrashParticipantHost` is the exception for the container
+    /// backend: it is lowered to process crash/restart actions immediately
+    /// after that barrier because the process lifecycle is scenario-driven.
     pub at_barrier: String,
     pub action: DistributedFaultV1,
 }
@@ -240,7 +243,7 @@ impl DistributedCampaignManifestV1 {
         }
         match &self.backend {
             DistributedBackendV1::Container(container) => {
-                validate_identifier("container_namespace", &container.namespace)?;
+                validate_container_namespace(&container.namespace)?;
                 if container.default_participant_image.trim().is_empty()
                     || container.relay_image.trim().is_empty()
                     || container.relay_command.is_empty()
@@ -274,6 +277,23 @@ impl DistributedCampaignManifestV1 {
                     return Err(RunnerError::validation(
                         "vm_required_for_block_latency",
                         "slow block-device latency requires the virtual-machine backend",
+                    ));
+                }
+                if self.faults.iter().any(|fault| {
+                    matches!(
+                        fault.action,
+                        DistributedFaultV1::NetworkPartition {
+                            peer: FaultPeerV1::Participant(_),
+                            ..
+                        } | DistributedFaultV1::NetworkHeal {
+                            peer: FaultPeerV1::Participant(_),
+                            ..
+                        }
+                    )
+                }) {
+                    return Err(RunnerError::validation(
+                        "container_participant_partition_unsupported",
+                        "container participants communicate through the relay; use a relay partition or a VM backend for participant-to-participant network faults",
                     ));
                 }
             }
@@ -406,6 +426,29 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), RunnerError> {
         return Err(RunnerError::validation(
             "unsafe_identifier",
             format!("{field} must use 1-96 safe identifier characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_container_namespace(value: &str) -> Result<(), RunnerError> {
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(RunnerError::validation(
+            "unsafe_container_namespace",
+            "container_namespace must use 1-96 Docker-safe characters and start and end with an alphanumeric character",
         ));
     }
     Ok(())

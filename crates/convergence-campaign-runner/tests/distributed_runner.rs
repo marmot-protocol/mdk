@@ -314,6 +314,37 @@ fn manifest_rejects_empty_output_and_participant_image_override() {
 }
 
 #[test]
+fn container_namespace_rejects_docker_name_separators_and_edge_punctuation() {
+    let (_root, mut manifest) = container_manifest();
+    for invalid in ["campaign:one", "-campaign", "campaign-"] {
+        let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+            unreachable!();
+        };
+        container.namespace = invalid.into();
+        assert_eq!(
+            manifest.validate().unwrap_err().code,
+            "unsafe_container_namespace"
+        );
+    }
+}
+
+#[test]
+fn container_backend_rejects_vacuous_participant_partitions() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults = vec![ScheduledFaultV1 {
+        at_barrier: "partition".into(),
+        action: DistributedFaultV1::NetworkPartition {
+            participant: "alice".into(),
+            peer: FaultPeerV1::Participant("bob".into()),
+        },
+    }];
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "container_participant_partition_unsupported"
+    );
+}
+
+#[test]
 fn mutable_container_images_require_an_explicit_local_opt_out() {
     let (_root, mut manifest) = container_manifest();
     let DistributedBackendV1::Container(container) = &mut manifest.backend else {
@@ -405,6 +436,10 @@ fn mixed_builds_select_an_exact_image_per_participant() {
             .values()
             .all(|args| !args.iter().any(|arg| arg == "NET_ADMIN"))
     );
+    assert!(launch.args_by_participant.values().all(|args| {
+        args.iter()
+            .any(|argument| argument == "--allow-isolated-container-network")
+    }));
     assert!(launch.args_by_participant.values().all(|args| {
         args.windows(2).any(|window| {
             window[0] == "--user" && window[1] != "0:0" && !window[1].starts_with("0:")

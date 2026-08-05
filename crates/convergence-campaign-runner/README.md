@@ -18,6 +18,14 @@ Commands are always built as argv arrays. Manifests do not contain shell
 fragments, credentials, key material, plaintext application payloads, or
 public relay endpoints. Campaign artifacts are written with owner-only modes.
 
+The campaign image's relay and loopback proxy executables are owned by this
+crate, not the deterministic simulator. Their cleartext socket is available
+only behind the explicit `--allow-isolated-container-network` flag: the proxy
+binds loopback, resolves and pins its upstream once per connection, and rejects
+any address outside an RFC 1918 or IPv6 unique-local container network. This is
+a test-only boundary for the runner-created isolated OCI network, never a
+general-purpose or production relay dial path.
+
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.
 

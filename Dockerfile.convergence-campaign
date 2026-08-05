@@ -10,7 +10,7 @@ COPY integrations ./integrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
-    cargo build --locked --release -p cgka-conformance-simulator \
+    cargo build --locked --release -p convergence-campaign-runner \
       --bin cgka-conformance-node --bin cgka-conformance-relay \
     && mkdir -p /campaign-bin \
     && cp target/release/cgka-conformance-node target/release/cgka-conformance-relay /campaign-bin/

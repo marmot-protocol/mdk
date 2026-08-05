@@ -12,13 +12,25 @@ struct RelayOptions {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_diagnostics();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("conformance relay failed: {error}");
+        Err(_) => {
+            tracing::error!(
+                target: "convergence_campaign_runner",
+                method = "cgka_conformance_relay_main",
+                failure = "relay_io"
+            );
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_diagnostics() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,9 +41,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .port(options.bind.port()),
     );
     relay.run().await?;
-    println!(
-        "ready ws://{}",
-        SocketAddr::new(options.advertise_ip, options.bind.port())
+    tracing::info!(
+        target: "convergence_campaign_runner",
+        method = "run_relay",
+        state = "ready",
+        loopback_advertisement = options.advertise_ip.is_loopback()
     );
     std::future::pending::<()>().await;
     Ok(())
