@@ -80,7 +80,8 @@ Options:
                            or 64-character hex public key; this must be a public
                            key, never an nsec or raw secret key
   --generate-identity      Explicitly use generated-identity onboarding (default)
-  --allow-user VALUE       Allow Marmot messages from this npub or hex account id; may repeat
+  --allow-user VALUE       Allow Marmot messages from npub/hex account ids;
+                           may repeat or contain comma-separated values
   --allow-all-users        Allow Marmot messages from any sender (explicit opt-in)
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --enable-streaming       Configure Marmot live preview streaming
@@ -815,7 +816,10 @@ enable_hermes_plugin() {
         log "would run: hermes plugins enable marmot"
         return 0
     fi
-    if run hermes plugins enable marmot; then
+    # Hermes may ask whether the plugin can override built-in tools. The
+    # installer does not grant that privileged capability, and the command
+    # must not consume a curl-piped installer's remaining source from stdin.
+    if run hermes plugins enable marmot </dev/null; then
         log "enabled Hermes plugin: marmot"
     else
         warn "could not auto-enable; run 'hermes plugins enable marmot'"
@@ -1424,44 +1428,15 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             fi
         fi
         if [ "$prompt_sender_auth" -eq 1 ]; then
-            while true; do
-                if ! user_reply="$(prompt_value "Allowed Marmot message sender npub or hex (blank to finish)" "")"; then
-                    sender_auth_not_configured_message
-                    exit 1
-                fi
-                if [ -n "$user_reply" ]; then
-                    ALLOW_USERS+=("$user_reply")
-                    continue
-                fi
-                if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
-                    break
-                fi
-                if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ]; then
-                    if prompt_yes_no "Also allow configured welcomer identity/identities to message Hermes?" "no"; then
-                        ALLOW_USERS+=("${ALLOW_WELCOMERS[@]}")
-                    else
-                        welcomer_prompt_status=$?
-                        if [ "$welcomer_prompt_status" -eq 2 ]; then
-                            sender_auth_not_configured_message
-                            exit 1
-                        fi
-                    fi
-                fi
-                if [ "${#ALLOW_USERS[@]}" -gt 0 ]; then
-                    break
-                fi
-                if prompt_yes_no "Allow Marmot messages from any sender? This sets MARMOT_ALLOW_ALL_USERS=true." "no"; then
-                    EXPLICIT_ALLOW_ALL=1
-                    break
-                else
-                    allow_all_prompt_status=$?
-                    if [ "$allow_all_prompt_status" -eq 2 ]; then
-                        sender_auth_not_configured_message
-                        exit 1
-                    fi
-                fi
-                printf 'Add at least one allowed sender or opt into allow-all before continuing.\n' >"$(prompt_tty_path)"
-            done
+            if ! user_reply="$(prompt_value "Allowed Marmot message senders, comma-separated npub or hex (blank allows all senders)" "")"; then
+                sender_auth_not_configured_message
+                exit 1
+            fi
+            if [ -n "$user_reply" ]; then
+                ALLOW_USERS+=("$user_reply")
+            else
+                EXPLICIT_ALLOW_ALL=1
+            fi
         fi
     fi
 fi
