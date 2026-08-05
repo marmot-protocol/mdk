@@ -289,24 +289,6 @@ impl EpochState {
         matches!(self, EpochState::PendingPublish(_) | EpochState::Merging(_))
     }
 
-    /// Whether this state is terminal: `Unrecoverable` needs a verified repair
-    /// path and `Disbanded` has no legal exit at all, so neither resolves on its
-    /// own.
-    ///
-    /// Terminal means *no new work is accepted*, not that accepted work is
-    /// discarded. Intents retained before the halt persist for the one legal
-    /// exit — a verified repair returns an `Unrecoverable` group to `Stable`,
-    /// and because retention stores the intent rather than ciphertext, the drain
-    /// re-prepares them under the post-repair epoch (mdk#1106). `Disbanded` is
-    /// the exception, and only because its Commit purges the queue in the same
-    /// transaction that writes the tombstone.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            EpochState::Unrecoverable(_) | EpochState::Disbanded(_)
-        )
-    }
-
     /// Whether this group is in the terminal `Unrecoverable` state and requires
     /// a repair path before it may apply or ingest more group traffic.
     pub fn is_unrecoverable(&self) -> bool {
@@ -671,7 +653,7 @@ mod tests {
                 [
                     state.is_stable(),
                     retains_outbound_work,
-                    state.is_terminal()
+                    state.is_unrecoverable() || state.is_disbanded()
                 ]
                 .iter()
                 .filter(|holds| **holds)
@@ -690,7 +672,8 @@ mod tests {
         assert!(
             !recovering.is_stable()
                 && !recovering.is_resolving_local_publish()
-                && !recovering.is_terminal(),
+                && !recovering.is_unrecoverable()
+                && !recovering.is_disbanded(),
             "Recovering must stay unclassified; classifying it is a policy change"
         );
     }
