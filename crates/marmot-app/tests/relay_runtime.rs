@@ -408,6 +408,8 @@ fn endpoint(url: &str) -> TransportEndpoint {
 }
 
 #[derive(Clone, Debug)]
+// Mirrors `src/tests.rs::TestExternalAccountSigner`; keep both shims aligned
+// when the `NostrSigner` or account-identity-proof signer traits change.
 struct TestExternalAccountSigner {
     keys: nostr::Keys,
 }
@@ -5917,6 +5919,9 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
 }
 
 #[tokio::test]
+// External signers were a distinct reported failure mode: this intentionally
+// pins `login_external_signer`, not only the shared routing helpers exercised
+// by the nsec-import regression above.
 async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_lists() {
     let publisher_dir = tempfile::tempdir().unwrap();
     let publisher_home = AccountHome::open(publisher_dir.path());
@@ -5981,22 +5986,108 @@ async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_li
 }
 
 #[tokio::test]
-async fn relay_list_edits_reject_retired_endpoints() {
+async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() {
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let publisher_home = AccountHome::open(publisher_dir.path());
+    let (_relay, publisher_app, relay_url) = mock_app(&publisher_dir).await;
+    let publisher_runtime = MarmotAppRuntime::new(publisher_app.clone());
+    let created = publisher_runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&relay_url)],
+            bootstrap_relays: vec![endpoint(&relay_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    publish_account_relay_lists_at(
+        &publisher_home,
+        &created.account.label,
+        &relay_url,
+        "wss://relay.damus.io",
+        test_unix_now_seconds() + 1,
+    )
+    .await;
+
+    let consumer_dir = tempfile::tempdir().unwrap();
+    let consumer = MarmotApp::with_relay_and_config(
+        consumer_dir.path(),
+        relay_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let fetched = consumer
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&relay_url)],
+        )
+        .await
+        .expect("configured directory relays should recover a remote KeyPackage");
+
+    assert_eq!(
+        fetched.relay_lists.nip65.relays,
+        vec!["wss://relay.damus.io"]
+    );
+    assert_eq!(
+        fetched.key_package.bytes().len(),
+        created.key_package_bytes.unwrap()
+    );
+
+    publisher_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
 
-    let result = app
+    let inbox = app
         .set_account_inbox_relays(
             "alice",
             vec![endpoint(&seed_url), endpoint("wss://relay.nostr.band")],
             vec![endpoint(&seed_url)],
         )
         .await;
-
     assert!(
-        matches!(result, Err(AppError::RelayDirectory(message)) if message.contains("retired"))
+        matches!(inbox, Err(AppError::RelayDirectory(message)) if message.contains("account relay-list declaration") && message.contains("retired"))
+    );
+
+    let bootstrap = app
+        .publish_account_relay_lists(
+            "alice",
+            AccountRelayListBootstrap::new(
+                vec![endpoint(&seed_url)],
+                vec![endpoint("wss://relay.damus.io")],
+            ),
+        )
+        .await;
+    assert!(
+        matches!(bootstrap, Err(AppError::RelayDirectory(message)) if message.contains("account relay-list publication") && message.contains("retired"))
+    );
+
+    let nip65_read = app
+        .publish_account_nip65_relay_set(
+            "alice",
+            vec![endpoint("wss://relay.nostr.band")],
+            vec![endpoint(&seed_url)],
+            vec![endpoint(&seed_url)],
+        )
+        .await;
+    assert!(
+        matches!(nip65_read, Err(AppError::RelayDirectory(message)) if message.contains("account NIP-65 read-relay declaration") && message.contains("retired"))
+    );
+
+    let nip65_write = app
+        .publish_account_nip65_relay_set(
+            "alice",
+            vec![endpoint(&seed_url)],
+            vec![endpoint("wss://relay.damus.io")],
+            vec![endpoint(&seed_url)],
+        )
+        .await;
+    assert!(
+        matches!(nip65_write, Err(AppError::RelayDirectory(message)) if message.contains("account NIP-65 write-relay declaration") && message.contains("retired"))
     );
 }
 

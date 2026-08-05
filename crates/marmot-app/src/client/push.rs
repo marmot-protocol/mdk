@@ -513,6 +513,7 @@ impl AppClient {
             .into_iter()
             .map(TransportEndpoint)
             .collect(),
+            "notification trigger relay discovery",
         ))
     }
 
