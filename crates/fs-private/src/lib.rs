@@ -218,18 +218,20 @@ pub fn prepare_directory_path(
         )
     })?;
 
-    // macOS exposes stable root aliases such as `/var -> private/var` and
-    // `/tmp -> private/tmp`. Resolve only such a first, root-owned component;
-    // every caller-controlled component below it is still opened with
-    // `O_NOFOLLOW`. Without this narrow normalization, ordinary temp-backed
-    // homes could never use the descriptor walk.
+    // Platforms spell parts of a private root through symlinks they own
+    // themselves: macOS `/var -> private/var`, and `/data/user/0 -> /data/data`
+    // inside an Android app's mount namespace. Rewrite only such verified
+    // platform aliases out of the prefix; every caller-controlled component
+    // below them is still opened with `O_NOFOLLOW`. Without this normalization,
+    // neither ordinary temp-backed homes nor an Android app's own data
+    // directory could use the descriptor walk.
     // iOS App Group APIs return the canonical `/private/...` spelling. Avoid
     // even probing its first sandbox-managed ancestor independently; the
     // complete-path open below is the authorization boundary.
     #[cfg(target_os = "ios")]
     let normalized_path: Option<PathBuf> = None;
     #[cfg(not(target_os = "ios"))]
-    let normalized_path = resolve_root_owned_alias(path)?;
+    let normalized_path = resolve_platform_directory_aliases(path, TRUSTED_PATH_IDS, inspect_path)?;
     let path = normalized_path.as_deref().unwrap_or(path);
 
     #[cfg(not(target_vendor = "apple"))]
@@ -450,41 +452,6 @@ pub fn prepare_directory_path(
         }
     }
 
-    #[cfg(not(target_os = "ios"))]
-    fn resolve_root_owned_alias(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
-        use std::os::unix::fs::MetadataExt;
-        use std::path::Component;
-
-        if !path.is_absolute() {
-            return Ok(None);
-        }
-        let mut components = path.components();
-        if components.next() != Some(Component::RootDir) {
-            return Ok(None);
-        }
-        let Some(Component::Normal(first)) = components.next() else {
-            return Ok(None);
-        };
-        let alias = Path::new("/").join(first);
-        let metadata = match std::fs::symlink_metadata(&alias) {
-            Ok(metadata) if metadata.file_type().is_symlink() => metadata,
-            Ok(_) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let root = std::fs::metadata("/")?;
-        if metadata.uid() != 0 || root.uid() != 0 || root.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing non-root-owned directory alias",
-            ));
-        }
-        let mut resolved = std::fs::canonicalize(&alias)?;
-        for component in components {
-            resolved.push(component.as_os_str());
-        }
-        Ok(Some(resolved))
-    }
-
     Ok(prepared)
 }
 
@@ -535,6 +502,219 @@ fn open_walk_anchor<T>(
             "every candidate prefix was denied",
         )
     })
+}
+
+/// Ids whose writes a private artifact path already trusts because they outrank
+/// the process: the superuser everywhere, plus the Android platform uid, which
+/// owns `/data` and builds each app's mount namespace.
+#[cfg(all(unix, not(target_os = "ios")))]
+const TRUSTED_PATH_IDS: &[u32] = if cfg!(target_os = "android") {
+    &[0, 1000]
+} else {
+    &[0]
+};
+
+/// What alias verification needs to know about one path component.
+#[cfg(all(unix, not(target_os = "ios")))]
+#[derive(Clone, Debug)]
+struct PathFacts {
+    kind: PathKind,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(all(unix, not(target_os = "ios")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PathKind {
+    Directory,
+    /// The link target exactly as stored, which may be relative.
+    Symlink(PathBuf),
+    Other,
+}
+
+/// Read one path component's facts without following a final symlink.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn inspect_path(path: &Path) -> io::Result<PathFacts> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = if metadata.file_type().is_symlink() {
+        PathKind::Symlink(std::fs::read_link(path)?)
+    } else if metadata.is_dir() {
+        PathKind::Directory
+    } else {
+        PathKind::Other
+    };
+    Ok(PathFacts {
+        kind,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+    })
+}
+
+/// Whether only `trusted` ids can modify what `facts` describes: a trusted
+/// owner, no world write, and group write only for a trusted group.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn only_trusted_ids_can_modify(facts: &PathFacts, trusted: &[u32]) -> bool {
+    trusted.contains(&facts.uid)
+        && facts.mode & 0o002 == 0
+        && (facts.mode & 0o020 == 0 || trusted.contains(&facts.gid))
+}
+
+#[cfg(all(unix, not(target_os = "ios")))]
+fn untrusted_alias(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing untrusted directory alias at {}: {reason}",
+            path.display()
+        ),
+    )
+}
+
+/// The normal components of an absolute path, or `None` if it is relative or
+/// spells any component as `.` or `..`.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn absolute_normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
+    use std::path::Component;
+
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return None;
+    }
+    components
+        .map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Verify that `/` through `directory` are real directories only `trusted` ids
+/// can modify, so no less-privileged id could have planted or could swap any of
+/// them.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn verify_trusted_directory_chain(
+    directory: &Path,
+    trusted: &[u32],
+    inspect: &mut impl FnMut(&Path) -> io::Result<PathFacts>,
+) -> io::Result<()> {
+    let Some(components) = absolute_normal_components(directory) else {
+        return Err(untrusted_alias(
+            directory,
+            "target is not a plain absolute path",
+        ));
+    };
+    let mut current = PathBuf::from("/");
+    for component in std::iter::once(None).chain(components.into_iter().map(Some)) {
+        if let Some(component) = component {
+            current.push(component);
+        }
+        let facts = inspect(&current)
+            .map_err(|error| io_context("inspect trusted path component", &current, error))?;
+        if facts.kind != PathKind::Directory {
+            return Err(untrusted_alias(&current, "component is not a directory"));
+        }
+        if !only_trusted_ids_can_modify(&facts, trusted) {
+            return Err(untrusted_alias(&current, "component is not trusted-owned"));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a symlink target against the link's own directory, keeping the
+/// result a plain absolute path.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn resolve_link_target(link: &Path, target: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut resolved = if target.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        link.parent().unwrap_or(Path::new("/")).to_owned()
+    };
+    for component in target.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => resolved.push(name),
+            // No platform alias needs `.` or `..`, and either would need its own
+            // verification pass.
+            _ => return Err(untrusted_alias(link, "target is not a plain path")),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Rewrite trusted platform directory aliases out of `path`'s prefix.
+///
+/// Platforms hand callers canonical paths whose prefix crosses a symlink the
+/// platform itself owns: macOS spells `/var -> private/var`, and inside an
+/// Android app's mount namespace `/data/user/0` is a root-owned symlink to
+/// `/data/data`. A strict `O_NOFOLLOW` walk cannot open either component, so
+/// replace it with its target — but only after verifying that nothing less
+/// privileged than `trusted` could have planted it or could swap it: the
+/// symlink is trusted-owned, and every directory above it and above its target
+/// is trusted-owned, not world-writable, and group-writable only for a trusted
+/// group. An alias that fails verification is rejected, never skipped, so the
+/// resolved path still reaches the walk with no symlink in it. The leaf is left
+/// alone: it is the artifact itself, and only `O_NOFOLLOW` decides it.
+#[cfg(all(unix, not(target_os = "ios")))]
+fn resolve_platform_directory_aliases(
+    path: &Path,
+    trusted: &[u32],
+    mut inspect: impl FnMut(&Path) -> io::Result<PathFacts>,
+) -> io::Result<Option<PathBuf>> {
+    // A relative path, or one still spelling `.`/`..`, is the caller's own
+    // validation to reject.
+    let Some(components) = absolute_normal_components(path) else {
+        return Ok(None);
+    };
+    let Some((leaf, prefix)) = components.split_last() else {
+        return Ok(None);
+    };
+
+    let mut resolved = PathBuf::from("/");
+    let mut rewritten = false;
+    let mut index = 0;
+    while index < prefix.len() {
+        resolved.push(prefix[index]);
+        index += 1;
+        let facts = match inspect(&resolved) {
+            Ok(facts) => facts,
+            // Nothing below the first missing component exists to be an alias;
+            // the walk creates it and opens it with `O_NOFOLLOW`.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(io_context(
+                    "inspect directory path component",
+                    &resolved,
+                    error,
+                ));
+            }
+        };
+        let PathKind::Symlink(target) = facts.kind else {
+            continue;
+        };
+        if !trusted.contains(&facts.uid) {
+            return Err(untrusted_alias(&resolved, "symlink is not trusted-owned"));
+        }
+        let parent = resolved.parent().unwrap_or(Path::new("/")).to_owned();
+        verify_trusted_directory_chain(&parent, trusted, &mut inspect)?;
+        let target = resolve_link_target(&resolved, &target)?;
+        verify_trusted_directory_chain(&target, trusted, &mut inspect)?;
+        resolved = target;
+        rewritten = true;
+    }
+    if !rewritten {
+        return Ok(None);
+    }
+    for remaining in &prefix[index..] {
+        resolved.push(remaining);
+    }
+    resolved.push(leaf);
+    Ok(Some(resolved))
 }
 
 fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
@@ -1218,6 +1398,228 @@ mod unix_tests {
             vec![dir.path().to_owned(), blocked.clone(), blocked.join("link")]
         );
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    /// Trusted ids for the Android app-namespace shape: superuser plus the
+    /// platform uid that owns `/data`.
+    const PLATFORM_TRUSTED_IDS: &[u32] = &[0, 1000];
+    const ALIASED_PATH: &str = "/data/user/0/pkg/files/Marmot";
+    const CANONICAL_PATH: &str = "/data/data/pkg/files/Marmot";
+
+    fn directory_facts(uid: u32, gid: u32, mode: u32) -> PathFacts {
+        PathFacts {
+            kind: PathKind::Directory,
+            uid,
+            gid,
+            mode,
+        }
+    }
+
+    fn symlink_facts(target: &str, uid: u32) -> PathFacts {
+        PathFacts {
+            kind: PathKind::Symlink(PathBuf::from(target)),
+            uid,
+            gid: uid,
+            mode: 0o777,
+        }
+    }
+
+    /// The Android app mount namespace: `/data/user/0` is a root-owned symlink
+    /// to `/data/data`, both on root-owned tmpfs, below a platform-owned
+    /// `/data`. Host tests cannot create root-owned fixtures, so alias
+    /// verification reads facts supplied by the caller.
+    fn android_namespace() -> Vec<(&'static str, PathFacts)> {
+        vec![
+            ("/", directory_facts(0, 0, 0o755)),
+            ("/data", directory_facts(1000, 1000, 0o771)),
+            ("/data/user", directory_facts(0, 0, 0o751)),
+            ("/data/user/0", symlink_facts("/data/data", 0)),
+            ("/data/data", directory_facts(0, 0, 0o751)),
+            ("/data/data/pkg", directory_facts(10491, 10491, 0o700)),
+            ("/data/data/pkg/files", directory_facts(10491, 10491, 0o771)),
+        ]
+    }
+
+    fn replacing(
+        tree: Vec<(&'static str, PathFacts)>,
+        path: &str,
+        facts: PathFacts,
+    ) -> Vec<(&'static str, PathFacts)> {
+        tree.into_iter()
+            .map(|(candidate, existing)| {
+                if candidate == path {
+                    (candidate, facts.clone())
+                } else {
+                    (candidate, existing)
+                }
+            })
+            .collect()
+    }
+
+    fn without(tree: Vec<(&'static str, PathFacts)>, path: &str) -> Vec<(&'static str, PathFacts)> {
+        tree.into_iter()
+            .filter(|(candidate, _)| *candidate != path)
+            .collect()
+    }
+
+    fn inspector(
+        tree: Vec<(&'static str, PathFacts)>,
+    ) -> impl FnMut(&Path) -> io::Result<PathFacts> {
+        move |path| {
+            tree.iter()
+                .find(|(candidate, _)| Path::new(candidate) == path)
+                .map(|(_, facts)| facts.clone())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
+    fn resolve_aliases(
+        path: &str,
+        tree: Vec<(&'static str, PathFacts)>,
+    ) -> io::Result<Option<PathBuf>> {
+        resolve_platform_directory_aliases(Path::new(path), PLATFORM_TRUSTED_IDS, inspector(tree))
+    }
+
+    #[test]
+    fn trusted_path_ids_admit_the_platform_uid_only_where_it_is_one() {
+        // Uid 1000 owns `/data` on Android but is an ordinary human user on a
+        // desktop, where trusting it would be a hole.
+        assert!(TRUSTED_PATH_IDS.contains(&0));
+        assert_eq!(
+            TRUSTED_PATH_IDS.contains(&1000),
+            cfg!(target_os = "android")
+        );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rewrites_a_trusted_platform_alias() {
+        assert_eq!(
+            resolve_aliases(ALIASED_PATH, android_namespace()).expect("trusted alias resolves"),
+            Some(PathBuf::from(CANONICAL_PATH))
+        );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_an_untrusted_alias_owner() {
+        let tree = replacing(
+            android_namespace(),
+            "/data/user/0",
+            symlink_facts("/data/data", 10491),
+        );
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("app-owned alias");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_an_untrusted_group_writable_ancestor() {
+        let tree = replacing(
+            android_namespace(),
+            "/data",
+            directory_facts(0, 2000, 0o775),
+        );
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("group-writable ancestor");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_a_world_writable_ancestor() {
+        let tree = replacing(android_namespace(), "/data", directory_facts(0, 0, 0o777));
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("world-writable ancestor");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_an_untrusted_alias_target() {
+        let tree = replacing(
+            android_namespace(),
+            "/data/data",
+            directory_facts(10491, 10491, 0o700),
+        );
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("app-owned alias target");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_trusts_only_the_ids_it_is_given() {
+        // The Android shape needs the platform uid that owns `/data`; the
+        // superuser alone must not be enough to accept it.
+        let error = resolve_platform_directory_aliases(
+            Path::new(ALIASED_PATH),
+            &[0],
+            inspector(android_namespace()),
+        )
+        .expect_err("platform-owned ancestor outside the trusted ids");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_leaves_an_alias_free_path_alone() {
+        assert_eq!(
+            resolve_aliases(CANONICAL_PATH, android_namespace()).expect("no alias to resolve"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_leaves_a_leaf_alias_to_the_walk() {
+        // The leaf is the artifact itself: only `O_NOFOLLOW` decides it.
+        assert_eq!(
+            resolve_aliases("/data/user/0", android_namespace()).expect("leaf left alone"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_keeps_components_below_a_missing_one() {
+        let tree = without(android_namespace(), "/data/data/pkg");
+        assert_eq!(
+            resolve_aliases(ALIASED_PATH, tree).expect("alias above a missing component"),
+            Some(PathBuf::from(CANONICAL_PATH))
+        );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_a_real_untrusted_symlinked_prefix() {
+        use std::os::unix::fs::symlink;
+
+        if effectively_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Canonical spelling throughout, so only ownership can reject the link.
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, base.join("link")).unwrap();
+
+        let error = resolve_platform_directory_aliases(
+            &base.join("link").join("leaf"),
+            TRUSTED_PATH_IDS,
+            inspect_path,
+        )
+        .expect_err("test-user-owned symlinked prefix");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_resolves_a_real_platform_alias() {
+        // macOS ships the one trusted-alias shape whose root ownership a host
+        // test cannot fabricate: `/var -> private/var`.
+        let Ok(metadata) = std::fs::symlink_metadata("/var") else {
+            return;
+        };
+        if !metadata.file_type().is_symlink() {
+            return;
+        }
+        assert_eq!(
+            resolve_platform_directory_aliases(
+                Path::new("/var/folders/leaf"),
+                TRUSTED_PATH_IDS,
+                inspect_path,
+            )
+            .expect("root-owned platform alias resolves"),
+            Some(PathBuf::from("/private/var/folders/leaf"))
+        );
     }
 
     #[test]
