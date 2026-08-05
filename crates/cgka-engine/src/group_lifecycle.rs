@@ -1232,6 +1232,15 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(&group_id, join_reason);
+        // The group is Stable again and its record is durable, so release any
+        // work it retained while it was held. A repair Welcome is the halted
+        // group's one legal exit (mdk#1106), and nothing else in a running
+        // process would put it back on the drain list — without this the
+        // retained intents wait for a restart. Ordinary joins take the same
+        // call rather than a `repaired_unrecoverable`-only branch: the read is
+        // conditional, a group with no retained work schedules nothing, and
+        // that leaves no re-join shape to reason about separately.
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
 
         // 9. Emit event + register for in-process dedup.
         self.events_buf

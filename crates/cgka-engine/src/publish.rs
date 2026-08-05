@@ -516,25 +516,27 @@ impl<S: StorageProvider> Engine<S> {
     /// Put a group back on the runtime's drain list when it still holds durable
     /// outbound intents.
     ///
-    /// The application payloads retained while a publication resolves are
-    /// released by the next convergence drain
-    /// (`converge_and_drain_queued_outbound_intents`), and in this process
-    /// nothing but a publish outcome arranges that: the caller gates hold the
-    /// group still while it is `PendingPublish` — ingest buffers rather than
-    /// advances the state, and the drain and send paths both return early on
-    /// non-`Stable` — so no other seam reaches the drain. (Across a restart,
-    /// session-open hydration re-arms the drain from the same durable queue
-    /// whatever state the group landed in.)
+    /// Retained application payloads are released by the next convergence drain
+    /// (`converge_and_drain_queued_outbound_intents`), and in this process only
+    /// the seam that returns the group to `Stable` arranges that. While the
+    /// group is held — `PendingPublish`, or halted `Unrecoverable` — the caller
+    /// gates keep it still: ingest buffers rather than advances the state, and
+    /// the drain and send paths both return early on non-`Stable`. So every
+    /// such seam must schedule on its way out: a publish outcome and a verified
+    /// repair Welcome through this helper, quarantine recovery
+    /// (`retry_hydrate_quarantined_group`) unconditionally because it has
+    /// already read the group. (Across a restart, session-open hydration re-arms
+    /// the drain from the same durable queue whatever state the group landed
+    /// in.)
     ///
     /// Best-effort by construction: this runs after the outcome is durable, so
-    /// a transient backend lock here must not fail an already-committed
-    /// confirm/rollback. Skipping the schedule is not free, though: the intents
-    /// stay durable, but their release then waits until unrelated traffic
-    /// happens to schedule this group or the process restarts (session-open
-    /// hydration re-arms from the same durable queue). So a failed read — which
-    /// cannot prove the queue is empty — schedules the drain anyway; a spurious
-    /// no-op pass is cheaper than a stranded payload.
-    fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
+    /// a transient backend lock here must not fail already-committed work.
+    /// Skipping the schedule is not free, though: the intents stay durable, but
+    /// their release then waits until unrelated traffic happens to schedule this
+    /// group or the process restarts. So a failed read — which cannot prove the
+    /// queue is empty — schedules the drain anyway; a spurious no-op pass is
+    /// cheaper than a stranded payload.
+    pub(crate) fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
         match self.storage.list_queued_outbound_intents(group_id) {
             Ok(retained) if !retained.is_empty() => {
                 self.schedule_pending_convergence_group(group_id);
@@ -545,7 +547,7 @@ impl<S: StorageProvider> Engine<S> {
                     target: "cgka_engine::publish",
                     method = "schedule_drain_for_retained_outbound_intents",
                     transient = error.is_transient(),
-                    "retained-intent read failed after a publish outcome; scheduling the drain anyway"
+                    "retained-intent read failed while returning a group to Stable; scheduling the drain anyway"
                 );
                 self.schedule_pending_convergence_group(group_id);
             }
