@@ -2169,16 +2169,17 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
     // adopting whatever the clobbered anchor happens to hold, i.e. installing a
     // lineage that never existed on any node.
     //
-    // NOTE — this is the clobbered-anchor LIVENESS limitation, not a
-    // silent-corruption path. Once the anchor is gone, the parked own commit
-    // cannot be realized at all: the anchor rewind is its only route, since MLS
+    // NOTE — once the anchor is gone, the parked own commit cannot be
+    // realized at all: the anchor rewind is its only route, since MLS
     // `process_message` refuses this device's own commits, so normal replay
-    // cannot materialize it either. X therefore fails closed and stays on its
-    // own branch, diverged from the fleet, until the rewind horizon retires the
-    // parked row and it reorgs onto whatever remains selectable. Correctness is
-    // preserved; liveness inside that window is not. Restoring it needs
-    // content-keyed retained anchors, which is shared with the convergence
-    // engine and out of scope for this fix.
+    // cannot materialize it either. Materialization runs the same lineage
+    // proof the apply does, so the pass PRUNES the unrealizable branch,
+    // terminalizes the parked row, and settles on the branch X already
+    // holds — leaving X live (later commits apply, own sends work) though
+    // diverged from the fleet's A-branch until depth or a re-add reconverges
+    // them. Correctness is preserved: no wrong lineage is ever installed.
+    // Content-keyed retained anchors would remove the divergence entirely and
+    // stay out of scope for this fix.
     use cgka_traits::ingest::IngestOutcome;
 
     let first = b"cwrf-first".as_slice();
@@ -2376,9 +2377,11 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
         matches!(outcome_2, IngestOutcome::Buffered { .. }),
         "the second A-branch follow-on must enter the convergence pass, got {outcome_2:?}"
     );
-    let converge = x.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+    let converge = x
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("a pass over an unrealizable branch must complete, not error");
 
-    // Whatever convergence reports, the invariant is the same: X must NOT be
+    // The pass pruned the A-branch instead of selecting it: X must NOT be
     // holding a state assembled from the clobbered anchor.
     let x_members: Vec<_> = x
         .members(&group_id)
@@ -2401,14 +2404,74 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
         3,
         "the refused rewind must leave X's live epoch untouched"
     );
-    // The parked own commit is still reconsiderable: nothing terminalized it,
-    // so once the horizon retires it (or a future engine key anchors by
-    // content) X is free to reorg.
-    let still_parked = x_storage.get_message(&commit_a.id).unwrap();
+    // The unrealizable parked own commit is terminalized by the settling
+    // pass: its anchor is provably gone (the rewind is its only route, and
+    // the lineage proof just refused that anchor), so leaving it
+    // reconsiderable would only make every future pass re-probe and re-prune
+    // its branch until the horizon retired it anyway.
+    let parked_after = x_storage.get_message(&commit_a.id).unwrap();
     assert_eq!(
-        still_parked.state,
-        MessageState::ConvergenceDeferred,
-        "failing closed must not terminalize the parked own commit"
+        parked_after.state,
+        MessageState::EpochInvalidated,
+        "the unrealizable own commit must be terminalized, not left to re-probe forever"
+    );
+
+    // LIVENESS REGRESSION (PR #1236 review): the pruned pass must leave the
+    // group fully usable — this is what the wedge broke. (a) Repeated passes
+    // keep completing without error and without moving the tip.
+    for _ in 0..2 {
+        x.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .expect("later passes over the settled state must complete");
+    }
+    assert_eq!(x.epoch(&group_id).unwrap().0, 3);
+    // (b) A later inbound commit on X's current branch still applies and
+    // advances the tip.
+    let mut ivan = build_client(b"cwrf-ivan");
+    let ivan_kp = ivan.fresh_key_package().await.unwrap();
+    let rival_follow_on_2 = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![ivan_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    x.ingest(route(rival_follow_on_2)).await.unwrap();
+    x.drain_events();
+    x.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the rival's later commit must settle");
+    assert_eq!(
+        x.epoch(&group_id).unwrap().0,
+        4,
+        "X's tip must advance again after the unrealizable branch is pruned"
+    );
+    // (c) X's own sends work again — the wedge made these fail with a
+    // converge-inputs backend error.
+    let mut judy = build_client(b"cwrf-judy");
+    let judy_kp = judy.fresh_key_package().await.unwrap();
+    match x
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![judy_kp],
+        })
+        .await
+        .expect("X must be able to commit on its branch again")
+    {
+        SendResult::GroupEvolution { pending, .. } => {
+            x.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected a group evolution, got {other:?}"),
+    }
+    assert_eq!(
+        x.epoch(&group_id).unwrap().0,
+        5,
+        "X's own commit must confirm and advance the tip"
     );
 }
 

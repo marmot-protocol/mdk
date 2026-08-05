@@ -24,6 +24,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- A clobbered retained anchor no longer wedges a group permanently. Branch
+  materialization now runs the same positive lineage proof as the apply stage,
+  so convergence prunes a branch whose parked own commit can no longer be
+  proven (clobbered or pre-marker anchor) instead of selecting a branch the
+  apply is guaranteed to refuse; an apply-time mismatch completes the pass
+  unapplied rather than retrying the identical selection forever. The
+  own-commit stamp marker additionally binds the full MLS GroupContext
+  (epoch, tree hash, confirmed transcript hash), so two lineages that share a
+  ratchet tree — e.g. across group-data-only commits — can no longer satisfy
+  the anchor lineage check for each other.
+
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
   formatting. The TUI group diagnostics panel no longer retains or renders raw

@@ -481,18 +481,49 @@ pub(crate) fn own_commit_stamp(
     })
 }
 
+/// Bumped whenever the marker derivation changes. Existing stamps then
+/// mismatch, so their anchors read as unprovable and the branch prunes —
+/// fail-closed, never fail-open.
+const OWN_COMMIT_POST_MERGE_MARKER_VERSION: u8 = 2;
+
 /// Fingerprint the state an own commit produced, for
 /// [`cgka_traits::message::OwnCommitConvergenceStamp::post_commit_tree_marker`].
 ///
 /// Call with the group AFTER `merge_pending_commit`. The ciphersuite is read
 /// from the group itself so the value recomputed at rewind time (which has no
 /// engine handle) is derived from exactly the same inputs.
+///
+/// The marker is `SHA-256(version || ciphersuite || len(GroupContext) ||
+/// TLS(GroupContext) || TLS(exported ratchet tree))`. This value does
+/// IDENTITY work — [`verify_rewound_anchor_lineage`] and the materialization
+/// rollforward accept a rewound anchor solely on its say-so — so unlike
+/// `compute_validated_tree_marker` (which certifies leaf-credential bytes for
+/// the open-time re-validation skip and deliberately hashes only the tree),
+/// it must bind the full GroupContext: epoch, tree hash, and confirmed
+/// transcript hash. A commit that leaves the ratchet tree unchanged (e.g. a
+/// group-data update) still advances the transcript, so two distinct
+/// lineages cannot share a marker the way they could share a tree.
 pub(crate) fn own_commit_post_merge_tree_marker(
     merged: &MlsGroup,
 ) -> Result<String, cgka_traits::error::EngineError> {
-    Ok(hex::encode(
-        crate::group_lifecycle::compute_validated_tree_marker(merged, merged.ciphersuite())?,
-    ))
+    let serialize_err =
+        |e: tls_codec::Error| cgka_traits::error::EngineError::Serialize(format!("{e}"));
+    let context_bytes = merged
+        .public_group()
+        .group_context()
+        .tls_serialize_detached()
+        .map_err(serialize_err)?;
+    let tree_bytes = merged
+        .export_ratchet_tree()
+        .tls_serialize_detached()
+        .map_err(serialize_err)?;
+    let mut hasher = Sha256::new();
+    hasher.update([OWN_COMMIT_POST_MERGE_MARKER_VERSION]);
+    hasher.update(u16::from(merged.ciphersuite()).to_be_bytes());
+    hasher.update((context_bytes.len() as u64).to_be_bytes());
+    hasher.update(&context_bytes);
+    hasher.update(&tree_bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Give retained proposal rows the same terminal disposition when a local
@@ -1983,16 +2014,19 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
 /// caller additionally rolls the group back to the pre-apply snapshot — so a
 /// failed proof leaves live state untouched.
 ///
-/// LIVENESS LIMITATION (deliberate, not papered over): when the anchor HAS
-/// been clobbered, the parked own commit can no longer be realized AT ALL. The
-/// anchor rewind is its only route — MLS `process_message` refuses this
-/// device's own commits, so normal replay cannot materialize it either. This
-/// node therefore fails closed and stays diverged from the branch the rest of
-/// the fleet selected until the rewind horizon retires the parked row
-/// (`BeyondRollbackHorizon` / `beyond_retained_anchor`), after which it
-/// reorgs onto whatever remains selectable. Correctness is preserved — no
-/// wrong lineage is ever installed — but liveness inside that window is not.
-/// Restoring it requires re-keying retained anchors by content rather than by
+/// LIVENESS: when the anchor HAS been clobbered, the parked own commit can no
+/// longer be realized AT ALL. The anchor rewind is its only route — MLS
+/// `process_message` refuses this device's own commits, so normal replay
+/// cannot materialize it either. Materialization runs this same proof
+/// per-branch and prunes an unprovable branch before selection, so a mismatch
+/// HERE means the anchor was clobbered between materialization and apply; the
+/// convergence driver then completes the pass unapplied instead of
+/// propagating the error (which would retry the identical selection forever
+/// and pin the tip — the wedge from the PR #1236 review), and the next pass
+/// prunes the branch at materialization and settles on what remains
+/// selectable. The node stays diverged from a fleet branch rooted at its own
+/// unrealizable commit until depth or a re-add reconverges them; removing
+/// that divergence needs retained anchors re-keyed by content rather than by
 /// epoch, which is shared with the convergence engine and out of scope here.
 fn verify_rewound_anchor_lineage<S: StorageProvider>(
     storage: &S,
@@ -2694,6 +2728,45 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 return Err(OpenMlsProjectionError::Replay(format!(
                     "own commit anchor epoch {anchor_epoch} does not match resulting epoch {resulting_epoch}"
                 )));
+            }
+            // Realizability is decided HERE, at materialization, with the same
+            // positive lineage proof the apply stage takes
+            // (`verify_rewound_anchor_lineage`): anchors are name-keyed by
+            // resulting epoch and replaced by every capture at that epoch, so
+            // the name and epoch checks above cannot see a clobber. A stamp
+            // with no marker (pre-marker row) or a marker the rewound state
+            // does not reproduce makes this branch unrealizable on this
+            // device; the Replay error prunes the branch
+            // (`probe_candidate_path` maps it to an unmaterialized candidate)
+            // so selection never nominates a branch the apply is guaranteed
+            // to refuse — that disagreement is what wedged the pass (PR #1236
+            // review).
+            //
+            // The proof is required only for NON-canonical rows — the parked
+            // displaced commits whose realization is the point of this arm.
+            // A `Processed` own commit is already applied on the live chain,
+            // the apply skips it via its already-applied prefix (never
+            // rewinding to its anchor), and its anchor here only provides
+            // replay context whose wrongness is self-limiting (subsequent
+            // commits fail to replay and the branch prunes) — so rows stamped
+            // before the marker existed (or under an older derivation) keep
+            // materializing their canonical prefix after an upgrade instead
+            // of getting their own live branch pruned and terminalized.
+            if !own_commits.is_canonical(&projection.message_digest) {
+                let Some(expected_marker) = stamp.post_commit_tree_marker.as_deref() else {
+                    return Err(OpenMlsProjectionError::Replay(format!(
+                        "own commit at epoch {source_epoch} carries no post-merge marker; \
+                         its anchor cannot be proven"
+                    )));
+                };
+                let actual_marker = own_commit_post_merge_tree_marker(&mls_group)
+                    .map_err(|e| OpenMlsProjectionError::Replay(format!("anchor marker: {e}")))?;
+                if actual_marker != expected_marker {
+                    return Err(OpenMlsProjectionError::Replay(format!(
+                        "retained anchor at epoch {resulting_epoch} does not hold this own \
+                         commit's post-merge state"
+                    )));
+                }
             }
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,

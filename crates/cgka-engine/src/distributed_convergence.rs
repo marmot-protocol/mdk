@@ -1328,7 +1328,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut completed_pass = pass.clone();
         completed_pass.phase = ConvergencePassPhase::Completed;
         completed_pass.fairness_slot_available = true;
-        let observations = self.storage.with_transaction(|storage| {
+        let apply_outcome = self.storage.with_transaction(|storage| {
             let observations = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
                 group_id,
@@ -1338,7 +1338,56 @@ impl<S: StorageProvider> Engine<S> {
             )?;
             storage.put_convergence_pass(&completed_pass)?;
             Ok::<_, OpenMlsProjectionError>(observations)
-        })?;
+        });
+        let observations = match apply_outcome {
+            Ok(observations) => observations,
+            // The selected branch is locally unrealizable: its retained anchor
+            // no longer holds the parked own commit's post-merge state (the
+            // apply's `verify_rewound_anchor_lineage` backstop caught a
+            // clobber that happened after materialization proved this
+            // branch). Propagating the error would pin the group forever —
+            // the identical pass would be retried while the tip (and with it
+            // the parked row's retirement floor, `tip - max_rewind_commits`)
+            // never moves. Instead complete the pass unapplied: the next
+            // pass's materialization runs the same lineage proof against the
+            // clobbered anchor, prunes the branch, and settles on the
+            // next-best candidate, and later commits keep applying so the
+            // horizon genuinely retires the parked row.
+            Err(OpenMlsProjectionError::AnchorLineageMismatch) => {
+                pass.phase = ConvergencePassPhase::Completed;
+                pass.fairness_slot_available = false;
+                self.storage
+                    .put_convergence_pass(&pass)
+                    .map_err(storage_projection_error)?;
+                self.audit_group_with_context(
+                    group_id,
+                    convergence_run_context(&run_id, ConvergencePhase::Blocked),
+                    marmot_forensics::AuditEventKind::ConvergenceRunState {
+                        phase: ConvergencePhase::Blocked,
+                        current_tip_epoch: Some(previous_tip.0),
+                        retained_anchor_horizon: Some(retained_anchor_epoch),
+                        reason: Some("anchor_lineage_mismatch".to_string()),
+                        error_kind: Some("anchor_lineage_mismatch".to_string()),
+                    },
+                );
+                result.selected_tip = None;
+                result.selected_fork_epoch = None;
+                result.selected_branch_id = None;
+                result.convergence_status = ConvergenceStatus::Blocked;
+                // The apply transaction unwound, so none of this pass's
+                // dispositions were persisted; returning them would let
+                // `convergence_ingest_outcome` report terminal outcomes for
+                // rows the next pass may still accept.
+                result.accepted_commits.clear();
+                result.accepted_proposals.clear();
+                result.accepted_app_messages.clear();
+                result.dropped_messages.clear();
+                result.invalidated_app_messages.clear();
+                result.deferred_messages.clear();
+                return Ok(result);
+            }
+            Err(err) => return Err(err),
+        };
         crate::test_crash_hooks::pause_if_requested("convergence-pass-completed-durable");
         // Diagnostic only: settling-latency telemetry for the remediation
         // plan — pass open → apply, and the gap since the previous completed
