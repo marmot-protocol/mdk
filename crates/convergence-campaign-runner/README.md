@@ -19,12 +19,13 @@ fragments, credentials, key material, plaintext application payloads, or
 public relay endpoints. Campaign artifacts are written with owner-only modes.
 
 The campaign image's relay and loopback proxy executables are owned by this
-crate, not the deterministic simulator. Their cleartext socket is available
-only behind the explicit `--allow-isolated-container-network` flag: the proxy
-binds loopback, resolves and pins its upstream once per connection, and rejects
-any address outside an RFC 1918 or IPv6 unique-local container network. This is
-a test-only boundary for the runner-created isolated OCI network, never a
-general-purpose or production relay dial path.
+crate, not the deterministic simulator. A container manifest must record
+`allow_cleartext_isolated_relay: true` before the runner enables this cleartext
+test hop. The proxy binds loopback and can dial only the fixed
+`marmot-campaign-relay` alias that the runner assigns to its relay on the
+isolated OCI network; it resolves and pins that authorized alias and rejects
+addresses outside an RFC 1918 or IPv6 unique-local network. This exception is
+never a general-purpose or production relay dial path.
 
 Use `cgka-distributed-campaign validate <manifest>`, then `plan` to inspect the
 normalized execution plan before `run` performs any external mutation.

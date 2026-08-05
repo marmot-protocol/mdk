@@ -37,6 +37,7 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
             runtime: OciRuntimeV1::Docker,
             namespace: "marmot-campaign-test".into(),
             allow_mutable_image_references: true,
+            allow_cleartext_isolated_relay: true,
             default_participant_image: "marmot-conformance:current".into(),
             relay_image: "marmot-conformance:current".into(),
             relay_command: vec!["cgka-conformance-relay".into()],
@@ -127,6 +128,13 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     assert_eq!(plan.backend, "container");
     assert_eq!(plan.setup.len(), 2);
     assert_eq!(plan.cleanup.len(), 2);
+    assert!(plan.setup[1].args.windows(2).any(|window| {
+        window
+            == [
+                "--network-alias".to_owned(),
+                "marmot-campaign-relay".to_owned(),
+            ]
+    }));
     for barrier in [
         "partition",
         "heal",
@@ -329,6 +337,19 @@ fn container_namespace_rejects_docker_name_separators_and_edge_punctuation() {
 }
 
 #[test]
+fn cleartext_isolated_relay_requires_manifest_level_operator_approval() {
+    let (_root, mut manifest) = container_manifest();
+    let DistributedBackendV1::Container(container) = &mut manifest.backend else {
+        unreachable!();
+    };
+    container.allow_cleartext_isolated_relay = false;
+    assert_eq!(
+        manifest.validate().unwrap_err().code,
+        "cleartext_isolated_relay_not_approved"
+    );
+}
+
+#[test]
 fn container_backend_rejects_vacuous_participant_partitions() {
     let (_root, mut manifest) = container_manifest();
     manifest.faults = vec![ScheduledFaultV1 {
@@ -438,7 +459,8 @@ fn mixed_builds_select_an_exact_image_per_participant() {
     );
     assert!(launch.args_by_participant.values().all(|args| {
         args.iter()
-            .any(|argument| argument == "--allow-isolated-container-network")
+            .any(|argument| argument == "--allow-cleartext-isolated-relay")
+            && !args.iter().any(|argument| argument == "--relay-proxy")
     }));
     assert!(launch.args_by_participant.values().all(|args| {
         args.windows(2).any(|window| {

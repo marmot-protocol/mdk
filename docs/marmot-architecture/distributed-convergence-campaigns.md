@@ -22,10 +22,12 @@ shell fragments. Because container participants communicate through the relay ra
 participant-to-participant partition selectors are rejected instead of recording a vacuous fault; use the VM backend
 when direct peer-network isolation is part of the scenario.
 
-The image's test relay and loopback proxy live in the campaign-runner crate. The proxy is enabled only by an explicit
-isolated-container-network flag, binds only to loopback, resolves and pins its upstream address, and rejects public,
-loopback, or otherwise non-private upstream addresses. The resulting cleartext hop is an explicitly local test
-boundary inside the runner-created OCI network, not an approved production dial path.
+The image's test relay and loopback proxy live in the campaign-runner crate. A container manifest must record
+`allow_cleartext_isolated_relay: true` as explicit operator approval before the runner enables the cleartext test hop.
+The proxy binds only to loopback and has no configurable upstream: it can dial only the fixed
+`marmot-campaign-relay` alias that the runner assigns to the relay on the isolated OCI network. It resolves and pins
+that authorized alias and rejects public, loopback, or otherwise non-private addresses. This is a recorded local test
+exception, not an approved production dial path.
 
 VMs are an explicit escalation, not a parallel implementation. The MDK runner validates and normalizes the campaign,
 then invokes an external driver using a versioned manifest and artifact-directory contract. A VM manifest is rejected
@@ -74,6 +76,8 @@ injectors explicitly select UID 0 together with their narrowly scoped `NET_ADMIN
 Container manifests require `NAME@sha256:DIGEST` references for the relay, default participant, and mixed-build
 overrides. A local developer using an image such as `marmot-conformance:local` must deliberately set
 `allow_mutable_image_references: true`; evidence from that run therefore cannot be mistaken for a digest-pinned run.
+Every container manifest must also deliberately set `allow_cleartext_isolated_relay: true`; omission fails validation,
+and the normalized manifest preserves that approval in the evidence bundle.
 
 Keep local or incident-derived manifests under `campaign-local/` and run artifacts under `campaign-output/` (or the
 already ignored incident directories). These paths are excluded from the Docker build context, and the campaign

@@ -52,6 +52,11 @@ pub struct ContainerBackendV1 {
     /// every image reference to carry an immutable sha256 manifest digest.
     #[serde(default)]
     pub allow_mutable_image_references: bool,
+    /// Explicit operator approval for the campaign-only cleartext hop from a
+    /// participant's loopback proxy to the runner-owned relay alias on the
+    /// isolated OCI network. This exception is never inferred or defaulted on.
+    #[serde(default)]
+    pub allow_cleartext_isolated_relay: bool,
     pub default_participant_image: String,
     pub relay_image: String,
     #[serde(default = "default_relay_command")]
@@ -244,6 +249,12 @@ impl DistributedCampaignManifestV1 {
         match &self.backend {
             DistributedBackendV1::Container(container) => {
                 validate_container_namespace(&container.namespace)?;
+                if !container.allow_cleartext_isolated_relay {
+                    return Err(RunnerError::validation(
+                        "cleartext_isolated_relay_not_approved",
+                        "container campaigns must explicitly approve the cleartext hop on the runner-owned isolated relay network",
+                    ));
+                }
                 if container.default_participant_image.trim().is_empty()
                     || container.relay_image.trim().is_empty()
                     || container.relay_command.is_empty()

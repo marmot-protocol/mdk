@@ -15,10 +15,11 @@ or convergence oracle.
 
 The campaign-only relay and loopback proxy binaries live here because they use
 real sockets. Keep real network behavior out of the deterministic simulator
-crate. The cleartext proxy is permitted only on the explicitly enabled,
-runner-created isolated container network; it must remain loopback-bound on the
-participant side, resolve and pin the private upstream address, and reject
-public or loopback upstream addresses.
+crate. The cleartext proxy is permitted only when the versioned manifest
+records explicit operator approval for the runner-created isolated container
+network. It must remain loopback-bound on the participant side and dial only
+the runner-owned relay alias, resolving and pinning a private address while
+rejecting public or loopback addresses.
 
 ## Invariants
 

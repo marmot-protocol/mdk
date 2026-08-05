@@ -7,11 +7,11 @@ use cgka_conformance_simulator::process_orchestrator::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::RunnerError;
 use crate::manifest::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
     FaultPeerV1,
 };
+use crate::{ISOLATED_RELAY_NETWORK_ALIAS, RunnerError};
 
 pub const DISTRIBUTED_EXECUTION_PLAN_VERSION: &str = "1";
 pub(crate) const NODE_RELAY_PROXY_LISTEN: &str = "127.0.0.1:18080";
@@ -149,6 +149,8 @@ fn container_plan(
                     relay.clone(),
                     "--network".into(),
                     network.clone(),
+                    "--network-alias".into(),
+                    ISOLATED_RELAY_NETWORK_ALIAS.into(),
                     "--label".into(),
                     label,
                     container.relay_image.clone(),
@@ -215,7 +217,6 @@ pub fn container_node_launch(
     };
     let runtime = container.runtime.executable();
     let network = format!("{}-network", container.namespace);
-    let relay = format!("{}-relay", container.namespace);
     let participant_user = participant_container_user()?;
     let mut args_by_participant = BTreeMap::new();
     for participant in &manifest.participants {
@@ -242,9 +243,7 @@ pub fn container_node_launch(
             [
                 container.node_command.clone(),
                 vec![
-                    "--allow-isolated-container-network".into(),
-                    "--relay-proxy".into(),
-                    format!("{relay}:8080"),
+                    "--allow-cleartext-isolated-relay".into(),
                     "--relay-proxy-listen".into(),
                     NODE_RELAY_PROXY_LISTEN.into(),
                 ],

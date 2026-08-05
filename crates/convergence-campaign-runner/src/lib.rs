@@ -13,6 +13,10 @@ pub use manifest::*;
 pub use plan::*;
 pub use runner::*;
 
+/// Runner-owned DNS alias attached only to the campaign relay container.
+pub const ISOLATED_RELAY_NETWORK_ALIAS: &str = "marmot-campaign-relay";
+pub const ISOLATED_RELAY_PORT: u16 = 8080;
+
 #[derive(Debug)]
 pub struct RunnerError {
     pub code: String,

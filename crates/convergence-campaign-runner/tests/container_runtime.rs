@@ -122,6 +122,7 @@ async fn real_container_nodes_survive_network_shaping_and_reach_exact_state() {
             runtime: OciRuntimeV1::Docker,
             namespace: format!("marmot-smoke-{}", std::process::id()),
             allow_mutable_image_references: true,
+            allow_cleartext_isolated_relay: true,
             default_participant_image: image.clone(),
             relay_image: image,
             relay_command: vec![
