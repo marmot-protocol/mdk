@@ -70,6 +70,16 @@ const HALT: &str = "halt";
 const LIVENESS: &str = "liveness";
 
 /// What the pipeline produced for an export: exactly one primary outcome.
+///
+/// Deliberately not [`fmt::Display`], unlike [`Advisory`]: half of these
+/// variants cannot be rendered from the outcome alone. [`Outcome::Accepted`]
+/// reads as whatever the CLI did with the artifact — which files it wrote, or
+/// how to persist it when no out-dir was given — and
+/// [`Outcome::InfrastructureFailure`] is a stderr line with a non-zero exit
+/// rather than a verdict on stdout. Rendering all four in the CLI's one match
+/// keeps a single source of truth for what an operator reads; a `Display` here
+/// could only cover the two variants that need no I/O, and its other arms were
+/// unreachable text describing output the CLI never produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// No incident and no liveness problem. Zero vectors.
@@ -106,19 +116,8 @@ pub struct Routing {
     pub advisories: Vec<Advisory>,
 }
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Outcome::Healthy => f.write_str("healthy: 0 vectors"),
-            Outcome::Accepted(artifact) => {
-                write!(f, "accepted: {}", artifact.vector.scenario_name)
-            }
-            Outcome::Quarantine { reason } => write!(f, "quarantine: {reason}"),
-            Outcome::InfrastructureFailure { reason } => write!(f, "error: {reason}"),
-        }
-    }
-}
-
+/// An advisory is nothing but its message, so unlike [`Outcome`] it renders
+/// losslessly here and needs no CLI knowledge to do it.
 impl fmt::Display for Advisory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "advisory ({}): {}", self.label, self.detail)
