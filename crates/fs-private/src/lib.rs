@@ -190,7 +190,8 @@ impl PreparedDirectory {
 /// complete authorized path (or deepest complete existing ancestor) with
 /// `O_NOFOLLOW_ANY`, then operate descriptor-relative below that anchor. This
 /// avoids independently opening sandbox-managed ancestors such as `/private`
-/// and `/private/var` on physical iOS. Other Unix platforms retain the
+/// and `/private/var` on physical iOS. Android anchors below the ancestors its
+/// app sandbox refuses to open, including `/`. Other Unix platforms retain the
 /// component-by-component descriptor walk from `/` or `.`.
 #[cfg(unix)]
 pub fn prepare_directory_path(
@@ -265,7 +266,28 @@ pub fn prepare_directory_path(
 
     #[cfg(target_vendor = "apple")]
     let (mut current, components, mut current_path) = open_apple_authorized_ancestor(path)?;
-    #[cfg(not(target_vendor = "apple"))]
+    // An Android app domain is denied opening `/` and the private root's
+    // system-owned parents, so the walk has to anchor deeper.
+    #[cfg(target_os = "android")]
+    let (mut current, mut current_path): (OwnedFd, PathBuf) = {
+        let start = if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        };
+        let mut options = OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let (depth, directory, anchor) =
+            open_walk_anchor(start, &components, |prefix| options.open(prefix)).map_err(
+                |error| io_context("locate openable directory-walk anchor", path, error),
+            )?;
+        components.drain(..depth);
+        (directory.into(), anchor)
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     let (mut current, mut current_path): (OwnedFd, PathBuf) = {
         let start = if path.is_absolute() {
             Path::new("/")
@@ -464,6 +486,55 @@ pub fn prepare_directory_path(
     }
 
     Ok(prepared)
+}
+
+/// Pick the descriptor-walk anchor among the prefixes of `root` joined with
+/// `components`: the shallowest prefix `open` accepts below the deepest one it
+/// denies, as its component depth, opened value, and path.
+///
+/// Probing continues past denied prefixes and stops at the first missing one.
+/// Every other rejection fails the lookup instead of descending: `O_NOFOLLOW`
+/// only guards a path's final component, so skipping a symlinked prefix would
+/// let the next, deeper probe resolve through that symlink and anchor outside
+/// the intended tree.
+#[cfg(all(unix, any(target_os = "android", test)))]
+fn open_walk_anchor<T>(
+    root: &Path,
+    components: &[std::ffi::OsString],
+    mut open: impl FnMut(&Path) -> io::Result<T>,
+) -> io::Result<(usize, T, PathBuf)> {
+    let mut prefix = root.to_owned();
+    let mut anchor: Option<(usize, T, PathBuf)> = None;
+    for depth in 0..=components.len() {
+        if depth > 0 {
+            prefix.push(&components[depth - 1]);
+        }
+        match open(&prefix) {
+            Ok(opened) if anchor.is_none() => {
+                anchor = Some((depth, opened, prefix.clone()));
+            }
+            Ok(_) => {}
+            // A denied ancestor is the only obstacle this anchor exists for,
+            // so keep descending but drop the candidates above it.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => anchor = None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            // A symlinked prefix reports ELOOP or ENOTDIR depending on the
+            // platform, and a non-directory prefix is unusable either way.
+            Err(error) => {
+                return Err(io_context(
+                    "open directory-walk anchor candidate",
+                    &prefix,
+                    error,
+                ));
+            }
+        }
+    }
+    anchor.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "every candidate prefix was denied",
+        )
+    })
 }
 
 fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
@@ -991,6 +1062,162 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
         assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {
+        walk_anchor_probing(root, components).0
+    }
+
+    /// The anchor lookup plus every prefix it probed, in order.
+    fn walk_anchor_probing(
+        root: &Path,
+        components: &[&str],
+    ) -> (io::Result<(usize, PathBuf)>, Vec<PathBuf>) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let owned: Vec<std::ffi::OsString> =
+            components.iter().map(std::ffi::OsString::from).collect();
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut probed = Vec::new();
+        let anchor = open_walk_anchor(root, &owned, |prefix| {
+            probed.push(prefix.to_owned());
+            options.open(prefix)
+        })
+        .map(|(depth, _directory, path)| (depth, path));
+        (anchor, probed)
+    }
+
+    fn effectively_root() -> bool {
+        (unsafe { libc::geteuid() }) == 0
+    }
+
+    #[test]
+    fn open_walk_anchor_descends_past_a_traverse_only_ancestor() {
+        if effectively_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        let inner = blocked.join("inner");
+        std::fs::create_dir_all(inner.join("leaf")).unwrap();
+        // Traversal without read, as Android grants on `/data`.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let anchor = walk_anchor(dir.path(), &["blocked", "inner", "leaf"]);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            anchor.expect("anchor below the traverse-only ancestor"),
+            (2, inner)
+        );
+    }
+
+    #[test]
+    fn open_walk_anchor_discards_candidates_above_a_blocked_ancestor() {
+        if effectively_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("readable").join("blocked");
+        let inner = blocked.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let anchor = walk_anchor(dir.path(), &["readable", "blocked", "inner"]);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            anchor.expect("anchor below the blocked ancestor"),
+            (3, inner)
+        );
+    }
+
+    #[test]
+    fn open_walk_anchor_keeps_the_root_when_no_ancestor_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("first").join("second")).unwrap();
+        assert_eq!(
+            walk_anchor(dir.path(), &["first", "second"]).expect("anchor at the root"),
+            (0, dir.path().to_owned())
+        );
+    }
+
+    #[test]
+    fn open_walk_anchor_stops_at_the_first_missing_component() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            walk_anchor(dir.path(), &["missing", "deeper"]).expect("anchor at the root"),
+            (0, dir.path().to_owned())
+        );
+    }
+
+    #[test]
+    fn open_walk_anchor_reports_no_anchor_when_nothing_opens() {
+        let components: Vec<std::ffi::OsString> =
+            ["a", "b"].iter().map(std::ffi::OsString::from).collect();
+        let error = open_walk_anchor(Path::new("/"), &components, |_| {
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .map(|(depth, _directory, path)| (depth, path))
+        .expect_err("no openable prefix");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn open_walk_anchor_rejects_a_symlinked_prefix_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("leaf")).unwrap();
+        let inside = dir.path().join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        symlink(&outside, inside.join("link")).unwrap();
+
+        let (anchor, probed) = walk_anchor_probing(dir.path(), &["inside", "link", "leaf"]);
+
+        let error = anchor.expect_err("symlinked prefix component");
+        assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        // Probing must stop at the symlink: the next prefix would have resolved
+        // through it and anchored under `outside`.
+        assert_eq!(
+            probed,
+            vec![dir.path().to_owned(), inside.clone(), inside.join("link")]
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn open_walk_anchor_rejects_a_symlink_below_a_denied_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        if effectively_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("leaf")).unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        symlink(&outside, blocked.join("link")).unwrap();
+        // Traversal without read, as Android grants on `/data`.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let (anchor, probed) = walk_anchor_probing(dir.path(), &["blocked", "link", "leaf"]);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = anchor.expect_err("symlink below a denied ancestor");
+        // The denial is forgiven, the symlink below it is not.
+        assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            probed,
+            vec![dir.path().to_owned(), blocked.clone(), blocked.join("link")]
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     #[test]
