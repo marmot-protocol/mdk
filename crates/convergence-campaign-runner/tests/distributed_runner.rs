@@ -130,6 +130,15 @@ fn container_plan_covers_network_restart_disk_and_contention_without_shell() {
     assert!(shape.args.contains(&"1.25%".into()));
     assert!(shape.args.contains(&"512kbit".into()));
     let partition = &plan.fault_commands["partition"];
+    assert!(partition.iter().all(|command| {
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--cap-add", "NET_ADMIN"])
+            && command.args.windows(2).any(|pair| {
+                pair[0] == "--network" && pair[1].starts_with("container:{run_token}-participant-")
+            })
+    }));
     assert!(
         partition
             .iter()
@@ -196,6 +205,12 @@ fn mixed_builds_select_an_exact_image_per_participant() {
     assert_eq!(
         launch.child_run_root.as_deref(),
         Some(std::path::Path::new("/campaign"))
+    );
+    assert!(
+        launch
+            .args_by_participant
+            .values()
+            .all(|args| !args.iter().any(|arg| arg == "NET_ADMIN"))
     );
 }
 

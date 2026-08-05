@@ -1381,6 +1381,22 @@ impl HarnessClient {
         let mut outcomes = self.tick_ingest_only().await;
         if let Some(gid) = self.default_group.clone() {
             let now_ms = self.harness_convergence_now_ms();
+            // The legacy harness shortcut represents both sides of a timer
+            // boundary in one tick. Give newly peeled inputs an explicit
+            // pre-cutoff admission point before the far-future settlement
+            // point; production and virtual-time subjects use their real
+            // single clock instant and never take this compatibility prepass.
+            if !self.virtual_time_tick_enabled
+                && let Err(e) = self
+                    .engine_mut()
+                    .advance_convergence_inputs_until_settled(&gid, 0)
+                    .await
+            {
+                outcomes.push(Err(EngineError::Backend(format!(
+                    "prepare buffered group: {e}"
+                ))));
+                return outcomes;
+            }
             match self
                 .engine_mut()
                 .advance_convergence_inputs_until_settled(&gid, now_ms)
