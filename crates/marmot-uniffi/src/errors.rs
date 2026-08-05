@@ -155,6 +155,16 @@ pub enum MarmotKitError {
     /// retry without treating the account as broken.
     #[error("external signer request was rejected or cancelled")]
     ExternalSignerRejected,
+    /// The group's outbound retention queue is full
+    /// (`MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP`), so this message was **not**
+    /// accepted and nothing was queued for it. The app layer has already
+    /// retracted the optimistic local row; this variant is typed rather than
+    /// the untyped [`MarmotKitError::Runtime`] bucket so the host can say the
+    /// group is stuck instead of reporting an opaque failure. Unlike
+    /// [`MarmotKitError::StorageBusy`] it is not worth an automatic retry: the
+    /// queue cannot drain until the group's stalled publication resolves.
+    #[error("group {group_id_hex} has too many messages waiting to be sent")]
+    GroupSendQueueFull { group_id_hex: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -296,6 +306,12 @@ impl MarmotKitError {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
             },
+            // The send was refused, not deferred: the host must be able to say
+            // so, and must not auto-retry a condition that cannot clear until
+            // the group resolves.
+            EngineError::QueuedOutboundAtCapacity { group_id } => Self::GroupSendQueueFull {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             // #484: surface transient storage lock contention as a typed,
             // app-distinguishable variant rather than flattening it into the
             // untyped `Runtime` bucket. `StorageError::is_transient()` is the
@@ -396,6 +412,24 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected DisbandingNotEnabled, got {other:?}"),
+        }
+    }
+
+    // A refused send is the one signal the retention feature owes the host: the
+    // message was not accepted at all. Flattened into `Runtime` the host cannot
+    // tell it from any other failure without string-parsing, and cannot explain
+    // to the user why the group stopped accepting messages.
+    #[test]
+    fn queued_outbound_at_capacity_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::QueuedOutboundAtCapacity {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::GroupSendQueueFull { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected GroupSendQueueFull, got {other:?}"),
         }
     }
 

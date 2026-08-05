@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
 use cgka_engine::{EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
@@ -1944,4 +1945,136 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
              drain anyway; nothing else will"
         );
     }
+}
+
+#[tokio::test]
+async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unresolved() {
+    // Retention has no deadline, and that is deliberate: a publication whose
+    // exposure is ambiguous must never be rolled back. So the state that holds
+    // the queue can hold forever — modelled here by staging a publication and
+    // never resolving it, exactly as the engine sees an ambiguous publish for
+    // which neither `confirm_published` nor `publish_failed` is ever called.
+    // Without a cap, a sender looping into that group grows the durable store
+    // without bound while every call still reports `Queued`.
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+    // The precondition the cap exists for, stated rather than inferred: the
+    // group owes a publish outcome, so it is not drainable and nothing below
+    // will release the queue. `Queued` alone would not prove this — a `Stable`
+    // group with unsettled convergence input answers `Queued` too.
+    assert!(
+        !alice.drain_pending_convergence_groups().contains(&group_id),
+        "the staged publication must still be unresolved while the queue fills"
+    );
+
+    // Up to the cap, every send is accepted and retained.
+    for i in 0..MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+        let payload = app_payload_for(&alice, &format!("retained {i}"));
+        let queued = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("send {i} below the cap must be retained: {error:?}"));
+        assert!(
+            matches!(queued, SendResult::Queued { .. }),
+            "send {i} below the cap must be retained, got {queued:?}"
+        );
+    }
+
+    // One past it, the caller is told the message was not accepted.
+    let payload = app_payload_for(&alice, "one past the cap");
+    let refused = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect_err("a send past the retention cap must be refused, not silently retained");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::QueuedOutboundAtCapacity { group_id: refused_group }
+                if refused_group == &group_id
+        ),
+        "expected a typed capacity refusal naming the group, got {refused:?}"
+    );
+    // Not transient: `is_transient` drives automatic retry loops, and this
+    // condition cannot clear until the group resolves.
+    assert!(
+        !refused.is_transient(),
+        "a full retention queue must not be retried automatically"
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP,
+        "the refusal must persist nothing and disturb nothing already retained"
+    );
+
+    // The cap refuses new work without endangering work already accepted: once
+    // the publication resolves, the whole retained backlog drains at the
+    // post-resolution epoch and the group accepts sends again.
+    alice.confirm_published(pending).await.unwrap();
+    let drain_time_epoch = alice.epoch(&group_id).unwrap();
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        drained.len(),
+        MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP,
+        "every retained intent must drain"
+    );
+    for result in drained {
+        let SendResult::ApplicationMessage {
+            msg, source_epoch, ..
+        } = result
+        else {
+            panic!("retained app-message intents drain as application messages, got {result:?}")
+        };
+        assert_eq!(
+            source_epoch, drain_time_epoch,
+            "a retained intent must be encrypted under the epoch it drains at"
+        );
+        // Capacity is reclaimed the same way it is anywhere else: the caller
+        // reports that the regenerated message reached the transport. Until
+        // then the row is still owed a delivery, so it still occupies the cap.
+        let (_, intent_id) = alice
+            .take_regenerated_queued_intent_for_message(&msg.id)
+            .expect("a drained retained intent must be attributable to its durable row");
+        alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+    }
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "confirming every drained publication must clear the retention queue"
+    );
+
+    let payload = app_payload_for(&alice, "after the group recovered");
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .expect("a recovered group must accept sends again");
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "expected a direct send once the group is stable again, got {sent:?}"
+    );
 }

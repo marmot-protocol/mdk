@@ -22,6 +22,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
   
+- Outbound messages retained while a group is resolving a stalled publication
+  are now bounded at 256 per group. Past that bound a send is refused instead of
+  queued without limit, and MarmotKit reports the typed `GroupSendQueueFull`
+  error so a host can say the group is stuck rather than surface an opaque
+  runtime failure. Messages already retained are never discarded; they still
+  publish once the group resolves.
+  
 ### Fixed
 
 - Account setup interruptions now have stable JSON recovery codes and repair

@@ -658,6 +658,7 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
+        EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::Storage(_) => "storage",
         EngineError::Peeler(_) => "peeler",

@@ -57,6 +57,35 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// backlog drains).
 pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 
+/// Per-group cap on retained outbound intents (mdk#1246). Unlike the
+/// deferred-peel cap above, these rows are not peer-mintable — every one
+/// originates from a local `send` — so this bounds a runaway local sender
+/// rather than a flood. It is enforced in `queue_outbound_intent`, the sole
+/// insertion point for the queue, so it covers both retention paths: a group
+/// resolving a locally staged publication and a `Stable` group whose
+/// convergence inputs have not settled.
+///
+/// The first of those can hold indefinitely — a publication whose exposure is
+/// ambiguous is never rolled back, and the transport fanout row that would
+/// retry it is retired at `TRANSPORT_FANOUT_RETENTION_SECS` — so without a cap
+/// a programmatic sender grows the durable store without bound while every
+/// call still reports `SendResult::Queued`.
+///
+/// Too low refuses a legitimate burst against a group that would have
+/// recovered in seconds; too high lets the queue's marginal durable footprint
+/// (each row duplicates an app-projection row the app wrote before the engine
+/// was called) grow past what a mobile device can absorb. 256 matches
+/// `MAX_PEEL_DEFERRED_ROWS_PER_GROUP` and the other per-scope retention caps in
+/// the workspace, and sits far above any plausible human burst across a stall.
+///
+/// At the cap the send is refused with
+/// [`EngineError::QueuedOutboundAtCapacity`](cgka_traits::error::EngineError::QueuedOutboundAtCapacity)
+/// so the caller learns its message was not accepted. Retention never silently
+/// drops work it already accepted — that is the difference from the
+/// deferred-peel cap, which may drop because transport redelivery is its
+/// recovery path.
+pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
+
 /// Upper bound on `PeelDeferred` rows re-attempted per retry sweep
 /// (mdk#339): a large historical backlog is worked through in slices
 /// across passes instead of holding a convergence drain hostage, so current
@@ -1350,7 +1379,13 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
         let created_at_ms = self.convergence_now_ms();
-        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len() as u64;
+        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
+        // Refuse before serializing or writing anything: the single durable
+        // write on this path is below, so a refusal here leaves nothing to
+        // compensate.
+        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
+        }
         let intent_bytes =
             serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let mut hasher = Sha256::new();
@@ -1358,7 +1393,7 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(group_id.as_slice());
         hasher.update(self.identity.self_id().as_slice());
         hasher.update(created_at_ms.to_be_bytes());
-        hasher.update(existing_count.to_be_bytes());
+        hasher.update((existing_count as u64).to_be_bytes());
         hasher.update(&intent_bytes);
         let intent_id = MessageId::new(hasher.finalize().to_vec());
         self.storage
