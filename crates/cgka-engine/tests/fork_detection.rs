@@ -22,7 +22,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
@@ -1598,6 +1598,15 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
 
 #[tokio::test]
 async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
+    candidate_win_leaves_old_incumbent_reconsiderable(false).await;
+}
+
+#[tokio::test]
+async fn legacy_own_commit_stamp_fails_closed_without_partial_reorg() {
+    candidate_win_leaves_old_incumbent_reconsiderable(true).await;
+}
+
+async fn candidate_win_leaves_old_incumbent_reconsiderable(simulate_legacy_stamp: bool) {
     // The mirror of `pairwise_incumbent_defers_to_deeper_convergence_branch`,
     // for the CANDIDATE-wins outcome of the pairwise race: node X's own
     // confirmed commit A loses to an inbound rival B and X rolls back onto B
@@ -1716,7 +1725,6 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
         b_key < a_key,
         "identity choice must make the inbound candidate win the pairwise race"
     );
-
     // (2) B arrives at X and WINS: X rolls back off A onto B (ForkRecovered).
     x.ingest(route(commit_b)).await.unwrap();
     let events = x.drain_events();
@@ -1733,7 +1741,7 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     // at its SOURCE epoch, with its stored payload (own-commit convergence
     // stamp) intact — not terminally `EpochInvalidated`, which would exclude
     // it from every later convergence pass and freeze X off the A-branch.
-    let parked = x_storage.get_message(&commit_a.id).unwrap();
+    let mut parked = x_storage.get_message(&commit_a.id).unwrap();
     assert_eq!(
         parked.state,
         MessageState::ConvergenceDeferred,
@@ -1744,7 +1752,17 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
         EpochId(1),
         "the parked incumbent must be keyed by its source epoch for the convergence rewind target"
     );
-
+    if simulate_legacy_stamp {
+        let payload = StoredMessagePayload::decode(&parked.payload).unwrap();
+        let message = payload.as_openmls_wire().unwrap().clone();
+        let mut stamp = payload.own_commit_stamp().unwrap().clone();
+        stamp.parent_group_context_sha256 = None;
+        stamp.resulting_group_context_sha256 = None;
+        parked.payload = StoredMessagePayload::own_commit_wire(message, stamp)
+            .encode()
+            .unwrap();
+        x_storage.put_message(&parked).unwrap();
+    }
     // (3) Y applied A (and never sees B), then extends the A-branch with a
     // follow-on invite from ITS epoch 2 — the A-branch is now depth 2. Y never
     // committed from epoch 1, so A routes through Y's convergence pass; drive
@@ -1783,9 +1801,33 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     );
     // Drive the pass past its quiescence window (production gets here via the
     // passage of time); the deeper A-branch must now be selected.
-    let result = x
-        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
-        .expect("reorg back onto the deeper A-branch");
+    let result = x.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+    if simulate_legacy_stamp {
+        let error = result.expect_err(
+            "an epoch-only own-commit stamp must abort the pass instead of pruning its branch",
+        );
+        assert!(
+            error.to_string().contains("own commit lineage unavailable"),
+            "unexpected fail-closed error: {error}"
+        );
+        assert_eq!(x.epoch(&group_id).unwrap(), EpochId(2));
+        let members = x
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        assert!(members.contains(&MemberId::new(pad32(b"cwin-eve"))));
+        assert!(!members.contains(&MemberId::new(pad32(b"cwin-david"))));
+        assert!(!members.contains(&MemberId::new(pad32(b"cwin-frank"))));
+        assert_eq!(
+            x_storage.get_message(&commit_a.id).unwrap().state,
+            MessageState::ConvergenceDeferred,
+            "the unverifiable branch must remain durable for authenticated repair"
+        );
+        return;
+    }
+    let result = result.expect("reorg back onto the deeper A-branch");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
     assert_eq!(

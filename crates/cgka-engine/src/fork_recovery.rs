@@ -214,6 +214,22 @@ impl ForkRecoveryManager {
         let parked =
             storage.with_transaction(|storage| -> Result<Option<MessageId>, EngineError> {
                 let mut live_messages = storage.list_messages(group_id, EpochId(0))?;
+                // The current ingest call owns the candidate row. Restoring
+                // that just-persisted `Created` row across the rewind makes
+                // the ingest retry hit durable dedup and return `Buffered`
+                // before it can apply the pairwise winner. Exclude only rows
+                // whose decoded MLS wire payload is this candidate; the
+                // retry loop immediately persists it again before applying,
+                // while every unrelated disposition remains part of this
+                // atomic transition.
+                live_messages.retain(|record| {
+                    let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                        return true;
+                    };
+                    payload
+                        .as_openmls_wire()
+                        .is_none_or(|message| message.payload.as_slice() != candidate_mls_bytes)
+                });
                 let live_queued_outbound = storage.list_queued_outbound_intents(group_id)?;
                 let mut parked = None;
 
@@ -240,9 +256,6 @@ impl ForkRecoveryManager {
                     let Some(message) = payload.as_openmls_wire() else {
                         continue;
                     };
-                    if message.payload.as_slice() == candidate_mls_bytes {
-                        continue;
-                    }
                     let Ok(projection) =
                         crate::openmls_projection::project_mls_message(&message.payload)
                     else {

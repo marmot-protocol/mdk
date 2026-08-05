@@ -519,6 +519,18 @@ fn own_commit_stamp_result_matches(
     stamp.resulting_group_context_sha256.as_deref() == Some(resulting_group_context_sha256)
 }
 
+fn require_own_commit_stamp_lineage(
+    stamp: &cgka_traits::message::OwnCommitConvergenceStamp,
+) -> Result<(), OpenMlsProjectionError> {
+    if stamp.parent_group_context_sha256.is_none() || stamp.resulting_group_context_sha256.is_none()
+    {
+        return Err(OpenMlsProjectionError::Replay(
+            "own commit lineage unavailable for retained convergence input".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Give retained proposal rows the same terminal disposition when a local
 /// commit is confirmed that stored convergence assigns when it selects that
 /// commit. The staged commit records consumed proposal references, while
@@ -1036,6 +1048,12 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 // guard at the stamp's use site keeps a diverging prefix from
                 // mis-realizing it.
                 if let Some(stamp) = own_commit_stamp {
+                    // A pre-lineage stamp proves this is an own commit MLS
+                    // cannot re-process, but cannot prove which retained
+                    // anchor produced it. Abort the complete pass instead of
+                    // pruning only this locally unverifiable branch and
+                    // selecting from a partial candidate set.
+                    require_own_commit_stamp_lineage(&stamp)?;
                     own_commits.insert_stamped(projection.message_digest, stamp);
                 }
                 commit_messages.push(StoredCommitMessage {
@@ -1183,6 +1201,7 @@ pub(crate) fn stored_candidate_peel_contexts<S: StorageProvider>(
             own_commits.insert_canonical(projection.message_digest);
         }
         if let Some(stamp) = own_commit_stamp {
+            require_own_commit_stamp_lineage(&stamp)?;
             own_commits.insert_stamped(projection.message_digest, stamp);
         }
         commits.push(StoredCommitMessage {
@@ -2831,8 +2850,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             // pre-validated result by rolling the group forward to the
             // retained anchor snapshot the confirm path captured at its
             // resulting epoch, and synthesize the CommitStaged observation
-            // from the confirm-time stamp. Any failure prunes this branch
-            // (the pre-fix behavior) rather than failing the pass.
+            // from the confirm-time stamp. Collection has already rejected a
+            // stamp without exact parent/result lineage for the complete pass;
+            // failures after that admission point reject this materialization.
             let group_epoch = mls_group.epoch().as_u64();
             if group_epoch != source_epoch {
                 return Err(OpenMlsProjectionError::Replay(format!(
