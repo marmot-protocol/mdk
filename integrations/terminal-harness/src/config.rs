@@ -168,6 +168,16 @@ pub fn load_config_with(
             .join(spec.reply_prefix)
             .join("sessions.json")
     });
+    let quic_candidates = lookup(&env_name("QUIC_CANDIDATES"))
+        .or_else(|| lookup("MARMOT_QUIC_CANDIDATES"))
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(LoadedConfig {
         harness: Config {
@@ -181,6 +191,7 @@ pub fn load_config_with(
             state_path,
             backend_timeout,
             backend_idle_timeout,
+            quic_candidates,
             spec,
         },
         home,

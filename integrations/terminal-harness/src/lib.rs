@@ -18,6 +18,24 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+/// One inbound Marmot attachment downloaded to a connector-host temp path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InvocationAttachment {
+    pub path: PathBuf,
+    pub media_type: String,
+    pub file_name: String,
+}
+
+impl fmt::Debug for InvocationAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InvocationAttachment")
+            .field("media_type_present", &!self.media_type.is_empty())
+            .field("file_name_present", &!self.file_name.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
 pub use bridge::run;
 pub use config::{ConfigSpec, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
@@ -52,6 +70,8 @@ pub struct Config {
     pub backend_timeout: Duration,
     /// Maximum backend stdout silence.
     pub backend_idle_timeout: Duration,
+    /// Optional QUIC broker candidates used for ephemeral live previews.
+    pub quic_candidates: Vec<String>,
     /// Connector identity and naming.
     pub spec: ConfigSpec,
 }
@@ -68,6 +88,7 @@ impl fmt::Debug for Config {
             .field("max_pending_per_group", &self.max_pending_per_group)
             .field("backend_timeout", &self.backend_timeout)
             .field("backend_idle_timeout", &self.backend_idle_timeout)
+            .field("quic_candidate_count", &self.quic_candidates.len())
             .field("spec", &self.spec)
             .finish_non_exhaustive()
     }
@@ -84,8 +105,12 @@ pub struct Invocation {
     pub cwd: PathBuf,
     /// Durable backend session id, when one is known.
     pub session_id: Option<String>,
+    /// Stable privacy-safe backend session name derived from the Marmot group.
+    pub session_name: String,
     /// Prompt plaintext passed only to the backend process.
     pub prompt: String,
+    /// Decrypted inbound attachments available only on the connector host.
+    pub attachments: Vec<InvocationAttachment>,
 }
 
 impl fmt::Debug for Invocation {
@@ -95,7 +120,9 @@ impl fmt::Debug for Invocation {
             .field("timeout", &self.timeout)
             .field("idle_timeout", &self.idle_timeout)
             .field("prompt_len", &self.prompt.len())
+            .field("attachment_count", &self.attachments.len())
             .field("session_present", &self.session_id.is_some())
+            .field("session_name_present", &!self.session_name.is_empty())
             .finish()
     }
 }
@@ -149,6 +176,8 @@ impl fmt::Debug for RunFailure {
 /// Completed backend output forwarded to the reply collector.
 #[derive(PartialEq, Eq)]
 pub enum RunnerEvent {
+    /// Append-only assistant text delta suitable for an ephemeral live preview.
+    Preview(String),
     /// Completed assistant text; never a thinking or tool delta.
     Text(String),
 }
@@ -156,6 +185,10 @@ pub enum RunnerEvent {
 impl fmt::Debug for RunnerEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Preview(text) => formatter
+                .debug_struct("Preview")
+                .field("text_len", &text.len())
+                .finish(),
             Self::Text(text) => formatter
                 .debug_struct("Text")
                 .field("text_len", &text.len())
@@ -167,6 +200,11 @@ impl fmt::Debug for RunnerEvent {
 /// Backend-specific command construction and event parsing boundary.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// Whether the backend consumes decrypted inbound attachments.
+    fn accepts_attachments(&self) -> bool {
+        false
+    }
+
     /// Runs one prompt and streams completed assistant text to `tx`.
     async fn run(
         &self,
@@ -193,14 +231,26 @@ mod privacy_tests {
             idle_timeout: Duration::from_secs(10),
             cwd: PathBuf::from("/secret/worktree"),
             session_id: Some("secret-session".to_owned()),
+            session_name: "secret-name".to_owned(),
             prompt: "secret prompt".to_owned(),
+            attachments: vec![InvocationAttachment {
+                path: PathBuf::from("/secret/image.png"),
+                media_type: "image/png".to_owned(),
+                file_name: "image.png".to_owned(),
+            }],
         };
         let invocation_debug = format!("{invocation:?}");
-        for secret in ["/secret", "secret-session", "secret prompt"] {
+        for secret in ["/secret", "secret-session", "secret-name", "secret prompt"] {
             assert!(!invocation_debug.contains(secret));
         }
         assert!(invocation_debug.contains("prompt_len: 13"));
         assert!(invocation_debug.contains("session_present: true"));
+
+        let attachment_debug = format!("{:?}", invocation.attachments[0]);
+        for secret in ["/secret", "image.png"] {
+            assert!(!attachment_debug.contains(secret));
+        }
+        assert!(attachment_debug.contains("media_type_present: true"));
 
         let outcome = Outcome {
             observed_session: Some("secret-session".to_owned()),

@@ -10,13 +10,20 @@ use crate::error::Result;
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
+    #[serde(default)]
+    pub(crate) session_name: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawRecord {
     Bare(String),
-    Full { session_id: String, cwd: PathBuf },
+    Full {
+        session_id: String,
+        cwd: PathBuf,
+        #[serde(default)]
+        session_name: Option<String>,
+    },
 }
 
 impl RawRecord {
@@ -25,8 +32,17 @@ impl RawRecord {
             Self::Bare(session_id) => SessionRecord {
                 session_id,
                 cwd: default_cwd.to_path_buf(),
+                session_name: None,
             },
-            Self::Full { session_id, cwd } => SessionRecord { session_id, cwd },
+            Self::Full {
+                session_id,
+                cwd,
+                session_name,
+            } => SessionRecord {
+                session_id,
+                cwd,
+                session_name,
+            },
         }
     }
 }
@@ -101,6 +117,7 @@ mod tests {
             let record = SessionRecord {
                 session_id: "ses_abc123".to_owned(),
                 cwd: home.join("proj"),
+                session_name: Some("marmot-session".to_owned()),
             };
             store.set("group1", record).await.unwrap();
         }
@@ -109,6 +126,7 @@ mod tests {
         let record = store.get("group1").await.expect("record persisted");
         assert_eq!(record.session_id, "ses_abc123");
         assert_eq!(record.cwd, home.join("proj"));
+        assert_eq!(record.session_name.as_deref(), Some("marmot-session"));
     }
 
     #[tokio::test]
@@ -123,6 +141,7 @@ mod tests {
         let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
         assert_eq!(record.cwd, home);
+        assert_eq!(record.session_name, None);
     }
 
     #[cfg(unix)]
@@ -140,6 +159,7 @@ mod tests {
                 SessionRecord {
                     session_id: "ses_private".to_owned(),
                     cwd: home,
+                    session_name: None,
                 },
             )
             .await

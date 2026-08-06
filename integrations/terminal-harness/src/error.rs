@@ -34,6 +34,9 @@ pub enum HarnessError {
     BackendIdle,
     #[error("backend stream error")]
     BackendStream,
+
+    #[error("backend protocol or version mismatch")]
+    BackendProtocolMismatch,
     #[error("backend process failed to start")]
     BackendSpawn,
     #[error("task join error")]
@@ -55,6 +58,7 @@ impl HarnessError {
             Self::BackendTimedOut => "backend_timeout",
             Self::BackendIdle => "backend_idle",
             Self::BackendStream => "backend_stream",
+            Self::BackendProtocolMismatch => "backend_protocol_mismatch",
             Self::BackendSpawn => "backend_spawn",
             Self::Join => "join",
         }

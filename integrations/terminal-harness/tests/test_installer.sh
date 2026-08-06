@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-kind="${1:?usage: test_installer.sh pi|opencode}"
+kind="${1:?usage: test_installer.sh pi|opencode|prime-agent}"
 case "$kind" in
     pi)
         env_prefix="WN_PI"
@@ -19,6 +19,14 @@ case "$kind" in
         agent_launchd="org.marmot.wn-agent.harnesses"
         agent_label="terminal-harness-agent"
         ;;
+    prime-agent)
+        env_prefix="WN_PRIME_AGENT"
+        display_name="Prime Agent"
+        default_home="$HOME/.marmot-agents/prime-agent"
+        agent_service="wn-agent-prime-agent.service"
+        agent_launchd="org.marmot.wn-agent.prime-agent"
+        agent_label="prime-agent-harness-agent"
+        ;;
     *) echo "unsupported harness: $kind" >&2; exit 64 ;;
 esac
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -33,7 +41,9 @@ idle_timeout_env="${env_prefix}_IDLE_TIMEOUT_SECS"
 request_timeout_env="${env_prefix}_REQUEST_TIMEOUT_SECS"
 max_reply_env="${env_prefix}_MAX_REPLY_BYTES"
 max_pending_env="${env_prefix}_MAX_PENDING_PER_GROUP"
-export "$bin_env=/bin/echo"
+if [ "$kind" != prime-agent ]; then
+    export "$bin_env=/bin/echo"
+fi
 allow_hex="$(printf '11%.0s' {1..32})"
 fixture_version="9.9.9"
 export FIXTURE_VERSION="$fixture_version"
@@ -73,6 +83,15 @@ stat_mode() {
     fi
 }
 
+env_file_value() {
+    local env_file="$1" name="$2"
+    bash --noprofile --norc -c '
+        name="$2"
+        . "$1"
+        printf "%s" "${!name}"
+    ' _ "$env_file" "$name"
+}
+
 run_linux_service_case() {
     local fixture_root="$1"
     local active="$2"
@@ -102,6 +121,20 @@ fixture_parent="$(mktemp -d)"
 fixture_root="$fixture_parent/fixture root"
 mkdir -p "$fixture_root"
 trap 'rm -rf "$fixture_parent"' EXIT
+if [ "$kind" = prime-agent ]; then
+    fake_prime_agent="$fixture_root/prime-agent"
+    cat >"$fake_prime_agent" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+    printf '%s\n' 'prime-agent 0.7.0'
+    exit 0
+fi
+exit 64
+EOF
+    chmod +x "$fake_prime_agent"
+    export "$bin_env=$fake_prime_agent"
+fi
+expected_harness_bin="${!bin_env}"
 mock_bin="$fixture_root/mock-bin"
 mkdir -p "$mock_bin"
 
@@ -216,6 +249,73 @@ unit_dir="$fixture_root/home/.config/systemd/user"
 grep -F "Environment=\"$timeout_env=3600\"" "$unit_dir/$harness_service" >/dev/null
 grep -F "Environment=\"$request_timeout_env=30\"" "$unit_dir/$harness_service" >/dev/null
 
+if [ "$kind" = prime-agent ]; then
+    default_daemon_socket="$fixture_root/marmot-home/dev/prime-agent.sock"
+    grep -F "Environment=\"WN_PRIME_AGENT_DAEMON_SOCKET=$default_daemon_socket\"" \
+        "$unit_dir/$harness_service" >/dev/null
+    [ "$(
+        env_file_value \
+            "$fixture_root/marmot-home/dev/$harness_binary.env" \
+            WN_PRIME_AGENT_DAEMON_SOCKET
+    )" = "$default_daemon_socket" ]
+
+    custom_daemon_socket="$fixture_root/custom-prime-agent.sock"
+    (
+        export WN_PRIME_AGENT_DAEMON_SOCKET="$custom_daemon_socket"
+        run_linux_service_case "$fixture_root" 1 "$fixture_root/systemctl-custom-daemon.log"
+    )
+    grep -F "Environment=\"WN_PRIME_AGENT_DAEMON_SOCKET=$custom_daemon_socket\"" \
+        "$unit_dir/$harness_service" >/dev/null
+    [ "$(
+        env_file_value \
+            "$fixture_root/marmot-home/dev/$harness_binary.env" \
+            WN_PRIME_AGENT_DAEMON_SOCKET
+    )" = "$custom_daemon_socket" ]
+
+    wrong_prime_agent="$fixture_root/prime-agent-wrong-version"
+    cat >"$wrong_prime_agent" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'prime-agent 0.7.1'
+EOF
+    chmod +x "$wrong_prime_agent"
+    wrong_version_status=0
+    (
+        export "$bin_env=$wrong_prime_agent"
+        run_linux_service_case "$fixture_root" 0 "$fixture_root/systemctl-wrong-version.log"
+    ) >/dev/null 2>&1 || wrong_version_status=$?
+    [ "$wrong_version_status" -ne 0 ]
+    grep -F "Prime Agent 0.7.0 is required" "$fixture_root/installer-output.log" >/dev/null
+
+    prerelease_prime_agent="$fixture_root/prime-agent-prerelease"
+    cat >"$prerelease_prime_agent" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'prime-agent 0.7.0-beta.1'
+EOF
+    chmod +x "$prerelease_prime_agent"
+    prerelease_status=0
+    (
+        export "$bin_env=$prerelease_prime_agent"
+        run_linux_service_case "$fixture_root" 0 "$fixture_root/systemctl-prerelease.log"
+    ) >/dev/null 2>&1 || prerelease_status=$?
+    [ "$prerelease_status" -ne 0 ]
+
+    (
+        export "$bin_env=$wrong_prime_agent"
+        WN_PRIME_AGENT_REQUIRED_VERSION=0.7.1 \
+            run_linux_service_case \
+                "$fixture_root" 0 "$fixture_root/systemctl-version-override.log"
+    )
+
+    # Seed a non-default daemon socket immediately before the ordinary upgrade
+    # rerun below. The rerun does not re-export this override and must preserve
+    # the private env file's prior value.
+    (
+        export WN_PRIME_AGENT_DAEMON_SOCKET="$custom_daemon_socket"
+        run_linux_service_case \
+            "$fixture_root" 1 "$fixture_root/systemctl-custom-daemon-before-upgrade.log"
+    )
+fi
+
 upgrade_log="$fixture_root/systemctl-upgrade.log"
 run_linux_service_case "$fixture_root" 1 "$upgrade_log"
 assert_log_contains "$upgrade_log" "--user enable $agent_service"
@@ -224,6 +324,16 @@ assert_log_contains "$upgrade_log" "--user enable $harness_service"
 assert_log_contains "$upgrade_log" "--user restart $harness_service"
 assert_log_excludes "$upgrade_log" "--user enable --now $agent_service"
 assert_log_excludes "$upgrade_log" "--user enable --now $harness_service"
+
+if [ "$kind" = prime-agent ]; then
+    grep -F "Environment=\"WN_PRIME_AGENT_DAEMON_SOCKET=$custom_daemon_socket\"" \
+        "$unit_dir/$harness_service" >/dev/null
+    [ "$(
+        env_file_value \
+            "$fixture_root/marmot-home/dev/$harness_binary.env" \
+            WN_PRIME_AGENT_DAEMON_SOCKET
+    )" = "$custom_daemon_socket" ]
+fi
 
 no_start_log="$fixture_root/systemctl-no-start.log"
 run_linux_service_case "$fixture_root" 1 "$no_start_log" "--no-start-$harness_binary"
@@ -253,7 +363,11 @@ MARMOT_HARNESS_SERVICE_NAME="custom-$kind" \
 assert_log_contains "$custom_log" "--user enable --now custom-$kind.service"
 [ -f "$unit_dir/custom-$kind.service" ]
 
-ln -s /bin/echo "$fixture_root/relative-$kind"
+relative_target=/bin/echo
+if [ "$kind" = prime-agent ]; then
+    relative_target="${!bin_env}"
+fi
+ln -s "$relative_target" "$fixture_root/relative-$kind"
 relative_log="$fixture_root/systemctl-relative.log"
 (
     cd "$fixture_root"
@@ -406,9 +520,15 @@ case "$installer_service_dry_run" in
     *) echo "$kind installer service dry-run did not write env file" >&2; exit 1;;
 esac
 case "$installer_service_dry_run" in
-    *"would require $display_name binary: /bin/echo"* ) ;;
+    *"would require $display_name binary: $expected_harness_bin"* ) ;;
     *) echo "$kind installer service dry-run did not validate $display_name binary" >&2; exit 1;;
 esac
+if [ "$kind" = prime-agent ]; then
+    case "$installer_service_dry_run" in
+        *"would verify Prime Agent version: 0.7.0"* ) ;;
+        *) echo "prime-agent installer did not pin the supported daemon version" >&2; exit 1;;
+    esac
+fi
 case "$installer_service_dry_run" in
     *"$timeout_env=3600"* ) ;;
     *) echo "$kind installer service dry-run did not set 3600s total timeout" >&2; exit 1;;

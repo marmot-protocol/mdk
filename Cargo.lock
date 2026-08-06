@@ -3277,8 +3277,10 @@ dependencies = [
  "agent-control",
  "async-trait",
  "fs-private",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7252,6 +7254,22 @@ name = "wn-pi"
 version = "0.9.10"
 dependencies = [
  "async-trait",
+ "clap",
+ "fs-private",
+ "marmot-terminal-harness",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "wn-prime-agent"
+version = "0.9.10"
+dependencies = [
+ "async-trait",
+ "base64",
  "clap",
  "fs-private",
  "marmot-terminal-harness",

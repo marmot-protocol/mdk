@@ -9,8 +9,9 @@ Current integrations:
 - [`openclaw/marmot`](openclaw/marmot) - OpenClaw channel plugin.
 - [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
 - [`pi/marmot`](pi/marmot) - `wn-pi` Pi harness binary.
+- [`prime-agent/marmot`](prime-agent/marmot) - `wn-prime-agent` daemon-attached harness binary.
 - [`terminal-harness`](terminal-harness) - shared hardened runtime for the
-  OpenCode and Pi terminal harnesses.
+  OpenCode, Pi, and Prime Agent terminal harnesses.
 
 All integrations are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
@@ -30,6 +31,7 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-openclaw-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
 - `scripts/install-pi-marmot.sh`
+- `scripts/install-prime-agent-marmot.sh`
 
 By default the production-shaped installs create separate local agent identities
 per connector:
@@ -40,24 +42,25 @@ per connector:
 | OpenClaw | `$HOME/.marmot-agents/openclaw` | `wn-agent-openclaw.service` / `org.marmot.wn-agent.openclaw` |
 | OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
 | Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
+| Prime Agent harness | `$HOME/.marmot-agents/prime-agent` | `wn-agent-prime-agent.service` / `org.marmot.wn-agent.prime-agent` plus `wn-prime-agent.service` / `org.marmot.wn-prime-agent` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
-uses the public relay defaults shared with the phone app pilot setup. OpenCode
-and Pi use separate connector homes and Marmot identities by default. They share
+uses the public relay defaults shared with the phone app pilot setup. OpenCode,
+Pi, and Prime Agent use separate connector homes and Marmot identities by default. They share
 implementation in `integrations/terminal-harness`, but they do not share prompts,
 sessions, sockets, or services unless an operator explicitly configures a shared
 deployment.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
-gateway automatically. `wn-opencode` and `wn-pi` each install their own harness
+gateway automatically. `wn-opencode`, `wn-pi`, and `wn-prime-agent` each install their own harness
 binary and service in addition to `wn-agent`, because they are standalone
 harnesses rather than plugins loaded by an existing gateway.
 
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, OpenCode, and Pi present as separate Nostr
+which means Hermes, OpenClaw, OpenCode, Pi, and Prime Agent present as separate Nostr
 identities when installed with default options.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
@@ -71,8 +74,9 @@ The installers persist the selected account into connector-specific config:
 - OpenClaw uses `channels.marmot.accountIdHex` or `MARMOT_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 - `wn-pi` uses `WN_PI_ACCOUNT_ID_HEX`.
+- `wn-prime-agent` uses `WN_PRIME_AGENT_ACCOUNT_ID_HEX`.
 
-Installing all four connectors on one machine with default options therefore
+Installing all five connectors on one machine with default options therefore
 creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
@@ -107,6 +111,10 @@ Each host runtime keeps its own runtime state:
 - `wn-pi` keeps harness configuration in `$MARMOT_HOME/dev/wn-pi.env`, connector
   state under `$XDG_STATE_HOME/wn-pi`, and Pi sessions under
   `$MARMOT_HOME/dev/pi-sessions` by default.
+- `wn-prime-agent` keeps harness configuration in
+  `$MARMOT_HOME/dev/wn-prime-agent.env`, connector state under
+  `$XDG_STATE_HOME/wn-prime-agent`, and its daemon socket under
+  `$MARMOT_HOME/dev` by default.
 
 Each integration also makes its own activation decision:
 
@@ -114,15 +122,16 @@ Each integration also makes its own activation decision:
   they default to mention-style activation and always reply in effective DMs.
   They also support richer gateway features such as live previews, durable reply
   routing, profile onboarding, and media handling.
-- `wn-opencode` and `wn-pi` are pure harnesses. They currently support only
-  `always` activation for prompt messages from explicitly allowed senders, and
-  have no media, profile onboarding, or live-preview behavior.
+- `wn-opencode`, `wn-pi`, and `wn-prime-agent` are pure harnesses. They currently
+  support only `always` activation for prompt messages from explicitly allowed
+  senders and have no profile onboarding. Prime Agent consumes inbound files and
+  images and can emit QUIC previews; OpenCode and Pi retain no-media behavior.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the
 same account and group, every eligible integration can reply. For example, a
 direct message from an allowlisted sender could trigger Hermes/OpenClaw,
-`wn-opencode`, and `wn-pi` if all are running and configured for that account.
+`wn-opencode`, `wn-pi`, and `wn-prime-agent` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
@@ -133,11 +142,12 @@ the same account.
 
 Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
 `wn-agent`. Their sync path is config-driven and may reconcile the connector
-allowlist to the configured set. Both terminal harnesses require at least one
+allowlist to the configured set. All terminal harnesses require at least one
 allowed sender and install those senders into both the prompt allowlist and the
 `wn-agent` welcomer allowlist. Their startup mirroring is additive: removing a
 sender only from `wn-agent` is not a full harness revoke while the sender remains
-in `WN_OPENCODE_ALLOWED_SENDERS_HEX` or `WN_PI_ALLOWED_SENDERS_HEX`.
+in `WN_OPENCODE_ALLOWED_SENDERS_HEX`, `WN_PI_ALLOWED_SENDERS_HEX`, or
+`WN_PRIME_AGENT_ALLOWED_SENDERS_HEX`.
 
 For shared-account deployments, prefer one explicit source of truth for the
 account's allowed welcomers, or configure every integration with the same
@@ -199,6 +209,10 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-prime-agent
+just prime-agent-dev-e2e-connector
+just prime-agent-installer-test
 ```
 
 For release-installer work, test dry-runs and real release assets from the

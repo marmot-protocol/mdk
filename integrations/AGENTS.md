@@ -12,6 +12,7 @@ systems to Marmot through `wn-agent`.
 - `openclaw/marmot` - OpenClaw channel plugin.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 - `pi/marmot` - `wn-pi` Pi harness binary.
+- `prime-agent/marmot` - `wn-prime-agent` daemon-attached harness binary.
 - `terminal-harness` - shared terminal-harness control/runtime library.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
@@ -27,7 +28,7 @@ deletes, invite policy, and local storage.
 - Treat `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN_FILE`,
   `MARMOT_AGENT_AUTH_TOKEN`, and `MARMOT_ACCOUNT_ID_HEX` as the common connector
   vocabulary. Use integration-specific prefixes only for integration-specific
-  behavior, for example `WN_OPENCODE_*` and `WN_PI_*`.
+  behavior, for example `WN_OPENCODE_*`, `WN_PI_*`, and `WN_PRIME_AGENT_*`.
 - Prefer explicit account ids in production configuration. Auto-select only the
   sole local-signing account; fail closed when multiple local-signing accounts
   are available.
@@ -48,7 +49,7 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-opencode` and `wn-pi` are pure terminal harnesses. They subscribe to allowed
+`wn-opencode`, `wn-pi`, and `wn-prime-agent` are pure terminal harnesses. They subscribe to allowed
 Marmot prompts and invoke their respective binaries; they should stay narrower than the
 gateway integrations unless there is a concrete product reason to broaden it.
 
@@ -120,10 +121,11 @@ Installer expectations:
 The default Hermes, OpenClaw, and terminal-harness service names are
 connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`,
-`wn-agent-harnesses.service`, `wn-agent-pi.service`,
+`wn-agent-harnesses.service`, `wn-agent-pi.service`, `wn-agent-prime-agent.service`,
 `org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
-`org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
-are also connector-specific (`wn-opencode` and `wn-pi`). If you add a new
+`org.marmot.wn-agent.harnesses`, `org.marmot.wn-agent.pi`, and
+`org.marmot.wn-agent.prime-agent`). Harness services are also connector-specific
+(`wn-opencode`, `wn-pi`, and `wn-prime-agent`). If you add a new
 production installer, choose names that can coexist with the existing
 integrations on the same login.
 
@@ -150,6 +152,10 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-prime-agent
+just prime-agent-dev-e2e-connector
+just prime-agent-installer-test
 ```
 
 For shared connector or release-workflow changes, run `just fast-ci` before
@@ -166,5 +172,5 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, OpenCode, and Pi before landing
+- document coexistence with Hermes, OpenClaw, OpenCode, Pi, and Prime Agent before landing
   production install support.

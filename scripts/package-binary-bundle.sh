@@ -6,7 +6,7 @@ target="${2:?usage: package-binary-bundle.sh <binary> <target> <rust-target>}"
 rust_target="${3:?usage: package-binary-bundle.sh <binary> <target> <rust-target>}"
 
 case "$binary" in
-    wn-agent | wn-opencode | wn-pi) ;;
+    wn-agent | wn-opencode | wn-pi | wn-prime-agent) ;;
     *) echo "error: unsupported release binary: $binary" >&2; exit 64 ;;
 esac
 if [[ ! "$target" =~ ^[A-Za-z0-9._-]+$ ]] || [[ ! "$rust_target" =~ ^[A-Za-z0-9._-]+$ ]]; then

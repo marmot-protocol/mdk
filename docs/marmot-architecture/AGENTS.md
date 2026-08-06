@@ -83,9 +83,10 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `../../integrations/AGENTS.md`, `../../integrations/hermes/marmot/AGENTS.md`,
   `../../integrations/openclaw/marmot/AGENTS.md`, `../../integrations/opencode/marmot/AGENTS.md`,
-  `../../integrations/pi/marmot/AGENTS.md`, and `../../integrations/terminal-harness/AGENTS.md`
+  `../../integrations/pi/marmot/AGENTS.md`, `../../integrations/prime-agent/marmot/AGENTS.md`, and
+  `../../integrations/terminal-harness/AGENTS.md`
   - **Role:** Host integration boundaries, connector coexistence, and verification for the Hermes, OpenClaw,
-    OpenCode, and Pi integrations plus their shared terminal-harness runtime.
+    OpenCode, Pi, and Prime Agent integrations plus their shared terminal-harness runtime.
 
 - **Repo:** `github.com/marmot-protocol/marmot`
   - **Role:** Marmot protocol specification by stable surface and app component.

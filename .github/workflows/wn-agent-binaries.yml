@@ -14,9 +14,11 @@ on:
       - scripts/install-opencode-marmot.sh
       - integrations/opencode/marmot/**
       - scripts/install-pi-marmot.sh
+      - scripts/install-prime-agent-marmot.sh
       - scripts/install-terminal-harness-marmot.sh
       - scripts/package-binary-bundle.sh
       - integrations/pi/marmot/**
+      - integrations/prime-agent/marmot/**
       - integrations/terminal-harness/**
       - Cargo.toml
       - Cargo.lock
@@ -112,11 +114,17 @@ jobs:
       - name: Smoke test wn-pi
         run: ./target/${{ matrix.rust_target }}/release/wn-pi --help
 
+      - name: Build wn-prime-agent
+        run: cargo build --locked --release -p wn-prime-agent --bin wn-prime-agent --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test wn-prime-agent
+        run: ./target/${{ matrix.rust_target }}/release/wn-prime-agent --help
+
       - name: Package binary bundles
         shell: bash
         run: |
           set -euo pipefail
-          for binary in wn-agent wn-opencode wn-pi; do
+          for binary in wn-agent wn-opencode wn-pi wn-prime-agent; do
             ./scripts/package-binary-bundle.sh \
               "$binary" \
               "${{ matrix.target }}" \
@@ -142,6 +150,13 @@ jobs:
         with:
           name: wn-pi-${{ matrix.target }}
           path: dist/wn-pi-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Upload wn-prime-agent bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-prime-agent-${{ matrix.target }}
+          path: dist/wn-prime-agent-${{ matrix.target }}/*
           if-no-files-found: error
 
   plugin:
@@ -366,7 +381,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/prime-linux dist/prime-linux-arm dist/prime-darwin dist/prime-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
@@ -379,6 +394,10 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-linux-aarch64 --dir dist/pi-linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-aarch64 --dir dist/pi-darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-x86_64 --dir dist/pi-darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-prime-agent-linux-x86_64 --dir dist/prime-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-prime-agent-linux-aarch64 --dir dist/prime-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-prime-agent-darwin-aarch64 --dir dist/prime-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-prime-agent-darwin-x86_64 --dir dist/prime-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
 
@@ -409,7 +428,7 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
-          for harness in opencode pi; do
+          for harness in opencode pi prime-agent; do
             awk -v harness="$harness" \
               'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
               scripts/install-terminal-harness-marmot.sh | \
@@ -439,6 +458,7 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-prime-agent-marmot.sh | bash
           \`\`\`
 
           Install this exact WN Agent release with:
@@ -448,18 +468,21 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-pi-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-prime-agent-marmot.sh | bash
           \`\`\`
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
           - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
           - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
+          - \`wn-prime-agent-<platform>-$version.tar.gz\`: Prime Agent harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
           - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
+          - \`install-prime-agent-marmot.sh\`: installer for testers with Prime Agent 0.7.0 already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -489,6 +512,14 @@ jobs:
             dist/pi-darwin/wn-pi-darwin-aarch64-"$version".tar.gz.sha256
             dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz
             dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz.sha256
+            dist/prime-linux/wn-prime-agent-linux-x86_64-"$version".tar.gz
+            dist/prime-linux/wn-prime-agent-linux-x86_64-"$version".tar.gz.sha256
+            dist/prime-linux-arm/wn-prime-agent-linux-aarch64-"$version".tar.gz
+            dist/prime-linux-arm/wn-prime-agent-linux-aarch64-"$version".tar.gz.sha256
+            dist/prime-darwin/wn-prime-agent-darwin-aarch64-"$version".tar.gz
+            dist/prime-darwin/wn-prime-agent-darwin-aarch64-"$version".tar.gz.sha256
+            dist/prime-darwin-intel/wn-prime-agent-darwin-x86_64-"$version".tar.gz
+            dist/prime-darwin-intel/wn-prime-agent-darwin-x86_64-"$version".tar.gz.sha256
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
             dist/plugin/openclaw-marmot-plugin-"$version".tgz
@@ -497,6 +528,7 @@ jobs:
             dist/install/install-openclaw-marmot.sh
             dist/install/install-opencode-marmot.sh
             dist/install/install-pi-marmot.sh
+            dist/install/install-prime-agent-marmot.sh
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -535,6 +567,7 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-opencode-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-pi-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-prime-agent-marmot.sh | bash
           \`\`\`
 
           Use the versioned \`$tag\` release URLs when you need a pinned install.
@@ -555,6 +588,7 @@ jobs:
             dist/install/install-openclaw-marmot.sh
             dist/install/install-opencode-marmot.sh
             dist/install/install-pi-marmot.sh
+            dist/install/install-prime-agent-marmot.sh
           )
 
           if gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

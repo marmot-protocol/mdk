@@ -179,7 +179,8 @@ GitHub-generated source archives are the downloadable artifacts.
 Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter/harness install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, the OpenClaw
 Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-opencode` harness +
-`install-opencode-marmot.sh`, and the `wn-pi` harness + `install-pi-marmot.sh`.
+`install-opencode-marmot.sh`, the `wn-pi` harness + `install-pi-marmot.sh`, and
+the `wn-prime-agent` harness + `install-prime-agent-marmot.sh`.
 
 The workflow lives at:
 
@@ -198,13 +199,15 @@ cargo test -p agent-connector
 cargo test -p marmot-terminal-harness
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-prime-agent
 bash scripts/install-hermes-marmot.sh --dry-run --yes
 bash scripts/install-openclaw-marmot.sh --dry-run --yes
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --pi-bin /bin/echo
+bash scripts/install-prime-agent-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --prime-agent-bin /path/to/prime-agent-0.7.0
 ```
 
-Bridge and control logs for both terminal harnesses now use the
+Bridge and control logs for all terminal harnesses use the
 `marmot_terminal_harness` tracing target. Include
 `marmot_terminal_harness=debug` in `RUST_LOG`. The former `wn_opencode` target
 no longer emits events, so existing filters that reference it must be updated.
@@ -258,6 +261,14 @@ The release job creates these assets:
 - `wn-pi-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-pi-darwin-x86_64-<version>.tar.gz`
 - `wn-pi-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-prime-agent-linux-x86_64-<version>.tar.gz`
+- `wn-prime-agent-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-prime-agent-linux-aarch64-<version>.tar.gz`
+- `wn-prime-agent-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-prime-agent-darwin-aarch64-<version>.tar.gz`
+- `wn-prime-agent-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-prime-agent-darwin-x86_64-<version>.tar.gz`
+- `wn-prime-agent-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`
@@ -266,6 +277,7 @@ The release job creates these assets:
 - `install-openclaw-marmot.sh`
 - `install-opencode-marmot.sh`
 - `install-pi-marmot.sh`
+- `install-prime-agent-marmot.sh`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
@@ -284,6 +296,8 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-lat
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
 # Pi terminal harness
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-pi-marmot.sh | bash
+# Prime Agent terminal harness
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-prime-agent-marmot.sh | bash
 ```
 
 Use the versioned `wn-agent-v<version>` release URLs instead when you need a pinned install for repeatable testing or
@@ -292,7 +306,7 @@ bug reports.
 These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin or
 harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot
 agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
-`--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
+`--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or a harness-specific `--no-start-*` when you need a
 partial/manual install.
 
 ## MarmotKit Binding Release

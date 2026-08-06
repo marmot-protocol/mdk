@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_control::{AgentControlAccount, AgentControlEvent};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::chunking::split_reply_chunks;
-use crate::control::ControlClient;
+use crate::control::{ActivePreview, ControlClient};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
@@ -269,6 +270,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 group_ref: group_id_hex,
                 message_ref: message.message_id_hex,
                 text: message.text,
+                media: message.media,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue
@@ -309,6 +311,7 @@ struct InboundPrompt {
     group_ref: String,
     message_ref: String,
     text: String,
+    media: Vec<agent_control::AgentControlMediaRef>,
 }
 
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit: GroupPermit) {
@@ -353,12 +356,52 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let session_id = known_session
         .as_ref()
         .and_then(|record| (!record.session_id.is_empty()).then(|| record.session_id.clone()));
+    let session_name = known_session
+        .as_ref()
+        .and_then(|record| record.session_name.clone())
+        .unwrap_or_else(|| session_name_for_group(&inbound.group_ref));
+    let mut attachments = Vec::new();
+    if ctx.backend.accepts_attachments() {
+        attachments.reserve(inbound.media.len());
+        for media in &inbound.media {
+            match ctx
+                .client
+                .download_media(&inbound.account_ref, &inbound.group_ref, media.clone())
+                .await
+            {
+                Ok(attachment) => attachments.push(attachment),
+                Err(err) => {
+                    warn!(
+                        target: TRACE_TARGET,
+                        method = "download_media",
+                        error_kind = err.privacy_safe_kind(),
+                        "failed to download inbound attachment"
+                    );
+                    let _ = send_reply(
+                        &ctx,
+                        &inbound.account_ref,
+                        &inbound.group_ref,
+                        &inbound.message_ref,
+                        &format!(
+                            "[{}] failed to prepare an attached file.",
+                            ctx.cfg.spec.reply_prefix
+                        ),
+                        0,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
+        session_name: session_name.clone(),
         prompt,
+        attachments,
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
@@ -366,11 +409,100 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
+    let mut preview = None;
+    let mut preview_disabled = ctx.cfg.quic_candidates.is_empty();
     while let Some(event) = rx.recv().await {
         match event {
+            RunnerEvent::Preview(delta) => {
+                if preview_disabled || delta.is_empty() {
+                    continue;
+                }
+                if preview.is_none() {
+                    match ctx
+                        .client
+                        .stream_begin(
+                            &inbound.account_ref,
+                            &inbound.group_ref,
+                            &inbound.message_ref,
+                            ctx.cfg.quic_candidates.clone(),
+                        )
+                        .await
+                    {
+                        Ok(active) => preview = Some(PreviewDelivery::new(active)),
+                        Err(err) => {
+                            warn!(
+                                target: TRACE_TARGET,
+                                method = "stream_begin",
+                                error_kind = err.privacy_safe_kind(),
+                                "failed to begin backend preview; continuing with durable delivery"
+                            );
+                            preview_disabled = true;
+                        }
+                    }
+                }
+                if let Some(active) = preview.as_mut() {
+                    if let Err(err) = ctx.client.stream_append(&active.handle, &delta).await {
+                        warn!(
+                            target: TRACE_TARGET,
+                            method = "stream_append",
+                            error_kind = err.privacy_safe_kind(),
+                            "failed to append backend preview; continuing with durable delivery"
+                        );
+                        if let Some(active) = preview.take() {
+                            let _ = ctx.client.stream_cancel(&active.handle).await;
+                        }
+                        preview_disabled = true;
+                    } else {
+                        active.append(&delta);
+                    }
+                }
+            }
             RunnerEvent::Text(text) => {
                 if delivery_failed {
                     continue;
+                }
+                if let Some(active) = preview.take() {
+                    if active.matches(&text) && text.len() <= ctx.cfg.max_reply_bytes {
+                        let transcript_hash_hex = hex::encode(Sha256::digest(text.as_bytes()));
+                        match finalize_preview(
+                            &ctx.client,
+                            &active.handle,
+                            &inbound.message_ref,
+                            &text,
+                            &transcript_hash_hex,
+                            active.chunk_count,
+                        )
+                        .await
+                        {
+                            PreviewFinalizeOutcome::Finalized => {
+                                delivered_chunks += 1;
+                                preview_disabled = true;
+                                continue;
+                            }
+                            PreviewFinalizeOutcome::Fallback(err) => {
+                                warn!(
+                                    target: TRACE_TARGET,
+                                    method = "stream_finalize",
+                                    error_kind = err.privacy_safe_kind(),
+                                    "failed to finalize backend preview; falling back to durable delivery"
+                                );
+                            }
+                            PreviewFinalizeOutcome::Uncertain(err) => {
+                                warn!(
+                                    target: TRACE_TARGET,
+                                    method = "stream_finalize",
+                                    error_kind = err.privacy_safe_kind(),
+                                    "backend preview finalization remained uncertain; refusing duplicate durable delivery"
+                                );
+                                let _ = ctx.client.stream_cancel(&active.handle).await;
+                                preview_disabled = true;
+                                delivery_failed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    let _ = ctx.client.stream_cancel(&active.handle).await;
+                    preview_disabled = true;
                 }
                 for chunk in split_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
                     chunk_index += 1;
@@ -400,6 +532,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         }
     }
 
+    if let Some(active) = preview.take() {
+        let _ = ctx.client.stream_cancel(&active.handle).await;
+    }
+
     match runner.await {
         Ok(Ok(outcome)) => {
             finish_success(
@@ -407,6 +543,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 inbound,
                 known_session,
                 cwd,
+                session_name,
                 outcome,
                 DeliveryReport {
                     chunk_count: delivered_chunks,
@@ -429,8 +566,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 &inbound.group_ref,
                 known_session.as_ref(),
                 cwd,
+                session_name,
                 &failure,
-                ctx.cfg.backend_idle_timeout,
             )
             .await;
             let _ = send_reply(
@@ -472,6 +609,7 @@ async fn finish_success(
     inbound: InboundPrompt,
     known_session: Option<SessionRecord>,
     cwd: PathBuf,
+    session_name: String,
     outcome: Outcome,
     delivery: DeliveryReport,
 ) {
@@ -489,7 +627,7 @@ async fn finish_success(
 
     let needs_persist = known_session
         .as_ref()
-        .is_none_or(|record| record.session_id.is_empty());
+        .is_none_or(|record| record.session_id.is_empty() || record.session_name.is_none());
     if !delivery.failed
         && needs_persist
         && let Some(session_id) = outcome.observed_session
@@ -498,6 +636,7 @@ async fn finish_success(
             &inbound.group_ref,
             known_session.as_ref(),
             cwd,
+            session_name,
             Some(session_id),
         )
         .await
@@ -558,20 +697,115 @@ struct DeliveryReport {
     failure_chunk_index: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewFinalizeFailureAction {
+    Retry,
+    Fallback,
+    Uncertain,
+}
+
+enum PreviewFinalizeOutcome {
+    Finalized,
+    Fallback(HarnessError),
+    Uncertain(HarnessError),
+}
+
+fn preview_finalize_failure_action(
+    error: &HarnessError,
+    attempt: usize,
+) -> PreviewFinalizeFailureAction {
+    if error.retryable() && attempt < SEND_RETRY_ATTEMPTS {
+        PreviewFinalizeFailureAction::Retry
+    } else if matches!(error, HarnessError::ControlRejected { .. }) {
+        // An explicit server rejection is the only response that proves the
+        // stream final did not publish. Malformed, mismatched, closed, or timed
+        // out responses are ambiguous after the external send side effect.
+        PreviewFinalizeFailureAction::Fallback
+    } else {
+        PreviewFinalizeFailureAction::Uncertain
+    }
+}
+
+async fn finalize_preview(
+    client: &ControlClient,
+    preview: &ActivePreview,
+    reply_to_ref: &str,
+    final_text: &str,
+    transcript_hash_hex: &str,
+    chunk_count: u64,
+) -> PreviewFinalizeOutcome {
+    for attempt in 1..=SEND_RETRY_ATTEMPTS {
+        match client
+            .stream_finalize(
+                preview,
+                reply_to_ref,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+            )
+            .await
+        {
+            Ok(()) => return PreviewFinalizeOutcome::Finalized,
+            Err(error) => match preview_finalize_failure_action(&error, attempt) {
+                PreviewFinalizeFailureAction::Retry => {
+                    sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                PreviewFinalizeFailureAction::Fallback => {
+                    return PreviewFinalizeOutcome::Fallback(error);
+                }
+                PreviewFinalizeFailureAction::Uncertain => {
+                    return PreviewFinalizeOutcome::Uncertain(error);
+                }
+            },
+        }
+    }
+    unreachable!("preview finalize retry loop always returns on its final attempt")
+}
+
+struct PreviewDelivery {
+    handle: ActivePreview,
+    transcript_hash: Sha256,
+    transcript_bytes: usize,
+    chunk_count: u64,
+}
+
+impl PreviewDelivery {
+    fn new(handle: ActivePreview) -> Self {
+        Self {
+            handle,
+            transcript_hash: Sha256::new(),
+            transcript_bytes: 0,
+            chunk_count: 0,
+        }
+    }
+
+    fn append(&mut self, delta: &str) {
+        self.transcript_hash.update(delta.as_bytes());
+        self.transcript_bytes = self.transcript_bytes.saturating_add(delta.len());
+        self.chunk_count += 1;
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        self.transcript_bytes == text.len()
+            && self.transcript_hash.clone().finalize() == Sha256::digest(text.as_bytes())
+    }
+}
+
 async fn handle_backend_run_failure(
     config: &Config,
     sessions: &SessionStore,
     group_ref: &str,
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
+    session_name: String,
     failure: &RunFailure,
-    idle_timeout: Duration,
 ) -> String {
     if let Err(store_err) = persist_observed_session_if_unset(
         sessions,
         group_ref,
         known_session,
         cwd,
+        session_name,
         failure.observed_session.clone(),
     )
     .await
@@ -589,7 +823,7 @@ async fn handle_backend_run_failure(
             "[{}] {} went silent for {}s without producing output; killing the invocation.",
             config.spec.reply_prefix,
             config.spec.display_name,
-            idle_timeout.as_secs()
+            config.backend_idle_timeout.as_secs()
         ),
         HarnessError::BackendTimedOut => {
             format!(
@@ -615,14 +849,22 @@ async fn persist_observed_session_if_unset(
     group_ref: &str,
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
+    session_name: String,
     observed_session: Option<String>,
 ) -> Result<()> {
     let needs_persist = known_session
         .as_ref()
-        .is_none_or(|record| record.session_id.is_empty());
+        .is_none_or(|record| record.session_id.is_empty() || record.session_name.is_none());
     if needs_persist && let Some(session_id) = observed_session {
         sessions
-            .set(group_ref, SessionRecord { session_id, cwd })
+            .set(
+                group_ref,
+                SessionRecord {
+                    session_id,
+                    cwd,
+                    session_name: Some(session_name),
+                },
+            )
             .await?;
     }
     Ok(())
@@ -677,6 +919,7 @@ async fn resolve_cwd_and_prompt(
                 SessionRecord {
                     session_id: String::new(),
                     cwd,
+                    session_name: Some(session_name_for_group(&inbound.group_ref)),
                 },
             )
             .await?;
@@ -695,6 +938,11 @@ async fn resolve_cwd_and_prompt(
         return Ok(None);
     }
     Ok(Some((cwd, rest)))
+}
+
+fn session_name_for_group(group_ref: &str) -> String {
+    let digest = hex::encode(Sha256::digest(group_ref.as_bytes()));
+    format!("marmot-{}", &digest[..32])
 }
 
 async fn resolve_account(
@@ -888,6 +1136,7 @@ mod tests {
             state_path: root.join("sessions.json"),
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
+            quic_candidates: Vec::new(),
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",
@@ -899,6 +1148,53 @@ mod tests {
                 legacy_allowed_senders_env: Some("WN_OPENCODE_ADMIN_HEX"),
             },
         }
+    }
+
+    #[test]
+    fn preview_delivery_hashes_deltas_without_retaining_the_transcript() {
+        let mut preview = PreviewDelivery::new(ActivePreview {
+            stream_id_hex: "stream".to_owned(),
+            stream_capability: "capability".to_owned(),
+        });
+        preview.append("hello");
+        preview.append(" world");
+
+        assert!(preview.matches("hello world"));
+        assert!(!preview.matches("hello world!"));
+        assert_eq!(preview.chunk_count, 2);
+    }
+
+    #[test]
+    fn preview_finalize_only_falls_back_after_a_definitive_rejection() {
+        let timeout = HarnessError::ControlTimedOut {
+            method: "stream_finalize",
+        };
+        assert_eq!(
+            preview_finalize_failure_action(&timeout, 1),
+            PreviewFinalizeFailureAction::Retry
+        );
+        assert_eq!(
+            preview_finalize_failure_action(&timeout, SEND_RETRY_ATTEMPTS),
+            PreviewFinalizeFailureAction::Uncertain
+        );
+
+        let malformed = HarnessError::UnexpectedResponse {
+            method: "stream_finalize",
+            response: "empty_stream_finalized",
+        };
+        assert_eq!(
+            preview_finalize_failure_action(&malformed, 1),
+            PreviewFinalizeFailureAction::Uncertain
+        );
+
+        let rejected = HarnessError::ControlRejected {
+            method: "stream_finalize",
+            code: "stream_not_found".to_owned(),
+        };
+        assert_eq!(
+            preview_finalize_failure_action(&rejected, 1),
+            PreviewFinalizeFailureAction::Fallback
+        );
     }
 
     #[tokio::test]
@@ -945,6 +1241,7 @@ mod tests {
             "group1",
             None,
             cwd.clone(),
+            "marmot-group1".to_owned(),
             Some("ses_new".to_owned()),
         )
         .await
@@ -952,12 +1249,14 @@ mod tests {
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_new");
         assert_eq!(record.cwd, cwd);
+        assert_eq!(record.session_name.as_deref(), Some("marmot-group1"));
 
         persist_observed_session_if_unset(
             &store,
             "group1",
             Some(&record),
             cwd.clone(),
+            "marmot-other".to_owned(),
             Some("ses_other".to_owned()),
         )
         .await
@@ -982,17 +1281,29 @@ mod tests {
             "group1",
             None,
             home.clone(),
+            "marmot-group1".to_owned(),
             &failure,
-            Duration::from_secs(45),
         )
         .await;
 
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_idle");
         assert_eq!(record.cwd, home);
+        assert_eq!(record.session_name.as_deref(), Some("marmot-group1"));
         assert_eq!(
             reply,
             "[wn-opencode] opencode went silent for 45s without producing output; killing the invocation."
         );
+    }
+
+    #[test]
+    fn backend_session_name_is_stable_without_exposing_group_id() {
+        let group_ref = "a1b2c3d4".repeat(8);
+        let first = session_name_for_group(&group_ref);
+        let second = session_name_for_group(&group_ref);
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("marmot-"));
+        assert!(!first.contains(&group_ref));
     }
 }

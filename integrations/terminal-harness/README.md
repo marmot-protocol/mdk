@@ -1,23 +1,27 @@
 # Marmot Terminal Harness
 
 `marmot-terminal-harness` is the shared Rust runtime behind
-[`wn-opencode`](../opencode/marmot) and [`wn-pi`](../pi/marmot). It keeps the
+[`wn-opencode`](../opencode/marmot), [`wn-pi`](../pi/marmot), and
+[`wn-prime-agent`](../prime-agent/marmot). It keeps the
 Marmot-facing behavior of pure terminal connectors consistent while leaving
 backend command construction and event parsing in each connector crate.
 
 The crate owns the `wn-agent` control client, account and sender selection,
 inbound reconnect and resync, per-group bounded queues, deduplication, working
-directory selection, private group-to-session mappings, reply chunking, and
-backend process lifecycle helpers. It does not own MLS, Nostr transport,
-storage, QUIC previews, or backend-specific CLI semantics.
+directory selection, private group-to-session mappings, reply chunking,
+optional QUIC preview/final lifecycle, and backend process lifecycle helpers.
+It does not own MLS, Nostr transport, storage, the QUIC transport
+implementation, or backend-specific CLI semantics.
 
 ## Backend Boundary
 
 A connector supplies a `Backend` implementation. For each authorized inbound
 prompt, the shared runtime passes an `Invocation` containing the selected
-working directory, optional prior session id, prompt, idle timeout, and total
-timeout. The backend may emit only completed assistant text as `RunnerEvent::Text`
-and returns privacy-safe `Outcome` metadata.
+working directory, optional prior session id, stable session name, prompt,
+backend-supported attachments, idle timeout, and total
+timeout. The backend may emit append-only assistant text deltas as
+`RunnerEvent::Preview`, followed by completed assistant text as
+`RunnerEvent::Text`, and returns privacy-safe `Outcome` metadata.
 
 Connector crates are responsible for:
 
@@ -28,12 +32,13 @@ Connector crates are responsible for:
 - preserving or reporting the backend session id needed for the next prompt.
 
 OpenCode keeps prompt text after its command's `--` delimiter. Pi writes prompt
-text to stdin. Backend-specific behavior belongs in those connector crates, not
-in this shared runtime.
+text to stdin. Prime Agent speaks daemon protocol v7 over a Unix socket and is
+the only current terminal backend that opts into attachment downloads.
+Backend-specific behavior belongs in those connector crates, not in this shared runtime.
 
 ## Shared Behavior
 
-Both connectors:
+All connectors:
 
 - speak `marmot.agent-control.v2` over a local Unix socket;
 - require an explicit sender allowlist and mirror it additively into the
@@ -52,23 +57,27 @@ and backend contracts:
 
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
+- [`integrations/prime-agent/marmot/README.md`](../prime-agent/marmot/README.md)
 
 ## Development
 
-Run the shared suite and both connector suites after changing this crate:
+Run the shared suite and all connector suites after changing this crate:
 
 ```sh
 cargo test -p marmot-terminal-harness
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-prime-agent
 
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
+just prime-agent-dev-e2e-connector
 
 just opencode-installer-test
 just pi-installer-test
+just prime-agent-installer-test
 ```
 
 The process-level connector tests are ignored by default and use real
 `wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real OpenCode or Pi CLIs.
+install or authenticate the real OpenCode, Pi, or Prime Agent CLIs.

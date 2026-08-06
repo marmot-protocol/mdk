@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_control::{
-    AgentControlEnvelope, AgentControlEvent, AgentControlRequest, AgentControlResponse,
-    read_envelope, write_frame,
+    AgentControlEnvelope, AgentControlEvent, AgentControlMediaRef, AgentControlRequest,
+    AgentControlResponse, read_envelope, write_frame,
 };
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -16,6 +16,11 @@ use tracing::{debug, warn};
 
 use crate::TRACE_TARGET;
 use crate::error::{HarnessError, Result};
+
+pub(crate) struct ActivePreview {
+    pub(crate) stream_id_hex: String,
+    pub(crate) stream_capability: String,
+}
 
 #[derive(Clone)]
 pub(crate) struct ControlClient {
@@ -106,7 +111,7 @@ impl ControlClient {
         text: &str,
         chunk_index: usize,
     ) -> Result<()> {
-        let idempotency_key = format!("{reply_to_ref}:reply:{chunk_index}");
+        let idempotency_key = final_reply_idempotency_key(reply_to_ref, chunk_index);
         match self
             .call(
                 "send_final",
@@ -132,6 +137,156 @@ impl ControlClient {
                 code,
             }),
             other => Err(unexpected_response("send_final", &other)),
+        }
+    }
+
+    pub(crate) async fn stream_begin(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        reply_to_ref: &str,
+        quic_candidates: Vec<String>,
+    ) -> Result<ActivePreview> {
+        match self
+            .call(
+                "stream_begin",
+                AgentControlRequest::StreamBegin {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    stream_id_hex: None,
+                    parent_message_id_hex: Some(reply_to_ref.to_owned()),
+                    quic_candidates,
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::StreamBegun {
+                stream_id_hex,
+                stream_capability,
+                ..
+            } => Ok(ActivePreview {
+                stream_id_hex,
+                stream_capability,
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "stream_begin",
+                code,
+            }),
+            other => Err(unexpected_response("stream_begin", &other)),
+        }
+    }
+
+    pub(crate) async fn stream_append(&self, preview: &ActivePreview, text: &str) -> Result<()> {
+        match self
+            .call(
+                "stream_append",
+                AgentControlRequest::StreamAppend {
+                    stream_id_hex: preview.stream_id_hex.clone(),
+                    stream_capability: preview.stream_capability.clone(),
+                    append_text: text.to_owned(),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::Ack => Ok(()),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "stream_append",
+                code,
+            }),
+            other => Err(unexpected_response("stream_append", &other)),
+        }
+    }
+
+    pub(crate) async fn stream_finalize(
+        &self,
+        preview: &ActivePreview,
+        reply_to_ref: &str,
+        final_text: &str,
+        transcript_hash_hex: &str,
+        chunk_count: u64,
+    ) -> Result<()> {
+        match self
+            .call(
+                "stream_finalize",
+                AgentControlRequest::StreamFinalize {
+                    stream_id_hex: preview.stream_id_hex.clone(),
+                    stream_capability: preview.stream_capability.clone(),
+                    final_text: final_text.to_owned(),
+                    transcript_hash_hex: transcript_hash_hex.to_owned(),
+                    chunk_count,
+                    idempotency_key: Some(final_reply_idempotency_key(reply_to_ref, 1)),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::StreamFinalized {
+                message_ids_hex, ..
+            } if !message_ids_hex.is_empty() => Ok(()),
+            AgentControlResponse::StreamFinalized { .. } => Err(HarnessError::UnexpectedResponse {
+                method: "stream_finalize",
+                response: "empty_stream_finalized",
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "stream_finalize",
+                code,
+            }),
+            other => Err(unexpected_response("stream_finalize", &other)),
+        }
+    }
+
+    pub(crate) async fn stream_cancel(&self, preview: &ActivePreview) -> Result<()> {
+        match self
+            .call(
+                "stream_cancel",
+                AgentControlRequest::StreamCancel {
+                    stream_id_hex: preview.stream_id_hex.clone(),
+                    stream_capability: preview.stream_capability.clone(),
+                    reason: Some("backend_preview_not_finalized".to_owned()),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::Ack => Ok(()),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "stream_cancel",
+                code,
+            }),
+            other => Err(unexpected_response("stream_cancel", &other)),
+        }
+    }
+
+    pub(crate) async fn download_media(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        media: AgentControlMediaRef,
+    ) -> Result<crate::InvocationAttachment> {
+        match self
+            .call(
+                "download_media",
+                AgentControlRequest::DownloadMedia {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    media,
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::MediaDownloaded {
+                path,
+                media_type,
+                file_name,
+                ..
+            } => Ok(crate::InvocationAttachment {
+                path: PathBuf::from(path),
+                media_type,
+                file_name,
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "download_media",
+                code,
+            }),
+            other => Err(unexpected_response("download_media", &other)),
         }
     }
 
@@ -290,6 +445,10 @@ fn validate_response_id(method: &'static str, actual: Option<&str>, expected: &s
     }
 }
 
+fn final_reply_idempotency_key(reply_to_ref: &str, chunk_index: usize) -> String {
+    format!("{reply_to_ref}:reply:{chunk_index}")
+}
+
 fn unexpected_response(method: &'static str, response: &AgentControlResponse) -> HarnessError {
     HarnessError::UnexpectedResponse {
         method,
@@ -334,6 +493,14 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    #[test]
+    fn preview_and_durable_final_share_one_idempotency_key() {
+        assert_eq!(
+            final_reply_idempotency_key("message-ref", 1),
+            "message-ref:reply:1"
+        );
+    }
 
     #[test]
     fn rich_context_golden_events_decode() {

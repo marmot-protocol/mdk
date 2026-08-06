@@ -282,7 +282,9 @@ mod tests {
             idle_timeout: Duration::from_millis(500),
             cwd: dir.path().to_path_buf(),
             session_id: None,
+            session_name: "marmot-test".to_owned(),
             prompt: scenario.to_owned(),
+            attachments: Vec::new(),
         }
     }
 

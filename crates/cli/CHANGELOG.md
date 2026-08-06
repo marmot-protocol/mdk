@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Added the `wn-prime-agent` terminal harness, which attaches Marmot groups to
+  resident Prime Agent 0.7.0 daemon sessions with durable per-group continuity,
+  `/model provider/model` control, inbound files and images, final replies, and
+  optional QUIC previews. Release bundles now include a coexistence-safe
+  installer and service definitions alongside `wn-agent`.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`

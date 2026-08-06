@@ -24,6 +24,7 @@ members = [
     "integrations/terminal-harness",
     "integrations/opencode/marmot",
     "integrations/pi/marmot",
+    "integrations/prime-agent/marmot",
 ]
 
 [workspace.package]
@@ -51,6 +52,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # utils
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 thiserror = "2"
 tracing = "0.1"

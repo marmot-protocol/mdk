@@ -42,6 +42,22 @@ pub async fn run_connector_e2e(
     harness_name: &'static str,
     spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
 ) {
+    run_connector_e2e_rounds(harness_name, spawn_harness, 1).await;
+}
+
+/// Runs two prompts in one group so a backend must resume its first session.
+pub async fn run_connector_resume_e2e(
+    harness_name: &'static str,
+    spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
+) {
+    run_connector_e2e_rounds(harness_name, spawn_harness, 2).await;
+}
+
+async fn run_connector_e2e_rounds(
+    harness_name: &'static str,
+    spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
+    rounds: usize,
+) {
     let temp = TempDir::new().expect("temp dir");
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
         .expect("make temp root private");
@@ -58,34 +74,47 @@ pub async fn run_connector_e2e(
     }));
 
     let expected_text = expected_reply_text();
-    let finals = inject_until_recorded_finals(
+    let message_ids = (0..rounds)
+        .map(|round| {
+            if round == 0 {
+                MESSAGE_ID_HEX.to_owned()
+            } else {
+                format!("{:064x}", round + 0x33)
+            }
+        })
+        .collect::<Vec<_>>();
+    let finals_by_message = inject_until_recorded_finals(
         &socket,
         &account.account_id_hex,
+        &message_ids,
         &expected_text,
         harness_name,
     )
     .await;
-    assert!(
-        finals.len() >= 2,
-        "expected chunked final sends, got {}",
-        finals.len()
-    );
-    assert_eq!(
-        finals
-            .iter()
-            .map(|send| send.text.as_str())
-            .collect::<String>(),
-        expected_text
-    );
-    for (index, send) in finals.iter().enumerate() {
-        assert_eq!(send.account_id_hex, account.account_id_hex);
-        assert_eq!(send.group_id_hex, GROUP_ID_HEX);
-        assert_eq!(
-            send.reply_to_message_id_hex.as_deref(),
-            Some(MESSAGE_ID_HEX)
+    for (message_id_hex, finals) in message_ids.iter().zip(finals_by_message) {
+        assert!(
+            finals.len() >= 2,
+            "expected chunked final sends, got {}",
+            finals.len()
         );
-        assert!(send.text.len() <= MAX_REPLY_BYTES);
-        assert_eq!(send.message_ids_hex, vec![format!("{:064x}", index + 1)]);
+        assert_eq!(
+            finals
+                .iter()
+                .map(|send| send.text.as_str())
+                .collect::<String>(),
+            expected_text
+        );
+        for send in &finals {
+            assert_eq!(send.account_id_hex, account.account_id_hex);
+            assert_eq!(send.group_id_hex, GROUP_ID_HEX);
+            assert_eq!(
+                send.reply_to_message_id_hex.as_deref(),
+                Some(message_id_hex.as_str())
+            );
+            assert!(send.text.len() <= MAX_REPLY_BYTES);
+            assert_eq!(send.message_ids_hex.len(), 1);
+            assert_eq!(send.message_ids_hex[0].len(), 64);
+        }
     }
 
     drop(harness);
@@ -197,45 +226,63 @@ async fn create_account(socket: &Path, harness_name: &str) -> AgentControlAccoun
 async fn inject_until_recorded_finals(
     socket: &Path,
     account_id_hex: &str,
+    message_ids: &[String],
     expected_text: &str,
     harness_name: &str,
-) -> Vec<AgentControlDebugFinalSend> {
-    wait_for(
-        || async {
+) -> Vec<Vec<AgentControlDebugFinalSend>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for message_id_hex in message_ids {
             let _ = send_control_request(
                 socket,
                 "req-debug-inject",
                 AgentControlRequest::DebugInjectInbound {
                     account_id_hex: account_id_hex.to_owned(),
                     group_id_hex: GROUP_ID_HEX.to_owned(),
-                    message_id_hex: MESSAGE_ID_HEX.to_owned(),
+                    message_id_hex: message_id_hex.to_owned(),
                     sender_account_id_hex: SENDER_ACCOUNT_ID_HEX.to_owned(),
                     text: INBOUND_TEXT.to_owned(),
                 },
             )
             .await;
-            let recorded = match send_control_request(
-                socket,
-                "req-debug-finals",
-                AgentControlRequest::DebugRecordedFinals,
-            )
-            .await
-            {
-                Ok(AgentControlResponse::DebugRecordedFinals { sends }) => sends,
-                _ => return None,
-            };
-            (recorded
+        }
+        let recorded = match send_control_request(
+            socket,
+            "req-debug-finals",
+            AgentControlRequest::DebugRecordedFinals,
+        )
+        .await
+        {
+            Ok(AgentControlResponse::DebugRecordedFinals { sends }) => sends,
+            _ => Vec::new(),
+        };
+        let matching = message_ids
+            .iter()
+            .map(|message_id_hex| {
+                recorded
+                    .iter()
+                    .filter(|send| {
+                        send.reply_to_message_id_hex.as_deref() == Some(message_id_hex.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if matching.iter().all(|sends| {
+            sends
                 .iter()
                 .map(|send| send.text.as_str())
                 .collect::<String>()
-                == expected_text)
-                .then_some(recorded)
-        },
-        &format!("recorded {harness_name} final sends"),
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("recorded final sends")
+                == expected_text
+        }) {
+            return matching;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for recorded {harness_name} final sends"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn send_control_request(

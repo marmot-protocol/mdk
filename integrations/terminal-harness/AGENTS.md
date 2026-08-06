@@ -20,4 +20,5 @@ before changing this crate.
 cargo test -p marmot-terminal-harness
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-prime-agent
 ```

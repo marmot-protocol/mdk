@@ -185,6 +185,21 @@ pi-installer-test:
 pi-dev-e2e-connector:
     cargo test -p wn-pi --test e2e_connector -- --ignored --nocapture
 
+test-terminal-harnesses:
+    cargo test -p marmot-terminal-harness -p wn-opencode -p wn-pi -p wn-prime-agent
+    integrations/opencode/marmot/tests/test_installer.sh
+    integrations/pi/marmot/tests/test_installer.sh
+    integrations/prime-agent/marmot/tests/test_installer.sh
+
+prime-agent-installer-test:
+    integrations/prime-agent/marmot/tests/test_installer.sh
+
+prime-agent-dev-e2e-connector:
+    cargo test -p wn-prime-agent --test e2e_connector -- --ignored --nocapture
+
+prime-agent-live-smoke:
+    WN_PRIME_AGENT_LIVE_SMOKE=1 cargo test -p wn-prime-agent live_daemon_smoke -- --ignored --nocapture
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail
