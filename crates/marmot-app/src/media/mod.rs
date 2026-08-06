@@ -95,7 +95,8 @@ pub const DEFAULT_BLOSSOM_SERVER_URL: &str = DEFAULT_BLOSSOM_SERVER_URLS[0];
 /// Public-profile images are intentionally not encrypted: their Blossom URL is
 /// published in Nostr kind:0 metadata and must be fetchable by other clients.
 pub const DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL: &str = "https://blossom.primal.net";
-const MAX_PROFILE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum profile-image upload and dial-safe download size (10 MiB).
+pub(crate) const MAX_PROFILE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Frozen legacy format label. New code chooses a version from group state.
 pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
 
@@ -191,6 +192,43 @@ pub(crate) async fn upload_profile_image_with_policy(
     host_safety::validate_blossom_fetch_url(&parsed, allow_loopback_http)
         .map_err(|_| AppError::BlobStore("upload returned an unsafe image URL".into()))?;
     Ok(url)
+}
+
+fn normalize_profile_image_max_bytes(max_bytes: u64) -> Result<u64, AppError> {
+    if max_bytes == 0 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "profile image max_bytes must be positive".into(),
+        ));
+    }
+    let ceiling = MAX_PROFILE_IMAGE_BYTES as u64;
+    if max_bytes > ceiling {
+        return Err(AppError::InvalidAppMessagePayload(format!(
+            "profile image max_bytes exceeds {ceiling} byte ceiling"
+        )));
+    }
+    Ok(max_bytes)
+}
+
+/// Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS
+/// policy (pinned public resolution, bounded redirects, and streaming limits).
+pub async fn download_profile_image(url: String, max_bytes: u64) -> Result<Vec<u8>, AppError> {
+    let max_bytes = normalize_profile_image_max_bytes(max_bytes)?;
+    blossom::fetch_profile_image(&url, max_bytes).await
+}
+
+#[cfg(test)]
+pub(crate) async fn download_profile_image_with_injected_addrs(
+    url: &str,
+    max_bytes: u64,
+    injected_addrs: Vec<std::net::SocketAddr>,
+) -> Result<Vec<u8>, AppError> {
+    let max_bytes = normalize_profile_image_max_bytes(max_bytes)?;
+    blossom::fetch_profile_image_with_injected_addrs(url, max_bytes, injected_addrs).await
+}
+
+#[cfg(test)]
+pub(crate) fn normalize_profile_image_max_bytes_for_test(max_bytes: u64) -> Result<u64, AppError> {
+    normalize_profile_image_max_bytes(max_bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -928,3 +966,5 @@ fn validate_outbound_file_name(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_profile_image;

@@ -7,7 +7,10 @@ use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTi
 use serde::Deserialize;
 use url::{Host, Url};
 
-use super::host_safety::{is_loopback_host, reject_non_public_ip, validate_blossom_fetch_url};
+use super::host_safety::{
+    is_loopback_host, reject_non_public_ip, validate_blossom_fetch_url,
+    validate_profile_image_fetch_url,
+};
 use crate::{AppError, unix_now_seconds};
 
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
@@ -214,6 +217,151 @@ pub(crate) async fn fetch_blossom_blob(
     }
 }
 
+pub(crate) async fn fetch_profile_image(url: &str, max_bytes: u64) -> Result<Vec<u8>, AppError> {
+    profile_operation_timeout(
+        MEDIA_HTTP_TOTAL_TIMEOUT,
+        fetch_profile_image_impl(url, max_bytes, ProfileResolveMode::Production),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_profile_image_with_injected_addrs(
+    url: &str,
+    max_bytes: u64,
+    injected_addrs: Vec<SocketAddr>,
+) -> Result<Vec<u8>, AppError> {
+    profile_operation_timeout(
+        MEDIA_HTTP_TOTAL_TIMEOUT,
+        fetch_profile_image_impl(url, max_bytes, ProfileResolveMode::Injected(injected_addrs)),
+    )
+    .await
+}
+
+async fn profile_operation_timeout<T>(
+    timeout: Duration,
+    operation: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| AppError::BlobStore("request timed out".into()))?
+}
+
+#[cfg(test)]
+pub(super) async fn profile_operation_timeout_for_test(timeout: Duration) -> Result<(), AppError> {
+    profile_operation_timeout(timeout, std::future::pending()).await
+}
+
+enum ProfileResolveMode {
+    Production,
+    #[cfg(test)]
+    Injected(Vec<SocketAddr>),
+}
+
+async fn fetch_profile_image_impl(
+    url: &str,
+    max_bytes: u64,
+    resolve_mode: ProfileResolveMode,
+) -> Result<Vec<u8>, AppError> {
+    let mut current = Url::parse(url)
+        .map_err(|_| AppError::InvalidAppMessagePayload("profile image URL is invalid".into()))?;
+    validate_profile_image_fetch_url(&current).map_err(|err| {
+        AppError::InvalidAppMessagePayload(format!("unsafe profile image URL: {err}"))
+    })?;
+    let mut redirects = 0_usize;
+
+    loop {
+        let client = media_http_client_for_profile(&current, &resolve_mode).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(reqwest_blob_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return read_limited_blossom_body(response, max_bytes).await;
+        }
+        if !status.is_redirection() {
+            return Err(AppError::BlobStore(format!(
+                "download returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+
+        if redirects >= BLOSSOM_REDIRECT_LIMIT {
+            return Err(AppError::BlobStore(format!(
+                "media redirect chain exceeded {BLOSSOM_REDIRECT_LIMIT} hops"
+            )));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                AppError::BlobStore("redirect response did not include Location".into())
+            })?
+            .to_str()
+            .map_err(|_| AppError::BlobStore("redirect Location header is invalid".into()))?;
+        let next = current.join(location).map_err(|_| {
+            AppError::BlobStore("redirect Location header is not a valid URL".into())
+        })?;
+        validate_profile_image_fetch_url(&next).map_err(|err| {
+            AppError::InvalidAppMessagePayload(format!("unsafe profile image redirect URL: {err}"))
+        })?;
+        current = next;
+        redirects += 1;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn plan_profile_image_pin(
+    url: &Url,
+    injected_addrs: &[SocketAddr],
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+    match url
+        .host()
+        .ok_or_else(|| AppError::BlobStore("media URL is missing a host".into()))?
+    {
+        Host::Domain(domain) => validated_media_domain_pin(domain, injected_addrs, false).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn validated_media_domain_pin(
+    domain: &str,
+    addrs: &[SocketAddr],
+    allow_loopback: bool,
+) -> Result<(String, Vec<SocketAddr>), AppError> {
+    if addrs.is_empty() {
+        return Err(AppError::BlobStore(
+            "media host DNS lookup returned no addresses".into(),
+        ));
+    }
+    for addr in addrs {
+        reject_non_public_ip(addr.ip(), allow_loopback)
+            .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+    }
+    Ok((domain.to_ascii_lowercase(), addrs.to_vec()))
+}
+
+async fn profile_media_pin(
+    url: &Url,
+    resolve_mode: &ProfileResolveMode,
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+    match resolve_mode {
+        ProfileResolveMode::Production => resolve_media_host(url, false).await,
+        #[cfg(test)]
+        ProfileResolveMode::Injected(addrs) => plan_profile_image_pin(url, addrs),
+    }
+}
+
+async fn media_http_client_for_profile(
+    url: &Url,
+    resolve_mode: &ProfileResolveMode,
+) -> Result<reqwest::Client, AppError> {
+    let pin = profile_media_pin(url, resolve_mode).await?;
+    build_pinned_media_http_client(MEDIA_HTTP_TOTAL_TIMEOUT, pin)
+}
+
 pub(super) fn validate_blossom_redirect_target(
     current: &Url,
     next: &Url,
@@ -269,17 +417,30 @@ async fn media_http_client_for_url(
 ) -> Result<reqwest::Client, AppError> {
     validate_blossom_fetch_url(url, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+    let allow_loopback = url.scheme() == "http"
+        && allow_loopback_http
+        && url.host().map(is_loopback_host).unwrap_or(false);
+    let pin = resolve_media_host(url, allow_loopback).await?;
+    build_pinned_media_http_client(MEDIA_HTTP_TOTAL_TIMEOUT, pin)
+}
+
+fn build_pinned_media_http_client(
+    operation_timeout: Duration,
+    pin: Option<(String, Vec<SocketAddr>)>,
+) -> Result<reqwest::Client, AppError> {
+    let connect_timeout = operation_timeout.min(MEDIA_HTTP_CONNECT_TIMEOUT);
+    let read_timeout = operation_timeout.min(MEDIA_HTTP_READ_TIMEOUT);
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
-        .read_timeout(MEDIA_HTTP_READ_TIMEOUT)
-        .timeout(MEDIA_HTTP_TOTAL_TIMEOUT)
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .timeout(operation_timeout)
         .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_zstd()
         .no_deflate();
-    if let Some((domain, addrs)) = resolve_media_host(url, allow_loopback_http).await? {
+    if let Some((domain, addrs)) = pin {
         builder = builder.resolve_to_addrs(&domain, &addrs);
     }
     builder
@@ -289,11 +450,8 @@ async fn media_http_client_for_url(
 
 async fn resolve_media_host(
     url: &Url,
-    allow_loopback_http: bool,
+    allow_loopback: bool,
 ) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
-    let allow_loopback = url.scheme() == "http"
-        && allow_loopback_http
-        && url.host().map(is_loopback_host).unwrap_or(false);
     match url
         .host()
         .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a host".into()))?
@@ -306,17 +464,7 @@ async fn resolve_media_host(
                 .await
                 .map_err(|_| AppError::BlobStore("media host DNS lookup failed".into()))?
                 .collect::<Vec<_>>();
-            if addrs.is_empty() {
-                return Err(AppError::BlobStore(
-                    "media host DNS lookup returned no addresses".into(),
-                ));
-            }
-            for addr in &addrs {
-                reject_non_public_ip(addr.ip(), allow_loopback).map_err(|err| {
-                    AppError::BlobStore(format!("unsafe media host address: {err}"))
-                })?;
-            }
-            Ok(Some((domain.to_ascii_lowercase(), addrs)))
+            validated_media_domain_pin(domain, &addrs, allow_loopback).map(Some)
         }
         Host::Ipv4(addr) => {
             reject_non_public_ip(IpAddr::V4(addr), allow_loopback)

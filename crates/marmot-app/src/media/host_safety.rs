@@ -56,6 +56,19 @@ pub(crate) fn validate_locator(
     Ok(())
 }
 
+/// HTTPS-only profile-image fetch URLs: default port 443, no credentials or
+/// fragments, and no loopback/private/special-use literal hosts. Unlike Blossom
+/// media locators, explicit non-default HTTPS ports are rejected.
+pub(crate) fn validate_profile_image_fetch_url(url: &Url) -> Result<(), String> {
+    validate_blossom_fetch_url(url, false)?;
+    if let Some(port) = url.port()
+        && port != 443
+    {
+        return Err("URL must use the default HTTPS port".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_blossom_fetch_url(
     url: &Url,
     allow_loopback_http: bool,

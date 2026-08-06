@@ -471,6 +471,26 @@ async fn profile_image_upload_binding_is_public_and_requires_a_known_account() {
 }
 
 #[tokio::test]
+async fn profile_image_download_binding_maps_invalid_url_to_typed_error() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .download_profile_image("https://127.0.0.1/avatar.png".into(), 1024)
+        .await
+        .expect_err("loopback profile URL must fail before dial");
+    assert!(
+        matches!(error, MarmotKitError::InvalidMediaReference { .. }),
+        "expected InvalidMediaReference, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
