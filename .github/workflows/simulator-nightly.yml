@@ -50,44 +50,11 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Install Tamarin
-        env:
-          TAMARIN_VERSION: 1.12.0
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends graphviz maude
-          curl -L --fail --show-error --silent \
-            "https://github.com/tamarin-prover/tamarin-prover/releases/download/${TAMARIN_VERSION}/tamarin-prover-${TAMARIN_VERSION}-linux64-ubuntu.tar.gz" \
-            -o /tmp/tamarin-prover.tar.gz
-          tar -xzf /tmp/tamarin-prover.tar.gz -C /tmp
-          sudo install -m 0755 /tmp/tamarin-prover /usr/local/bin/tamarin-prover
-
-      - name: Run strict symbolic proof gate
-        run: just tamarin
-
-      - name: Run complete simulator suite
-        # Adversarial campaigns and independent convergence checks run below
-        # with their required feature sets; exclude only those duplicates here.
-        run: just simulator-full
-
-      - name: Validate convergence execution-lane policy
-        run: just convergence-lane-policy
+      - name: Run nightly convergence lane
+        run: just convergence-nightly-lane
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
-
-      - name: Run adversarial reliability campaigns
-        run: just adversarial-reliability-ci
-
-      - name: Verify convergence with independent models
-        run: just convergence-verification-ci
-
-      - name: Run process-boundary convergence campaigns
-        run: cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --test route_equivalence --locked
-
-      - name: Validate distributed campaign runner
-        run: cargo nextest run -p convergence-campaign-runner --locked
 
       - name: Build current distributed campaign image
         run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
@@ -95,7 +62,10 @@ jobs:
       - name: Run selected real-container convergence campaign
         env:
           CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
-        run: cargo test -p convergence-campaign-runner --test container_runtime --locked -- --ignored real_container_nodes_recover_the_cross_route_deeper_branch
+        run: |
+          cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+            --run-ignored ignored-only --no-tests fail \
+            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state)'
 
       - name: Run encrypted file-backed vector report
         run: |

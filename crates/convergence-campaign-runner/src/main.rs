@@ -21,7 +21,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Validate the manifest and pinned scenario bytes without side effects.
-    Validate { manifest: PathBuf },
+    Validate {
+        manifest: PathBuf,
+        /// Require at least two participant builds and effective container images.
+        #[arg(long)]
+        require_mixed_builds: bool,
+    },
     /// Print or privately write the exact argv execution plan.
     Plan {
         manifest: PathBuf,
@@ -63,8 +68,14 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Validate { manifest } => {
+        Commands::Validate {
+            manifest,
+            require_mixed_builds,
+        } => {
             let manifest = load_manifest(&manifest)?;
+            if require_mixed_builds {
+                manifest.validate_mixed_builds()?;
+            }
             let scenario = verify_manifest_inputs(&manifest)?;
             validate_scenario_bytes(&manifest, &scenario)?;
             println!("valid {}", manifest.campaign_id);
@@ -147,10 +158,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("campaign exceeded its reviewed lane budget".into());
             }
         }
-        Commands::CheckEvidence { bundle } => {
+        Commands::CheckEvidence {
+            bundle: bundle_path,
+        } => {
+            let base_dir = bundle_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             let bundle: ConvergenceEvidenceBundleV1 =
-                serde_json::from_slice(&std::fs::read(bundle)?)?;
-            bundle.validate()?;
+                serde_json::from_slice(&std::fs::read(&bundle_path)?)?;
+            bundle.validate_artifacts(base_dir)?;
             println!("valid-evidence {}", bundle.source_revision);
         }
     }

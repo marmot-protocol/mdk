@@ -4,8 +4,7 @@
   "contents": {
     "strict_formal_gate": true,
     "fixed_vectors": true,
-    "engine_reference_relay_cases": 2048,
-    "generated_seed_cases": 8192,
+    "minimum_executed_cases": 5,
     "file_backed_storage": true,
     "crash_matrix": true,
     "retained_relays": true,
@@ -15,7 +14,7 @@
     "resource_sweeps": true,
     "constant_sweeps": true,
     "mixed_version": true,
-    "incident_corpus": true
+    "incident_corpus": false
   },
   "budgets": {
     "max_wall_clock_seconds": 28800,

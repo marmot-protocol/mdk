@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-08-04
+updated: 2026-08-06
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -1005,19 +1005,24 @@ that scaling the existing corpus is sufficient.
 
 ### 6.3 Execution lanes
 
-- [x] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
-- [x] Nightly lane: seed matrices, file-backed storage, crash matrix, retained relays, mutation subset.
-- [x] Weekly/manual lane: process/container soak, resource and constant sweeps.
-- [x] Release-hardening lane: mixed-version and incident-derived corpus.
+- [ ] PR lane: strict formal gate, fixed vectors, small engine/reference/relay cases.
+- [ ] Nightly lane: seed matrices, file-backed storage, crash matrix, retained relays, mutation subset.
+- [ ] Weekly/manual lane: process/container soak, resource and constant sweeps.
+- [ ] Release-hardening lane: mixed-version and incident-derived corpus.
 - [x] Define wall-clock, CPU, memory, disk, artifact-retention, and flake budgets for every lane.
 
-Four versioned lane manifests now define both included capabilities and reviewed limits. The PR workflow remains
-container-free and keeps formal/model/vector checks parallel; nightly adds process campaigns and one real-container
-cross-route regression; the scheduled weekly/manual workflow runs the full current container suite and expanded
-resource/constant campaigns; release hardening additionally requires an operator-supplied, reviewed distributed
-manifest so mixed-version evidence cannot silently degrade into a current-build-only run. A typed budget evaluator
-fails wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. The evidence-bundle validator requires
-route/model/adapter/mutation/boundary/counterexample/assumption/untested-surface sections and a passing same-lane budget.
+Four versioned lane manifests are the single reviewed policy source for intended contents and limits. The nightly and
+weekly entry points run only existing named targets, and selected-container filtering fails instead of silently passing
+when it matches no test. Scheduled runs inherit the source revision's mandatory PR formal gate instead of rerunning the
+same symbolic proof. Incident-corpus execution remains false until the failure-corpus slice lands, and the reviewed
+minimum case counts describe only work that the current recipes can launch.
+
+The typed evaluator rejects zero-case observations, inconsistent flaky-case counts, work below the lane minimum, and
+wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. It is not yet fed by a workflow-owned
+observation collector, so the four execution/enforcement items and the resource/flake exit gate remain open. Evidence
+bundles require a nonempty artifact set; `check-evidence` resolves each relative artifact path beside the bundle and
+verifies its SHA-256 bytes. The remaining route/model/adapter/mutation/boundary/assumption fields are still
+producer-supplied scoped evidence rather than an automatic correctness attestation.
 
 ### 6.4 Failure corpus lifecycle
 
@@ -1153,7 +1158,7 @@ incorrect result.
 | 2026-08-04 | Milestone 5 app/process simulation | Added a production-shaped app-runtime adapter, versioned child-node protocol, multi-process orchestrator, projection/event observation, retained-relay repair, real pause/resume/kill/restart, cross-adapter comparison, and privacy-safe failure capsules; then replaced milestone-scoped module/test names with durable capability names | Commits `a3296b16` through `19d0d5f8`; `app_runtime_adapter`; `node_protocol`; `process_orchestrator`; `just fast-ci` |
 | 2026-08-04 | Milestone 6 assurance scope correction | Used the cross-seam divergence from [MDK #1236](https://github.com/marmot-protocol/mdk/pull/1236) to add decision-route inventory/equivalence, a permanent four-participant regression family, cryptographic interoperability, application disposition, model/mutation expansion, and scoped evidence requirements before distributed scale work can be called complete | Milestone 6.1 and strengthened exit gate in this document |
 | 2026-08-05 | 6.2 container and VM execution | Split the container-first distributed runner, barrier-bound faults, mixed-image participants, real OCI smoke coverage, and capability-gated external VM-driver boundary out of the larger assurance branch without carrying production convergence changes or a #1236 outcome assumption | [MDK #1270](https://github.com/marmot-protocol/mdk/pull/1270); `distributed_runner`; ignored `container_runtime`; [`distributed-convergence-campaigns.md`](./distributed-convergence-campaigns.md) |
-| 2026-08-05 | 6.3 execution lanes and evidence budgets | Added drift-checked PR, nightly, weekly/manual, and release-hardening policies; machine-checkable wall/CPU/RSS/disk/artifact/retention/flake budgets; scheduled container hardening; and a completeness-checked scoped evidence bundle as a separate layer over the runner core | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
+| 2026-08-06 | 6.3 lane policy and evidence foundations | Added single-source PR, nightly, weekly/manual, and release-hardening policy manifests; fail-closed standalone wall/CPU/RSS/disk/artifact/retention/flake evaluation; nonempty byte-verified evidence artifacts; and scheduled entry points without claiming workflow-owned measurement or incident-corpus execution yet | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
 
 ## Post-Milestone 6 Cleanup
 

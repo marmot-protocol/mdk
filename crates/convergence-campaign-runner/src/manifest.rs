@@ -366,6 +366,42 @@ impl DistributedCampaignManifestV1 {
         Ok(())
     }
 
+    /// Apply the additional release-hardening contract that at least two
+    /// participant builds, and for containers two effective images, are used.
+    pub fn validate_mixed_builds(&self) -> Result<(), RunnerError> {
+        self.validate()?;
+        let build_ids = self
+            .participants
+            .iter()
+            .map(|participant| participant.build_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if build_ids.len() < 2 {
+            return Err(RunnerError::validation(
+                "mixed_build_ids",
+                "mixed-build campaigns require at least two participant build ids",
+            ));
+        }
+        if let DistributedBackendV1::Container(container) = &self.backend {
+            let images = self
+                .participants
+                .iter()
+                .map(|participant| {
+                    participant
+                        .container_image
+                        .as_deref()
+                        .unwrap_or(&container.default_participant_image)
+                })
+                .collect::<BTreeSet<_>>();
+            if images.len() < 2 {
+                return Err(RunnerError::validation(
+                    "mixed_build_images",
+                    "mixed-build container campaigns require at least two effective participant images",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn required_vm_capabilities(&self) -> BTreeSet<VirtualMachineCapabilityV1> {
         self.faults
             .iter()

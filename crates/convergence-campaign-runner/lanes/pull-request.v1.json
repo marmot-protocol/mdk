@@ -4,8 +4,7 @@
   "contents": {
     "strict_formal_gate": true,
     "fixed_vectors": true,
-    "engine_reference_relay_cases": 32,
-    "generated_seed_cases": 0,
+    "minimum_executed_cases": 1,
     "file_backed_storage": true,
     "crash_matrix": false,
     "retained_relays": true,

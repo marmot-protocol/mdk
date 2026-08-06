@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-05
+updated: 2026-08-06
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -118,25 +118,32 @@ may opt into the real-container tests when the runner environment advertises tha
 
 ## Execution lanes and budgets
 
-Reviewed lane manifests live under `crates/convergence-campaign-runner/lanes`. The Rust policy test requires those
-files to equal the built-in policy exactly, so a budget or coverage change cannot arrive as an unreviewed JSON edit.
+Reviewed lane manifests live under `crates/convergence-campaign-runner/lanes`. They are compiled into the runner with
+`include_str!` and parsed by `CampaignLaneConfigV1::builtin`, so the reviewed JSON is the only policy source rather
+than a second copy of the same constants in Rust.
 The four lanes are:
 
-- pull request: strict formal checks, fixed vectors, and bounded engine/reference/relay coverage without Docker;
-- nightly: expanded seeds, file-backed storage, crash and retained-relay matrices, targeted mutations, process runs,
-  selected containers, and the incident corpus;
-- weekly/manual: process/container soak plus full targeted mutations, resource sweeps, constant sweeps, and mixed-build
-  support; and
-- release hardening: the largest reviewed bounds, mixed-version execution, and incident-derived regressions.
+- pull request: the ordinary mandatory formal/model/vector checks without Docker;
+- nightly: file-backed, crash, retained-relay, mutation, process, policy-sweep, and selected-container coverage;
+- weekly/manual: the nightly coverage plus a larger generated batch and the full current container test target; and
+- release hardening: the weekly work plus an operator-supplied distributed manifest with at least two participant
+  build ids and, for containers, at least two effective participant images.
+
+The source revision must already have passed the mandatory PR formal gate; scheduled workflows do not repeat the same
+state-independent proof. Incident-corpus coverage is deliberately false in these manifests until the failure-corpus
+slice lands.
 
 Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
 and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
-any limit is exceeded. A flake is therefore evidence, not permission to turn a failing assertion green silently.
+any limit is exceeded. It also rejects zero executed cases, observations below the lane minimum, and flaky-case counts
+larger than executed-case counts. The scheduled workflows do not yet emit this aggregate observation or invoke
+`check-budget`; these limits are machine-checkable reviewed policy, not yet a green-workflow attestation.
 
 The version-1 evidence-bundle type requires a scoped assurance claim, covered decision routes, models, adapters,
 mutation results, tested workload/constant boundaries, unresolved counterexamples, residual assumptions, untested
-surfaces, a passing same-lane budget evaluation, and digest-pinned artifacts. `check-evidence` rejects incomplete
-bundles; valid bundles are written with owner-only permissions.
+surfaces, a passing same-lane budget evaluation, and at least one digest-pinned artifact. `check-evidence` rejects
+incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by resolving artifacts
+relative to the bundle's directory. Valid bundles are written with owner-only permissions.
 
 ## What this evidence means
 

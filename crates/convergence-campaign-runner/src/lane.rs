@@ -62,8 +62,9 @@ pub struct CampaignLaneConfigV1 {
 pub struct CampaignLaneContentsV1 {
     pub strict_formal_gate: bool,
     pub fixed_vectors: bool,
-    pub engine_reference_relay_cases: u32,
-    pub generated_seed_cases: u32,
+    /// Minimum aggregate case count required before an observation can attest
+    /// that this lane executed meaningful work.
+    pub minimum_executed_cases: u64,
     pub file_backed_storage: bool,
     pub crash_matrix: bool,
     pub retained_relays: bool,
@@ -119,127 +120,21 @@ pub struct CampaignBudgetEvaluationV1 {
 
 impl CampaignLaneConfigV1 {
     pub fn builtin(lane: CampaignLaneV1) -> Self {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (contents, budgets) = match lane {
-            CampaignLaneV1::PullRequest => (
-                CampaignLaneContentsV1 {
-                    strict_formal_gate: true,
-                    fixed_vectors: true,
-                    engine_reference_relay_cases: 32,
-                    generated_seed_cases: 0,
-                    file_backed_storage: true,
-                    crash_matrix: false,
-                    retained_relays: true,
-                    mutation_scope: MutationScopeV1::Sentinel,
-                    process_campaigns: false,
-                    container_campaigns: false,
-                    resource_sweeps: false,
-                    constant_sweeps: false,
-                    mixed_version: false,
-                    incident_corpus: false,
-                },
-                CampaignLaneBudgetsV1 {
-                    max_wall_clock_seconds: 3_600,
-                    max_cpu_seconds: 7_200,
-                    max_peak_rss_bytes: 6 * GIB,
-                    max_disk_bytes: 12 * GIB,
-                    max_artifact_bytes: GIB,
-                    artifact_retention_days: 14,
-                    max_flake_retries: 0,
-                    max_flake_rate_basis_points: 0,
-                },
-            ),
-            CampaignLaneV1::Nightly => (
-                CampaignLaneContentsV1 {
-                    strict_formal_gate: true,
-                    fixed_vectors: true,
-                    engine_reference_relay_cases: 256,
-                    generated_seed_cases: 256,
-                    file_backed_storage: true,
-                    crash_matrix: true,
-                    retained_relays: true,
-                    mutation_scope: MutationScopeV1::Targeted,
-                    process_campaigns: true,
-                    container_campaigns: true,
-                    resource_sweeps: false,
-                    constant_sweeps: false,
-                    mixed_version: false,
-                    incident_corpus: true,
-                },
-                CampaignLaneBudgetsV1 {
-                    max_wall_clock_seconds: 7_200,
-                    max_cpu_seconds: 14_400,
-                    max_peak_rss_bytes: 8 * GIB,
-                    max_disk_bytes: 20 * GIB,
-                    max_artifact_bytes: 5 * GIB,
-                    artifact_retention_days: 30,
-                    max_flake_retries: 1,
-                    max_flake_rate_basis_points: 50,
-                },
-            ),
-            CampaignLaneV1::WeeklyManual => (
-                CampaignLaneContentsV1 {
-                    strict_formal_gate: true,
-                    fixed_vectors: true,
-                    engine_reference_relay_cases: 1_024,
-                    generated_seed_cases: 4_096,
-                    file_backed_storage: true,
-                    crash_matrix: true,
-                    retained_relays: true,
-                    mutation_scope: MutationScopeV1::FullTargeted,
-                    process_campaigns: true,
-                    container_campaigns: true,
-                    resource_sweeps: true,
-                    constant_sweeps: true,
-                    mixed_version: true,
-                    incident_corpus: true,
-                },
-                CampaignLaneBudgetsV1 {
-                    max_wall_clock_seconds: 21_600,
-                    max_cpu_seconds: 43_200,
-                    max_peak_rss_bytes: 12 * GIB,
-                    max_disk_bytes: 40 * GIB,
-                    max_artifact_bytes: 10 * GIB,
-                    artifact_retention_days: 60,
-                    max_flake_retries: 2,
-                    max_flake_rate_basis_points: 25,
-                },
-            ),
-            CampaignLaneV1::ReleaseHardening => (
-                CampaignLaneContentsV1 {
-                    strict_formal_gate: true,
-                    fixed_vectors: true,
-                    engine_reference_relay_cases: 2_048,
-                    generated_seed_cases: 8_192,
-                    file_backed_storage: true,
-                    crash_matrix: true,
-                    retained_relays: true,
-                    mutation_scope: MutationScopeV1::FullTargeted,
-                    process_campaigns: true,
-                    container_campaigns: true,
-                    resource_sweeps: true,
-                    constant_sweeps: true,
-                    mixed_version: true,
-                    incident_corpus: true,
-                },
-                CampaignLaneBudgetsV1 {
-                    max_wall_clock_seconds: 28_800,
-                    max_cpu_seconds: 57_600,
-                    max_peak_rss_bytes: 12 * GIB,
-                    max_disk_bytes: 50 * GIB,
-                    max_artifact_bytes: 15 * GIB,
-                    artifact_retention_days: 180,
-                    max_flake_retries: 1,
-                    max_flake_rate_basis_points: 10,
-                },
-            ),
+        let json = match lane {
+            CampaignLaneV1::PullRequest => include_str!("../lanes/pull-request.v1.json"),
+            CampaignLaneV1::Nightly => include_str!("../lanes/nightly.v1.json"),
+            CampaignLaneV1::WeeklyManual => include_str!("../lanes/weekly-manual.v1.json"),
+            CampaignLaneV1::ReleaseHardening => {
+                include_str!("../lanes/release-hardening.v1.json")
+            }
         };
-        Self {
-            schema_version: CAMPAIGN_LANE_SCHEMA_VERSION.into(),
-            lane,
-            contents,
-            budgets,
-        }
+        let config: Self =
+            serde_json::from_str(json).expect("tracked campaign lane manifest must be valid JSON");
+        assert_eq!(config.lane, lane, "tracked campaign lane manifest mismatch");
+        config
+            .validate()
+            .expect("tracked campaign lane manifest must satisfy policy invariants");
+        config
     }
 
     pub fn validate(&self) -> Result<(), RunnerError> {
@@ -249,11 +144,24 @@ impl CampaignLaneConfigV1 {
                 "unsupported campaign lane schema version",
             ));
         }
-        let expected = Self::builtin(self.lane);
-        if self != &expected {
+        if self.contents.minimum_executed_cases == 0 {
             return Err(RunnerError::validation(
-                "campaign_lane_drift",
-                "tracked lane configuration differs from the reviewed built-in policy",
+                "campaign_lane_cases",
+                "campaign lane must require at least one executed case",
+            ));
+        }
+        let budgets = &self.budgets;
+        if budgets.max_wall_clock_seconds == 0
+            || budgets.max_cpu_seconds == 0
+            || budgets.max_peak_rss_bytes == 0
+            || budgets.max_disk_bytes == 0
+            || budgets.max_artifact_bytes == 0
+            || budgets.artifact_retention_days == 0
+            || budgets.max_flake_rate_basis_points > 10_000
+        {
+            return Err(RunnerError::validation(
+                "campaign_lane_budget",
+                "campaign lane budgets must be nonzero and the flake rate must not exceed 10000 basis points",
             ));
         }
         Ok(())
@@ -298,11 +206,25 @@ impl CampaignLaneConfigV1 {
             observation.flake_retries,
             u64::from(budget.max_flake_retries),
         );
+        if observation.executed_cases == 0 {
+            violations.push("executed_cases:0".into());
+        } else if observation.executed_cases < self.contents.minimum_executed_cases {
+            violations.push(format!(
+                "executed_cases:{}<{}",
+                observation.executed_cases, self.contents.minimum_executed_cases
+            ));
+        }
+        if observation.flaky_cases > observation.executed_cases {
+            violations.push(format!(
+                "flaky_cases:{}>{}",
+                observation.flaky_cases, observation.executed_cases
+            ));
+        }
         let flake_rate_basis_points = observation
             .flaky_cases
             .saturating_mul(10_000)
             .checked_div(observation.executed_cases)
-            .unwrap_or(0);
+            .unwrap_or_default();
         check_limit(
             &mut violations,
             "flake_rate_basis_points",

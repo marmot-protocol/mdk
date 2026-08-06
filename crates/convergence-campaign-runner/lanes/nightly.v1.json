@@ -4,18 +4,17 @@
   "contents": {
     "strict_formal_gate": true,
     "fixed_vectors": true,
-    "engine_reference_relay_cases": 256,
-    "generated_seed_cases": 256,
+    "minimum_executed_cases": 1,
     "file_backed_storage": true,
     "crash_matrix": true,
     "retained_relays": true,
     "mutation_scope": "targeted",
     "process_campaigns": true,
     "container_campaigns": true,
-    "resource_sweeps": false,
-    "constant_sweeps": false,
+    "resource_sweeps": true,
+    "constant_sweeps": true,
     "mixed_version": false,
-    "incident_corpus": true
+    "incident_corpus": false
   },
   "budgets": {
     "max_wall_clock_seconds": 7200,

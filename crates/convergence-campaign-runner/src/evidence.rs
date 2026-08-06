@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{CampaignBudgetEvaluationV1, CampaignLaneV1, RunnerError};
 
@@ -66,6 +67,7 @@ impl ConvergenceEvidenceBundleV1 {
             ("tested_boundaries", self.tested_boundaries.is_empty()),
             ("residual_assumptions", self.residual_assumptions.is_empty()),
             ("untested_surfaces", self.untested_surfaces.is_empty()),
+            ("artifacts", self.artifacts.is_empty()),
         ] {
             if empty {
                 return Err(RunnerError::validation(
@@ -96,8 +98,50 @@ impl ConvergenceEvidenceBundleV1 {
         Ok(())
     }
 
-    pub fn write_private(&self, path: &Path) -> Result<(), RunnerError> {
+    /// Validate artifact paths and bind every declared digest to the bytes
+    /// present beside an ingested evidence bundle.
+    pub fn validate_artifacts(&self, base_dir: &Path) -> Result<(), RunnerError> {
         self.validate()?;
+        let canonical_base = std::fs::canonicalize(base_dir)
+            .map_err(|error| RunnerError::environment("evidence_artifact_base", error))?;
+        for artifact in &self.artifacts {
+            if artifact.path.as_os_str().is_empty()
+                || artifact.path.is_absolute()
+                || artifact.path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(RunnerError::validation(
+                    "evidence_artifact_path",
+                    "artifact paths must be nonempty relative paths without parent traversal",
+                ));
+            }
+            let canonical_path = std::fs::canonicalize(canonical_base.join(&artifact.path))
+                .map_err(|error| RunnerError::environment("evidence_artifact_read", error))?;
+            if !canonical_path.starts_with(&canonical_base) {
+                return Err(RunnerError::validation(
+                    "evidence_artifact_path",
+                    "artifact paths must remain within the evidence bundle directory",
+                ));
+            }
+            let bytes = std::fs::read(canonical_path)
+                .map_err(|error| RunnerError::environment("evidence_artifact_read", error))?;
+            let actual = hex::encode(Sha256::digest(bytes));
+            if actual != artifact.sha256 {
+                return Err(RunnerError::validation(
+                    "evidence_artifact_digest_mismatch",
+                    "artifact bytes do not match the declared SHA-256 digest",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_private(&self, path: &Path) -> Result<(), RunnerError> {
+        self.validate_artifacts(path.parent().unwrap_or_else(|| Path::new(".")))?;
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| RunnerError::environment("evidence_serialize", error))?;
         fs_private::write_private(path, &bytes)

@@ -60,22 +60,6 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Install Tamarin
-        env:
-          TAMARIN_VERSION: 1.12.0
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends graphviz maude
-          curl -L --fail --show-error --silent \
-            "https://github.com/tamarin-prover/tamarin-prover/releases/download/${TAMARIN_VERSION}/tamarin-prover-${TAMARIN_VERSION}-linux64-ubuntu.tar.gz" \
-            -o /tmp/tamarin-prover.tar.gz
-          tar -xzf /tmp/tamarin-prover.tar.gz -C /tmp
-          sudo install -m 0755 /tmp/tamarin-prover /usr/local/bin/tamarin-prover
-
-      - name: Run strict symbolic proof gate
-        run: just tamarin
-
       - name: Build current distributed campaign image
         run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
@@ -84,7 +68,8 @@ jobs:
         run: |
           just convergence-weekly-lane
           CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
-            cargo test -p convergence-campaign-runner --test container_runtime --locked -- --ignored
+            cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+              --run-ignored ignored-only --no-tests fail
 
       - name: Require a release manifest
         if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'

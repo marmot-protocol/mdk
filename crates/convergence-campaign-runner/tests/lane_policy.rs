@@ -4,39 +4,29 @@ use convergence_campaign_runner::{
     CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
     EvidenceArtifactV1, TestedBoundaryV1,
 };
+use sha2::{Digest, Sha256};
 
-const TRACKED_LANES: &[(CampaignLaneV1, &str)] = &[
-    (
-        CampaignLaneV1::PullRequest,
-        include_str!("../lanes/pull-request.v1.json"),
-    ),
-    (
-        CampaignLaneV1::Nightly,
-        include_str!("../lanes/nightly.v1.json"),
-    ),
-    (
-        CampaignLaneV1::WeeklyManual,
-        include_str!("../lanes/weekly-manual.v1.json"),
-    ),
-    (
-        CampaignLaneV1::ReleaseHardening,
-        include_str!("../lanes/release-hardening.v1.json"),
-    ),
+const LANES: &[CampaignLaneV1] = &[
+    CampaignLaneV1::PullRequest,
+    CampaignLaneV1::Nightly,
+    CampaignLaneV1::WeeklyManual,
+    CampaignLaneV1::ReleaseHardening,
 ];
 
 #[test]
-fn tracked_lane_manifests_equal_the_reviewed_builtin_policy() {
-    for (lane, json) in TRACKED_LANES {
-        let tracked: CampaignLaneConfigV1 = serde_json::from_str(json).unwrap();
-        tracked.validate().unwrap();
-        assert_eq!(tracked, CampaignLaneConfigV1::builtin(*lane));
+fn tracked_lane_manifests_are_the_reviewed_builtin_policy() {
+    for lane in LANES {
+        let config = CampaignLaneConfigV1::builtin(*lane);
+        config.validate().unwrap();
+        assert_eq!(config.lane, *lane);
     }
 }
 
 #[test]
 fn every_lane_has_all_resource_retention_and_flake_budgets() {
-    for (lane, _) in TRACKED_LANES {
+    for lane in LANES {
         let config = CampaignLaneConfigV1::builtin(*lane);
+        assert!(config.contents.minimum_executed_cases > 0);
         assert!(config.budgets.max_wall_clock_seconds > 0);
         assert!(config.budgets.max_cpu_seconds > 0);
         assert!(config.budgets.max_peak_rss_bytes > 0);
@@ -45,6 +35,32 @@ fn every_lane_has_all_resource_retention_and_flake_budgets() {
         assert!(config.budgets.artifact_retention_days > 0);
         assert!(config.budgets.max_flake_rate_basis_points <= 10_000);
     }
+}
+
+#[test]
+fn budget_evaluation_rejects_empty_and_inconsistent_observations() {
+    let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::WeeklyManual);
+    let empty = config.evaluate(CampaignLaneObservationV1::default());
+    assert!(!empty.passed);
+    assert!(
+        empty
+            .violations
+            .iter()
+            .any(|violation| violation == "executed_cases:0")
+    );
+
+    let inconsistent = config.evaluate(CampaignLaneObservationV1 {
+        executed_cases: config.contents.minimum_executed_cases,
+        flaky_cases: config.contents.minimum_executed_cases + 1,
+        ..CampaignLaneObservationV1::default()
+    });
+    assert!(!inconsistent.passed);
+    assert!(
+        inconsistent
+            .violations
+            .iter()
+            .any(|violation| violation.starts_with("flaky_cases:"))
+    );
 }
 
 #[test]
@@ -67,6 +83,10 @@ fn budget_evaluation_reports_every_exceeded_dimension() {
 #[test]
 fn release_evidence_requires_scoped_coverage_and_a_passing_budget() {
     let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::ReleaseHardening);
+    let temp = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"process report";
+    std::fs::create_dir(temp.path().join("reports")).unwrap();
+    std::fs::write(temp.path().join("reports/process.json"), artifact_bytes).unwrap();
     let mut bundle = ConvergenceEvidenceBundleV1 {
         schema_version: "1".into(),
         lane: CampaignLaneV1::ReleaseHardening,
@@ -84,14 +104,35 @@ fn release_evidence_requires_scoped_coverage_and_a_passing_budget() {
         unresolved_counterexamples: Vec::new(),
         residual_assumptions: vec!["eventual input-set equality".into()],
         untested_surfaces: vec!["unbounded executions".into()],
-        budget: config.evaluate(CampaignLaneObservationV1::default()),
+        budget: config.evaluate(CampaignLaneObservationV1 {
+            executed_cases: config.contents.minimum_executed_cases,
+            ..CampaignLaneObservationV1::default()
+        }),
         artifacts: vec![EvidenceArtifactV1 {
             kind: "process_report".into(),
             path: "reports/process.json".into(),
-            sha256: "0".repeat(64),
+            sha256: hex::encode(Sha256::digest(artifact_bytes)),
         }],
     };
     bundle.validate().unwrap();
+    bundle.validate_artifacts(temp.path()).unwrap();
+    bundle
+        .write_private(&temp.path().join("evidence.json"))
+        .unwrap();
+
+    let mut missing_artifacts = bundle.clone();
+    missing_artifacts.artifacts.clear();
+    assert_eq!(
+        missing_artifacts.validate().unwrap_err().code,
+        "incomplete_evidence_bundle"
+    );
+
+    bundle.artifacts[0].sha256 = "0".repeat(64);
+    assert_eq!(
+        bundle.validate_artifacts(temp.path()).unwrap_err().code,
+        "evidence_artifact_digest_mismatch"
+    );
+    bundle.artifacts[0].sha256 = hex::encode(Sha256::digest(artifact_bytes));
     bundle.untested_surfaces.clear();
     assert_eq!(
         bundle.validate().unwrap_err().code,
