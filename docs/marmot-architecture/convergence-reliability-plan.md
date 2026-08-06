@@ -269,7 +269,9 @@ Categories:
 The completeness scope is constants that directly affect convergence policy, retained convergence input, convergence
 engine work bounds, dedicated convergence scheduling, or dedicated history reacquisition. Generic HTTP, relay SDK,
 account-open, and UI timeouts remain owned by their subsystem runtime policy and are not convergence constants merely
-because they can delay a process.
+because they can delay a process. Simulator/campaign execution budgets and evidence-artifact transaction timeouts are
+likewise tooling policy: they may make a test or evidence write fail closed, but they do not alter engine inputs,
+branch selection, application projection, or production scheduling and therefore stay outside this ledger.
 
 The machine-readable
 [`convergence-constant-inventory.txt`](./convergence-constant-inventory.txt) maps every ledger ID to its current Rust

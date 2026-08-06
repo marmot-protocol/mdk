@@ -408,9 +408,9 @@ pub fn semantic_reduction_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
 
 fn semantic_minimization_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
     let mut units = semantic_reduction_units(steps);
+    let paired_indices = units.iter().flatten().copied().collect::<BTreeSet<_>>();
     units.extend(steps.iter().enumerate().filter_map(|(index, step)| {
-        (semantic_pair_marker(step, None).is_none() && is_minimizer_removable(step))
-            .then_some(vec![index])
+        (!paired_indices.contains(&index) && is_minimizer_removable(step)).then_some(vec![index])
     }));
     units
 }
@@ -2821,5 +2821,24 @@ mod tests {
             ScenarioStep::SetPartition { .. }
         ));
         assert!(matches!(minimized.steps[1], ScenarioStep::ClearPartition));
+    }
+
+    #[test]
+    fn minimization_units_include_orphans_without_splitting_complete_pairs() {
+        let steps = vec![
+            ScenarioStep::ClearPartition,
+            ScenarioStep::SetPartition {
+                allow: vec!["alice".into()],
+            },
+            ScenarioStep::SetPartition {
+                allow: vec!["bob".into()],
+            },
+            ScenarioStep::ClearPartition,
+        ];
+
+        assert_eq!(
+            semantic_minimization_units(&steps),
+            vec![vec![2, 3], vec![0], vec![1]]
+        );
     }
 }

@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::{
     FailureCapsuleSensitivity, FailureCapsuleV1, FailureIdentityV1, ScenarioSpec,
-    ScenarioTopologyV2, TerminalOutcomeClassification, TraceExpectation, VectorMismatch,
-    run_scenario_report, write_failure_capsule,
+    ScenarioStepLogEntry, ScenarioStepStatus, ScenarioTopologyV2, SubjectFailureCategory,
+    TerminalOutcomeClassification, TraceExpectation, VectorMismatch, run_scenario_report,
+    write_failure_capsule,
 };
 use convergence_campaign_runner::{
     CampaignAdapterV1, ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1,
     DistributedParticipantV1, FailureClassificationV1, FailureCorpusObservationV1, FailureCorpusV1,
     OciRuntimeV1, RunnerError, ScenarioArtifactV1, build_adapter_reduction_candidate,
-    promote_capsule_into_corpus, read_failure_corpus, record_distributed_failure,
-    update_failure_corpus, write_failure_corpus,
+    observation_from_capsule, promote_capsule_into_corpus, read_failure_corpus,
+    record_distributed_failure, update_failure_corpus, write_failure_corpus,
 };
 use sha2::Digest;
 
@@ -304,4 +305,45 @@ async fn successful_promotion_records_validated_capsule_and_vector_digests() {
             .promoted_vectors
             .contains(&promoted)
     );
+}
+
+#[tokio::test]
+async fn environment_capsules_do_not_emit_cross_adapter_reduction_candidates() {
+    let scenario = ScenarioSpec {
+        name: "environment-capsule/v1".into(),
+        spec_version: "2".into(),
+        clients: Vec::new(),
+        topology: ScenarioTopologyV2::default(),
+        steps: Vec::new(),
+    };
+    let mut report = run_scenario_report(&scenario, None).await.unwrap();
+    report.step_log.push(ScenarioStepLogEntry {
+        step_index: 0,
+        step_type: "campaign_setup".into(),
+        status: ScenarioStepStatus::Failed {
+            kind: "environment_unavailable".into(),
+            category: SubjectFailureCategory::Environment,
+            message: "synthetic environment failure".into(),
+        },
+        wall_us: 0,
+    });
+    let capsule = FailureCapsuleV1::from_report(
+        report,
+        FailureCapsuleSensitivity::SyntheticShareable,
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+
+    let observation = observation_from_capsule(
+        &capsule,
+        "environment-capsule.v1.json".into(),
+        CampaignAdapterV1::Process,
+        BTreeMap::new(),
+    );
+    assert_eq!(
+        observation.classification,
+        FailureClassificationV1::EnvironmentFailure
+    );
+    assert!(observation.reduction_candidate.is_none());
 }

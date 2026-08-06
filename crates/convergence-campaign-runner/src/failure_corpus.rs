@@ -335,14 +335,11 @@ fn with_failure_corpus_lock<T>(
 
     #[cfg(not(unix))]
     {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .map_err(|_| {
-                RunnerError::validation("failure_corpus_lock", "failure corpus lock was poisoned")
-            })?;
-        operation()
+        let _ = operation;
+        Err(RunnerError::validation(
+            "failure_corpus_interprocess_lock_unsupported",
+            "failure corpus mutation requires Unix advisory file leases",
+        ))
     }
 }
 
@@ -498,7 +495,7 @@ pub fn observation_from_capsule(
         build_matrix,
         scenario,
         capsule.failure.semantic_identity(),
-        false,
+        classification == FailureClassificationV1::EnvironmentFailure,
     );
     observation.seeds = capsule.seeds.values().copied().collect();
     observation.capsule_paths.insert(capsule_path);
