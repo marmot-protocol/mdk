@@ -3576,3 +3576,127 @@ async fn fanout_staging_failure_rolls_back_pending_mls_state() {
         ))
     ));
 }
+
+#[tokio::test]
+async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_publish() {
+    // Field incidents blamed a stalled self-update publication for wedging a
+    // group in `PendingPublish` (and, before app payloads were retained across
+    // that state, for failing user sends). This pins the bound that makes the
+    // rejection case terminal: one complete attempt where every endpoint
+    // rejected the event is an unambiguous all-failed publication, so the
+    // pending publish rolls back on that attempt rather than waiting out the
+    // 30s→1h per-target backoff — which never terminates on its own.
+    //
+    // Its counterpart is
+    // `ambiguous_self_update_exposure_survives_restart_and_respects_retry_backoff`:
+    // when the adapter *errors*, a relay may hold the event, so the same staged
+    // commit deliberately keeps its obligation instead of risking a fork.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot rejected self update key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "rejected self update".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let source_epoch = initial.epoch(&group_id).unwrap();
+    drop(initial);
+
+    let adapter = RecordingAdapter::default();
+    // Every endpoint rejects: an `Ok` report with zero acknowledgements, which
+    // is precisely what a relay refusal looks like to the account runtime.
+    adapter.accept_next(0);
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    let effects = runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(adapter.publishes().len(), 1);
+    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert!(
+        !fanout.possible_exposure,
+        "a rejection is a definite non-delivery, not an ambiguous exposure"
+    );
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. })),
+        "a completely rejected publication must resolve its pending publish, not defer it; got {:?}",
+        effects.pending
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap(),
+        source_epoch,
+        "rollback must restore the epoch the self-update was staged from"
+    );
+    // Rollback compensated the staged evolution in the same transaction, so the
+    // obligation has nothing left to re-publish and must re-stage rather than
+    // cling to an event that reached no one. That is the liveness half of the
+    // bound: without it a rejected publication leaves the rotation permanently
+    // owed.
+    //
+    // The very next maintenance run must do it, with the clock exactly where
+    // the rejection left it, and asserting that is the point. Nothing on this
+    // path can legitimately delay the re-stage: `not_before` is only written by
+    // the quiet-period arm, which a due obligation in `PendingPublication` never
+    // reaches, and the re-staged commit gets a fresh fanout whose targets have
+    // no `last_attempt_at`, so the 30s→1h per-target retry backoff has nothing
+    // to measure from. Pinning the immediate re-stage means any future backoff
+    // introduced here fails loudly instead of hiding behind a clock the test
+    // advanced for it.
+    adapter.accept_next(1);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1,
+        "the obligation must re-stage and land a fresh self-update after the rejected one rolled back"
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Complete,
+        "the rotation the rejected publication owed must end up satisfied"
+    );
+}

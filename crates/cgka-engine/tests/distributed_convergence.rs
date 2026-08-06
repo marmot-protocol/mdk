@@ -3674,6 +3674,44 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         "send must report Unrecoverable; got {send_err:?}"
     );
 
+    // The durable-retention path observes the same terminal boundary: a halted
+    // group accepts no *new* work. That is a narrower claim than it looks —
+    // intents accepted before the halt are held for the one legal exit and are
+    // delivered after a verified repair, which
+    // `intent_retained_before_a_halt_is_delivered_after_a_verified_repair`
+    // pins. Refusing here keeps the queue to work the engine accepted while it
+    // still had a live epoch to accept it against.
+    //
+    // The whole gate is pinned, not just `from`. `queue_app_message` passes two
+    // gates that both report `from: "Unrecoverable"` — the durable halt sync in
+    // `validate_send_acceptance` and the retention-boundary check after it — so
+    // matching `from` alone cannot tell which one fired, and reordering them
+    // would keep this test green while moving the refusal behind the retention
+    // check. Pinning `to` and `reason` makes that reordering fail loudly.
+    let queue_err = restarted
+        .queue_app_message(
+            group_id.clone(),
+            app_payload_for(&restarted, b"must not be retained while halted"),
+        )
+        .await
+        .expect_err("queue_app_message must refuse Unrecoverable");
+    let cgka_traits::error::EngineError::InvalidTransition(queue_transition) = queue_err else {
+        panic!("queue_app_message must report an illegal transition; got {queue_err:?}")
+    };
+    assert_eq!(
+        (
+            queue_transition.from,
+            queue_transition.to,
+            queue_transition.reason
+        ),
+        (
+            "Unrecoverable",
+            "app_message",
+            "group is Unrecoverable pending verified repair"
+        ),
+        "the durable halt sync must be the gate that refuses, ahead of the retention boundary"
+    );
+
     // A verified replacement Welcome must be able to repair a frozen active
     // record. Alice removes Carol from the live branch and re-adds her with a
     // fresh KeyPackage; Carol intentionally never ingests the removal, so her
@@ -3724,6 +3762,332 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         })
         .await
         .expect("verified repair returns the group to Stable");
+}
+
+/// A group that accepted an app message and then halted `Unrecoverable`, with
+/// the verified repair Welcome staged but not yet joined — the shared starting
+/// point for both halves of the mdk#1106 hold-through-repair promise. Each test
+/// joins the Welcome itself, because *when* the repair lands is what they
+/// differ on.
+struct HaltedAwaitingRepair {
+    alice: Engine<SqliteAccountStorage>,
+    carol: Engine<SqliteAccountStorage>,
+    carol_storage: SqliteAccountStorage,
+    group_id: cgka_traits::GroupId,
+    intent_id: cgka_traits::MessageId,
+    /// The epoch the intent was accepted at. The repair moves the group past
+    /// it, so a drain at the post-repair epoch proves re-encryption.
+    queue_time_epoch: cgka_traits::EpochId,
+    repair_welcome: cgka_traits::transport::TransportMessage,
+}
+
+async fn retain_intent_then_halt_awaiting_repair() -> HaltedAwaitingRepair {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "retained-across-repair".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    // Carol's message is accepted and retained before anything goes wrong.
+    let queue_time_epoch = carol.epoch(&group_id).unwrap();
+    let payload = app_payload_for(&carol, b"typed before the halt");
+    let intent_id = match carol
+        .queue_app_message(group_id.clone(), payload.clone())
+        .await
+        .expect("a non-terminal group retains an app message")
+    {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected durable retention, got {other:?}"),
+    };
+
+    // The group then halts Unrecoverable durably (mdk#971).
+    let mut halted_record = carol_storage.get_group(&group_id).unwrap();
+    halted_record.unrecoverable = true;
+    carol_storage.put_group(&halted_record).unwrap();
+
+    let blocked = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("the durable halt pauses the drain");
+    assert!(blocked.is_empty(), "nothing may publish while halted");
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .iter()
+            .map(|queued| queued.id.clone())
+            .collect::<Vec<_>>(),
+        vec![intent_id.clone()],
+        "already-accepted work must survive the halt for its one legal exit"
+    );
+
+    // The one legal exit: Alice removes Carol from the live branch and re-adds
+    // her with a fresh KeyPackage. Carol never ingests the removal, so her
+    // frozen record still lists her when the repair Welcome arrives.
+    let repair_kp = carol.fresh_key_package().await.unwrap();
+    let (_remove_commit, remove_pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![carol.self_id()],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(remove_pending).await.unwrap();
+    let (repair_pending, repair_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![repair_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected repair GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(repair_pending).await.unwrap();
+
+    HaltedAwaitingRepair {
+        alice,
+        carol,
+        carol_storage,
+        group_id,
+        intent_id,
+        queue_time_epoch,
+        repair_welcome,
+    }
+}
+
+#[tokio::test]
+async fn intent_retained_before_a_halt_is_delivered_after_a_verified_repair() {
+    // mdk#1106 pins that a halted group's queued work "must remain available
+    // after verified repair". This is the other half of that promise: the
+    // retained intent must actually reach the group once the repair lands.
+    //
+    // It can, because retention holds an *intent*, not ciphertext. The drain
+    // re-prepares the payload against whatever canonical state the group ended
+    // up on, so a message accepted before the halt is encrypted under the
+    // post-repair epoch and every current member can read it. Holding across
+    // the halt therefore promises a delivery the engine can keep.
+    //
+    // This half covers the restart shape; the no-restart shape is
+    // `a_verified_repair_schedules_the_drain_for_retained_intents_without_a_restart`.
+    let HaltedAwaitingRepair {
+        mut alice,
+        mut carol,
+        carol_storage,
+        group_id,
+        intent_id,
+        queue_time_epoch,
+        repair_welcome,
+    } = retain_intent_then_halt_awaiting_repair().await;
+
+    carol
+        .join_welcome(repair_welcome)
+        .await
+        .expect("an authenticated replacement Welcome repairs Unrecoverable");
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "verified repair must clear the durable marker"
+    );
+
+    // A restart is the realistic shape: the repair may well land in a later
+    // session than the halt. Hydration must put the group back on the drain
+    // schedule because it still holds durable intents.
+    drop(carol);
+    let mut repaired = build_client_with_storage(b"carol", carol_storage.clone());
+    repaired
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds after repair");
+    assert!(
+        repaired
+            .drain_pending_convergence_groups()
+            .contains(&group_id),
+        "hydration must re-schedule a repaired group that still holds intents"
+    );
+
+    let repaired_epoch = repaired.epoch(&group_id).unwrap();
+    assert_eq!(
+        repaired_epoch,
+        alice.epoch(&group_id).unwrap(),
+        "the replacement Welcome installs the verified live state"
+    );
+    assert!(
+        repaired_epoch > queue_time_epoch,
+        "the repair must move the epoch, or re-encryption proves nothing: \
+         {queue_time_epoch:?} -> {repaired_epoch:?}"
+    );
+
+    let mut drained = repaired
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .expect("a repaired group drains its retained work");
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(
+        source_epoch, repaired_epoch,
+        "the retained intent must be encrypted under the post-repair epoch"
+    );
+
+    // And that is delivery, not bookkeeping: Alice, on the repaired branch,
+    // decrypts the message Carol wrote before the halt.
+    assert!(matches!(
+        alice.ingest(route(msg, &group_id)).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            GroupEvent::MessageReceived {
+                sender, payload, ..
+            } => Some((sender, payload)),
+            _ => None,
+        })
+        .expect("alice observes the retained message");
+    assert_eq!(received.0, repaired.self_id());
+    assert_eq!(app_content(&received.1), b"typed before the halt");
+
+    // The durable intent is retired only once the app confirms publication.
+    repaired
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("the drained intent is the one that was queued before the halt");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_verified_repair_schedules_the_drain_for_retained_intents_without_a_restart() {
+    // The restart half above passes because session-open hydration re-arms the
+    // drain from the durable queue. That hides the case a live client actually
+    // hits: the repair Welcome arrives in the same session as the halt.
+    //
+    // A running host releases retained work by draining
+    // `drain_pending_convergence_groups` after each engine call. If the repair
+    // does not put the group on that list, the message the user typed before
+    // the halt sits durable and unsent until unrelated traffic happens to
+    // schedule the group or the process restarts — the same reason a publish
+    // outcome schedules the drain.
+    let HaltedAwaitingRepair {
+        mut alice,
+        mut carol,
+        carol_storage,
+        group_id,
+        intent_id,
+        queue_time_epoch,
+        repair_welcome,
+    } = retain_intent_then_halt_awaiting_repair().await;
+
+    // Everything scheduled before the repair has already been taken by the
+    // host's drain, so what remains is what the repair itself scheduled.
+    let scheduled_before_repair = carol.drain_pending_convergence_groups();
+
+    carol
+        .join_welcome(repair_welcome)
+        .await
+        .expect("an authenticated replacement Welcome repairs Unrecoverable");
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "verified repair must clear the durable marker"
+    );
+
+    assert!(
+        carol.drain_pending_convergence_groups().contains(&group_id),
+        "a verified repair must schedule the drain for a group that still holds \
+         retained intents; scheduled before the repair: {scheduled_before_repair:?}"
+    );
+
+    let repaired_epoch = carol.epoch(&group_id).unwrap();
+    assert!(
+        repaired_epoch > queue_time_epoch,
+        "the repair must move the epoch, or re-encryption proves nothing: \
+         {queue_time_epoch:?} -> {repaired_epoch:?}"
+    );
+
+    let mut drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .expect("a repaired group drains its retained work");
+    assert_eq!(
+        drained.len(),
+        1,
+        "expected exactly the retained message, got {drained:?}"
+    );
+    let SendResult::ApplicationMessage {
+        msg, source_epoch, ..
+    } = drained.remove(0)
+    else {
+        panic!("a retained app-message intent drains as an application message")
+    };
+    assert_eq!(
+        source_epoch, repaired_epoch,
+        "the retained intent must be encrypted under the post-repair epoch"
+    );
+
+    // Delivery, not bookkeeping: Alice decrypts what Carol typed before the halt.
+    assert!(matches!(
+        alice.ingest(route(msg, &group_id)).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            GroupEvent::MessageReceived {
+                sender, payload, ..
+            } => Some((sender, payload)),
+            _ => None,
+        })
+        .expect("alice observes the retained message");
+    assert_eq!(received.0, carol.self_id());
+    assert_eq!(app_content(&received.1), b"typed before the halt");
+
+    carol
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("the drained intent is the one that was queued before the halt");
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

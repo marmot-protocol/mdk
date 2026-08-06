@@ -22,6 +22,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
   
+- Outbound messages waiting in a group's durable queue are now bounded at 256
+  per group. The bound covers every reason a message waits: a group resolving a
+  stalled publication, convergence input that has not settled, and messages
+  queued while the account is offline. Past the bound a send is refused instead
+  of queued without limit — MarmotKit reports the typed `GroupSendQueueFull`
+  error, which is deliberately not retried automatically, so a host should tell
+  the user the message was not accepted and offer to resend once the group is
+  sending again. Nothing already queued is discarded; a slot frees only once its
+  message is accepted by a relay.
+  
 ### Fixed
 
 - Account setup interruptions now have stable JSON recovery codes and repair

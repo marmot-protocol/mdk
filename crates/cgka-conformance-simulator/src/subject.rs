@@ -2014,7 +2014,11 @@ fn outbound_sequence(outbound_id: &str) -> Result<u64, SubjectError> {
 
 pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCategory, String) {
     let category = match error {
-        EngineError::Backend(_) | EngineError::Storage(_) => SubjectFailureCategory::Resource,
+        // A full outbound retention queue is a visible, fail-closed resource
+        // bound (ledger E9), the same class of observation as a storage failure.
+        EngineError::Backend(_)
+        | EngineError::Storage(_)
+        | EngineError::QueuedOutboundAtCapacity { .. } => SubjectFailureCategory::Resource,
         EngineError::InvalidTransition(_)
         | EngineError::Other(_)
         | EngineError::Peeler(_)
@@ -2098,6 +2102,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
+        EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
     }
     .into()
 }

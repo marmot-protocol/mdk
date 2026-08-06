@@ -35,7 +35,7 @@ use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::types::EpochId;
+use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider as _;
 
@@ -316,6 +316,7 @@ impl<S: StorageProvider> Engine<S> {
                 "deferred fork-recovery prune after confirm; will retry on next pass"
             );
         }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
@@ -501,6 +502,7 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
             self.schedule_pending_convergence_group(&queued_group_id);
         }
+        self.schedule_drain_for_retained_outbound_intents(&group_id);
         self.forget_pending_commit_for_recovery(pending)?;
         self.restore_self_remove_auto_commit_schedules_for_group(
             &group_id,
@@ -509,6 +511,47 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
+    }
+
+    /// Put a group back on the runtime's drain list when it still holds durable
+    /// outbound intents.
+    ///
+    /// Retained application payloads are released by the next convergence drain
+    /// (`converge_and_drain_queued_outbound_intents`), and in this process only
+    /// the seam that returns the group to `Stable` arranges that. While the
+    /// group is held — `PendingPublish`, or halted `Unrecoverable` — the caller
+    /// gates keep it still: ingest buffers rather than advances the state, and
+    /// the drain and send paths both return early on non-`Stable`. So every
+    /// such seam must schedule on its way out: a publish outcome and a verified
+    /// repair Welcome through this helper, quarantine recovery
+    /// (`retry_hydrate_quarantined_group`) unconditionally because it has
+    /// already read the group. (Across a restart, session-open hydration re-arms
+    /// the drain from the same durable queue whatever state the group landed
+    /// in.)
+    ///
+    /// Best-effort by construction: this runs after the outcome is durable, so
+    /// a transient backend lock here must not fail already-committed work.
+    /// Skipping the schedule is not free, though: the intents stay durable, but
+    /// their release then waits until unrelated traffic happens to schedule this
+    /// group or the process restarts. So a failed read — which cannot prove the
+    /// queue is empty — schedules the drain anyway; a spurious no-op pass is
+    /// cheaper than a stranded payload.
+    pub(crate) fn schedule_drain_for_retained_outbound_intents(&mut self, group_id: &GroupId) {
+        match self.storage.list_queued_outbound_intents(group_id) {
+            Ok(retained) if !retained.is_empty() => {
+                self.schedule_pending_convergence_group(group_id);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "cgka_engine::publish",
+                    method = "schedule_drain_for_retained_outbound_intents",
+                    transient = error.is_transient(),
+                    "retained-intent read failed while returning a group to Stable; scheduling the drain anyway"
+                );
+                self.schedule_pending_convergence_group(group_id);
+            }
+        }
     }
 }
 

@@ -57,6 +57,46 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// backlog drains).
 pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 
+/// Per-group cap on retained outbound intents (mdk#1246). Unlike the
+/// deferred-peel cap above, these rows are not peer-mintable — every one
+/// originates from a local `send` — so this bounds a runaway local sender
+/// rather than a flood. It is enforced in `queue_outbound_intent`, the sole
+/// insertion point for the queue, so it covers every path that retains: a group
+/// resolving a locally staged publication, a `Stable` group whose convergence
+/// inputs have not settled, and the offline outbox — `queue_app_message`, which
+/// the app calls when the account is not active (mdk#1158). The last is the one
+/// a user drives directly: 256 sends into one group across a single offline
+/// stretch, and the 257th is refused rather than queued.
+///
+/// The first of those can hold indefinitely — a publication whose exposure is
+/// ambiguous is never rolled back, and the transport fanout row that would
+/// retry it is retired at `TRANSPORT_FANOUT_RETENTION_SECS` — so without a cap
+/// a programmatic sender grows the durable store without bound while every
+/// call still reports `SendResult::Queued`.
+///
+/// Too low refuses a legitimate burst against a group that would have
+/// recovered in seconds; too high lets the queue's marginal durable footprint
+/// (each row duplicates an app-projection row the app wrote before the engine
+/// was called) grow past what a mobile device can absorb. 256 matches
+/// `MAX_PEEL_DEFERRED_ROWS_PER_GROUP` and the other per-scope retention caps in
+/// the workspace, and sits far above any plausible human burst across a stall.
+///
+/// At the cap the send is refused with
+/// [`EngineError::QueuedOutboundAtCapacity`](cgka_traits::error::EngineError::QueuedOutboundAtCapacity)
+/// so the caller learns its message was not accepted. Retention never silently
+/// drops work it already accepted — that is the difference from the
+/// deferred-peel cap, which may drop because transport redelivery is its
+/// recovery path.
+///
+/// Capacity is reclaimed on confirmation, not on drain. A drained row is
+/// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
+/// intent, inside `confirm_published` — so a payload that was prepared and
+/// published but never acknowledged still holds its slot and is re-prepared on
+/// the next drain. A group whose transport keeps failing therefore sits at the
+/// cap: its rows keep being re-attempted, but nothing frees a slot until a
+/// publish is accepted by at least one endpoint.
+pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
+
 /// Upper bound on `PeelDeferred` rows re-attempted per retry sweep
 /// (mdk#339): a large historical backlog is worked through in slices
 /// across passes instead of holding a convergence drain hostage, so current
@@ -300,7 +340,10 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(&intent, SendIntent::Disband { .. }) {
             return self.do_request_disband(group_id);
         }
-        if self.should_queue_outbound_intent(&group_id).await? {
+        if self
+            .should_queue_outbound_intent(&group_id, &intent)
+            .await?
+        {
             return self.queue_outbound_intent(group_id, intent);
         }
 
@@ -317,14 +360,25 @@ impl<S: StorageProvider> Engine<S> {
             payload,
         };
         self.validate_send_acceptance(&intent)?;
+        // Same retention boundary as `send`: a publication this client staged
+        // holds the payload, every other non-`Stable` state refuses it.
+        //
+        // For the two terminal states this is defense in depth —
+        // `validate_send_acceptance` above already refused them, `Unrecoverable`
+        // through the durable halt sync (which consults the in-memory map first)
+        // and `Disbanded` through the write-once tombstone written in the same
+        // transaction that purges the queue. Re-checking the epoch state catches
+        // a divergence between it and those durable markers rather than trusting
+        // one of the two.
         if let Some(state) = self.epoch_manager.state(&group_id)
-            && !matches!(state, EpochState::Stable { .. })
+            && !state.is_stable()
+            && !state.is_resolving_local_publish()
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: state.name(),
                     to: "queue_app_message",
-                    reason: "queue_app_message requires Stable",
+                    reason: "queue_app_message requires Stable or an unresolved local publish",
                 },
             ));
         }
@@ -577,11 +631,32 @@ impl<S: StorageProvider> Engine<S> {
     async fn should_queue_outbound_intent(
         &mut self,
         group_id: &GroupId,
+        intent: &SendIntent,
     ) -> Result<bool, EngineError> {
         if let Some(state) = self.epoch_manager.state(group_id)
-            && !matches!(state, EpochState::Stable { .. })
+            && !state.is_stable()
         {
-            return Ok(false);
+            // A publication this client staged owes its exit to a transport
+            // outcome and then a local merge, both of which can take minutes
+            // when relays misbehave. Retain application payloads across that
+            // window so a stalled group operation cannot make a user's message
+            // vanish; the drain re-prepares them from whatever canonical state
+            // the group lands on.
+            //
+            // Group-state intents keep the strict `Stable` requirement: a
+            // second staged evolution has no epoch to apply to, and the
+            // per-intent guards in `do_send_ready` report that as the illegal
+            // transition it is. `Recovering` and the terminal states retain
+            // nothing — see `EpochState::is_resolving_local_publish`.
+            //
+            // The terminal states never reach this branch: `do_send` runs
+            // `validate_send_acceptance` first, and its durable halt and
+            // tombstone gates already refused them. They are excluded here too
+            // because `is_resolving_local_publish` does not match them — the
+            // same shape as the `Stable`-only re-check in
+            // `converge_and_drain_queued_outbound_intents`.
+            return Ok(matches!(intent, SendIntent::AppMessage { .. })
+                && state.is_resolving_local_publish());
         }
 
         let now_ms = self.convergence_now_ms();
@@ -1316,7 +1391,13 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
         let created_at_ms = self.convergence_now_ms();
-        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len() as u64;
+        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
+        // Refuse before serializing or writing anything: the single durable
+        // write on this path is below, so a refusal here leaves nothing to
+        // compensate.
+        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
+        }
         let intent_bytes =
             serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let mut hasher = Sha256::new();
@@ -1324,7 +1405,7 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(group_id.as_slice());
         hasher.update(self.identity.self_id().as_slice());
         hasher.update(created_at_ms.to_be_bytes());
-        hasher.update(existing_count.to_be_bytes());
+        hasher.update((existing_count as u64).to_be_bytes());
         hasher.update(&intent_bytes);
         let intent_id = MessageId::new(hasher.finalize().to_vec());
         self.storage

@@ -119,6 +119,19 @@ pub enum EngineError {
         conflicting_epoch: EpochId,
     },
 
+    /// The group's durable outbound-intent retention queue is full
+    /// (`MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP`), so this send was not
+    /// accepted. Nothing was persisted; the intents already queued are intact
+    /// and still drain when the group resolves.
+    ///
+    /// Deliberately **not** [`is_transient`](EngineError::is_transient): that
+    /// predicate drives automatic retry loops, and a full queue cannot clear
+    /// until the group leaves the state that is holding it — which, for a
+    /// publication whose exposure is ambiguous, may be never. It is retryable
+    /// by the user once the group recovers, not by a loop.
+    #[error("queued outbound retention is at capacity for this group")]
+    QueuedOutboundAtCapacity { group_id: GroupId },
+
     /// Illegal state-machine transition (from
     /// [`crate::engine_state::InvalidTransition`]). Indicates an engine bug.
     #[error(transparent)]
