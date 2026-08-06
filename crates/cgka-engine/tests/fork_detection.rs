@@ -2149,18 +2149,20 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         .converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .expect("the deeper A branch must be realizable after restart");
 
-    let x_members: Vec<_> = x
+    let mut x_members: Vec<_> = x
         .members(&group_id)
         .unwrap()
         .iter()
         .map(|m| m.id.clone())
         .collect();
-    let y_members: Vec<_> = y
+    let mut y_members: Vec<_> = y
         .members(&group_id)
         .unwrap()
         .iter()
         .map(|m| m.id.clone())
         .collect();
+    x_members.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    y_members.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
     assert_eq!(
         x_members,
         y_members,

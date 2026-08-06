@@ -92,8 +92,8 @@ mod tests {
     };
     use cgka_traits::capabilities::{Capability, GroupCapabilities};
     use cgka_traits::storage::{
-        CapabilityStorage, GroupStateCheckpointRef, GroupStorage, MessageStorage,
-        OutboundIntentStorage, StorageError, StorageProvider,
+        CapabilityStorage, GroupStateCheckpointRef, GroupStorage, MemberValidationCacheStorage,
+        MessageStorage, OutboundIntentStorage, StorageError, StorageProvider,
     };
     use cgka_traits::types::EpochId;
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -164,6 +164,14 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"branch-a".to_vec()))
             .unwrap();
+        let mut branch_a_caps = GroupCapabilities::default();
+        branch_a_caps.insert(Capability::Proposal(10));
+        store
+            .save_member_capabilities(&g1.id, &g1.members[0], branch_a_caps.clone())
+            .unwrap();
+        store
+            .put_validated_tree_marker(&g1.id, b"branch-a-marker")
+            .unwrap();
         let checkpoint = GroupStateCheckpointRef {
             id: "own-commit-a".into(),
             resulting_epoch: EpochId(1),
@@ -186,6 +194,14 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"branch-b".to_vec()))
             .unwrap();
+        let mut branch_b_caps = GroupCapabilities::default();
+        branch_b_caps.insert(Capability::Extension(11));
+        store
+            .save_member_capabilities(&g2.id, &g2.members[0], branch_b_caps)
+            .unwrap();
+        store
+            .put_validated_tree_marker(&g2.id, b"branch-b-marker")
+            .unwrap();
 
         store
             .restore_group_state_checkpoint(&g2.id, &checkpoint.id)
@@ -194,6 +210,16 @@ mod tests {
         assert_eq!(store.get_group(&g1.id).unwrap(), g1);
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"branch-a".to_vec())));
+        assert_eq!(
+            store
+                .member_capabilities(&g1.id, &g1.members[0].id)
+                .unwrap(),
+            Some(branch_a_caps)
+        );
+        assert_eq!(
+            store.validated_tree_marker(&g1.id).unwrap(),
+            Some(b"branch-a-marker".to_vec())
+        );
         assert_eq!(
             store.list_messages(&g1.id, EpochId(0)).unwrap(),
             vec![live_message]

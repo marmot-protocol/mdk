@@ -3487,17 +3487,19 @@ mod checkpoint_prefix_tests {
             .put_message(&own_commit_row(b"commit-a", 1))
             .unwrap();
         storage
-            .put_message(&own_commit_row(b"commit-a2", 1))
+            .put_message(&own_commit_row_with_checkpoint(b"commit-a2", 1, false))
             .unwrap();
 
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
-            &result_accepting(&[b"commit-a"]),
+            &result_accepting(&[b"commit-a2"]),
             &BTreeSet::new(),
         )
         .unwrap();
-        let realized = prefix.realized.expect("selected sibling should be exact");
-        assert_eq!(realized.resulting_epoch, 2);
-        assert_eq!(realized.id, checkpoint_id_for(b"commit-a"));
+        assert!(
+            prefix.realized.is_none(),
+            "a sibling at the same epoch must not resolve to another commit's checkpoint"
+        );
+        assert!(prefix.commit_ids.is_empty());
     }
 }
