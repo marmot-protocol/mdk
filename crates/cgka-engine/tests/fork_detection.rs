@@ -2264,6 +2264,10 @@ struct RouterFlipFixture {
     local_storage: SqliteAccountStorage,
     local_seed: Vec<u8>,
     competing: TransportMessage,
+    /// Wrap-time transport id of the device's own confirmed commit — the id
+    /// its stored row is keyed by, and therefore the id any rollback /
+    /// invalidation event attributing that commit must carry.
+    own_commit_id: MessageId,
     own_invitee: MemberId,
     sibling_invitee: MemberId,
     /// True when deterministic commit ordering makes the inbound sibling commit
@@ -2277,9 +2281,20 @@ struct RouterFlipFixture {
 /// sorts FIRST — which makes the inbound sibling commit the ordering winner for
 /// every `tag`, so control and restart runs are directly comparable.
 async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
+    router_flip_fixture_arranged(tag, true).await
+}
+
+/// [`router_flip_fixture`] with the ordering winner chosen up front:
+/// `sibling_wins` picks whether the creator's inbound sibling commit or the
+/// joiner's own confirmed commit wins the privileged same-epoch committer
+/// comparison (identities are seed-derived, so the arrangement is exact).
+async fn router_flip_fixture_arranged(
+    tag: &str,
+    sibling_wins: bool,
+) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
     let a = format!("rf-a-{tag}").into_bytes();
     let b = format!("rf-b-{tag}").into_bytes();
-    let (creator_seed, joiner_seed) = if pad32(&a) < pad32(&b) {
+    let (creator_seed, joiner_seed) = if (pad32(&a) < pad32(&b)) == sibling_wins {
         (a, b)
     } else {
         (b, a)
@@ -2368,6 +2383,7 @@ async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAcco
         local_storage: joiner_storage,
         local_seed: joiner_seed,
         competing: routed,
+        own_commit_id: own_commit.id,
         own_invitee: MemberId::new(pad32(&own_seed)),
         sibling_invitee: MemberId::new(pad32(&sibling_seed)),
         sibling_wins: sibling_key < own_key,
@@ -2846,4 +2862,241 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
         MessageState::Processed,
         "the parked pairwise loser must become canonical, not stay parked"
     );
+}
+
+// --- U4 event fidelity: what a convergence apply tells the app --------------
+//
+// `emit_rolled_back_commits` / `emit_superseded_processed_commits`
+// (distributed_convergence.rs) are the only paths that withdraw state
+// notifications on the stored-convergence seam. #1285 touched this region
+// (own commits now materialize from commit-addressed checkpoints, so a kept
+// own commit lands in `accepted_commits` instead of having no disposition).
+// These two tests pin the EXACT GroupEvent set a settling pass emits when it
+// (i) keeps the device's own commit and (ii) replaces it — the event contract
+// the pairwise-route deletion (Slice C) must preserve.
+
+#[tokio::test]
+async fn convergence_pass_that_keeps_the_own_commit_emits_no_own_withdrawal() {
+    // Keep-own arm. A restarted committer routes the losing sibling through
+    // stored convergence; the pass keeps the device's own (ordering-winning)
+    // branch. The pre-#1285 hazard was a spurious withdrawal of the KEPT own
+    // commit: with no checkpoint the own commit could not be materialized
+    // into the accepted set, so the superseded-processed sweep saw a
+    // `Processed` commit row with no disposition and invalidated it — telling
+    // the app to tombstone rows for a commit the device still stands on.
+    // #1285's checkpoint materialization closes that: this test pins the
+    // clean behavior.
+    let (f, local) = router_flip_fixture_arranged("u4-keep", false).await;
+    assert!(
+        !f.sibling_wins,
+        "fixture must make the device's own commit the ordering winner"
+    );
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    drop(local);
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the losing sibling must enter the convergence pass, got {outcome:?}"
+    );
+    assert!(
+        local.drain_events().is_empty(),
+        "buffering the rival must not be application-visible"
+    );
+
+    drive_convergence(&mut local, &f, &competing_id).await;
+    assert_eq!(settled_branch(&local, &f), Branch::Own);
+    assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
+
+    // The exact application-visible output of the settling pass: the losing
+    // sibling's withdrawal pair, and nothing else — no epoch change, no
+    // membership diff (the canonical state did not move), and above all no
+    // event naming the KEPT own commit.
+    let events = local.drain_events();
+    assert!(
+        events.iter().all(|event| match event {
+            GroupEvent::CommitRolledBack {
+                invalidated_commit_id,
+                ..
+            }
+            | GroupEvent::GroupStateInvalidated {
+                invalidated_commit_id,
+                ..
+            } => invalidated_commit_id != &f.own_commit_id,
+            _ => true,
+        }),
+        "a kept own commit must never be withdrawn: {events:?}"
+    );
+    assert_eq!(
+        events.len(),
+        2,
+        "the settling pass must emit exactly the sibling's withdrawal pair: {events:?}"
+    );
+    assert!(
+        matches!(
+            &events[0],
+            GroupEvent::CommitRolledBack { group_id, invalidated_commit_id }
+                if group_id == &f.group_id && invalidated_commit_id == &competing_id
+        ),
+        "first event must roll back the losing sibling: {events:?}"
+    );
+    assert!(
+        matches!(
+            &events[1],
+            GroupEvent::GroupStateInvalidated { group_id, epoch, invalidated_commit_id, reason }
+                if group_id == &f.group_id
+                    && *epoch == EpochId(1)
+                    && invalidated_commit_id == &competing_id
+                    && *reason == cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection
+        ),
+        "second event must withdraw the sibling's state notifications at its source epoch: {events:?}"
+    );
+
+    // Dispositions: the kept own commit stays canonical; the losing sibling is
+    // parked reconsiderable at its source epoch (N4 — not terminally
+    // invalidated), so a later deeper rival branch can still be materialized.
+    assert_eq!(
+        f.local_storage.get_message(&f.own_commit_id).unwrap().state,
+        MessageState::Processed,
+        "the kept own commit must stay canonical"
+    );
+    let sibling = f.local_storage.get_message(&competing_id).unwrap();
+    assert_eq!(sibling.state, MessageState::ConvergenceDeferred);
+    assert_eq!(sibling.epoch, EpochId(1));
+}
+
+#[tokio::test]
+async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once() {
+    // Replace-own arm. Same restarted-committer route, but the inbound sibling
+    // wins the ordering: the pass reorgs the device off its own published-and-
+    // confirmed commit. Spec (convergence.md "Applying the selected branch"):
+    // superseding a previously applied commit — including the device's own —
+    // MUST withdraw the state notifications attributed to it, exactly once.
+    let (f, local) = router_flip_fixture_arranged("u4-replace", true).await;
+    assert!(
+        f.sibling_wins,
+        "fixture must make the inbound sibling commit the ordering winner"
+    );
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    drop(local);
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the winning sibling must enter the convergence pass, got {outcome:?}"
+    );
+    assert!(
+        local.drain_events().is_empty(),
+        "buffering the rival must not be application-visible"
+    );
+
+    drive_convergence(&mut local, &f, &competing_id).await;
+    assert_eq!(settled_branch(&local, &f), Branch::Sibling);
+    assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
+
+    // The exact application-visible output of the settling pass: the reorg's
+    // membership diff (the sibling's invitee replaces the own invitee — both
+    // unattributed, stamped with the winning commit as origin), then the own
+    // commit's withdrawal pair. Same-numbered epochs on both branches, so no
+    // EpochChanged.
+    let events = local.drain_events();
+    let state_changes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                ..
+            } if group_id == &f.group_id => Some((epoch, actor, change)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        state_changes.len(),
+        2,
+        "the reorg must announce exactly the two membership deltas: {events:?}"
+    );
+    assert!(
+        state_changes.iter().any(|(epoch, actor, change)| {
+            **epoch == EpochId(2)
+                && actor.is_none()
+                && matches!(
+                    change,
+                    cgka_traits::engine::GroupStateChange::MemberAdded { member }
+                        if member == &f.sibling_invitee
+                )
+        }),
+        "the winning branch's invitee must be announced: {events:?}"
+    );
+    assert!(
+        state_changes.iter().any(|(epoch, actor, change)| {
+            **epoch == EpochId(2)
+                && actor.is_none()
+                && matches!(
+                    change,
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                        if member == &f.own_invitee
+                )
+        }),
+        "the abandoned own branch's invitee must be withdrawn from membership: {events:?}"
+    );
+    let withdrawals: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GroupEvent::CommitRolledBack { .. } | GroupEvent::GroupStateInvalidated { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        withdrawals.len(),
+        2,
+        "the superseded own commit must be withdrawn exactly once: {events:?}"
+    );
+    assert!(
+        matches!(
+            withdrawals[0],
+            GroupEvent::CommitRolledBack { group_id, invalidated_commit_id }
+                if group_id == &f.group_id && invalidated_commit_id == &f.own_commit_id
+        ),
+        "the rollback must name the own commit by its stored id: {events:?}"
+    );
+    assert!(
+        matches!(
+            withdrawals[1],
+            GroupEvent::GroupStateInvalidated { group_id, epoch, invalidated_commit_id, reason }
+                if group_id == &f.group_id
+                    && *epoch == EpochId(1)
+                    && invalidated_commit_id == &f.own_commit_id
+                    && *reason == cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection
+        ),
+        "the withdrawal must name the own commit at its source epoch: {events:?}"
+    );
+    assert_eq!(
+        events.len(),
+        4,
+        "the settling pass must emit exactly the membership diff plus the own-commit withdrawal pair: {events:?}"
+    );
+
+    // Dispositions: the winning sibling becomes canonical; the displaced own
+    // commit is parked reconsiderable at its source epoch — the convergence
+    // route agrees with the pairwise route's #1285 parking (a peer that
+    // applied the own commit and never saw the sibling can still deepen that
+    // branch, and this device must be able to follow).
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Processed
+    );
+    let own = f.local_storage.get_message(&f.own_commit_id).unwrap();
+    assert_eq!(
+        own.state,
+        MessageState::ConvergenceDeferred,
+        "the displaced own commit must stay reconsiderable"
+    );
+    assert_eq!(own.epoch, EpochId(1));
 }
