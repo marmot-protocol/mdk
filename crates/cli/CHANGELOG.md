@@ -24,12 +24,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
-- A group quarantined because interrupted fork-recovery probe snapshots could
-  not be restored on session open now reports the dedicated
-  `ForkProbeRecoveryFailed` hydration-quarantine reason (surfaced through the
-  app and FFI mirrors) instead of the generic `GroupRecordLoadFailed`, so
-  operators diagnosing a quarantine are pointed at the probe invariant rather
-  than a group-record load.
+- A group quarantined because an interrupted crash-recovery snapshot could not
+  be restored on session open now reports which recovery seam failed instead
+  of the generic `GroupRecordLoadFailed`: `ForkProbeRecoveryFailed` for
+  fork-recovery ordering probes, `RetainedAnchorProbeRecoveryFailed` for
+  retained-anchor convergence probes, and `ConvergenceApplyRecoveryFailed` for
+  convergence-apply snapshots (all surfaced through the app and FFI mirrors),
+  so operators diagnosing a quarantine are pointed at the failing recovery
+  rather than a group-record load that never happened.
   ([#1241](https://github.com/marmot-protocol/mdk/pull/1241))
 
 - A clobbered retained anchor no longer wedges a group permanently. Branch

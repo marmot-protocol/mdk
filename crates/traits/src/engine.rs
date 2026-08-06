@@ -393,6 +393,13 @@ pub enum GroupHydrationQuarantineReason {
     /// which breaks the probes-are-serialized-per-group invariant), and
     /// restoring the surviving live-state snapshot failed.
     ForkProbeRecoveryFailed,
+    /// Hydrate found an interrupted retained-anchor convergence probe (or
+    /// more than one), and restoring the surviving pre-probe live snapshot
+    /// failed.
+    RetainedAnchorProbeRecoveryFailed,
+    /// Hydrate found an interrupted convergence-apply snapshot (or more than
+    /// one), and restoring the surviving pre-apply live snapshot failed.
+    ConvergenceApplyRecoveryFailed,
 }
 
 /// Ordered, decrypted output the application should render / act on.

@@ -100,6 +100,12 @@ fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'
             "pending_commit_recovery_failed"
         }
         GroupHydrationQuarantineReason::ForkProbeRecoveryFailed => "fork_probe_recovery_failed",
+        GroupHydrationQuarantineReason::RetainedAnchorProbeRecoveryFailed => {
+            "retained_anchor_probe_recovery_failed"
+        }
+        GroupHydrationQuarantineReason::ConvergenceApplyRecoveryFailed => {
+            "convergence_apply_recovery_failed"
+        }
     }
 }
 
@@ -1283,9 +1289,9 @@ impl<S: StorageProvider> Engine<S> {
             &self.storage,
             group_id,
         )
-        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        .map_err(|_| GroupHydrationQuarantineReason::RetainedAnchorProbeRecoveryFailed)?;
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+            .map_err(|_| GroupHydrationQuarantineReason::ConvergenceApplyRecoveryFailed)?;
         // A fork-recovery ordering-metadata probe (pairwise fork resolution or
         // the hydrate-time routing-state rebuild) snapshots the live group
         // before rolling back to a retained fork snapshot. Process termination

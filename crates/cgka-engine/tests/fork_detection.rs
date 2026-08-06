@@ -2665,6 +2665,63 @@ async fn multiple_interrupted_fork_probes_quarantine_with_probe_reason() {
     );
 }
 
+#[tokio::test]
+async fn multiple_interrupted_retained_anchor_probes_quarantine_with_probe_reason() {
+    let local_id = b"raprobe-local".as_slice();
+    let (group_id, local_storage, _local_commit, _rival_root) =
+        forked_privileged_invites(local_id, b"raprobe-rival", b"raprobe-david", b"raprobe-eve")
+            .await;
+
+    local_storage
+        .create_group_snapshot(&group_id, "openmls-retained-probe-deadbeefcafebabe")
+        .unwrap();
+    local_storage
+        .create_group_snapshot(&group_id, "openmls-retained-probe-cafebabedeadbeef")
+        .unwrap();
+
+    let mut local = reopen_legacy_client_unhydrated(local_id, local_storage.clone());
+    local
+        .hydrate_stable_groups_from_storage()
+        .expect("one quarantined group must not abort account open");
+
+    assert_eq!(
+        local.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            cgka_traits::engine::GroupHydrationQuarantineReason::RetainedAnchorProbeRecoveryFailed
+        )],
+        "ambiguous retained-anchor probes must quarantine with the probe-specific reason"
+    );
+}
+
+#[tokio::test]
+async fn multiple_interrupted_apply_snapshots_quarantine_with_apply_reason() {
+    let local_id = b"apsnap-local".as_slice();
+    let (group_id, local_storage, _local_commit, _rival_root) =
+        forked_privileged_invites(local_id, b"apsnap-rival", b"apsnap-david", b"apsnap-eve").await;
+
+    local_storage
+        .create_group_snapshot(&group_id, "openmls-apply-deadbeefcafebabe")
+        .unwrap();
+    local_storage
+        .create_group_snapshot(&group_id, "openmls-apply-cafebabedeadbeef")
+        .unwrap();
+
+    let mut local = reopen_legacy_client_unhydrated(local_id, local_storage.clone());
+    local
+        .hydrate_stable_groups_from_storage()
+        .expect("one quarantined group must not abort account open");
+
+    assert_eq!(
+        local.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            cgka_traits::engine::GroupHydrationQuarantineReason::ConvergenceApplyRecoveryFailed
+        )],
+        "ambiguous apply snapshots must quarantine with the apply-specific reason"
+    );
+}
+
 /// Observable form of the invariant the `is_canonical` carve-out in own-branch
 /// materialization rests on: a `Processed` commit row means "applied on this
 /// device's live canonical chain", so there is at most one `Processed` commit

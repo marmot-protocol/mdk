@@ -591,6 +591,12 @@ pub enum AppGroupHydrationQuarantineReasonFfi {
     /// Hydrate found an interrupted fork-recovery probe, and restoring the
     /// surviving live-state snapshot failed.
     ForkProbeRecoveryFailed,
+    /// Hydrate found an interrupted retained-anchor convergence probe, and
+    /// restoring the surviving pre-probe live snapshot failed.
+    RetainedAnchorProbeRecoveryFailed,
+    /// Hydrate found an interrupted convergence-apply snapshot, and restoring
+    /// the surviving pre-apply live snapshot failed.
+    ConvergenceApplyRecoveryFailed,
 }
 
 impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReasonFfi {
@@ -607,6 +613,12 @@ impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReas
             }
             AppGroupHydrationQuarantineReason::ForkProbeRecoveryFailed => {
                 Self::ForkProbeRecoveryFailed
+            }
+            AppGroupHydrationQuarantineReason::RetainedAnchorProbeRecoveryFailed => {
+                Self::RetainedAnchorProbeRecoveryFailed
+            }
+            AppGroupHydrationQuarantineReason::ConvergenceApplyRecoveryFailed => {
+                Self::ConvergenceApplyRecoveryFailed
             }
         }
     }
