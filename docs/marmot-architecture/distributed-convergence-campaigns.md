@@ -81,7 +81,9 @@ docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
 The campaign image pins both base-image indexes and the Debian package snapshot. Update the digest, dated tag, and
 snapshot timestamp together during an explicit dependency refresh. The resulting image also stores the resolved
-runtime package set at `/usr/local/share/campaign-runtime-packages.txt`. Participant containers run as the invoking
+runtime package set at `/usr/local/share/campaign-runtime-packages.txt`. Its builder tag must match the channel in
+`rust-toolchain.toml`, which is copied into the build context and enforced by the ordinary CI toolchain gate.
+Participant containers run as the invoking
 non-root host identity so their private bind-mounted run roots remain writable; only short-lived network fault
 injectors explicitly select UID 0 together with their narrowly scoped `NET_ADMIN` capability.
 
