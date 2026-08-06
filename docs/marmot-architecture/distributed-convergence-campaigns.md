@@ -138,6 +138,8 @@ and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-us
 any limit is exceeded. It also rejects zero executed cases, observations below the lane minimum, and flaky-case counts
 larger than executed-case counts. The scheduled workflows do not yet emit this aggregate observation or invoke
 `check-budget`; these limits are machine-checkable reviewed policy, not yet a green-workflow attestation.
+`minimum_executed_cases` is therefore only a liveness floor: it prevents empty evidence, but does not prove that every
+declared capability ran. Capability-specific evidence remains required before a lane can support an assurance claim.
 
 The version-1 evidence-bundle type requires a scoped assurance claim, covered decision routes, models, adapters,
 mutation results, tested workload/constant boundaries, unresolved counterexamples, residual assumptions, untested

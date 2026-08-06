@@ -62,8 +62,8 @@ pub struct CampaignLaneConfigV1 {
 pub struct CampaignLaneContentsV1 {
     pub strict_formal_gate: bool,
     pub fixed_vectors: bool,
-    /// Minimum aggregate case count required before an observation can attest
-    /// that this lane executed meaningful work.
+    /// Liveness floor proving that the lane executed some work. This is not a
+    /// substitute for capability-specific coverage recorded in evidence.
     pub minimum_executed_cases: u64,
     pub file_backed_storage: bool,
     pub crash_matrix: bool,
@@ -223,8 +223,7 @@ impl CampaignLaneConfigV1 {
         let flake_rate_basis_points = observation
             .flaky_cases
             .saturating_mul(10_000)
-            .checked_div(observation.executed_cases)
-            .unwrap_or_default();
+            .div_ceil(observation.executed_cases.max(1));
         check_limit(
             &mut violations,
             "flake_rate_basis_points",

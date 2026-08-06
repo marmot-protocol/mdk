@@ -40,13 +40,13 @@ enum Commands {
     Run { manifest: PathBuf },
     /// Print or privately write the reviewed policy for an execution lane.
     Lane {
-        lane: String,
+        lane: CampaignLaneV1,
         #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Fail when observed campaign usage exceeds the selected lane budget.
     CheckBudget {
-        lane: String,
+        lane: CampaignLaneV1,
         observation: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
@@ -131,7 +131,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("completed {}", receipt.campaign_id);
         }
         Commands::Lane { lane, output } => {
-            let lane = lane.parse::<CampaignLaneV1>()?;
             let config = CampaignLaneConfigV1::builtin(lane);
             let bytes = serde_json::to_vec_pretty(&config)?;
             if let Some(path) = output {
@@ -145,7 +144,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             observation,
             output,
         } => {
-            let lane = lane.parse::<CampaignLaneV1>()?;
             let observed: CampaignLaneObservationV1 =
                 serde_json::from_slice(&std::fs::read(observation)?)?;
             let evaluation = CampaignLaneConfigV1::builtin(lane).evaluate(observed);

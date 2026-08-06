@@ -64,6 +64,24 @@ fn budget_evaluation_rejects_empty_and_inconsistent_observations() {
 }
 
 #[test]
+fn zero_flake_budget_rejects_any_nonzero_flake_rate() {
+    let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::PullRequest);
+    let evaluation = config.evaluate(CampaignLaneObservationV1 {
+        executed_cases: 10_001,
+        flaky_cases: 1,
+        ..CampaignLaneObservationV1::default()
+    });
+    assert_eq!(evaluation.flake_rate_basis_points, 1);
+    assert!(!evaluation.passed);
+    assert!(
+        evaluation
+            .violations
+            .iter()
+            .any(|violation| violation == "flake_rate_basis_points:1>0")
+    );
+}
+
+#[test]
 fn budget_evaluation_reports_every_exceeded_dimension() {
     let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::PullRequest);
     let evaluation = config.evaluate(CampaignLaneObservationV1 {
@@ -143,6 +161,12 @@ fn release_evidence_requires_scoped_coverage_and_a_passing_budget() {
         "evidence_artifact_digest_mismatch"
     );
     bundle.artifacts[0].sha256 = hex::encode(Sha256::digest(artifact_bytes));
+    let mut traversal = bundle.clone();
+    traversal.artifacts[0].path = "../process.json".into();
+    assert_eq!(
+        traversal.validate_artifacts(temp.path()).unwrap_err().code,
+        "evidence_artifact_path"
+    );
     bundle.untested_surfaces.clear();
     assert_eq!(
         bundle.validate().unwrap_err().code,

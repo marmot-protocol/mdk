@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -137,9 +138,21 @@ impl ConvergenceEvidenceBundleV1 {
                     "artifact paths must remain within the evidence bundle directory",
                 ));
             }
-            let bytes = std::fs::read(canonical_path)
+            let file = std::fs::File::open(canonical_path)
                 .map_err(|error| RunnerError::environment("evidence_artifact_read", error))?;
-            let actual = hex::encode(Sha256::digest(bytes));
+            let mut reader = BufReader::new(file);
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| RunnerError::environment("evidence_artifact_read", error))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let actual = hex::encode(hasher.finalize());
             if actual != artifact.sha256 {
                 return Err(RunnerError::validation(
                     "evidence_artifact_digest_mismatch",

@@ -1014,8 +1014,8 @@ that scaling the existing corpus is sufficient.
 Four versioned lane manifests are the single reviewed policy source for intended contents and limits. The nightly and
 weekly entry points run only existing named targets, and selected-container filtering fails instead of silently passing
 when it matches no test. Scheduled runs inherit the source revision's mandatory PR formal gate instead of rerunning the
-same symbolic proof. Incident-corpus execution remains false until the failure-corpus slice lands, and the reviewed
-minimum case counts describe only work that the current recipes can launch.
+same symbolic proof. Incident-corpus execution remains false until the failure-corpus slice lands. The conservative
+minimum case counts are liveness floors preventing empty evidence, not attestations that every declared capability ran.
 
 The typed evaluator rejects zero-case observations, inconsistent flaky-case counts, work below the lane minimum, and
 wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. It is not yet fed by a workflow-owned
