@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-07-30
+updated: 2026-08-06
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -614,6 +614,10 @@ Metadata notes:
   unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
   `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
   Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+- `reason = "missing_retained_anchor"` has two emission sites: the convergence coordinator's materialization-time halt
+  (paired with a `convergence_run_state` row carrying the same `error_kind`) and the ingest-time admission halt for an
+  in-horizon rival commit whose fork-source anchor snapshot is gone (paired with a `message_state_changed` row carrying
+  `reason = "fork_rival_missing_retained_anchor"`, no convergence-run context).
 
 ### `group_state_changed`
 
@@ -873,6 +877,7 @@ Current `reason` values found in production call sites:
 | `state_update` | Generic `update_stored_message_state` path updates a stored message. |
 | `publish_confirmed` | A pending commit message is promoted to processed after publish confirmation. |
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
+| `fork_rival_missing_retained_anchor` | An in-horizon rival commit could not be admitted to convergence because its fork-source anchor snapshot is gone; the rival is parked `convergence_deferred` under its source epoch and the group durably halts (`epoch_state_changed` with `new_state = "unrecoverable"`, `reason = "missing_retained_anchor"`). |
 | `peel_failed_no_snapshot` | Historical stable tag: group-message peel failed and no fallback snapshot could recover it; the outcome is `transport_deferred` and state becomes `peel_deferred`. |
 | `resource_refused_deferred_capacity` | The retained transport-deferred row cap refused an additional object without persisting it. |
 | `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |

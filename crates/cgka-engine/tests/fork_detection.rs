@@ -2463,7 +2463,7 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork
 }
 
 #[tokio::test]
-async fn restarted_committer_without_source_anchor_silently_drops_winning_sibling() {
+async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
     // Control on the same deterministic fixture: no restart, pairwise route.
     let (control, mut control_local) = router_flip_fixture("control").await;
     assert!(control.sibling_wins);
@@ -2471,17 +2471,21 @@ async fn restarted_committer_without_source_anchor_silently_drops_winning_siblin
         .ingest(control.competing.clone())
         .await
         .unwrap();
-    let control_branch = settled_branch(&control_local, &control);
     assert_eq!(
-        control_branch,
+        settled_branch(&control_local, &control),
         Branch::Sibling,
         "the pairwise route rolls the committer onto the winning branch"
     );
 
-    // Same fixture shape, but the device restarts AND the source-epoch anchor is
-    // absent. Neither route is then reachable: `committed_from` is empty so the
-    // pairwise gate fails, and `has_retained_anchor_snapshot` is false so the
-    // commit is not admitted to convergence either.
+    // Same fixture shape, but the device restarts AND the source-epoch anchor
+    // is absent (pre-mechanism database, storage loss). Neither resolution
+    // route is then reachable: `committed_from` is empty so the pairwise gate
+    // fails, and `has_retained_anchor_snapshot` refuses convergence admission.
+    // Within the rewind horizon that absence is abnormal by construction —
+    // every canonical advance retains a source-epoch anchor and pruning runs
+    // only beyond the horizon — so the only honest outcome is a durable,
+    // observable halt: silently keeping our own (possibly losing) branch would
+    // be permanent divergence invisible to both the app and forensics.
     let (f, local) = router_flip_fixture("silent").await;
     assert!(f.sibling_wins);
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
@@ -2489,47 +2493,79 @@ async fn restarted_committer_without_source_anchor_silently_drops_winning_siblin
     f.local_storage
         .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
         .expect("release the source-epoch anchor");
-    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let recorder =
+        marmot_forensics::JsonlRecorder::open(&audit_path, "restarted-committer".to_string())
+            .unwrap();
+    let mut local = {
+        let mut engine = EngineBuilder::new(f.local_storage.clone())
+            .legacy_compatibility_profile()
+            .identity(pad32(&f.local_seed))
+            .account_identity_proof_signer(proof_signer(&f.local_seed))
+            .feature_registry(selfremove_registry())
+            .peeler(Box::new(MockPeeler))
+            .recorder(Box::new(recorder))
+            .build()
+            .unwrap();
+        engine.hydrate_stable_groups_from_storage().unwrap();
+        engine
+    };
 
     let outcome = local.ingest(f.competing.clone()).await.unwrap();
 
-    // Current behavior, pinned so a fix flips these assertions deliberately.
-    // The authenticated winning commit is discarded with no fork signal at all.
-    assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadyAtEpoch { .. }
-            }
-        ),
-        "expected the silent stale discard, got {outcome:?}"
-    );
+    // The rival's arrival is loud: retained for repair, never a silent Stale.
     assert_eq!(
-        f.local_storage.get_message(&competing_id).unwrap().state,
-        MessageState::Failed,
-        "the winning sibling is marked Failed, not EpochInvalidated"
+        outcome,
+        IngestOutcome::Buffered {
+            group_id: f.group_id.clone(),
+            epoch: EpochId(2),
+        },
+        "the unadjudicated rival must be retained, not silently classified stale"
     );
     assert!(
-        local.drain_events().is_empty(),
-        "no ForkRecovered, no CommitRolledBack, no GroupUnrecoverable is emitted"
-    );
-    assert!(
-        !f.local_storage
+        f.local_storage
             .get_group(&f.group_id)
             .unwrap()
             .unrecoverable,
-        "the group is not marked unrecoverable either"
+        "missing in-horizon fork-recovery material must durably halt the group"
+    );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::ConvergenceDeferred,
+        "the winning sibling stays parked for reconsideration after repair"
+    );
+    assert!(
+        local.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id } if group_id == &f.group_id
+        )),
+        "the halt must reach the app so it can surface repair"
     );
 
-    // The divergence: identical fork, opposite outcome from the control.
+    // Canonical state is untouched: the device keeps its own branch at its own
+    // epoch until a verified repair path adjudicates the fork.
     assert_eq!(
         settled_branch(&local, &f),
         Branch::Own,
-        "the restarted committer keeps its own losing branch"
+        "the halt must not adjudicate the fork without recovery material"
     );
-    assert_ne!(
-        settled_branch(&local, &f),
-        control_branch,
-        "restart alone flips which branch this device converges to"
+    assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
+
+    // Drop the engine so the JsonlRecorder flushes on Drop, then pin the
+    // forensic trail of the halt.
+    drop(local);
+    let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            marmot_forensics::AuditEventKind::EpochStateChanged { new_state, reason, .. }
+                if new_state == "unrecoverable" && reason == "missing_retained_anchor"
+        )),
+        "the durable halt must leave an audit row naming the missing material"
     );
 }
