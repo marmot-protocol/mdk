@@ -2278,7 +2278,7 @@ impl AppClient {
             &self.state.label,
             group_id_hex,
             app_event_id,
-            "local_publish_failed",
+            crate::LOCAL_PUBLISH_FAILED_REASON,
         ) {
             Ok(Some(update)) => on_local_projection(update),
             Ok(None) => {}

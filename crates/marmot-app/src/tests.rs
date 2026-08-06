@@ -6398,6 +6398,110 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     );
 }
 
+/// Issue #1177: a send the engine accepted but never published derives as
+/// `Pending`, which is truthful only while convergence can still release it.
+/// Once the group is terminal the queue is purged, so the sweep the sync loop
+/// runs at that seam must make the app-facing delivery state say `Failed`
+/// instead of claiming `Pending` forever — and must leave a published send's
+/// `Delivered` alone.
+#[test]
+fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "alpha".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )],
+    })
+    .unwrap();
+
+    let sent = |message_id_hex: &str, source_message_id_hex: Option<String>, recorded_at: u64| {
+        AppMessageProjection {
+            message_id_hex: message_id_hex.to_owned(),
+            source_message_id_hex,
+            direction: "sent".to_owned(),
+            group_id_hex: "aa".to_owned(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "hello".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(2),
+            retention: None,
+            recorded_at: Some(recorded_at),
+            origin_commit_id: None,
+            moderation_grant: false,
+        }
+    };
+    // An earlier send that reached the relay, then one the engine retained.
+    app.record_account_app_event("alice", &sent("published", Some("bb".repeat(32)), 10))
+        .unwrap();
+    app.record_account_app_event("alice", &sent("held", None, 11))
+        .unwrap();
+
+    let delivery_state = || {
+        app.chat_list_row("alice", "aa")
+            .unwrap()
+            .expect("chat-list row")
+            .last_message
+            .expect("last message")
+            .delivery_state
+    };
+    assert_eq!(
+        delivery_state(),
+        ChatListMessageDeliveryState::Pending,
+        "a retained send is pending while convergence can still release it"
+    );
+
+    app.invalidate_timeline_pending_sends_for_group("alice", "aa")
+        .unwrap()
+        .expect("a held row must produce a projection update");
+
+    assert_eq!(
+        delivery_state(),
+        ChatListMessageDeliveryState::Failed,
+        "the swept send must report a terminal outcome, not pending forever"
+    );
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some("aa".to_owned()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(
+        status("held"),
+        Some(Some("local_publish_failed".to_owned())),
+        "the held row must carry the terminal outcome the app renders as failed"
+    );
+    assert_eq!(
+        status("published"),
+        Some(None),
+        "a send that already reached the relay stays delivered"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
