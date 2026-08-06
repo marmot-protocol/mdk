@@ -914,6 +914,8 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "x25519-dalek 2.0.1",
+ "zeroize",
 ]
 
 [[package]]

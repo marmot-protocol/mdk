@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `cgka-engine` now owns one short-lived device-pairing session per account,
+  rotating a fresh random session id and ephemeral X25519 key every 30 seconds.
+  Stale, expired, rejected, and replayed QR scans fail with typed errors;
+  terminal transitions wipe private key material and emit privacy-safe forensic
+  audit rows without bearer tokens or keys.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`

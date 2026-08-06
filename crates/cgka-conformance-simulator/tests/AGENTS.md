@@ -40,6 +40,9 @@ Map for simulator tests.
 - **File:** `openmls_replay_probe.rs`
   - **Owns:** OpenMLS replay and candidate materialization probes.
 
+- **File:** `pairing_session.rs`
+  - **Owns:** Engine-owned pairing-session rotation and stale-QR winner semantics through `HarnessClient`.
+
 - **File:** `proptest_invariants.rs`
   - **Owns:** Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior,
     generated send/leave histories, and delivery-profile convergence.

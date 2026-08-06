@@ -9,8 +9,8 @@ what trouble it introduces, and what result the engine is supposed to produce.
 
 Portable vectors live in `vectors/*.json`. They are the cross-implementation cases.
 
-Rust-only harness scenarios live in `tests/canonical_scenarios.rs`. They cover engine behavior that still needs direct
-harness access.
+Rust-only harness scenarios live in `tests/canonical_scenarios.rs` and focused sibling test files. They cover engine
+behavior that still needs direct harness access.
 
 Generated families live in `src/family.rs`. They produce seeded adversarial `ScenarioSpec` cases. Promote one into
 `vectors/` only when it should become a stable named contract.
@@ -190,6 +190,14 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 ## Rust-Only Harness Scenarios
 
 These are real simulator scenarios that are still tied to Rust harness details.
+
+### `stale_qr_race_rejects_first_scan_and_accepts_newest`
+
+- Setup: one account renders a pairing QR, then rotates it before either QR is scanned.
+- Pressure: a device scans the stale QR before another device scans the newest QR.
+- Expected: the stale scan receives typed `Superseded`; the newest scan succeeds and becomes the only `Scanned`
+  session.
+- File: `tests/pairing_session.rs`.
 
 ### `three_client_happy_path_via_harness`
 

@@ -869,6 +869,12 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             arms: 3,
             arm_threshold: 3,
         },
+        AuditEventKind::PairingSession {
+            previous_state: Some("scanned".into()),
+            new_state: "approved".into(),
+            reason: "local_user_approved".into(),
+            expires_at_ms: 1_700_000_030_000,
+        },
         AuditEventKind::ConvergencePassDiscarded {
             stale_base_epoch: 7,
             current_tip_epoch: 13,

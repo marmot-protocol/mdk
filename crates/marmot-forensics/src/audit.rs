@@ -1045,6 +1045,19 @@ pub enum AuditEventKind {
         arms: u64,
         arm_threshold: u64,
     },
+    /// One engine-owned device-pairing lifecycle transition.
+    ///
+    /// Deliberately excludes the bearer session id, X25519 public key, and
+    /// private key. The state, reason, and deadline are sufficient to diagnose
+    /// stale-QR races without turning the forensic stream into a capability
+    /// disclosure channel.
+    PairingSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_state: Option<String>,
+        new_state: String,
+        reason: String,
+        expires_at_ms: u64,
+    },
     /// A durable convergence pass whose base epoch disagreed with the device's
     /// current tip was discarded, freeing convergence to reopen at the tip.
     /// Non-terminal by construction: it records a repair, not a fault. The
@@ -1115,6 +1128,7 @@ impl AuditEventKind {
             AuditEventKind::SyncDrain { .. } => "sync_drain",
             AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
             AuditEventKind::EpochStallBackfillEscalated { .. } => "epoch_stall_backfill_escalated",
+            AuditEventKind::PairingSession { .. } => "pairing_session",
             AuditEventKind::ConvergencePassDiscarded { .. } => "convergence_pass_discarded",
         }
     }

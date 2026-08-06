@@ -1686,6 +1686,28 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "new_state", "reason", "expires_at_ms"],
+          "properties": {
+            "type": {
+              "const": "pairing_session"
+            },
+            "previous_state": {
+              "type": "string"
+            },
+            "new_state": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "expires_at_ms": {
+              "$ref": "#/$defs/u64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": [
             "type",
             "stale_base_epoch",

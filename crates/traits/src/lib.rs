@@ -18,6 +18,7 @@ pub mod group_context;
 pub mod ingest;
 pub mod maintenance;
 pub mod message;
+pub mod pairing;
 pub mod peeler;
 pub mod storage;
 pub mod transport;
@@ -95,6 +96,7 @@ pub use maintenance::{
     TransportFanoutTarget, WallClock,
 };
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
+pub use pairing::*;
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
     CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,

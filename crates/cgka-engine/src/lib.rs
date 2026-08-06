@@ -63,6 +63,7 @@ pub mod maintenance;
 pub(crate) mod message_disposition;
 pub mod message_processor;
 pub mod openmls_projection;
+pub(crate) mod pairing_session;
 pub mod pending_commit_guard;
 pub mod provider;
 pub mod publish;

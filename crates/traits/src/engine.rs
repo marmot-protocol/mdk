@@ -25,6 +25,9 @@ use crate::error::EngineError;
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
+use crate::pairing::{
+    PairingSessionDescriptor, PairingSessionError, PairingSessionId, PairingSessionState,
+};
 use crate::transport::TransportMessage;
 use crate::transport_adapter::TransportEndpoint;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -597,6 +600,42 @@ pub struct CreateGroupRequest {
 /// Method docs describe legal state transitions and error classes.
 #[async_trait]
 pub trait CgkaEngine: Send + Sync {
+    // ── Account pairing ─────────────────────────────────────────────────────
+
+    /// Start a fresh short-lived pairing session.
+    ///
+    /// Starting a session deterministically supersedes any unexpired active
+    /// session. The returned bearer token and X25519 public key must be passed
+    /// only through the rendered QR; neither is logged by the engine.
+    fn start_pairing_session(&mut self) -> Result<PairingSessionDescriptor, PairingSessionError>;
+
+    /// Observe one session's current lifecycle state.
+    ///
+    /// Deadline checks are lazy and use the engine's injected wall clock.
+    /// A session missing after process restart fails closed as expired.
+    fn pairing_session_state(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<PairingSessionState, PairingSessionError>;
+
+    /// Mark the current QR as scanned exactly once.
+    fn scan_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError>;
+
+    /// Consume a scanned session after local-user approval.
+    fn approve_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError>;
+
+    /// Terminally reject a scanned session.
+    fn reject_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError>;
+
     // ── Inbound ─────────────────────────────────────────────────────────────
 
     /// Ingest a raw transport message.

@@ -12,6 +12,7 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
+use crate::pairing_session::{PairingSessionManager, PairingSessionTransition};
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
@@ -32,6 +33,10 @@ use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::{
+    DEFAULT_PAIRING_SESSION_TTL_MS, PairingSessionDescriptor, PairingSessionError,
+    PairingSessionId, PairingSessionState,
+};
 use marmot_forensics::{
     AuditEngineContext, AuditEventContext, AuditEventKind, AuditGroupContext, AuditRecord,
     ForensicRecorder, NoopRecorder,
@@ -166,6 +171,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) max_past_epochs: usize,
     pub(crate) wall_clock: Arc<dyn WallClock>,
     pub(crate) maintenance_random: Arc<dyn MaintenanceRandom>,
+    pub(crate) pairing_sessions: PairingSessionManager,
 
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
@@ -542,6 +548,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: self.max_past_epochs,
             wall_clock: self.wall_clock,
             maintenance_random: self.maintenance_random,
+            pairing_sessions: PairingSessionManager::default(),
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
@@ -588,6 +595,25 @@ impl<S: StorageProvider> EngineBuilder<S> {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    fn record_pairing_transitions(
+        &self,
+        transitions: impl IntoIterator<Item = PairingSessionTransition>,
+    ) {
+        for transition in transitions {
+            self.recorder.record(AuditRecord::new(
+                None,
+                AuditEventKind::PairingSession {
+                    previous_state: transition
+                        .previous_state
+                        .map(|state| state.as_str().to_string()),
+                    new_state: transition.new_state.as_str().to_string(),
+                    reason: transition.reason.to_string(),
+                    expires_at_ms: transition.expires_at_ms,
+                },
+            ));
+        }
+    }
+
     /// Change the explicit replay-probe ceiling for a running exhaustion
     /// campaign. Production builds do not expose this method.
     #[cfg(feature = "test-policy-overrides")]
@@ -2565,6 +2591,73 @@ impl<S: StorageProvider> Engine<S> {
 
 #[async_trait]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
+    fn start_pairing_session(&mut self) -> Result<PairingSessionDescriptor, PairingSessionError> {
+        let now_ms = self.wall_clock.now_ms();
+        let expires_at_ms = now_ms.saturating_add(DEFAULT_PAIRING_SESSION_TTL_MS);
+        let session_id = loop {
+            let mut session_id_bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut session_id_bytes);
+            let session_id = PairingSessionId::new(session_id_bytes);
+            if !self.pairing_sessions.contains(&session_id) {
+                break session_id;
+            }
+        };
+        let private_key = x25519_dalek::ReusableSecret::random_from_rng(rand::rngs::OsRng);
+        let ephemeral_public_key = *x25519_dalek::PublicKey::from(&private_key).as_bytes();
+        let descriptor = PairingSessionDescriptor {
+            session_id,
+            ephemeral_public_key,
+            expires_at_ms,
+        };
+        let operation = self.pairing_sessions.start(descriptor, private_key, now_ms);
+        self.record_pairing_transitions(operation.transitions);
+        Ok(operation.result)
+    }
+
+    fn pairing_session_state(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<PairingSessionState, PairingSessionError> {
+        let operation = self
+            .pairing_sessions
+            .state(session_id, self.wall_clock.now_ms());
+        self.record_pairing_transitions(operation.transitions);
+        operation.result
+    }
+
+    fn scan_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError> {
+        let operation = self
+            .pairing_sessions
+            .scan(session_id, self.wall_clock.now_ms());
+        self.record_pairing_transitions(operation.transitions);
+        operation.result
+    }
+
+    fn approve_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError> {
+        let operation = self
+            .pairing_sessions
+            .approve(session_id, self.wall_clock.now_ms());
+        self.record_pairing_transitions(operation.transitions);
+        operation.result
+    }
+
+    fn reject_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError> {
+        let operation = self
+            .pairing_sessions
+            .reject(session_id, self.wall_clock.now_ms());
+        self.record_pairing_transitions(operation.transitions);
+        operation.result
+    }
+
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
         self.ingest_with_audit_context(msg, None).await
     }
