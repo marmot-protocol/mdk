@@ -73,6 +73,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   rival branch. Checkpoints are pruned with the retained rewind horizon.
   Displacing the losing branch is also a single durable transaction now, so an
   interrupted resolution can no longer drop it without a trace.
+  ([#1285](https://github.com/marmot-protocol/mdk/pull/1285))
 
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
