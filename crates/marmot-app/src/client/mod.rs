@@ -260,7 +260,19 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
-        Ok(self.runtime.republish_key_package().await?)
+        if self
+            .runtime
+            .key_package_maintenance_status()?
+            .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some())
+        {
+            // A prior ambiguous or rejected setup attempt already owns exact
+            // signed bytes and private material. Resume that replacement;
+            // republish_key_package deliberately rejects pending rotations and
+            // would otherwise make account setup non-idempotent.
+            Ok(self.runtime.publish_fresh_key_package().await?)
+        } else {
+            Ok(self.runtime.republish_key_package().await?)
+        }
     }
 
     pub fn maintenance_status(

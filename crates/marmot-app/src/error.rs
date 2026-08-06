@@ -123,6 +123,14 @@ pub enum AppError {
     /// owns the account's in-memory engine session.
     #[error("marmot account session is already in use")]
     AccountSessionBusy,
+    /// An account database predates the durable setup journal and has no
+    /// recoverable stable KeyPackage slot. Local evidence cannot prove that a
+    /// previously signed package was never exposed, so automatic rotation is
+    /// forbidden. The host may offer the explicit incomplete-setup reset API.
+    #[error(
+        "incomplete account setup requires explicit recovery because prior KeyPackage exposure cannot be ruled out"
+    )]
+    AccountSetupRecoveryRequired,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -206,6 +214,7 @@ impl AppError {
             Self::BlockingTask(_) => "blocking_task",
             Self::RuntimeBusy => "runtime_busy",
             Self::AccountSessionBusy => "account_session_busy",
+            Self::AccountSetupRecoveryRequired => "account_setup_recovery_required",
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",

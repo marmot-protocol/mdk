@@ -48,6 +48,11 @@ pub enum MarmotKitError {
     /// account's in-memory engine session. Retry only after that owner closes.
     #[error("marmot account session is already in use")]
     AccountSessionBusy,
+    /// A pre-journal account has an encrypted database but no recoverable
+    /// stable KeyPackage slot. Automatic retry cannot prove non-exposure; the
+    /// host may offer `reset_incomplete_account_setup` with explicit consent.
+    #[error("incomplete account setup requires explicit recovery")]
+    AccountSetupRecoveryRequired,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -220,6 +225,7 @@ impl From<AppError> for MarmotKitError {
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeBusy => Self::RuntimeBusy,
             AppError::AccountSessionBusy => Self::AccountSessionBusy,
+            AppError::AccountSetupRecoveryRequired => Self::AccountSetupRecoveryRequired,
             AppError::RuntimeStopping => Self::RuntimeStopping,
             AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
             // #484: a transient storage busy error can also surface directly at
@@ -540,6 +546,12 @@ mod tests {
             ),
             "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn incomplete_account_setup_crosses_ffi_as_typed_recovery() {
+        let ffi: MarmotKitError = AppError::AccountSetupRecoveryRequired.into();
+        assert!(matches!(ffi, MarmotKitError::AccountSetupRecoveryRequired));
     }
 
     #[test]

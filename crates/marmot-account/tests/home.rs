@@ -477,6 +477,30 @@ fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential()
 }
 
 #[test]
+fn runtime_import_resumes_only_while_durable_setup_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+
+    let first = home.import_nostr_account_idempotent(&secret).unwrap();
+    let resumed = home.import_nostr_account_idempotent(&secret).unwrap();
+    assert_eq!(resumed.account(), first.account());
+    assert!(
+        home.account_setup_state(&first.account().label)
+            .unwrap()
+            .is_some()
+    );
+
+    home.complete_account_setup(&first.account().label).unwrap();
+    assert!(matches!(
+        home.import_nostr_account_idempotent(&secret),
+        Err(AccountHomeError::AccountExists(account))
+            if account == first.account().account_id_hex
+    ));
+}
+
+#[test]
 fn account_home_keychain_keeps_signing_secret_when_public_twin_record_is_removed() {
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();

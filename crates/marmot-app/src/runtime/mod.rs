@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
+use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
-use marmot_account::{AccountHome, AccountHomeError, AccountSummary, NostrAccountImport};
+use marmot_account::{
+    AccountHome, AccountHomeError, AccountSetupPhase, AccountSummary, NostrAccountImport,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -3232,6 +3235,34 @@ impl MarmotAppRuntime {
         self.accounts.create_or_import_account(request).await
     }
 
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: &str,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .reset_incomplete_account_setup(nsec, acknowledge_possible_key_package_orphan)
+            .await
+    }
+
+    /// Consent-gated compatibility recovery followed by an immediate retry of
+    /// the same setup request. Keeping both operations inside the runtime
+    /// prevents a host crash from turning reset into a separate manual step.
+    pub async fn recover_incomplete_account_setup(
+        &self,
+        request: AccountSetupRequest,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<AccountSetupResult, AppError> {
+        let nsec = request
+            .import_nsec
+            .as_deref()
+            .ok_or(AppError::UnexpectedPrivateKey)?;
+        self.accounts
+            .reset_incomplete_account_setup(nsec, acknowledge_possible_key_package_orphan)
+            .await?;
+        self.accounts.create_or_import_account(request).await
+    }
+
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
@@ -3343,7 +3374,85 @@ impl AccountManager {
             // unlinked inode and a later re-import silently splits writes
             // across a stale handle.
             self.app.drop_account_caches(&account.label);
+            self.app
+                .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            Ok(())
+        }
+        .await;
+        self.set_account_tearing_down(&account.account_id_hex, false);
+        result
+    }
+
+    /// Explicit recovery for an account created before durable setup journals.
+    ///
+    /// This is intentionally not automatic: without a lifecycle/legacy slot,
+    /// local files cannot prove that an old KeyPackage was never exposed. The
+    /// caller must present the matching nsec and explicitly acknowledge that
+    /// resetting can orphan such an unknown publication. The credential is
+    /// retained so the next `create_or_import_account` reuses it rather than
+    /// creating a duplicate keychain entry.
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: &str,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        if !acknowledge_possible_key_package_orphan {
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
+        let account_id = AccountHome::account_id_for_secret(nsec)?;
+        let account = self.app.account_home().account(&account_id)?;
+        if !account.local_signing
+            || self
+                .app
+                .account_home()
+                .load_signing_keys(&account.label)?
+                .public_key()
+                .to_hex()
+                != account_id
+        {
+            return Err(AppError::IdentityKeyMismatch);
+        }
+        if self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some()
+        {
+            return Err(AppError::RelayDirectory(
+                "durable account setup state is recoverable by retry; reset is not allowed".into(),
+            ));
+        }
+        if !self
+            .app
+            .key_package_cutover_replacement_pending(&account.label)
+        {
+            return Err(AppError::RelayDirectory(
+                "account is not in the legacy incomplete-setup recovery state".into(),
+            ));
+        }
+        let storage = self.app.account_storage(&account.label)?;
+        if storage.key_package_lifecycle()?.is_some()
+            || !storage.stored_key_package_bundles()?.is_empty()
+            || self.app.key_package_record_path(&account.label).exists()
+        {
+            return Err(AppError::RelayDirectory(
+                "account has recoverable KeyPackage state; reset is not allowed".into(),
+            ));
+        }
+
+        self.set_account_tearing_down(&account.account_id_hex, true);
+        let result = async {
+            if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
+                worker.shutdown().await;
+            }
+            self.app.drop_account_caches(&account.label);
+            self.app
+                .remove_account_key_package_artifacts(&account.label)?;
+            self.app
+                .account_home()
+                .reset_incomplete_setup_preserving_credential(&account.label)?;
             Ok(())
         }
         .await;
@@ -3774,6 +3883,11 @@ impl AccountManager {
         let imports_private_key = request.import_nsec.is_some();
         let creates_new_private_key = request.identity.is_none() && request.import_nsec.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+        if let Some(nsec) = request.import_nsec.as_deref()
+            && self.legacy_incomplete_account_for_import(nsec)?
+        {
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
         let identity_key: Option<&str> = request
             .import_nsec
             .as_ref()
@@ -3788,7 +3902,13 @@ impl AccountManager {
             self.create_nostr_account_from_setup(&request)?
         };
         let reactivating_existing = account.signed_out;
-        let rollback_on_setup_failure = !reactivating_existing;
+        let setup_already_reached_publication = self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|state| state.phase != AccountSetupPhase::LocalStateCreated);
+        let rollback_on_setup_failure =
+            !reactivating_existing && !setup_already_reached_publication;
 
         if imports_private_key || reactivating_existing || !account.local_signing {
             // Resolve a pre-existing identity's profile from public indexers, not
@@ -3879,18 +3999,45 @@ impl AccountManager {
         };
 
         let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
-            self.shared.lifecycle().ensure_running()?;
-            match self.publish_initial_key_package_for_account(&account).await {
-                Ok(bytes) => Some(bytes),
-                Err(err) => {
+            let setup_phase = self
+                .app
+                .account_home()
+                .account_setup_state(&account.label)?
+                .map(|state| state.phase);
+            if setup_phase == Some(AccountSetupPhase::KeyPackagePublicationConfirmed) {
+                Some(self.confirmed_setup_key_package_bytes(&account.label)?)
+            } else {
+                self.shared.lifecycle().ensure_running()?;
+                if setup_phase.is_some()
+                    && let Err(err) = self.app.account_home().set_account_setup_phase(
+                        &account.label,
+                        AccountSetupPhase::KeyPackagePublicationStarted,
+                    )
+                {
                     if rollback_on_setup_failure {
                         return self.rollback_import_after_setup_failure(
                             &account,
                             private_key_import.as_ref(),
-                            err,
+                            err.into(),
                         );
                     }
-                    return Err(err);
+                    return Err(err.into());
+                }
+                match self.publish_initial_key_package_for_account(&account).await {
+                    Ok(bytes) => {
+                        self.app.account_home().set_account_setup_phase(
+                            &account.label,
+                            AccountSetupPhase::KeyPackagePublicationConfirmed,
+                        )?;
+                        Some(bytes)
+                    }
+                    Err(err) => {
+                        // Publication-started state plus the SQLCipher lifecycle
+                        // is sufficient to retry safely after any ordinary error
+                        // or task cancellation. Never delete possibly exposed
+                        // exact bytes/private material here.
+                        return Err(err);
+                    }
                 }
             }
         } else {
@@ -3917,6 +4064,9 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
         }
         self.reconcile().await?;
+        self.app
+            .account_home()
+            .complete_account_setup(&account.label)?;
 
         Ok(AccountSetupResult {
             account,
@@ -4024,14 +4174,12 @@ impl AccountManager {
         let key_package_bytes = if request.publish_initial_key_package {
             match self.publish_initial_key_package_for_account(&account).await {
                 Ok(bytes) => Some(bytes),
-                Err(err) => {
-                    return self.rollback_external_signer_setup(
-                        &account.label,
-                        created_account,
-                        upgraded_public_account,
-                        err,
-                    );
-                }
+                // Session lifecycle state owns exact signed bytes and private
+                // material before network exposure. Once KeyPackage setup has
+                // started, deleting a freshly-added external account could
+                // orphan an ambiguously accepted publication; keep it for an
+                // exact-byte retry instead.
+                Err(err) => return Err(err),
             }
         } else {
             None
@@ -4243,10 +4391,28 @@ impl AccountManager {
         &self,
         account: &AccountSummary,
     ) -> Result<usize, AppError> {
+        if self
+            .app
+            .legacy_incomplete_setup_requires_recovery(&account.label)?
+        {
+            let _ = self
+                .app
+                .mark_key_package_cutover_replacement_pending(&account.label);
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
         self.app.status(&account.label)?;
         let mut client = self.app.client(&account.label).await?;
         let key_package = client.publish_key_package().await?;
         Ok(key_package.bytes().len())
+    }
+
+    fn confirmed_setup_key_package_bytes(&self, label: &str) -> Result<usize, AppError> {
+        self.app
+            .account_storage(label)?
+            .key_package_lifecycle()?
+            .and_then(|lifecycle| lifecycle.current_key_package)
+            .map(|key_package| key_package.bytes().len())
+            .ok_or(AppError::AccountSetupRecoveryRequired)
     }
 
     fn signed_out_account_for_identity(
@@ -4266,6 +4432,60 @@ impl AccountManager {
         }
     }
 
+    fn legacy_incomplete_account_for_import(&self, nsec: &str) -> Result<bool, AppError> {
+        let account_id = AccountHome::account_id_for_secret(nsec)?;
+        let account = match self.app.account_home().account(&account_id) {
+            Ok(account) if account.local_signing && !account.signed_out => account,
+            Ok(_) | Err(AccountHomeError::UnknownAccount(_)) => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_none()
+            && self.app.account_storage_path(&account.label).exists()
+            && self
+                .app
+                .account_storage(&account.label)?
+                .key_package_lifecycle()?
+                .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some())
+        {
+            // Pre-journal MDK could strand an account after persisting the exact
+            // replacement but before returning from setup. Adopt that durable
+            // attempt into the journal so same-nsec login resumes its bytes.
+            // Validate the credential before changing any provenance state.
+            if self
+                .app
+                .account_home()
+                .load_signing_keys(&account.label)?
+                .public_key()
+                .to_hex()
+                != account_id
+            {
+                return Err(AppError::IdentityKeyMismatch);
+            }
+            self.app
+                .account_home()
+                .begin_account_setup(&account, false)?;
+            self.app.account_home().set_account_setup_phase(
+                &account.label,
+                AccountSetupPhase::KeyPackagePublicationStarted,
+            )?;
+            return Ok(false);
+        }
+        if !self
+            .app
+            .legacy_incomplete_setup_requires_recovery(&account.label)?
+        {
+            return Ok(false);
+        }
+        let _ = self
+            .app
+            .mark_key_package_cutover_replacement_pending(&account.label);
+        Ok(true)
+    }
+
     fn create_nostr_account_from_setup(
         &self,
         request: &AccountSetupRequest,
@@ -4276,8 +4496,22 @@ impl AccountManager {
             return Ok((imported.account().clone(), Some(imported)));
         }
         match request.identity.as_deref() {
-            Some(value) => Ok((account_home.add_public_account(value)?, None)),
-            None => Ok((account_home.create_nostr_account()?, None)),
+            Some(value) => {
+                let account = account_home.add_public_account(value)?;
+                if let Err(error) = account_home.begin_account_setup(&account, false) {
+                    let _ = account_home.remove_account(&account.label);
+                    return Err(error.into());
+                }
+                Ok((account, None))
+            }
+            None => {
+                let account = account_home.create_nostr_account()?;
+                if let Err(error) = account_home.begin_account_setup(&account, false) {
+                    let _ = account_home.remove_account(&account.label);
+                    return Err(error.into());
+                }
+                Ok((account, None))
+            }
         }
     }
 
@@ -4315,6 +4549,11 @@ impl AccountManager {
         // so a later re-import does not reuse a handle bound to the now-unlinked
         // inode. See `drop_account_caches` and mdk#220.
         self.app.drop_account_caches(account);
+        if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
+            return Err(AppError::RelayDirectory(format!(
+                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
+            )));
+        }
         match self.app.account_home().remove_account(account) {
             Ok(()) => Err(source),
             Err(rollback) => Err(AppError::RelayDirectory(format!(
@@ -4334,6 +4573,14 @@ impl AccountManager {
         };
 
         self.app.drop_account_caches(&account.label);
+        if let Err(rollback) = self
+            .app
+            .remove_account_key_package_artifacts(&account.label)
+        {
+            return Err(AppError::RelayDirectory(format!(
+                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
+            )));
+        }
         match self
             .app
             .account_home()

@@ -1823,6 +1823,10 @@ fn existing_account_database_without_slot_evidence_fails_closed() {
 
     app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
         .unwrap();
+    assert!(
+        app.legacy_incomplete_setup_requires_recovery(&account.label)
+            .unwrap()
+    );
 
     assert!(
         app.account_storage(&account.label)
@@ -1833,6 +1837,78 @@ fn existing_account_database_without_slot_evidence_fails_closed() {
         "an existing database must not mint a second stable slot without migration evidence"
     );
     assert!(app.key_package_cutover_replacement_pending(&account.label));
+}
+
+#[test]
+fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("journaled-fresh-setup").unwrap();
+    home.begin_account_setup(&account, false).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    // Reproduce the critical ordering: an advisory/local operation creates the
+    // encrypted DB before strict KeyPackage initialization runs.
+    app.account_storage(&account.label).unwrap();
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+
+    let lifecycle = app
+        .account_storage(&account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.stable_slot_id.len(), 64);
+}
+
+#[tokio::test]
+async fn legacy_ambiguous_setup_requires_consent_before_reset() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    app.account_storage(&account.label).unwrap();
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+    assert!(
+        app.legacy_incomplete_setup_requires_recovery(&account.label)
+            .unwrap()
+    );
+    assert!(app.key_package_cutover_replacement_pending(&account.label));
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let retry_error = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(secret.clone())),
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect_err("ordinary same-nsec retry must identify the legacy recovery state");
+    assert!(matches!(
+        retry_error,
+        AppError::AccountSetupRecoveryRequired
+    ));
+    assert!(matches!(
+        runtime.reset_incomplete_account_setup(&secret, false).await,
+        Err(AppError::AccountSetupRecoveryRequired)
+    ));
+    runtime
+        .reset_incomplete_account_setup(&secret, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(!app.key_package_cutover_replacement_pending(&account.label));
+
+    let retried = home.import_nostr_account_idempotent(&secret).unwrap();
+    assert_eq!(retried.account().account_id_hex, account.account_id_hex);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

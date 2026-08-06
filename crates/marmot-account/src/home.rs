@@ -9,13 +9,14 @@ use std::fs;
 use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
-use crate::io::{read_json, validate_account_label, write_json};
+use crate::io::{read_json, validate_account_label, write_json, write_secret_json};
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
     scrub_and_remove_local_secret_file,
 };
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
+const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
@@ -93,6 +94,31 @@ pub struct AccountSummary {
 pub struct NostrAccountImport {
     account: AccountSummary,
     reused_account_id_credential: bool,
+}
+
+/// Durable provenance and progress for an account setup that has not committed.
+///
+/// This file is created with the account record and removed only after the app
+/// runtime has completed setup. It makes task cancellation and process death
+/// recoverable without treating the mere existence of `session.sqlite` as evidence
+/// that a KeyPackage was previously published.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSetupState {
+    pub account_id_hex: String,
+    pub reused_account_id_credential: bool,
+    pub phase: AccountSetupPhase,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSetupPhase {
+    #[default]
+    LocalStateCreated,
+    /// Set before entering KeyPackage preparation/publication. If the task is
+    /// cancelled after this point, the SQLCipher lifecycle is authoritative:
+    /// exact signed bytes are persisted there before the first network send.
+    KeyPackagePublicationStarted,
+    KeyPackagePublicationConfirmed,
 }
 
 impl NostrAccountImport {
@@ -274,9 +300,24 @@ impl AccountHome {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_account_label(&account_id_hex)?;
 
-        if self.account_record_path(&account_id_hex).exists()
-            || self.secret_store.has_secret_for_label(&account_id_hex)?
-        {
+        if self.account_record_path(&account_id_hex).exists() {
+            let account = self.account(&account_id_hex)?;
+            let Some(setup) = self.account_setup_state(&account_id_hex)? else {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            };
+            if !account.local_signing || setup.account_id_hex != account.account_id_hex {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            }
+            let stored_keys = self.secret_store.load_secret(&account)?;
+            if stored_keys.public_key() != keys.public_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            return Ok(NostrAccountImport {
+                account,
+                reused_account_id_credential: setup.reused_account_id_credential,
+            });
+        }
+        if self.secret_store.has_secret_for_label(&account_id_hex)? {
             return Err(AccountHomeError::AccountExists(account_id_hex));
         }
         if self
@@ -304,13 +345,93 @@ impl AccountHome {
             }
             self.write_account_record(&account)?;
         } else {
-            self.write_new_signing_account(&account, &keys)?;
+            self.write_account_record(&account)?;
+            if let Err(err) = self.secret_store.write_secret(&account, &keys) {
+                let _ = fs::remove_file(self.account_record_path(&account.label));
+                let _ = fs::remove_dir(self.account_dir(&account.label));
+                return Err(err);
+            }
+        }
+        if let Err(err) = self.begin_account_setup(&account, reused_account_id_credential) {
+            if !reused_account_id_credential {
+                let _ = self.secret_store.remove_secret(&account);
+            }
+            let _ = fs::remove_file(self.account_record_path(&account.label));
+            let _ = fs::remove_dir_all(self.account_dir(&account.label));
+            return Err(err);
         }
 
         Ok(NostrAccountImport {
             account,
             reused_account_id_credential,
         })
+    }
+
+    /// Create the durable setup journal for a newly-created account.
+    pub fn begin_account_setup(
+        &self,
+        account: &AccountSummary,
+        reused_account_id_credential: bool,
+    ) -> AccountHomeResult<AccountSetupState> {
+        let state = AccountSetupState {
+            account_id_hex: account.account_id_hex.clone(),
+            reused_account_id_credential,
+            phase: AccountSetupPhase::LocalStateCreated,
+        };
+        write_secret_json(self.account_setup_state_path(&account.label), &state)?;
+        Ok(state)
+    }
+
+    pub fn account_setup_state(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<AccountSetupState>> {
+        let account = self.account(account_ref)?;
+        match read_json(self.account_setup_state_path(&account.label)) {
+            Ok(state) => Ok(Some(state)),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn set_account_setup_phase(
+        &self,
+        account_ref: &str,
+        phase: AccountSetupPhase,
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let Some(mut state) = self.account_setup_state(&account.label)? else {
+            return Ok(());
+        };
+        if state.account_id_hex != account.account_id_hex {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        state.phase = phase;
+        write_secret_json(self.account_setup_state_path(&account.label), &state)
+    }
+
+    pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        match fs::remove_file(self.account_setup_state_path(&account.label)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Remove an explicitly-authorized legacy incomplete setup while retaining
+    /// the matching account-id-keyed credential for the immediate retry.
+    pub fn reset_incomplete_setup_preserving_credential(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let preserve = self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?;
+        self.remove_account_inner(account_ref, Some(&account), preserve)
     }
 
     pub fn add_public_account(&self, public_key: &str) -> AccountHomeResult<AccountSummary> {
@@ -831,5 +952,9 @@ impl AccountHome {
 
     fn account_record_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_RECORD_FILE)
+    }
+
+    fn account_setup_state_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(ACCOUNT_SETUP_STATE_FILE)
     }
 }
