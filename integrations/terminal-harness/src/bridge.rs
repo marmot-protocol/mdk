@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_control::{AgentControlAccount, AgentControlEvent};
+use agent_control::{
+    AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX, AgentControlAccount, AgentControlEvent,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::sleep;
@@ -365,6 +367,21 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         .unwrap_or_else(|| session_name_for_group(&inbound.group_ref));
     let mut attachments = Vec::new();
     if ctx.backend.accepts_attachments() {
+        if inbound.media.len() > AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX {
+            let _ = send_reply(
+                &ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                &format!(
+                    "[{}] at most {} attached files are supported per prompt.",
+                    ctx.cfg.spec.reply_prefix, AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX
+                ),
+                0,
+            )
+            .await;
+            return;
+        }
         attachments.reserve(inbound.media.len());
         for media in &inbound.media {
             match ctx
@@ -511,6 +528,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                                 );
                                 let _ = ctx.client.stream_cancel(&active.handle).await;
                                 preview_disabled = true;
+                                // Keep chunk_index at zero so finish_success uses the
+                                // same reply:1 idempotency slot as the uncertain final.
                                 delivery_failed = true;
                                 continue;
                             }

@@ -121,8 +121,9 @@ async fn run_connector_e2e_rounds(
     );
 
     if restart_harness {
-        drop(harness);
-        sleep(Duration::from_millis(250)).await;
+        harness.stop_and_wait();
+        // The account change is intentional: session records are keyed by group,
+        // so the same group must resume independently of the selected account.
         let resumed_account = create_account(&socket, &format!("{harness_name}-resumed")).await;
         harness = ChildGuard::new(spawn_harness(context(&resumed_account.account_id_hex)));
 
@@ -255,6 +256,11 @@ fn wn_agent_binary() -> PathBuf {
             "failed to build wn-agent for connector e2e test"
         );
     }
+    assert!(
+        binary.is_file(),
+        "wn-agent was not produced at the expected target path: {}",
+        binary.display()
+    );
     binary
 }
 
@@ -434,6 +440,10 @@ impl ChildGuard {
             stdout_path: spawned.stdout_path,
             stderr_path: spawned.stderr_path,
         }
+    }
+
+    fn stop_and_wait(mut self) {
+        stop_process(&mut self.child);
     }
 }
 

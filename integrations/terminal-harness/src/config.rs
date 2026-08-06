@@ -27,7 +27,7 @@ pub struct ConfigSpec {
     pub reply_prefix: &'static str,
     /// Backend binary environment variable.
     pub bin_env_name: &'static str,
-    /// Account environment variable.
+    /// Primary account environment variable.
     pub account_env_name: &'static str,
     /// Optional historical sender-list alias.
     pub legacy_allowed_senders_env: Option<&'static str>,
@@ -96,9 +96,20 @@ pub fn load_config_with(
     let allowed_senders = parse_hex_csv(&allowed_name, &allowed_raw)?;
 
     let account_name = env_name("ACCOUNT_ID_HEX");
-    let account_id_hex = lookup(&account_name)
-        .map(|value| (account_name.as_str(), value))
-        .or_else(|| lookup("MARMOT_ACCOUNT_ID_HEX").map(|value| ("MARMOT_ACCOUNT_ID_HEX", value)))
+    let account_id_hex = lookup(spec.account_env_name)
+        .map(|value| (spec.account_env_name, value))
+        .or_else(|| {
+            (spec.account_env_name != account_name)
+                .then(|| lookup(&account_name))
+                .flatten()
+                .map(|value| (account_name.as_str(), value))
+        })
+        .or_else(|| {
+            (spec.account_env_name != "MARMOT_ACCOUNT_ID_HEX")
+                .then(|| lookup("MARMOT_ACCOUNT_ID_HEX"))
+                .flatten()
+                .map(|value| ("MARMOT_ACCOUNT_ID_HEX", value))
+        })
         .map(|(name, value)| normalize_hex(name, &value))
         .transpose()?;
 

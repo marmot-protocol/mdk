@@ -12,7 +12,7 @@ const CONFIG_SPEC: ConfigSpec = ConfigSpec {
     display_name: "Prime Agent",
     reply_prefix: "wn-prime-agent",
     bin_env_name: "WN_PRIME_AGENT_BIN",
-    account_env_name: "WN_PRIME_AGENT_ACCOUNT_ID_HEX",
+    account_env_name: "MARMOT_ACCOUNT_ID_HEX",
     legacy_allowed_senders_env: None,
 };
 
@@ -67,6 +67,39 @@ mod tests {
         assert_eq!(
             config.daemon_socket,
             PathBuf::from("/home/test/.marmot-agents/prime-agent/dev/prime-agent.sock")
+        );
+    }
+
+    #[test]
+    fn shared_account_variable_precedes_connector_alias() {
+        let map = HashMap::from([
+            ("HOME", "/home/test"),
+            ("WN_PRIME_AGENT_ALLOWED_SENDERS_HEX", SENDER),
+            ("MARMOT_ACCOUNT_ID_HEX", SENDER),
+            ("WN_PRIME_AGENT_ACCOUNT_ID_HEX", "invalid"),
+        ]);
+
+        let config =
+            Config::load_with(&mut |name| map.get(name).map(|value| (*value).to_owned())).unwrap();
+        assert_eq!(
+            config.loaded.harness.account_id_hex.as_deref(),
+            Some(SENDER)
+        );
+    }
+
+    #[test]
+    fn connector_account_variable_remains_a_fallback_alias() {
+        let map = HashMap::from([
+            ("HOME", "/home/test"),
+            ("WN_PRIME_AGENT_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_PRIME_AGENT_ACCOUNT_ID_HEX", SENDER),
+        ]);
+
+        let config =
+            Config::load_with(&mut |name| map.get(name).map(|value| (*value).to_owned())).unwrap();
+        assert_eq!(
+            config.loaded.harness.account_id_hex.as_deref(),
+            Some(SENDER)
         );
     }
 }

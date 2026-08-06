@@ -45,11 +45,11 @@ impl PrimeBackend {
     }
 
     async fn ensure_daemon(&self, cwd: &Path) -> Result<(), HarnessError> {
-        if self.daemon_ready().await {
+        if self.daemon_ready().await? {
             return Ok(());
         }
         let _guard = self.start_gate.lock().await;
-        if self.daemon_ready().await {
+        if self.daemon_ready().await? {
             return Ok(());
         }
         if let Some(parent) = self.daemon_socket.parent() {
@@ -70,7 +70,7 @@ impl PrimeBackend {
 
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {
-            if self.daemon_ready().await {
+            if self.daemon_ready().await? {
                 return Ok(());
             }
             if child
@@ -88,8 +88,9 @@ impl PrimeBackend {
         }
     }
 
-    async fn daemon_ready(&self) -> bool {
-        timeout(
+    /// Reports whether a compatible daemon answers without hiding protocol mismatches.
+    async fn daemon_ready(&self) -> Result<bool, HarnessError> {
+        match timeout(
             Duration::from_millis(500),
             DaemonConnection::connect(
                 &self.daemon_socket,
@@ -98,7 +99,11 @@ impl PrimeBackend {
             ),
         )
         .await
-        .is_ok_and(|result| result.is_ok())
+        {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(error @ HarnessError::BackendProtocolMismatch)) => Err(error),
+            Ok(Err(_)) | Err(_) => Ok(false),
+        }
     }
 
     async fn run_inner(
@@ -150,7 +155,9 @@ impl PrimeBackend {
             },
         };
         *observed_session = Some(session_id.clone());
-        *observed_session_path = session_path;
+        if let Some(session_path) = session_path {
+            *observed_session_path = Some(session_path);
+        }
 
         daemon
             .request(
@@ -726,7 +733,7 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
     }
 
-    async fn run_fake_daemon(listener: UnixListener) {
+    async fn run_fake_daemon(listener: UnixListener, session_file: PathBuf) {
         let mut actual_connection = 0usize;
         while actual_connection < 4 {
             let (stream, _) = listener.accept().await.unwrap();
@@ -750,7 +757,6 @@ mod tests {
             };
             actual_connection += 1;
             let mut next = Some(first);
-            let mut saw_create = false;
             let mut saw_prompt = false;
             let mut successful_commands = 0usize;
             let mut final_command_id = None;
@@ -790,14 +796,22 @@ mod tests {
                 }
                 let data = match command_type {
                     "create" => {
-                        assert_eq!(actual_connection, 1, "only the first run may create");
+                        assert!(actual_connection <= 2, "only prompt runs may create");
                         assert_eq!(
                             command.get("name").and_then(Value::as_str),
                             Some("marmot-daemon-contract")
                         );
                         assert!(command.pointer("/config/name").is_none());
-                        saw_create = true;
-                        json!({"activeSessionId": "active-session-1"})
+                        let requested_path = command.get("sessionPath").and_then(Value::as_str);
+                        if actual_connection == 1 {
+                            assert_eq!(requested_path, None);
+                        } else {
+                            assert_eq!(requested_path, session_file.to_str());
+                        }
+                        json!({
+                            "activeSessionId": "active-session-1",
+                            "sessionFile": session_file
+                        })
                     }
                     "attach" => {
                         assert_eq!(
@@ -913,9 +927,7 @@ mod tests {
                 rejected_command_id.is_none(),
                 "rejected daemon responses must be acknowledged"
             );
-            if actual_connection == 1 {
-                assert!(saw_create);
-            }
+
             if actual_connection <= 2 {
                 assert!(saw_prompt);
             }
@@ -923,7 +935,16 @@ mod tests {
         }
     }
 
-    async fn run_single_prompt_daemon(listener: UnixListener, expect_create: bool) {
+    async fn run_single_prompt_daemon(
+        listener: UnixListener,
+        session_file: PathBuf,
+        expect_resume: bool,
+    ) {
+        let active_session_id = if expect_resume {
+            "restart-resumed-session"
+        } else {
+            "restart-stable-session"
+        };
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let (read_half, mut writer) = stream.into_split();
@@ -965,20 +986,27 @@ mod tests {
                     continue;
                 }
                 let data = match command_type {
-                    "create" if expect_create => {
+                    "create" => {
                         saw_session_command = true;
-                        json!({"activeSessionId": "restart-stable-session"})
+                        let requested_path = command.get("sessionPath").and_then(Value::as_str);
+                        if expect_resume {
+                            assert_eq!(requested_path, session_file.to_str());
+                        } else {
+                            assert_eq!(requested_path, None);
+                        }
+                        json!({
+                            "activeSessionId": active_session_id,
+                            "sessionFile": session_file
+                        })
                     }
                     "attach" => {
-                        if expect_create {
-                            assert!(saw_session_command, "create must precede attach");
-                        }
+                        assert!(saw_session_command, "create must precede attach");
                         assert_eq!(
                             command.get("activeSessionId").and_then(Value::as_str),
-                            Some("restart-stable-session")
+                            Some(active_session_id)
                         );
                         saw_session_command = true;
-                        json!({"activeSessionId": "restart-stable-session"})
+                        json!({"activeSessionId": active_session_id})
                     }
                     "set_session_name" | "prompt_and_wait" => Value::Null,
                     "get_last_assistant_text" => {
@@ -1175,8 +1203,9 @@ mod tests {
     async fn backend_speaks_daemon_protocol_reuses_session_and_forwards_attachments() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("prime.sock");
+        let session_file = root.path().join("prime-session.jsonl");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(run_fake_daemon(listener));
+        let server = tokio::spawn(run_fake_daemon(listener, session_file.clone()));
         let backend = PrimeBackend::new("unused-prime-agent".to_owned(), socket);
 
         let image = root.path().join("image.png");
@@ -1203,6 +1232,10 @@ mod tests {
             Some("active-session-1")
         );
         assert_eq!(
+            first_outcome.observed_session_path.as_deref(),
+            Some(session_file.as_path())
+        );
+        assert_eq!(
             rx.recv().await,
             Some(RunnerEvent::Preview("hello".to_owned()))
         );
@@ -1217,9 +1250,10 @@ mod tests {
 
         let mut second = test_invocation(
             root.path(),
-            first_outcome.observed_session,
+            first_outcome.observed_session.clone(),
             "inspect both attachments",
         );
+        second.session_path = first_outcome.observed_session_path.clone();
         second.attachments = vec![
             marmot_terminal_harness::InvocationAttachment {
                 path: root.path().join("image.png"),
@@ -1237,6 +1271,10 @@ mod tests {
         assert_eq!(
             second_outcome.observed_session.as_deref(),
             Some("active-session-1")
+        );
+        assert_eq!(
+            second_outcome.observed_session_path.as_deref(),
+            Some(session_file.as_path())
         );
         assert_eq!(
             rx.recv().await,
@@ -1279,13 +1317,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_reattaches_to_recovered_resident_session_after_daemon_restart() {
+    async fn backend_resumes_persisted_session_after_daemon_restart() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("prime-restart.sock");
+        let session_file = root.path().join("prime-restart-session.jsonl");
         let backend = PrimeBackend::new("unused-prime-agent".to_owned(), socket.clone());
 
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(run_single_prompt_daemon(listener, true));
+        let server = tokio::spawn(run_single_prompt_daemon(
+            listener,
+            session_file.clone(),
+            false,
+        ));
         let (tx, mut rx) = mpsc::channel(4);
         let first = backend
             .run(test_invocation(root.path(), None, "first"), tx)
@@ -1295,22 +1338,34 @@ mod tests {
             rx.recv().await,
             Some(RunnerEvent::Text("restart recovered".to_owned()))
         );
+        assert_eq!(
+            first.observed_session.as_deref(),
+            Some("restart-stable-session")
+        );
+        assert_eq!(
+            first.observed_session_path.as_deref(),
+            Some(session_file.as_path())
+        );
         server.await.unwrap();
 
         std::fs::remove_file(&socket).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(run_single_prompt_daemon(listener, false));
+        let server = tokio::spawn(run_single_prompt_daemon(
+            listener,
+            session_file.clone(),
+            true,
+        ));
         let (tx, mut rx) = mpsc::channel(4);
-        let second = backend
-            .run(
-                test_invocation(root.path(), first.observed_session, "second"),
-                tx,
-            )
-            .await
-            .unwrap();
+        let mut resumed = test_invocation(root.path(), first.observed_session.clone(), "second");
+        resumed.session_path = first.observed_session_path.clone();
+        let second = backend.run(resumed, tx).await.unwrap();
         assert_eq!(
             second.observed_session.as_deref(),
-            Some("restart-stable-session")
+            Some("restart-resumed-session")
+        );
+        assert_eq!(
+            second.observed_session_path.as_deref(),
+            Some(session_file.as_path())
         );
         assert_eq!(
             rx.recv().await,
@@ -1320,7 +1375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unpinned_daemon_app_version() {
+    async fn ensure_daemon_propagates_unpinned_app_version() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("prime.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1342,9 +1397,8 @@ mod tests {
             .await;
         });
 
-        let result =
-            DaemonConnection::connect(&socket, Arc::new(AtomicU64::new(1)), Duration::from_secs(1))
-                .await;
+        let backend = PrimeBackend::new("unused".to_owned(), socket);
+        let result = backend.ensure_daemon(temp.path()).await;
         assert!(matches!(result, Err(HarnessError::BackendProtocolMismatch)));
         server.await.unwrap();
     }
@@ -1379,7 +1433,7 @@ mod tests {
             attachments: Vec::new(),
         };
         let (tx, mut rx) = mpsc::channel(16);
-        backend.run(invocation, tx).await.unwrap();
+        let outcome = backend.run(invocation, tx).await.unwrap();
 
         let mut final_text = None;
         while let Some(event) = rx.recv().await {
@@ -1390,6 +1444,10 @@ mod tests {
         assert_eq!(
             final_text.as_deref().map(str::trim),
             Some("PRIME_AGENT_CONNECTOR_OK")
+        );
+        assert!(
+            outcome.observed_session_path.is_some(),
+            "live daemon create response must expose sessionFile"
         );
     }
 }

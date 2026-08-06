@@ -42,7 +42,7 @@ fn spawn_prime_harness(context: HarnessContext) -> SpawnedChild {
         // Non-empty candidates exercise StreamBegin/Append/Finalize. The invalid
         // candidate deliberately selects wn-agent's no-live-broker compose path.
         .env("MARMOT_QUIC_CANDIDATES", "not-a-quic-candidate")
-        .env("WN_PRIME_AGENT_ACCOUNT_ID_HEX", context.account_id_hex)
+        .env("MARMOT_ACCOUNT_ID_HEX", context.account_id_hex)
         .env("WN_PRIME_AGENT_ALLOWED_SENDERS_HEX", SENDER_ACCOUNT_ID_HEX);
     SpawnedChild::spawn("wn-prime-agent", &mut command, context.root)
 }

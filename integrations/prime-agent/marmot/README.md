@@ -69,11 +69,11 @@ The installer writes a private environment file. Direct launches use the same va
 | --- | --- | --- |
 | `WN_PRIME_AGENT_ALLOWED_SENDERS_HEX` | Comma-separated Marmot sender hex keys | required |
 | `WN_PRIME_AGENT_BIN` | Prime Agent executable | `prime-agent` |
-| `WN_PRIME_AGENT_DAEMON_SOCKET` | Prime Agent daemon Unix socket | `$WN_PRIME_AGENT_HOME/dev/prime-agent.sock` |
-| `WN_PRIME_AGENT_SOCKET` | `wn-agent` control socket | `$WN_PRIME_AGENT_HOME/dev/wn-agent.sock` |
-| `WN_PRIME_AGENT_HOME` | Connector state root | `~/.marmot-agents/prime-agent` |
-| `WN_PRIME_AGENT_STATE_PATH` | Private group/session mapping | `$WN_PRIME_AGENT_HOME/dev/sessions.json` |
-| `WN_PRIME_AGENT_ACCOUNT_ID_HEX` | Explicit local Marmot account | auto-resolved |
+| `WN_PRIME_AGENT_DAEMON_SOCKET` | Prime Agent daemon Unix socket | `$MARMOT_HOME/dev/prime-agent.sock` |
+| `MARMOT_AGENT_SOCKET` | `wn-agent` control socket | `$MARMOT_HOME/dev/wn-agent.sock` |
+| `MARMOT_HOME` | Connector state root | `~/.marmot-agents/prime-agent` |
+| `WN_PRIME_AGENT_STATE_PATH` | Private group/session mapping | `$MARMOT_HOME/dev/sessions.json` |
+| `MARMOT_ACCOUNT_ID_HEX` | Explicit local Marmot account | auto-resolved |
 | `WN_PRIME_AGENT_TIMEOUT_SECS` | Total prompt timeout | `3600` |
 | `WN_PRIME_AGENT_IDLE_TIMEOUT_SECS` | Daemon-output idle timeout | `120` |
 | `WN_PRIME_AGENT_REQUEST_TIMEOUT_SECS` | `wn-agent` request timeout | `30` |
@@ -81,13 +81,16 @@ The installer writes a private environment file. Direct launches use the same va
 | `WN_PRIME_AGENT_MAX_REPLY_BYTES` | Durable reply chunk size | `30000` |
 | `WN_PRIME_AGENT_QUIC_CANDIDATES` | Optional live-preview broker candidates | empty |
 
+`WN_PRIME_AGENT_ACCOUNT_ID_HEX` remains accepted as a legacy fallback, but
+`MARMOT_ACCOUNT_ID_HEX` takes precedence.
+
 ## Group and Session Semantics
 
 The first group message must be `/<path>` selecting a canonical directory beneath the service user's home. The harness stores only the canonical directory, Prime Agent session file path and current active session id, and a stable hashed session name in a mode-`0600` state file. After a harness or Prime Agent daemon restart, it reloads the durable session file to recover conversation history before attaching to the new active session id.
 
 Prompts for one Marmot group are serialized. A prompt received while that group's Prime Agent run is active is queued within the configured bound; it is not sent as a daemon steering message. Different groups may run concurrently.
 
-The initial prompt creates a resident Prime Agent session with the selected repository as `cwd` and a stable top-level session name. Later prompts reattach by the persisted active session id. Daemon restarts preserve the resident worker and active id through Prime Agent's own recovery path.
+The initial prompt creates a resident Prime Agent session with the selected repository as `cwd` and a stable top-level session name. Later prompts reopen the persisted `sessionPath`, which reuses the resident worker while the daemon is live. After a daemon restart, the connector recreates the resident session from that path, attaches to the newly assigned active session id, and persists the replacement id.
 
 ## Models and Attachments
 
