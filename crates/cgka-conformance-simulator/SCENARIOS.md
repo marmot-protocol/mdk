@@ -157,6 +157,24 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: Bob's message is delayed, Alice restarts, and the released message is duplicated and reordered.
 - Expected: Alice hydrates the stable group after restart and receives Bob's payload once.
 
+### `route-equivalence/v1`
+
+- File: `vectors/route-equivalence.v1.json`
+- Setup: Alice creates a group with Bob, Carol, and Dave. Alice and Bob (both admins) race same-epoch
+  `UpdateGroupData` commits and both confirm publication; both commits are withheld, then Bob — the
+  deterministic ordering winner — restarts before either sibling is released, so he consumes the fork over
+  durable storage with a fresh engine.
+- Pressure: the same depth-1 fork is resolved through every route that exists today — the live committer's
+  pairwise fork-recovery seam (Alice, the ordering loser), post-restart convergence over hydrated storage
+  (Bob, the restarted committer whose in-memory `committed_from` guard is gone), and the observer convergence
+  selector (Carol and Dave). Both withheld commits are released in reversed order before anyone consumes the
+  sibling branch.
+- Expected: all four clients converge at epoch 2 with four members and the same branch-sensitive group name,
+  pass exact canonical equivalence and no-pending-work, and exactly one recovery observation is recorded — the
+  live pairwise loser's; the restarted committer and both observers settle the identical branch through
+  convergence decisions instead. This pins the route equivalence that the pairwise-route deletion (option C
+  Slice C) must preserve unchanged.
+
 ### `conversation/v1`
 
 - File: `vectors/conversation.v1.json`

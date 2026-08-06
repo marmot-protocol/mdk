@@ -222,6 +222,19 @@
       "next": "Use as the restart-plus-delivery-fault fixture."
     },
     {
+      "id": "route-equivalence/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "route-equivalence.v1.json",
+      "coverage": [
+        "same-epoch group-data commit race resolved by every fork-resolution route in one trace",
+        "live committer pairwise route versus observer convergence route agreement at depth 1",
+        "restarted committer resolving the same fork through convergence over hydrated storage",
+        "strict exact-equivalence, group-name convergence, and no-pending-work tail"
+      ],
+      "next": "Route-unification acceptance pin (option C Slice B): the equivalence this vector pins must survive the pairwise-route deletion unchanged."
+    },
+    {
       "id": "fork-recovery-incident/v1",
       "kind": "scenario_vector",
       "status": "incident_replay",
