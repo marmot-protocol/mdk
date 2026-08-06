@@ -1924,7 +1924,7 @@ async fn assert_concurrent_rename_withdrawal(
     expect_distinct_transport_ids: bool,
 ) {
     use cgka_traits::engine::{GroupStateChange, GroupStateInvalidationReason};
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    use cgka_traits::ingest::IngestOutcome;
 
     alice.drain_events();
     bob.drain_events();
@@ -1988,7 +1988,8 @@ async fn assert_concurrent_rename_withdrawal(
         );
     }
 
-    // Deliver both commits to both members.
+    // Deliver both commits to both members. Each rival enters the receiving
+    // committer's convergence pass; drive both passes to their settled state.
     let alice_outcome = alice
         .ingest(route_to_group(&bob_commit, &gid))
         .await
@@ -1997,6 +1998,19 @@ async fn assert_concurrent_rename_withdrawal(
         .ingest(route_to_group(&alice_commit, &gid))
         .await
         .unwrap();
+    assert!(
+        matches!(alice_outcome, IngestOutcome::Buffered { .. }),
+        "the rival rename must enter convergence on alice, got {alice_outcome:?}"
+    );
+    assert!(
+        matches!(bob_outcome, IngestOutcome::Buffered { .. }),
+        "the rival rename must enter convergence on bob, got {bob_outcome:?}"
+    );
+    alice
+        .converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on alice");
+    bob.converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on bob");
     let alice_after = alice.drain_events();
     let bob_after = bob.drain_events();
 
@@ -2016,26 +2030,12 @@ async fn assert_concurrent_rename_withdrawal(
     // content-derived id, so the surviving notification's attribution is
     // `content_id(winning commit)` there (attribution only has to be
     // deterministic per device across the emit and withdraw paths).
-    let (loser_after, loser_origin, loser_own, loser_outcome, winner_after, winner_outcome) =
+    let (loser_after, loser_origin, loser_own, winner_after, winner_origin) =
         if canonical_name == "New name from A" {
-            (
-                bob_after,
-                bob_origin,
-                bob_own,
-                bob_outcome,
-                alice_after,
-                alice_outcome,
-            )
+            (bob_after, bob_origin, bob_own, alice_after, alice_origin)
         } else {
             assert_eq!(canonical_name, "New name from B");
-            (
-                alice_after,
-                alice_origin,
-                alice_own,
-                alice_outcome,
-                bob_after,
-                bob_outcome,
-            )
+            (alice_after, alice_origin, alice_own, bob_after, bob_origin)
         };
     let winner_commit_id_on_loser = if canonical_name == "New name from A" {
         content_id(&alice_commit)
@@ -2043,25 +2043,15 @@ async fn assert_concurrent_rename_withdrawal(
         content_id(&bob_commit)
     };
 
-    // The losing committer applied the winner's commit over its own.
+    // The winner's settled pass keeps its own (canonical) rename: no
+    // withdrawal may name the winner's own commit. (An invalidation naming
+    // the never-applied losing sibling is fine — no notification on the
+    // winner carries that id, so the app-side tombstone is a no-op.)
     assert!(
-        !matches!(loser_outcome, IngestOutcome::Stale { .. }),
-        "loser must apply the winning commit, got {loser_outcome:?}"
-    );
-    // The winner classifies the losing commit as stale — no rollback, no
-    // withdrawal of its own (canonical) rename.
-    assert!(
-        matches!(
-            winner_outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadyAtEpoch { .. }
-            }
-        ),
-        "winner must not roll back to the losing commit, got {winner_outcome:?}"
-    );
-    assert!(
-        state_invalidations(&winner_after).is_empty(),
-        "winner must not withdraw any state notification, got {winner_after:?}"
+        !state_invalidations(&winner_after)
+            .iter()
+            .any(|(id, _)| id == &winner_origin),
+        "winner must not withdraw its own canonical rename, got {winner_after:?}"
     );
 
     // The losing committer MUST emit the explicit invalidation naming its own
@@ -2122,11 +2112,8 @@ async fn assert_concurrent_rename_withdrawal(
 
 /// Stored-convergence variant of the issue #363 scenario, with
 /// PRODUCTION-shaped ids: the losing committer's own published-and-confirmed
-/// rename is superseded by a rewind/replay reorg, not the direct
-/// staged-commit seam. The loser restarts after confirming (an engine rebuild
-/// drops the in-memory `committed_from` set, so the sibling commit routes
-/// into stored convergence — there is no direct-seam `ForkRecovered` on this
-/// path), then converges over the winner's commit.
+/// rename is superseded by a rewind/replay reorg. The loser restarts after
+/// confirming, then converges over the winner's commit.
 ///
 /// The correctness core: the withdrawal on the losing device must name the
 /// SAME id its confirm-time rows were stamped with (the wrap-time transport
@@ -2135,7 +2122,7 @@ async fn assert_concurrent_rename_withdrawal(
 #[tokio::test]
 async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_origin() {
     use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority, GroupStateChange};
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    use cgka_traits::ingest::IngestOutcome;
 
     let (mut alice, alice_storage, mut bob, bob_storage, gid) =
         create_admin_pair_with_peeler(ephemeral_peeler).await;
@@ -2200,6 +2187,13 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
     );
     assert_ne!(alice_key, bob_key);
     let alice_wins = alice_key < bob_key;
+    // The winner's own stamped origin, captured before the destructuring
+    // below moves the origins out.
+    let winner_origin = if alice_wins {
+        alice_origin.clone()
+    } else {
+        bob_origin.clone()
+    };
     #[allow(clippy::type_complexity)]
     let (
         mut winner,
@@ -2251,29 +2245,30 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
         )
     };
 
-    // The winner never restarts: it classifies the losing commit as stale on
-    // the direct seam (its own confirmed commit stays the incumbent) and
-    // withdraws nothing.
+    // The winner never restarts: the losing commit routes into its
+    // convergence pass, which keeps the winner's own confirmed commit
+    // selected and withdraws nothing.
     let winner_outcome = winner
         .ingest(route_to_group(&loser_commit, &gid))
         .await
         .unwrap();
     assert!(
-        matches!(
-            winner_outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::AlreadyAtEpoch { .. }
-            }
-        ),
-        "winner must keep its incumbent commit, got {winner_outcome:?}"
+        matches!(winner_outcome, IngestOutcome::Buffered { .. }),
+        "the losing commit must enter the winner's convergence pass, got {winner_outcome:?}"
     );
-    assert!(state_invalidations(&winner.drain_events()).is_empty());
+    winner
+        .converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on the winner");
+    assert!(
+        !state_invalidations(&winner.drain_events())
+            .iter()
+            .any(|(id, _)| id == &winner_origin),
+        "winner must not withdraw its own canonical rename"
+    );
 
-    // The LOSER restarts. Durable state survives; the in-memory
-    // `committed_from` set does not, so the winner's sibling commit is
-    // buffered for stored convergence instead of hitting the direct
-    // fork-recovery seam — the reorg path issue #363's own-commit withdrawal
-    // must also cover.
+    // The LOSER restarts. Durable state survives across the rebuild, and the
+    // winner's sibling commit is buffered for stored convergence — the reorg
+    // path issue #363's own-commit withdrawal must also cover.
     drop(loser_engine);
     let mut loser =
         build_with_storage_and_peeler(loser_id, loser_storage.clone(), ephemeral_peeler());
@@ -2454,11 +2449,10 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
         other => panic!("expected exactly one attributed rename on the winner, got {other:?}"),
     };
 
-    // The WINNER restarts: durable state survives, the in-memory
-    // `committed_from` guard does not, so the losing sibling commit routes
-    // into stored convergence. Its own confirmed commit must still compete
-    // there — realized from the confirm-time stamp + retained anchor — and
-    // win by the same authenticated ordering key the direct seam would use.
+    // The WINNER restarts: durable state survives, and the losing sibling
+    // commit routes into stored convergence. Its own confirmed commit must
+    // still compete there — realized from the confirm-time stamp + retained
+    // anchor — and win by the same authenticated ordering key.
     drop(winner);
     let mut winner =
         build_with_storage_and_peeler(winner_id, winner_storage.clone(), ephemeral_peeler());
@@ -2521,16 +2515,20 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
         ),
     }
 
-    // The never-restarted loser resolves the same fork on the direct seam and
-    // lands on the same canonical branch — no group-level fork.
+    // The never-restarted loser resolves the same fork through its own
+    // convergence pass and lands on the same canonical branch — no
+    // group-level fork.
     let loser_outcome = loser
         .ingest(route_to_group(&winner_commit, &gid))
         .await
         .unwrap();
     assert!(
-        !matches!(loser_outcome, IngestOutcome::Stale { .. }),
-        "loser must apply the winning commit, got {loser_outcome:?}"
+        matches!(loser_outcome, IngestOutcome::Buffered { .. }),
+        "the winning commit must enter the loser's convergence pass, got {loser_outcome:?}"
     );
+    loser
+        .converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on the loser");
     assert_eq!(loser_storage.get_group(&gid).unwrap().name, winner_name);
     assert_eq!(
         winner_storage.get_group(&gid).unwrap().name,
@@ -3079,6 +3077,19 @@ async fn concurrent_rename_and_retention_change_withdraw_only_superseded_commit(
         .ingest(route_to_group(&alice_commit, &gid))
         .await
         .unwrap();
+    assert!(
+        matches!(alice_outcome, IngestOutcome::Buffered { .. }),
+        "the rival commit must enter convergence on alice, got {alice_outcome:?}"
+    );
+    assert!(
+        matches!(bob_outcome, IngestOutcome::Buffered { .. }),
+        "the rival commit must enter convergence on bob, got {bob_outcome:?}"
+    );
+    alice
+        .converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on alice");
+    bob.converge_stored_openmls_messages_at(&gid, u64::MAX)
+        .expect("the fork settles on bob");
     let alice_after = alice.drain_events();
     let bob_after = bob.drain_events();
 
@@ -3087,10 +3098,16 @@ async fn concurrent_rename_and_retention_change_withdraw_only_superseded_commit(
     let bob_group = bob_storage.get_group(&gid).unwrap();
     assert_eq!(alice_group.name, bob_group.name);
     let rename_won = alice_group.name == "renamed while racing";
+    // The winner's own stamped origin, captured before the destructuring
+    // below moves the origins out.
+    let winner_origin = if rename_won {
+        alice_origin.clone()
+    } else {
+        bob_origin.clone()
+    };
 
     let (loser_after, loser_origin, loser_own, winner_after, winner_commit_id_on_loser) =
         if rename_won {
-            assert!(!matches!(bob_outcome, IngestOutcome::Stale { .. }));
             (
                 bob_after,
                 bob_origin,
@@ -3099,7 +3116,6 @@ async fn concurrent_rename_and_retention_change_withdraw_only_superseded_commit(
                 content_id(&alice_commit),
             )
         } else {
-            assert!(!matches!(alice_outcome, IngestOutcome::Stale { .. }));
             (
                 alice_after,
                 alice_origin,
@@ -3122,34 +3138,63 @@ async fn concurrent_rename_and_retention_change_withdraw_only_superseded_commit(
         "the winning commit's notifications must not be withdrawn"
     );
     assert!(
-        state_invalidations(&winner_after).is_empty(),
-        "winner must not withdraw anything, got {winner_after:?}"
+        !state_invalidations(&winner_after)
+            .iter()
+            .any(|(id, _)| id == &winner_origin),
+        "winner must not withdraw its own canonical notification, got {winner_after:?}"
     );
 
-    // Resulting view on the losing device: exactly the winner's change type,
-    // attributed to the winner's commit.
+    // Resulting view on the losing device: the winner's change survives,
+    // attributed to the winner's commit, and the loser's superseded change is
+    // gone. (The reorg's replay diff may additionally synthesize the revert
+    // of the loser's locally applied change — the same diff-derived event any
+    // observer reorging across this fork sees — attributed to the winning
+    // commit.)
     let mut loser_notifications = loser_own;
     loser_notifications.extend(attributed_state_changes(&loser_after));
     let surviving = surviving_state_changes(&loser_notifications, &loser_invalidations);
-    assert_eq!(
-        surviving.len(),
-        1,
-        "resulting view must hold exactly the winner's notification, got {surviving:?}"
+    assert!(
+        surviving
+            .iter()
+            .all(|(_, origin)| origin == &winner_commit_id_on_loser),
+        "every surviving notification must be attributed to the winning commit, got {surviving:?}"
     );
-    let (surviving_change, surviving_origin) = &surviving[0];
-    assert_eq!(surviving_origin, &winner_commit_id_on_loser);
     if rename_won {
         assert!(
-            matches!(surviving_change, GroupStateChange::GroupRenamed { name, .. } if name == "renamed while racing")
+            surviving.iter().any(|(change, _)| matches!(
+                change,
+                GroupStateChange::GroupRenamed { name, .. } if name == "renamed while racing"
+            )),
+            "the winning rename must survive, got {surviving:?}"
+        );
+        assert!(
+            surviving.iter().all(|(change, _)| !matches!(
+                change,
+                GroupStateChange::MessageRetentionChanged {
+                    new_seconds: 60,
+                    ..
+                }
+            )),
+            "the superseded retention change must not survive, got {surviving:?}"
         );
     } else {
-        assert!(matches!(
-            surviving_change,
-            GroupStateChange::MessageRetentionChanged {
-                old_seconds: 0,
-                new_seconds: 60,
-            }
-        ));
+        assert!(
+            surviving.iter().any(|(change, _)| matches!(
+                change,
+                GroupStateChange::MessageRetentionChanged {
+                    old_seconds: 0,
+                    new_seconds: 60,
+                }
+            )),
+            "the winning retention change must survive, got {surviving:?}"
+        );
+        assert!(
+            surviving.iter().all(|(change, _)| !matches!(
+                change,
+                GroupStateChange::GroupRenamed { name, .. } if name == "renamed while racing"
+            )),
+            "the superseded rename must not survive, got {surviving:?}"
+        );
     }
 }
 

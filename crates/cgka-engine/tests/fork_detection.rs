@@ -2,10 +2,12 @@
 //!
 //! A concurrent-invite scenario deliberately produces divergent epoch-2
 //! histories. The engine should:
-//! - Recognize the fork via `committed_from_epochs` + inbound WrongEpoch
-//! - Compare deterministic transport ordering keys
-//! - Roll back to the pre-commit snapshot if the inbound commit wins
-//! - Apply the winning commit and return to Stable
+//! - Admit the same-epoch rival into distributed convergence via the retained
+//!   source-epoch anchor — one route for committers and observers alike
+//! - Compare deterministic ordering keys (and valid branch depth) inside the
+//!   settled pass
+//! - Reorg onto the winning branch and park the loser reconsiderable
+//! - Fail closed loudly when the in-horizon recovery material is missing
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
@@ -283,8 +285,8 @@ fn raw_self_update_commit(
 #[tokio::test]
 async fn concurrent_invites_recover_to_deterministic_winner() {
     // Setup: alice + bob in group at epoch 1. Both at Stable{1}.
-    let mut alice = build_client(b"alice");
-    let mut bob = build_client(b"bob");
+    let (mut alice, alice_storage) = build_client_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"bob");
     let mut david = build_client(b"david");
     let mut eve = build_client(b"eve");
 
@@ -380,31 +382,33 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         ..msg
     };
 
-    // Loser ingests winner's commit → fork recovery rolls them back.
+    // Loser ingests winner's commit. The rival enters distributed convergence
+    // (the committer takes the same route as any observer); once the pass
+    // settles, deterministic ordering rolls the loser onto the winner's branch.
     let (winning_invitee, losing_invitee) = if bob_wins {
-        alice.ingest(route(bob_commit.clone())).await.unwrap();
-        let events = alice.drain_events();
-        let (source_epoch, recovered_epoch, winner, invalidated) =
-            extract_fork_recovered(&events, &group_id)
-                .expect("alice should emit ForkRecovered after rolling back to Bob's commit");
-        assert_eq!(source_epoch.0, 1);
-        assert_eq!(recovered_epoch.0, 2);
-        assert_eq!(winner, &bob_key);
-        assert_eq!(invalidated, &alice_key);
-        assert!(winner < invalidated);
+        assert!(bob_key < alice_key);
+        let outcome = alice.ingest(route(bob_commit.clone())).await.unwrap();
+        assert!(
+            matches!(outcome, IngestOutcome::Buffered { .. }),
+            "the rival commit must enter convergence, got {outcome:?}"
+        );
+        let result = alice
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .expect("the fork settles on the loser");
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
         assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
         ("eve", "david")
     } else {
-        bob.ingest(route(alice_commit.clone())).await.unwrap();
-        let events = bob.drain_events();
-        let (source_epoch, recovered_epoch, winner, invalidated) =
-            extract_fork_recovered(&events, &group_id)
-                .expect("bob should emit ForkRecovered after rolling back to Alice's commit");
-        assert_eq!(source_epoch.0, 1);
-        assert_eq!(recovered_epoch.0, 2);
-        assert_eq!(winner, &alice_key);
-        assert_eq!(invalidated, &bob_key);
-        assert!(winner < invalidated);
+        assert!(alice_key < bob_key);
+        let outcome = bob.ingest(route(alice_commit.clone())).await.unwrap();
+        assert!(
+            matches!(outcome, IngestOutcome::Buffered { .. }),
+            "the rival commit must enter convergence, got {outcome:?}"
+        );
+        let result = bob
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .expect("the fork settles on the loser");
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
         assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
         ("david", "eve")
     };
@@ -426,31 +430,63 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
             .any(|m| m.id == MemberId::new(pad32(losing_invitee.as_bytes())))
     );
 
-    // Winner ingests loser's commit. Should be classified as stale, not roll
-    // the winner back off their already-winning branch.
-    let outcome = if bob_wins {
-        bob.ingest(route(alice_commit)).await.unwrap()
+    // Winner ingests loser's commit through the same convergence route. The
+    // settled pass must keep the winner on its already-winning branch and park
+    // the losing rival reconsiderable.
+    let (winner_engine, winner_storage, losing_commit) = if bob_wins {
+        (&mut bob, &bob_storage, alice_commit)
     } else {
-        alice.ingest(route(bob_commit)).await.unwrap()
+        (&mut alice, &alice_storage, bob_commit)
     };
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadyAtEpoch { .. }
-        }
-    ));
+    let losing_content_id = {
+        use sha2::{Digest, Sha256};
+        MessageId::new(Sha256::digest(&losing_commit.payload).to_vec())
+    };
+    let outcome = winner_engine.ingest(route(losing_commit)).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the losing rival must enter convergence on the winner too, got {outcome:?}"
+    );
+    let result = winner_engine
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the fork settles on the winner");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        winner_engine.epoch(&group_id).unwrap().0,
+        2,
+        "the winner must stay on its own branch"
+    );
+    let winner_members = winner_engine.members(&group_id).unwrap();
+    assert!(
+        winner_members
+            .iter()
+            .any(|m| m.id == MemberId::new(pad32(winning_invitee.as_bytes())))
+    );
+    assert!(
+        !winner_members
+            .iter()
+            .any(|m| m.id == MemberId::new(pad32(losing_invitee.as_bytes())))
+    );
+    assert_eq!(
+        winner_storage
+            .get_message(&losing_content_id)
+            .unwrap()
+            .state,
+        MessageState::ConvergenceDeferred,
+        "the losing rival stays parked reconsiderable on the winner"
+    );
 }
 
 #[tokio::test]
 async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    use cgka_traits::ingest::IngestOutcome;
     use sha2::{Digest, Sha256};
 
     // Both commits below are privileged, so choose identities that make the
     // forbidden Add sort before the valid incumbent. This pins the exact
-    // failure mode: without the probe-time strict-cutover gate, fork recovery
-    // rolls back the incumbent before normal ingest rejects the Add.
+    // failure mode: without the materialization-time strict-cutover gate,
+    // branch selection would prefer the forbidden Add on the ordering key and
+    // roll the valid incumbent back.
     let first = b"strict-fork-first".as_slice();
     let second = b"strict-fork-second".as_slice();
     let (incumbent_id, candidate_id) = if pad32(first) > pad32(second) {
@@ -553,16 +589,19 @@ async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
         },
         ..legacy_add
     };
+    // The rival candidate enters distributed convergence like any other
+    // in-horizon fork commit; branch materialization enforces the strict
+    // cutover (`reject_legacy_group_additions`) and must drop it there,
+    // before selection can compare ordering keys.
     let outcome = incumbent.ingest(routed_add).await.unwrap();
     assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Stale {
-                reason: StaleReason::InvalidAgainstCanonicalState
-            }
-        ),
-        "probe-time strict cutover must reject the candidate before selection, got {outcome:?}"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival candidate must enter convergence, got {outcome:?}"
     );
+    let result = incumbent
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the pass settles after rejecting the forbidden candidate");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
     assert_eq!(
         incumbent.epoch(&group_id).unwrap(),
@@ -581,15 +620,8 @@ async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
     );
     assert_eq!(
         incumbent_storage.get_message(&content_id).unwrap().state,
-        MessageState::Failed,
+        MessageState::EpochInvalidated,
         "the forbidden candidate must be retired terminally"
-    );
-    assert!(
-        incumbent
-            .drain_events()
-            .iter()
-            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
-        "a candidate rejected by the probe must never emit ForkRecovered"
     );
 }
 
@@ -672,23 +704,29 @@ async fn convergence_privileged_remove_beats_grinding_ordinary_self_update() {
     alice.confirm_published(remove_pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
 
-    let outcome = alice.ingest(self_update).await.unwrap();
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadyAtEpoch {
-                current: EpochId(2),
-                msg_epoch: EpochId(1),
-            }
-        }
-    ));
-    let events = alice.drain_events();
+    // The routed self-update enters distributed convergence; the settled pass
+    // must keep the privileged remove selected — a ground digest cannot beat
+    // commit priority.
+    let routed_self_update = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..self_update
+    };
+    let outcome = alice.ingest(routed_self_update).await.unwrap();
+    use cgka_traits::ingest::IngestOutcome;
     assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
-        "ordinary self-update must not win fork recovery over privileged remove"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival self-update must enter convergence, got {outcome:?}"
+    );
+    let result = alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the fork settles on the remover");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        alice.epoch(&group_id).unwrap(),
+        EpochId(2),
+        "the privileged remove stays selected"
     );
     let members = alice.members(&group_id).unwrap();
     assert!(
@@ -699,13 +737,12 @@ async fn convergence_privileged_remove_beats_grinding_ordinary_self_update() {
 
 /// A peer's same-epoch commit that arrives during our own `PendingPublish`
 /// window is buffered `Retryable` before any peel. When our own commit confirms
-/// and wins the fork, replay must reclassify the buffered commit: the content
-/// row parks `ConvergenceDeferred` — reconsiderable, not terminal, because
-/// nodes that did not commit from that epoch resolve the same conflict through
-/// distributed convergence, where the rival branch can still win by growing
-/// deeper (see `pairwise_incumbent_defers_to_deeper_convergence_branch`) — and
-/// the raw transport wrapper is retired `Processed`, not left `Retryable` to be
-/// re-peeled on every later publish-cycle replay.
+/// and wins the fork through the convergence pass, the buffered rival must be
+/// reclassified: the content row parks `ConvergenceDeferred` — reconsiderable,
+/// not terminal, because the rival branch can still win a later pass by
+/// growing deeper (see `incumbent_committer_defers_to_deeper_convergence_branch`)
+/// — and the raw transport wrapper is retired `Processed`, not left
+/// `Retryable` to be re-peeled on every later publish-cycle replay.
 #[tokio::test]
 async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
     use cgka_traits::ingest::IngestOutcome;
@@ -772,17 +809,27 @@ async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
         "the buffered raw transport row is persisted Retryable pending replay"
     );
 
-    // Confirm advances Alice to epoch 2 and replays the backlog. The buffered
-    // commit loses the fork to the incumbent (privileged > ordinary).
+    // Confirm advances Alice to epoch 2 and replays the backlog. The replayed
+    // rival routes into distributed convergence; the settled pass keeps the
+    // incumbent (privileged > ordinary) and parks the loser reconsiderable.
     alice.confirm_published(remove_pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+    let result = alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the replayed rival settles through convergence");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        alice.epoch(&group_id).unwrap(),
+        EpochId(2),
+        "the incumbent remove stays selected"
+    );
 
     assert_eq!(
         alice_storage.get_message(&content_id).unwrap().state,
         MessageState::ConvergenceDeferred,
-        "the pairwise-losing fork commit's content row is parked reconsiderable \
-         (cross-seam: distributed convergence may still select its branch if it \
-         grows deeper), not terminally EpochInvalidated"
+        "the losing fork commit's content row is parked reconsiderable \
+         (distributed convergence may still select its branch if it grows \
+         deeper), not terminally EpochInvalidated"
     );
     assert_eq!(
         alice_storage.get_message(&raw_id).unwrap().state,
@@ -790,35 +837,25 @@ async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
         "the raw transport wrapper must be retired terminal after replay — not \
          left Retryable to be re-peeled on every later publish cycle"
     );
-    assert!(
-        alice
-            .drain_events()
-            .iter()
-            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
-        "the incumbent won the fork; no rollback / ForkRecovered is emitted"
-    );
 }
 
 /// Two peer rows buffered during our own `PendingPublish` window replay in a
 /// single pass. The first is a privileged admin `RemoveMembers` that removes
 /// our leaf; being privileged it deterministically wins the same-source-epoch
-/// fork over our own ordinary `UpdateGroupData`, so on confirm-replay fork
-/// recovery rolls us back and applies it inline — our local group state goes
-/// `Inactive`. The second buffered row is then re-ingested against that
-/// inactive state, so `ingest_group_message` classifies it `SelfEvicted` and
-/// persists its raw row `Failed` (authenticated evidence we were removed).
+/// fork over our own ordinary `UpdateGroupData`, so the settled convergence
+/// pass rolls us back and applies it — our local group state goes `Inactive`.
+/// The second buffered row loses branch selection to it.
 ///
-/// Replay retires the backlog, and that retirement must only touch rows STILL
-/// awaiting retry after re-ingest. The unconditional retirement write introduced
-/// in ae616488 violates this in two ways in exactly this scenario: it errors
-/// (`Storage(NotFound)`) on the winning remove's raw row, which fork-recovery
-/// rollback already swept away, and — the invariant this guards — it would
-/// relabel the `SelfEvicted` row `Processed`, clobbering the `Failed` verdict
-/// ingest committed. A `Processed` raw row is a canonicalization input
-/// (`openmls_projection` / `distributed_convergence` select on it), so a row we
-/// were evicted on must stay `Failed`, never be swept back into convergence.
+/// The invariant this guards (regression shape from ae616488, retargeted to
+/// the unified route): replay must respect the verdicts committed during
+/// re-ingest. The raw wrappers leave the retry lifecycle exactly once their
+/// content rows are durable convergence input, and a losing rival's CONTENT
+/// row must never be relabeled `Processed` — a `Processed` content row is a
+/// canonicalization input (`openmls_projection` / `distributed_convergence`
+/// select on it), so sweeping the loser back in could resurrect the removed
+/// member.
 #[tokio::test]
-async fn buffered_self_evicted_row_stays_failed_not_swept_processed_on_replay() {
+async fn buffered_losing_rival_content_row_is_never_swept_canonical_on_replay() {
     use cgka_traits::ingest::IngestOutcome;
 
     let (mut alice, alice_storage) = build_client_with_storage(b"alice-self-evict-replay");
@@ -860,11 +897,12 @@ async fn buffered_self_evicted_row_stays_failed_not_swept_processed_on_replay() 
         ..msg
     };
 
-    // A second epoch-1 message from Bob, produced before he advances. On replay
-    // this is the row that classifies `SelfEvicted` once Alice's leaf is gone —
-    // its content is never peeled (the `!is_active` gate fires first).
+    // A second epoch-1 message from Bob, produced before he advances. On
+    // replay it buffers into the same convergence pass as the remove and
+    // loses branch selection to it.
     let second = route(raw_self_update_commit(&bob_storage, &bob_id, &group_id));
     let second_id = second.id.clone();
+    let second_payload = second.payload.clone();
 
     // Bob (admin) removes Alice at epoch 1 → a privileged commit.
     let remove_alice = match bob
@@ -916,10 +954,13 @@ async fn buffered_self_evicted_row_stays_failed_not_swept_processed_on_replay() 
     }
 
     // Confirm advances Alice to epoch 2 (her ordinary update applied) and
-    // replays the backlog. The buffered remove is a same-source-epoch fork the
-    // privileged committer wins, so fork recovery rolls Alice back and applies
-    // it inline — evicting her leaf — before the second row is replayed.
+    // replays the backlog into distributed convergence. The buffered remove is
+    // a same-source-epoch fork the privileged committer wins, so the settled
+    // pass rolls Alice back and applies it — evicting her leaf.
     alice.confirm_published(staged).await.unwrap();
+    alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the replayed remove settles through convergence");
 
     // The buffered remove really did evict Alice on replay.
     assert!(
@@ -931,13 +972,34 @@ async fn buffered_self_evicted_row_stays_failed_not_swept_processed_on_replay() 
         "the buffered remove must have evicted Alice on replay"
     );
 
-    // Regression: the `SelfEvicted` row's raw wrapper must keep the `Failed`
-    // state ingest committed — never clobbered to `Processed`.
+    // The second buffered row was peeled and durably buffered as convergence
+    // input during the same replay: its raw wrapper is retired (out of the
+    // retry lifecycle, never re-peeled), while its CONTENT row carries the
+    // verdict and must never be swept into canonical state — the losing
+    // ordinary commit cannot resurrect Alice.
     assert_eq!(
         alice_storage.get_message(&second_id).unwrap().state,
-        MessageState::Failed,
-        "a row we were evicted on must stay Failed after replay, not be swept \
-         into canonicalization as Processed"
+        MessageState::Processed,
+        "the second row's raw wrapper must be retired after buffering"
+    );
+    let second_content_id = {
+        use sha2::Digest as _;
+        MessageId::new(sha2::Sha256::digest(&second_payload).to_vec())
+    };
+    let second_content = alice_storage.get_message(&second_content_id).unwrap();
+    assert_ne!(
+        second_content.state,
+        MessageState::Processed,
+        "the losing ordinary commit must never become canonical input, got {:?}",
+        second_content.state
+    );
+    assert!(
+        !alice
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == alice_id),
+        "Alice stays evicted after the backlog fully settles"
     );
 }
 
@@ -1037,6 +1099,9 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
         },
         ..late_commit
     };
+    // Clear the setup traffic's events so the assertion below only sees what
+    // the stale ingest itself produced.
+    alice.drain_events();
     let outcome = alice.ingest(routed).await.unwrap();
     use cgka_traits::ingest::{IngestOutcome, StaleReason};
     assert!(matches!(
@@ -1052,33 +1117,10 @@ async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork(
     assert!(
         events
             .iter()
-            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
-        "late commits outside the rewind horizon must not trigger fork recovery"
+            .all(|event| !matches!(event, GroupEvent::EpochChanged { .. })),
+        "late commits outside the rewind horizon must not change canonical state"
     );
-}
-
-fn extract_fork_recovered<'a>(
-    events: &'a [GroupEvent],
-    group_id: &cgka_traits::types::GroupId,
-) -> Option<(
-    EpochId,
-    EpochId,
-    &'a CommitOrderingKey,
-    &'a CommitOrderingKey,
-)> {
-    events.iter().find_map(|event| match event {
-        GroupEvent::ForkRecovered {
-            group_id: event_group,
-            source_epoch,
-            recovered_epoch,
-            winner,
-            invalidated,
-            ..
-        } if event_group == group_id => {
-            Some((*source_epoch, *recovered_epoch, winner, invalidated))
-        }
-        _ => None,
-    })
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(3));
 }
 
 #[tokio::test]
@@ -1154,16 +1196,14 @@ async fn stale_commit_without_own_commit_is_classified_as_already_at_epoch_not_f
 
 #[tokio::test]
 async fn failed_invite_staging_does_not_poison_fork_detection() {
-    // Regression: `do_send_invite` used to record `committed_from` BEFORE
-    // staging the commit. When staging failed, the cleanup guard cleared the
-    // OpenMLS pending commit but nothing pruned the phantom "we committed
-    // from this epoch" entry. Once Alice later advanced past that epoch via a
-    // PEER's commit (settled through convergence — so no fork-recovery
-    // incumbent of her own exists), a legitimate same-epoch sibling commit
-    // was mis-routed: the phantom blocked convergence entry, the WrongEpoch
-    // fork branch found no recovery snapshot, and ingest failed closed with
-    // ForkedEpoch, sticking the group in Recovering. `committed_from` is now
-    // recorded only inside `begin_pending`, atomically with the transition.
+    // Regression (historical shape): `do_send_invite` used to record
+    // fork-detection bookkeeping BEFORE staging the commit; when staging
+    // failed, the leftover phantom entry mis-routed a legitimate same-epoch
+    // sibling commit into fail-closed fork recovery, sticking the group in
+    // Recovering. Routing no longer consults committer-side bookkeeping at
+    // all — the sibling is admitted into convergence by the retained
+    // source-epoch anchor — and this test keeps pinning that a failed staging
+    // attempt leaves later sibling classification untouched.
     let (mut alice, _alice_storage) = build_client_with_storage(b"phantom-alice");
     let mut bob = build_client(b"phantom-bob");
     let mut carol = build_client(b"phantom-carol");
@@ -1283,14 +1323,12 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
 #[tokio::test]
 async fn publish_failed_rollback_does_not_poison_fork_detection() {
     // Companion regression to `failed_invite_staging_does_not_poison_fork_
-    // detection`, for the POST-staging failure: staging succeeds, so
-    // `begin_pending` records `committed_from`, and then the publish fails.
-    // `rollback_publish` used to clear the staged commit and drop its
-    // recovery snapshot but leave the provisional `committed_from` entry
-    // behind. Once Alice later advanced past that epoch via a peer's commit,
-    // a legitimate late same-epoch sibling hit the phantom entry, found no
-    // recovery snapshot, and failed closed with ForkedEpoch. Rollback now
-    // removes the provisional entry it recorded.
+    // detection`, for the POST-staging failure: staging succeeds and then
+    // the publish fails. Historically the rollback left phantom
+    // fork-detection bookkeeping behind that mis-routed a legitimate late
+    // same-epoch sibling into fail-closed fork recovery. Routing no longer
+    // consults committer-side bookkeeping; this test keeps pinning that a
+    // rolled-back publish leaves later sibling classification untouched.
     let (mut alice, _alice_storage) = build_client_with_storage(b"rollback-alice");
     let mut bob = build_client(b"rollback-bob");
     let mut carol = build_client(b"rollback-carol");
@@ -1331,8 +1369,7 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
     // later.
     let dave_sibling_commit = raw_self_update_commit(&dave_storage, &dave_id, &group_id);
 
-    // Alice's invite stages successfully — `begin_pending` records the
-    // provisional `committed_from` entry — and then the publish fails.
+    // Alice's invite stages successfully — and then the publish fails.
     let mut frank = build_client(b"rollback-frank");
     let frank_kp = frank.fresh_key_package().await.unwrap();
     let staged = alice
@@ -1406,24 +1443,25 @@ async fn publish_failed_rollback_does_not_poison_fork_detection() {
 }
 
 #[tokio::test]
-async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
-    // Cross-seam divergence, as observed in multi-VM soak runs: a node that
-    // committed from epoch N resolves a same-epoch rival PAIRWISE
-    // (ForkRecoveryManager — ordering key only, depth-blind), while every
-    // node that did NOT commit from N resolves the same conflict through
-    // distributed convergence, where a deeper valid branch outranks the
-    // ordering key. If the pairwise loser is invalidated terminally, the
-    // pairwise node can never follow the fleet onto the rival branch once
-    // that branch grows — a permanent lineage split in which each side keeps
+async fn incumbent_committer_defers_to_deeper_convergence_branch() {
+    // Formerly `pairwise_incumbent_defers_to_deeper_convergence_branch`
+    // (#1285's regression at the deleted pairwise seam). Unified route: the
+    // committer that advanced from epoch N adjudicates a same-epoch rival
+    // through the same distributed-convergence pass as every observer. At
+    // equal depth the ordering key keeps the committer's own branch and the
+    // losing rival root must stay reconsiderable — not terminally
+    // invalidated — because a deeper valid branch outranks the ordering key
+    // in a later pass. If the loser were invalidated terminally, the
+    // committer could never follow the fleet onto the rival branch once that
+    // branch grows — a permanent lineage split in which each side keeps
     // decrypting only its own history.
     //
-    // This test drives the exact sequence: the pairwise winner must first
-    // reject the rival root (incumbent wins on the ordering key), then
-    // CONVERGE onto the rival branch after a follow-on commit makes it the
-    // deeper valid branch.
-    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    // This test drives the exact sequence: the committer must first keep its
+    // own branch (incumbent wins on the ordering key), then CONVERGE onto the
+    // rival branch after a follow-on commit makes it the deeper valid branch.
+    use cgka_traits::ingest::IngestOutcome;
 
-    // Fix which identity wins the pairwise race up front (privileged admin
+    // Fix which identity wins the equal-depth race up front (privileged admin
     // commits at the same epoch order by committer identity).
     let first = b"seam-first".as_slice();
     let second = b"seam-second".as_slice();
@@ -1436,7 +1474,7 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     // Concrete Engine type: the test drives the convergence pass to
     // completion explicitly (`converge_stored_openmls_messages_at`), which is
     // not part of the CgkaEngine trait surface.
-    let (mut winner, winner_storage) = build_client_with_storage(winner_id); // pairwise incumbent-keeper
+    let (mut winner, winner_storage) = build_client_with_storage(winner_id); // equal-depth incumbent-keeper
     let mut loser = build_client(loser_id); //  rival whose branch grows deeper
     let mut david = build_client(b"seam-david");
     let mut eve = build_client(b"seam-eve");
@@ -1527,25 +1565,22 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     );
     assert!(
         winner_key < loser_key,
-        "identity choice must make the incumbent win the pairwise race"
+        "identity choice must make the incumbent win the equal-depth race"
     );
 
-    // Seam 1 on the winner: the rival root LOSES the pairwise race. The
-    // winner keeps its own branch (no ForkRecovered), and — the fix under
-    // test — the loser's root must stay reconsiderable, not terminally
-    // invalidated.
+    // Pass 1 on the winner: the rival root LOSES the equal-depth ordering
+    // comparison inside the convergence pass. The winner keeps its own
+    // branch, and — the fix under test — the loser's root must stay
+    // reconsiderable, not terminally invalidated.
     let outcome = winner.ingest(route(loser_root.clone())).await.unwrap();
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadyAtEpoch { .. }
-        }
-    ));
-    let events = winner.drain_events();
     assert!(
-        extract_fork_recovered(&events, &group_id).is_none(),
-        "incumbent-wins must not roll the winner back"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival root must enter convergence, got {outcome:?}"
     );
+    let result = winner
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the equal-depth fork settles on the winner");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(winner.epoch(&group_id).unwrap().0, 2);
     // The parked loser-root row IS the fix: `ConvergenceDeferred` (so branch
     // materialization re-admits it) and keyed by its SOURCE epoch (the apply
@@ -1559,7 +1594,7 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     assert_eq!(
         parked.state,
         MessageState::ConvergenceDeferred,
-        "the pairwise loser-root must be parked reconsiderable, not terminally invalidated"
+        "the losing rival root must be parked reconsiderable, not terminally invalidated"
     );
     assert_eq!(
         parked.epoch,
@@ -1585,7 +1620,7 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     };
     assert_eq!(loser.epoch(&group_id).unwrap().0, 3);
 
-    // Seam 2 on the winner: the follow-on commit routes into distributed
+    // Pass 2 on the winner: the follow-on commit routes into distributed
     // convergence, which must now select the rival branch (valid depth 2 from
     // the fork point vs the winner's own depth 1) and rewind the winner onto
     // it — the same branch every convergence-only node picks. Before the fix
@@ -1624,7 +1659,7 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
     );
     assert!(
         !winner_members.contains(&MemberId::new(pad32(b"seam-david"))),
-        "the abandoned pairwise branch's invitee must be gone"
+        "the abandoned own branch's invitee must be gone"
     );
     let loser_members: Vec<_> = loser
         .members(&group_id)
@@ -1648,11 +1683,12 @@ async fn pairwise_incumbent_defers_to_deeper_convergence_branch() {
 }
 
 #[tokio::test]
-async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
-    // The mirror of `pairwise_incumbent_defers_to_deeper_convergence_branch`,
-    // for the CANDIDATE-wins outcome of the pairwise race: node X's own
-    // confirmed commit A loses to an inbound rival B and X rolls back onto B
-    // (ForkRecovered). The displaced incumbent A must be parked
+async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
+    // Formerly `pairwise_candidate_win_leaves_old_incumbent_reconsiderable`.
+    // The mirror of `incumbent_committer_defers_to_deeper_convergence_branch`,
+    // for the RIVAL-wins outcome of the equal-depth race: node X's own
+    // confirmed commit A loses to an inbound rival B and the convergence pass
+    // reorgs X onto B. The displaced own commit A must be parked
     // `ConvergenceDeferred` at its SOURCE epoch — not terminally
     // `EpochInvalidated` — because a peer that applied A and never saw B can
     // keep extending the A-branch. Once that branch is deeper, distributed
@@ -1674,7 +1710,7 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     // completion explicitly (`converge_stored_openmls_messages_at`), which is
     // not part of the CgkaEngine trait surface.
     let (mut x, x_storage) = build_client_with_storage(x_id); // rolls back onto B, must later reorg onto A
-    let mut rival = build_client(rival_id); //                   authors the pairwise-winning B
+    let mut rival = build_client(rival_id); //                   authors the equal-depth-winning B
     let (mut y, _y_storage) = build_client_with_storage(b"cwin-y"); // applied A, never sees B
     let mut david = build_client(b"cwin-david");
     let mut eve = build_client(b"cwin-eve");
@@ -1719,7 +1755,7 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     };
 
     // (1) X commits from epoch 1 (commit A: invite david) and confirms — A is
-    // X's fork-recovery incumbent. (2)'s rival B (invite eve) branches from
+    // X's confirmed own commit. (2)'s rival B (invite eve) branches from
     // the same epoch without seeing A.
     let david_kp = david.fresh_key_package().await.unwrap();
     let eve_kp = eve.fresh_key_package().await.unwrap();
@@ -1765,20 +1801,28 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     );
     assert!(
         b_key < a_key,
-        "identity choice must make the inbound candidate win the pairwise race"
+        "identity choice must make the inbound rival win the equal-depth race"
     );
 
-    // (2) B arrives at X and WINS: X rolls back off A onto B (ForkRecovered).
-    x.ingest(route(commit_b)).await.unwrap();
-    let events = x.drain_events();
-    let (source_epoch, recovered_epoch, winner, invalidated) =
-        extract_fork_recovered(&events, &group_id)
-            .expect("candidate win must roll X back and emit ForkRecovered");
-    assert_eq!(source_epoch.0, 1);
-    assert_eq!(recovered_epoch.0, 2);
-    assert_eq!(winner, &b_key);
-    assert_eq!(invalidated, &a_key);
+    // (2) B arrives at X and WINS the equal-depth ordering comparison inside
+    // the convergence pass: X reorgs off A onto B.
+    let outcome = x.ingest(route(commit_b)).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival must enter convergence, got {outcome:?}"
+    );
+    let result = x
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the equal-depth fork settles on X");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(x.epoch(&group_id).unwrap().0, 2);
+    assert!(
+        x.members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == MemberId::new(pad32(b"cwin-eve"))),
+        "X must land on the rival branch (B's invitee present)"
+    );
 
     // The fix under test: the displaced incumbent A is parked reconsiderable
     // at its SOURCE epoch, with its stored payload (own-commit convergence
@@ -1788,7 +1832,7 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
     assert_eq!(
         parked.state,
         MessageState::ConvergenceDeferred,
-        "the pairwise-losing incumbent must be parked reconsiderable, not terminally invalidated"
+        "the displaced own commit must be parked reconsiderable, not terminally invalidated"
     );
     assert_eq!(
         parked.epoch,
@@ -1885,11 +1929,12 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
 
 #[tokio::test]
 async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
-    // X confirms A, loses pairwise to B, and advances B far enough to replace
-    // every epoch-named anchor that previously described A.  After a restart,
-    // A grows deeper. X must cross its own path-bearing commit without asking
-    // OpenMLS to process the wire echo: the immutable commit-addressed
-    // checkpoint restores A's exact post-merge state and replay continues.
+    // X confirms A, loses the equal-depth convergence race to B, and advances
+    // B far enough to replace every epoch-named anchor that previously
+    // described A.  After a restart, A grows deeper. X must cross its own
+    // path-bearing commit without asking OpenMLS to process the wire echo:
+    // the immutable commit-addressed checkpoint restores A's exact post-merge
+    // state and replay continues.
     use cgka_traits::ingest::IngestOutcome;
 
     let first = b"cwrf-first".as_slice();
@@ -1988,13 +2033,19 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
     );
     assert!(
         b_key < a_key,
-        "the inbound candidate must win the pairwise race"
+        "the inbound rival must win the equal-depth race"
     );
 
-    // (2) B wins at X; A is parked reconsiderable at its source epoch.
-    x.ingest(route(commit_b)).await.unwrap();
-    let events = x.drain_events();
-    extract_fork_recovered(&events, &group_id).expect("candidate win must roll X back onto B");
+    // (2) B wins the equal-depth convergence race at X; A is parked
+    // reconsiderable at its source epoch.
+    let outcome = x.ingest(route(commit_b)).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival must enter convergence, got {outcome:?}"
+    );
+    x.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("rival win must reorg X onto B");
+    x.drain_events();
     assert_eq!(x.epoch(&group_id).unwrap().0, 2);
     let parked = x_storage.get_message(&commit_a.id).unwrap();
     assert_eq!(parked.state, MessageState::ConvergenceDeferred);
@@ -2239,15 +2290,15 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
     );
 }
 
-// --- Router flip: a restarted committer takes the observer route -----------
+// --- One route for every member, restarted or live --------------------------
 //
-// `EpochManager::committed_from` is in-memory only. A device that committed
-// from epoch N and confirmed takes the pairwise `ForkRecoveryManager` route for
-// a competing epoch-N commit; after a restart the same device, given the same
-// input, takes whatever route `commit_should_enter_convergence` picks for a
-// non-committer. That is documented at `openmls_projection.rs` (see
-// `PrevalidatedOwnCommits`) but no test drove it through `CgkaEngine::ingest`.
-// These two tests pin both post-restart routes.
+// A same-epoch rival commit is adjudicated by distributed convergence whether
+// the device is the committer that advanced past the rival's source epoch, an
+// observer, or a committer that restarted in between. The durable
+// source-epoch anchor (`openmls-retained-anchor-{epoch}`) is what admits the
+// rival into the pass; when it is missing inside the rewind horizon the
+// device halts loudly instead of silently keeping its own branch. These two
+// tests pin the restart shape of both outcomes.
 
 /// Which branch of a two-way epoch-1 fork a device ended up on.
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
@@ -2434,7 +2485,10 @@ async fn drive_convergence(
 }
 
 #[tokio::test]
-async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork_recovery() {
+async fn restarted_committer_routes_same_epoch_sibling_into_convergence() {
+    // Formerly `restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork_recovery`;
+    // since the route unification this is the SAME route every live committer
+    // takes — the test remains as the restart-shape pin.
     let (f, local) = router_flip_fixture("converge").await;
     assert!(
         f.sibling_wins,
@@ -2442,8 +2496,8 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork
     );
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
 
-    // The confirm path retained an anchor at the commit's SOURCE epoch, which is
-    // what routes the sibling into convergence once `committed_from` is gone.
+    // The confirm path retained an anchor at the commit's SOURCE epoch, which
+    // is what admits the sibling into convergence.
     assert!(
         f.local_storage
             .list_group_snapshots(&f.group_id)
@@ -2465,13 +2519,6 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork
         ),
         "a restarted committer must not classify the sibling stale, got {outcome:?}"
     );
-    assert!(
-        local
-            .drain_events()
-            .iter()
-            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
-        "the pairwise route is unreachable after restart, so no ForkRecovered"
-    );
 
     drive_convergence(&mut local, &f, &competing_id).await;
     assert_eq!(
@@ -2487,23 +2534,28 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork
 
 #[tokio::test]
 async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
-    // Control on the same deterministic fixture: no restart, pairwise route.
+    // Control on the same deterministic fixture: no restart. The live
+    // committer resolves the rival through the convergence pass like every
+    // other member.
     let (control, mut control_local) = router_flip_fixture("control").await;
     assert!(control.sibling_wins);
     control_local
         .ingest(control.competing.clone())
         .await
         .unwrap();
+    control_local
+        .converge_stored_openmls_messages_at(&control.group_id, u64::MAX)
+        .expect("the control fork settles through convergence");
     assert_eq!(
         settled_branch(&control_local, &control),
         Branch::Sibling,
-        "the pairwise route rolls the committer onto the winning branch"
+        "the convergence pass rolls the committer onto the winning branch"
     );
 
     // Same fixture shape, but the device restarts AND the source-epoch anchor
-    // is absent (pre-mechanism database, storage loss). Neither resolution
-    // route is then reachable: `committed_from` is empty so the pairwise gate
-    // fails, and `has_retained_anchor_snapshot` refuses convergence admission.
+    // is absent (pre-mechanism database, storage loss). The rival is then
+    // unadjudicable: `has_retained_anchor_snapshot` refuses convergence
+    // admission and no other resolution route exists.
     // Within the rewind horizon that absence is abnormal by construction —
     // every canonical advance retains a source-epoch anchor and pruning runs
     // only beyond the horizon — so the only honest outcome is a durable,
@@ -2594,19 +2646,16 @@ async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
 }
 
 #[tokio::test]
-async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
-    // THE #1285 CLAIM, driven end to end (option-c plan, N5). #1285 made the
-    // pairwise route park its loser reconsiderable instead of terminally
-    // invalidating it — the implicit claim being that a committer whose OWN
-    // commit won the pairwise race will still reach the same terminal state
-    // as every convergence-resolved observer once depth disagrees with the
-    // ordering key. No test drove both routes side by side to eventual state
-    // equality; this one does:
+async fn committers_losing_rival_is_reconsidered_onto_the_fleets_deeper_branch() {
+    // Formerly `pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch`
+    // — the go/no-go evidence for deleting the pairwise fast-path (option C
+    // Slice B → C). With the routes unified, both the committer A and the
+    // observer O adjudicate the same fork through distributed convergence;
+    // the test remains as the eventual-agreement pin:
     //
-    // - A commits `UpdateGroupData` from epoch 1, confirms, and STAYS LIVE, so
-    //   the rival root resolves through the pairwise `ForkRecoveryManager`
-    //   seam. Seeds are arranged so A's own commit wins the ordering key and
-    //   the rival root B is parked, not applied.
+    // - A commits `UpdateGroupData` from epoch 1, confirms, and STAYS LIVE.
+    //   Seeds are arranged so A's own commit wins the ordering key and the
+    //   rival root B is parked, not applied.
     // - O never commits: it resolves the identical fork through distributed
     //   convergence. At depth 1 vs 1 the ordering key makes O select A's
     //   branch first — so O must itself REORG when depth later disagrees.
@@ -2615,14 +2664,12 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     //   (O, and the rival committer trivially) settles the rival branch.
     //
     // The verdict this test pins: A's convergence pass re-admits the PARKED
-    // pairwise loser as branch input and reorgs A onto the fleet's deeper
-    // branch — the two fork-resolution rules agree eventually on members,
-    // epoch, and group name. This is the go/no-go evidence that deleting the
-    // pairwise route (option C Slice C) is deduplication, not a behavior
-    // change.
+    // loser as branch input and reorgs A onto the fleet's deeper branch —
+    // committer and observer agree eventually on members, epoch, and group
+    // name.
 
     // Privileged same-epoch commits order by committer identity: A's identity
-    // must sort BEFORE the rival's so A's own commit wins the pairwise race.
+    // must sort BEFORE the rival's so A's own commit wins the equal-depth race.
     let first = b"n5-first".as_slice();
     let second = b"n5-second".as_slice();
     let (a_id, rival_id) = if pad32(first) < pad32(second) {
@@ -2634,7 +2681,7 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     // Concrete Engine types: the test drives convergence passes to completion
     // explicitly (`converge_stored_openmls_messages_at`), which is not part of
     // the CgkaEngine trait surface.
-    let (mut a, a_storage) = build_client_with_storage(a_id); // pairwise route (live committer)
+    let (mut a, a_storage) = build_client_with_storage(a_id); // live committer
     let mut rival = build_client(rival_id); //                   authors the parked loser root
     let (mut observer, observer_storage) = build_client_with_storage(b"n5-observer");
     let mut eve = build_client(b"n5-eve");
@@ -2725,24 +2772,27 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     );
     assert!(
         a_key < rival_key,
-        "seed arrangement must make A's own commit the pairwise winner"
+        "seed arrangement must make A's own commit the equal-depth winner"
     );
 
-    // Seam on A: the rival root LOSES the pairwise race. A keeps its own
-    // branch (no rollback, no ForkRecovered) and parks the loser
-    // reconsiderable at its source epoch (#1285).
+    // Pass on A: the rival root LOSES the equal-depth ordering comparison
+    // inside A's convergence pass. A keeps its own branch (no rollback) and
+    // parks the loser reconsiderable at its source epoch.
     let outcome = a.ingest(route(rival_root.clone())).await.unwrap();
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Stale {
-            reason: StaleReason::AlreadyAtEpoch { .. }
-        }
-    ));
     assert!(
-        extract_fork_recovered(&a.drain_events(), &group_id).is_none(),
-        "own-commit-wins must not roll A back"
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "the rival root must enter A's convergence pass, got {outcome:?}"
     );
+    let result = a
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the equal-depth fork settles on A");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(a.epoch(&group_id).unwrap().0, 2);
+    assert_eq!(
+        a_storage.get_group(&group_id).unwrap().name,
+        "a-branch",
+        "A must keep its own equal-depth winning branch"
+    );
     let rival_root_content_id = MessageId::new(Sha256::digest(&rival_root.payload).to_vec());
     let parked = a_storage.get_message(&rival_root_content_id).unwrap();
     assert_eq!(parked.state, MessageState::ConvergenceDeferred);
@@ -2750,7 +2800,7 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
 
     // The observer consumes the same depth-1 fork through convergence. Both
     // roots are equally deep, so the ordering key decides: the observer first
-    // settles A's branch — agreeing with A's pairwise resolution.
+    // settles A's branch — agreeing with A's own settled pass.
     observer.ingest(route(a_root.clone())).await.unwrap();
     observer.ingest(route(rival_root.clone())).await.unwrap();
     observer
@@ -2814,8 +2864,8 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
         "rival-branch"
     );
 
-    // THE QUESTION UNDER TEST. A — whose pairwise resolution kept its own
-    // branch and parked the rival root — ingests the follow-ons and runs its
+    // THE QUESTION UNDER TEST. A — whose settled pass kept its own branch
+    // and parked the rival root — ingests the follow-ons and runs its next
     // convergence pass. The parked loser must be re-admitted as branch input
     // and A must follow the fleet.
     let outcome_1 = a.ingest(route(follow_on_1)).await.unwrap();
@@ -2830,11 +2880,11 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     );
     let result = a
         .converge_stored_openmls_messages_at(&group_id, u64::MAX)
-        .expect("A's pass reconsiders the parked pairwise loser");
+        .expect("A's pass reconsiders the parked loser");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 
-    // VERDICT: eventual agreement between the pairwise route and the
-    // convergence route — members, epoch, and group name.
+    // VERDICT: eventual agreement between committer and observer — members,
+    // epoch, and group name.
     let sorted_members = |members: Vec<cgka_traits::group::Member>| {
         let mut ids: Vec<_> = members.into_iter().map(|m| m.id).collect();
         ids.sort_by(|x, y| x.as_slice().cmp(y.as_slice()));
@@ -2845,7 +2895,7 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     let rival_members = sorted_members(rival.members(&group_id).unwrap());
     assert_eq!(
         a_members, observer_members,
-        "the pairwise-resolved committer and the convergence-resolved observer must agree"
+        "the committer and the convergence-resolved observer must agree"
     );
     assert_eq!(
         observer_members, rival_members,
@@ -2867,7 +2917,7 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
     assert_eq!(
         realized_root.state,
         MessageState::Processed,
-        "the parked pairwise loser must become canonical, not stay parked"
+        "the parked loser must become canonical, not stay parked"
     );
 }
 
@@ -2880,7 +2930,7 @@ async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
 // own commit lands in `accepted_commits` instead of having no disposition).
 // These two tests pin the EXACT GroupEvent set a settling pass emits when it
 // (i) keeps the device's own commit and (ii) replaces it — the event contract
-// the pairwise-route deletion (Slice C) must preserve.
+// the pairwise-route deletion (Slice C) had to preserve.
 
 #[tokio::test]
 async fn convergence_pass_that_keeps_the_own_commit_emits_no_own_withdrawal() {
@@ -3091,8 +3141,7 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
     );
 
     // Dispositions: the winning sibling becomes canonical; the displaced own
-    // commit is parked reconsiderable at its source epoch — the convergence
-    // route agrees with the pairwise route's #1285 parking (a peer that
+    // commit is parked reconsiderable at its source epoch (a peer that
     // applied the own commit and never saw the sibling can still deepen that
     // branch, and this device must be able to follow).
     assert_eq!(

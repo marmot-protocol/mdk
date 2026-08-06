@@ -1578,7 +1578,13 @@ impl<S: StorageProvider> Engine<S> {
                         // slot (mdk#339), mirroring `retry_deferred_peels`.
                         self.update_stored_message_state(&record.id, MessageState::Processed)?;
                         self.note_peel_deferred_row_retired(group_id);
-                    } else {
+                    } else if self.raw_transport_row_awaiting_retry(&record.id)? {
+                        // Keep the row replayable ONLY while ingest itself did
+                        // not already resolve it. A peeled message buffered
+                        // into convergence retires its own raw wrapper
+                        // (`mark_raw_transport_message_processed_if_awaiting_retry`)
+                        // — resetting it Retryable here would re-peel it on
+                        // every later publish-cycle replay.
                         self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     }
                 }
