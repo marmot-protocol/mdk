@@ -5,38 +5,60 @@ use cgka_engine::EngineBuilder;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::PeeledMessage;
-use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
+use cgka_traits::maintenance::{MaintenanceRandom, MonotonicClock, WallClock};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportMessage};
 use cgka_traits::{CgkaEngine, DEFAULT_PAIRING_SESSION_TTL_MS, MemberId, PairingSessionState};
 use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
 use support::proof_signer;
 
 #[derive(Default)]
-struct ManualWallClock(AtomicU64);
+struct ManualClock {
+    wall_ms: AtomicU64,
+    monotonic_ms: AtomicU64,
+}
 
-impl ManualWallClock {
+impl ManualClock {
     fn new(now_ms: u64) -> Self {
-        Self(AtomicU64::new(now_ms))
+        Self {
+            wall_ms: AtomicU64::new(now_ms),
+            monotonic_ms: AtomicU64::new(0),
+        }
     }
 
     fn advance(&self, delta_ms: u64) {
-        self.0.fetch_add(delta_ms, Ordering::SeqCst);
+        self.wall_ms.fetch_add(delta_ms, Ordering::SeqCst);
+        self.monotonic_ms.fetch_add(delta_ms, Ordering::SeqCst);
+    }
+
+    fn set_wall_ms(&self, now_ms: u64) {
+        self.wall_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    fn advance_monotonic(&self, delta_ms: u64) {
+        self.monotonic_ms.fetch_add(delta_ms, Ordering::SeqCst);
     }
 }
 
-impl WallClock for ManualWallClock {
+impl WallClock for ManualClock {
     fn now(&self) -> Timestamp {
         Timestamp(self.now_ms() / 1_000)
     }
 
     fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.wall_ms.load(Ordering::SeqCst)
+    }
+}
+
+impl MonotonicClock for ManualClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.monotonic_ms.load(Ordering::SeqCst))
     }
 }
 
@@ -101,12 +123,12 @@ fn valid_identity(seed: &[u8]) -> Vec<u8> {
     }
 }
 
-fn build_engine(clock: Arc<ManualWallClock>) -> cgka_engine::Engine<SqliteAccountStorage> {
+fn build_engine(clock: Arc<ManualClock>) -> cgka_engine::Engine<SqliteAccountStorage> {
     build_engine_with_recorder(clock, None)
 }
 
 fn build_engine_with_recorder(
-    clock: Arc<ManualWallClock>,
+    clock: Arc<ManualClock>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     let mut builder = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
@@ -114,7 +136,8 @@ fn build_engine_with_recorder(
         .identity(valid_identity(b"pairing-session"))
         .account_identity_proof_signer(proof_signer(b"pairing-session"))
         .peeler(Box::new(StubPeeler))
-        .maintenance_sources(clock, Arc::new(FixedMaintenanceRandom));
+        .maintenance_sources(clock.clone(), Arc::new(FixedMaintenanceRandom))
+        .pairing_monotonic_clock(clock);
     if let Some(recorder) = recorder {
         builder = builder.recorder(recorder);
     }
@@ -138,7 +161,7 @@ impl CapturingRecorder {
 
 #[test]
 fn rotation_expires_old_qr_and_returns_fresh_material() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let mut engine = build_engine(clock.clone());
 
     let first = engine.start_pairing_session().expect("start first session");
@@ -167,7 +190,7 @@ fn rotation_expires_old_qr_and_returns_fresh_material() {
 
 #[test]
 fn expired_session_is_rejected_before_scan() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let mut engine = build_engine(clock.clone());
     let session = engine.start_pairing_session().expect("start session");
 
@@ -180,8 +203,23 @@ fn expired_session_is_rejected_before_scan() {
 }
 
 #[test]
+fn wall_clock_rollback_does_not_extend_session_ttl() {
+    let clock = Arc::new(ManualClock::new(100_000));
+    let mut engine = build_engine(clock.clone());
+    let session = engine.start_pairing_session().expect("start session");
+
+    clock.set_wall_ms(1_000);
+    clock.advance_monotonic(DEFAULT_PAIRING_SESSION_TTL_MS);
+
+    assert_eq!(
+        engine.scan_pairing_session(&session.session_id),
+        Err(cgka_traits::PairingSessionError::Expired)
+    );
+}
+
+#[test]
 fn stale_qr_loses_to_newest_session() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let mut engine = build_engine(clock);
 
     let stale = engine.start_pairing_session().expect("start stale session");
@@ -202,7 +240,7 @@ fn stale_qr_loses_to_newest_session() {
 
 #[test]
 fn approved_session_is_single_use_and_requires_a_scan() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let mut engine = build_engine(clock);
     let session = engine.start_pairing_session().expect("start session");
 
@@ -233,7 +271,7 @@ fn approved_session_is_single_use_and_requires_a_scan() {
 
 #[test]
 fn rejected_session_remains_terminal_until_its_ttl() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let mut engine = build_engine(clock.clone());
     let session = engine.start_pairing_session().expect("start session");
     engine
@@ -261,7 +299,7 @@ fn rejected_session_remains_terminal_until_its_ttl() {
 
 #[test]
 fn restart_fails_closed_for_in_flight_session() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let session = {
         let mut engine = build_engine(clock.clone());
         engine.start_pairing_session().expect("start session")
@@ -280,7 +318,7 @@ fn restart_fails_closed_for_in_flight_session() {
 
 #[test]
 fn every_pairing_transition_emits_a_privacy_safe_audit_row() {
-    let clock = Arc::new(ManualWallClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(1_000));
     let capture = CapturingRecorder::default();
     let mut engine = build_engine_with_recorder(clock.clone(), Some(Box::new(capture.clone())));
 

@@ -26,7 +26,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
+use cgka_traits::maintenance::{MaintenanceRandom, MonotonicClock, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
@@ -50,7 +50,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
@@ -83,6 +83,25 @@ impl WallClock for SystemWallClock {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Debug)]
+struct SystemMonotonicClock {
+    origin: Instant,
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn elapsed(&self) -> Duration {
+        self.origin.elapsed()
     }
 }
 
@@ -171,6 +190,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) max_past_epochs: usize,
     pub(crate) wall_clock: Arc<dyn WallClock>,
     pub(crate) maintenance_random: Arc<dyn MaintenanceRandom>,
+    pub(crate) pairing_monotonic_clock: Arc<dyn MonotonicClock>,
     pub(crate) pairing_sessions: PairingSessionManager,
 
     /// Per-group state-machine owner. Every transition, pending-ref
@@ -353,6 +373,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     max_past_epochs: usize,
     wall_clock: Arc<dyn WallClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
+    pairing_monotonic_clock: Arc<dyn MonotonicClock>,
     convergence_clock: Arc<dyn ConvergenceClock>,
     #[cfg(feature = "test-policy-overrides")]
     admit_app_witnesses: bool,
@@ -376,6 +397,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
             wall_clock: Arc::new(SystemWallClock),
             maintenance_random: Arc::new(OsMaintenanceRandom),
+            pairing_monotonic_clock: Arc::new(SystemMonotonicClock::default()),
             convergence_clock: Arc::new(SystemConvergenceClock::default()),
             #[cfg(feature = "test-policy-overrides")]
             admit_app_witnesses: true,
@@ -452,6 +474,12 @@ impl<S: StorageProvider> EngineBuilder<S> {
     ) -> Self {
         self.wall_clock = wall_clock;
         self.maintenance_random = maintenance_random;
+        self
+    }
+
+    /// Install the process-local clock that bounds pairing bearer-token TTLs.
+    pub fn pairing_monotonic_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
+        self.pairing_monotonic_clock = clock;
         self
     }
 
@@ -548,6 +576,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: self.max_past_epochs,
             wall_clock: self.wall_clock,
             maintenance_random: self.maintenance_random,
+            pairing_monotonic_clock: self.pairing_monotonic_clock,
             pairing_sessions: PairingSessionManager::default(),
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
@@ -2592,8 +2621,11 @@ impl<S: StorageProvider> Engine<S> {
 #[async_trait]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     fn start_pairing_session(&mut self) -> Result<PairingSessionDescriptor, PairingSessionError> {
-        let now_ms = self.wall_clock.now_ms();
-        let expires_at_ms = now_ms.saturating_add(DEFAULT_PAIRING_SESSION_TTL_MS);
+        let wall_now_ms = self.wall_clock.now_ms();
+        let expires_at_ms = wall_now_ms.saturating_add(DEFAULT_PAIRING_SESSION_TTL_MS);
+        let monotonic_now = self.pairing_monotonic_clock.elapsed();
+        let expires_at_monotonic =
+            monotonic_now.saturating_add(Duration::from_millis(DEFAULT_PAIRING_SESSION_TTL_MS));
         let session_id = loop {
             let mut session_id_bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut session_id_bytes);
@@ -2609,7 +2641,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
             ephemeral_public_key,
             expires_at_ms,
         };
-        let operation = self.pairing_sessions.start(descriptor, private_key, now_ms);
+        let operation = self.pairing_sessions.start(
+            descriptor,
+            private_key,
+            monotonic_now,
+            expires_at_monotonic,
+        );
         self.record_pairing_transitions(operation.transitions);
         Ok(operation.result)
     }
@@ -2620,7 +2657,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     ) -> Result<PairingSessionState, PairingSessionError> {
         let operation = self
             .pairing_sessions
-            .state(session_id, self.wall_clock.now_ms());
+            .state(session_id, self.pairing_monotonic_clock.elapsed());
         self.record_pairing_transitions(operation.transitions);
         operation.result
     }
@@ -2631,7 +2668,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     ) -> Result<(), PairingSessionError> {
         let operation = self
             .pairing_sessions
-            .scan(session_id, self.wall_clock.now_ms());
+            .scan(session_id, self.pairing_monotonic_clock.elapsed());
         self.record_pairing_transitions(operation.transitions);
         operation.result
     }
@@ -2642,7 +2679,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     ) -> Result<(), PairingSessionError> {
         let operation = self
             .pairing_sessions
-            .approve(session_id, self.wall_clock.now_ms());
+            .approve(session_id, self.pairing_monotonic_clock.elapsed());
         self.record_pairing_transitions(operation.transitions);
         operation.result
     }
@@ -2653,7 +2690,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     ) -> Result<(), PairingSessionError> {
         let operation = self
             .pairing_sessions
-            .reject(session_id, self.wall_clock.now_ms());
+            .reject(session_id, self.pairing_monotonic_clock.elapsed());
         self.record_pairing_transitions(operation.transitions);
         operation.result
     }

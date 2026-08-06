@@ -11,9 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
-- `cgka-engine` now owns one short-lived device-pairing session per account,
-  rotating a fresh random session id and ephemeral X25519 key every 30 seconds.
-  Stale, expired, rejected, and replayed QR scans fail with typed errors;
+- `cgka-engine` now owns one short-lived device-pairing session per account and
+  issues a fresh random session id and ephemeral X25519 key at the client's
+  explicit QR-rotation call. Each bearer capability expires after at most 30
+  seconds of process-local monotonic time. Stale, expired, rejected, and
+  replayed QR scans fail with typed errors;
   terminal transitions wipe private key material and emit privacy-safe forensic
   audit rows without bearer tokens or keys.
 

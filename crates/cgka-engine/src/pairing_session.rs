@@ -2,6 +2,7 @@ use cgka_traits::{
     PairingSessionDescriptor, PairingSessionError, PairingSessionId, PairingSessionState,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 use x25519_dalek::ReusableSecret;
 use zeroize::Zeroize;
 
@@ -20,6 +21,7 @@ pub(crate) struct PairingOperation<T> {
 
 struct ActivePairingSession {
     descriptor: PairingSessionDescriptor,
+    expires_at_monotonic: Duration,
     private_key: ReusableSecret,
     state: PairingSessionState,
 }
@@ -41,7 +43,7 @@ impl zeroize::ZeroizeOnDrop for ActivePairingSession {}
 #[derive(Clone, Copy)]
 struct TerminalPairingSession {
     state: PairingSessionState,
-    expires_at_ms: u64,
+    expires_at_monotonic: Duration,
 }
 
 #[derive(Default)]
@@ -62,10 +64,11 @@ impl PairingSessionManager {
         &mut self,
         descriptor: PairingSessionDescriptor,
         private_key: ReusableSecret,
-        now_ms: u64,
+        now_monotonic: Duration,
+        expires_at_monotonic: Duration,
     ) -> PairingOperation<PairingSessionDescriptor> {
-        self.prune_terminal(now_ms);
-        let mut transitions = self.expire_active_if_due(now_ms);
+        self.prune_terminal(now_monotonic);
+        let mut transitions = self.expire_active_if_due(now_monotonic);
         if self.active.is_some() {
             transitions.push(
                 self.terminalize_active(PairingSessionState::Superseded, "new_session_started"),
@@ -81,6 +84,7 @@ impl PairingSessionManager {
         });
         self.active = Some(ActivePairingSession {
             descriptor,
+            expires_at_monotonic,
             private_key,
             state: PairingSessionState::Active,
         });
@@ -93,10 +97,10 @@ impl PairingSessionManager {
     pub fn state(
         &mut self,
         session_id: &PairingSessionId,
-        now_ms: u64,
+        now_monotonic: Duration,
     ) -> PairingOperation<Result<PairingSessionState, PairingSessionError>> {
-        let transitions = self.expire_active_if_due(now_ms);
-        self.prune_terminal(now_ms);
+        let transitions = self.expire_active_if_due(now_monotonic);
+        self.prune_terminal(now_monotonic);
         let result = if let Some(active) = self
             .active
             .as_ref()
@@ -120,10 +124,10 @@ impl PairingSessionManager {
     pub fn scan(
         &mut self,
         session_id: &PairingSessionId,
-        now_ms: u64,
+        now_monotonic: Duration,
     ) -> PairingOperation<Result<(), PairingSessionError>> {
-        let mut transitions = self.expire_active_if_due(now_ms);
-        self.prune_terminal(now_ms);
+        let mut transitions = self.expire_active_if_due(now_monotonic);
+        self.prune_terminal(now_monotonic);
         let result = if let Some(active) = self
             .active
             .as_mut()
@@ -157,11 +161,11 @@ impl PairingSessionManager {
     pub fn approve(
         &mut self,
         session_id: &PairingSessionId,
-        now_ms: u64,
+        now_monotonic: Duration,
     ) -> PairingOperation<Result<(), PairingSessionError>> {
         self.finish_scanned(
             session_id,
-            now_ms,
+            now_monotonic,
             PairingSessionState::Approved,
             "local_user_approved",
         )
@@ -170,11 +174,11 @@ impl PairingSessionManager {
     pub fn reject(
         &mut self,
         session_id: &PairingSessionId,
-        now_ms: u64,
+        now_monotonic: Duration,
     ) -> PairingOperation<Result<(), PairingSessionError>> {
         self.finish_scanned(
             session_id,
-            now_ms,
+            now_monotonic,
             PairingSessionState::Rejected,
             "local_user_rejected",
         )
@@ -183,12 +187,12 @@ impl PairingSessionManager {
     fn finish_scanned(
         &mut self,
         session_id: &PairingSessionId,
-        now_ms: u64,
+        now_monotonic: Duration,
         terminal_state: PairingSessionState,
         reason: &'static str,
     ) -> PairingOperation<Result<(), PairingSessionError>> {
-        let mut transitions = self.expire_active_if_due(now_ms);
-        self.prune_terminal(now_ms);
+        let mut transitions = self.expire_active_if_due(now_monotonic);
+        self.prune_terminal(now_monotonic);
         let active_state = self
             .active
             .as_ref()
@@ -213,11 +217,11 @@ impl PairingSessionManager {
         }
     }
 
-    fn expire_active_if_due(&mut self, now_ms: u64) -> Vec<PairingSessionTransition> {
+    fn expire_active_if_due(&mut self, now_monotonic: Duration) -> Vec<PairingSessionTransition> {
         if self
             .active
             .as_ref()
-            .is_some_and(|session| now_ms >= session.descriptor.expires_at_ms)
+            .is_some_and(|session| now_monotonic >= session.expires_at_monotonic)
         {
             vec![self.terminalize_active(PairingSessionState::Expired, "ttl_elapsed")]
         } else {
@@ -235,6 +239,7 @@ impl PairingSessionManager {
         let previous_state = active.state;
         let session_id = active.descriptor.session_id.clone();
         let expires_at_ms = active.descriptor.expires_at_ms;
+        let expires_at_monotonic = active.expires_at_monotonic;
         // Wipe the original in-place before moving/dropping the session. This
         // avoids leaving key bytes in the vacated `Option` payload.
         active.wipe_private_key();
@@ -244,7 +249,7 @@ impl PairingSessionManager {
             session_id,
             TerminalPairingSession {
                 state,
-                expires_at_ms,
+                expires_at_monotonic,
             },
         );
         PairingSessionTransition {
@@ -255,9 +260,9 @@ impl PairingSessionManager {
         }
     }
 
-    fn prune_terminal(&mut self, now_ms: u64) {
+    fn prune_terminal(&mut self, now_monotonic: Duration) {
         self.terminal
-            .retain(|_, session| now_ms < session.expires_at_ms);
+            .retain(|_, session| now_monotonic < session.expires_at_monotonic);
     }
 }
 
@@ -288,6 +293,7 @@ mod tests {
                 ephemeral_public_key: [2; 32],
                 expires_at_ms: 30_000,
             },
+            expires_at_monotonic: Duration::from_millis(30_000),
             private_key: ReusableSecret::random_from_rng(rand::rngs::OsRng),
             state: PairingSessionState::Scanned,
         };

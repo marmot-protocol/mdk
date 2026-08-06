@@ -606,13 +606,18 @@ pub trait CgkaEngine: Send + Sync {
     ///
     /// Starting a session deterministically supersedes any unexpired active
     /// session. The returned bearer token and X25519 public key must be passed
-    /// only through the rendered QR; neither is logged by the engine.
+    /// only through the rendered QR; neither is logged by the engine. This
+    /// synchronous call is also the explicit rotation seam: clients schedule
+    /// the next call from the returned display deadline, while the engine owns
+    /// fresh material, supersession, and authoritative expiry.
     fn start_pairing_session(&mut self) -> Result<PairingSessionDescriptor, PairingSessionError>;
 
     /// Observe one session's current lifecycle state.
     ///
-    /// Deadline checks are lazy and use the engine's injected wall clock.
-    /// A session missing after process restart fails closed as expired.
+    /// Deadline checks are lazy and use the engine's process-local monotonic
+    /// clock. The descriptor's Unix deadline is only for client scheduling,
+    /// display, and audit. A session missing after process restart fails closed
+    /// as expired.
     fn pairing_session_state(
         &mut self,
         session_id: &PairingSessionId,
