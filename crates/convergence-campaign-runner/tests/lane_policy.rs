@@ -38,6 +38,56 @@ fn every_lane_has_all_resource_retention_and_flake_budgets() {
 }
 
 #[test]
+fn workflow_artifact_retention_matches_lane_policy() {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let nightly = include_str!("../../../.github/workflows/simulator-nightly.yml");
+    let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
+
+    assert_artifact_retention(
+        ci,
+        "name: cgka-conformance-simulator-reports",
+        &CampaignLaneConfigV1::builtin(CampaignLaneV1::PullRequest)
+            .budgets
+            .artifact_retention_days
+            .to_string(),
+    );
+    assert_artifact_retention(
+        nightly,
+        "name: cgka-conformance-simulator-nightly-reports",
+        &CampaignLaneConfigV1::builtin(CampaignLaneV1::Nightly)
+            .budgets
+            .artifact_retention_days
+            .to_string(),
+    );
+
+    let weekly = CampaignLaneConfigV1::builtin(CampaignLaneV1::WeeklyManual)
+        .budgets
+        .artifact_retention_days;
+    let release = CampaignLaneConfigV1::builtin(CampaignLaneV1::ReleaseHardening)
+        .budgets
+        .artifact_retention_days;
+    assert_artifact_retention(
+        hardening,
+        "name: convergence-hardening-${{ github.run_id }}",
+        &format!("${{{{ inputs.lane == 'release_hardening' && {release} || {weekly} }}}}"),
+    );
+}
+
+fn assert_artifact_retention(workflow: &str, artifact_name: &str, expected: &str) {
+    let artifact_step = workflow
+        .split_once(artifact_name)
+        .unwrap_or_else(|| panic!("workflow is missing artifact {artifact_name}"))
+        .1
+        .split("\n\n")
+        .next()
+        .expect("artifact upload step has content");
+    assert!(
+        artifact_step.contains(&format!("retention-days: {expected}")),
+        "artifact {artifact_name} retention does not match lane policy {expected}"
+    );
+}
+
+#[test]
 fn budget_evaluation_rejects_empty_and_inconsistent_observations() {
     let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::WeeklyManual);
     let empty = config.evaluate(CampaignLaneObservationV1::default());
@@ -146,6 +196,15 @@ fn release_evidence_requires_scoped_coverage_and_a_passing_budget() {
         cli.status.success(),
         "bare bundle filename failed: {}",
         String::from_utf8_lossy(&cli.stderr)
+    );
+
+    let mut forged_budget = bundle.clone();
+    forged_budget.budget.observation.wall_clock_seconds = config.budgets.max_wall_clock_seconds + 1;
+    forged_budget.budget.passed = true;
+    forged_budget.budget.violations.clear();
+    assert_eq!(
+        forged_budget.validate().unwrap_err().code,
+        "evidence_budget"
     );
 
     let mut missing_artifacts = bundle.clone();

@@ -1020,9 +1020,11 @@ minimum case counts are liveness floors preventing empty evidence, not attestati
 The typed evaluator rejects zero-case observations, inconsistent flaky-case counts, work below the lane minimum, and
 wall-clock, CPU, RSS, disk, artifact-size, retry, or flake-rate overages. It is not yet fed by a workflow-owned
 observation collector, so the four execution/enforcement items and the resource/flake exit gate remain open. Evidence
-bundles require a nonempty artifact set; `check-evidence` resolves each relative artifact path beside the bundle and
-verifies its SHA-256 bytes. The remaining route/model/adapter/mutation/boundary/assumption fields are still
-producer-supplied scoped evidence rather than an automatic correctness attestation.
+bundles require a nonempty artifact set; `check-evidence` recomputes the budget result from its observation and the
+reviewed lane policy, resolves each relative artifact path beside the bundle, and verifies its SHA-256 bytes. A policy
+test also pins each workflow artifact-retention setting to the corresponding lane manifest. The remaining
+route/model/adapter/mutation/boundary/assumption fields are still producer-supplied scoped evidence rather than an
+automatic correctness attestation.
 
 ### 6.4 Failure corpus lifecycle
 

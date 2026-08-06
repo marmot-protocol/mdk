@@ -143,9 +143,10 @@ declared capability ran. Capability-specific evidence remains required before a 
 
 The version-1 evidence-bundle type requires a scoped assurance claim, covered decision routes, models, adapters,
 mutation results, tested workload/constant boundaries, unresolved counterexamples, residual assumptions, untested
-surfaces, a passing same-lane budget evaluation, and at least one digest-pinned artifact. `check-evidence` rejects
-incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by resolving artifacts
-relative to the bundle's directory. Valid bundles are written with owner-only permissions.
+surfaces, a passing same-lane budget evaluation, and at least one digest-pinned artifact. `check-evidence` recomputes
+the evaluation from the recorded observation and reviewed lane policy instead of trusting producer-supplied result
+fields. It rejects incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by
+resolving artifacts relative to the bundle's directory. Valid bundles are written with owner-only permissions.
 
 ## What this evidence means
 

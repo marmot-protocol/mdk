@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{CampaignBudgetEvaluationV1, CampaignLaneV1, RunnerError};
+use crate::{CampaignBudgetEvaluationV1, CampaignLaneConfigV1, CampaignLaneV1, RunnerError};
 
 pub const CONVERGENCE_EVIDENCE_BUNDLE_VERSION: &str = "1";
 
@@ -87,10 +87,12 @@ impl ConvergenceEvidenceBundleV1 {
                 ));
             }
         }
-        if self.budget.lane != self.lane || !self.budget.passed {
+        let expected_budget =
+            CampaignLaneConfigV1::builtin(self.lane).evaluate(self.budget.observation.clone());
+        if !expected_budget.passed || self.budget != expected_budget {
             return Err(RunnerError::validation(
                 "evidence_budget",
-                "evidence lane must match a passing budget evaluation",
+                "evidence budget must match a recomputed passing lane evaluation",
             ));
         }
         for artifact in &self.artifacts {
