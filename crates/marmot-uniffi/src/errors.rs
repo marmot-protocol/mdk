@@ -188,6 +188,15 @@ pub enum MarmotKitError {
     /// group is sending again.
     #[error("group {group_id_hex} has too many messages waiting to be sent")]
     GroupSendQueueFull { group_id_hex: String },
+    /// The group is halted and cannot send until another member re-admits this
+    /// device with a replacement Welcome. Messages accepted before the halt are
+    /// still held and publish once the repair lands; only this new send was
+    /// refused. Typed rather than the untyped [`MarmotKitError::Runtime`] bucket
+    /// so the host can tell the user the conversation needs re-joining instead of
+    /// surfacing opaque error text (mdk#1177). Not worth an automatic retry: the
+    /// repair arrives on a remote member's schedule.
+    #[error("group {group_id_hex} is unrecoverable and needs to be re-joined before sending")]
+    GroupUnrecoverableRepairRequired { group_id_hex: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -348,6 +357,14 @@ impl MarmotKitError {
             EngineError::QueuedOutboundAtCapacity { group_id } => Self::GroupSendQueueFull {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            // mdk#1177: a halted group needs a re-join, which is something the
+            // host can tell the user and act on. Keep it out of `Runtime` so it
+            // does not have to be recovered by parsing the reason text.
+            EngineError::GroupUnrecoverableRepairRequired { group_id } => {
+                Self::GroupUnrecoverableRepairRequired {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                }
+            }
             // #484: surface transient storage lock contention as a typed,
             // app-distinguishable variant rather than flattening it into the
             // untyped `Runtime` bucket. `StorageError::is_transient()` is the
@@ -481,6 +498,24 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected GroupSendQueueFull, got {other:?}"),
+        }
+    }
+
+    // A wedged group is a durable, host-actionable condition, not an engine bug.
+    // Flattened into `Runtime` the host can only string-match the reason text to
+    // tell "re-join required" from any other failure (mdk#1177).
+    #[test]
+    fn group_unrecoverable_repair_required_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x44; 16]);
+        let ffi =
+            MarmotKitError::from_engine_error(&EngineError::GroupUnrecoverableRepairRequired {
+                group_id: group_id.clone(),
+            });
+        match ffi {
+            MarmotKitError::GroupUnrecoverableRepairRequired { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected GroupUnrecoverableRepairRequired, got {other:?}"),
         }
     }
 

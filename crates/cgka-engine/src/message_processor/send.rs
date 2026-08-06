@@ -58,13 +58,10 @@ impl<S: StorageProvider> Engine<S> {
         // Recheck the durable lifecycle marker here so no outbound work can
         // escape an `Unrecoverable` halt after restart.
         if self.sync_unrecoverable_halt_from_storage(&group_id)? {
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "Unrecoverable",
-                    to: crate::audit_helpers::send_intent_kind_str(&intent),
-                    reason: "group is Unrecoverable pending verified repair",
-                },
-            ));
+            // Same condition and same typed error as the `validate_send_acceptance`
+            // gate (mdk#1177): a drain reaching a halted group must not report it
+            // differently just because it bypassed `do_send`.
+            return Err(EngineError::GroupUnrecoverableRepairRequired { group_id });
         }
         // Queued-intent drains call this method directly. A disband request or
         // inbound terminal candidate can arrive after an ordinary intent was

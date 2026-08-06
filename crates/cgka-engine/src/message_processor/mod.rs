@@ -471,13 +471,12 @@ impl<S: StorageProvider> Engine<S> {
         // mdk#971: durable Unrecoverable halt — sync into memory and refuse
         // outbound work until a verified repair path clears the marker.
         if self.sync_unrecoverable_halt_from_storage(&group_id)? {
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "Unrecoverable",
-                    to: crate::audit_helpers::send_intent_kind_str(intent),
-                    reason: "group is Unrecoverable pending verified repair",
-                },
-            ));
+            // mdk#1177: typed, not `InvalidTransition`. A halted group is a
+            // durable condition whose only exit is another member's repair
+            // Welcome, so the host has something to tell the user and act on —
+            // that is not an engine bug, which is what `InvalidTransition`
+            // denotes.
+            return Err(EngineError::GroupUnrecoverableRepairRequired { group_id });
         }
         if self.disbanding_in_progress(&group_id)? {
             return Err(EngineError::InvalidTransition(
