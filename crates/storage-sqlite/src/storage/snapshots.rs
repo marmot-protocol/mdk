@@ -230,6 +230,28 @@ mod tests {
     }
 
     #[test]
+    fn releasing_missing_group_state_checkpoint_reports_snapshot_missing() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        let checkpoint = GroupStateCheckpointRef {
+            id: "own-commit-a".into(),
+            resulting_epoch: EpochId(1),
+        };
+        store
+            .create_group_state_checkpoint(&group.id, &checkpoint)
+            .unwrap();
+
+        store
+            .release_group_state_checkpoint(&group.id, &checkpoint.id)
+            .unwrap();
+        assert!(matches!(
+            store.release_group_state_checkpoint(&group.id, &checkpoint.id),
+            Err(StorageError::SnapshotMissing(id)) if id == checkpoint.id
+        ));
+    }
+
+    #[test]
     fn snapshot_rollback_joins_outer_transaction() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let anchor_group = sample_group(gid(1), 0, 1);

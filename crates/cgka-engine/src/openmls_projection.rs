@@ -1706,10 +1706,9 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // CandidateWins resolution (see `fork_recovery`) can head the selected
     // branch WITHOUT being in the already-applied prefix. MLS cannot
     // re-process own commits and this apply cannot nest the selection stage's
-    // per-commit anchor rollforward, so realize such a leading run in one
-    // step: skip it from the replay and rewind to the retained anchor at the
-    // run's final resulting epoch — the exact post-merge state its last own
-    // commit produced.
+    // per-commit checkpoint rollforward, so realize such a leading run in one
+    // step: skip it from the replay and restore the commit-addressed checkpoint
+    // for the run's final own commit — the exact post-merge state it produced.
     let own_checkpoint_prefix =
         checkpoint_realizable_own_commit_prefix(storage, result, &applied_prefix)?;
     let mut skipped_prefix = applied_prefix;
@@ -2102,9 +2101,10 @@ fn prune_group_state_checkpoints<S: StorageProvider>(
         if checkpoint.resulting_epoch.0 >= oldest_retained_epoch {
             continue;
         }
-        storage
-            .release_group_state_checkpoint(group_id, &checkpoint.id)
-            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+        match storage.release_group_state_checkpoint(group_id, &checkpoint.id) {
+            Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+            Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+        }
     }
     Ok(())
 }

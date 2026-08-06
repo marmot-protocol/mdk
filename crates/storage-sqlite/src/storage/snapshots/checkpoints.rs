@@ -144,7 +144,7 @@ pub(super) fn release_group_state_checkpoint(
     checkpoint_id: &str,
 ) -> StorageResult<()> {
     let delete = || {
-        store
+        let deleted = store
             .lock()?
             .execute(
                 "DELETE FROM cgka_group_state_checkpoints
@@ -152,6 +152,9 @@ pub(super) fn release_group_state_checkpoint(
                 params![group_id.as_slice(), checkpoint_id],
             )
             .storage()?;
+        if deleted == 0 {
+            return Err(StorageError::SnapshotMissing(checkpoint_id.to_owned()));
+        }
         Ok(())
     };
     if store.connection.is_current_thread_transaction_owner() {
