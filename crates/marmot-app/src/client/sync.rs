@@ -1920,9 +1920,8 @@ impl AppClient {
                 group_id, change, ..
             } = event
                 && terminates_local_outbound_queue(change, &local_account_id_hex)
-                && let Some(projection_update) = self
-                    .app
-                    .invalidate_timeline_pending_sends_for_group(
+                && let Some(projection_update) =
+                    self.app.invalidate_timeline_pending_sends_for_group(
                         &self.state.label,
                         &hex::encode(group_id.as_slice()),
                     )?

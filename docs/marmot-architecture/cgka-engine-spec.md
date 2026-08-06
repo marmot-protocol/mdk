@@ -214,8 +214,17 @@ Because retention stores the *intent*, not ciphertext, a message retained across
 the epoch it is regenerated at, never the epoch it was accepted at. That is what makes holding across a halt
 deliverable rather than a promise the engine cannot keep.
 
-When a publish outcome returns a group to `Stable`, the engine MUST schedule that group for convergence if it still
-holds durable outbound intents. Nothing else would release them.
+Whenever a group returns to `Stable`, the engine MUST schedule it for convergence if it still holds durable outbound
+intents. Both returns count: a publish outcome that resolves the pending publication, and a verified repair that lifts
+`Unrecoverable`. Nothing else would release them, and scheduling only on the publish outcome would leave a repaired
+group's intents waiting for an unrelated event.
+
+Retention is not unconditional. Two transitions end a retained intent permanently, and both discard the whole queue
+rather than individual intents: a disband, whose terminal Commit purges the queue in the tombstone transaction, and the
+local copy being removed from the group, which leaves no state to regenerate under. Neither is recoverable by
+convergence, so the engine MUST NOT report those intents as still pending. The application layer MUST be able to name
+that outcome per message rather than infer it from a message that never arrives; how it is surfaced is an application
+concern, not a protocol one.
 
 Releasing a retained intent is not ordered against a new send: a send accepted once the group is `Stable` publishes
 immediately if its convergence inputs have settled, while a retained intent waits for the next convergence drain, so a

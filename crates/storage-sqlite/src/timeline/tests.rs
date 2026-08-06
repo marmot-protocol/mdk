@@ -2530,7 +2530,9 @@ fn publishing_a_held_send_reports_a_delivery_state_change_not_a_new_message() {
         .changes
         .iter()
         .find_map(|change| match change {
-            TimelineMessageChange::Upsert { trigger, message } if message.message_id_hex == "held" => {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == "held" =>
+            {
                 Some(trigger.clone())
             }
             _ => None,
