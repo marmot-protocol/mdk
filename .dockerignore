@@ -11,3 +11,10 @@ target
 dev/data
 .DS_Store
 *.log
+
+# Local/private campaign inputs and outputs must never enter the build context.
+/campaign-local/
+/campaign-output/
+/incident-exports/
+/incident-replay-output/
+*-sensitive-replay-capsule.v1.json

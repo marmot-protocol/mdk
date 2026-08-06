@@ -14,8 +14,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::node_protocol::{
-    NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1, NodeFailureCapsuleV1, NodeObservationV1,
-    NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
+    NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
+    NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
     CompiledScenarioV2, ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec,
@@ -26,6 +26,83 @@ use crate::{
 pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
 const NODE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESS_QUIESCENCE_POLL: Duration = Duration::from_millis(100);
+
+/// Adapter-neutral command template for a participant node process. The
+/// distributed runner uses this seam to launch the exact same JSONL node in a
+/// container without teaching the simulator about Docker, Podman, or VMs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessNodeLaunchV1 {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// Optional exact argv overrides keyed by canonical participant label.
+    /// This permits mixed-build container campaigns without changing the node
+    /// protocol or canonical Scenario IR.
+    pub args_by_participant: BTreeMap<String, Vec<String>>,
+    /// Root visible to the child. `None` means the host run root is visible at
+    /// the same path, as it is for an ordinary local process.
+    pub child_run_root: Option<PathBuf>,
+}
+
+impl ProcessNodeLaunchV1 {
+    pub fn executable(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            args_by_participant: BTreeMap::new(),
+            child_run_root: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ProcessBarrierHook: Send {
+    async fn before_barrier(&mut self, name: &str) -> Result<(), ProcessOrchestratorError>;
+}
+
+struct NoopProcessBarrierHook;
+
+#[async_trait::async_trait]
+impl ProcessBarrierHook for NoopProcessBarrierHook {
+    async fn before_barrier(&mut self, _name: &str) -> Result<(), ProcessOrchestratorError> {
+        Ok(())
+    }
+}
+
+/// Values substituted in [`ProcessNodeLaunchV1::args`]:
+/// `{participant}`, `{run_token}`, `{host_run_root}`, and `{child_run_root}`.
+/// Substitution is argv-local; no shell is involved.
+fn render_node_arg(
+    template: &str,
+    participant: &str,
+    run_token: &str,
+    host_run_root: &Path,
+    child_run_root: &Path,
+) -> Result<String, ProcessOrchestratorError> {
+    let host_run_root = host_run_root.to_str().ok_or_else(|| {
+        ProcessOrchestratorError::new(
+            "non_utf8_run_root",
+            "node command templates require UTF-8 run-root paths",
+        )
+    })?;
+    let child_run_root = child_run_root.to_str().ok_or_else(|| {
+        ProcessOrchestratorError::new(
+            "non_utf8_child_root",
+            "node command templates require UTF-8 child-root paths",
+        )
+    })?;
+    let rendered = template
+        .replace("{participant}", participant)
+        .replace("{run_token}", run_token)
+        .replace("{host_run_root}", host_run_root)
+        .replace("{child_run_root}", child_run_root);
+    if rendered.contains('{') || rendered.contains('}') {
+        return Err(ProcessOrchestratorError::new(
+            "unknown_node_command_placeholder",
+            "node command contains an unknown template placeholder",
+        ));
+    }
+    Ok(rendered)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessScenarioReportV1 {
@@ -70,7 +147,7 @@ pub struct ProcessOrchestratorError {
 }
 
 impl ProcessOrchestratorError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -87,7 +164,7 @@ impl fmt::Display for ProcessOrchestratorError {
 impl std::error::Error for ProcessOrchestratorError {}
 
 pub struct ProcessOrchestrator {
-    node_executable: PathBuf,
+    node_launch: ProcessNodeLaunchV1,
     run_root: tempfile::TempDir,
     artifact_directory: PathBuf,
     compiled: CompiledScenarioV2,
@@ -117,12 +194,33 @@ impl ProcessOrchestrator {
         scenario: &ScenarioSpec,
         artifact_directory: impl AsRef<Path>,
     ) -> Result<Self, ProcessOrchestratorError> {
+        Self::launch_with(
+            ProcessNodeLaunchV1::executable(node_executable.as_ref()),
+            None,
+            scenario,
+            artifact_directory,
+        )
+        .await
+    }
+
+    /// Launch participant nodes through a caller-supplied argv template and,
+    /// optionally, use already-running retained relays. This is the boundary
+    /// used by distributed container/VM orchestration; the canonical scenario
+    /// executor and node protocol stay unchanged.
+    pub async fn launch_with(
+        node_launch: ProcessNodeLaunchV1,
+        external_relay_urls: Option<BTreeMap<String, String>>,
+        scenario: &ScenarioSpec,
+        artifact_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProcessOrchestratorError> {
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
-        preflight_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(|error| {
-            ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
-        })?;
+        preflight_process_compiled_scenario(&compiled, &process_subject_descriptor()).map_err(
+            |error| {
+                ProcessOrchestratorError::new("process_capability_preflight", error.to_string())
+            },
+        )?;
         let artifact_directory = artifact_directory.as_ref().to_path_buf();
         fs_private::create_dir_all_private(&artifact_directory).map_err(environment_error)?;
         let run_root = tempfile::Builder::new()
@@ -142,12 +240,31 @@ impl ProcessOrchestrator {
                 .collect()
         };
         let mut relays = BTreeMap::new();
-        let mut relay_urls = BTreeMap::new();
-        for label in relay_labels {
-            let relay = MockRelay::run().await.map_err(environment_error)?;
-            relay_urls.insert(label.clone(), relay.url().await.to_string());
-            relays.insert(label, relay);
-        }
+        let relay_urls = if let Some(relay_urls) = external_relay_urls {
+            let expected = relay_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let actual = relay_urls
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if actual != expected {
+                return Err(ProcessOrchestratorError::new(
+                    "missing_external_relay",
+                    "external relay map must exactly match the scenario topology",
+                ));
+            }
+            relay_urls
+        } else {
+            let mut relay_urls = BTreeMap::new();
+            for label in relay_labels {
+                let relay = MockRelay::run().await.map_err(environment_error)?;
+                relay_urls.insert(label.clone(), relay.url().await.to_string());
+                relays.insert(label, relay);
+            }
+            relay_urls
+        };
 
         let processes = compiled
             .topology
@@ -170,7 +287,7 @@ impl ProcessOrchestrator {
         let clients = compiled.clients.clone();
 
         let mut orchestrator = Self {
-            node_executable: node_executable.as_ref().to_path_buf(),
+            node_launch,
             run_root,
             artifact_directory,
             compiled,
@@ -194,6 +311,23 @@ impl ProcessOrchestrator {
         Ok(orchestrator)
     }
 
+    pub fn run_root(&self) -> &Path {
+        self.run_root.path()
+    }
+
+    pub fn run_token(&self) -> Result<&str, ProcessOrchestratorError> {
+        self.run_root
+            .path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                ProcessOrchestratorError::new(
+                    "invalid_run_root",
+                    "process run root has no UTF-8 final component",
+                )
+            })
+    }
+
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
         self.nodes
             .iter()
@@ -202,6 +336,14 @@ impl ProcessOrchestrator {
     }
 
     pub async fn run(&mut self) -> Result<ProcessScenarioReportV1, ProcessOrchestratorError> {
+        let mut hook = NoopProcessBarrierHook;
+        self.run_with_barrier_hook(&mut hook).await
+    }
+
+    pub async fn run_with_barrier_hook(
+        &mut self,
+        hook: &mut dyn ProcessBarrierHook,
+    ) -> Result<ProcessScenarioReportV1, ProcessOrchestratorError> {
         let compiled = self.compiled.clone();
         let schedule = compiled.expanded_schedule();
         let mut report = ProcessScenarioReportV1 {
@@ -216,7 +358,7 @@ impl ProcessOrchestrator {
         };
         for action in &compiled.actions {
             let action_id = action.schedule.action_id.clone();
-            match self.execute_action(action, &mut report).await {
+            match self.execute_action(action, &mut report, hook).await {
                 Ok((participants, status)) => report.actions.push(ProcessActionResultV1 {
                     action_id,
                     action_type: action.schedule.action_type.clone(),
@@ -264,6 +406,7 @@ impl ProcessOrchestrator {
         &mut self,
         action: &crate::CompiledScenarioActionV2,
         report: &mut ProcessScenarioReportV1,
+        hook: &mut dyn ProcessBarrierHook,
     ) -> Result<(Vec<String>, ProcessActionStatusV1), (Option<String>, NodeErrorV1)> {
         let action_id = action.schedule.action_id.as_str();
         let group = action
@@ -463,6 +606,9 @@ impl ProcessOrchestrator {
                 ProcessActionStatusV1::AlreadyPublished,
             )),
             ScenarioStep::Barrier { name } => {
+                hook.before_barrier(name)
+                    .await
+                    .map_err(orchestrator_failure)?;
                 let labels = self.running_labels();
                 self.barrier_all(action_id, name).await?;
                 Ok((labels, ProcessActionStatusV1::Completed))
@@ -531,19 +677,40 @@ impl ProcessOrchestrator {
         client: &str,
         action_id: &str,
     ) -> Result<(), ProcessOrchestratorError> {
-        let client_token = stable_filesystem_token(client);
+        let client_token = process_participant_token(client);
+        let run_token = self.run_token()?;
         let root = self
             .run_root
             .path()
             .join("participants")
             .join(&client_token);
+        let child_run_root = self
+            .node_launch
+            .child_run_root
+            .as_deref()
+            .unwrap_or_else(|| self.run_root.path());
+        let child_root = child_run_root.join("participants").join(&client_token);
         fs_private::create_dir_all_private(&root).map_err(environment_error)?;
         let stderr_dir = self.run_root.path().join("node-stderr");
         fs_private::create_dir_all_private(&stderr_dir).map_err(environment_error)?;
         let stderr =
             fs_private::open_private_append(&stderr_dir.join(format!("{client_token}.log")))
                 .map_err(environment_error)?;
-        let mut command = Command::new(&self.node_executable);
+        let mut command = Command::new(&self.node_launch.program);
+        let arguments = self
+            .node_launch
+            .args_by_participant
+            .get(client)
+            .unwrap_or(&self.node_launch.args);
+        for argument in arguments {
+            command.arg(render_node_arg(
+                argument,
+                &client_token,
+                run_token,
+                self.run_root.path(),
+                child_run_root,
+            )?);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -574,7 +741,7 @@ impl ProcessOrchestrator {
         let response = node
             .send(NodeCommandV1::Initialize {
                 participant: client.into(),
-                root,
+                root: child_root,
                 relay_urls,
             })
             .await?;
@@ -1024,15 +1191,40 @@ impl NodeProcess {
                 "node closed stdout before responding",
             ));
         }
-        let response: NodeResponseV1 = serde_json::from_str(&line).map_err(environment_error)?;
-        if response.protocol != NODE_PROTOCOL_VERSION || response.request_id != request_id {
-            return Err(ProcessOrchestratorError::new(
-                "node_protocol_mismatch",
-                "node response did not match the request",
-            ));
-        }
+        let response = decode_node_response(&line, &request_id)?;
         Ok(response.body)
     }
+}
+
+fn decode_node_response(
+    line: &str,
+    request_id: &str,
+) -> Result<NodeResponseV1, ProcessOrchestratorError> {
+    let raw: serde_json::Value = serde_json::from_str(line).map_err(environment_error)?;
+    let protocol = raw.get("protocol").and_then(serde_json::Value::as_str);
+    let response_request_id = raw.get("request_id").and_then(serde_json::Value::as_str);
+    if protocol != Some(NODE_PROTOCOL_VERSION) || response_request_id != Some(request_id) {
+        return Err(ProcessOrchestratorError::new(
+            "node_protocol_mismatch",
+            "node response did not match the request",
+        ));
+    }
+    if raw
+        .pointer("/body/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("observation")
+        && raw
+            .pointer("/body/observation/schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(NODE_OBSERVATION_SCHEMA_VERSION)
+    {
+        return Err(ProcessOrchestratorError::new(
+            "node_observation_schema_mismatch",
+            "node observation schema is unsupported",
+        ));
+    }
+    let response: NodeResponseV1 = serde_json::from_value(raw).map_err(environment_error)?;
+    Ok(response)
 }
 
 fn process_subject_descriptor() -> SubjectDescriptor {
@@ -1047,7 +1239,6 @@ fn process_subject_descriptor() -> SubjectDescriptor {
             SubjectCapability::EventObservation,
             SubjectCapability::AdminPolicyObservation,
             SubjectCapability::CrashReopen,
-            SubjectCapability::VirtualTime,
             SubjectCapability::OutboundPublication,
             SubjectCapability::StructuralProgress,
             SubjectCapability::ParticipantConnectivity,
@@ -1056,6 +1247,27 @@ fn process_subject_descriptor() -> SubjectDescriptor {
             SubjectCapability::RetainedRelayHistory,
         ]),
     }
+}
+
+/// Preflight the canonical schedule against the process executor's actual
+/// capabilities. `AwaitQuiescence` is a semantic fixed-point gate here: the
+/// orchestrator polls real participant progress with a bounded wall-clock
+/// deadline, so it discharges that action without claiming arbitrary virtual
+/// time support. Other time-dependent actions remain rejected.
+fn preflight_process_compiled_scenario(
+    compiled: &CompiledScenarioV2,
+    descriptor: &SubjectDescriptor,
+) -> Result<(), crate::ScenarioRunError> {
+    let mut process_compiled = compiled.clone();
+    for action in &mut process_compiled.actions {
+        if matches!(action.step, ScenarioStep::AwaitQuiescence { .. }) {
+            action
+                .schedule
+                .required_capabilities
+                .remove(&SubjectCapability::VirtualTime);
+        }
+    }
+    preflight_compiled_scenario(&process_compiled, descriptor)
 }
 
 fn unexpected_response(_body: NodeResponseBodyV1) -> NodeErrorV1 {
@@ -1096,7 +1308,7 @@ fn process_action_error(error: (Option<String>, NodeErrorV1)) -> ProcessOrchestr
     ProcessOrchestratorError::new(error.1.code, error.1.message)
 }
 
-fn stable_filesystem_token(label: &str) -> String {
+pub fn process_participant_token(label: &str) -> String {
     let digest = hex::encode(sha2::Sha256::digest(label.as_bytes()));
     format!("participant-{}", &digest[..16])
 }
@@ -1191,5 +1403,61 @@ mod tests {
             .unwrap(),
             report
         );
+    }
+
+    #[test]
+    fn node_command_template_is_argv_local_and_rejects_unknown_placeholders() {
+        let host = Path::new("/tmp/host-run");
+        let child = Path::new("/campaign");
+        assert_eq!(
+            render_node_arg(
+                "name={run_token}-{participant}:{host_run_root}:{child_run_root}",
+                "participant-abcd",
+                "run-1234",
+                host,
+                child,
+            )
+            .unwrap(),
+            "name=run-1234-participant-abcd:/tmp/host-run:/campaign"
+        );
+        let error = render_node_arg("{shell}", "p", "r", host, child).unwrap_err();
+        assert_eq!(error.code, "unknown_node_command_placeholder");
+    }
+    #[test]
+    fn observation_schema_is_rejected_before_typed_observation_decoding() {
+        let line = format!(
+            r#"{{"protocol":"{NODE_PROTOCOL_VERSION}","request_id":"request-1","participant":"alice","body":{{"type":"observation","action_id":"observe","observation":{{"schema_version":"0"}}}}}}"#
+        );
+        let error = decode_node_response(&line, "request-1").unwrap_err();
+        assert_eq!(error.code, "node_observation_schema_mismatch");
+    }
+
+    #[test]
+    fn process_preflight_supports_observed_quiescence_without_claiming_virtual_time() {
+        let descriptor = process_subject_descriptor();
+        assert!(!descriptor.supports(SubjectCapability::VirtualTime));
+
+        let await_spec = ScenarioSpec {
+            name: "process-observed-quiescence".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::AwaitQuiescence {
+                policy: Default::default(),
+            }],
+        };
+        let compiled = compile_scenario(&await_spec).unwrap();
+        preflight_process_compiled_scenario(&compiled, &descriptor).unwrap();
+
+        let advance_spec = ScenarioSpec {
+            name: "process-rejects-virtual-time".into(),
+            steps: vec![ScenarioStep::AdvanceTime { delta_ms: 1 }],
+            ..await_spec
+        };
+        let compiled = compile_scenario(&advance_spec).unwrap();
+        let error = preflight_process_compiled_scenario(&compiled, &descriptor)
+            .expect_err("arbitrary virtual-time actions remain unsupported");
+        assert_eq!(error.kind, "unsupported_subject_capability");
+        assert_eq!(error.step_index, Some(0));
     }
 }

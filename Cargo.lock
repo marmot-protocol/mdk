@@ -1149,6 +1149,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "convergence-campaign-runner"
+version = "0.9.10"
+dependencies = [
+ "async-trait",
+ "cgka-conformance-simulator",
+ "clap",
+ "fs-private",
+ "hex",
+ "libc",
+ "nostr-relay-builder",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

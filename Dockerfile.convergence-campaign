@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY integrations ./integrations
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --locked --release -p convergence-campaign-runner \
+      --bin cgka-conformance-node --bin cgka-conformance-relay \
+    && mkdir -p /campaign-bin \
+    && cp target/release/cgka-conformance-node target/release/cgka-conformance-relay /campaign-bin/
+
+FROM debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+
+ARG DEBIAN_SNAPSHOT=20260713T000000Z
+
+# Campaign-only image. NET_ADMIN is granted only to short-lived fault-injector
+# containers, never participant processes or a production service. The tools
+# below implement explicit network and disk fault actions from the versioned
+# distributed manifest.
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" \
+        > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        iptables \
+        ipset \
+        procps \
+        stress-ng \
+        util-linux \
+    && dpkg-query --show --showformat='${Package}=${Version}\n' \
+        > /usr/local/share/campaign-runtime-packages.txt \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 campaign \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin campaign \
+    && install --directory --owner=65532 --group=65532 --mode=0700 /campaign
+
+COPY --from=builder /campaign-bin/cgka-conformance-node /usr/local/bin/
+COPY --from=builder /campaign-bin/cgka-conformance-relay /usr/local/bin/
+
+VOLUME ["/campaign"]
+USER 65532:65532
+CMD ["cgka-conformance-node"]

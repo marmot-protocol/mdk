@@ -7,6 +7,7 @@ members = [
     "crates/cgka-session",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
+    "crates/convergence-campaign-runner",
     "crates/incident-replay",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
@@ -118,6 +119,7 @@ cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
+convergence-campaign-runner = { path = "crates/convergence-campaign-runner" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }

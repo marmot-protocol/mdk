@@ -405,6 +405,15 @@ fn build_harness_engine(
     audit_capture: &AuditCapture,
     options: HarnessEngineOptions<'_>,
 ) -> Engine<SqliteAccountStorage> {
+    // The engine's legacy compatibility switch is deliberately debug-only.
+    // A release-built harness must fail loudly instead of claiming it ran a
+    // legacy profile while silently exercising current compatibility rules.
+    #[cfg(not(debug_assertions))]
+    assert_ne!(
+        protocol_profile,
+        ProtocolProfile::Legacy,
+        "the legacy harness protocol profile is unavailable in release builds"
+    );
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(identity.to_vec())
@@ -416,6 +425,7 @@ fn build_harness_engine(
         .supported_app_components(harness_supported_app_components())
         .peeler(Box::new(peeler))
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
+    #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
     }
@@ -1380,6 +1390,22 @@ impl HarnessClient {
         let mut outcomes = self.tick_ingest_only().await;
         if let Some(gid) = self.default_group.clone() {
             let now_ms = self.harness_convergence_now_ms();
+            // The legacy harness shortcut represents both sides of a timer
+            // boundary in one tick. Give newly peeled inputs an explicit
+            // pre-cutoff admission point before the far-future settlement
+            // point; production and virtual-time subjects use their real
+            // single clock instant and never take this compatibility prepass.
+            if !self.virtual_time_tick_enabled
+                && let Err(e) = self
+                    .engine_mut()
+                    .advance_convergence_inputs_until_settled(&gid, 0)
+                    .await
+            {
+                outcomes.push(Err(EngineError::Backend(format!(
+                    "prepare buffered group: {e}"
+                ))));
+                return outcomes;
+            }
             match self
                 .engine_mut()
                 .advance_convergence_inputs_until_settled(&gid, now_ms)
