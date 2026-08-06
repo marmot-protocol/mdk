@@ -308,6 +308,8 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
         committer: MemberId::new(vec![0xEE; 32]),
         priority: CommitOrderingPriority::Privileged,
         consumed_proposal_refs: vec!["0a0b".into()],
+        checkpoint_id: None,
+        resulting_epoch_authenticator: None,
     };
     let payload = StoredMessagePayload::own_commit_wire(message.clone(), stamp.clone());
 
@@ -319,6 +321,18 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
     assert_eq!(decoded.as_openmls_wire().unwrap(), &message);
     assert_eq!(decoded.own_commit_stamp().unwrap(), &stamp);
     assert!(decoded.as_raw_transport().is_none());
+
+    // A branch-addressed checkpoint and its resulting epoch authenticator
+    // round-trip together. Older stamp rows omit both optional fields.
+    let marked = OwnCommitConvergenceStamp {
+        checkpoint_id: Some(format!("openmls-own-commit-v1-{}", "ab".repeat(32))),
+        resulting_epoch_authenticator: Some("cd".repeat(32)),
+        ..stamp.clone()
+    };
+    let marked_payload = StoredMessagePayload::own_commit_wire(message, marked.clone());
+    let decoded_marked = StoredMessagePayload::decode(&marked_payload.encode().unwrap()).unwrap();
+    assert_eq!(decoded_marked.own_commit_stamp().unwrap(), &marked);
+    assert!(decoded.own_commit_stamp().unwrap().checkpoint_id.is_none());
 }
 
 #[test]

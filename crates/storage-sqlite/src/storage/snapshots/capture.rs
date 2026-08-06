@@ -1,6 +1,6 @@
 use super::rows::{
-    MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
-    Snapshot,
+    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
+    OrderedQueuedOutbound, Snapshot,
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
@@ -84,6 +84,29 @@ fn capture_snapshot(conn: &rusqlite::Connection, group_id: &GroupId) -> StorageR
     })
 }
 
+pub(super) fn capture_group_state(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+) -> StorageResult<GroupStateCheckpoint> {
+    let mls_group_key = mls_group_key(group_id)?;
+    let group_blob: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM cgka_groups WHERE id = ?1",
+            params![group_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?
+        .ok_or(StorageError::NotFound)?;
+
+    Ok(GroupStateCheckpoint {
+        group: deserialize(&group_blob)?,
+        member_caps: member_capabilities(conn, group_id)?,
+        validated_tree_marker: validated_tree_marker(conn, group_id)?,
+        openmls_values: openmls_values(conn, &mls_group_key)?,
+    })
+}
+
 #[cfg(feature = "test-conformance-replay")]
 pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<u8>> {
     let conn = store.lock()?;
@@ -164,7 +187,8 @@ fn member_capabilities(
     let mut stmt = tx
         .prepare(
             "SELECT member_id, capabilities FROM cgka_member_capabilities
-             WHERE group_id = ?1",
+             WHERE group_id = ?1
+             ORDER BY member_id",
         )
         .storage()?;
     let rows = stmt

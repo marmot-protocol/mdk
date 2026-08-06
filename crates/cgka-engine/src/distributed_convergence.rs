@@ -1252,16 +1252,19 @@ impl<S: StorageProvider> Engine<S> {
             );
         }
 
-        // retained-history.md:30-31 — a required retained state missing inside
-        // the rollback horizon MUST report `MissingRetainedAnchor`, leave
-        // canonical group state unchanged, and move the group to
-        // `Unrecoverable`. Halt before applying anything. Persist the marker
-        // on the group record so process restart cannot silently clear it
-        // (mdk#971).
-        if result
-            .errors
-            .contains(&CanonicalizationError::MissingRetainedAnchor)
-        {
+        // Missing branch state inside the rollback horizon must leave
+        // canonical state unchanged and move the group to `Unrecoverable`.
+        // This includes an epoch anchor and the exact checkpoint required to
+        // realize a locally authored pre-upgrade commit.
+        let missing_retained_state = result.errors.iter().copied().find(|error| {
+            matches!(
+                error,
+                CanonicalizationError::MissingRetainedAnchor
+                    | CanonicalizationError::MissingOwnCommitCheckpoint
+            )
+        });
+        if let Some(missing_retained_state) = missing_retained_state {
+            let error_kind = canonicalization_error_tag(missing_retained_state);
             let mut group = self
                 .storage
                 .get_group(group_id)
@@ -1284,7 +1287,7 @@ impl<S: StorageProvider> Engine<S> {
                     previous_state,
                     new_state: "unrecoverable".to_string(),
                     epoch: epoch.0,
-                    reason: "missing_retained_anchor".to_string(),
+                    reason: error_kind.to_string(),
                     pending_ref: None,
                     pending_kind: None,
                 },
@@ -1300,7 +1303,7 @@ impl<S: StorageProvider> Engine<S> {
                     current_tip_epoch: Some(previous_tip.0),
                     retained_anchor_horizon: Some(retained_anchor_epoch),
                     reason: None,
-                    error_kind: Some("missing_retained_anchor".to_string()),
+                    error_kind: Some(error_kind.to_string()),
                 },
             );
             return Ok(result);
@@ -2120,6 +2123,7 @@ fn canonicalization_error_tag(error: CanonicalizationError) -> &'static str {
     match error {
         CanonicalizationError::UnsupportedPolicy => "unsupported_policy",
         CanonicalizationError::MissingRetainedAnchor => "missing_retained_anchor",
+        CanonicalizationError::MissingOwnCommitCheckpoint => "missing_own_commit_checkpoint",
         CanonicalizationError::CandidateStateUnavailable => "candidate_state_unavailable",
         CanonicalizationError::MlsValidationFailed => "mls_validation_failed",
         CanonicalizationError::OutboundIntentStale => "outbound_intent_stale",

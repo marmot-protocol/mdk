@@ -29,6 +29,15 @@ pub struct OwnCommitConvergenceStamp {
     pub priority: CommitOrderingPriority,
     /// Hex-encoded proposal references the commit consumed, in sorted order.
     pub consumed_proposal_refs: Vec<String>,
+    /// Immutable canonical-state checkpoint produced by this commit.  The id
+    /// is derived from the MLS wire commit digest rather than the epoch, so
+    /// sibling branches can never replace one another's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    /// Epoch authenticator of the checkpointed resulting state.  Restore
+    /// verifies this value before the checkpoint can realize an own commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_epoch_authenticator: Option<String>,
 }
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].

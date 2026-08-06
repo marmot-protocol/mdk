@@ -19,6 +19,18 @@ pub(super) struct Snapshot {
     pub(super) openmls_values: Vec<OpenMlsValueSnapshot>,
 }
 
+/// Branch-addressed canonical state.  Unlike `Snapshot`, this deliberately
+/// excludes the mutable message ledger, outbound queue, convergence policy,
+/// and pass scheduler so selecting a historical branch cannot rewind current
+/// operational work.
+#[derive(Serialize, Deserialize)]
+pub(super) struct GroupStateCheckpoint {
+    pub(super) group: Group,
+    pub(super) member_caps: Vec<MemberCapabilitiesSnapshot>,
+    pub(super) validated_tree_marker: Option<Vec<u8>>,
+    pub(super) openmls_values: Vec<OpenMlsValueSnapshot>,
+}
+
 /// Test-only envelope for byte-exact convergence replay.
 ///
 /// Ordinary epoch rollback deliberately excludes the durable convergence pass:

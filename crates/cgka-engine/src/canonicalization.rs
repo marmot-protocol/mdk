@@ -316,6 +316,7 @@ pub enum DeferredMessageReason {
 pub enum CanonicalizationError {
     UnsupportedPolicy,
     MissingRetainedAnchor,
+    MissingOwnCommitCheckpoint,
     CandidateStateUnavailable,
     MlsValidationFailed,
     OutboundIntentStale,
@@ -1112,10 +1113,13 @@ fn convergence_status_for_result(
 }
 
 fn has_blocking_convergence_error(result: &CanonicalizationResult) -> bool {
-    result
-        .errors
-        .iter()
-        .any(|error| matches!(error, CanonicalizationError::MissingRetainedAnchor))
+    result.errors.iter().any(|error| {
+        matches!(
+            error,
+            CanonicalizationError::MissingRetainedAnchor
+                | CanonicalizationError::MissingOwnCommitCheckpoint
+        )
+    })
 }
 
 fn app_message_expired(

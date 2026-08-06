@@ -883,7 +883,7 @@ impl<S: StorageProvider> Engine<S> {
                                         &group_id, &msg.id, msg_epoch, current,
                                     ));
                                 }
-                                ForkResolution::IncumbentWins
+                                ForkResolution::IncumbentWins { .. }
                                 | ForkResolution::CandidateWins { .. } => {
                                     // recovery_snapshot_name_for_fork and
                                     // resolve_fork_candidate read the same
@@ -940,16 +940,32 @@ impl<S: StorageProvider> Engine<S> {
                                 winner,
                                 invalidated,
                                 invalidated_storage_id,
+                                ..
                             } => {
                                 pending_recovery =
                                     Some((msg_epoch, winner, invalidated, invalidated_storage_id));
                                 continue;
                             }
-                            ForkResolution::IncumbentWins => {
-                                self.update_stored_message_state(
-                                    &msg.id,
-                                    MessageState::EpochInvalidated,
+                            ForkResolution::IncumbentWins { .. } => {
+                                // Keep the pairwise loser eligible for a later
+                                // distributed pass, and key it by the commit's
+                                // source epoch as required by replay. This seam
+                                // is reachable only with no active pass; the
+                                // next pass seeds this deferred row from storage.
+                                self.persist_openmls_wire_message(
+                                    &openmls_msg,
+                                    &group_id,
+                                    msg_epoch,
+                                    MessageState::ConvergenceDeferred,
                                 )?;
+                                self.audit_group(
+                                    &group_id,
+                                    crate::audit_helpers::message_state_changed_event(
+                                        hex::encode(msg.id.as_slice()),
+                                        MessageState::ConvergenceDeferred,
+                                        "pairwise_fork_loser",
+                                    ),
+                                );
                                 return Ok(IngestOutcome::Stale {
                                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                                 });
