@@ -409,9 +409,9 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let exists: Option<i64> = conn
+            let existing_source: Option<Option<String>> = conn
                 .query_row(
-                    "SELECT 1
+                    "SELECT source_message_id_hex
                      FROM app_events
                      WHERE group_id_hex = ?1
                        AND message_id_hex = ?2
@@ -422,9 +422,14 @@ impl SqliteAccountStorage {
                 )
                 .optional()
                 .storage()?;
-            if exists.is_none() {
+            let Some(existing_source) = existing_source else {
                 return Ok(None);
-            }
+            };
+            // A row whose source id is about to go NULL -> Some is a send moving
+            // from `pending` to `delivered`. That is a delivery-state change, not
+            // new content, and subscribers need to tell the two apart to update a
+            // badge without re-reading the row.
+            let publishes_held_send = existing_source.is_none() && source_message_id_hex.is_some();
             let updated = conn
                 .execute(
                     "UPDATE app_events
@@ -473,7 +478,7 @@ impl SqliteAccountStorage {
             }
             let messages =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
-            let changes = timeline_changes_for_event(
+            let mut changes = timeline_changes_for_event(
                 message_id_hex,
                 kind,
                 &tags,
@@ -481,6 +486,18 @@ impl SqliteAccountStorage {
                 &affected_message_ids,
                 &messages,
             );
+            if publishes_held_send {
+                // Only the published row's own delivery state changed. Rows it
+                // merely affects (a reply preview, say) keep the trigger their
+                // own content warrants.
+                for change in &mut changes {
+                    if let TimelineMessageChange::Upsert { trigger, message } = change
+                        && message.message_id_hex == message_id_hex
+                    {
+                        *trigger = TimelineUpdateTrigger::DeliveryOrSendStateChanged;
+                    }
+                }
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex: group_id_hex.to_owned(),
                 messages,

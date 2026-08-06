@@ -2504,3 +2504,73 @@ fn sweeping_a_group_twice_leaves_the_first_outcome_intact() {
         Some(Some("local_publish_failed".to_owned()))
     );
 }
+
+#[test]
+fn publishing_a_held_send_reports_a_delivery_state_change_not_a_new_message() {
+    // The pending -> delivered flip is the whole point of the delivery badge,
+    // but it reached subscribers indistinguishable from a brand-new message, so
+    // a client could not update the badge without re-reading the row.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&pending_sent(&group_id_hex, "held", 10))
+        .unwrap();
+
+    let finalized = store
+        .finalize_app_event_source_retention(
+            &group_id_hex,
+            "held",
+            Some("source-held"),
+            9,
+            AppMessageRetentionDecision::new(10, 300),
+        )
+        .unwrap()
+        .expect("finalization update");
+    let trigger = finalized
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message } if message.message_id_hex == "held" => {
+                Some(trigger.clone())
+            }
+            _ => None,
+        })
+        .expect("the finalized row must be reported as changed");
+    assert_eq!(trigger, TimelineUpdateTrigger::DeliveryOrSendStateChanged);
+}
+
+#[test]
+fn finalizing_an_already_published_send_is_not_a_delivery_state_change() {
+    // A row that already carried a source id was already `delivered`; a later
+    // retention finalization changes no delivery state and must keep reporting
+    // whatever its content warranted.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    store
+        .record_app_event(&chat("published", "alice", 10, "already delivered"))
+        .unwrap();
+
+    let finalized = store
+        .finalize_app_event_source_retention(
+            &group_id_hex,
+            "published",
+            Some("source-published"),
+            9,
+            AppMessageRetentionDecision::new(10, 300),
+        )
+        .unwrap()
+        .expect("finalization update");
+    let trigger = finalized
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message }
+                if message.message_id_hex == "published" =>
+            {
+                Some(trigger.clone())
+            }
+            _ => None,
+        })
+        .expect("the finalized row must be reported as changed");
+    assert_ne!(trigger, TimelineUpdateTrigger::DeliveryOrSendStateChanged);
+}
