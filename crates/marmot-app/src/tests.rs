@@ -7660,3 +7660,59 @@ async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown
     runtime.shutdown().await;
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// #1177: an accepted send whose intent the engine retained in the group's
+/// durable queue must say so. Reporting `published: 0` with no message ids
+/// forces the host to infer acceptance from an empty list, which is exactly
+/// the inference the criterion forbids.
+#[test]
+fn a_retained_send_reports_accepted_pending_rather_than_an_empty_publish() {
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.queued.push(cgka_session::QueuedIntentRef {
+        group_id: cgka_traits::GroupId::new(vec![0x11; 16]),
+        intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
+    });
+
+    let summary = crate::groups::send_summary_from_effects(&effects);
+
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::AcceptedPending,
+        "a retained intent is accepted work, not a silent no-op"
+    );
+}
+
+/// The published half of #1177's criterion, end to end: a send that reaches the
+/// transport must report `Published`, so `AcceptedPending` stays a signal a host
+/// can act on rather than the value every send happens to carry.
+#[tokio::test]
+async fn a_send_that_reaches_the_transport_reports_published() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://accept-disposition.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("alice").await.unwrap();
+    let group_id = setup_client
+        .create_group("accept disposition", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let summary = runtime
+        .send_message("alice", &group_id, b"published now".to_vec())
+        .await
+        .expect("a send with a healthy transport must publish");
+
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published,
+        "the message reached the transport, so nothing is being held"
+    );
+
+    runtime.shutdown().await;
+}

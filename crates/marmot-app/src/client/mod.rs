@@ -2243,6 +2243,17 @@ impl AppClient {
             SendSummary {
                 published: effects.reports.len(),
                 message_ids: vec![app_event_id],
+                // Per-message, not per-pass: `published` above matched this
+                // exact `app_event_id` in `effects.published_app_messages`. A
+                // send that folded peer commits can publish other work in the
+                // same pass, so counting `effects.reports` or the group-wide
+                // queue would misreport this row. Absent means the engine
+                // accepted and retained it (mdk#1177).
+                accept_disposition: if published.is_some() {
+                    cgka_traits::SendAcceptDisposition::Published
+                } else {
+                    cgka_traits::SendAcceptDisposition::AcceptedPending
+                },
                 maintenance_disposition: effects.maintenance_disposition,
             },
         ))
@@ -2360,6 +2371,11 @@ impl AppClient {
                 return Ok(SendSummary {
                     published: 0,
                     message_ids: vec![existing_id],
+                    // Idempotent no-op, not a retained intent: the reaction is
+                    // already canonical group output and `message_ids` names
+                    // it. Nothing is being held for a later drain, so there is
+                    // nothing pending to report (mdk#1177).
+                    accept_disposition: cgka_traits::SendAcceptDisposition::Published,
                     maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
                 });
             }
@@ -2945,6 +2961,7 @@ impl AppClient {
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
+            accept_disposition: crate::groups::accept_disposition_from_effects(&effects),
             maintenance_disposition: effects.maintenance_disposition,
         })
     }

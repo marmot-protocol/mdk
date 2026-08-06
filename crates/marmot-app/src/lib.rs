@@ -835,6 +835,10 @@ pub struct AppMessageQuery {
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
+    /// Whether the accepted send reached the transport or is retained in the
+    /// group's durable queue. Distinguishes accepted-pending from published
+    /// without inferring either from `message_ids` being empty (mdk#1177).
+    pub accept_disposition: cgka_traits::SendAcceptDisposition,
     pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
 }
 

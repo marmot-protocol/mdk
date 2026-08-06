@@ -2179,7 +2179,28 @@ pub(crate) fn send_summary_from_effects(
             .iter()
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect(),
+        accept_disposition: accept_disposition_from_effects(effects),
         maintenance_disposition: effects.maintenance_disposition,
+    }
+}
+
+/// Whether a group-state send pass was published or retained (mdk#1177).
+///
+/// Any retained intent makes the pass accepted-pending. These callers send
+/// group-state intents, which the engine only queues as a whole — it never
+/// splits one into a published and a retained half — so a non-empty queue is
+/// this send's own outcome.
+///
+/// The application-message path deliberately does not use this: it has a
+/// per-message answer in `effects.published_app_messages` and reports that,
+/// because one pass can publish unrelated work alongside a retained message.
+pub(crate) fn accept_disposition_from_effects(
+    effects: &marmot_account::AccountDeviceEffects,
+) -> cgka_traits::SendAcceptDisposition {
+    if effects.queued.is_empty() {
+        cgka_traits::SendAcceptDisposition::Published
+    } else {
+        cgka_traits::SendAcceptDisposition::AcceptedPending
     }
 }
 
