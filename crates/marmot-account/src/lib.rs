@@ -17,7 +17,7 @@ mod time;
 
 pub use error::{AccountError, AccountHomeError, AccountHomeResult, AccountResult};
 pub use home::{
-    AccountHome, AccountSetupPhase, AccountSetupState, AccountSummary,
+    AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
     DEFAULT_KEYCHAIN_SERVICE_NAME, EXTERNAL_SQLCIPHER_SECRET_FILE, NostrAccountImport,
 };
 pub use key_package::{

@@ -13,7 +13,8 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
 use marmot_account::{
-    AccountHome, AccountHomeError, AccountSetupPhase, AccountSummary, NostrAccountImport,
+    AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
+    NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
@@ -3420,26 +3421,20 @@ impl AccountManager {
             .account_setup_state(&account.label)?
             .is_some()
         {
-            return Err(AppError::RelayDirectory(
-                "durable account setup state is recoverable by retry; reset is not allowed".into(),
-            ));
+            return Err(AppError::AccountSetupRetryRequired);
         }
         if !self
             .app
             .key_package_cutover_replacement_pending(&account.label)
         {
-            return Err(AppError::RelayDirectory(
-                "account is not in the legacy incomplete-setup recovery state".into(),
-            ));
+            return Err(AppError::AccountSetupResetNotApplicable);
         }
         let storage = self.app.account_storage(&account.label)?;
         if storage.key_package_lifecycle()?.is_some()
             || !storage.stored_key_package_bundles()?.is_empty()
             || self.app.key_package_record_path(&account.label).exists()
         {
-            return Err(AppError::RelayDirectory(
-                "account has recoverable KeyPackage state; reset is not allowed".into(),
-            ));
+            return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
 
         self.set_account_tearing_down(&account.account_id_hex, true);
@@ -4004,8 +3999,14 @@ impl AccountManager {
                 .account_home()
                 .account_setup_state(&account.label)?
                 .map(|state| state.phase);
-            if setup_phase == Some(AccountSetupPhase::KeyPackagePublicationConfirmed) {
-                Some(self.confirmed_setup_key_package_bytes(&account.label)?)
+            let confirmed_bytes =
+                if setup_phase == Some(AccountSetupPhase::KeyPackagePublicationConfirmed) {
+                    self.confirmed_setup_key_package_bytes(&account.label)?
+                } else {
+                    None
+                };
+            if let Some(bytes) = confirmed_bytes {
+                Some(bytes)
             } else {
                 self.shared.lifecycle().ensure_running()?;
                 if setup_phase.is_some()
@@ -4137,6 +4138,24 @@ impl AccountManager {
                 err,
             );
         }
+        if self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_none()
+        {
+            self.app.account_home().begin_account_setup_with(
+                &account,
+                false,
+                AccountSetupKind::ExternalSigner,
+                AccountSetupPhase::LocalStateCreated,
+            )?;
+        }
+        let setup_already_reached_publication = self
+            .app
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|state| state.phase != AccountSetupPhase::LocalStateCreated);
 
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
         // An external-signer account is pre-existing by definition, so resolve
@@ -4162,6 +4181,9 @@ impl AccountManager {
         {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
+                if setup_already_reached_publication {
+                    return Err(err);
+                }
                 return self.rollback_external_signer_setup(
                     &account.label,
                     created_account,
@@ -4172,8 +4194,18 @@ impl AccountManager {
         };
 
         let key_package_bytes = if request.publish_initial_key_package {
+            self.app.account_home().set_account_setup_phase(
+                &account.label,
+                AccountSetupPhase::KeyPackagePublicationStarted,
+            )?;
             match self.publish_initial_key_package_for_account(&account).await {
-                Ok(bytes) => Some(bytes),
+                Ok(bytes) => {
+                    self.app.account_home().set_account_setup_phase(
+                        &account.label,
+                        AccountSetupPhase::KeyPackagePublicationConfirmed,
+                    )?;
+                    Some(bytes)
+                }
                 // Session lifecycle state owns exact signed bytes and private
                 // material before network exposure. Once KeyPackage setup has
                 // started, deleting a freshly-added external account could
@@ -4203,6 +4235,9 @@ impl AccountManager {
                 .set_account_signed_out(&account.label, false)?;
         }
         self.reconcile().await?;
+        self.app
+            .account_home()
+            .complete_account_setup(&account.label)?;
 
         Ok(AccountSetupResult {
             account,
@@ -4406,13 +4441,13 @@ impl AccountManager {
         Ok(key_package.bytes().len())
     }
 
-    fn confirmed_setup_key_package_bytes(&self, label: &str) -> Result<usize, AppError> {
-        self.app
+    fn confirmed_setup_key_package_bytes(&self, label: &str) -> Result<Option<usize>, AppError> {
+        Ok(self
+            .app
             .account_storage(label)?
             .key_package_lifecycle()?
             .and_then(|lifecycle| lifecycle.current_key_package)
-            .map(|key_package| key_package.bytes().len())
-            .ok_or(AppError::AccountSetupRecoveryRequired)
+            .map(|key_package| key_package.bytes().len()))
     }
 
     fn signed_out_account_for_identity(
@@ -4465,11 +4500,10 @@ impl AccountManager {
             {
                 return Err(AppError::IdentityKeyMismatch);
             }
-            self.app
-                .account_home()
-                .begin_account_setup(&account, false)?;
-            self.app.account_home().set_account_setup_phase(
-                &account.label,
+            self.app.account_home().begin_account_setup_with(
+                &account,
+                false,
+                AccountSetupKind::ImportedIdentity,
                 AccountSetupPhase::KeyPackagePublicationStarted,
             )?;
             return Ok(false);
@@ -4498,18 +4532,22 @@ impl AccountManager {
         match request.identity.as_deref() {
             Some(value) => {
                 let account = account_home.add_public_account(value)?;
-                if let Err(error) = account_home.begin_account_setup(&account, false) {
+                if let Err(error) = account_home.begin_account_setup_with(
+                    &account,
+                    false,
+                    AccountSetupKind::PublicIdentity,
+                    AccountSetupPhase::LocalStateCreated,
+                ) {
                     let _ = account_home.remove_account(&account.label);
                     return Err(error.into());
                 }
                 Ok((account, None))
             }
             None => {
-                let account = account_home.create_nostr_account()?;
-                if let Err(error) = account_home.begin_account_setup(&account, false) {
-                    let _ = account_home.remove_account(&account.label);
-                    return Err(error.into());
-                }
+                let account = match account_home.resumable_generated_account_setup()? {
+                    Some(account) => account,
+                    None => account_home.create_nostr_account_for_setup()?,
+                };
                 Ok((account, None))
             }
         }
@@ -4531,6 +4569,7 @@ impl AccountManager {
             return self.rollback_account_after_setup_failure(label, err);
         }
         if upgraded_public_account {
+            let _ = self.app.account_home().complete_account_setup(label);
             let _ = self
                 .app
                 .account_home()

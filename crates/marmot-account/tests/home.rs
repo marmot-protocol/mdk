@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Once};
 
 use marmot_account::{
-    AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSummary,
-    KeychainSecretStore,
+    AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
+    AccountSetupPhase, AccountSetupState, AccountSummary, KeychainSecretStore,
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
@@ -106,6 +106,83 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
             .to_hex(),
         imported.account_id_hex
     );
+}
+
+#[test]
+fn runtime_import_recovers_journal_before_secret_or_account_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let account_dir = dir.path().join("accounts").join(&account_id);
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join(".account-setup.json"),
+        serde_json::to_vec(&AccountSetupState {
+            account_id_hex: account_id.clone(),
+            reused_account_id_credential: false,
+            kind: AccountSetupKind::ImportedIdentity,
+            phase: AccountSetupPhase::LocalStateCreated,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let home = AccountHome::open(dir.path());
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(imported.account().account_id_hex, account_id);
+    assert_eq!(home.accounts().unwrap().len(), 1);
+    assert_eq!(
+        home.load_signing_keys(&account_id).unwrap().public_key(),
+        keys.public_key()
+    );
+}
+
+#[test]
+fn runtime_import_recovers_journal_and_secret_before_account_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let account = home
+        .import_nostr_account(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    std::fs::remove_file(home.account_dir(&account.label).join("account.json")).unwrap();
+    std::fs::write(
+        home.account_dir(&account.label).join(".account-setup.json"),
+        serde_json::to_vec(&AccountSetupState {
+            account_id_hex: account_id.clone(),
+            reused_account_id_credential: false,
+            kind: AccountSetupKind::ImportedIdentity,
+            phase: AccountSetupPhase::LocalStateCreated,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let imported = home
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    assert_eq!(imported.account().account_id_hex, account_id);
+    assert_eq!(home.accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn setup_phase_update_fails_when_journal_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.set_account_setup_phase(
+            &account.label,
+            AccountSetupPhase::KeyPackagePublicationStarted
+        ),
+        Err(AccountHomeError::AccountSetupStateMissing)
+    ));
 }
 
 #[test]

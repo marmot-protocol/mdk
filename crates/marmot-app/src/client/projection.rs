@@ -596,6 +596,13 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::AccountSetupRecoveryRequired => {
             "read_marker_failed:account_setup_recovery_required"
         }
+        AppError::AccountSetupRetryRequired => "read_marker_failed:account_setup_retry_required",
+        AppError::AccountSetupResetNotApplicable => {
+            "read_marker_failed:account_setup_reset_not_applicable"
+        }
+        AppError::AccountSetupKeyPackageRecoveryAvailable => {
+            "read_marker_failed:account_setup_key_package_recovery_available"
+        }
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
         AppError::TransportClosed => "read_marker_failed:transport_closed",

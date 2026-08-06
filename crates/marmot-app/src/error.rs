@@ -131,6 +131,12 @@ pub enum AppError {
         "incomplete account setup requires explicit recovery because prior KeyPackage exposure cannot be ruled out"
     )]
     AccountSetupRecoveryRequired,
+    #[error("durable account setup can be resumed by retrying the original operation")]
+    AccountSetupRetryRequired,
+    #[error("account is not in the legacy incomplete-setup reset state")]
+    AccountSetupResetNotApplicable,
+    #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
+    AccountSetupKeyPackageRecoveryAvailable,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
     #[error("no matching reaction by this account to retract")]
@@ -215,6 +221,11 @@ impl AppError {
             Self::RuntimeBusy => "runtime_busy",
             Self::AccountSessionBusy => "account_session_busy",
             Self::AccountSetupRecoveryRequired => "account_setup_recovery_required",
+            Self::AccountSetupRetryRequired => "account_setup_retry_required",
+            Self::AccountSetupResetNotApplicable => "account_setup_reset_not_applicable",
+            Self::AccountSetupKeyPackageRecoveryAvailable => {
+                "account_setup_key_package_recovery_available"
+            }
             Self::RuntimeStopping => "runtime_stopping",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",
@@ -259,6 +270,7 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::InvalidPublicKey => "account_home_invalid_public_key",
         AccountHomeError::InvalidAccountLabel(_) => "account_home_invalid_account_label",
         AccountHomeError::AccountIdMismatch => "account_home_account_id_mismatch",
+        AccountHomeError::AccountSetupStateMissing => "account_home_setup_state_missing",
         AccountHomeError::UnsupportedSecretBackend(_) => "account_home_unsupported_secret_backend",
         AccountHomeError::SecretStoreNotInitialized(_) => {
             "account_home_secret_store_not_initialized"
