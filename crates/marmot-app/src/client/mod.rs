@@ -2199,6 +2199,10 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
+        // Discarded deliberately, unlike on the convergence-retry path: the
+        // re-record below reprojects the same row with its new source id and
+        // hands that update to `on_local_projection`, so forwarding these too
+        // would emit the flip twice.
         let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
@@ -2882,7 +2886,15 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
-        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        // This is the path that releases sends the engine had retained, so its
+        // finalize updates carry the pending -> delivered flip for each of them.
+        // Unlike the send path — which drops the same updates because it
+        // immediately re-records the row and hands that update to the caller —
+        // there is nothing here to re-emit them, so buffer them for the account
+        // worker to broadcast. Dropping them leaves storage delivered while
+        // every timeline and chat-list subscriber still shows pending.
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.pending_projection_updates.extend(finalize_updates);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
