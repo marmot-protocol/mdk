@@ -1,0 +1,97 @@
+name: Convergence Hardening
+
+on:
+  schedule:
+    - cron: "43 2 * * 6"
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Execution lane
+        required: true
+        type: choice
+        default: weekly_manual
+        options:
+          - weekly_manual
+          - release_hardening
+      distributed_manifest:
+        description: Repository-relative mixed-build manifest required by release hardening
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: convergence-hardening-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  hardening:
+    name: Weekly or release convergence hardening
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: just
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build current distributed campaign image
+        run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
+
+      - name: Run weekly/manual lane
+        if: github.event_name == 'schedule' || inputs.lane == 'weekly_manual'
+        run: |
+          just convergence-weekly-lane
+          CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
+            cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+              --run-ignored ignored-only --no-tests fail
+
+      - name: Require a release manifest
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
+        run: |
+          test -n "$DISTRIBUTED_MANIFEST"
+          test -f "$DISTRIBUTED_MANIFEST"
+
+      - name: Run release-hardening lane
+        if: github.event_name == 'workflow_dispatch' && inputs.lane == 'release_hardening'
+        env:
+          DISTRIBUTED_MANIFEST: ${{ inputs.distributed_manifest }}
+        run: just convergence-release-hardening-lane "$DISTRIBUTED_MANIFEST"
+
+      - name: Upload convergence evidence inputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: convergence-hardening-${{ github.run_id }}
+          path: |
+            target/cgka-weekly-reliability
+            target/cgka-adversarial-reliability-ci
+          if-no-files-found: warn
+          retention-days: ${{ inputs.lane == 'release_hardening' && 180 || 60 }}

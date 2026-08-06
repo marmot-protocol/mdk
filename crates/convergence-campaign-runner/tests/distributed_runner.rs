@@ -413,6 +413,25 @@ fn mutable_container_images_require_an_explicit_local_opt_out() {
 }
 
 #[test]
+fn release_mixed_build_validation_requires_distinct_builds_and_images() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.validate_mixed_builds().unwrap();
+
+    manifest.participants[1].build_id = manifest.participants[0].build_id.clone();
+    assert_eq!(
+        manifest.validate_mixed_builds().unwrap_err().code,
+        "mixed_build_ids"
+    );
+
+    manifest.participants[1].build_id = "previous".into();
+    manifest.participants[1].container_image = None;
+    assert_eq!(
+        manifest.validate_mixed_builds().unwrap_err().code,
+        "mixed_build_images"
+    );
+}
+
+#[test]
 fn faults_sharing_a_barrier_keep_distinct_compensation_boundaries() {
     let (_root, mut manifest) = container_manifest();
     manifest.faults = vec![

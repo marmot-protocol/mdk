@@ -50,19 +50,22 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run complete simulator suite
-        # Adversarial campaigns and independent convergence checks run below
-        # with their required feature sets; exclude only those duplicates here.
-        run: just simulator-full
+      - name: Run nightly convergence lane
+        run: just convergence-nightly-lane
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
-      - name: Run adversarial reliability campaigns
-        run: just adversarial-reliability-ci
+      - name: Build current distributed campaign image
+        run: docker build -f Dockerfile.convergence-campaign -t marmot-conformance:local .
 
-      - name: Verify convergence with independent models
-        run: just convergence-verification-ci
+      - name: Run selected real-container convergence campaign
+        env:
+          CGKA_CONVERGENCE_IMAGE: marmot-conformance:local
+        run: |
+          cargo nextest run -p convergence-campaign-runner --test container_runtime --locked \
+            --run-ignored ignored-only --no-tests fail \
+            -E 'test(=real_container_nodes_survive_network_shaping_and_reach_exact_state)'
 
       - name: Run encrypted file-backed vector report
         run: |
@@ -81,6 +84,7 @@ jobs:
           name: cgka-conformance-simulator-nightly-reports
           path: target/cgka-conformance-simulator-nightly-reports
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Report nightly failure
         if: failure()

@@ -5,10 +5,14 @@ use std::path::Path;
 
 use sha2::Digest;
 
+pub mod evidence;
+pub mod lane;
 pub mod manifest;
 pub mod plan;
 pub mod runner;
 
+pub use evidence::*;
+pub use lane::*;
 pub use manifest::*;
 pub use plan::*;
 pub use runner::*;

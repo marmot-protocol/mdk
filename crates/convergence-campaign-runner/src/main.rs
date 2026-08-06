@@ -3,8 +3,10 @@ use std::process::{ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
-    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, load_manifest,
-    run_manifest, validate_scenario_bytes, verify_manifest_inputs,
+    CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
+    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan,
+    evidence_bundle_base_dir, load_manifest, run_manifest, validate_scenario_bytes,
+    verify_manifest_inputs,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -20,7 +22,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Validate the manifest and pinned scenario bytes without side effects.
-    Validate { manifest: PathBuf },
+    Validate {
+        manifest: PathBuf,
+        /// Require at least two participant builds and effective container images.
+        #[arg(long)]
+        require_mixed_builds: bool,
+    },
     /// Print or privately write the exact argv execution plan.
     Plan {
         manifest: PathBuf,
@@ -31,6 +38,21 @@ enum Commands {
     Doctor { manifest: PathBuf },
     /// Execute the campaign and write owner-only reports under output_dir.
     Run { manifest: PathBuf },
+    /// Print or privately write the reviewed policy for an execution lane.
+    Lane {
+        lane: CampaignLaneV1,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Fail when observed campaign usage exceeds the selected lane budget.
+    CheckBudget {
+        lane: CampaignLaneV1,
+        observation: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Validate that an evidence bundle contains every required assurance section.
+    CheckEvidence { bundle: PathBuf },
 }
 
 #[tokio::main]
@@ -47,8 +69,14 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Validate { manifest } => {
+        Commands::Validate {
+            manifest,
+            require_mixed_builds,
+        } => {
             let manifest = load_manifest(&manifest)?;
+            if require_mixed_builds {
+                manifest.validate_mixed_builds()?;
+            }
             let scenario = verify_manifest_inputs(&manifest)?;
             validate_scenario_bytes(&manifest, &scenario)?;
             println!("valid {}", manifest.campaign_id);
@@ -101,6 +129,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("campaign did not complete; inspect private run artifacts".into());
             }
             println!("completed {}", receipt.campaign_id);
+        }
+        Commands::Lane { lane, output } => {
+            let config = CampaignLaneConfigV1::builtin(lane);
+            let bytes = serde_json::to_vec_pretty(&config)?;
+            if let Some(path) = output {
+                fs_private::write_private(&path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Commands::CheckBudget {
+            lane,
+            observation,
+            output,
+        } => {
+            let observed: CampaignLaneObservationV1 =
+                serde_json::from_slice(&std::fs::read(observation)?)?;
+            let evaluation = CampaignLaneConfigV1::builtin(lane).evaluate(observed);
+            let bytes = serde_json::to_vec_pretty(&evaluation)?;
+            if let Some(path) = output {
+                fs_private::write_private(&path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+            if !evaluation.passed {
+                return Err("campaign exceeded its reviewed lane budget".into());
+            }
+        }
+        Commands::CheckEvidence {
+            bundle: bundle_path,
+        } => {
+            let base_dir = evidence_bundle_base_dir(&bundle_path);
+            let bundle: ConvergenceEvidenceBundleV1 =
+                serde_json::from_slice(&std::fs::read(&bundle_path)?)?;
+            bundle.validate_artifacts(base_dir)?;
+            println!("valid-evidence {}", bundle.source_revision);
         }
     }
     Ok(())

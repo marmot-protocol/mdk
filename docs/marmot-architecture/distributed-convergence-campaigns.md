@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-05
+updated: 2026-08-06
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -115,6 +115,38 @@ CGKA_CONVERGENCE_IMAGE=marmot-conformance:local \
 
 The default CI lane validates command construction and the process boundary without requiring Docker. Scheduled lanes
 may opt into the real-container tests when the runner environment advertises that capability.
+
+## Execution lanes and budgets
+
+Reviewed lane manifests live under `crates/convergence-campaign-runner/lanes`. They are compiled into the runner with
+`include_str!` and parsed by `CampaignLaneConfigV1::builtin`, so the reviewed JSON is the only policy source rather
+than a second copy of the same constants in Rust.
+The four lanes are:
+
+- pull request: the ordinary mandatory formal/model/vector checks without Docker;
+- nightly: file-backed, crash, retained-relay, mutation, process, policy-sweep, and selected-container coverage;
+- weekly/manual: the nightly coverage plus a larger generated batch and the full current container test target; and
+- release hardening: the weekly work plus an operator-supplied distributed manifest with at least two participant
+  build ids and, for containers, at least two effective participant images.
+
+The source revision must already have passed the mandatory PR formal gate; scheduled workflows do not repeat the same
+state-independent proof. Incident-corpus coverage is deliberately false in these manifests until the failure-corpus
+slice lands.
+
+Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
+and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
+any limit is exceeded. It also rejects zero executed cases, observations below the lane minimum, and flaky-case counts
+larger than executed-case counts. The scheduled workflows do not yet emit this aggregate observation or invoke
+`check-budget`; these limits are machine-checkable reviewed policy, not yet a green-workflow attestation.
+`minimum_executed_cases` is therefore only a liveness floor: it prevents empty evidence, but does not prove that every
+declared capability ran. Capability-specific evidence remains required before a lane can support an assurance claim.
+
+The version-1 evidence-bundle type requires a scoped assurance claim, covered decision routes, models, adapters,
+mutation results, tested workload/constant boundaries, unresolved counterexamples, residual assumptions, untested
+surfaces, a passing same-lane budget evaluation, and at least one digest-pinned artifact. `check-evidence` recomputes
+the evaluation from the recorded observation and reviewed lane policy instead of trusting producer-supplied result
+fields. It rejects incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by
+resolving artifacts relative to the bundle's directory. Valid bundles are written with owner-only permissions.
 
 ## What this evidence means
 
