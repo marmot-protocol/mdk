@@ -177,21 +177,21 @@ fn validate_partition_restart_order(
     let mut active = std::collections::BTreeSet::<(String, String)>::new();
     for fault in faults {
         match &fault.action {
-            crate::DistributedFaultV1::NetworkPartition { participant, peer } => {
-                if !active.insert((participant.clone(), fault_peer_key(peer))) {
-                    return Err(RunnerError::validation(
-                        "duplicate_network_partition",
-                        "a participant/peer partition cannot be applied again before it is healed",
-                    ));
-                }
+            crate::DistributedFaultV1::NetworkPartition { participant, peer }
+                if !active.insert((participant.clone(), fault_peer_key(peer))) =>
+            {
+                return Err(RunnerError::validation(
+                    "duplicate_network_partition",
+                    "a participant/peer partition cannot be applied again before it is healed",
+                ));
             }
-            crate::DistributedFaultV1::NetworkHeal { participant, peer } => {
-                if !active.remove(&(participant.clone(), fault_peer_key(peer))) {
-                    return Err(RunnerError::validation(
-                        "unmatched_network_heal",
-                        "a network heal requires a preceding active partition for the same participant and peer",
-                    ));
-                }
+            crate::DistributedFaultV1::NetworkHeal { participant, peer }
+                if !active.remove(&(participant.clone(), fault_peer_key(peer))) =>
+            {
+                return Err(RunnerError::validation(
+                    "unmatched_network_heal",
+                    "a network heal requires a preceding active partition for the same participant and peer",
+                ));
             }
             crate::DistributedFaultV1::CrashParticipantHost { participant }
                 if active.iter().any(|(subject, peer)| {
