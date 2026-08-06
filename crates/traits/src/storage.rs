@@ -66,6 +66,17 @@ impl StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Immutable, branch-addressed canonical group-state checkpoint.
+///
+/// The checkpoint id is derived from an authenticated MLS commit, while the
+/// resulting epoch is retained only for bounded garbage collection.  Backends
+/// must reject an attempt to replace an existing id with different contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStateCheckpointRef {
+    pub id: String,
+    pub resulting_epoch: EpochId,
+}
+
 // ── GroupStorage ────────────────────────────────────────────────────────────
 
 /// CRUD for group metadata (no Nostr types; see `group.rs` invariants).
@@ -109,6 +120,33 @@ pub trait MessageStorage {
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
+
+    /// Capture only canonical group state: the Marmot group projection,
+    /// member-capability projection, validation marker, and every group-scoped
+    /// OpenMLS provider value. Messages, outbound queues, and convergence-pass
+    /// bookkeeping are deliberately excluded.
+    fn create_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint: &GroupStateCheckpointRef,
+    ) -> StorageResult<()>;
+
+    fn restore_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()>;
+
+    fn list_group_state_checkpoints(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<GroupStateCheckpointRef>>;
+
+    fn release_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()>;
 }
 
 // ── OutboundIntentStorage ──────────────────────────────────────────────────

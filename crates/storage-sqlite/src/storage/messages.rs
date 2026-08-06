@@ -5,7 +5,7 @@ use crate::{
     serialize,
 };
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
+use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -124,6 +124,37 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn create_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint: &GroupStateCheckpointRef,
+    ) -> StorageResult<()> {
+        snapshots::create_group_state_checkpoint(self, group_id, checkpoint)
+    }
+
+    fn restore_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        snapshots::restore_group_state_checkpoint(self, group_id, checkpoint_id)
+    }
+
+    fn list_group_state_checkpoints(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<GroupStateCheckpointRef>> {
+        snapshots::list_group_state_checkpoints(self, group_id)
+    }
+
+    fn release_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        snapshots::release_group_state_checkpoint(self, group_id, checkpoint_id)
     }
 
     fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {

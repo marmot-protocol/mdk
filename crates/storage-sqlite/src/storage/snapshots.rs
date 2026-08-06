@@ -1,4 +1,5 @@
 mod capture;
+mod checkpoints;
 mod lifecycle;
 mod restore;
 mod rows;
@@ -35,6 +36,37 @@ pub(super) fn release(
     lifecycle::release(store, group_id, name)
 }
 
+pub(super) fn create_group_state_checkpoint(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    checkpoint: &cgka_traits::storage::GroupStateCheckpointRef,
+) -> StorageResult<()> {
+    checkpoints::create_group_state_checkpoint(store, group_id, checkpoint)
+}
+
+pub(super) fn restore_group_state_checkpoint(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    checkpoint_id: &str,
+) -> StorageResult<()> {
+    checkpoints::restore_group_state_checkpoint(store, group_id, checkpoint_id)
+}
+
+pub(super) fn list_group_state_checkpoints(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> StorageResult<Vec<cgka_traits::storage::GroupStateCheckpointRef>> {
+    checkpoints::list_group_state_checkpoints(store, group_id)
+}
+
+pub(super) fn release_group_state_checkpoint(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    checkpoint_id: &str,
+) -> StorageResult<()> {
+    checkpoints::release_group_state_checkpoint(store, group_id, checkpoint_id)
+}
+
 #[cfg(feature = "test-conformance-replay")]
 pub(crate) fn export_replay(
     store: &SqliteAccountStorage,
@@ -60,8 +92,8 @@ mod tests {
     };
     use cgka_traits::capabilities::{Capability, GroupCapabilities};
     use cgka_traits::storage::{
-        CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, StorageError,
-        StorageProvider,
+        CapabilityStorage, GroupStateCheckpointRef, GroupStorage, MessageStorage,
+        OutboundIntentStorage, StorageError, StorageProvider,
     };
     use cgka_traits::types::EpochId;
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -120,6 +152,81 @@ mod tests {
         );
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+    }
+
+    #[test]
+    fn group_state_checkpoint_restores_canonical_state_without_rewinding_live_work() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let g1 = sample_group(gid(1), 1, 1);
+        store.put_group(&g1).unwrap();
+        let mls_group_id = openmls::group::GroupId::from_slice(g1.id.as_slice());
+        store
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"branch-a".to_vec()))
+            .unwrap();
+        let checkpoint = GroupStateCheckpointRef {
+            id: "own-commit-a".into(),
+            resulting_epoch: EpochId(1),
+        };
+        store
+            .create_group_state_checkpoint(&g1.id, &checkpoint)
+            .unwrap();
+        // Exact retry is idempotent.
+        store
+            .create_group_state_checkpoint(&g1.id, &checkpoint)
+            .unwrap();
+
+        let g2 = sample_group(gid(1), 2, 2);
+        store.put_group(&g2).unwrap();
+        let live_message = sample_message(mid(2), g2.id.clone(), 2);
+        let live_queue = sample_queued_intent(mid(10), g2.id.clone());
+        store.put_message(&live_message).unwrap();
+        store.put_queued_outbound_intent(&live_queue).unwrap();
+        store
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"branch-b".to_vec()))
+            .unwrap();
+
+        store
+            .restore_group_state_checkpoint(&g2.id, &checkpoint.id)
+            .unwrap();
+
+        assert_eq!(store.get_group(&g1.id).unwrap(), g1);
+        let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
+        assert_eq!(state, Some(TestGroupState(b"branch-a".to_vec())));
+        assert_eq!(
+            store.list_messages(&g1.id, EpochId(0)).unwrap(),
+            vec![live_message]
+        );
+        assert_eq!(
+            store.list_queued_outbound_intents(&g1.id).unwrap(),
+            vec![live_queue]
+        );
+    }
+
+    #[test]
+    fn group_state_checkpoint_id_is_immutable() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let g1 = sample_group(gid(1), 1, 1);
+        store.put_group(&g1).unwrap();
+        let checkpoint = GroupStateCheckpointRef {
+            id: "own-commit-a".into(),
+            resulting_epoch: EpochId(1),
+        };
+        store
+            .create_group_state_checkpoint(&g1.id, &checkpoint)
+            .unwrap();
+
+        let g2 = sample_group(gid(1), 2, 2);
+        store.put_group(&g2).unwrap();
+        assert!(matches!(
+            store.create_group_state_checkpoint(&g2.id, &checkpoint),
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            store.list_group_state_checkpoints(&g2.id).unwrap(),
+            vec![checkpoint]
+        );
     }
 
     #[test]

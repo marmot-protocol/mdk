@@ -1,6 +1,6 @@
 use super::rows::{
-    MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound,
-    Snapshot,
+    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
+    OrderedQueuedOutbound, Snapshot,
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
@@ -131,6 +131,18 @@ fn restore_snapshot(
     convergence_policy(conn, group_id, snapshot.convergence_policy.as_deref())?;
     validated_tree_marker(conn, group_id, snapshot.validated_tree_marker.as_deref())?;
     openmls_values(conn, mls_group_key, &snapshot.openmls_values)
+}
+
+pub(super) fn restore_group_state(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    checkpoint: &GroupStateCheckpoint,
+) -> StorageResult<()> {
+    let mls_group_key = mls_group_key(group_id)?;
+    group(conn, group_id, &checkpoint.group)?;
+    member_capabilities(conn, group_id, &checkpoint.member_caps)?;
+    validated_tree_marker(conn, group_id, checkpoint.validated_tree_marker.as_deref())?;
+    openmls_values(conn, &mls_group_key, &checkpoint.openmls_values)
 }
 
 fn group(conn: &rusqlite::Connection, group_id: &GroupId, group: &Group) -> StorageResult<()> {

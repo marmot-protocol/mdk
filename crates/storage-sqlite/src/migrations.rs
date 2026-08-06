@@ -80,6 +80,8 @@ mod migration_0039_chat_pin_positions;
 mod migration_0040_disband_requests;
 #[path = "migrations/0041_secure_delete_checkpoint_intents.rs"]
 mod migration_0041_secure_delete_checkpoint_intents;
+#[path = "migrations/0042_group_state_checkpoints.rs"]
+mod migration_0042_group_state_checkpoints;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -296,6 +298,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 41,
         name: "0041_secure_delete_checkpoint_intents",
         apply: migration_0041_secure_delete_checkpoint_intents::apply,
+    },
+    Migration {
+        version: 42,
+        name: "0042_group_state_checkpoints",
+        apply: migration_0042_group_state_checkpoints::apply,
     },
 ];
 

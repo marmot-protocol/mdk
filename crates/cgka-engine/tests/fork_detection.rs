@@ -178,6 +178,19 @@ fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<Sql
     engine
 }
 
+fn reopen_legacy_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
+    let mut engine = EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine
+}
+
 fn raw_self_update_commit(
     storage: &SqliteAccountStorage,
     sender: &MemberId,
@@ -1833,35 +1846,12 @@ async fn pairwise_candidate_win_leaves_old_incumbent_reconsiderable() {
 }
 
 #[tokio::test]
-async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_lineage() {
-    // Variant of `pairwise_candidate_win_leaves_old_incumbent_reconsiderable`
-    // with ONE extra commit on the winning (rival) branch between the
-    // displacement and the A-branch follow-on. That single commit is what
-    // breaks the retained-anchor fast path, because retained anchors are
-    // name-keyed by resulting epoch (`openmls-retained-anchor-<N>`) and every
-    // capture at that epoch REPLACES the previous one — including the captures
-    // `ingest` takes around each inbound merge. Applying the rival's follow-on
-    // therefore overwrites the anchor that held X's parked own commit A's
-    // post-merge state, with no own-stamped row left behind to notice it.
-    //
-    // What this test pins down is the SAFE outcome. The apply rewinds to the
-    // anchor, recomputes the content-bound tree marker, finds it does not match
-    // the marker A stamped at confirm time, and aborts — the rewind is rolled
-    // back and X keeps its existing (rival-branch) state. The unsafe outcome
-    // this guards against is the one the positive check replaced: silently
-    // adopting whatever the clobbered anchor happens to hold, i.e. installing a
-    // lineage that never existed on any node.
-    //
-    // NOTE — this is the clobbered-anchor LIVENESS limitation, not a
-    // silent-corruption path. Once the anchor is gone, the parked own commit
-    // cannot be realized at all: the anchor rewind is its only route, since MLS
-    // `process_message` refuses this device's own commits, so normal replay
-    // cannot materialize it either. X therefore fails closed and stays on its
-    // own branch, diverged from the fleet, until the rewind horizon retires the
-    // parked row and it reorgs onto whatever remains selectable. Correctness is
-    // preserved; liveness inside that window is not. Restoring it needs
-    // content-keyed retained anchors, which is shared with the convergence
-    // engine and out of scope for this fix.
+async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
+    // X confirms A, loses pairwise to B, and advances B far enough to replace
+    // every epoch-named anchor that previously described A.  After a restart,
+    // A grows deeper. X must cross its own path-bearing commit without asking
+    // OpenMLS to process the wire echo: the immutable commit-addressed
+    // checkpoint restores A's exact post-merge state and replay continues.
     use cgka_traits::ingest::IngestOutcome;
 
     let first = b"cwrf-first".as_slice();
@@ -2006,6 +1996,18 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
         3,
         "X must apply the rival's follow-on on the branch it rolled onto"
     );
+    assert_eq!(
+        x_storage
+            .list_group_state_checkpoints(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "the own-commit checkpoint must not alias the rival's epoch anchor"
+    );
+
+    // Prove checkpoint identity and the own-commit stamp survive hydration.
+    drop(x);
+    let mut x = reopen_legacy_client(x_id, x_storage.clone());
 
     // (3) Y settles A and grows the A-branch two commits deeper, so distributed
     // convergence unambiguously prefers it (depth 3 vs the rival branch's 2)
@@ -2046,9 +2048,8 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
     };
     assert_eq!(y.epoch(&group_id).unwrap().0, 4);
 
-    // (4) X ingests the deeper A-branch. Convergence selects it, the apply
-    // reaches the retained-anchor fast path for the parked own commit A, and
-    // the post-rewind marker check refuses it.
+    // (4) X ingests the deeper A-branch. Convergence selects it, restores A's
+    // commit-addressed checkpoint, then replays both peer-authored descendants.
     let outcome = x.ingest(route(follow_on)).await.unwrap();
     assert!(
         matches!(outcome, IngestOutcome::Buffered { .. }),
@@ -2059,38 +2060,42 @@ async fn pairwise_candidate_win_with_rival_follow_on_fails_closed_not_wrong_line
         matches!(outcome_2, IngestOutcome::Buffered { .. }),
         "the second A-branch follow-on must enter the convergence pass, got {outcome_2:?}"
     );
-    let converge = x.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+    let convergence = x
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the deeper A branch must be realizable after restart");
 
-    // Whatever convergence reports, the invariant is the same: X must NOT be
-    // holding a state assembled from the clobbered anchor.
     let x_members: Vec<_> = x
         .members(&group_id)
         .unwrap()
         .iter()
         .map(|m| m.id.clone())
         .collect();
-    assert!(
-        !x_members.contains(&MemberId::new(pad32(b"cwrf-david"))),
-        "X must not silently install the A-branch it cannot prove it rewound to; \
-         members were {x_members:?}, convergence returned {converge:?}"
+    let y_members: Vec<_> = y
+        .members(&group_id)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(
+        x_members,
+        y_members,
+        "X and Y must converge after restart; X epoch {:?}, result {convergence:?}",
+        x.epoch(&group_id)
     );
-    assert!(
-        x_members.contains(&MemberId::new(pad32(b"cwrf-eve")))
-            && x_members.contains(&MemberId::new(pad32(b"cwrf-heidi"))),
-        "X must keep the intact branch it was already on; members were {x_members:?}"
-    );
+    assert!(x_members.contains(&MemberId::new(pad32(b"cwrf-david"))));
+    assert!(x_members.contains(&MemberId::new(pad32(b"cwrf-frank"))));
+    assert!(x_members.contains(&MemberId::new(pad32(b"cwrf-grace"))));
+    assert!(!x_members.contains(&MemberId::new(pad32(b"cwrf-eve"))));
+    assert!(!x_members.contains(&MemberId::new(pad32(b"cwrf-heidi"))));
     assert_eq!(
         x.epoch(&group_id).unwrap().0,
-        3,
-        "the refused rewind must leave X's live epoch untouched"
+        4,
+        "X must reach the selected A-branch tip"
     );
-    // The parked own commit is still reconsiderable: nothing terminalized it,
-    // so once the horizon retires it (or a future engine key anchors by
-    // content) X is free to reorg.
-    let still_parked = x_storage.get_message(&commit_a.id).unwrap();
+    let realized = x_storage.get_message(&commit_a.id).unwrap();
     assert_eq!(
-        still_parked.state,
-        MessageState::ConvergenceDeferred,
-        "failing closed must not terminalize the parked own commit"
+        realized.state,
+        MessageState::Processed,
+        "the restored own commit must become canonical"
     );
 }

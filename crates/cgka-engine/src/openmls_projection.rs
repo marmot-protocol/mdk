@@ -338,13 +338,11 @@ pub enum OpenMlsProjectionError {
     Storage(String),
     InvalidPolicy(String),
     ReplayBudgetExceeded,
-    /// A retained-anchor rewind meant to realize a parked own commit landed on
-    /// state that does not match the fingerprint that commit stamped at
-    /// confirm time: the name-keyed anchor was replaced by another branch's
-    /// capture at the same epoch. The apply is aborted and rolled back rather
-    /// than installing the wrong lineage. See
-    /// [`verify_rewound_anchor_lineage`] for the liveness consequence.
-    AnchorLineageMismatch,
+    /// A branch-addressed own-commit checkpoint restored state that does not
+    /// match the resulting epoch and epoch authenticator stamped at confirm
+    /// time. The apply is aborted and rolled back rather than installing an
+    /// unverified lineage.
+    CheckpointStateMismatch,
 }
 
 impl std::fmt::Display for OpenMlsProjectionError {
@@ -389,10 +387,10 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::ReplayBudgetExceeded => {
                 write!(f, "convergence replay budget exceeded")
             }
-            OpenMlsProjectionError::AnchorLineageMismatch => {
+            OpenMlsProjectionError::CheckpointStateMismatch => {
                 write!(
                     f,
-                    "retained anchor does not hold the parked own commit's post-merge state"
+                    "own-commit checkpoint does not match its stamped post-merge state"
                 )
             }
         }
@@ -416,10 +414,9 @@ impl From<StorageError> for OpenMlsProjectionError {
 /// branch would silently drop out of branch selection and the device could be
 /// reorged onto a losing sibling (or, with two restarted committers, the group
 /// could fork permanently). Instead, an own `Processed` commit whose ordering
-/// stamp was persisted at confirm time is realized by rolling the group
-/// forward to the retained anchor snapshot at its resulting epoch — the exact
-/// post-merge state the commit produced — and synthesizing its
-/// `CommitStaged` observation from the stamp.
+/// stamp was persisted at confirm time is realized from its immutable,
+/// commit-addressed canonical-state checkpoint, and its `CommitStaged`
+/// observation is synthesized from that stamp.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PrevalidatedOwnCommits {
     /// Confirm-stamped own `Processed` commits, keyed by wire-bytes digest.
@@ -457,10 +454,8 @@ impl PrevalidatedOwnCommits {
 /// while the staged commit is still attached (confirm time). See
 /// [`cgka_traits::message::OwnCommitConvergenceStamp`].
 ///
-/// `post_commit_tree_marker` is left `None` here and filled in by the caller
-/// once the staged commit has been MERGED: the marker fingerprints the state
-/// the commit PRODUCES, which does not exist yet while the commit is merely
-/// staged. See [`own_commit_post_merge_tree_marker`].
+/// Checkpoint identity and resulting epoch authentication are filled in by the
+/// confirm path after the commit is merged.
 pub(crate) fn own_commit_stamp(
     staged: &openmls::group::StagedCommit,
     committer: MemberId,
@@ -477,22 +472,38 @@ pub(crate) fn own_commit_stamp(
         committer,
         priority,
         consumed_proposal_refs,
-        post_commit_tree_marker: None,
+        checkpoint_id: None,
+        resulting_epoch_authenticator: None,
     })
 }
 
-/// Fingerprint the state an own commit produced, for
-/// [`cgka_traits::message::OwnCommitConvergenceStamp::post_commit_tree_marker`].
-///
-/// Call with the group AFTER `merge_pending_commit`. The ciphersuite is read
-/// from the group itself so the value recomputed at rewind time (which has no
-/// engine handle) is derived from exactly the same inputs.
-pub(crate) fn own_commit_post_merge_tree_marker(
-    merged: &MlsGroup,
+pub(crate) fn own_commit_checkpoint_id<S: StorageProvider>(
+    storage: &S,
+    message_id: &MessageId,
 ) -> Result<String, cgka_traits::error::EngineError> {
-    Ok(hex::encode(
-        crate::group_lifecycle::compute_validated_tree_marker(merged, merged.ciphersuite())?,
+    let record = storage.get_message(message_id)?;
+    let payload = StoredMessagePayload::decode(&record.payload)
+        .map_err(|error| cgka_traits::error::EngineError::Serialize(error.to_string()))?;
+    let wire = payload.as_openmls_wire().ok_or_else(|| {
+        cgka_traits::error::EngineError::Serialize(
+            "own commit record does not contain OpenMLS wire bytes".into(),
+        )
+    })?;
+    let projection = project_mls_message(&wire.payload)
+        .map_err(|error| cgka_traits::error::EngineError::Serialize(error.to_string()))?;
+    if projection.kind != OpenMlsContentKind::Commit {
+        return Err(cgka_traits::error::EngineError::Serialize(
+            "own commit record is not a commit".into(),
+        ));
+    }
+    Ok(format!(
+        "openmls-own-commit-v1-{}",
+        hex::encode(projection.message_digest)
     ))
+}
+
+pub(crate) fn own_commit_post_merge_epoch_authenticator(merged: &MlsGroup) -> String {
+    hex::encode(merged.epoch_authenticator().as_slice())
 }
 
 /// Give retained proposal rows the same terminal disposition when a local
@@ -1661,21 +1672,19 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // step: skip it from the replay and rewind to the retained anchor at the
     // run's final resulting epoch — the exact post-merge state its last own
     // commit produced.
-    let own_anchor_prefix =
-        anchor_realizable_own_commit_prefix(storage, group_id, result, &applied_prefix)?;
+    let own_checkpoint_prefix =
+        checkpoint_realizable_own_commit_prefix(storage, group_id, result, &applied_prefix)?;
     let mut skipped_prefix = applied_prefix;
-    skipped_prefix.extend(own_anchor_prefix.commit_ids.iter().cloned());
-    let apply_start_epoch = match own_anchor_prefix.resulting_epoch {
+    skipped_prefix.extend(own_checkpoint_prefix.commit_ids.iter().cloned());
+    let apply_start_epoch = match own_checkpoint_prefix.resulting_epoch {
         Some(epoch) => epoch,
         None => apply_start_epoch_for_canonicalization_result(storage, result, &skipped_prefix)?
             .unwrap_or(current_epoch),
     };
-    // The own-anchor case must rewind even when the anchor epoch equals the
-    // live tip epoch: the live tip is a DIFFERENT branch's state at that
-    // epoch (that is what displaced the own incumbent), while the retained
-    // anchor holds the own commit's post-merge state.
-    let rewind_to_retained_anchor =
-        apply_start_epoch < current_epoch || own_anchor_prefix.resulting_epoch.is_some();
+    // The own-checkpoint case must restore even when its epoch equals the live
+    // tip: the live tip may be a different branch's state at that epoch.
+    let rewind_to_retained_anchor = apply_start_epoch < current_epoch;
+    let restore_own_checkpoint = own_checkpoint_prefix.checkpoint_id.is_some();
     let replay_messages = replay_messages_for_canonicalization_result(
         storage,
         result,
@@ -1695,15 +1704,12 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
 
     // Refresh the current-epoch anchor only in the case that always did:
     // there are new commits AND the apply starts at the live tip. The extra
-    // `own_anchor_prefix.resulting_epoch.is_none()` term is what this branch
-    // adds, and only that: in the own-anchor case the live tip and the rewind
-    // target share an epoch number, so retaining here would overwrite the own
-    // commit's post-merge state with the displacing branch's state before the
-    // rollback reads it. `apply_start_epoch > current_epoch` stays skipped,
-    // exactly as before.
+    // `own_checkpoint_prefix.resulting_epoch.is_none()` term avoids an
+    // unnecessary epoch-anchor refresh before restoring exact checkpoint
+    // state. `apply_start_epoch > current_epoch` stays skipped as before.
     let prepare_result = if has_new_commits
         && apply_start_epoch == current_epoch
-        && own_anchor_prefix.resulting_epoch.is_none()
+        && own_checkpoint_prefix.resulting_epoch.is_none()
     {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
     } else {
@@ -1720,24 +1726,31 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // therefore returns to the pre-apply live state instead of committing an
     // older message/queue image and rebuilding it row by row.
     let apply_result = storage.with_transaction(|storage| {
-        if rewind_to_retained_anchor {
+        if let Some(checkpoint_id) = own_checkpoint_prefix.checkpoint_id.as_deref() {
+            storage
+                .restore_group_state_checkpoint(group_id, checkpoint_id)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            verify_restored_own_checkpoint(
+                storage,
+                group_id,
+                own_checkpoint_prefix
+                    .resulting_epoch
+                    .expect("checkpoint prefix has resulting epoch"),
+                own_checkpoint_prefix
+                    .expected_epoch_authenticator
+                    .as_deref()
+                    .expect("checkpoint prefix has epoch authenticator"),
+            )?;
+            restore_live_message_and_queue_records(
+                storage,
+                &live_message_records,
+                &live_queued_outbound,
+            )?;
+        } else if rewind_to_retained_anchor {
             let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
             storage
                 .rollback_group_to_snapshot(group_id, &anchor_snapshot)
                 .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-            // Positive proof that the anchor held the parked own commit's
-            // post-merge state, taken only now — nothing before the rewind can
-            // distinguish a clobbered anchor from a good one (the anchor name
-            // encodes only the epoch). This runs inside the apply transaction
-            // and BEFORE any replay, so a mismatch unwinds the rewind with the
-            // live state untouched; the caller additionally rolls back to the
-            // pre-apply snapshot.
-            if let Some(expected_marker) = own_anchor_prefix
-                .expected_post_commit_tree_marker
-                .as_deref()
-            {
-                verify_rewound_anchor_lineage(storage, group_id, expected_marker)?;
-            }
             restore_live_message_and_queue_records(
                 storage,
                 &live_message_records,
@@ -1752,7 +1765,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             &replay_messages,
             profile_policy,
         )?;
-        if apply_start_epoch < current_epoch {
+        if apply_start_epoch < current_epoch || restore_own_checkpoint {
             crate::test_crash_hooks::pause_if_requested("historical-apply-before-commit");
         }
         storage
@@ -1872,54 +1885,38 @@ fn apply_start_epoch_for_canonicalization_result<S: StorageProvider>(
 }
 
 #[derive(Default)]
-struct AnchorRealizableOwnPrefix {
-    /// Selected-branch commit ids (hex) realized via the retained anchor
+struct CheckpointRealizableOwnPrefix {
+    /// Selected-branch commit ids (hex) realized via an exact checkpoint
     /// instead of replay.
     commit_ids: BTreeSet<String>,
-    /// Resulting epoch of the run's last own commit — the retained-anchor
-    /// rewind target that realizes the whole run.
+    /// Resulting epoch of the run's last own commit.
     resulting_epoch: Option<u64>,
-    /// Hex `post_commit_tree_marker` stamped by the run's LAST own commit:
-    /// the fingerprint the rewound state must reproduce for the rewind to be
-    /// proven on that commit's lineage. `Some` exactly when
-    /// `resulting_epoch` is `Some` — the scan refuses to extend the run past a
-    /// commit whose stamp carries no marker.
-    expected_post_commit_tree_marker: Option<String>,
+    checkpoint_id: Option<String>,
+    expected_epoch_authenticator: Option<String>,
 }
 
 /// The leading run — after the already-applied prefix — of this device's own
 /// confirm-stamped commits on the selected branch, bounded to those whose
-/// resulting-epoch retained anchor still exists. Such commits reach the apply
+/// commit-addressed checkpoint still exists. Such commits reach the apply
 /// stage outside the applied prefix when a pairwise CandidateWins resolution
 /// parked a displaced own incumbent `ConvergenceDeferred` (see
 /// `fork_recovery`) and convergence later selected its regrown branch. MLS
 /// refuses to re-process own commits, so the apply realizes the run by
-/// rewinding to the retained anchor at its final resulting epoch — the exact
-/// post-merge state captured when the commit confirmed — mirroring the
-/// selection stage's stamp rollforward (`PrevalidatedOwnCommits`). The first
-/// commit that is not an anchor-realizable own commit ends the run; anything
-/// after it replays normally from that state.
-///
-/// ## Anchor identity is NOT established here
-///
-/// Retained anchors are named by resulting epoch ALONE
-/// (`openmls-retained-anchor-<N>`) and every `retain_current_group_epoch_snapshot`
-/// call at that epoch REPLACES the previous one (`INSERT OR REPLACE`). Those
-/// callers include every inbound-commit merge, so a PEER commit that merely
-/// lands on epoch N silently clobbers an own commit's anchor while leaving no
-/// own-stamped row behind. No scan over stored rows can detect that, so this
-/// function does not try: it only assembles the CANDIDATE run and the
-/// fingerprint the rewound state must reproduce. The binding check is
-/// [`verify_rewound_anchor_lineage`], run after the rewind, inside the apply
-/// transaction.
-fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
+/// restoring the final commit's immutable checkpoint — the exact canonical
+/// state captured when it confirmed. The first commit without a retained
+/// checkpoint ends the run; anything after it replays normally from that
+/// state. The restored epoch and epoch authenticator are verified inside the
+/// apply transaction.
+fn checkpoint_realizable_own_commit_prefix<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     result: &CanonicalizationResult,
     applied_prefix: &BTreeSet<String>,
-) -> Result<AnchorRealizableOwnPrefix, OpenMlsProjectionError> {
-    let mut prefix = AnchorRealizableOwnPrefix::default();
-    let mut snapshots: Option<Vec<String>> = None;
+) -> Result<CheckpointRealizableOwnPrefix, OpenMlsProjectionError> {
+    let mut prefix = CheckpointRealizableOwnPrefix::default();
+    let checkpoints = storage
+        .list_group_state_checkpoints(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     for commit_id in result
         .accepted_commits
         .iter()
@@ -1934,83 +1931,51 @@ fn anchor_realizable_own_commit_prefix<S: StorageProvider>(
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             break;
         };
-        // The stamp must carry the post-merge fingerprint of the state this
-        // commit produced. Rows stamped before that field existed cannot be
-        // proven against the anchor, so they end the run and fall back to
-        // normal replay (which fails closed on an own commit).
-        let Some(expected_marker) = payload
-            .own_commit_stamp()
-            .and_then(|stamp| stamp.post_commit_tree_marker.clone())
-        else {
+        let Some(stamp) = payload.own_commit_stamp() else {
+            break;
+        };
+        let (Some(checkpoint_id), Some(expected_authenticator)) = (
+            stamp.checkpoint_id.clone(),
+            stamp.resulting_epoch_authenticator.clone(),
+        ) else {
             break;
         };
         let resulting_epoch = record.epoch.0.saturating_add(1);
-        if snapshots.is_none() {
-            snapshots = Some(
-                storage
-                    .list_group_snapshots(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
-            );
-        }
-        let retained = snapshots
-            .as_ref()
-            .is_some_and(|names| names.contains(&retained_anchor_snapshot_name(resulting_epoch)));
+        let retained = checkpoints.iter().any(|checkpoint| {
+            checkpoint.id == checkpoint_id && checkpoint.resulting_epoch.0 == resulting_epoch
+        });
         if !retained {
             break;
         }
         prefix.commit_ids.insert(commit_id.clone());
         prefix.resulting_epoch = Some(resulting_epoch);
-        prefix.expected_post_commit_tree_marker = Some(expected_marker);
+        prefix.checkpoint_id = Some(checkpoint_id);
+        prefix.expected_epoch_authenticator = Some(expected_authenticator);
     }
     Ok(prefix)
 }
 
-/// Prove that a completed retained-anchor rewind landed on the lineage of the
-/// own commit the rewind was meant to realize.
-///
-/// Anchors are name-keyed by resulting epoch and are replaced by EVERY capture
-/// at that epoch — `retain_current_group_epoch_snapshot` runs before each
-/// inbound-commit merge, after each apply, and on each own confirm — so the
-/// anchor named for epoch N may hold a rival branch's state instead. Nothing
-/// observable before the rewind distinguishes the two cases, so this is a
-/// POSITIVE identity check taken after it: recompute the content-bound tree
-/// marker over the rewound group and require it to equal the fingerprint the
-/// parked commit stamped at confirm time. Only the exact ratchet tree that
-/// commit produced can match.
-///
-/// Must be called INSIDE the apply transaction: a mismatch returns `Err`, the
-/// transaction (which the SQLite snapshot rollback joins) unwinds, and the
-/// caller additionally rolls the group back to the pre-apply snapshot — so a
-/// failed proof leaves live state untouched.
-///
-/// LIVENESS LIMITATION (deliberate, not papered over): when the anchor HAS
-/// been clobbered, the parked own commit can no longer be realized AT ALL. The
-/// anchor rewind is its only route — MLS `process_message` refuses this
-/// device's own commits, so normal replay cannot materialize it either. This
-/// node therefore fails closed and stays diverged from the branch the rest of
-/// the fleet selected until the rewind horizon retires the parked row
-/// (`BeyondRollbackHorizon` / `beyond_retained_anchor`), after which it
-/// reorgs onto whatever remains selectable. Correctness is preserved — no
-/// wrong lineage is ever installed — but liveness inside that window is not.
-/// Restoring it requires re-keying retained anchors by content rather than by
-/// epoch, which is shared with the convergence engine and out of scope here.
-fn verify_rewound_anchor_lineage<S: StorageProvider>(
+/// Verify the exact own-commit checkpoint after restoring it. This runs inside
+/// the apply transaction so any mismatch rolls back to the pre-apply state.
+fn verify_restored_own_checkpoint<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
-    expected_marker: &str,
+    resulting_epoch: u64,
+    expected_authenticator: &str,
 ) -> Result<(), OpenMlsProjectionError> {
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("load rewound anchor group: {e:?}")))?
+        .map_err(|e| {
+            OpenMlsProjectionError::Snapshot(format!("load restored checkpoint group: {e:?}"))
+        })?
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
-    let actual = own_commit_post_merge_tree_marker(&mls_group)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e}")))?;
-    if actual == expected_marker {
+    let actual = own_commit_post_merge_epoch_authenticator(&mls_group);
+    if mls_group.epoch().as_u64() == resulting_epoch && actual == expected_authenticator {
         return Ok(());
     }
-    Err(OpenMlsProjectionError::AnchorLineageMismatch)
+    Err(OpenMlsProjectionError::CheckpointStateMismatch)
 }
 
 fn rollback_and_release_group_snapshot<S: StorageProvider>(
@@ -2089,7 +2054,29 @@ pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     storage
         .create_group_snapshot(group_id, &retained_anchor_snapshot_name(epoch))
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-    prune_retained_anchor_snapshots(storage, group_id, epoch, max_retained_anchor_rewind)
+    prune_retained_anchor_snapshots(storage, group_id, epoch, max_retained_anchor_rewind)?;
+    prune_group_state_checkpoints(storage, group_id, epoch, max_retained_anchor_rewind)
+}
+
+fn prune_group_state_checkpoints<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_epoch: u64,
+    max_retained_anchor_rewind: u64,
+) -> Result<(), OpenMlsProjectionError> {
+    let oldest_retained_epoch = retained_epoch.saturating_sub(max_retained_anchor_rewind);
+    for checkpoint in storage
+        .list_group_state_checkpoints(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+    {
+        if checkpoint.resulting_epoch.0 >= oldest_retained_epoch {
+            continue;
+        }
+        storage
+            .release_group_state_checkpoint(group_id, &checkpoint.id)
+            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    }
+    Ok(())
 }
 
 fn prune_retained_anchor_snapshots<S: StorageProvider>(
@@ -2142,9 +2129,9 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
         // No pre-validated own commits here: snapshot rollforward cannot nest
         // inside this transaction, and every own commit on the accepted
         // branch was excluded from `replay_messages` before this call —
-        // either as part of the already-applied prefix or as an
-        // anchor-realizable own-commit run whose retained-anchor rewind the
-        // caller performs itself (`anchor_realizable_own_commit_prefix`).
+        // either as part of the already-applied prefix or as a
+        // checkpoint-realizable own-commit run whose exact restore the
+        // caller performs itself (`checkpoint_realizable_own_commit_prefix`).
         let output = process_openmls_messages_inner(
             storage,
             group_id,
@@ -2620,12 +2607,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             && prefix_canonical
             && let Some(stamp) = own_commits.stamp(&projection.message_digest)
         {
-            // MLS cannot process this device's own commit; realize its
-            // pre-validated result by rolling the group forward to the
-            // retained anchor snapshot the confirm path captured at its
-            // resulting epoch, and synthesize the CommitStaged observation
-            // from the confirm-time stamp. Any failure prunes this branch
-            // (the pre-fix behavior) rather than failing the pass.
+            // MLS cannot process this device's path-bearing own commit from
+            // the public wire echo after its pending state is gone. Restore
+            // the immutable post-merge checkpoint captured for this exact
+            // commit instead.
             let group_epoch = mls_group.epoch().as_u64();
             if group_epoch != source_epoch {
                 return Err(OpenMlsProjectionError::Replay(format!(
@@ -2633,27 +2618,26 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 )));
             }
             let resulting_epoch = source_epoch.saturating_add(1);
-            match storage.rollback_group_to_snapshot(
-                group_id,
-                &retained_anchor_snapshot_name(resulting_epoch),
-            ) {
-                Ok(()) => {}
-                Err(StorageError::SnapshotMissing(_)) => {
-                    return Err(OpenMlsProjectionError::Replay(format!(
-                        "own commit anchor snapshot missing at epoch {resulting_epoch}"
-                    )));
-                }
-                Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
-            }
+            let (Some(checkpoint_id), Some(expected_authenticator)) = (
+                stamp.checkpoint_id.as_deref(),
+                stamp.resulting_epoch_authenticator.as_deref(),
+            ) else {
+                return Err(OpenMlsProjectionError::Replay(
+                    "own commit has no branch checkpoint".into(),
+                ));
+            };
+            storage
+                .restore_group_state_checkpoint(group_id, checkpoint_id)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
             mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
-                .map_err(|e| OpenMlsProjectionError::Replay(format!("anchor reload: {e:?}")))?
+                .map_err(|e| OpenMlsProjectionError::Replay(format!("checkpoint reload: {e:?}")))?
                 .ok_or(OpenMlsProjectionError::MissingGroup)?;
-            let anchor_epoch = mls_group.epoch().as_u64();
-            if anchor_epoch != resulting_epoch {
-                return Err(OpenMlsProjectionError::Replay(format!(
-                    "own commit anchor epoch {anchor_epoch} does not match resulting epoch {resulting_epoch}"
-                )));
-            }
+            verify_restored_own_checkpoint(
+                storage,
+                group_id,
+                resulting_epoch,
+                expected_authenticator,
+            )?;
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,
                 source_epoch,
@@ -3256,18 +3240,15 @@ mod reuse_scope_tests {
 }
 
 #[cfg(test)]
-mod anchor_prefix_lineage_tests {
-    use super::{
-        AnchorRealizableOwnPrefix, anchor_realizable_own_commit_prefix,
-        retained_anchor_snapshot_name,
-    };
+mod checkpoint_prefix_tests {
+    use super::{CheckpointRealizableOwnPrefix, checkpoint_realizable_own_commit_prefix};
     use crate::canonicalization::{CanonicalizationResult, ConvergenceStatus};
     use cgka_traits::engine::CommitOrderingPriority;
     use cgka_traits::group::{Group, ProtocolProfile};
     use cgka_traits::message::{
         MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload,
     };
-    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::storage::{GroupStateCheckpointRef, GroupStorage, MessageStorage};
     use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
     use std::collections::BTreeSet;
@@ -3277,22 +3258,22 @@ mod anchor_prefix_lineage_tests {
         GroupId::new(vec![7u8; 32])
     }
 
-    /// Marker string a row claims its post-merge state fingerprints to. The
-    /// scan only propagates it; the value is proven against the real rewound
-    /// tree in `verify_rewound_anchor_lineage` (covered end-to-end by the
-    /// `fork_detection` integration tests, which need a real MLS group).
-    fn marker_for(id: &[u8]) -> String {
-        format!("marker-{}", hex::encode(id))
+    fn checkpoint_id_for(id: &[u8]) -> String {
+        format!("openmls-own-commit-v1-{}", hex::encode(id))
+    }
+
+    fn authenticator_for(id: &[u8]) -> String {
+        format!("auth-{}", hex::encode(id))
     }
 
     fn own_commit_row(id: &[u8], source_epoch: u64) -> MessageRecord {
-        own_commit_row_with_marker(id, source_epoch, Some(marker_for(id)))
+        own_commit_row_with_checkpoint(id, source_epoch, true)
     }
 
-    fn own_commit_row_with_marker(
+    fn own_commit_row_with_checkpoint(
         id: &[u8],
         source_epoch: u64,
-        post_commit_tree_marker: Option<String>,
+        present: bool,
     ) -> MessageRecord {
         let message = TransportMessage {
             id: MessageId::new(id.to_vec()),
@@ -3310,7 +3291,8 @@ mod anchor_prefix_lineage_tests {
             committer: MemberId::new(vec![1u8; 32]),
             priority: CommitOrderingPriority::Privileged,
             consumed_proposal_refs: Vec::new(),
-            post_commit_tree_marker,
+            checkpoint_id: present.then(|| checkpoint_id_for(id)),
+            resulting_epoch_authenticator: present.then(|| authenticator_for(id)),
         };
         MessageRecord {
             id: MessageId::new(id.to_vec()),
@@ -3349,14 +3331,14 @@ mod anchor_prefix_lineage_tests {
         }
     }
 
-    fn storage_with_anchor_at_epoch_2() -> SqliteAccountStorage {
+    fn storage_with_checkpoint(id: &[u8], resulting_epoch: u64) -> SqliteAccountStorage {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         storage
             .put_group(&Group {
                 id: group_id(),
-                name: "anchor-lineage".into(),
+                name: "checkpoint-prefix".into(),
                 description: String::new(),
-                epoch: EpochId(2),
+                epoch: EpochId(resulting_epoch),
                 members: Vec::new(),
                 required_capabilities: Default::default(),
                 protocol_profile: ProtocolProfile::Legacy,
@@ -3367,23 +3349,25 @@ mod anchor_prefix_lineage_tests {
             })
             .unwrap();
         storage
-            .create_group_snapshot(&group_id(), &retained_anchor_snapshot_name(2))
+            .create_group_state_checkpoint(
+                &group_id(),
+                &GroupStateCheckpointRef {
+                    id: checkpoint_id_for(id),
+                    resulting_epoch: EpochId(resulting_epoch),
+                },
+            )
             .unwrap();
         storage
     }
 
     #[test]
-    fn stamped_own_commit_proposes_the_anchor_fast_path_with_its_marker() {
-        // A confirm-stamped own commit whose stamp carries the post-merge tree
-        // marker is a fast-path CANDIDATE: the scan proposes the rewind target
-        // and hands the apply the fingerprint it must reproduce after the
-        // rewind. The scan itself never claims the anchor is the right one.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn stamped_own_commit_selects_its_exact_checkpoint() {
+        let storage = storage_with_checkpoint(b"commit-a", 2);
         storage
             .put_message(&own_commit_row(b"commit-a", 1))
             .unwrap();
 
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &group_id(),
             &result_accepting(&[b"commit-a"]),
@@ -3392,27 +3376,21 @@ mod anchor_prefix_lineage_tests {
         .unwrap();
         assert_eq!(prefix.resulting_epoch, Some(2));
         assert!(prefix.commit_ids.contains(&hex::encode(b"commit-a")));
+        assert_eq!(prefix.checkpoint_id, Some(checkpoint_id_for(b"commit-a")));
         assert_eq!(
-            prefix.expected_post_commit_tree_marker,
-            Some(marker_for(b"commit-a")),
-            "the apply must be given the marker to verify the rewind against"
+            prefix.expected_epoch_authenticator,
+            Some(authenticator_for(b"commit-a"))
         );
     }
 
     #[test]
-    fn own_commit_without_a_post_merge_marker_refuses_the_anchor_fast_path() {
-        // Rows stamped by engine versions that predate
-        // `post_commit_tree_marker` carry no fingerprint, so a rewind to the
-        // name-keyed anchor could never be PROVEN to land on their lineage.
-        // Refuse the fast path outright: the apply falls back to normal
-        // replay, which fails closed on an own commit
-        // (`process_message` refuses them) and lets convergence prune.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn own_commit_without_a_checkpoint_refuses_the_fast_path() {
+        let storage = storage_with_checkpoint(b"commit-a", 2);
         storage
-            .put_message(&own_commit_row_with_marker(b"commit-a", 1, None))
+            .put_message(&own_commit_row_with_checkpoint(b"commit-a", 1, false))
             .unwrap();
 
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &group_id(),
             &result_accepting(&[b"commit-a"]),
@@ -3421,24 +3399,30 @@ mod anchor_prefix_lineage_tests {
         .unwrap();
         assert_eq!(
             prefix.resulting_epoch,
-            AnchorRealizableOwnPrefix::default().resulting_epoch,
-            "an unprovable anchor must not yield a rewind target"
+            CheckpointRealizableOwnPrefix::default().resulting_epoch,
+            "a commit without a checkpoint must not yield a restore target"
         );
         assert!(
             prefix.commit_ids.is_empty(),
-            "an unprovable anchor must not realize any commit"
+            "a commit without a checkpoint must not realize any commit"
         );
-        assert!(prefix.expected_post_commit_tree_marker.is_none());
+        assert!(prefix.checkpoint_id.is_none());
     }
 
     #[test]
-    fn a_run_of_own_commits_verifies_against_the_last_ones_marker() {
-        // The whole run is realized by a single rewind to the LAST own
-        // commit's resulting epoch, so that commit's marker — not the first's
-        // — is what the rewound state must reproduce.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn a_run_of_own_commits_uses_the_last_checkpoint() {
+        let storage = storage_with_checkpoint(b"commit-a", 2);
+        let mut group = storage.get_group(&group_id()).unwrap();
+        group.epoch = EpochId(3);
+        storage.put_group(&group).unwrap();
         storage
-            .create_group_snapshot(&group_id(), &retained_anchor_snapshot_name(3))
+            .create_group_state_checkpoint(
+                &group_id(),
+                &GroupStateCheckpointRef {
+                    id: checkpoint_id_for(b"commit-a-next"),
+                    resulting_epoch: EpochId(3),
+                },
+            )
             .unwrap();
         storage
             .put_message(&own_commit_row(b"commit-a", 1))
@@ -3447,7 +3431,7 @@ mod anchor_prefix_lineage_tests {
             .put_message(&own_commit_row(b"commit-a-next", 2))
             .unwrap();
 
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &group_id(),
             &result_accepting(&[b"commit-a", b"commit-a-next"]),
@@ -3457,24 +3441,14 @@ mod anchor_prefix_lineage_tests {
         assert_eq!(prefix.commit_ids.len(), 2);
         assert_eq!(prefix.resulting_epoch, Some(3));
         assert_eq!(
-            prefix.expected_post_commit_tree_marker,
-            Some(marker_for(b"commit-a-next"))
+            prefix.checkpoint_id,
+            Some(checkpoint_id_for(b"commit-a-next"))
         );
     }
 
     #[test]
-    fn a_second_own_row_at_the_same_epoch_no_longer_gates_the_scan() {
-        // Deliberate behavior change. An earlier revision refused the fast
-        // path whenever more than one own confirm-stamped row shared a source
-        // epoch, on the theory that a second own confirm may have clobbered
-        // the name-keyed anchor. That under-approximation was unsound in both
-        // directions: a PEER commit that merely lands on the epoch also
-        // replaces the anchor (`retain_current_group_epoch_snapshot` runs
-        // before every inbound merge) while leaving no own row behind, so
-        // row-counting missed the real clobber — and it refused provable cases
-        // like this one for nothing. The scan now stays permissive and the
-        // apply proves anchor identity positively after the rewind.
-        let storage = storage_with_anchor_at_epoch_2();
+    fn sibling_own_rows_at_the_same_epoch_do_not_alias() {
+        let storage = storage_with_checkpoint(b"commit-a", 2);
         storage
             .put_message(&own_commit_row(b"commit-a", 1))
             .unwrap();
@@ -3482,7 +3456,7 @@ mod anchor_prefix_lineage_tests {
             .put_message(&own_commit_row(b"commit-a2", 1))
             .unwrap();
 
-        let prefix = anchor_realizable_own_commit_prefix(
+        let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &group_id(),
             &result_accepting(&[b"commit-a"]),
@@ -3490,10 +3464,6 @@ mod anchor_prefix_lineage_tests {
         )
         .unwrap();
         assert_eq!(prefix.resulting_epoch, Some(2));
-        assert_eq!(
-            prefix.expected_post_commit_tree_marker,
-            Some(marker_for(b"commit-a")),
-            "identity is decided by commit-a's own marker, not by row counts"
-        );
+        assert_eq!(prefix.checkpoint_id, Some(checkpoint_id_for(b"commit-a")));
     }
 }

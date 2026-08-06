@@ -576,6 +576,37 @@ mod tests {
             self.release_attempts.lock().unwrap().push(name.to_string());
             Err(StorageError::Backend("release failed".into()))
         }
+
+        fn create_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint: &cgka_traits::storage::GroupStateCheckpointRef,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn restore_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint_id: &str,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_group_state_checkpoints(
+            &self,
+            _group_id: &GroupId,
+        ) -> StorageResult<Vec<cgka_traits::storage::GroupStateCheckpointRef>> {
+            unused()
+        }
+
+        fn release_group_state_checkpoint(
+            &self,
+            _group_id: &GroupId,
+            _checkpoint_id: &str,
+        ) -> StorageResult<()> {
+            unused()
+        }
     }
 
     #[test]

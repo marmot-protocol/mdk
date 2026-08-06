@@ -14,10 +14,11 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage,
-    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
+    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -425,6 +426,36 @@ impl MessageStorage for FlakyGroupRecordStorage {
     }
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.release_group_snapshot(group_id, name)
+    }
+    fn create_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint: &GroupStateCheckpointRef,
+    ) -> StorageResult<()> {
+        self.inner
+            .create_group_state_checkpoint(group_id, checkpoint)
+    }
+    fn restore_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .restore_group_state_checkpoint(group_id, checkpoint_id)
+    }
+    fn list_group_state_checkpoints(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<GroupStateCheckpointRef>> {
+        self.inner.list_group_state_checkpoints(group_id)
+    }
+    fn release_group_state_checkpoint(
+        &self,
+        group_id: &GroupId,
+        checkpoint_id: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .release_group_state_checkpoint(group_id, checkpoint_id)
     }
 }
 

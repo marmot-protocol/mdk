@@ -65,14 +65,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   keyed by its source epoch) so a later convergence pass adopts the same
   branch everywhere, and `fork_resolution` audit rows now record the kept
   incumbent's commit digest so cross-member convergence is provable from
-  forensic logs. Adopting such a branch again rewinds to a retained snapshot,
-  and that rewind is now verified against a fingerprint of the state the
-  member's own commit produced, so a snapshot that a later commit on the same
-  epoch replaced can never be mistaken for it — the reorg is refused instead of
-  installing a lineage no member ever held. Displacing the losing branch is
-  also a single durable transaction now, so an interrupted resolution can no
-  longer drop it without a trace.
-  ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
+  forensic logs. Because OpenMLS cannot process a device's own Commit from the
+  network, confirmation now atomically retains an immutable, commit-addressed
+  checkpoint of the canonical MLS/Marmot state. A later reorg can restore that
+  exact branch after restart, verify its epoch authenticator, and replay its
+  descendants even when an epoch-keyed rollback anchor has been replaced by a
+  rival branch. Checkpoints are pruned with the retained rewind horizon.
+  Displacing the losing branch is also a single durable transaction now, so an
+  interrupted resolution can no longer drop it without a trace.
 
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed

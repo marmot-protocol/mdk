@@ -140,6 +140,14 @@ impl<S: StorageProvider> Engine<S> {
                             staged,
                             self.identity.self_id().clone(),
                         )?);
+                        if let (Some(stamp), Some(message_id)) =
+                            (own_commit_stamp.as_mut(), origin_commit_id.as_ref())
+                        {
+                            stamp.checkpoint_id =
+                                Some(crate::openmls_projection::own_commit_checkpoint_id(
+                                    storage, message_id,
+                                )?);
+                        }
                     }
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
                     crate::openmls_projection::mark_consumed_proposal_records_processed(
@@ -159,19 +167,11 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
-                    // Fingerprint the state this commit just PRODUCED. The
-                    // retained anchor captured below is name-keyed by resulting
-                    // epoch and is REPLACED by every later capture at that
-                    // epoch, so an anchor's name never proves whose post-merge
-                    // state it holds. This marker is what lets a later
-                    // retained-anchor rewind positively verify it landed on
-                    // this commit's lineage
-                    // (`openmls_projection::verify_rewound_anchor_lineage`).
                     if let Some(stamp) = own_commit_stamp.as_mut() {
-                        stamp.post_commit_tree_marker = Some(
-                            crate::openmls_projection::own_commit_post_merge_tree_marker(
+                        stamp.resulting_epoch_authenticator = Some(
+                            crate::openmls_projection::own_commit_post_merge_epoch_authenticator(
                                 &mls_group,
-                            )?,
+                            ),
                         );
                     }
                 }
@@ -199,6 +199,17 @@ impl<S: StorageProvider> Engine<S> {
                     self.identity.self_id(),
                     self.ciphersuite,
                 )?;
+                if let Some(stamp) = own_commit_stamp.as_ref()
+                    && let Some(checkpoint_id) = stamp.checkpoint_id.as_ref()
+                {
+                    storage.create_group_state_checkpoint(
+                        &group_id,
+                        &cgka_traits::storage::GroupStateCheckpointRef {
+                            id: checkpoint_id.clone(),
+                            resulting_epoch: EpochId(mls_group.epoch().as_u64()),
+                        },
+                    )?;
+                }
                 if let Some(message_id) = origin_commit_id.as_ref() {
                     // Enrich the stored wire record with the convergence stamp
                     // (when one was captured above) in the same write that marks
