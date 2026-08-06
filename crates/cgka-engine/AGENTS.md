@@ -465,6 +465,13 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   commit nothing will ever apply.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
+- **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a
+  specific transition and `set_stable` refuses it: `Unrecoverable` → `repair_to_stable` after a verified repair path,
+  `PendingPublish`/`Merging` → `confirm_publish` or `rollback_publish` (which carry the pending slot and
+  `committed_from` ownership a blind overwrite would strand), `Disbanded` → nothing. Callers are gated to reach it only
+  from the two overwritable states (inbound apply behind `can_ingest`, the outbound drain behind its `Stable`-only
+  re-check, hydration on fresh state, create/join on a group that cannot be holding a publication), so a fired refusal
+  means a new caller lost that gate — fix the caller, don't relax the refusal.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so

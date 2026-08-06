@@ -103,16 +103,34 @@ impl EpochManager {
     /// Set a group's state to `Stable { epoch }`. Used by the join-welcome
     /// path (no prior state) and by the merge-to-stable path post-confirm.
     ///
-    /// Refuses to overwrite `Unrecoverable` or terminal `Disbanded`: the only
-    /// legal exit from `Unrecoverable` is [`Self::repair_to_stable`] after a
-    /// verified repair path (mdk#971), while `Disbanded` has no outgoing
-    /// transition.
+    /// Only `Stable` and `Recovering` may be overwritten. Every other state owes
+    /// its exit to a specific transition, and this refuses to steal it:
+    ///
+    /// - `Unrecoverable` exits only through [`Self::repair_to_stable`] after a
+    ///   verified repair path (mdk#971);
+    /// - an unresolved local publication (`PendingPublish` / `Merging`) exits
+    ///   only through [`Self::confirm_publish`] or [`Self::rollback_publish`],
+    ///   which carry the per-pending bookkeeping — the pending slot and its
+    ///   `committed_from` ownership — that a blind overwrite would strand;
+    /// - `Disbanded` has no outgoing transition.
+    ///
+    /// Callers are already gated to the two overwritable states, so a fired
+    /// refusal means a caller lost its gate; see the invariant in
+    /// `crates/cgka-engine/AGENTS.md`.
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
         if self.is_unrecoverable(&group_id) || self.is_disbanded(&group_id) {
             tracing::warn!(
                 target: "cgka_engine::epoch_manager",
                 method = "set_stable",
                 "refusing set_stable while Unrecoverable or Disbanded; verified repair must use repair_to_stable"
+            );
+            return;
+        }
+        if self.is_resolving_local_publish(&group_id) {
+            tracing::warn!(
+                target: "cgka_engine::epoch_manager",
+                method = "set_stable",
+                "refusing set_stable while a local publication is unresolved; its outcome must use confirm_publish or rollback_publish"
             );
             return;
         }
@@ -338,6 +356,15 @@ impl EpochManager {
             .is_some_and(EpochState::is_disbanded)
     }
 
+    /// Whether the named group is mid-way through resolving a publication this
+    /// client staged (`PendingPublish` awaiting the transport outcome, or
+    /// `Merging` awaiting the local merge that outcome authorizes).
+    fn is_resolving_local_publish(&self, group_id: &GroupId) -> bool {
+        self.states
+            .get(group_id)
+            .is_some_and(EpochState::is_resolving_local_publish)
+    }
+
     pub(crate) fn mark_disbanded(
         &mut self,
         group_id: &GroupId,
@@ -495,6 +522,45 @@ mod tests {
             "set_stable must leave Unrecoverable intact"
         );
         assert_eq!(em.epoch(&group_id), Some(EpochId(4)));
+    }
+
+    /// A held publication is nobody else's to steal: while a staged commit is
+    /// still awaiting its transport outcome, `set_stable` must not overwrite it.
+    /// The publication's own outcome — `confirm_publish` or `rollback_publish` —
+    /// is the only way out, and it must still work afterwards.
+    #[test]
+    fn set_stable_refuses_while_a_local_publication_is_unresolved() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(7));
+        let pending_ref = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            pending_ref,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("begin_pending from Stable succeeds");
+
+        em.set_stable(group_id.clone(), EpochId(9));
+
+        assert_eq!(
+            em.state(&group_id).map(|s| s.name()),
+            Some("PendingPublish"),
+            "set_stable must leave an unresolved local publication intact"
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
+
+        // The publication still resolves through its own transition.
+        let (confirmed_group, confirmed_epoch) = em
+            .confirm_publish(pending_ref)
+            .expect("confirm_publish still exits the held publication");
+        assert_eq!(confirmed_group, group_id);
+        assert_eq!(confirmed_epoch, EpochId(8));
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
     }
 
     /// mdk#971: verified repair is the only Unrecoverable exit.
