@@ -50,6 +50,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
   
+- MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
+  kind:0 profile `picture` URLs (HTTPS-only, pinned public resolution, bounded
+  redirects, and streaming limits) so Android and Swift hosts do not maintain a
+  separate SSRF stack for public avatars.
+
 - Outbound messages waiting in a group's durable queue are now bounded at 256
   per group. The bound covers every reason a message waits: a group resolving a
   stalled publication, convergence input that has not settled, and messages
