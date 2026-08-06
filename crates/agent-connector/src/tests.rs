@@ -674,6 +674,28 @@ async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
 }
 
 #[tokio::test]
+async fn connector_serve_fails_fast_when_control_socket_link_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    let server = tokio::spawn(serve_socket(config));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("control socket should appear at the final path");
+    std::fs::remove_file(&socket).expect("unlink final control socket path");
+    let err = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve must fail fast after the control socket link is removed")
+        .expect("serve task must not panic")
+        .expect_err("serve must exit with an error");
+    assert_eq!(err.code(), "io_error");
+}
+
+#[tokio::test]
 async fn connector_control_plane_requires_token_for_group_shared_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");

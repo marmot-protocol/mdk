@@ -897,6 +897,72 @@ pub fn parse_octal_mode(value: &str) -> Result<u32, String> {
     Ok(mode)
 }
 
+/// Device/inode identity of a bound Unix socket path entry.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixSocketInode {
+    dev: u64,
+    ino: u64,
+}
+
+/// Read the device/inode identity of an existing Unix socket path.
+#[cfg(unix)]
+fn unix_socket_inode(path: &Path) -> io::Result<UnixSocketInode> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a Unix socket",
+        ));
+    }
+    Ok(UnixSocketInode {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// Fail when `path` is missing, is not a Unix socket, or no longer names
+/// `expected` (for example after an external unlink or replacement).
+#[cfg(unix)]
+pub fn verify_unix_socket_inode(path: &Path, expected: UnixSocketInode) -> io::Result<()> {
+    const LINK_LOST: &str = "unix socket path no longer names the bound listener";
+
+    let actual = match unix_socket_inode(path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, LINK_LOST));
+        }
+        Err(err) => return Err(err),
+    };
+    if actual != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, LINK_LOST));
+    }
+    Ok(())
+}
+
+/// Unix listener bound through [`bind_unix_listener_private_tracked`],
+/// retaining the final-path link identity callers must keep stable while
+/// serving.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct BoundUnixListener {
+    listener: std::os::unix::net::UnixListener,
+    link_identity: UnixSocketInode,
+}
+
+#[cfg(unix)]
+impl BoundUnixListener {
+    pub fn link_identity(&self) -> UnixSocketInode {
+        self.link_identity
+    }
+
+    pub fn into_listener(self) -> std::os::unix::net::UnixListener {
+        self.listener
+    }
+}
+
 /// The staging directory `bind_unix_listener_private` binds through for
 /// `final_path`. Exposed so callers and tests can assert staging cleanup
 /// without re-deriving the (otherwise private) naming scheme.
@@ -929,6 +995,16 @@ pub fn bind_unix_listener_private(
     final_path: &Path,
     mode: u32,
 ) -> io::Result<std::os::unix::net::UnixListener> {
+    bind_unix_listener_private_tracked(final_path, mode).map(BoundUnixListener::into_listener)
+}
+
+/// Bind as [`bind_unix_listener_private`] does, retaining the final-path link
+/// identity so long-lived services can detect an unlink or replacement.
+#[cfg(unix)]
+pub fn bind_unix_listener_private_tracked(
+    final_path: &Path,
+    mode: u32,
+) -> io::Result<BoundUnixListener> {
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -961,11 +1037,22 @@ pub fn bind_unix_listener_private(
                 err
             }
         })?;
-        Ok(listener)
+        let link_identity = unix_socket_inode(final_path)?;
+        if unix_socket_inode(&staged_socket)? != link_identity {
+            return Err(io::Error::other(
+                "staged socket hard link identity mismatch",
+            ));
+        }
+        Ok((listener, link_identity))
     })();
     let _ = std::fs::remove_file(&staged_socket);
     let _ = std::fs::remove_dir(&staging_dir);
-    outcome
+    let (listener, link_identity) = outcome?;
+    verify_unix_socket_inode(final_path, link_identity)?;
+    Ok(BoundUnixListener {
+        listener,
+        link_identity,
+    })
 }
 
 #[cfg(test)]
@@ -1685,6 +1772,31 @@ mod unix_tests {
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         assert_eq!(mode_of(&target), 0o644);
+    }
+
+    #[test]
+    fn verify_unix_socket_inode_fails_when_final_path_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let bound = bind_unix_listener_private_tracked(&socket, 0o600).unwrap();
+        let identity = bound.link_identity();
+        std::fs::remove_file(&socket).unwrap();
+        let err = verify_unix_socket_inode(&socket, identity).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn verify_unix_socket_inode_fails_when_path_names_a_different_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sock");
+        let second = dir.path().join("second.sock");
+        let first_bound = bind_unix_listener_private_tracked(&first, 0o600).unwrap();
+        let first_identity = first_bound.link_identity();
+        drop(first_bound);
+        drop(bind_unix_listener_private(&second, 0o600).unwrap());
+        std::fs::rename(&second, &first).unwrap();
+        let err = verify_unix_socket_inode(&first, first_identity).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

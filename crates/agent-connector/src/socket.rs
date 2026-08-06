@@ -24,6 +24,7 @@ pub fn bind_connector_socket_with_mode(
     socket_mode: u32,
 ) -> Result<UnixListener, ConnectorError> {
     bind_connector_socket_with_owned_home(socket, socket_dir_mode, socket_mode, None)
+        .map(|(listener, _link_identity)| listener)
 }
 
 pub(crate) fn bind_connector_socket_with_owned_home(
@@ -31,28 +32,40 @@ pub(crate) fn bind_connector_socket_with_owned_home(
     socket_dir_mode: u32,
     socket_mode: u32,
     owned_home: Option<&Path>,
-) -> Result<UnixListener, ConnectorError> {
+) -> Result<(UnixListener, fs_private::UnixSocketInode), ConnectorError> {
     let _parent_guard = socket
         .parent()
         .map(|parent| prepare_socket_dir(parent, socket_dir_mode, owned_home))
         .transpose()?;
-    let listener = match bind_private(socket, socket_mode) {
-        Ok(listener) => listener,
+    let (listener, link_identity) = match bind_private(socket, socket_mode) {
+        Ok(bound) => bound,
         Err(error) if error.kind() == ErrorKind::AddrInUse => {
             remove_stale_socket(socket, &error)?;
             bind_private(socket, socket_mode)?
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(listener)
+    Ok((listener, link_identity))
 }
 
 /// Bind through a 0700 staging dir so the socket never exists at
 /// umask-default permissions, even when `socket_dir_mode` is group-accessible.
-fn bind_private(socket: &Path, socket_mode: u32) -> std::io::Result<UnixListener> {
-    let listener = fs_private::bind_unix_listener_private(socket, socket_mode)?;
+fn bind_private(
+    socket: &Path,
+    socket_mode: u32,
+) -> std::io::Result<(UnixListener, fs_private::UnixSocketInode)> {
+    let bound = fs_private::bind_unix_listener_private_tracked(socket, socket_mode)?;
+    let link_identity = bound.link_identity();
+    let listener = bound.into_listener();
     listener.set_nonblocking(true)?;
-    UnixListener::from_std(listener)
+    Ok((UnixListener::from_std(listener)?, link_identity))
+}
+
+pub(crate) fn verify_control_socket_link(
+    socket: &Path,
+    link_identity: fs_private::UnixSocketInode,
+) -> Result<(), ConnectorError> {
+    fs_private::verify_unix_socket_inode(socket, link_identity).map_err(ConnectorError::from)
 }
 
 fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::Result<()> {

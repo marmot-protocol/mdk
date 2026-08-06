@@ -60,6 +60,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   `NSEC…` argv identities are rejected at the same early gate as lowercase
   `nsec…`.
 
+- `wn-agent serve` now exits when its control-socket path is removed or
+  replaced while the listener is still bound, instead of staying alive with an
+  unreachable Unix listener after the final hard link disappears.
+
 - The runtime-start local-readiness regression test now asserts startup-before-
   subscription ordering directly while retaining a bounded hang deadline,
   avoiding false failures when unrelated startup work is delayed under loaded
