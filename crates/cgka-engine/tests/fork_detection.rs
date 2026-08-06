@@ -2569,3 +2569,281 @@ async fn restarted_committer_without_source_anchor_fails_closed_for_repair() {
         "the durable halt must leave an audit row naming the missing material"
     );
 }
+
+#[tokio::test]
+async fn pairwise_loser_is_reconsidered_onto_the_fleets_deeper_branch() {
+    // THE #1285 CLAIM, driven end to end (option-c plan, N5). #1285 made the
+    // pairwise route park its loser reconsiderable instead of terminally
+    // invalidating it — the implicit claim being that a committer whose OWN
+    // commit won the pairwise race will still reach the same terminal state
+    // as every convergence-resolved observer once depth disagrees with the
+    // ordering key. No test drove both routes side by side to eventual state
+    // equality; this one does:
+    //
+    // - A commits `UpdateGroupData` from epoch 1, confirms, and STAYS LIVE, so
+    //   the rival root resolves through the pairwise `ForkRecoveryManager`
+    //   seam. Seeds are arranged so A's own commit wins the ordering key and
+    //   the rival root B is parked, not applied.
+    // - O never commits: it resolves the identical fork through distributed
+    //   convergence. At depth 1 vs 1 the ordering key makes O select A's
+    //   branch first — so O must itself REORG when depth later disagrees.
+    // - The rival's branch then grows two follow-on commits deeper. Under the
+    //   convergence rule valid depth outranks the ordering key, so the fleet
+    //   (O, and the rival committer trivially) settles the rival branch.
+    //
+    // The verdict this test pins: A's convergence pass re-admits the PARKED
+    // pairwise loser as branch input and reorgs A onto the fleet's deeper
+    // branch — the two fork-resolution rules agree eventually on members,
+    // epoch, and group name. This is the go/no-go evidence that deleting the
+    // pairwise route (option C Slice C) is deduplication, not a behavior
+    // change.
+
+    // Privileged same-epoch commits order by committer identity: A's identity
+    // must sort BEFORE the rival's so A's own commit wins the pairwise race.
+    let first = b"n5-first".as_slice();
+    let second = b"n5-second".as_slice();
+    let (a_id, rival_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Concrete Engine types: the test drives convergence passes to completion
+    // explicitly (`converge_stored_openmls_messages_at`), which is not part of
+    // the CgkaEngine trait surface.
+    let (mut a, a_storage) = build_client_with_storage(a_id); // pairwise route (live committer)
+    let mut rival = build_client(rival_id); //                   authors the parked loser root
+    let (mut observer, observer_storage) = build_client_with_storage(b"n5-observer");
+    let mut eve = build_client(b"n5-eve");
+    let mut frank = build_client(b"n5-frank");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let observer_kp = observer.fresh_key_package().await.unwrap();
+    let (group_id, create) = a
+        .create_group(CreateGroupRequest {
+            name: "route-agreement".into(),
+            description: String::new(),
+            members: vec![rival_kp, observer_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // The rival needs admin for its UpdateGroupData root and follow-on
+            // invites; the observer stays a plain member so its only
+            // resolution route is distributed convergence.
+            initial_admins: vec![rival.self_id()],
+        })
+        .await
+        .unwrap();
+    let (rival_welcome, observer_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            a.confirm_published(pending).await.unwrap();
+            let observer_welcome = welcomes.remove(1);
+            (welcomes.remove(0), observer_welcome)
+        }
+        _ => unreachable!(),
+    };
+    rival.join_welcome(rival_welcome).await.unwrap();
+    observer.join_welcome(observer_welcome).await.unwrap();
+    assert_eq!(a.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(observer.epoch(&group_id).unwrap().0, 1);
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Rival `UpdateGroupData` commits from epoch 1: the branch-sensitive group
+    // name makes the finally selected branch observable on every device.
+    let a_root = match a
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("a-branch".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            a.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let rival_root = match rival
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("rival-branch".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let a_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(a_id)),
+        &a_root.payload,
+    );
+    let rival_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &rival_root.payload,
+    );
+    assert!(
+        a_key < rival_key,
+        "seed arrangement must make A's own commit the pairwise winner"
+    );
+
+    // Seam on A: the rival root LOSES the pairwise race. A keeps its own
+    // branch (no rollback, no ForkRecovered) and parks the loser
+    // reconsiderable at its source epoch (#1285).
+    let outcome = a.ingest(route(rival_root.clone())).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadyAtEpoch { .. }
+        }
+    ));
+    assert!(
+        extract_fork_recovered(&a.drain_events(), &group_id).is_none(),
+        "own-commit-wins must not roll A back"
+    );
+    assert_eq!(a.epoch(&group_id).unwrap().0, 2);
+    let rival_root_content_id = MessageId::new(Sha256::digest(&rival_root.payload).to_vec());
+    let parked = a_storage.get_message(&rival_root_content_id).unwrap();
+    assert_eq!(parked.state, MessageState::ConvergenceDeferred);
+    assert_eq!(parked.epoch, EpochId(1));
+
+    // The observer consumes the same depth-1 fork through convergence. Both
+    // roots are equally deep, so the ordering key decides: the observer first
+    // settles A's branch — agreeing with A's pairwise resolution.
+    observer.ingest(route(a_root.clone())).await.unwrap();
+    observer.ingest(route(rival_root.clone())).await.unwrap();
+    observer
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the depth-1 fork settles on the observer");
+    assert_eq!(observer.epoch(&group_id).unwrap().0, 2);
+    assert_eq!(
+        observer_storage.get_group(&group_id).unwrap().name,
+        "a-branch",
+        "at equal depth the ordering key must hand the observer A's branch"
+    );
+
+    // The rival's branch grows TWO follow-on commits deeper (it never saw A's
+    // commit). Depth now outranks the ordering key fleet-wide.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let follow_on_1 = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let follow_on_2 = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(rival.epoch(&group_id).unwrap().0, 4);
+
+    // The observer control: its next pass must REORG off A's branch onto the
+    // deeper rival branch — this is the fleet outcome A has to match.
+    observer.ingest(route(follow_on_1.clone())).await.unwrap();
+    observer.ingest(route(follow_on_2.clone())).await.unwrap();
+    observer
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the deeper rival branch settles on the observer");
+    assert_eq!(
+        observer.epoch(&group_id).unwrap().0,
+        4,
+        "the observer must reorg onto the deeper rival branch"
+    );
+    assert_eq!(
+        observer_storage.get_group(&group_id).unwrap().name,
+        "rival-branch"
+    );
+
+    // THE QUESTION UNDER TEST. A — whose pairwise resolution kept its own
+    // branch and parked the rival root — ingests the follow-ons and runs its
+    // convergence pass. The parked loser must be re-admitted as branch input
+    // and A must follow the fleet.
+    let outcome_1 = a.ingest(route(follow_on_1)).await.unwrap();
+    assert!(
+        matches!(outcome_1, IngestOutcome::Buffered { .. }),
+        "the first rival follow-on must enter the convergence pass, got {outcome_1:?}"
+    );
+    let outcome_2 = a.ingest(route(follow_on_2)).await.unwrap();
+    assert!(
+        matches!(outcome_2, IngestOutcome::Buffered { .. }),
+        "the second rival follow-on must enter the convergence pass, got {outcome_2:?}"
+    );
+    let result = a
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("A's pass reconsiders the parked pairwise loser");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    // VERDICT: eventual agreement between the pairwise route and the
+    // convergence route — members, epoch, and group name.
+    let sorted_members = |members: Vec<cgka_traits::group::Member>| {
+        let mut ids: Vec<_> = members.into_iter().map(|m| m.id).collect();
+        ids.sort_by(|x, y| x.as_slice().cmp(y.as_slice()));
+        ids
+    };
+    let a_members = sorted_members(a.members(&group_id).unwrap());
+    let observer_members = sorted_members(observer.members(&group_id).unwrap());
+    let rival_members = sorted_members(rival.members(&group_id).unwrap());
+    assert_eq!(
+        a_members, observer_members,
+        "the pairwise-resolved committer and the convergence-resolved observer must agree"
+    );
+    assert_eq!(
+        observer_members, rival_members,
+        "the observer must match the rival branch author"
+    );
+    assert!(a_members.contains(&MemberId::new(pad32(b"n5-eve"))));
+    assert!(a_members.contains(&MemberId::new(pad32(b"n5-frank"))));
+    assert_eq!(
+        a.epoch(&group_id).unwrap().0,
+        4,
+        "A must reach the fleet's tip"
+    );
+    assert_eq!(
+        a_storage.get_group(&group_id).unwrap().name,
+        "rival-branch",
+        "A must surface the selected branch's group data"
+    );
+    let realized_root = a_storage.get_message(&rival_root_content_id).unwrap();
+    assert_eq!(
+        realized_root.state,
+        MessageState::Processed,
+        "the parked pairwise loser must become canonical, not stay parked"
+    );
+}
