@@ -44,8 +44,9 @@ Failed distributed executions append a privacy-safe entry to the private
 `failure-corpus.v1.json` in the campaign output directory. `index-capsule` and
 `index-node-capsule` add simulator or process failures, `classify-failure`
 applies the reviewed four-way disposition, `diagnose-failure` records
-time-to-diagnosis and vector promotion, and `promote-capsule` creates a fixed
-vector candidate from synthetic shareable evidence.
+time-to-diagnosis, and `promote-capsule` creates a fixed vector candidate from
+validated synthetic-shareable evidence and records its capsule/vector digests
+in the corpus. Promotion cannot be asserted through the diagnosis command.
 
 The operator contract, backend boundary, artifact posture, and real-container
 verification commands live in

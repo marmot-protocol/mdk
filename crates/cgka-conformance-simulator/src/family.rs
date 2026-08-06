@@ -339,61 +339,50 @@ async fn minimize_failing_case(
     let target_identity = fingerprint_report_failure(failing_report)
         .ok()?
         .semantic_identity();
-
-    let mut candidate = case.scenario.clone();
-    let mut changed = false;
-    loop {
-        let mut reduced_unit = false;
-        for unit in semantic_reduction_units(&candidate.steps) {
-            let mut trial = candidate.clone();
-            remove_step_indices(&mut trial.steps, &unit);
-            if reproduces_failure(
+    minimize_scenario_with(case.scenario.clone(), |trial| {
+        let expected_trace = expected_trace.cloned();
+        let expected_outcomes = case.expected_outcomes.clone();
+        let target_identity = target_identity.clone();
+        async move {
+            reproduces_failure(
                 &trial,
-                expected_trace.cloned(),
-                case.expected_outcomes.clone(),
+                expected_trace,
+                expected_outcomes,
                 &target_identity,
                 storage_mode,
                 case.subject,
             )
             .await
-            {
+        }
+    })
+    .await
+}
+
+async fn minimize_scenario_with<F, Fut>(
+    mut candidate: ScenarioSpec,
+    mut reproduces: F,
+) -> Option<ScenarioSpec>
+where
+    F: FnMut(ScenarioSpec) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut changed = false;
+    loop {
+        let mut reduced = false;
+        for unit in semantic_minimization_units(&candidate.steps) {
+            let mut trial = candidate.clone();
+            remove_step_indices(&mut trial.steps, &unit);
+            if reproduces(trial.clone()).await {
                 candidate = trial;
                 changed = true;
-                reduced_unit = true;
+                reduced = true;
                 break;
             }
         }
-        if !reduced_unit {
+        if !reduced {
             break;
         }
     }
-
-    let mut index = 0;
-    while index < candidate.steps.len() {
-        if !is_minimizer_removable(&candidate.steps[index]) {
-            index += 1;
-            continue;
-        }
-
-        let mut trial = candidate.clone();
-        trial.steps.remove(index);
-        if reproduces_failure(
-            &trial,
-            expected_trace.cloned(),
-            case.expected_outcomes.clone(),
-            &target_identity,
-            storage_mode,
-            case.subject,
-        )
-        .await
-        {
-            candidate = trial;
-            changed = true;
-        } else {
-            index += 1;
-        }
-    }
-
     changed.then_some(candidate)
 }
 
@@ -414,6 +403,15 @@ pub fn semantic_reduction_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
             units.push(vec![start, index]);
         }
     }
+    units
+}
+
+fn semantic_minimization_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
+    let mut units = semantic_reduction_units(steps);
+    units.extend(steps.iter().enumerate().filter_map(|(index, step)| {
+        (semantic_pair_marker(step, None).is_none() && is_minimizer_removable(step))
+            .then_some(vec![index])
+    }));
     units
 }
 
@@ -2783,5 +2781,45 @@ mod tests {
         }];
 
         add_strict_reliability_oracle(&mut scenario, &mut expected);
+    }
+
+    #[tokio::test]
+    async fn minimizer_never_splits_a_fault_and_recovery_pair() {
+        let scenario = ScenarioSpec {
+            name: "paired-reduction".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![
+                ScenarioStep::SetPartition {
+                    allow: vec!["alice".into()],
+                },
+                ScenarioStep::ClearEvents {
+                    clients: vec!["alice".into()],
+                },
+                ScenarioStep::ClearPartition,
+            ],
+        };
+
+        let minimized = minimize_scenario_with(scenario, |trial| async move {
+            let has_partition = trial
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::SetPartition { .. }));
+            let has_clear = trial
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::ClearPartition));
+            has_partition || has_clear
+        })
+        .await
+        .expect("independent noise should be removable");
+
+        assert_eq!(minimized.steps.len(), 2);
+        assert!(matches!(
+            minimized.steps[0],
+            ScenarioStep::SetPartition { .. }
+        ));
+        assert!(matches!(minimized.steps[1], ScenarioStep::ClearPartition));
     }
 }

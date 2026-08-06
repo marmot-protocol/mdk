@@ -7,8 +7,8 @@ use convergence_campaign_runner::{
     CampaignAdapterV1, CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1,
     ConvergenceEvidenceBundleV1, DistributedBackendV1, FailureClassificationV1,
     INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, evidence_bundle_base_dir, load_manifest,
-    observation_from_capsule, read_failure_corpus, run_manifest, validate_scenario_bytes,
-    verify_manifest_inputs, write_failure_corpus,
+    observation_from_capsule, promote_capsule_into_corpus, run_manifest, update_failure_corpus,
+    validate_scenario_bytes, verify_manifest_inputs,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -75,16 +75,16 @@ enum Commands {
         fingerprint: String,
         classification: String,
     },
-    /// Record time-to-diagnosis and an optional promoted vector.
+    /// Record time-to-diagnosis for a corpus entry.
     DiagnoseFailure {
         corpus: PathBuf,
         fingerprint: String,
         elapsed_seconds: u64,
-        #[arg(long)]
-        promoted_vector: Option<PathBuf>,
     },
     /// Turn a stable synthetic failure capsule into a fixed vector candidate.
     PromoteCapsule {
+        corpus: PathBuf,
+        fingerprint: String,
         capsule: PathBuf,
         output: PathBuf,
         #[arg(long)]
@@ -217,9 +217,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 BTreeMap::from([("indexed_build".into(), build_id)]),
             );
             let fingerprint = observation.fingerprint.clone();
-            let mut index = read_failure_corpus(&corpus)?;
-            index.record(observation)?;
-            write_failure_corpus(&corpus, &index)?;
+            update_failure_corpus(&corpus, |index| index.record(observation))?;
             println!("indexed-failure {fingerprint}");
         }
         Commands::IndexNodeCapsule {
@@ -242,9 +240,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 BTreeMap::from([("indexed_build".into(), build_id)]),
             );
             let fingerprint = observation.fingerprint.clone();
-            let mut index = read_failure_corpus(&corpus)?;
-            index.record(observation)?;
-            write_failure_corpus(&corpus, &index)?;
+            update_failure_corpus(&corpus, |index| index.record(observation))?;
             println!("indexed-failure {fingerprint}");
         }
         Commands::ClassifyFailure {
@@ -252,37 +248,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             fingerprint,
             classification,
         } => {
-            let mut index = read_failure_corpus(&corpus)?;
-            index.reclassify(
-                &fingerprint,
-                classification.parse::<FailureClassificationV1>()?,
-            )?;
-            write_failure_corpus(&corpus, &index)?;
+            let classification = classification.parse::<FailureClassificationV1>()?;
+            update_failure_corpus(&corpus, |index| {
+                index.reclassify(&fingerprint, classification)
+            })?;
             println!("classified-failure {fingerprint}");
         }
         Commands::DiagnoseFailure {
             corpus,
             fingerprint,
             elapsed_seconds,
-            promoted_vector,
         } => {
-            let mut index = read_failure_corpus(&corpus)?;
-            index.mark_diagnosed(&fingerprint, elapsed_seconds, promoted_vector)?;
-            write_failure_corpus(&corpus, &index)?;
+            update_failure_corpus(&corpus, |index| {
+                index.mark_diagnosed(&fingerprint, elapsed_seconds)
+            })?;
             println!("diagnosed-failure {fingerprint}");
         }
         Commands::PromoteCapsule {
+            corpus,
+            fingerprint,
             capsule,
             output,
             generator_version,
         } => {
-            let capsule = cgka_conformance_simulator::read_failure_capsule(&capsule)?;
-            let vector = cgka_conformance_simulator::promote_failure_capsule_to_vector(
+            promote_capsule_into_corpus(
+                &corpus,
+                &fingerprint,
                 &capsule,
+                &output,
                 &generator_version,
             )?;
-            let bytes = serde_json::to_vec_pretty(&vector)?;
-            fs_private::write_private(&output, &bytes)?;
             println!("promoted-vector {}", output.display());
         }
     }

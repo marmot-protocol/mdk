@@ -92,18 +92,26 @@ pub async fn run_manifest(
         DistributedBackendV1::Container(_) => run_container(manifest, &plan, &scenario).await,
         DistributedBackendV1::VirtualMachine(_) => run_vm(manifest, &plan).await,
     };
-    if let Err(error) = &result
-        && let Err(corpus_error) = record_distributed_failure(manifest, error)
-    {
-        return Err(RunnerError::validation(
-            "failure_corpus_record",
-            format!(
-                "run failed with {}; failure evidence could not be recorded ({})",
-                error.code, corpus_error.code
-            ),
+    match result {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let corpus_error = record_distributed_failure(manifest, &error, &scenario).err();
+            Err(with_secondary_corpus_error(error, corpus_error.as_ref()))
+        }
+    }
+}
+
+fn with_secondary_corpus_error(
+    mut primary: RunnerError,
+    corpus_error: Option<&RunnerError>,
+) -> RunnerError {
+    if let Some(corpus_error) = corpus_error {
+        primary.message.push_str(&format!(
+            "; secondary failure corpus recording error: {}",
+            corpus_error.code
         ));
     }
-    result
+    primary
 }
 
 /// Parse the pinned canonical scenario and run all cross-manifest scheduling
@@ -854,6 +862,22 @@ mod tests {
             args,
             success_exit_codes: vec![0],
         }
+    }
+
+    #[test]
+    fn corpus_recording_failure_keeps_campaign_error_primary() {
+        let primary = RunnerError {
+            code: "command_timeout".into(),
+            message: "campaign timed out".into(),
+        };
+        let secondary = RunnerError {
+            code: "failure_corpus_write".into(),
+            message: "omitted".into(),
+        };
+        let combined = with_secondary_corpus_error(primary, Some(&secondary));
+        assert_eq!(combined.code, "command_timeout");
+        assert!(combined.message.contains("failure_corpus_write"));
+        assert!(!combined.message.contains("omitted"));
     }
 
     #[test]

@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::{
-    FailureIdentityV1, ScenarioSpec, ScenarioTopologyV2, TerminalOutcomeClassification,
+    FailureCapsuleSensitivity, FailureCapsuleV1, FailureIdentityV1, ScenarioSpec,
+    ScenarioTopologyV2, TerminalOutcomeClassification, TraceExpectation, VectorMismatch,
+    run_scenario_report, write_failure_capsule,
 };
 use convergence_campaign_runner::{
     CampaignAdapterV1, ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1,
     DistributedParticipantV1, FailureClassificationV1, FailureCorpusObservationV1, FailureCorpusV1,
     OciRuntimeV1, RunnerError, ScenarioArtifactV1, build_adapter_reduction_candidate,
-    read_failure_corpus, record_distributed_failure, write_failure_corpus,
+    promote_capsule_into_corpus, read_failure_corpus, record_distributed_failure,
+    update_failure_corpus, write_failure_corpus,
 };
 use sha2::Digest;
 
@@ -24,7 +27,7 @@ fn observation(fingerprint: &str, adapter: CampaignAdapterV1) -> FailureCorpusOb
 }
 
 #[test]
-fn recurrence_classification_diagnosis_and_promotion_are_durable() {
+fn recurrence_classification_and_diagnosis_are_durable() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("failure-corpus.v1.json");
     let fingerprint = "a".repeat(64);
@@ -38,10 +41,8 @@ fn recurrence_classification_diagnosis_and_promotion_are_durable() {
     corpus
         .reclassify(&fingerprint, FailureClassificationV1::ProtocolAmbiguity)
         .unwrap();
-    corpus
-        .mark_diagnosed(&fingerprint, 900, Some("vectors/regression.v1.json".into()))
-        .unwrap();
-    corpus.mark_diagnosed(&fingerprint, 600, None).unwrap();
+    corpus.mark_diagnosed(&fingerprint, 900).unwrap();
+    corpus.mark_diagnosed(&fingerprint, 600).unwrap();
     write_failure_corpus(&path, &corpus).unwrap();
 
     let persisted = read_failure_corpus(&path).unwrap();
@@ -55,17 +56,21 @@ fn recurrence_classification_diagnosis_and_promotion_are_durable() {
         FailureClassificationV1::ProtocolAmbiguity
     );
     assert_eq!(entry.adapters.len(), 2);
-    assert!(
-        entry
-            .promoted_vectors
-            .contains(std::path::Path::new("vectors/regression.v1.json"))
-    );
+    assert!(entry.promoted_vectors.is_empty());
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join(".failure-corpus.v1.json.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
     }
@@ -153,6 +158,7 @@ fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
             code: "container_scenario".into(),
             message: "not persisted".into(),
         },
+        &scenario,
     )
     .unwrap();
     let corpus = read_failure_corpus(&path).unwrap();
@@ -166,5 +172,136 @@ fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
         !std::fs::read_to_string(path)
             .unwrap()
             .contains("not persisted")
+    );
+}
+
+#[test]
+fn concurrent_updates_do_not_lose_recurrences() {
+    let root = tempfile::tempdir().unwrap();
+    let path = std::sync::Arc::new(root.path().join("failure-corpus.v1.json"));
+    let fingerprint = "b".repeat(64);
+    let workers = 12;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+    let handles = (0..workers)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let fingerprint = fingerprint.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                update_failure_corpus(&path, |corpus| {
+                    corpus.record(observation(&fingerprint, CampaignAdapterV1::Process))
+                })
+                .unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let corpus = read_failure_corpus(&path).unwrap();
+    let entry = &corpus.entries[&fingerprint];
+    assert_eq!(entry.recurrence_count, workers as u64);
+    assert_eq!(entry.first_seen_sequence, 1);
+    assert_eq!(entry.last_seen_sequence, workers as u64);
+    assert_eq!(corpus.next_sequence, workers as u64 + 1);
+}
+
+#[test]
+fn abandoned_temporary_file_never_replaces_the_corpus() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("failure-corpus.v1.json");
+    let fingerprint = "c".repeat(64);
+    update_failure_corpus(&path, |corpus| {
+        corpus.record(observation(&fingerprint, CampaignAdapterV1::Process))
+    })
+    .unwrap();
+    fs_private::write_private(
+        &root.path().join(".failure-corpus.v1.json.tmp.abandoned"),
+        b"{not-json",
+    )
+    .unwrap();
+
+    update_failure_corpus(&path, |corpus| {
+        corpus.record(observation(&fingerprint, CampaignAdapterV1::Container))
+    })
+    .unwrap();
+
+    let corpus = read_failure_corpus(&path).unwrap();
+    assert_eq!(corpus.entries[&fingerprint].recurrence_count, 2);
+}
+
+#[tokio::test]
+async fn successful_promotion_records_validated_capsule_and_vector_digests() {
+    let root = tempfile::tempdir().unwrap();
+    let corpus_path = root.path().join("failure-corpus.v1.json");
+    let capsule_path = root.path().join("failure-capsule.v1.json");
+    let vector_path = root.path().join("regression-vector.v1.json");
+    let scenario = ScenarioSpec {
+        name: "promotion-provenance/v1".into(),
+        spec_version: "2".into(),
+        clients: Vec::new(),
+        topology: ScenarioTopologyV2::default(),
+        steps: Vec::new(),
+    };
+    let mut report = run_scenario_report(&scenario, None).await.unwrap();
+    report
+        .expected_outcomes
+        .push(TraceExpectation::NoPendingWork {
+            clients: Vec::new(),
+        });
+    report.expectation_failures.push(VectorMismatch {
+        kind: "promotion_sentinel".into(),
+        message: "synthetic mismatch".into(),
+        expected: serde_json::json!(true),
+        actual: serde_json::json!(false),
+    });
+    let capsule = FailureCapsuleV1::from_report(
+        report,
+        FailureCapsuleSensitivity::SyntheticShareable,
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    write_failure_capsule(&capsule_path, &capsule).unwrap();
+    let fingerprint = capsule.failure.digest.clone();
+    update_failure_corpus(&corpus_path, |corpus| {
+        corpus.record(observation(&fingerprint, CampaignAdapterV1::Engine))
+    })
+    .unwrap();
+
+    let alias_error = promote_capsule_into_corpus(
+        &corpus_path,
+        &fingerprint,
+        &capsule_path,
+        &corpus_path,
+        "test",
+    )
+    .unwrap_err();
+    assert_eq!(alias_error.code, "promotion_output_alias");
+    assert!(read_failure_corpus(&corpus_path).is_ok());
+
+    let promoted = promote_capsule_into_corpus(
+        &corpus_path,
+        &fingerprint,
+        &capsule_path,
+        &vector_path,
+        "test",
+    )
+    .unwrap();
+
+    assert_eq!(
+        promoted.sha256,
+        hex::encode(sha2::Sha256::digest(std::fs::read(&vector_path).unwrap()))
+    );
+    assert_eq!(
+        promoted.source_capsule_sha256,
+        hex::encode(sha2::Sha256::digest(std::fs::read(&capsule_path).unwrap()))
+    );
+    assert!(
+        read_failure_corpus(&corpus_path).unwrap().entries[&fingerprint]
+            .promoted_vectors
+            .contains(&promoted)
     );
 }
