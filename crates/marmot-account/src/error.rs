@@ -33,6 +33,8 @@ pub enum AccountHomeError {
     InvalidAccountLabel(String),
     #[error("stored account id does not match stored secret key")]
     AccountIdMismatch,
+    #[error("durable account setup state is missing")]
+    AccountSetupStateMissing,
     #[error("unsupported account secret storage backend: {0}")]
     UnsupportedSecretBackend(String),
     #[error("account secret store is not initialized: {0}")]

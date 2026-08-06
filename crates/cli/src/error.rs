@@ -604,6 +604,27 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "account_catch_up",
             "message": err.to_string(),
         }),
+        AppError::AccountSetupRecoveryRequired => json!({
+            "code": "account_setup_recovery_required",
+            "message": err.to_string(),
+            "repair": {
+                "action": "confirm possible orphaned KeyPackage exposure, then retry with the host recovery API",
+            },
+        }),
+        AppError::AccountSetupRetryRequired => json!({
+            "code": "account_setup_retry_required",
+            "message": err.to_string(),
+            "repair": { "action": "retry the original account setup operation" },
+        }),
+        AppError::AccountSetupResetNotApplicable => json!({
+            "code": "account_setup_reset_not_applicable",
+            "message": err.to_string(),
+        }),
+        AppError::AccountSetupKeyPackageRecoveryAvailable => json!({
+            "code": "account_setup_key_package_recovery_available",
+            "message": err.to_string(),
+            "repair": { "action": "retry the original account setup operation" },
+        }),
         other => json!({
             "code": "command_failed",
             "message": other.to_string(),
@@ -689,6 +710,31 @@ mod tests {
             assert!(!message.contains(nsec), "{message}");
             let json = wn_error_json(&err).to_string();
             assert!(!json.contains(nsec), "{json}");
+        }
+    }
+
+    #[test]
+    fn account_setup_recovery_errors_have_stable_json_codes() {
+        let cases = [
+            (
+                AppError::AccountSetupRecoveryRequired,
+                "account_setup_recovery_required",
+            ),
+            (
+                AppError::AccountSetupRetryRequired,
+                "account_setup_retry_required",
+            ),
+            (
+                AppError::AccountSetupResetNotApplicable,
+                "account_setup_reset_not_applicable",
+            ),
+            (
+                AppError::AccountSetupKeyPackageRecoveryAvailable,
+                "account_setup_key_package_recovery_available",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(wn_error_json(&WnError::App(error))["code"], code);
         }
     }
 }

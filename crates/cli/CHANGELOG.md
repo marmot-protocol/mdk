@@ -24,6 +24,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Account setup interruptions now have stable JSON recovery codes and repair
+  hints instead of falling through to the generic `command_failed` bucket.
+
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
   formatting. The TUI group diagnostics panel no longer retains or renders raw

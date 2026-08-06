@@ -160,6 +160,61 @@ impl Marmot {
         })
     }
 
+    /// Remove only the legacy ambiguous partial-account shape so a subsequent
+    /// `login` with the same nsec can recreate it. The acknowledgement is
+    /// required because old local state cannot prove that no KeyPackage was
+    /// exposed before its stable slot was lost.
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: String,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), MarmotKitError> {
+        let nsec = Zeroizing::new(nsec);
+        self.runtime
+            .reset_incomplete_account_setup(nsec.as_str(), acknowledge_possible_key_package_orphan)
+            .await?;
+        Ok(())
+    }
+
+    /// Consent-gated one-call recovery for installations stranded before MDK
+    /// had durable account-setup journals. This validates the same nsec,
+    /// removes only the recognized ambiguous partial shape, preserves an
+    /// existing account-id Keychain credential, and immediately retries login.
+    pub async fn login_recovering_incomplete_setup(
+        &self,
+        nsec: String,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        if !marmot_app::is_nostr_secret(&nsec) {
+            return Err(MarmotKitError::InvalidIdentity {
+                details: "incomplete setup recovery requires an nsec".into(),
+            });
+        }
+        let request = AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(Zeroizing::new(nsec)),
+            default_relays: endpoints(&default_relays),
+            bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        };
+        let result = self
+            .runtime
+            .recover_incomplete_account_setup(request, acknowledge_possible_key_package_orphan)
+            .await?;
+        Ok(AccountSummaryFfi {
+            label: result.account.label,
+            account_id_hex: result.account.account_id_hex,
+            local_signing: result.account.local_signing,
+            external_signing: result.account.external_signing,
+            signed_out: result.account.signed_out,
+            running: true,
+        })
+    }
+
     /// Log in with an external account signer such as Amber/NIP-55.
     ///
     /// MDK stores only the account public key and device-local database

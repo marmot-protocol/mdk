@@ -3150,6 +3150,23 @@ impl MarmotApp {
         }
     }
 
+    /// Remove compatibility artifacts that live outside the account directory.
+    /// Account-home deletion cannot otherwise make setup rollback complete.
+    fn remove_account_key_package_artifacts(&self, label: &str) -> Result<(), AppError> {
+        for path in [
+            self.key_package_record_path(label),
+            self.key_package_cutover_replacement_pending_path(label),
+            self.key_package_cutover_scan_complete_path(label),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
         self.key_package_cutover_scan_complete_path(label).exists()
     }
@@ -3537,6 +3554,7 @@ impl MarmotApp {
         label: &str,
     ) -> Result<(), AppError> {
         let account_storage_preexisted = self.account_storage_path(label).exists();
+        let setup_in_progress = self.account_home().account_setup_state(label)?.is_some();
         let storage = self.account_storage(label)?;
         let existing_lifecycle = storage.key_package_lifecycle()?;
         if existing_lifecycle
@@ -3561,18 +3579,27 @@ impl MarmotApp {
                 }
             }
             Ok(None)
-                if !account_storage_preexisted
+                if (!account_storage_preexisted || setup_in_progress)
                     && storage.stored_key_package_bundles()?.is_empty() =>
             {
-                // Only a newly-created account database can mint the first
-                // slot without migration evidence. An existing database with
-                // missing cache authority fails closed even when no private
-                // bundles remain: it may previously have published under a
-                // now-unrecoverable `d` slot.
+                // Only a newly-created or durably journaled account setup can
+                // mint the first slot without migration evidence. Other
+                // existing databases fail closed even when no private bundles
+                // remain: they may have published under an unrecoverable `d`.
                 let mut slot = [0u8; 32];
                 OsRng.fill_bytes(&mut slot);
                 storage
                     .put_key_package_lifecycle(&empty_key_package_lifecycle(hex::encode(slot)))?;
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None) | Err(_) if account_storage_preexisted && !setup_in_progress => {
+                // A database created before the durable setup journal is
+                // ambiguous: it may be an interrupted fresh setup, or an
+                // upgraded device whose published stable slot was lost. Do not
+                // mint a second slot. Keep normal account reads available; the
+                // setup publication boundary surfaces the typed recovery state.
                 if self.mark_key_package_cutover_replacement_pending(label) {
                     return Ok(());
                 }
@@ -3592,6 +3619,18 @@ impl MarmotApp {
         Err(AppError::Io(std::io::Error::other(
             "could not persist strict cutover replacement intent before session open",
         )))
+    }
+
+    fn legacy_incomplete_setup_requires_recovery(&self, label: &str) -> Result<bool, AppError> {
+        if !self.account_storage_path(label).exists()
+            || self.account_home().account_setup_state(label)?.is_some()
+            || self.key_package_record_path(label).exists()
+        {
+            return Ok(false);
+        }
+        let storage = self.account_storage(label)?;
+        Ok(storage.key_package_lifecycle()?.is_none()
+            && storage.stored_key_package_bundles()?.is_empty())
     }
 
     async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {

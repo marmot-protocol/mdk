@@ -1078,6 +1078,10 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::ExternalSignerRejected
         | AppError::MissingDirectoryEntry(_)
         | AppError::NotificationsDisabled
+        | AppError::AccountSetupRecoveryRequired
+        | AppError::AccountSetupRetryRequired
+        | AppError::AccountSetupResetNotApplicable
+        | AppError::AccountSetupKeyPackageRecoveryAvailable
         | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)

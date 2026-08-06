@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-#[cfg(feature = "test-policy-overrides")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
@@ -34,7 +33,7 @@ use nostr_sdk::prelude::{
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use transport_nostr_adapter::{
     KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST, NostrRelayClient, NostrSdkRelayClient,
@@ -113,6 +112,52 @@ impl WritePolicy for RejectDeletionEvents {
             } else {
                 PolicyResult::Accept
             }
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RejectKeyPackagesWhileArmed(Arc<AtomicBool>);
+
+impl WritePolicy for RejectKeyPackagesWhileArmed {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if self.0.load(Ordering::Relaxed)
+                && event.kind == Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
+            {
+                PolicyResult::Reject("injected key package rejection".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BlockKeyPackagesWhileArmed {
+    armed: Arc<AtomicBool>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl WritePolicy for BlockKeyPackagesWhileArmed {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if self.armed.load(Ordering::Relaxed)
+                && event.kind == Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            PolicyResult::Accept
         })
     }
 }
@@ -781,6 +826,290 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
     );
 
     recovered_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_key_package_setup_retries_same_nsec_after_restart() {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(true));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
+    let setup = |secret: &str| AccountSetupRequest {
+        identity: None,
+        import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let first_runtime = MarmotAppRuntime::new(first_app.clone());
+    let error = first_runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect_err("the first KeyPackage publish must be rejected");
+    assert!(
+        error.to_string().contains("key package publication failed"),
+        "unexpected setup boundary: {error}"
+    );
+    let first_home = AccountHome::open(dir.path());
+    let account = first_home.account(&account_id).unwrap();
+    assert_eq!(
+        first_home
+            .account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted
+    );
+    assert!(
+        first_home
+            .account_dir(&account.label)
+            .join("session.sqlite")
+            .exists()
+    );
+    // Simulate the exact shape left by an older app build: the encrypted
+    // lifecycle owns an exact pending publication, but setup predates the
+    // durable journal introduced by this fix.
+    std::fs::remove_file(
+        first_home
+            .account_dir(&account.label)
+            .join(".account-setup.json"),
+    )
+    .unwrap();
+    first_runtime.shutdown().await;
+    drop(first_runtime);
+    drop(first_app);
+
+    rejecting.store(false, Ordering::Relaxed);
+    let second_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let second_runtime = MarmotAppRuntime::new(second_app.clone());
+    let retried = second_runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect("the same nsec must resume after restart");
+    assert_eq!(retried.account.account_id_hex, account_id);
+    let second_home = AccountHome::open(dir.path());
+    assert_eq!(second_home.accounts().unwrap().len(), 1);
+    assert!(
+        second_home
+            .account_setup_state(&retried.account.label)
+            .unwrap()
+            .is_none(),
+        "the setup journal is removed only after commit"
+    );
+    let lifecycle = second_runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle.current_key_package.is_some());
+    assert!(lifecycle.pending_replacement.is_none());
+    assert_eq!(lifecycle.stable_slot_id.len(), 64);
+    second_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(true));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let first_runtime = MarmotAppRuntime::new(first_app);
+    first_runtime
+        .create_identity(setup())
+        .await
+        .expect_err("the first generated identity KeyPackage publish must fail");
+    let first_home = AccountHome::open(dir.path());
+    let first_account = first_home.accounts().unwrap().into_iter().next().unwrap();
+    assert_eq!(
+        first_home
+            .account_setup_state(&first_account.label)
+            .unwrap()
+            .unwrap()
+            .kind,
+        marmot_account::AccountSetupKind::GeneratedIdentity
+    );
+    first_runtime.shutdown().await;
+
+    rejecting.store(false, Ordering::Relaxed);
+    let second_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let second_runtime = MarmotAppRuntime::new(second_app);
+    let retried = second_runtime
+        .create_identity(setup())
+        .await
+        .expect("create-identity retry must resume the generated identity");
+    assert_eq!(retried.account.account_id_hex, first_account.account_id_hex);
+    assert_eq!(AccountHome::open(dir.path()).accounts().unwrap().len(), 1);
+    second_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_external_signer_setup_resumes_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(true));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let keys = Keys::generate();
+    let public_key = keys.public_key().to_hex();
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let first_runtime = MarmotAppRuntime::new(first_app);
+    first_runtime
+        .login_external_signer(
+            public_key.clone(),
+            TestExternalAccountSigner { keys: keys.clone() },
+            setup(),
+        )
+        .await
+        .expect_err("the first external-signer KeyPackage publish must fail");
+    let first_home = AccountHome::open(dir.path());
+    assert_eq!(
+        first_home
+            .account_setup_state(&public_key)
+            .unwrap()
+            .unwrap()
+            .phase,
+        marmot_account::AccountSetupPhase::KeyPackagePublicationStarted
+    );
+    first_runtime.shutdown().await;
+
+    rejecting.store(false, Ordering::Relaxed);
+    let second_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let second_runtime = MarmotAppRuntime::new(second_app);
+    let retried = second_runtime
+        .login_external_signer(
+            public_key.clone(),
+            TestExternalAccountSigner { keys },
+            setup(),
+        )
+        .await
+        .expect("external-signer retry must resume its pending publication");
+    assert_eq!(retried.account.account_id_hex, public_key);
+    assert!(
+        AccountHome::open(dir.path())
+            .account_setup_state(&retried.account.label)
+            .unwrap()
+            .is_none()
+    );
+    second_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart() {
+    use marmot_account::AccountSetupPhase;
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(BlockKeyPackagesWhileArmed {
+            armed: armed.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
+    let setup = |secret: &str| AccountSetupRequest {
+        identity: None,
+        import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+
+    let first_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let first_runtime = MarmotAppRuntime::new(first_app.clone());
+    let attempt_runtime = first_runtime.clone();
+    let first_setup = setup(&secret);
+    let attempt =
+        tokio::spawn(async move { attempt_runtime.create_or_import_account(first_setup).await });
+    timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("KeyPackage publication must reach the blocking relay");
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+
+    let first_home = AccountHome::open(dir.path());
+    let account = first_home.account(&account_id).unwrap();
+    assert_eq!(
+        first_home
+            .account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .phase,
+        AccountSetupPhase::KeyPackagePublicationStarted
+    );
+    assert!(
+        first_home
+            .account_dir(&account.label)
+            .join("session.sqlite")
+            .exists()
+    );
+
+    armed.store(false, Ordering::Relaxed);
+    release.notify_one();
+    first_runtime.shutdown().await;
+    drop(first_runtime);
+    drop(first_app);
+
+    let second_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let second_runtime = MarmotAppRuntime::new(second_app);
+    let retried = second_runtime
+        .create_or_import_account(setup(&secret))
+        .await
+        .expect("cancelled setup must resume without deleting local data");
+    assert_eq!(retried.account.account_id_hex, account_id);
+    let lifecycle = second_runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle.current_key_package.is_some());
+    assert!(lifecycle.pending_replacement.is_none());
+    second_runtime.shutdown().await;
 }
 
 #[tokio::test]
