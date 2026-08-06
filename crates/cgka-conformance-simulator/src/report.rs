@@ -763,7 +763,6 @@ mod tests {
             step_log: Vec::new(),
             pending_resolution_observations: Vec::new(),
             quiescence_observations: Vec::new(),
-            recovery_observations: Vec::new(),
             epoch_change_observations: Vec::new(),
             app_invalidation_observations: Vec::new(),
             expectation_failures: Vec::new(),
@@ -776,13 +775,13 @@ mod tests {
     fn scenario_report_failures_include_oracle_coverage_failures() {
         let report = report_with_oracle(ScenarioOracleReport {
             stimuli: vec![ScenarioStimulus::CommitStorm],
-            oracle_behaviors: vec![OracleBehavior::ForkRecovered],
+            oracle_behaviors: vec![OracleBehavior::ClientConvergence],
             observed_behaviors: Vec::new(),
-            missing_observed_behaviors: vec![OracleBehavior::ForkRecovered],
+            missing_observed_behaviors: vec![OracleBehavior::ClientConvergence],
             evidence: BehaviorEvidenceSummary::default(),
             weak_oracle_warnings: vec![OracleCoverageWarning {
                 stimulus: ScenarioStimulus::CommitStorm,
-                expected_any_of: vec![OracleBehavior::ForkRecovered],
+                expected_any_of: vec![OracleBehavior::ClientConvergence],
                 message:
                     "scenario includes CommitStorm but no expectation checks the matching behavior"
                         .into(),

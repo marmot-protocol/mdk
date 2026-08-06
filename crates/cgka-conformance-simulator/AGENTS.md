@@ -145,7 +145,7 @@ the property-test registry. This file is the agent-facing model.
   - **Role:** `ScenarioTrace`, observations, and semantic `TraceExpectation` checks. Records final epoch/member/payload
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
     commit/proposal/application input dispositions, pending-work blockers, active decryptability matrices, and
-    `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`.
+    settled `ConvergenceDecisionObservation` entries captured from the forensic recorder.
 
 - **Module:** `src/policy_cases.rs`
   - **Role:** Serializable `PolicyCase` DTOs plus selection-reasoning helpers (`parse_policy_cases`, `reason_against`,
@@ -252,7 +252,7 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 2. Include `scenario_name`, `vector_version`, `conformance_version`, `seed`, `scenario`, and either `expected_trace` or
    `expected_outcomes`.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
-4. Make recovery behavior observable through `ForkRecoveryObservation`, not just final membership.
+4. Make fork-resolution behavior observable through a settled `convergence_decision` expectation, not just final membership.
 5. Run `cargo test -p cgka-conformance-simulator canonical_vector_fixtures_match_generated_traces`.
 
 ## OpenMLS replay probes

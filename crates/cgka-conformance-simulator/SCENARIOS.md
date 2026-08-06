@@ -91,14 +91,14 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/group-data-fork-recovery.v1.json`
 - Setup: Alice and Bob both update group data from the same epoch.
 - Pressure: same-epoch group-data commit race.
-- Expected: the engine chooses one branch, rolls the loser back, and both clients converge at epoch 2.
+- Expected: distributed convergence selects one branch, reorgs the loser onto it, and both clients converge at epoch 2 with a settled convergence decision recorded.
 
 ### `concurrent-invite-fork-recovery/v1`
 
 - File: `vectors/concurrent-invite-fork-recovery.v1.json`
 - Setup: Alice and Bob both invite a different member from the same epoch.
 - Pressure: same-epoch invite commit race.
-- Expected: one invite branch wins, the other is invalidated, and active clients converge on the same member set.
+- Expected: one invite branch wins branch selection, the other is parked off the canonical branch, and active clients converge on the same member set with a settled convergence decision recorded.
 
 ### `convergence-committer-selected/v1`
 
@@ -164,16 +164,14 @@ These are the scenarios another implementation should be able to load from JSON 
   `UpdateGroupData` commits and both confirm publication; both commits are withheld, then Bob — the
   deterministic ordering winner — restarts before either sibling is released, so he consumes the fork over
   durable storage with a fresh engine.
-- Pressure: the same depth-1 fork is resolved through every route that exists today — the live committer's
-  pairwise fork-recovery seam (Alice, the ordering loser), post-restart convergence over hydrated storage
-  (Bob, the restarted committer whose in-memory `committed_from` guard is gone), and the observer convergence
-  selector (Carol and Dave). Both withheld commits are released in reversed order before anyone consumes the
-  sibling branch.
+- Pressure: the same depth-1 fork is resolved by every member shape — the live committer (Alice, the
+  ordering loser), the restarted committer over hydrated storage (Bob), and the passive observers (Carol and
+  Dave) — all through the one distributed-convergence route. Both withheld commits are released in reversed
+  order before anyone consumes the sibling branch.
 - Expected: all four clients converge at epoch 2 with four members and the same branch-sensitive group name,
-  pass exact canonical equivalence and no-pending-work, and exactly one recovery observation is recorded — the
-  live pairwise loser's; the restarted committer and both observers settle the identical branch through
-  convergence decisions instead. This pins the route equivalence that the pairwise-route deletion (option C
-  Slice C) must preserve unchanged.
+  pass exact canonical equivalence and no-pending-work, and a settled convergence decision at tip epoch 2 is
+  recorded. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
+  route agreed; flipped into the unified-route acceptance pin when the pairwise route was deleted.
 
 ### `conversation/v1`
 
@@ -280,8 +278,8 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Setup: two clients create a group, then raise competing group-data commits from the same epoch — the concurrent-fork
   shape the adapter derives from a fork-recovery incident.
 - Pressure: same-epoch group-data commit race with deferred delivery (no partition needed; the commits are concurrent).
-- Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
-  epoch 2 with the full recovery summary matching the recorded incident.
+- Expected: distributed convergence resolves the race on delivery, the designated winner's branch survives, and both
+  clients converge at epoch 2 with a settled convergence decision at that tip recorded as the resolution evidence.
 
 ### `membership-fork-recovery-incident/v1`
 
@@ -289,11 +287,11 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Setup: two committers create a group, then raise competing membership commits (an invite race) from the same epoch,
   with the two invitees held out by a partition — the membership-fork shape the adapter derives from a fork-recovery
   incident whose contested tip is a membership/admin commit (`member_added`/`member_removed`/`admin_added`/`admin_removed`).
-- Pressure: same-epoch membership commit race with deferred delivery; the fork-recovery seam — not the convergence
-  selector — resolves it.
-- Expected: the engine fork-recovers on delivery and both committers converge at epoch 2 with `member_count == 3` — the
-  winner-agnostic proof that exactly one branch's invite survived — and the full recovery summary matching the recorded
-  incident. Unlike the group-data fork, the recovery is winner-agnostic (no branch-name label search), because real
+- Pressure: same-epoch membership commit race with deferred delivery, resolved by the convergence selector.
+- Expected: distributed convergence resolves the race on delivery and both committers converge at epoch 2 with
+  `member_count == 3` — the winner-agnostic proof that exactly one branch's invite survived — and a settled
+  convergence decision at that tip recorded as the resolution evidence. Unlike the group-data fork, the resolution
+  expectation is winner-agnostic (no branch-name label search), because real
   observer-recorded exports cannot join a commit's publisher (`account_ref`, the observing engine) to its committer
   (`actor_member_ref`, an MLS member id).
 
@@ -423,9 +421,9 @@ These are real simulator scenarios that are still tied to Rust harness details.
 ### `deliberate_fork_via_harness`
 
 - Setup: Alice and Bob concurrently invite different new members while a partition hides each branch.
-- Expected: one branch wins by deterministic ordering. One peer rolls back, and Alice and Bob end on the same member
-  set.
-- Reason: the test inspects recovery observations and exact branch ordering keys.
+- Expected: one branch wins by deterministic ordering. One peer reorgs onto it, and Alice and Bob end on the same
+  member set.
+- Reason: the test inspects harness tick outcomes and exact membership directly.
 
 ### `failed_invite_staging_does_not_poison_fork_detection_via_harness`
 
@@ -434,9 +432,9 @@ These are real simulator scenarios that are still tied to Rust harness details.
   source epoch.
 - Expected: the sibling commit is adjudicated deterministically (stale losing branch or reorg onto the winner) — never
   a fail-closed `ForkedEpoch` — and Alice's group stays usable for a follow-up invite.
-- Reason: regression guard for the phantom `committed_from` bookkeeping bug (fixed by recording it only inside
-  `begin_pending`); mirrors the cgka-engine test `failed_invite_staging_does_not_poison_fork_detection` at the
-  multi-client bus level.
+- Reason: regression guard for the historical phantom fork-detection bookkeeping bug (routing no longer consults
+  committer-side bookkeeping at all); mirrors the cgka-engine test
+  `failed_invite_staging_does_not_poison_fork_detection` at the multi-client bus level.
 
 ### `convergence-e2e-group-events/v1`
 

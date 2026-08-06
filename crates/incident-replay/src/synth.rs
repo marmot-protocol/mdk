@@ -118,12 +118,18 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
                 pending: "l".to_owned(),
                 resolution: "confirmed".to_owned(),
             },
-            // Rule 4: assert the full recovery summary, not just the winner.
-            TraceExpectation::RecoverySummary {
-                count: 1,
-                source_epoch: Some(1),
-                recovered_epoch: Some(2),
-                winner_differs_from_invalidated: true,
+            // Rule 4: assert the resolution evidence, not just the final
+            // state — a settled convergence decision at the post-fork tip
+            // proves branch selection actually ran (fork resolution is
+            // unified through distributed convergence; no per-recovery
+            // event exists).
+            TraceExpectation::ConvergenceDecision {
+                client: None,
+                selected_branch_id: None,
+                selected_tip_epoch: Some(2),
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: None,
             },
             // Both committers settle on the one surviving branch.
             TraceExpectation::ClientsConverged {
@@ -227,12 +233,18 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
                 pending: "l".to_owned(),
                 resolution: "confirmed".to_owned(),
             },
-            // Rule 4: assert the full recovery summary, not just the winner.
-            TraceExpectation::RecoverySummary {
-                count: 1,
-                source_epoch: Some(1),
-                recovered_epoch: Some(2),
-                winner_differs_from_invalidated: true,
+            // Rule 4: assert the resolution evidence, not just the final
+            // state — a settled convergence decision at the post-fork tip
+            // proves branch selection actually ran (fork resolution is
+            // unified through distributed convergence; no per-recovery
+            // event exists).
+            TraceExpectation::ConvergenceDecision {
+                client: None,
+                selected_branch_id: None,
+                selected_tip_epoch: Some(2),
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: None,
             },
             // member_count 3 == exactly one branch's invite survived (both would
             // be 4, neither 2): the winner-agnostic survival proof.

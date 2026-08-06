@@ -722,27 +722,6 @@ fn snapshot_group_events() {
         }
     );
     insta::assert_json_snapshot!(
-        "event_fork_recovered",
-        GroupEvent::ForkRecovered {
-            group_id: gid(),
-            source_epoch: EpochId(1),
-            recovered_epoch: EpochId(2),
-            winner: CommitOrderingKey {
-                source_epoch: EpochId(1),
-                priority: CommitOrderingPriority::Privileged,
-                committer: MemberId::new(b"alice".to_vec()),
-                commit_digest: [0xAA; 32],
-            },
-            invalidated: CommitOrderingKey {
-                source_epoch: EpochId(1),
-                priority: CommitOrderingPriority::Ordinary,
-                committer: MemberId::new(b"bob".to_vec()),
-                commit_digest: [0xBB; 32],
-            },
-            invalidated_commit_id: mid(),
-        }
-    );
-    insta::assert_json_snapshot!(
         "event_commit_rolled_back",
         GroupEvent::CommitRolledBack {
             group_id: gid(),

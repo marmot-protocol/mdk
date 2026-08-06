@@ -22,11 +22,10 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use crate::{
-    ClientEventCounts, ClientObservation, ConvergenceSubject, ForkRecoveryObservation,
-    ScenarioAdminPolicyObservation, ScenarioInputLedgerEntry, SubjectCapability,
-    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
-    SubjectInviteMembers, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    ClientEventCounts, ClientObservation, ConvergenceSubject, ScenarioAdminPolicyObservation,
+    ScenarioInputLedgerEntry, SubjectCapability, SubjectCreateGroup, SubjectDescriptor,
+    SubjectError, SubjectFailureCategory, SubjectInviteMembers, SubjectRemoveMembers,
+    SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 
 pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
@@ -563,7 +562,6 @@ impl AppRuntimeHarness {
                     removed_members: Vec::new(),
                     epoch_changes: Vec::new(),
                     app_invalidations: Vec::new(),
-                    recoveries: Vec::<ForkRecoveryObservation>::new(),
                     convergence_decisions: Vec::new(),
                 })
             })

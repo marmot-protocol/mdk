@@ -751,7 +751,6 @@ fn convergence_chaos_invite_fork(case_index: u64) -> (ScenarioSpec, Vec<TraceExp
         clients_converged(["alice", "bob"], Some(2), Some(3)),
         client_state("alice", 2, 3, vec![]),
         client_state("bob", 2, 3, vec![]),
-        recovery_summary(1, Some(1), Some(2)),
     ];
     (scenario, expected)
 }
@@ -795,7 +794,6 @@ fn convergence_chaos_group_data_fork(case_index: u64) -> (ScenarioSpec, Vec<Trac
         confirmed(7, "alice", "alice-update"),
         confirmed(8, "bob", "bob-update"),
         clients_converged(["alice", "bob"], Some(2), Some(2)),
-        recovery_summary(1, Some(1), Some(2)),
     ];
     (scenario, expected)
 }
@@ -2519,19 +2517,6 @@ fn client_state(
         received_payloads: Some(received_payloads),
         added_members: None,
         removed_members: None,
-    }
-}
-
-fn recovery_summary(
-    count: usize,
-    source_epoch: Option<u64>,
-    recovered_epoch: Option<u64>,
-) -> TraceExpectation {
-    TraceExpectation::RecoverySummary {
-        count,
-        source_epoch,
-        recovered_epoch,
-        winner_differs_from_invalidated: true,
     }
 }
 

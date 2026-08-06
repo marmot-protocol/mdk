@@ -876,7 +876,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -897,7 +896,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -918,7 +916,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
             ],
@@ -1997,7 +1994,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
 }
 
 #[tokio::test]
-async fn scenario_report_records_trace_log_recoveries_and_failures() {
+async fn scenario_report_records_trace_log_and_failures() {
     let spec = deliberate_fork_recovery_spec();
 
     let report = run_scenario_report(&spec, None)
@@ -2013,12 +2010,6 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
             .iter()
             .all(|entry| entry.status.is_completed())
     );
-    assert_eq!(report.recovery_observations.len(), 1);
-    let recovery = &report.recovery_observations[0];
-    assert_eq!(recovery.source_epoch, 1);
-    assert_eq!(recovery.recovered_epoch, 2);
-    assert_ne!(recovery.winner, recovery.invalidated);
-    assert!(recovery.winner < recovery.invalidated);
     assert!(report.invariant_failures.is_empty());
 
     let json = serde_json::to_value(&report).expect("report serializes");
@@ -2049,16 +2040,6 @@ async fn group_data_fork_recovery_fixture_uses_semantic_outcomes() {
         assert_eq!(observation.epoch, 2);
         assert_eq!(observation.member_count, 2);
     }
-    let recoveries = trace
-        .observations
-        .iter()
-        .flat_map(|observation| observation.recoveries.iter())
-        .collect::<Vec<_>>();
-    assert_eq!(recoveries.len(), 1);
-    assert_ne!(
-        recoveries[0].winner, recoveries[0].invalidated,
-        "semantic recovery fixture should not depend on exact commit digest bytes"
-    );
 }
 
 #[tokio::test]
@@ -2442,31 +2423,6 @@ async fn deliberate_fork_via_harness() {
         alice_members, bob_members,
         "alice outcomes: {alice_outcomes:?}; bob outcomes: {bob_outcomes:?}"
     );
-    let trace = ScenarioTrace {
-        name: "deliberate-fork-recovery/v1".into(),
-        pending_resolutions: vec![],
-        errors: vec![],
-        admin_policies: vec![],
-        decryptability_probes: vec![],
-        observations: vec![
-            observe_client("alice", &mut alice),
-            observe_client("bob", &mut bob),
-        ],
-    };
-    let recoveries: Vec<_> = trace
-        .observations
-        .iter()
-        .flat_map(|o| o.recoveries.iter())
-        .collect();
-    assert_eq!(
-        recoveries.len(),
-        1,
-        "exactly one peer should roll back to the deterministic winner: {trace:#?}"
-    );
-    assert_eq!(recoveries[0].source_epoch, 1);
-    assert_eq!(recoveries[0].recovered_epoch, 2);
-    assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
-    assert!(recoveries[0].winner < recoveries[0].invalidated);
     let has_david = alice_members.iter().any(|m| m.id == david.member_id());
     let has_eve = alice_members.iter().any(|m| m.id == eve.member_id());
     assert_ne!(has_david, has_eve);
@@ -2922,7 +2878,6 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
         }
         assert!(observation.removed_members.is_empty());
         assert!(observation.app_invalidations.is_empty());
-        assert!(observation.recoveries.is_empty());
     }
 }
 
