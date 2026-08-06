@@ -2281,17 +2281,24 @@ struct RouterFlipFixture {
 /// sorts FIRST — which makes the inbound sibling commit the ordering winner for
 /// every `tag`, so control and restart runs are directly comparable.
 async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
-    router_flip_fixture_arranged(tag, true).await
+    let (fixture, joiner, _creator) = router_flip_fixture_arranged(tag, true).await;
+    (fixture, joiner)
 }
 
 /// [`router_flip_fixture`] with the ordering winner chosen up front:
 /// `sibling_wins` picks whether the creator's inbound sibling commit or the
 /// joiner's own confirmed commit wins the privileged same-epoch committer
 /// comparison (identities are seed-derived, so the arrangement is exact).
+/// Also returns the creator engine (the sibling author, live on its own
+/// branch) so repair-path tests can keep driving the group from that side.
 async fn router_flip_fixture_arranged(
     tag: &str,
     sibling_wins: bool,
-) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
+) -> (
+    RouterFlipFixture,
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+) {
     let a = format!("rf-a-{tag}").into_bytes();
     let b = format!("rf-b-{tag}").into_bytes();
     let (creator_seed, joiner_seed) = if (pad32(&a) < pad32(&b)) == sibling_wins {
@@ -2388,7 +2395,7 @@ async fn router_flip_fixture_arranged(
         sibling_invitee: MemberId::new(pad32(&sibling_seed)),
         sibling_wins: sibling_key < own_key,
     };
-    (fixture, joiner)
+    (fixture, joiner, creator)
 }
 
 fn settled_branch(engine: &Engine<SqliteAccountStorage>, f: &RouterFlipFixture) -> Branch {
@@ -2886,7 +2893,7 @@ async fn convergence_pass_that_keeps_the_own_commit_emits_no_own_withdrawal() {
     // the app to tombstone rows for a commit the device still stands on.
     // #1285's checkpoint materialization closes that: this test pins the
     // clean behavior.
-    let (f, local) = router_flip_fixture_arranged("u4-keep", false).await;
+    let (f, local, _creator) = router_flip_fixture_arranged("u4-keep", false).await;
     assert!(
         !f.sibling_wins,
         "fixture must make the device's own commit the ordering winner"
@@ -2973,7 +2980,7 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
     // confirmed commit. Spec (convergence.md "Applying the selected branch"):
     // superseding a previously applied commit — including the device's own —
     // MUST withdraw the state notifications attributed to it, exactly once.
-    let (f, local) = router_flip_fixture_arranged("u4-replace", true).await;
+    let (f, local, _creator) = router_flip_fixture_arranged("u4-replace", true).await;
     assert!(
         f.sibling_wins,
         "fixture must make the inbound sibling commit the ordering winner"
@@ -3099,4 +3106,156 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         "the displaced own commit must stay reconsiderable"
     );
     assert_eq!(own.epoch, EpochId(1));
+}
+
+#[tokio::test]
+async fn verified_welcome_repair_reconsiders_the_parked_rival_and_restores_service() {
+    // Slice A parks the unadjudicated rival `ConvergenceDeferred` and durably
+    // halts the group; "reconsiderable after a verified repair" was designed
+    // but untested — `repair_to_stable`'s only production caller is the
+    // authenticated-Welcome join path (mdk#971, `join_welcome_repair`). This
+    // drives that whole loop through public APIs:
+    //
+    // 1. the Slice A halt: a restarted committer with no source-epoch anchor
+    //    receives the winning sibling → parked rival + durable Unrecoverable;
+    // 2. the verified repair: the sibling author (admin, live on the fleet's
+    //    branch) removes the wedged device and re-invites it with a fresh key
+    //    package; the authenticated Welcome exits the halt via
+    //    `repair_to_stable`, landing the device on the fleet's branch;
+    // 3. the reconsideration: the repaired group's convergence drain settles
+    //    with the parked rival re-scored against the joined state instead of
+    //    staying wedged — and the device can publish again.
+    let (f, local, mut creator) = router_flip_fixture_arranged("repair", true).await;
+    assert!(f.sibling_wins);
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    drop(local);
+    f.local_storage
+        .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
+        .expect("release the source-epoch anchor");
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    // (1) The Slice A halt, exactly as pinned by
+    // `restarted_committer_without_source_anchor_fails_closed_for_repair`.
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    assert!(
+        f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+    local.drain_events();
+
+    // A halted group refuses new work — the wedge is real before the repair.
+    let wedged = local
+        .send(SendIntent::SelfUpdate {
+            group_id: f.group_id.clone(),
+        })
+        .await;
+    assert!(
+        wedged.is_err(),
+        "an unrecoverable group must refuse sends, got {wedged:?}"
+    );
+
+    // (2) The verified repair. The sibling author removes the wedged device
+    // from the fleet's branch and re-invites it with a fresh key package.
+    let device_id = MemberId::new(pad32(&f.local_seed));
+    match creator
+        .send(SendIntent::RemoveMembers {
+            group_id: f.group_id.clone(),
+            members: vec![device_id.clone()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => {
+            creator.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+    let fresh_kp = local.fresh_key_package().await.unwrap();
+    let welcome = match creator
+        .send(SendIntent::Invite {
+            group_id: f.group_id.clone(),
+            key_packages: vec![fresh_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => {
+            creator.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let joined = local.join_welcome(welcome).await.unwrap();
+    assert_eq!(joined, f.group_id, "the Welcome repairs the SAME group");
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "an authenticated Welcome is a verified repair path out of the halt"
+    );
+    assert_eq!(
+        local.epoch(&f.group_id).unwrap(),
+        EpochId(4),
+        "the repaired device joins the fleet's branch at the re-invite epoch"
+    );
+    assert_eq!(
+        settled_branch(&local, &f),
+        Branch::Sibling,
+        "the repair lands the device on the branch it could not adjudicate"
+    );
+
+    // (3) The parked rival is reconsidered by the repaired group's drain: the
+    // pass settles (no relapse into Blocked/Unrecoverable) with the rival
+    // re-scored against the joined state — it IS the joined branch's history,
+    // so it must never be re-applied, and the group publishes again.
+    let result = local
+        .converge_stored_openmls_messages_at(&f.group_id, u64::MAX)
+        .expect("the repaired group's convergence drain must run");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(result.errors.is_empty(), "no errors: {:?}", result.errors);
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "reconsidering the parked rival must not relapse the halt"
+    );
+    assert_eq!(
+        local.epoch(&f.group_id).unwrap(),
+        EpochId(4),
+        "reconsideration must not move the repaired tip"
+    );
+    // Characterization: the drain leaves the parked rival exactly where the
+    // halt put it — `ConvergenceDeferred` below the joined tip. It is never
+    // re-applied (the welcomed state already embodies its branch) and never
+    // terminally invalidated; it is inert, reconsiderable residue. If a later
+    // slice terminalizes below-join residue, flip this pin deliberately.
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::ConvergenceDeferred,
+        "the below-join rival stays parked, not re-applied and not terminalized"
+    );
+
+    let probe = local
+        .send(SendIntent::SelfUpdate {
+            group_id: f.group_id.clone(),
+        })
+        .await
+        .expect("the repaired group must accept new work");
+    assert!(matches!(
+        probe,
+        SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
+    ));
 }
