@@ -33,7 +33,7 @@ treated like telemetry.
 | Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json) |
 | Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
-| Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`fork_recovery.rs`](../../crates/cgka-engine/src/fork_recovery.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
+| Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
 | Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
@@ -657,15 +657,17 @@ Metadata notes:
 
 ### `snapshot_created`
 
-Emitted after fork-recovery snapshot creation succeeds.
+Historical (read-compat): emitted by pre-unification engine versions after send/apply-time fork-recovery snapshot
+creation. The unified engine retains source-epoch anchors (`openmls-retained-anchor-{epoch}`) without emitting this
+kind; the kind stays parseable so historical JSONL exports keep loading.
 
 | Field | Meaning |
 | --- | --- |
-| `snapshot_name` | Snapshot name returned by `ForkRecoveryManager::create_snapshot`. |
+| `snapshot_name` | Snapshot name from the (deleted) send/apply-time capture. |
 | `source_epoch` | Epoch the snapshot represents. |
 | `reason` | Stable reason string from the call site. |
 
-Current `reason` values found in production call sites:
+Historical `reason` values:
 
 - `pre_inbound_commit_apply`
 - `pre_auto_commit`
@@ -673,15 +675,19 @@ Current `reason` values found in production call sites:
 - `pre_remove_members_commit`
 - `pre_update_group_data_commit`
 - `pre_upgrade_commit`
+- `pre_disband_commit`
+- `pre_self_update_commit`
 
 Metadata notes:
 
 - This event has `group_ref`.
-- Snapshot creation itself is still storage-local; the audit event records the name/epoch/reason for reconstruction.
 
 ### `fork_resolution`
 
-Emitted when `ForkRecoveryManager::resolve` returns a verdict for a same-epoch candidate commit.
+Historical (read-compat): emitted by pre-unification engine versions when the pairwise fork-resolution route returned
+a verdict for a same-epoch candidate commit. The unified engine adjudicates same-epoch rivals through distributed
+convergence (`convergence_decision` is the resolution evidence) and never emits this kind; it stays parseable so
+historical JSONL exports keep loading.
 
 | Field | Meaning |
 | --- | --- |
@@ -689,13 +695,11 @@ Emitted when `ForkRecoveryManager::resolve` returns a verdict for a same-epoch c
 | `candidate_digest` | SHA-256 digest of the candidate MLS bytes, hex encoded. |
 | `incumbent_digest` | Digest of the incumbent commit when available. |
 | `winner` | `candidate`, `incumbent`, or `missing_snapshot`. |
-| `invalidated_msg_id` | Message id invalidated when the candidate wins. |
+| `invalidated_msg_id` | Message id invalidated when the candidate won. |
 
 Metadata notes:
 
 - This event has `group_ref`.
-- If the candidate wins, the engine also updates the invalidated stored message to `epoch_invalidated` and emits
-  `message_state_changed` with `reason = "fork_loser"`.
 
 ### `convergence_decision`
 

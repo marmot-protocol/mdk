@@ -8,6 +8,19 @@ Format: date → area → observation → takeaway for the real system.
 
 ---
 
+## 2026-08-06 — Fork-resolution route unification (option C)
+
+The pairwise same-epoch fork-recovery route (2026-05-04 entry below) is deleted. Two routes for the same input —
+`ForkRecoveryManager` on the committing member, distributed convergence everywhere else — were proven eventually
+equivalent (option C Slice B) and the pairwise fast-path was depth-blind, so it was a duplicate rule over machinery
+that handles the general case (#1285's commit-addressed checkpoints materialize own commits inside the pass).
+Takeaway: the durable source-epoch anchor (`openmls-retained-anchor-{epoch}`) is the single admission credential for
+in-horizon rivals; missing material halts loudly instead of silently keeping a possibly-losing branch. The known cost
+is that a committer's rival resolution now waits for the convergence pass (~1.1 s quiescence); a committer-expedite is
+a designed follow-up.
+
+---
+
 ## 2026-05-09 — Engine line-by-line audit + fix pass
 
 A read-only audit of every file under `crates/cgka-engine/src/` produced 15 findings. Of those, 14 were addressed in
