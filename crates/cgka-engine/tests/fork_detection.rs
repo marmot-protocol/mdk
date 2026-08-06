@@ -2238,3 +2238,298 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         "the upgrade-path halt must be surfaced to the host"
     );
 }
+
+// --- Router flip: a restarted committer takes the observer route -----------
+//
+// `EpochManager::committed_from` is in-memory only. A device that committed
+// from epoch N and confirmed takes the pairwise `ForkRecoveryManager` route for
+// a competing epoch-N commit; after a restart the same device, given the same
+// input, takes whatever route `commit_should_enter_convergence` picks for a
+// non-committer. That is documented at `openmls_projection.rs` (see
+// `PrevalidatedOwnCommits`) but no test drove it through `CgkaEngine::ingest`.
+// These two tests pin both post-restart routes.
+
+/// Which branch of a two-way epoch-1 fork a device ended up on.
+use cgka_traits::ingest::{IngestOutcome, StaleReason};
+use sha2::{Digest as _, Sha256};
+
+#[derive(Debug, PartialEq, Eq)]
+enum Branch {
+    Own,
+    Sibling,
+}
+
+struct RouterFlipFixture {
+    group_id: cgka_traits::types::GroupId,
+    local_storage: SqliteAccountStorage,
+    local_seed: Vec<u8>,
+    competing: TransportMessage,
+    own_invitee: MemberId,
+    sibling_invitee: MemberId,
+    /// True when deterministic commit ordering makes the inbound sibling commit
+    /// the winner, so a correct device must end on [`Branch::Sibling`].
+    sibling_wins: bool,
+}
+
+/// Two admins concurrently invite from epoch 1 and both confirm publish. The
+/// device under test is the joiner. Seeds are assigned so the creator's identity
+/// always loses the `CommitOrderingKey` committer comparison to nobody — i.e.
+/// sorts FIRST — which makes the inbound sibling commit the ordering winner for
+/// every `tag`, so control and restart runs are directly comparable.
+async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
+    let a = format!("rf-a-{tag}").into_bytes();
+    let b = format!("rf-b-{tag}").into_bytes();
+    let (creator_seed, joiner_seed) = if pad32(&a) < pad32(&b) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let own_seed = format!("rf-own-invitee-{tag}").into_bytes();
+    let sibling_seed = format!("rf-sibling-invitee-{tag}").into_bytes();
+
+    let (mut creator, _creator_storage) = build_client_with_storage(&creator_seed);
+    let (mut joiner, joiner_storage) = build_client_with_storage(&joiner_seed);
+    let mut own_invitee = build_client(&own_seed);
+    let mut sibling_invitee = build_client(&sibling_seed);
+
+    let joiner_kp = joiner.fresh_key_package().await.unwrap();
+    let (group_id, create) = creator
+        .create_group(CreateGroupRequest {
+            name: "router flip".into(),
+            description: String::new(),
+            members: vec![joiner_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![joiner.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            creator.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    joiner.join_welcome(welcome).await.unwrap();
+
+    let own_kp = own_invitee.fresh_key_package().await.unwrap();
+    let sibling_kp = sibling_invitee.fresh_key_package().await.unwrap();
+    let (own_commit, own_pending) = match joiner
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![own_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let (sibling_commit, sibling_pending) = match creator
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![sibling_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    joiner.confirm_published(own_pending).await.unwrap();
+    creator.confirm_published(sibling_pending).await.unwrap();
+    assert_eq!(joiner.epoch(&group_id).unwrap(), EpochId(2));
+
+    let own_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        joiner.self_id(),
+        &own_commit.payload,
+    );
+    let sibling_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        creator.self_id(),
+        &sibling_commit.payload,
+    );
+
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..sibling_commit
+    };
+    let fixture = RouterFlipFixture {
+        group_id,
+        local_storage: joiner_storage,
+        local_seed: joiner_seed,
+        competing: routed,
+        own_invitee: MemberId::new(pad32(&own_seed)),
+        sibling_invitee: MemberId::new(pad32(&sibling_seed)),
+        sibling_wins: sibling_key < own_key,
+    };
+    (fixture, joiner)
+}
+
+fn settled_branch(engine: &Engine<SqliteAccountStorage>, f: &RouterFlipFixture) -> Branch {
+    let members = engine.members(&f.group_id).unwrap();
+    let has_sibling = members.iter().any(|m| m.id == f.sibling_invitee);
+    let has_own = members.iter().any(|m| m.id == f.own_invitee);
+    assert_ne!(
+        has_sibling, has_own,
+        "exactly one of the two forked invitees must be present"
+    );
+    if has_sibling {
+        Branch::Sibling
+    } else {
+        Branch::Own
+    }
+}
+
+/// Drive convergence like a runtime scheduler until the competing commit leaves
+/// `Created`, letting the real P4 quiescence window elapse.
+async fn drive_convergence(
+    engine: &mut Engine<SqliteAccountStorage>,
+    f: &RouterFlipFixture,
+    competing_id: &MessageId,
+) {
+    for _ in 0..40 {
+        engine
+            .converge_stored_openmls_messages(&f.group_id)
+            .expect("convergence pass runs");
+        let state = f.local_storage.get_message(competing_id).unwrap().state;
+        if state != MessageState::Created {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("competing commit never left MessageState::Created");
+}
+
+#[tokio::test]
+async fn restarted_committer_routes_same_epoch_sibling_into_convergence_not_fork_recovery() {
+    let (f, local) = router_flip_fixture("converge").await;
+    assert!(
+        f.sibling_wins,
+        "fixture must make the inbound sibling commit the ordering winner"
+    );
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+
+    // The confirm path retained an anchor at the commit's SOURCE epoch, which is
+    // what routes the sibling into convergence once `committed_from` is gone.
+    assert!(
+        f.local_storage
+            .list_group_snapshots(&f.group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "confirm_published must retain a source-epoch anchor"
+    );
+
+    drop(local);
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "a restarted committer must not classify the sibling stale, got {outcome:?}"
+    );
+    assert!(
+        local
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
+        "the pairwise route is unreachable after restart, so no ForkRecovered"
+    );
+
+    drive_convergence(&mut local, &f, &competing_id).await;
+    assert_eq!(
+        settled_branch(&local, &f),
+        Branch::Sibling,
+        "convergence must still land the restarted committer on the winning branch"
+    );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Processed
+    );
+}
+
+#[tokio::test]
+async fn restarted_committer_without_source_anchor_silently_drops_winning_sibling() {
+    // Control on the same deterministic fixture: no restart, pairwise route.
+    let (control, mut control_local) = router_flip_fixture("control").await;
+    assert!(control.sibling_wins);
+    control_local
+        .ingest(control.competing.clone())
+        .await
+        .unwrap();
+    let control_branch = settled_branch(&control_local, &control);
+    assert_eq!(
+        control_branch,
+        Branch::Sibling,
+        "the pairwise route rolls the committer onto the winning branch"
+    );
+
+    // Same fixture shape, but the device restarts AND the source-epoch anchor is
+    // absent. Neither route is then reachable: `committed_from` is empty so the
+    // pairwise gate fails, and `has_retained_anchor_snapshot` is false so the
+    // commit is not admitted to convergence either.
+    let (f, local) = router_flip_fixture("silent").await;
+    assert!(f.sibling_wins);
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    drop(local);
+    f.local_storage
+        .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
+        .expect("release the source-epoch anchor");
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+
+    // Current behavior, pinned so a fix flips these assertions deliberately.
+    // The authenticated winning commit is discarded with no fork signal at all.
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "expected the silent stale discard, got {outcome:?}"
+    );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Failed,
+        "the winning sibling is marked Failed, not EpochInvalidated"
+    );
+    assert!(
+        local.drain_events().is_empty(),
+        "no ForkRecovered, no CommitRolledBack, no GroupUnrecoverable is emitted"
+    );
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "the group is not marked unrecoverable either"
+    );
+
+    // The divergence: identical fork, opposite outcome from the control.
+    assert_eq!(
+        settled_branch(&local, &f),
+        Branch::Own,
+        "the restarted committer keeps its own losing branch"
+    );
+    assert_ne!(
+        settled_branch(&local, &f),
+        control_branch,
+        "restart alone flips which branch this device converges to"
+    );
+}
