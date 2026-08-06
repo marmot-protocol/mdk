@@ -160,10 +160,8 @@ impl ForkRecoveryManager {
     /// Decide the pairwise race and, when the candidate wins, displace the
     /// incumbent atomically.
     ///
-    /// Bounded by `StorageProvider` rather than `MessageStorage` specifically
-    /// so the displacement can run inside `with_transaction`: capture,
-    /// rollback, re-persist and release are one durable unit. Nothing weaker
-    /// works — see the ordering comment below.
+    /// Bounded by `StorageProvider` so capture, rollback, re-persist and
+    /// release can join one transaction.
     fn resolve<S: StorageProvider>(
         &mut self,
         storage: &S,
@@ -190,60 +188,13 @@ impl ForkRecoveryManager {
             });
         }
 
-        // Atomicity rationale (durability of the displaced branch). Capture,
-        // rollback, re-persist and release are ONE durable unit.
-        //
-        // They have to be. The rollback sweeps the incumbent's stored row away
-        // (the pre-commit snapshot predates that row's own persist), so if the
-        // re-persist failed on its own the displaced branch would be gone with
-        // no way back: a later `resolve` cannot repair it, because (1) the
-        // rollback already removed the row so the capture would read
-        // `NotFound` and silently park nothing, and (2) there typically IS no
-        // later resolve — storage now sits at the pre-incumbent epoch, so a
-        // redelivery of the same candidate applies cleanly with no WrongEpoch
-        // and no fork resolution at all. The branch would vanish silently.
-        //
-        // SQLite snapshot ops JOIN an outer transaction rather than driving
-        // their own (`storage_sqlite::storage::snapshots::
-        // snapshot_rollback_joins_outer_transaction` /
-        // `snapshot_create_joins_outer_transaction`), which is what makes this
-        // grouping possible; `apply_openmls_canonicalization_result` relies on
-        // the same property. A failure anywhere inside therefore unwinds the
-        // rollback too, leaving the incumbent applied, its row intact and its
-        // snapshot retained — genuinely retryable.
-        //
-        // The in-memory `incumbents.remove` stays OUTSIDE, after the commit:
-        // it is the point of no return and must not be reached for a
-        // transaction that rolled back.
-        //
-        // Park the pairwise-losing incumbent `ConvergenceDeferred`, not
-        // terminally `EpochInvalidated` — the mirror of the incumbent-wins
-        // seam in `ingest_group_message`. The losing branch may still gain
-        // follow-on commits from peers that applied it and never saw the
-        // candidate; distributed convergence then selects the DEEPER branch,
-        // and every convergence-only node reorgs onto it. A terminal (or
-        // missing) row is excluded from convergence input, so this node could
-        // never materialize that branch's root and would diverge from the
-        // fleet forever.
-        //
-        // If the incumbent's branch loses in convergence too, its commits are
-        // NOT terminalized there: an eligible-but-unselected branch's commits
-        // are re-deferred `ConvergenceDeferred`
-        // (`NonSelectedEligibleBranch` in
-        // `classify_losing_materialized_candidate_commits`), so they stay
-        // reconsiderable pass after pass. (`LosingBranch` is an APP-message
-        // invalidation reason, not a commit disposition.) Terminalization
-        // happens only at the rewind horizon —
-        // `BeyondRollbackHorizon`/`BeyondAnchor`, or the
-        // `beyond_retained_anchor` retirement in
-        // `seed_convergence_pass_members`.
-        //
-        // The row is re-keyed at the commit's SOURCE epoch (convergence
-        // derives its rewind target from `record.epoch`) and its payload is
-        // preserved verbatim — for an own commit it carries the convergence
-        // ordering stamp (`stamp_processed_own_commit_record`) that replay
-        // needs to rebuild the ordering key (MLS refuses to process own
-        // commits).
+        // Rollback removes the incumbent row because its snapshot predates the
+        // commit. Capture and re-persist it atomically so the displaced branch
+        // remains reconsiderable. A nested call joins its caller's transaction;
+        // either way, an error aborts the boundary that contains this rollback.
+        // Re-key the row to its source epoch because convergence derives the
+        // rewind target from `record.epoch`. Remove the in-memory incumbent only
+        // after that transaction commits.
         let snapshot_name = incumbent.snapshot_name.clone();
         let incumbent_storage_id = incumbent.storage_id.clone();
         let incumbent_source_epoch = incumbent.source_epoch;

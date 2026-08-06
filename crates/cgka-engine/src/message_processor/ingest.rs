@@ -947,65 +947,11 @@ impl<S: StorageProvider> Engine<S> {
                                 continue;
                             }
                             ForkResolution::IncumbentWins { .. } => {
-                                // The candidate lost this node's PAIRWISE race
-                                // — but nodes that did not commit from this
-                                // epoch resolve the same conflict through
-                                // distributed convergence, where a deeper
-                                // candidate branch outranks the ordering key.
-                                // Terminal `EpochInvalidated` froze this node
-                                // on its own lineage forever (convergence
-                                // never re-admits it — see
-                                // `convergence_input::can_start_pass`), so two
-                                // honest nodes could keep different branches
-                                // permanently. Park the loser
-                                // `ConvergenceDeferred` instead: that state
-                                // re-enters branch materialization (see
-                                // `unresolved_commit_state`) so a later pass
-                                // can still select its branch once follow-on
-                                // commits arrive — while staying out of the
-                                // linear pending replay, which would choke on
-                                // a cross-branch commit.
-                                //
-                                // If its branch loses in convergence too, the
-                                // commit is NOT terminalized there: an
-                                // eligible-but-unselected branch's commits are
-                                // re-deferred `ConvergenceDeferred`
-                                // (`NonSelectedEligibleBranch` in
-                                // `classify_losing_materialized_candidate_commits`)
-                                // and stay reconsiderable in later passes.
-                                // (`LosingBranch` is an APP-message
-                                // invalidation reason, not a commit
-                                // disposition.) Commits go terminal only at
-                                // the rewind horizon —
-                                // `BeyondRollbackHorizon`/`BeyondAnchor`, or
-                                // the `beyond_retained_anchor` retirement in
-                                // `seed_convergence_pass_members`.
-                                //
-                                // Re-persist the full row (not just the state):
-                                // the row was stored above under this node's
-                                // CURRENT epoch, but convergence-input rows are
-                                // keyed by the commit's SOURCE epoch (see
-                                // `buffer_openmls_convergence_message_with_time`)
-                                // — the apply stage reads `record.epoch` to
-                                // pick the retained-anchor rewind target, so a
-                                // current-epoch row would make the reorg replay
-                                // this epoch-N commit against the live tip
-                                // state (WrongEpoch).
-                                //
-                                // Load-bearing invariant: this arm is reachable
-                                // only while NO convergence pass is active —
-                                // `commit_should_enter_convergence` routes any
-                                // stale commit into convergence whenever a pass
-                                // is live (its `active_pass` term), so a commit
-                                // that reaches this pairwise seam never belongs
-                                // to an open pass. The parked row is therefore
-                                // always picked up by the NEXT pass:
-                                // `seed_convergence_pass_members` seeds pass
-                                // membership from a storage scan that includes
-                                // `ConvergenceDeferred` rows. If that routing
-                                // guard is ever relaxed, a row parked here
-                                // while a pass is open would belong to no pass
-                                // and become an orphan.
+                                // Keep the pairwise loser eligible for a later
+                                // distributed pass, and key it by the commit's
+                                // source epoch as required by replay. This seam
+                                // is reachable only with no active pass; the
+                                // next pass seeds this deferred row from storage.
                                 self.persist_openmls_wire_message(
                                     &openmls_msg,
                                     &group_id,

@@ -8,9 +8,15 @@
 //! - Apply the winning commit and return to Stable
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::{CanonicalizationPolicy, ConvergenceStatus};
+use cgka_engine::canonicalization::{
+    CanonicalizationError, CanonicalizationPolicy, CanonicalizationState, ConvergenceStatus,
+};
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::openmls_projection::{
+    OpenMlsProjectionError, apply_openmls_canonicalization_result,
+    canonicalize_stored_openmls_messages,
+};
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -22,10 +28,11 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MessageStorage,
+    StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -35,6 +42,7 @@ use openmls::group::MlsGroup;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use std::collections::BTreeSet;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
@@ -71,6 +79,36 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn mutate_own_commit_stamp(
+    storage: &SqliteAccountStorage,
+    message_id: &MessageId,
+    mutate: impl FnOnce(&mut cgka_traits::message::OwnCommitConvergenceStamp),
+) {
+    let mut record = storage.get_message(message_id).unwrap();
+    let mut payload = StoredMessagePayload::decode(&record.payload).unwrap();
+    match &mut payload {
+        StoredMessagePayload::SignedOpenMlsWire {
+            stamp: Some(stamp), ..
+        }
+        | StoredMessagePayload::OwnCommitWire { stamp, .. } => mutate(stamp),
+        _ => panic!("expected a stamped own commit"),
+    }
+    record.payload = payload.encode().unwrap();
+    storage.put_message(&record).unwrap();
+}
+
+fn own_commit_stamp(
+    storage: &SqliteAccountStorage,
+    message_id: &MessageId,
+) -> cgka_traits::message::OwnCommitConvergenceStamp {
+    let record = storage.get_message(message_id).unwrap();
+    StoredMessagePayload::decode(&record.payload)
+        .unwrap()
+        .own_commit_stamp()
+        .expect("expected a stamped own commit")
+        .clone()
 }
 
 #[async_trait]
@@ -2060,6 +2098,53 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         matches!(outcome_2, IngestOutcome::Buffered { .. }),
         "the second A-branch follow-on must enter the convergence pass, got {outcome_2:?}"
     );
+
+    // Select with the valid checkpoint, then corrupt only the stamped
+    // authenticator before apply. The restore must fail closed and the apply
+    // snapshot must return canonical state to the rival branch.
+    let policy = CanonicalizationPolicy::default();
+    let selection = canonicalize_stored_openmls_messages(
+        &x_storage,
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 3,
+            retained_anchor_epoch: 0,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        Vec::new(),
+        policy.clone(),
+        u64::MAX,
+    )
+    .expect("the deeper A branch should select with an intact checkpoint");
+    let before_failed_apply = x_storage.get_group(&group_id).unwrap();
+    let original_own_record = x_storage.get_message(&commit_a.id).unwrap();
+    mutate_own_commit_stamp(&x_storage, &commit_a.id, |stamp| {
+        stamp.resulting_epoch_authenticator = Some("mismatched-authenticator".into());
+    });
+    let error = apply_openmls_canonicalization_result(
+        &x_storage,
+        &group_id,
+        &selection,
+        policy.convergence.max_rewind_commits,
+    )
+    .expect_err("a mismatched checkpoint authenticator must abort apply");
+    assert!(matches!(
+        error,
+        OpenMlsProjectionError::CheckpointStateMismatch
+    ));
+    assert_eq!(
+        x_storage.get_group(&group_id).unwrap(),
+        before_failed_apply,
+        "failed checkpoint verification must roll back canonical state"
+    );
+    assert_eq!(
+        x_storage.get_message(&commit_a.id).unwrap().state,
+        MessageState::ConvergenceDeferred,
+        "failed apply must leave the parked root reconsiderable"
+    );
+    x_storage.put_message(&original_own_record).unwrap();
+
     let convergence = x
         .converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .expect("the deeper A branch must be realizable after restart");
@@ -2097,5 +2182,57 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
         realized.state,
         MessageState::Processed,
         "the restored own commit must become canonical"
+    );
+
+    // Model an upgrade from a pre-checkpoint database: the durable own stamp
+    // remains, but migration 42 starts with no historical checkpoint rows and
+    // the optional fields deserialize as absent. This must report missing
+    // required retained state, which the convergence coordinator turns into a
+    // durable Unrecoverable halt, rather than repeatedly selecting the branch.
+    let stamp = own_commit_stamp(&x_storage, &commit_a.id);
+    x_storage
+        .release_group_state_checkpoint(
+            &group_id,
+            stamp
+                .checkpoint_id
+                .as_deref()
+                .expect("new own commit has checkpoint id"),
+        )
+        .unwrap();
+    mutate_own_commit_stamp(&x_storage, &commit_a.id, |stamp| {
+        stamp.checkpoint_id = None;
+        stamp.resulting_epoch_authenticator = None;
+    });
+    x_storage
+        .update_message_state(&commit_a.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    let fresh_trigger = x_storage
+        .list_messages(&group_id, EpochId(3))
+        .unwrap()
+        .into_iter()
+        .find(|record| record.epoch == EpochId(3) && record.state == MessageState::Processed)
+        .expect("the selected branch has an epoch-3 descendant");
+    x_storage
+        .update_message_state(&fresh_trigger.id, MessageState::Created)
+        .unwrap();
+    x_storage.delete_convergence_pass(&group_id).unwrap();
+    let legacy_result = x
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("legacy missing-checkpoint state should produce a terminal result");
+    assert_eq!(
+        legacy_result.errors,
+        vec![CanonicalizationError::MissingOwnCommitCheckpoint]
+    );
+    assert_eq!(legacy_result.convergence_status, ConvergenceStatus::Blocked);
+    assert!(
+        x_storage.get_group(&group_id).unwrap().unrecoverable,
+        "missing a required legacy own-commit checkpoint must durably halt the group"
+    );
+    assert!(
+        x.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "the upgrade-path halt must be surfaced to the host"
     );
 }

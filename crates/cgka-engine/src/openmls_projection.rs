@@ -338,6 +338,10 @@ pub enum OpenMlsProjectionError {
     Storage(String),
     InvalidPolicy(String),
     ReplayBudgetExceeded,
+    /// A locally authored commit predates commit-addressed checkpoints. Its
+    /// branch cannot be reconstructed safely from the network wire or an
+    /// epoch-keyed anchor.
+    MissingOwnCommitCheckpoint,
     /// A branch-addressed own-commit checkpoint restored state that does not
     /// match the resulting epoch and epoch authenticator stamped at confirm
     /// time. The apply is aborted and rolled back rather than installing an
@@ -386,6 +390,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             }
             OpenMlsProjectionError::ReplayBudgetExceeded => {
                 write!(f, "convergence replay budget exceeded")
+            }
+            OpenMlsProjectionError::MissingOwnCommitCheckpoint => {
+                write!(f, "own commit has no branch-addressed checkpoint")
             }
             OpenMlsProjectionError::CheckpointStateMismatch => {
                 write!(
@@ -1014,15 +1021,14 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 if record.state == MessageState::Processed {
                     own_commits.insert_canonical(projection.message_digest);
                 }
-                // The stamp is written only at confirm time, so its presence
-                // alone proves this is an own commit MLS cannot re-process.
-                // Register it independently of `Processed`: a pairwise
-                // CandidateWins resolution parks the displaced own incumbent
-                // `ConvergenceDeferred` (see `fork_recovery`), and replaying
-                // its branch still needs the stamp — the prefix-canonical
-                // guard at the stamp's use site keeps a diverging prefix from
-                // mis-realizing it.
-                if let Some(stamp) = own_commit_stamp {
+                // Confirmed own commits remain prevalidated while canonical or
+                // parked for convergence. Terminal states must not regain
+                // checkpoint-based eligibility.
+                if matches!(
+                    record.state,
+                    MessageState::Processed | MessageState::ConvergenceDeferred
+                ) && let Some(stamp) = own_commit_stamp
+                {
                     own_commits.insert_stamped(projection.message_digest, stamp);
                 }
                 commit_messages.push(StoredCommitMessage {
@@ -1272,7 +1278,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         },
         ReplayBudget::new,
     );
-    let path_result = build_stored_openmls_candidate_paths(
+    let path_result = match build_stored_openmls_candidate_paths(
         storage,
         group_id,
         work.commit_messages,
@@ -1281,7 +1287,23 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         &work.own_commits,
         work.profile_policy,
         &mut replay_budget,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(OpenMlsProjectionError::MissingOwnCommitCheckpoint) => {
+            // Older stamps have no exact post-merge checkpoint. Treat that as
+            // missing required retained state so the convergence coordinator
+            // durably halts the group instead of repeatedly selecting a branch
+            // this device can never materialize.
+            return Ok(missing_required_state_result(
+                work.state,
+                work.outbound_intents,
+                work.policy,
+                work.now_ms,
+                CanonicalizationError::MissingOwnCommitCheckpoint,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
 
     let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
     let can_reuse_materialized = can_reuse_bfs_materialization(
@@ -1346,6 +1368,22 @@ fn missing_retained_anchor_result(
     policy: CanonicalizationPolicy,
     now_ms: u64,
 ) -> CanonicalizationResult {
+    missing_required_state_result(
+        state,
+        outbound_intents,
+        policy,
+        now_ms,
+        CanonicalizationError::MissingRetainedAnchor,
+    )
+}
+
+fn missing_required_state_result(
+    state: CanonicalizationState,
+    outbound_intents: Vec<OutboundIntent>,
+    policy: CanonicalizationPolicy,
+    now_ms: u64,
+    error: CanonicalizationError,
+) -> CanonicalizationResult {
     let elapsed = now_ms.saturating_sub(state.last_convergence_relevant_input_ms);
     let convergence_status = if elapsed >= policy.settlement_quiescence_ms {
         ConvergenceStatus::Blocked
@@ -1369,7 +1407,7 @@ fn missing_retained_anchor_result(
         already_seen: Vec::new(),
         queued_outbound_intents: outbound_intents,
         publishable_outbound_messages: Vec::new(),
-        errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        errors: vec![error],
         #[cfg(feature = "test-conformance-snapshot")]
         replay_probe_count: 0,
         selection_trace: None,
@@ -1673,30 +1711,37 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // run's final resulting epoch — the exact post-merge state its last own
     // commit produced.
     let own_checkpoint_prefix =
-        checkpoint_realizable_own_commit_prefix(storage, group_id, result, &applied_prefix)?;
+        checkpoint_realizable_own_commit_prefix(storage, result, &applied_prefix)?;
     let mut skipped_prefix = applied_prefix;
     skipped_prefix.extend(own_checkpoint_prefix.commit_ids.iter().cloned());
-    let apply_start_epoch = match own_checkpoint_prefix.resulting_epoch {
-        Some(epoch) => epoch,
+    let apply_start_epoch = match own_checkpoint_prefix.realized.as_ref() {
+        Some(realized) => realized.resulting_epoch,
         None => apply_start_epoch_for_canonicalization_result(storage, result, &skipped_prefix)?
             .unwrap_or(current_epoch),
     };
     // The own-checkpoint case must restore even when its epoch equals the live
     // tip: the live tip may be a different branch's state at that epoch.
     let rewind_to_retained_anchor = apply_start_epoch < current_epoch;
-    let restore_own_checkpoint = own_checkpoint_prefix.checkpoint_id.is_some();
+    let restore_own_checkpoint = own_checkpoint_prefix.realized.is_some();
     let replay_messages = replay_messages_for_canonicalization_result(
         storage,
         result,
         &skipped_prefix,
         apply_start_epoch,
     )?;
-    let live_message_records = storage
-        .list_messages(group_id, EpochId(0))
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    let live_queued_outbound = storage
-        .list_queued_outbound_intents(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    let (live_message_records, live_queued_outbound) =
+        if rewind_to_retained_anchor && !restore_own_checkpoint {
+            (
+                storage
+                    .list_messages(group_id, EpochId(0))
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
+                storage
+                    .list_queued_outbound_intents(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let snapshot = apply_snapshot_name(group_id, result);
     storage
         .create_group_snapshot(group_id, &snapshot)
@@ -1704,12 +1749,12 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
 
     // Refresh the current-epoch anchor only in the case that always did:
     // there are new commits AND the apply starts at the live tip. The extra
-    // `own_checkpoint_prefix.resulting_epoch.is_none()` term avoids an
+    // `own_checkpoint_prefix.realized.is_none()` term avoids an
     // unnecessary epoch-anchor refresh before restoring exact checkpoint
     // state. `apply_start_epoch > current_epoch` stays skipped as before.
     let prepare_result = if has_new_commits
         && apply_start_epoch == current_epoch
-        && own_checkpoint_prefix.resulting_epoch.is_none()
+        && own_checkpoint_prefix.realized.is_none()
     {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
     } else {
@@ -1726,25 +1771,15 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // therefore returns to the pre-apply live state instead of committing an
     // older message/queue image and rebuilding it row by row.
     let apply_result = storage.with_transaction(|storage| {
-        if let Some(checkpoint_id) = own_checkpoint_prefix.checkpoint_id.as_deref() {
+        if let Some(realized) = own_checkpoint_prefix.realized.as_ref() {
             storage
-                .restore_group_state_checkpoint(group_id, checkpoint_id)
+                .restore_group_state_checkpoint(group_id, &realized.id)
                 .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
             verify_restored_own_checkpoint(
                 storage,
                 group_id,
-                own_checkpoint_prefix
-                    .resulting_epoch
-                    .expect("checkpoint prefix has resulting epoch"),
-                own_checkpoint_prefix
-                    .expected_epoch_authenticator
-                    .as_deref()
-                    .expect("checkpoint prefix has epoch authenticator"),
-            )?;
-            restore_live_message_and_queue_records(
-                storage,
-                &live_message_records,
-                &live_queued_outbound,
+                realized.resulting_epoch,
+                &realized.expected_epoch_authenticator,
             )?;
         } else if rewind_to_retained_anchor {
             let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
@@ -1889,10 +1924,13 @@ struct CheckpointRealizableOwnPrefix {
     /// Selected-branch commit ids (hex) realized via an exact checkpoint
     /// instead of replay.
     commit_ids: BTreeSet<String>,
-    /// Resulting epoch of the run's last own commit.
-    resulting_epoch: Option<u64>,
-    checkpoint_id: Option<String>,
-    expected_epoch_authenticator: Option<String>,
+    realized: Option<RealizedCheckpoint>,
+}
+
+struct RealizedCheckpoint {
+    resulting_epoch: u64,
+    id: String,
+    expected_epoch_authenticator: String,
 }
 
 /// The leading run — after the already-applied prefix — of this device's own
@@ -1909,14 +1947,10 @@ struct CheckpointRealizableOwnPrefix {
 /// apply transaction.
 fn checkpoint_realizable_own_commit_prefix<S: StorageProvider>(
     storage: &S,
-    group_id: &GroupId,
     result: &CanonicalizationResult,
     applied_prefix: &BTreeSet<String>,
 ) -> Result<CheckpointRealizableOwnPrefix, OpenMlsProjectionError> {
     let mut prefix = CheckpointRealizableOwnPrefix::default();
-    let checkpoints = storage
-        .list_group_state_checkpoints(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     for commit_id in result
         .accepted_commits
         .iter()
@@ -1941,16 +1975,12 @@ fn checkpoint_realizable_own_commit_prefix<S: StorageProvider>(
             break;
         };
         let resulting_epoch = record.epoch.0.saturating_add(1);
-        let retained = checkpoints.iter().any(|checkpoint| {
-            checkpoint.id == checkpoint_id && checkpoint.resulting_epoch.0 == resulting_epoch
-        });
-        if !retained {
-            break;
-        }
         prefix.commit_ids.insert(commit_id.clone());
-        prefix.resulting_epoch = Some(resulting_epoch);
-        prefix.checkpoint_id = Some(checkpoint_id);
-        prefix.expected_epoch_authenticator = Some(expected_authenticator);
+        prefix.realized = Some(RealizedCheckpoint {
+            resulting_epoch,
+            id: checkpoint_id,
+            expected_epoch_authenticator: expected_authenticator,
+        });
     }
     Ok(prefix)
 }
@@ -2064,7 +2094,7 @@ fn prune_group_state_checkpoints<S: StorageProvider>(
     retained_epoch: u64,
     max_retained_anchor_rewind: u64,
 ) -> Result<(), OpenMlsProjectionError> {
-    let oldest_retained_epoch = retained_epoch.saturating_sub(max_retained_anchor_rewind);
+    let oldest_retained_epoch = oldest_retained_epoch(retained_epoch, max_retained_anchor_rewind);
     for checkpoint in storage
         .list_group_state_checkpoints(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -2085,7 +2115,7 @@ fn prune_retained_anchor_snapshots<S: StorageProvider>(
     retained_epoch: u64,
     max_retained_anchor_rewind: u64,
 ) -> Result<(), OpenMlsProjectionError> {
-    let oldest_retained_epoch = retained_epoch.saturating_sub(max_retained_anchor_rewind);
+    let oldest_retained_epoch = oldest_retained_epoch(retained_epoch, max_retained_anchor_rewind);
     let snapshots = storage
         .list_group_snapshots(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
@@ -2104,6 +2134,10 @@ fn prune_retained_anchor_snapshots<S: StorageProvider>(
     }
 
     Ok(())
+}
+
+fn oldest_retained_epoch(retained_epoch: u64, max_retained_anchor_rewind: u64) -> u64 {
+    retained_epoch.saturating_sub(max_retained_anchor_rewind)
 }
 
 fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
@@ -2622,13 +2656,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 stamp.checkpoint_id.as_deref(),
                 stamp.resulting_epoch_authenticator.as_deref(),
             ) else {
-                return Err(OpenMlsProjectionError::Replay(
-                    "own commit has no branch checkpoint".into(),
-                ));
+                return Err(OpenMlsProjectionError::MissingOwnCommitCheckpoint);
             };
-            storage
-                .restore_group_state_checkpoint(group_id, checkpoint_id)
-                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            match storage.restore_group_state_checkpoint(group_id, checkpoint_id) {
+                Ok(()) => {}
+                Err(StorageError::SnapshotMissing(_)) => {
+                    return Err(OpenMlsProjectionError::MissingOwnCommitCheckpoint);
+                }
+                Err(error) => {
+                    return Err(OpenMlsProjectionError::Snapshot(format!("{error:?}")));
+                }
+            }
             mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
                 .map_err(|e| OpenMlsProjectionError::Replay(format!("checkpoint reload: {e:?}")))?
                 .ok_or(OpenMlsProjectionError::MissingGroup)?;
@@ -3241,7 +3279,7 @@ mod reuse_scope_tests {
 
 #[cfg(test)]
 mod checkpoint_prefix_tests {
-    use super::{CheckpointRealizableOwnPrefix, checkpoint_realizable_own_commit_prefix};
+    use super::checkpoint_realizable_own_commit_prefix;
     use crate::canonicalization::{CanonicalizationResult, ConvergenceStatus};
     use cgka_traits::engine::CommitOrderingPriority;
     use cgka_traits::group::{Group, ProtocolProfile};
@@ -3369,17 +3407,17 @@ mod checkpoint_prefix_tests {
 
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
-            &group_id(),
             &result_accepting(&[b"commit-a"]),
             &BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(prefix.resulting_epoch, Some(2));
+        let realized = prefix.realized.expect("checkpoint should be realizable");
+        assert_eq!(realized.resulting_epoch, 2);
         assert!(prefix.commit_ids.contains(&hex::encode(b"commit-a")));
-        assert_eq!(prefix.checkpoint_id, Some(checkpoint_id_for(b"commit-a")));
+        assert_eq!(realized.id, checkpoint_id_for(b"commit-a"));
         assert_eq!(
-            prefix.expected_epoch_authenticator,
-            Some(authenticator_for(b"commit-a"))
+            realized.expected_epoch_authenticator,
+            authenticator_for(b"commit-a")
         );
     }
 
@@ -3392,21 +3430,18 @@ mod checkpoint_prefix_tests {
 
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
-            &group_id(),
             &result_accepting(&[b"commit-a"]),
             &BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(
-            prefix.resulting_epoch,
-            CheckpointRealizableOwnPrefix::default().resulting_epoch,
+        assert!(
+            prefix.realized.is_none(),
             "a commit without a checkpoint must not yield a restore target"
         );
         assert!(
             prefix.commit_ids.is_empty(),
             "a commit without a checkpoint must not realize any commit"
         );
-        assert!(prefix.checkpoint_id.is_none());
     }
 
     #[test]
@@ -3433,17 +3468,16 @@ mod checkpoint_prefix_tests {
 
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
-            &group_id(),
             &result_accepting(&[b"commit-a", b"commit-a-next"]),
             &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(prefix.commit_ids.len(), 2);
-        assert_eq!(prefix.resulting_epoch, Some(3));
-        assert_eq!(
-            prefix.checkpoint_id,
-            Some(checkpoint_id_for(b"commit-a-next"))
-        );
+        let realized = prefix
+            .realized
+            .expect("last checkpoint should realize the run");
+        assert_eq!(realized.resulting_epoch, 3);
+        assert_eq!(realized.id, checkpoint_id_for(b"commit-a-next"));
     }
 
     #[test]
@@ -3458,12 +3492,12 @@ mod checkpoint_prefix_tests {
 
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
-            &group_id(),
             &result_accepting(&[b"commit-a"]),
             &BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(prefix.resulting_epoch, Some(2));
-        assert_eq!(prefix.checkpoint_id, Some(checkpoint_id_for(b"commit-a")));
+        let realized = prefix.realized.expect("selected sibling should be exact");
+        assert_eq!(realized.resulting_epoch, 2);
+        assert_eq!(realized.id, checkpoint_id_for(b"commit-a"));
     }
 }

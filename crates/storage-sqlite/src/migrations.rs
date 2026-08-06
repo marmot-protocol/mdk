@@ -1320,6 +1320,7 @@ mod tests {
             ("cgka_convergence_policies", "group_id"),
             ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
+            ("cgka_group_state_checkpoints", "group_id"),
         ] {
             assert_eq!(
                 foreign_key(&conn, table, column),
