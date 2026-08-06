@@ -2632,6 +2632,39 @@ async fn hydrate_recovers_interrupted_fork_probe_snapshot() {
     );
 }
 
+#[tokio::test]
+async fn multiple_interrupted_fork_probes_quarantine_with_probe_reason() {
+    let local_id = b"fprobe2-local".as_slice();
+    let (group_id, local_storage, _local_commit, _rival_root) =
+        forked_privileged_invites(local_id, b"fprobe2-rival", b"fprobe2-david", b"fprobe2-eve")
+            .await;
+
+    // Two surviving `fork-probe-` snapshots break the probes-are-serialized
+    // invariant: recovery cannot tell which one holds the live state, so it
+    // must fail closed. The quarantine reason must name the probe-recovery
+    // failure, not masquerade as a group-record load failure.
+    local_storage
+        .create_group_snapshot(&group_id, "fork-probe-1-deadbeefcafebabe")
+        .unwrap();
+    local_storage
+        .create_group_snapshot(&group_id, "fork-probe-2-cafebabedeadbeef")
+        .unwrap();
+
+    let mut local = reopen_legacy_client_unhydrated(local_id, local_storage.clone());
+    local
+        .hydrate_stable_groups_from_storage()
+        .expect("one quarantined group must not abort account open");
+
+    assert_eq!(
+        local.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            cgka_traits::engine::GroupHydrationQuarantineReason::ForkProbeRecoveryFailed
+        )],
+        "ambiguous interrupted probes must quarantine with the probe-specific reason"
+    );
+}
+
 /// Observable form of the invariant the `is_canonical` carve-out in own-branch
 /// materialization rests on: a `Processed` commit row means "applied on this
 /// device's live canonical chain", so there is at most one `Processed` commit

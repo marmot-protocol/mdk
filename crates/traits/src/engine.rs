@@ -389,6 +389,10 @@ pub enum GroupHydrationQuarantineReason {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// Hydrate found an interrupted fork-recovery probe (or more than one,
+    /// which breaks the probes-are-serialized-per-group invariant), and
+    /// restoring the surviving live-state snapshot failed.
+    ForkProbeRecoveryFailed,
 }
 
 /// Ordered, decrypted output the application should render / act on.

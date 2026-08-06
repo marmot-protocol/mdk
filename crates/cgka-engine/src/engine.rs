@@ -99,6 +99,7 @@ fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'
         GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
             "pending_commit_recovery_failed"
         }
+        GroupHydrationQuarantineReason::ForkProbeRecoveryFailed => "fork_probe_recovery_failed",
     }
 }
 
@@ -1292,7 +1293,7 @@ impl<S: StorageProvider> Engine<S> {
         // the rolled-back state; the surviving `fork-probe-` snapshot holds the
         // live state that must win on reopen.
         crate::openmls_projection::recover_interrupted_fork_probe(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+            .map_err(|_| GroupHydrationQuarantineReason::ForkProbeRecoveryFailed)?;
 
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = {

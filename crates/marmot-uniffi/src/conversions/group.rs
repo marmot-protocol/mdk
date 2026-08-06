@@ -588,6 +588,9 @@ pub enum AppGroupHydrationQuarantineReasonFfi {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// Hydrate found an interrupted fork-recovery probe, and restoring the
+    /// surviving live-state snapshot failed.
+    ForkProbeRecoveryFailed,
 }
 
 impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReasonFfi {
@@ -601,6 +604,9 @@ impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReas
             AppGroupHydrationQuarantineReason::GroupRecordLoadFailed => Self::GroupRecordLoadFailed,
             AppGroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
                 Self::PendingCommitRecoveryFailed
+            }
+            AppGroupHydrationQuarantineReason::ForkProbeRecoveryFailed => {
+                Self::ForkProbeRecoveryFailed
             }
         }
     }

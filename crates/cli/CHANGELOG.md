@@ -24,6 +24,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- A group quarantined because interrupted fork-recovery probe snapshots could
+  not be restored on session open now reports the dedicated
+  `ForkProbeRecoveryFailed` hydration-quarantine reason (surfaced through the
+  app and FFI mirrors) instead of the generic `GroupRecordLoadFailed`, so
+  operators diagnosing a quarantine are pointed at the probe invariant rather
+  than a group-record load.
+  ([#1241](https://github.com/marmot-protocol/mdk/pull/1241))
+
 - A clobbered retained anchor no longer wedges a group permanently. Branch
   materialization now runs the same positive lineage proof as the apply stage,
   so convergence prunes a branch whose parked own commit can no longer be
@@ -34,7 +42,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   (epoch, tree hash, confirmed transcript hash), so two lineages that share a
   ratchet tree — e.g. across group-data-only commits — can no longer satisfy
   the anchor lineage check for each other.
-  ([#1236](https://github.com/marmot-protocol/mdk/pull/1236))
+  ([#1241](https://github.com/marmot-protocol/mdk/pull/1241))
 
 - The residual divergence those fail-closed paths accept — a node
   terminalizing its own unrealizable commit and staying on a branch the fleet
