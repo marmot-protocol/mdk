@@ -119,6 +119,16 @@ fn release_evidence_requires_scoped_coverage_and_a_passing_budget() {
     bundle
         .write_private(&temp.path().join("evidence.json"))
         .unwrap();
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cgka-distributed-campaign"))
+        .current_dir(temp.path())
+        .args(["check-evidence", "evidence.json"])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "bare bundle filename failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
 
     let mut missing_artifacts = bundle.clone();
     missing_artifacts.artifacts.clear();

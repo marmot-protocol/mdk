@@ -4,8 +4,9 @@ use std::process::{ExitCode, Stdio};
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
     CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
-    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, load_manifest,
-    run_manifest, validate_scenario_bytes, verify_manifest_inputs,
+    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan,
+    evidence_bundle_base_dir, load_manifest, run_manifest, validate_scenario_bytes,
+    verify_manifest_inputs,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -161,9 +162,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::CheckEvidence {
             bundle: bundle_path,
         } => {
-            let base_dir = bundle_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
+            let base_dir = evidence_bundle_base_dir(&bundle_path);
             let bundle: ConvergenceEvidenceBundleV1 =
                 serde_json::from_slice(&std::fs::read(&bundle_path)?)?;
             bundle.validate_artifacts(base_dir)?;

@@ -42,6 +42,16 @@ pub struct EvidenceArtifactV1 {
     pub sha256: String,
 }
 
+/// Directory against which an evidence bundle's relative artifact paths are
+/// resolved. A bare filename lives in the current directory even though
+/// `Path::parent` represents that parent as an empty path.
+pub fn evidence_bundle_base_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 impl ConvergenceEvidenceBundleV1 {
     pub fn validate(&self) -> Result<(), RunnerError> {
         if self.schema_version != CONVERGENCE_EVIDENCE_BUNDLE_VERSION {
@@ -140,11 +150,31 @@ impl ConvergenceEvidenceBundleV1 {
         Ok(())
     }
 
+    /// Write an owner-only bundle after verifying that every declared artifact
+    /// already exists beside the destination and matches its digest.
     pub fn write_private(&self, path: &Path) -> Result<(), RunnerError> {
-        self.validate_artifacts(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        self.validate_artifacts(evidence_bundle_base_dir(path))?;
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| RunnerError::environment("evidence_serialize", error))?;
         fs_private::write_private(path, &bytes)
             .map_err(|error| RunnerError::environment("evidence_write", error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_bundle_base_dir;
+    use std::path::Path;
+
+    #[test]
+    fn bare_bundle_filename_resolves_artifacts_from_current_directory() {
+        assert_eq!(
+            evidence_bundle_base_dir(Path::new("evidence.json")),
+            Path::new(".")
+        );
+        assert_eq!(
+            evidence_bundle_base_dir(Path::new("reports/evidence.json")),
+            Path::new("reports")
+        );
     }
 }
