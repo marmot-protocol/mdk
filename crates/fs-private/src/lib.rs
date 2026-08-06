@@ -1022,11 +1022,15 @@ pub fn bind_unix_listener_private_tracked(
     builder.create(&staging_dir)?;
 
     let staged_socket = staging_dir.join(name);
-    let outcome = (|| {
+    let outcome: io::Result<_> = (|| {
         let listener = std::os::unix::net::UnixListener::bind(&staged_socket)?;
         std::fs::set_permissions(&staged_socket, std::fs::Permissions::from_mode(mode))?;
+        let link_identity = unix_socket_inode(&staged_socket)?;
         // link(2) fails if the target exists, unlike rename: preserves bind's
-        // AddrInUse contract instead of silently replacing a live socket.
+        // AddrInUse contract instead of silently replacing a live socket. Keep
+        // every fallible validation before this atomic publication: POSIX has
+        // no atomic compare-and-unlink operation that could safely compensate
+        // a later error without risking removal of a concurrent replacement.
         std::fs::hard_link(&staged_socket, final_path).map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
                 io::Error::new(
@@ -1037,18 +1041,11 @@ pub fn bind_unix_listener_private_tracked(
                 err
             }
         })?;
-        let link_identity = unix_socket_inode(final_path)?;
-        if unix_socket_inode(&staged_socket)? != link_identity {
-            return Err(io::Error::other(
-                "staged socket hard link identity mismatch",
-            ));
-        }
         Ok((listener, link_identity))
     })();
     let _ = std::fs::remove_file(&staged_socket);
     let _ = std::fs::remove_dir(&staging_dir);
     let (listener, link_identity) = outcome?;
-    verify_unix_socket_inode(final_path, link_identity)?;
     Ok(BoundUnixListener {
         listener,
         link_identity,

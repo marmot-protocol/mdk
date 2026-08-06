@@ -333,14 +333,16 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     let socket_path = config.socket.clone();
     let max_connections = config.max_connections;
     let connector = AgentConnector::open(config)?;
+    let link_loss = wait_control_socket_link_loss(&socket_path, link_identity);
+    tokio::pin!(link_loss);
     tokio::select! {
         res = connector.start() => res?,
-        res = wait_control_socket_link_loss(&socket_path, link_identity) => res?,
+        res = &mut link_loss => res?,
     }
     let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
         let accepted = tokio::select! {
-            res = wait_control_socket_link_loss(&socket_path, link_identity) => {
+            res = &mut link_loss => {
                 return res;
             }
             accepted = listener.accept() => accepted,
