@@ -33,7 +33,10 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use cgka_traits::{ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass};
+use cgka_traits::{
+    ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass, PairingSessionDescriptor,
+    PairingSessionError, PairingSessionId, PairingSessionState,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -562,6 +565,26 @@ impl HarnessClient {
 
     pub fn engine_mut(&mut self) -> &mut Engine<SqliteAccountStorage> {
         self.engine.as_mut().expect("harness engine is available")
+    }
+
+    pub fn start_pairing_session(
+        &mut self,
+    ) -> Result<PairingSessionDescriptor, PairingSessionError> {
+        self.engine_mut().start_pairing_session()
+    }
+
+    pub fn scan_pairing_session(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<(), PairingSessionError> {
+        self.engine_mut().scan_pairing_session(session_id)
+    }
+
+    pub fn pairing_session_state(
+        &mut self,
+        session_id: &PairingSessionId,
+    ) -> Result<PairingSessionState, PairingSessionError> {
+        self.engine_mut().pairing_session_state(session_id)
     }
 
     pub fn storage(&self) -> &SqliteAccountStorage {
