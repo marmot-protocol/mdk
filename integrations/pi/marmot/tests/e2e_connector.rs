@@ -19,6 +19,7 @@ fn spawn_wn_pi(context: HarnessContext<'_>) -> SpawnedChild {
     let fake_pi = write_fake_pi(context.root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn-pi"));
     command
+        .env("HOME", context.home)
         .env("MARMOT_HOME", context.root.join("wn-pi-home"))
         .env("MARMOT_AGENT_SOCKET", context.socket)
         .env("WN_PI_ACCOUNT_ID_HEX", context.account_id_hex)

@@ -19,6 +19,7 @@ fn spawn_wn_opencode(context: HarnessContext<'_>) -> SpawnedChild {
     let fake_opencode = write_fake_opencode(context.root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn-opencode"));
     command
+        .env("HOME", context.home)
         .env("MARMOT_AGENT_SOCKET", context.socket)
         .env("WN_OPENCODE_ACCOUNT_ID_HEX", context.account_id_hex)
         .env("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER_ACCOUNT_ID_HEX)

@@ -22,6 +22,7 @@ const DAEMON_APP_VERSION: &str = "0.7.0";
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const DAEMON_FRAME_OVERHEAD_BYTES: usize = 8 * 1024;
 const CONTROL_REPLY_MAX_BYTES: usize = 16 * 1024;
 const CONTROL_REPLY_TRUNCATED_SUFFIX: &str = "\n… output truncated";
 
@@ -105,6 +106,7 @@ impl PrimeBackend {
         invocation: &Invocation,
         tx: &mpsc::Sender<RunnerEvent>,
         observed_session: &mut Option<String>,
+        observed_session_path: &mut Option<PathBuf>,
         prompt_started: &mut bool,
     ) -> Result<(String, Option<String>), HarnessError> {
         self.ensure_daemon(&invocation.cwd).await?;
@@ -115,28 +117,40 @@ impl PrimeBackend {
         )
         .await?;
 
-        let session_id = match &invocation.session_id {
-            Some(session_id) => session_id.clone(),
-            None => {
+        let (session_id, session_path) = match &invocation.session_path {
+            Some(session_path) => {
                 let data = daemon
                     .request(
                         json!({
                             "type": "create",
+                            "sessionPath": session_path,
                             "name": invocation.session_name,
                             "config": {"cwd": invocation.cwd},
                         }),
                         None,
                     )
                     .await?;
-                data.get("activeSessionId")
-                    .or_else(|| data.get("id"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-                    .ok_or(HarnessError::BackendStream)?
+                parse_created_session(&data, Some(session_path))?
             }
+            None => match &invocation.session_id {
+                Some(session_id) => (session_id.clone(), None),
+                None => {
+                    let data = daemon
+                        .request(
+                            json!({
+                                "type": "create",
+                                "name": invocation.session_name,
+                                "config": {"cwd": invocation.cwd},
+                            }),
+                            None,
+                        )
+                        .await?;
+                    parse_created_session(&data, None)?
+                }
+            },
         };
         *observed_session = Some(session_id.clone());
+        *observed_session_path = session_path;
 
         daemon
             .request(
@@ -298,10 +312,17 @@ impl Backend for PrimeBackend {
     ) -> std::result::Result<Outcome, RunFailure> {
         let started = Instant::now();
         let mut observed_session = invocation.session_id.clone();
+        let mut observed_session_path = invocation.session_path.clone();
         let mut prompt_started = false;
         let result = match timeout(
             invocation.timeout,
-            self.run_inner(&invocation, &tx, &mut observed_session, &mut prompt_started),
+            self.run_inner(
+                &invocation,
+                &tx,
+                &mut observed_session,
+                &mut observed_session_path,
+                &mut prompt_started,
+            ),
         )
         .await
         {
@@ -316,6 +337,7 @@ impl Backend for PrimeBackend {
                 Err(RunFailure {
                     error,
                     observed_session,
+                    observed_session_path,
                 })
             }
             Ok((session_id, text)) => {
@@ -325,10 +347,12 @@ impl Backend for PrimeBackend {
                         .map_err(|_| RunFailure {
                             error: HarnessError::BackendStream,
                             observed_session: Some(session_id.clone()),
+                            observed_session_path: observed_session_path.clone(),
                         })?;
                 }
                 Ok(Outcome {
                     observed_session: Some(session_id),
+                    observed_session_path,
                     exit_code: Some(0),
                     error_summary: None,
                     stderr: String::new(),
@@ -339,17 +363,32 @@ impl Backend for PrimeBackend {
     }
 }
 
+fn parse_created_session(
+    data: &Value,
+    requested_path: Option<&PathBuf>,
+) -> Result<(String, Option<PathBuf>), HarnessError> {
+    let session_id = data
+        .get("activeSessionId")
+        .or_else(|| data.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(HarnessError::BackendStream)?;
+    let session_path = data
+        .get("sessionFile")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| requested_path.cloned());
+    Ok((session_id, session_path))
+}
+
 async fn prompt_content(invocation: &Invocation) -> Result<(String, Vec<Value>), HarnessError> {
     let mut message = invocation.prompt.clone();
-    let mut images = Vec::new();
+    let mut image_attachments = Vec::new();
     for attachment in &invocation.attachments {
         if attachment.media_type.starts_with("image/") {
-            let bytes = tokio::fs::read(&attachment.path).await?;
-            images.push(json!({
-                "type": "image",
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                "mimeType": attachment.media_type,
-            }));
+            image_attachments.push(attachment);
         } else {
             message.push_str(&format!(
                 "\n\nAttached file `{}` is available at `{}`.",
@@ -358,7 +397,42 @@ async fn prompt_content(invocation: &Invocation) -> Result<(String, Vec<Value>),
             ));
         }
     }
+
+    let mut projected_frame_bytes = serde_json::to_vec(&message)
+        .map_err(|_| HarnessError::BackendStream)?
+        .len()
+        .checked_add(DAEMON_FRAME_OVERHEAD_BYTES)
+        .ok_or(HarnessError::BackendStream)?;
+    for attachment in &image_attachments {
+        let raw_bytes = tokio::fs::metadata(&attachment.path).await?.len();
+        let encoded_bytes = base64_encoded_len(raw_bytes).ok_or(HarnessError::BackendStream)?;
+        projected_frame_bytes = projected_frame_bytes
+            .checked_add(encoded_bytes)
+            .and_then(|size| size.checked_add(attachment.media_type.len() + 64))
+            .ok_or(HarnessError::BackendStream)?;
+        if projected_frame_bytes > DAEMON_MAX_FRAME_BYTES {
+            return Err(HarnessError::BackendStream);
+        }
+    }
+
+    let mut images = Vec::with_capacity(image_attachments.len());
+    for attachment in image_attachments {
+        let bytes = tokio::fs::read(&attachment.path).await?;
+        images.push(json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "mimeType": attachment.media_type,
+        }));
+    }
     Ok((message, images))
+}
+
+fn base64_encoded_len(raw_bytes: u64) -> Option<usize> {
+    usize::try_from(raw_bytes)
+        .ok()?
+        .checked_add(2)?
+        .checked_div(3)?
+        .checked_mul(4)
 }
 
 enum DaemonRequestError {
@@ -639,6 +713,7 @@ mod tests {
             idle_timeout: Duration::from_secs(2),
             cwd: root.to_path_buf(),
             session_id,
+            session_path: None,
             session_name: "marmot-daemon-contract".to_owned(),
             prompt: prompt.to_owned(),
             attachments: Vec::new(),
@@ -1078,6 +1153,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_image_is_rejected_before_base64_encoding() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("oversized.png");
+        let file = tokio::fs::File::create(&image).await.unwrap();
+        file.set_len(DAEMON_MAX_FRAME_BYTES as u64).await.unwrap();
+        let mut invocation = test_invocation(root.path(), None, "inspect image");
+        invocation.attachments = vec![marmot_terminal_harness::InvocationAttachment {
+            path: image,
+            media_type: "image/png".to_owned(),
+            file_name: "oversized.png".to_owned(),
+        }];
+
+        assert!(matches!(
+            prompt_content(&invocation).await,
+            Err(HarnessError::BackendStream)
+        ));
+    }
+
+    #[tokio::test]
     async fn backend_speaks_daemon_protocol_reuses_session_and_forwards_attachments() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("prime.sock");
@@ -1279,6 +1373,7 @@ mod tests {
             idle_timeout: Duration::from_secs(120),
             cwd,
             session_id: None,
+            session_path: None,
             session_name: format!("marmot-live-smoke-{}", std::process::id()),
             prompt: "Reply with exactly PRIME_AGENT_CONNECTOR_OK and nothing else.".to_owned(),
             attachments: Vec::new(),

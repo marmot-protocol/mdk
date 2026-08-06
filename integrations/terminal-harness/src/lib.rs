@@ -105,6 +105,8 @@ pub struct Invocation {
     pub cwd: PathBuf,
     /// Durable backend session id, when one is known.
     pub session_id: Option<String>,
+    /// Durable backend session file, when the backend exposes one.
+    pub session_path: Option<PathBuf>,
     /// Stable privacy-safe backend session name derived from the Marmot group.
     pub session_name: String,
     /// Prompt plaintext passed only to the backend process.
@@ -122,6 +124,7 @@ impl fmt::Debug for Invocation {
             .field("prompt_len", &self.prompt.len())
             .field("attachment_count", &self.attachments.len())
             .field("session_present", &self.session_id.is_some())
+            .field("session_path_present", &self.session_path.is_some())
             .field("session_name_present", &!self.session_name.is_empty())
             .finish()
     }
@@ -132,6 +135,8 @@ impl fmt::Debug for Invocation {
 pub struct Outcome {
     /// Session id observed from the backend event stream.
     pub observed_session: Option<String>,
+    /// Durable session file observed from the backend.
+    pub observed_session_path: Option<PathBuf>,
     /// Process exit code, or `None` when terminated by a signal.
     pub exit_code: Option<i32>,
     /// Sanitized backend error classification.
@@ -147,6 +152,10 @@ impl fmt::Debug for Outcome {
         formatter
             .debug_struct("Outcome")
             .field("session_present", &self.observed_session.is_some())
+            .field(
+                "session_path_present",
+                &self.observed_session_path.is_some(),
+            )
             .field("exit_code", &self.exit_code)
             .field("error_summary_present", &self.error_summary.is_some())
             .field("stderr_len", &self.stderr.len())
@@ -161,6 +170,8 @@ pub struct RunFailure {
     pub error: HarnessError,
     /// Session id observed before the failure.
     pub observed_session: Option<String>,
+    /// Durable session file observed before the failure.
+    pub observed_session_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for RunFailure {
@@ -169,6 +180,10 @@ impl fmt::Debug for RunFailure {
             .debug_struct("RunFailure")
             .field("error_kind", &self.error.privacy_safe_kind())
             .field("session_present", &self.observed_session.is_some())
+            .field(
+                "session_path_present",
+                &self.observed_session_path.is_some(),
+            )
             .finish()
     }
 }
@@ -231,6 +246,7 @@ mod privacy_tests {
             idle_timeout: Duration::from_secs(10),
             cwd: PathBuf::from("/secret/worktree"),
             session_id: Some("secret-session".to_owned()),
+            session_path: Some(PathBuf::from("/secret/session.jsonl")),
             session_name: "secret-name".to_owned(),
             prompt: "secret prompt".to_owned(),
             attachments: vec![InvocationAttachment {
@@ -254,6 +270,7 @@ mod privacy_tests {
 
         let outcome = Outcome {
             observed_session: Some("secret-session".to_owned()),
+            observed_session_path: Some(PathBuf::from("/secret/session.jsonl")),
             exit_code: Some(64),
             error_summary: Some("secret-summary".to_owned()),
             stderr: "secret stderr".to_owned(),

@@ -83,7 +83,7 @@ The installer writes a private environment file. Direct launches use the same va
 
 ## Group and Session Semantics
 
-The first group message must be `/<path>` selecting a canonical directory beneath the service user's home. The harness stores only the canonical directory, Prime Agent active session id, and a stable hashed session name in a mode-`0600` state file.
+The first group message must be `/<path>` selecting a canonical directory beneath the service user's home. The harness stores only the canonical directory, Prime Agent session file path and current active session id, and a stable hashed session name in a mode-`0600` state file. After a harness or Prime Agent daemon restart, it reloads the durable session file to recover conversation history before attaching to the new active session id.
 
 Prompts for one Marmot group are serialized. A prompt received while that group's Prime Agent run is active is queued within the configured bound; it is not sent as a daemon steering message. Different groups may run concurrently.
 

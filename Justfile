@@ -195,7 +195,7 @@ prime-agent-installer-test:
     integrations/prime-agent/marmot/tests/test_installer.sh
 
 prime-agent-dev-e2e-connector:
-    cargo test -p wn-prime-agent --test e2e_connector -- --ignored --nocapture
+    cargo test -p wn-prime-agent --test e2e_connector -- --nocapture
 
 prime-agent-live-smoke:
     WN_PRIME_AGENT_LIVE_SMOKE=1 cargo test -p wn-prime-agent live_daemon_smoke -- --ignored --nocapture

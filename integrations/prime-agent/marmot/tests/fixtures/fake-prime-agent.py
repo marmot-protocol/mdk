@@ -36,6 +36,8 @@ def send(writer, message):
 
 completed = False
 reply = "marmot-e2e-ok: ping from connector " + ("chunk " * 40)
+session_path = args.daemon_socket + ".session.jsonl"
+active_session_id = None
 while not completed:
     connection, _ = server.accept()
     with connection:
@@ -59,9 +61,32 @@ while not completed:
                     raise RuntimeError("missing stable Marmot session name")
                 if "name" in command.get("config", {}):
                     raise RuntimeError("session name must be a top-level create field")
-                data = {"activeSessionId": "fake-prime-session"}
+                requested_path = command.get("sessionPath")
+                if requested_path is None:
+                    if os.path.exists(session_path):
+                        raise RuntimeError("restart must resume the persisted session path")
+                    with open(session_path, "w", encoding="utf-8") as session_file:
+                        session_file.write("{}\n")
+                    active_session_id = "fake-prime-session-1"
+                else:
+                    if requested_path != session_path or not os.path.isfile(requested_path):
+                        raise RuntimeError("invalid persisted session path")
+                    active_session_id = "fake-prime-session-2"
+                data = {
+                    "activeSessionId": active_session_id,
+                    "sessionFile": session_path,
+                }
             elif command_type == "attach":
-                data = {"activeSessionId": "fake-prime-session"}
+                if command.get("activeSessionId") != active_session_id:
+                    send(writer, {
+                        "type": "response",
+                        "id": command_id,
+                        "command": command_type,
+                        "success": False,
+                        "error": "active session not found",
+                    })
+                    continue
+                data = {"activeSessionId": active_session_id}
             elif command_type == "set_session_name":
                 data = None
             elif command_type == "prompt_and_wait":

@@ -23,6 +23,7 @@ pub const SENDER_ACCOUNT_ID_HEX: &str =
     "4444444444444444444444444444444444444444444444444444444444444444";
 /// Prompt injected through the debug control socket.
 const INBOUND_TEXT: &str = "ping from connector";
+const REPOSITORY_NAME: &str = "repo";
 /// Small reply cap that forces chunking in connector e2e tests.
 pub const MAX_REPLY_BYTES: usize = 64;
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,6 +32,8 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct HarnessContext<'a> {
     /// Private temporary root for the test.
     pub root: &'a Path,
+    /// Synthetic service-user home containing the selected repository.
+    pub home: &'a Path,
     /// Debug `wn-agent` control socket.
     pub socket: &'a Path,
     /// Local account created for the test.
@@ -40,85 +43,144 @@ pub struct HarnessContext<'a> {
 /// Runs the shared real-process connector scenario around a backend factory.
 pub async fn run_connector_e2e(
     harness_name: &'static str,
-    spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
+    spawn_harness: impl FnMut(HarnessContext<'_>) -> SpawnedChild,
 ) {
-    run_connector_e2e_rounds(harness_name, spawn_harness, 1).await;
+    run_connector_e2e_rounds(harness_name, spawn_harness, false).await;
 }
 
-/// Runs two prompts in one group so a backend must resume its first session.
+/// Runs two prompts around a harness restart so a backend must resume its first session.
 pub async fn run_connector_resume_e2e(
     harness_name: &'static str,
-    spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
+    spawn_harness: impl FnMut(HarnessContext<'_>) -> SpawnedChild,
 ) {
-    run_connector_e2e_rounds(harness_name, spawn_harness, 2).await;
+    run_connector_e2e_rounds(harness_name, spawn_harness, true).await;
 }
 
 async fn run_connector_e2e_rounds(
     harness_name: &'static str,
-    spawn_harness: impl FnOnce(HarnessContext<'_>) -> SpawnedChild,
-    rounds: usize,
+    mut spawn_harness: impl FnMut(HarnessContext<'_>) -> SpawnedChild,
+    restart_harness: bool,
 ) {
     let temp = TempDir::new().expect("temp dir");
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
         .expect("make temp root private");
+    let service_home = temp.path().join("home");
+    fs::create_dir_all(service_home.join(REPOSITORY_NAME)).expect("create selected repository");
     let marmot_home = temp.path().join("marmot-home");
     let socket = temp.path().join("a.sock");
 
     let agent = ChildGuard::new(spawn_wn_agent(&marmot_home, &socket, temp.path()));
     wait_for_agent(&socket).await;
-    let account = create_account(&socket, harness_name).await;
-    let harness = ChildGuard::new(spawn_harness(HarnessContext {
+    let account = create_account(&socket, &format!("{harness_name}-e2e")).await;
+    let context = |account_id_hex| HarnessContext {
         root: temp.path(),
+        home: &service_home,
         socket: &socket,
-        account_id_hex: &account.account_id_hex,
-    }));
+        account_id_hex,
+    };
+    let mut harness = ChildGuard::new(spawn_harness(context(&account.account_id_hex)));
 
     let expected_text = expected_reply_text();
-    let message_ids = (0..rounds)
-        .map(|round| {
-            if round == 0 {
-                MESSAGE_ID_HEX.to_owned()
-            } else {
-                format!("{:064x}", round + 0x33)
-            }
-        })
-        .collect::<Vec<_>>();
-    let finals_by_message = inject_until_recorded_finals(
+    if restart_harness {
+        let picker_reply = format!("[{harness_name}] Select workdir first: /<path> [prompt].");
+        let finals = inject_until_recorded_final(
+            &socket,
+            &account.account_id_hex,
+            MESSAGE_ID_HEX,
+            INBOUND_TEXT,
+            &picker_reply,
+            harness_name,
+        )
+        .await;
+        assert_recorded_final(
+            &finals,
+            MESSAGE_ID_HEX,
+            &account.account_id_hex,
+            &picker_reply,
+            false,
+        );
+    }
+
+    let first_prompt_id = format!("{:064x}", 0x34);
+    let first_prompt = format!("/{REPOSITORY_NAME} {INBOUND_TEXT}");
+    let finals = inject_until_recorded_final(
         &socket,
         &account.account_id_hex,
-        &message_ids,
+        &first_prompt_id,
+        &first_prompt,
         &expected_text,
         harness_name,
     )
     .await;
-    for (message_id_hex, finals) in message_ids.iter().zip(finals_by_message) {
+    assert_recorded_final(
+        &finals,
+        &first_prompt_id,
+        &account.account_id_hex,
+        &expected_text,
+        true,
+    );
+
+    if restart_harness {
+        drop(harness);
+        sleep(Duration::from_millis(250)).await;
+        let resumed_account = create_account(&socket, &format!("{harness_name}-resumed")).await;
+        harness = ChildGuard::new(spawn_harness(context(&resumed_account.account_id_hex)));
+
+        let second_prompt_id = format!("{:064x}", 0x35);
+        let finals = inject_until_recorded_final(
+            &socket,
+            &resumed_account.account_id_hex,
+            &second_prompt_id,
+            INBOUND_TEXT,
+            &expected_text,
+            harness_name,
+        )
+        .await;
+        assert_recorded_final(
+            &finals,
+            &second_prompt_id,
+            &resumed_account.account_id_hex,
+            &expected_text,
+            true,
+        );
+    }
+
+    drop(harness);
+    drop(agent);
+}
+
+fn assert_recorded_final(
+    finals: &[AgentControlDebugFinalSend],
+    message_id_hex: &str,
+    account_id_hex: &str,
+    expected_text: &str,
+    expect_chunked: bool,
+) {
+    if expect_chunked {
         assert!(
             finals.len() >= 2,
             "expected chunked final sends, got {}",
             finals.len()
         );
-        assert_eq!(
-            finals
-                .iter()
-                .map(|send| send.text.as_str())
-                .collect::<String>(),
-            expected_text
-        );
-        for send in &finals {
-            assert_eq!(send.account_id_hex, account.account_id_hex);
-            assert_eq!(send.group_id_hex, GROUP_ID_HEX);
-            assert_eq!(
-                send.reply_to_message_id_hex.as_deref(),
-                Some(message_id_hex.as_str())
-            );
-            assert!(send.text.len() <= MAX_REPLY_BYTES);
-            assert_eq!(send.message_ids_hex.len(), 1);
-            assert_eq!(send.message_ids_hex[0].len(), 64);
-        }
     }
-
-    drop(harness);
-    drop(agent);
+    assert_eq!(
+        finals
+            .iter()
+            .map(|send| send.text.as_str())
+            .collect::<String>(),
+        expected_text
+    );
+    for send in finals {
+        assert_eq!(send.account_id_hex, account_id_hex);
+        assert_eq!(send.group_id_hex, GROUP_ID_HEX);
+        assert_eq!(
+            send.reply_to_message_id_hex.as_deref(),
+            Some(message_id_hex)
+        );
+        assert!(send.text.len() <= MAX_REPLY_BYTES);
+        assert_eq!(send.message_ids_hex.len(), 1);
+        assert_eq!(send.message_ids_hex[0].len(), 64);
+    }
 }
 
 /// Spawned child and its captured log paths.
@@ -159,18 +221,10 @@ fn repo_root() -> &'static Path {
 }
 
 fn spawn_wn_agent(home: &Path, socket: &Path, log_root: &Path) -> SpawnedChild {
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    let binary = wn_agent_binary();
+    let mut command = Command::new(binary);
     command
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "agent-connector",
-            "--bin",
-            "wn-agent",
-            "--",
-            "--home",
-        ])
+        .arg("--home")
         .arg(home)
         .arg("--socket")
         .arg(socket)
@@ -181,6 +235,27 @@ fn spawn_wn_agent(home: &Path, socket: &Path, log_root: &Path) -> SpawnedChild {
             env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
         );
     SpawnedChild::spawn("wn-agent", &mut command, log_root)
+}
+
+fn wn_agent_binary() -> PathBuf {
+    let binary = env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .and_then(Path::parent)
+        .expect("Cargo target profile directory")
+        .join("wn-agent");
+    if !binary.is_file() {
+        let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+            .args(["build", "-q", "-p", "agent-connector", "--bin", "wn-agent"])
+            .current_dir(repo_root())
+            .status()
+            .expect("build wn-agent for connector e2e test");
+        assert!(
+            status.success(),
+            "failed to build wn-agent for connector e2e test"
+        );
+    }
+    binary
 }
 
 fn expected_reply_text() -> String {
@@ -206,12 +281,12 @@ async fn wait_for_agent(socket: &Path) {
     .await;
 }
 
-async fn create_account(socket: &Path, harness_name: &str) -> AgentControlAccount {
+async fn create_account(socket: &Path, account_label: &str) -> AgentControlAccount {
     let response = send_control_request(
         socket,
         "req-create-account",
         AgentControlRequest::AccountCreate {
-            label: Some(format!("{harness_name}-e2e")),
+            label: Some(account_label.to_owned()),
             publish_key_package: false,
         },
     )
@@ -223,29 +298,28 @@ async fn create_account(socket: &Path, harness_name: &str) -> AgentControlAccoun
     account
 }
 
-async fn inject_until_recorded_finals(
+async fn inject_until_recorded_final(
     socket: &Path,
     account_id_hex: &str,
-    message_ids: &[String],
+    message_id_hex: &str,
+    inbound_text: &str,
     expected_text: &str,
     harness_name: &str,
-) -> Vec<Vec<AgentControlDebugFinalSend>> {
+) -> Vec<AgentControlDebugFinalSend> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        for message_id_hex in message_ids {
-            let _ = send_control_request(
-                socket,
-                "req-debug-inject",
-                AgentControlRequest::DebugInjectInbound {
-                    account_id_hex: account_id_hex.to_owned(),
-                    group_id_hex: GROUP_ID_HEX.to_owned(),
-                    message_id_hex: message_id_hex.to_owned(),
-                    sender_account_id_hex: SENDER_ACCOUNT_ID_HEX.to_owned(),
-                    text: INBOUND_TEXT.to_owned(),
-                },
-            )
-            .await;
-        }
+        let _ = send_control_request(
+            socket,
+            "req-debug-inject",
+            AgentControlRequest::DebugInjectInbound {
+                account_id_hex: account_id_hex.to_owned(),
+                group_id_hex: GROUP_ID_HEX.to_owned(),
+                message_id_hex: message_id_hex.to_owned(),
+                sender_account_id_hex: SENDER_ACCOUNT_ID_HEX.to_owned(),
+                text: inbound_text.to_owned(),
+            },
+        )
+        .await;
         let recorded = match send_control_request(
             socket,
             "req-debug-finals",
@@ -256,27 +330,22 @@ async fn inject_until_recorded_finals(
             Ok(AgentControlResponse::DebugRecordedFinals { sends }) => sends,
             _ => Vec::new(),
         };
-        let matching = message_ids
+        let matching = recorded
             .iter()
-            .map(|message_id_hex| {
-                recorded
-                    .iter()
-                    .filter(|send| {
-                        send.reply_to_message_id_hex.as_deref() == Some(message_id_hex.as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .filter(|send| send.reply_to_message_id_hex.as_deref() == Some(message_id_hex))
+            .cloned()
             .collect::<Vec<_>>();
-        if matching.iter().all(|sends| {
-            sends
-                .iter()
-                .map(|send| send.text.as_str())
-                .collect::<String>()
-                == expected_text
-        }) {
+        let actual = matching
+            .iter()
+            .map(|send| send.text.as_str())
+            .collect::<String>();
+        if actual == expected_text {
             return matching;
         }
+        assert!(
+            actual.is_empty() || expected_text.starts_with(&actual),
+            "recorded {harness_name} an unexpected final: {actual:?}"
+        );
         assert!(
             Instant::now() < deadline,
             "timed out waiting for recorded {harness_name} final sends"

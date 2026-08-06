@@ -23,6 +23,7 @@ fn spawn_prime_harness(context: HarnessContext) -> SpawnedChild {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn-prime-agent"));
     command
+        .env("HOME", context.home)
         .env("MARMOT_AGENT_SOCKET", context.socket)
         .env("MARMOT_HOME", context.root.join("prime-home"))
         .env(
@@ -47,7 +48,6 @@ fn spawn_prime_harness(context: HarnessContext) -> SpawnedChild {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires the real wn-agent binary and runs a local multi-client connector flow"]
 async fn prompt_streams_preview_and_publishes_durable_final() {
     run_connector_resume_e2e("wn-prime-agent", spawn_prime_harness).await;
 }

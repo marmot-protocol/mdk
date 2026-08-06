@@ -9,6 +9,8 @@ use crate::error::Result;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_path: Option<PathBuf>,
     pub(crate) cwd: PathBuf,
     #[serde(default)]
     pub(crate) session_name: Option<String>,
@@ -20,6 +22,8 @@ enum RawRecord {
     Bare(String),
     Full {
         session_id: String,
+        #[serde(default)]
+        session_path: Option<PathBuf>,
         cwd: PathBuf,
         #[serde(default)]
         session_name: Option<String>,
@@ -31,15 +35,18 @@ impl RawRecord {
         match self {
             Self::Bare(session_id) => SessionRecord {
                 session_id,
+                session_path: None,
                 cwd: default_cwd.to_path_buf(),
                 session_name: None,
             },
             Self::Full {
                 session_id,
+                session_path,
                 cwd,
                 session_name,
             } => SessionRecord {
                 session_id,
+                session_path,
                 cwd,
                 session_name,
             },
@@ -116,6 +123,7 @@ mod tests {
             let store = SessionStore::load(path.clone(), &home).unwrap();
             let record = SessionRecord {
                 session_id: "ses_abc123".to_owned(),
+                session_path: Some(home.join("sessions/ses_abc123.jsonl")),
                 cwd: home.join("proj"),
                 session_name: Some("marmot-session".to_owned()),
             };
@@ -125,6 +133,10 @@ mod tests {
         let store = SessionStore::load(path.clone(), &home).unwrap();
         let record = store.get("group1").await.expect("record persisted");
         assert_eq!(record.session_id, "ses_abc123");
+        assert_eq!(
+            record.session_path.as_deref(),
+            Some(home.join("sessions/ses_abc123.jsonl").as_path())
+        );
         assert_eq!(record.cwd, home.join("proj"));
         assert_eq!(record.session_name.as_deref(), Some("marmot-session"));
     }
@@ -140,6 +152,7 @@ mod tests {
         let store = SessionStore::load(path, &home).unwrap();
         let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
+        assert_eq!(record.session_path, None);
         assert_eq!(record.cwd, home);
         assert_eq!(record.session_name, None);
     }
@@ -158,6 +171,7 @@ mod tests {
                 "group1",
                 SessionRecord {
                     session_id: "ses_private".to_owned(),
+                    session_path: None,
                     cwd: home,
                     session_name: None,
                 },

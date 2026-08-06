@@ -356,6 +356,9 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let session_id = known_session
         .as_ref()
         .and_then(|record| (!record.session_id.is_empty()).then(|| record.session_id.clone()));
+    let session_path = known_session
+        .as_ref()
+        .and_then(|record| record.session_path.clone());
     let session_name = known_session
         .as_ref()
         .and_then(|record| record.session_name.clone())
@@ -399,6 +402,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
+        session_path,
         session_name: session_name.clone(),
         prompt,
         attachments,
@@ -409,6 +413,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
+    let mut final_text_seen = false;
     let mut preview = None;
     let mut preview_disabled = ctx.cfg.quic_candidates.is_empty();
     while let Some(event) = rx.recv().await {
@@ -458,6 +463,16 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 }
             }
             RunnerEvent::Text(text) => {
+                if final_text_seen {
+                    warn!(
+                        target: TRACE_TARGET,
+                        method = "runner_event",
+                        error_kind = "duplicate_final",
+                        "dropping duplicate final text event"
+                    );
+                    continue;
+                }
+                final_text_seen = true;
                 if delivery_failed {
                     continue;
                 }
@@ -625,21 +640,16 @@ async fn finish_success(
         "backend invocation completed"
     );
 
-    let needs_persist = known_session
-        .as_ref()
-        .is_none_or(|record| record.session_id.is_empty() || record.session_name.is_none());
-    if !delivery.failed
-        && needs_persist
-        && let Some(session_id) = outcome.observed_session
-        && let Err(err) = persist_observed_session_if_unset(
-            &ctx.sessions,
-            &inbound.group_ref,
-            known_session.as_ref(),
-            cwd,
-            session_name,
-            Some(session_id),
-        )
-        .await
+    if let Err(err) = persist_observed_session(
+        &ctx.sessions,
+        &inbound.group_ref,
+        known_session.as_ref(),
+        cwd,
+        session_name,
+        outcome.observed_session,
+        outcome.observed_session_path,
+    )
+    .await
     {
         warn!(
             target: TRACE_TARGET,
@@ -800,13 +810,14 @@ async fn handle_backend_run_failure(
     session_name: String,
     failure: &RunFailure,
 ) -> String {
-    if let Err(store_err) = persist_observed_session_if_unset(
+    if let Err(store_err) = persist_observed_session(
         sessions,
         group_ref,
         known_session,
         cwd,
         session_name,
         failure.observed_session.clone(),
+        failure.observed_session_path.clone(),
     )
     .await
     {
@@ -844,28 +855,36 @@ async fn handle_backend_run_failure(
     }
 }
 
-async fn persist_observed_session_if_unset(
+async fn persist_observed_session(
     sessions: &SessionStore,
     group_ref: &str,
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
     session_name: String,
     observed_session: Option<String>,
+    observed_session_path: Option<PathBuf>,
 ) -> Result<()> {
-    let needs_persist = known_session
-        .as_ref()
-        .is_none_or(|record| record.session_id.is_empty() || record.session_name.is_none());
-    if needs_persist && let Some(session_id) = observed_session {
-        sessions
-            .set(
-                group_ref,
-                SessionRecord {
-                    session_id,
-                    cwd,
-                    session_name: Some(session_name),
-                },
-            )
-            .await?;
+    let Some(session_id) = observed_session else {
+        return Ok(());
+    };
+    let session_path = observed_session_path
+        .or_else(|| known_session.and_then(|record| record.session_path.clone()));
+    if known_session.is_some_and(|record| {
+        record.session_id == session_id
+            && record.session_path == session_path
+            && record.cwd == cwd
+            && record.session_name.as_deref() == Some(session_name.as_str())
+    }) {
+        return Ok(());
+    }
+    let next = SessionRecord {
+        session_id,
+        session_path,
+        cwd,
+        session_name: Some(session_name),
+    };
+    if known_session != Some(&next) {
+        sessions.set(group_ref, next).await?;
     }
     Ok(())
 }
@@ -881,7 +900,21 @@ async fn resolve_cwd_and_prompt(
     }
 
     let (name, rest) = match parse_repo_picker(&inbound.text) {
-        RepoPicker::Absent => return Ok(Some((ctx.home.clone(), inbound.text.clone()))),
+        RepoPicker::Absent => {
+            send_reply(
+                ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                &format!(
+                    "[{}] Select workdir first: /<path> [prompt].",
+                    ctx.cfg.spec.reply_prefix
+                ),
+                0,
+            )
+            .await?;
+            return Ok(None);
+        }
         RepoPicker::Invalid => {
             send_reply(
                 ctx,
@@ -918,6 +951,7 @@ async fn resolve_cwd_and_prompt(
                 &inbound.group_ref,
                 SessionRecord {
                     session_id: String::new(),
+                    session_path: None,
                     cwd,
                     session_name: Some(session_name_for_group(&inbound.group_ref)),
                 },
@@ -1229,40 +1263,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_observed_session_only_when_unset() {
+    async fn persist_observed_session_updates_runtime_id_and_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let home = dir.path().to_path_buf();
         let store = SessionStore::load(path.clone(), &home).unwrap();
         let cwd = home.join("proj");
+        let session_path = home.join("session.jsonl");
 
-        persist_observed_session_if_unset(
+        persist_observed_session(
             &store,
             "group1",
             None,
             cwd.clone(),
             "marmot-group1".to_owned(),
             Some("ses_new".to_owned()),
+            Some(session_path.clone()),
         )
         .await
         .unwrap();
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_new");
+        assert_eq!(record.session_path.as_deref(), Some(session_path.as_path()));
         assert_eq!(record.cwd, cwd);
         assert_eq!(record.session_name.as_deref(), Some("marmot-group1"));
 
-        persist_observed_session_if_unset(
+        persist_observed_session(
             &store,
             "group1",
             Some(&record),
             cwd.clone(),
             "marmot-other".to_owned(),
             Some("ses_other".to_owned()),
+            Some(session_path.clone()),
         )
         .await
         .unwrap();
         let record = store.get("group1").await.unwrap();
-        assert_eq!(record.session_id, "ses_new");
+        assert_eq!(record.session_id, "ses_other");
+        assert_eq!(record.session_path.as_deref(), Some(session_path.as_path()));
     }
 
     #[tokio::test]
@@ -1273,6 +1312,7 @@ mod tests {
         let failure = RunFailure {
             error: HarnessError::BackendIdle,
             observed_session: Some("ses_idle".to_owned()),
+            observed_session_path: Some(home.join("session.jsonl")),
         };
 
         let reply = handle_backend_run_failure(
@@ -1288,6 +1328,10 @@ mod tests {
 
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_idle");
+        assert_eq!(
+            record.session_path.as_deref(),
+            Some(home.join("session.jsonl").as_path())
+        );
         assert_eq!(record.cwd, home);
         assert_eq!(record.session_name.as_deref(), Some("marmot-group1"));
         assert_eq!(

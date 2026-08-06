@@ -59,19 +59,23 @@ async fn run_with_bin(
     let mut child = command.spawn().map_err(|_| RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
+        observed_session_path: None,
     })?;
     let total_deadline = tokio::time::Instant::now() + invocation.timeout;
     let stdin = child.stdin.take().ok_or(RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
+        observed_session_path: None,
     })?;
     let stdout = child.stdout.take().ok_or(RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
+        observed_session_path: None,
     })?;
     let stderr = child.stderr.take().ok_or(RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
+        observed_session_path: None,
     })?;
     let mut stderr_task = tokio::spawn(capture_stderr(stderr));
     let mut writer_task = write_stdin(stdin, invocation.prompt);
@@ -143,6 +147,7 @@ async fn run_with_bin(
         };
         Ok::<_, HarnessError>(Outcome {
             observed_session: observed_session.clone(),
+            observed_session_path: None,
             exit_code: status.code(),
             error_summary,
             stderr: strip_ansi(stderr.trim()),
@@ -158,6 +163,7 @@ async fn run_with_bin(
             Err(RunFailure {
                 error,
                 observed_session,
+                observed_session_path: None,
             })
         }
         Err(_) => {
@@ -165,6 +171,7 @@ async fn run_with_bin(
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
+                observed_session_path: None,
             })
         }
     }
@@ -345,6 +352,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 idle_timeout: Duration::from_secs(2),
                 cwd: root.path().to_path_buf(),
                 session_id: None,
+                session_path: None,
                 session_name: "marmot-test".to_owned(),
                 prompt: "--prompt-via-stdin".to_owned(),
                 attachments: Vec::new(),
@@ -399,6 +407,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 idle_timeout: Duration::from_secs(2),
                 cwd: root.path().to_path_buf(),
                 session_id: Some("missing-session".to_owned()),
+                session_path: None,
                 session_name: "marmot-test".to_owned(),
                 prompt: "p".repeat(60_000),
                 attachments: Vec::new(),
@@ -442,6 +451,7 @@ exit 64
                 idle_timeout: Duration::from_secs(2),
                 cwd: root.path().to_path_buf(),
                 session_id: None,
+                session_path: None,
                 session_name: "marmot-test".to_owned(),
                 prompt: "p".repeat(60_000),
                 attachments: Vec::new(),
@@ -476,6 +486,7 @@ exit 64
                 idle_timeout: Duration::from_secs(30),
                 cwd: root.path().to_path_buf(),
                 session_id: Some("wn-pi-real-contract".to_owned()),
+                session_path: None,
                 session_name: "marmot-live-smoke".to_owned(),
                 prompt: "Reply with exactly PI_CONNECTOR_OK and nothing else.".to_owned(),
                 attachments: Vec::new(),

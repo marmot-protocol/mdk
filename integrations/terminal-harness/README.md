@@ -17,8 +17,8 @@ implementation, or backend-specific CLI semantics.
 
 A connector supplies a `Backend` implementation. For each authorized inbound
 prompt, the shared runtime passes an `Invocation` containing the selected
-working directory, optional prior session id, stable session name, prompt,
-backend-supported attachments, idle timeout, and total
+working directory, optional prior session id and durable session file, stable
+session name, prompt, backend-supported attachments, idle timeout, and total
 timeout. The backend may emit append-only assistant text deltas as
 `RunnerEvent::Preview`, followed by completed assistant text as
 `RunnerEvent::Text`, and returns privacy-safe `Outcome` metadata.
@@ -78,6 +78,7 @@ just pi-installer-test
 just prime-agent-installer-test
 ```
 
-The process-level connector tests are ignored by default and use real
-`wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real OpenCode, Pi, or Prime Agent CLIs.
+The OpenCode and Pi process-level connector tests are ignored by default. The
+Prime Agent restart regression runs in the default package test suite. All
+three use real `wn-agent` and connector binaries with fake backend executables;
+they do not install or authenticate the real OpenCode, Pi, or Prime Agent CLIs.

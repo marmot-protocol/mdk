@@ -86,6 +86,7 @@ async fn run_with_bin(
     let mut child = command.spawn().map_err(|_| RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
+        observed_session_path: None,
     })?;
     let total_deadline = tokio::time::Instant::now() + invocation.timeout;
     let stdout = match child.stdout.take() {
@@ -95,6 +96,7 @@ async fn run_with_bin(
             return Err(RunFailure {
                 error: HarnessError::BackendSpawn,
                 observed_session: None,
+                observed_session_path: None,
             });
         }
     };
@@ -105,6 +107,7 @@ async fn run_with_bin(
             return Err(RunFailure {
                 error: HarnessError::BackendSpawn,
                 observed_session: None,
+                observed_session_path: None,
             });
         }
     };
@@ -179,6 +182,7 @@ async fn run_with_bin(
         };
         Ok::<Outcome, HarnessError>(Outcome {
             observed_session: observed_session.clone(),
+            observed_session_path: None,
             exit_code: status.code(),
             error_summary,
             stderr: strip_ansi(stderr.trim()),
@@ -194,6 +198,7 @@ async fn run_with_bin(
             Err(RunFailure {
                 error,
                 observed_session,
+                observed_session_path: None,
             })
         }
         Err(_) => {
@@ -201,6 +206,7 @@ async fn run_with_bin(
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
+                observed_session_path: None,
             })
         }
     }
@@ -282,6 +288,7 @@ mod tests {
             idle_timeout: Duration::from_millis(500),
             cwd: dir.path().to_path_buf(),
             session_id: None,
+            session_path: None,
             session_name: "marmot-test".to_owned(),
             prompt: scenario.to_owned(),
             attachments: Vec::new(),
