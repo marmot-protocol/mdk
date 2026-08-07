@@ -647,3 +647,33 @@ async fn failed_promotion_in_convergence_buffer_persists_no_row() {
         "no convergence row may be persisted for the failed group"
     );
 }
+
+#[tokio::test]
+async fn failed_promotion_in_convergence_advance_propagates() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
+    insert_marmot_group_without_openmls_state(&storage, &broken_group, 7);
+
+    let mut engine = build_engine(storage.clone());
+    engine
+        .hydrate_stable_groups_from_storage()
+        .expect("cheap pass");
+
+    // A fresh promotion failure must propagate instead of letting the
+    // advance loop read convergence state for the rejected group (and
+    // potentially report it settled).
+    let result = engine
+        .advance_convergence_inputs_until_settled(&broken_group, 0)
+        .await;
+    assert!(
+        matches!(result, Err(EngineError::UnknownGroup(ref id)) if id == &broken_group),
+        "failed promotion must propagate: {result:?}"
+    );
+    assert_eq!(
+        engine.quarantined_groups(),
+        vec![(
+            broken_group,
+            GroupHydrationQuarantineReason::OpenMlsGroupMissing
+        )]
+    );
+}

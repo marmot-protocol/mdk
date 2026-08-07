@@ -821,9 +821,12 @@ impl<S: StorageProvider> Engine<S> {
         now_ms: u64,
     ) -> Result<bool, EngineError> {
         // Promote a seeded-but-unhydrated group before reading its stored
-        // inputs (mdk#1161); a hydration failure quarantines it and the
-        // converge call below reports the blocked run as before.
-        let _ = self.ensure_hydrated(group_id);
+        // inputs (mdk#1161). A failed promotion quarantines the group and
+        // MUST propagate — continuing would read convergence state for a
+        // group validation just rejected and could report it settled.
+        // Already-quarantined groups keep their pre-existing semantics
+        // (`ensure_hydrated` no-ops; converge reports the blocked run).
+        self.ensure_hydrated(group_id)?;
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
                 let result = self
