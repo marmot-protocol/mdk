@@ -11,6 +11,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Hermes Marmot delivery now batches up to 10 ordered local images into one
+  encrypted-media application message instead of sending one message per image.
+  The adapter preflights every path and the bounded per-file/aggregate byte
+  limits before staging, applies the album caption once, reports every durable
+  message id and attachment outcome, and retries timed-out sends with connector-
+  persisted idempotency so a retry cannot duplicate the album.
+
 - Account-open startup is now stage-attributed in app telemetry: engine
   session open, stored-group hydration, the shared startup profile load, and
   the group-read-snapshot capture each get fixed-bucket duration metrics.

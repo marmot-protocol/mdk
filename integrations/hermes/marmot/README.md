@@ -441,6 +441,17 @@ then stages a private copy under `MARMOT_OUTBOUND_MEDIA_DIR` (defaults to
 the connector responds. `wn-agent` must independently allow that exact staging
 directory with `--media-allowed-root`; without one, path sends fail closed.
 
+Hermes multi-image responses are sent as one ordered Marmot media message, not
+as one message per image. The adapter accepts at most 10 attachments, caps each
+plaintext to the encrypted-blob limit (64 MiB minus authentication overhead),
+and caps the full batch at 128 MiB. It validates every source before staging or
+uploading any of them, applies the first non-empty caption once, and removes all
+staged copies on success, error, timeout, or cancellation. Retryable control-
+plane failures reuse one idempotency key; `wn-agent` binds that key to the
+destination, caption, ordered attachment metadata, and plaintext hashes before
+uploading, then returns the original durable message ids on a matching retry.
+Reply-targeted media sends remain unsupported and fail before upload.
+
 ## Behavior
 
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to

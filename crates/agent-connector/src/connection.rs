@@ -453,9 +453,16 @@ impl AgentConnector {
                 group_id_hex,
                 attachments,
                 caption,
+                idempotency_key,
             } => {
-                self.send_media_response(&account_id_hex, &group_id_hex, attachments, caption)
-                    .await
+                self.send_media_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    attachments,
+                    caption,
+                    idempotency_key,
+                )
+                .await
             }
             AgentControlRequest::DownloadMedia {
                 account_id_hex,
