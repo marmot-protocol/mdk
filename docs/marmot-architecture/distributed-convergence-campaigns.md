@@ -1,7 +1,7 @@
 ---
 title: "Distributed Convergence Campaigns"
 created: 2026-08-04
-updated: 2026-08-06
+updated: 2026-08-07
 tags: [marmot, convergence, testing, containers, virtual-machines]
 ---
 
@@ -9,7 +9,10 @@ tags: [marmot, convergence, testing, containers, virtual-machines]
 
 The `convergence-campaign-runner` crate extends the canonical conformance scenario boundary across operating-system
 processes and isolated hosts. It does not define a second scenario language or convergence oracle. A campaign pins the
-exact Scenario IR bytes by SHA-256, assigns each scenario participant to a build, and selects an execution backend.
+exact selected input bytes by SHA-256, assigns each scenario participant to a build, and selects an execution backend.
+The input may be raw canonical Scenario IR or a saved generated-input envelope. Generated inputs additionally pin the
+digest of the canonical IR inside the envelope, so changing generator provenance or expectations cannot obscure which
+executable history reached the adapter.
 The child nodes continue to report through the same versioned process protocol and exact-state oracle used by the
 process adapter.
 
@@ -39,6 +42,13 @@ unless the campaign requests behavior that the container backend cannot faithful
 latency. Driver capability declarations make the reason for escalation reviewable. Provisioning belongs in the
 dedicated multi-VM harness rather than this repository.
 
+Before either backend starts, the runner resolves the selected input through the simulator-owned parser. Container
+orchestration consumes that value in memory; manifest-declared host crashes deterministically lower into process crash
+and restart steps, and the process report records a distinct digest for the post-lowering IR it compiles. VM runs write
+the selected canonical IR privately to `canonical-scenario.json`. The VM `{scenario}` placeholder names that file, so
+external drivers never need a second generated-envelope parser and cannot accidentally execute envelope metadata as
+Scenario IR.
+
 VM driver lifecycle contract v1 contains two argv-only invocations on the same driver: the campaign action and an
 idempotent cancellation/cleanup action. The runner executes cleanup after success, failure, or campaign timeout under
 its own nonzero timeout, records its receipt, and fails closed if cleanup does not complete. The external driver owns
@@ -51,7 +61,8 @@ normalized manifest so the driver targets the exact versioned ownership record r
 Every manifest contains:
 
 - a stable campaign id and schema version;
-- the canonical scenario path and digest;
+- the selected scenario/envelope path and exact source digest;
+- the resolved canonical Scenario IR digest when a generated envelope is selected;
 - the complete participant/build/image assignment;
 - the backend and its declared capabilities;
 - faults attached to named Scenario IR barriers; and
@@ -60,8 +71,9 @@ Every manifest contains:
 `validate` checks the manifest, participant-to-scenario binding, digest, fault parameters, and backend suitability.
 It also rejects a heal without a matching active partition and a duplicate partition that has not first been healed.
 `plan` emits the exact normalized command plan without running it. `run` first writes the normalized manifest with
-owner-only permissions, then writes the process report and distributed run receipt. Container cleanup is attempted on
-both success and failure and cleanup failures remain visible in the receipt.
+owner-only permissions; VM runs also write the selected `canonical-scenario.json`. It then writes the process report and
+distributed run receipt. The normalized manifest always records the selected canonical digest. Container cleanup is
+attempted on both success and failure and cleanup failures remain visible in the receipt.
 
 External container faults run immediately before the named barrier. Host crash faults are different: the runner lowers
 them into scenario-owned process crash and restart actions immediately after the named barrier, so evidence describes

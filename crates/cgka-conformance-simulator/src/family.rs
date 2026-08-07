@@ -5,11 +5,11 @@
 
 use crate::scenario::subject_setup_error;
 use crate::{
-    GeneratedScenarioMetadata, HarnessStorageMode, RetainedRelaySubject, ScenarioFailureCaptureV1,
-    ScenarioMessageSelectorV2, ScenarioOutboundSelection, ScenarioReport, ScenarioRunError,
-    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectFailureCategory,
-    SubjectOutboundOutcome, TraceExpectation, VectorFixture, fingerprint_report_failure,
-    run_scenario_report_with_outcomes_and_capture,
+    AppRuntimeHarness, GeneratedScenarioMetadata, HarnessStorageMode, RetainedRelaySubject,
+    ScenarioFailureCaptureV1, ScenarioMessageSelectorV2, ScenarioOutboundSelection, ScenarioReport,
+    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass,
+    SubjectFailureCategory, SubjectOutboundOutcome, TraceExpectation, VectorFixture,
+    fingerprint_report_failure, run_scenario_report_with_outcomes_and_capture,
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_subject,
     stable_action_id,
 };
@@ -72,11 +72,29 @@ pub enum GeneratedSubjectKind {
     #[default]
     Engine,
     RetainedRelay,
+    AppRuntime,
 }
 
 impl GeneratedSubjectKind {
     fn is_engine(&self) -> bool {
         *self == Self::Engine
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "engine" => Ok(Self::Engine),
+            "retained-relay" => Ok(Self::RetainedRelay),
+            "app-runtime" => Ok(Self::AppRuntime),
+            other => Err(format!("unsupported generated-case adapter {other}")),
+        }
+    }
+
+    pub(crate) fn artifact_label(self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::RetainedRelay => "retained-relay",
+            Self::AppRuntime => "app-runtime",
+        }
     }
 }
 
@@ -279,7 +297,14 @@ pub async fn run_generated_case_report_with_storage_mode(
         storage_mode,
     )
     .await?;
-    add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;
+    add_generated_metadata(
+        case,
+        case.subject,
+        expected_trace.as_ref(),
+        &mut report,
+        storage_mode,
+    )
+    .await;
     Ok(report)
 }
 
@@ -291,7 +316,24 @@ pub async fn run_generated_case_report_with_capture(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
-    let (mut report, failure_capture) = match case.subject {
+    run_generated_case_report_with_capture_on_subject(
+        case,
+        case.subject,
+        expected_trace,
+        storage_mode,
+        capture_sensitive_replay,
+    )
+    .await
+}
+
+pub async fn run_generated_case_report_with_capture_on_subject(
+    case: &GeneratedScenarioCase,
+    execution_subject: GeneratedSubjectKind,
+    expected_trace: Option<ScenarioTrace>,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
+    let (mut report, failure_capture) = match execution_subject {
         GeneratedSubjectKind::Engine => {
             run_scenario_report_with_outcomes_and_capture(
                 &case.scenario,
@@ -334,19 +376,63 @@ pub async fn run_generated_case_report_with_capture(
                 },
             )
         }
+        GeneratedSubjectKind::AppRuntime => {
+            if capture_sensitive_replay {
+                return Err(ScenarioRunError {
+                    step_index: None,
+                    kind: "sensitive_replay_capture_unsupported".into(),
+                    category: SubjectFailureCategory::Environment,
+                    message: "app-runtime generated cases cannot capture an engine checkpoint"
+                        .into(),
+                });
+            }
+            let mut subject = AppRuntimeHarness::new(&case.scenario.clients)
+                .await
+                .map_err(subject_setup_error)?;
+            let result = run_scenario_report_with_subject(
+                &case.scenario,
+                expected_trace.clone(),
+                case.expected_outcomes.clone(),
+                &mut subject,
+            )
+            .await;
+            subject.shutdown().await;
+            (
+                result?,
+                ScenarioFailureCaptureV1 {
+                    transport: Default::default(),
+                    byte_replay: None,
+                },
+            )
+        }
     };
-    add_generated_metadata(case, expected_trace.as_ref(), &mut report, storage_mode).await;
+    add_generated_metadata(
+        case,
+        execution_subject,
+        expected_trace.as_ref(),
+        &mut report,
+        storage_mode,
+    )
+    .await;
     Ok((report, failure_capture))
 }
 
 async fn add_generated_metadata(
     case: &GeneratedScenarioCase,
+    execution_subject: GeneratedSubjectKind,
     expected_trace: Option<&ScenarioTrace>,
     report: &mut ScenarioReport,
     storage_mode: HarnessStorageMode,
 ) {
     let minimized_case = if fingerprint_report_failure(report).is_ok() {
-        minimize_failing_case(case, expected_trace, report, storage_mode).await
+        minimize_failing_case(
+            case,
+            execution_subject,
+            expected_trace,
+            report,
+            storage_mode,
+        )
+        .await
     } else {
         None
     };
@@ -361,6 +447,7 @@ async fn add_generated_metadata(
 
 async fn minimize_failing_case(
     case: &GeneratedScenarioCase,
+    execution_subject: GeneratedSubjectKind,
     expected_trace: Option<&ScenarioTrace>,
     failing_report: &ScenarioReport,
     storage_mode: HarnessStorageMode,
@@ -379,7 +466,7 @@ async fn minimize_failing_case(
                 expected_outcomes,
                 &target_identity,
                 storage_mode,
-                case.subject,
+                execution_subject,
             )
             .await
         }
@@ -576,6 +663,20 @@ async fn run_generated_scenario(
                 &mut retained,
             )
             .await
+        }
+        GeneratedSubjectKind::AppRuntime => {
+            let mut app = AppRuntimeHarness::new(&scenario.clients)
+                .await
+                .map_err(subject_setup_error)?;
+            let result = run_scenario_report_with_subject(
+                scenario,
+                expected_trace,
+                expected_outcomes,
+                &mut app,
+            )
+            .await;
+            app.shutdown().await;
+            result
         }
     }
 }

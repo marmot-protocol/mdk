@@ -109,6 +109,7 @@ async fn real_container_nodes_survive_network_shaping_and_reach_exact_state() {
         scenario: ScenarioArtifactV1 {
             path: scenario_path,
             sha256: hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+            canonical_ir_sha256: None,
         },
         participants: ["alice", "bob"]
             .into_iter()

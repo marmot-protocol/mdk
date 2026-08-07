@@ -405,6 +405,8 @@ pub struct ScenarioReportMetadata {
     pub subject: Option<SubjectDescriptor>,
     pub generated: Option<GeneratedScenarioMetadata>,
     pub fixture: Option<VectorFixtureMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_provenance: Option<crate::ScenarioInputProvenanceV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1380,6 +1382,7 @@ async fn run_scenario_report_inner(
             subject: Some(descriptor),
             generated: None,
             fixture,
+            input_provenance: None,
         },
         scenario: spec.clone(),
         resolved_topology: compiled.topology.clone(),

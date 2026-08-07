@@ -226,17 +226,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             scenario,
             build_id,
         } => {
-            use sha2::Digest;
-
             let node_capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
                 serde_json::from_slice(&std::fs::read(&capsule)?)?;
             let scenario_bytes = std::fs::read(scenario)?;
-            let scenario = serde_json::from_slice(&scenario_bytes)?;
+            let scenario =
+                cgka_conformance_simulator::resolve_scenario_input_bytes(&scenario_bytes)?;
+            let scenario_digest = node_capsule_scenario_digest(&scenario).to_owned();
             let observation = convergence_campaign_runner::observation_from_node_capsule(
                 &node_capsule,
                 capsule,
-                scenario,
-                &hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+                scenario.scenario,
+                &scenario_digest,
                 BTreeMap::from([("indexed_build".into(), build_id)]),
             );
             let fingerprint = observation.fingerprint.clone();
@@ -282,4 +282,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn node_capsule_scenario_digest(
+    input: &cgka_conformance_simulator::ResolvedScenarioInputV1,
+) -> &str {
+    &input.provenance.source_sha256
+}
+
+#[cfg(test)]
+mod tests {
+    use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep, resolve_scenario_input_bytes};
+    use sha2::Digest;
+
+    use super::node_capsule_scenario_digest;
+
+    #[test]
+    fn node_capsule_index_preserves_pretty_printed_raw_ir_fingerprint_identity() {
+        let scenario = ScenarioSpec {
+            name: "pretty-raw-index".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::DeliverAll],
+        };
+        let bytes = serde_json::to_vec_pretty(&scenario).unwrap();
+        let input = resolve_scenario_input_bytes(&bytes).unwrap();
+        let source_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+
+        assert_eq!(node_capsule_scenario_digest(&input), source_sha256);
+        assert_ne!(
+            node_capsule_scenario_digest(&input),
+            input.provenance.canonical_ir_sha256
+        );
+    }
 }

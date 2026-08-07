@@ -1,10 +1,15 @@
 use std::collections::BTreeSet;
 
+use cgka_conformance_simulator::{
+    GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind, ScenarioInputFormatV1,
+    ScenarioSpec, ScenarioStep,
+};
 use convergence_campaign_runner::{
     ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1, DistributedFaultV1,
     DistributedParticipantV1, FaultPeerV1, OciRuntimeV1, ScenarioArtifactV1, ScheduledFaultV1,
     VirtualMachineBackendV1, VirtualMachineCapabilityV1, build_execution_plan,
-    container_node_launch, load_manifest, verify_manifest_inputs,
+    container_node_launch, load_manifest, run_manifest, validate_scenario_bytes,
+    verify_manifest_inputs,
 };
 use sha2::Digest;
 
@@ -20,6 +25,7 @@ fn container_manifest() -> (tempfile::TempDir, DistributedCampaignManifestV1) {
         scenario: ScenarioArtifactV1 {
             path: scenario,
             sha256,
+            canonical_ir_sha256: None,
         },
         participants: vec![
             DistributedParticipantV1 {
@@ -318,6 +324,118 @@ fn scenario_digest_accepts_uppercase_hex() {
 }
 
 #[test]
+fn distributed_manifest_selects_a_generated_input_and_pins_its_canonical_ir() {
+    let (_root, mut manifest) = container_manifest();
+    manifest.faults.clear();
+    let scenario = ScenarioSpec {
+        name: "saved-distributed-input".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: Vec::new(),
+    };
+    let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
+        family_name: "saved-distributed/v1".into(),
+        generator_version: "7".into(),
+        seed: 41,
+        case_index: 9,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: scenario.clone(),
+        expected_outcomes: Vec::new(),
+    });
+    let bytes = serde_json::to_vec_pretty(&input).unwrap();
+    fs_private::write_private(&manifest.scenario.path, &bytes).unwrap();
+    manifest.scenario.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    let resolved = cgka_conformance_simulator::resolve_scenario_input_bytes(&bytes).unwrap();
+    manifest.scenario.canonical_ir_sha256 = Some(resolved.provenance.canonical_ir_sha256.clone());
+
+    let selected = validate_scenario_bytes(&manifest, &bytes).unwrap();
+    assert_eq!(selected.scenario, scenario);
+    assert_eq!(
+        selected.provenance.format,
+        ScenarioInputFormatV1::GeneratedScenarioInputV1
+    );
+    assert_eq!(
+        selected.provenance.generated.unwrap().family_name,
+        "saved-distributed/v1"
+    );
+
+    manifest.scenario.canonical_ir_sha256 = None;
+    assert_eq!(
+        validate_scenario_bytes(&manifest, &bytes).unwrap_err().code,
+        "canonical_scenario_ir_digest_required"
+    );
+    manifest.scenario.canonical_ir_sha256 = Some("ff".repeat(32));
+    assert_eq!(
+        validate_scenario_bytes(&manifest, &bytes).unwrap_err().code,
+        "canonical_scenario_ir_digest_mismatch"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn vm_run_materializes_the_selected_generated_input_as_canonical_ir() {
+    let (_root, mut manifest) = container_manifest();
+    let scenario = ScenarioSpec {
+        name: "saved-vm-input".into(),
+        spec_version: "2".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        topology: Default::default(),
+        steps: vec![ScenarioStep::Barrier {
+            name: "slow-disk".into(),
+        }],
+    };
+    let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
+        family_name: "saved-vm/v1".into(),
+        generator_version: "3".into(),
+        seed: 91,
+        case_index: 4,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: scenario.clone(),
+        expected_outcomes: Vec::new(),
+    });
+    let bytes = serde_json::to_vec_pretty(&input).unwrap();
+    fs_private::write_private(&manifest.scenario.path, &bytes).unwrap();
+    let resolved = cgka_conformance_simulator::resolve_scenario_input_bytes(&bytes).unwrap();
+    manifest.scenario.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    manifest.scenario.canonical_ir_sha256 = Some(resolved.provenance.canonical_ir_sha256.clone());
+    for participant in &mut manifest.participants {
+        participant.container_image = None;
+    }
+    manifest.faults = vec![ScheduledFaultV1 {
+        at_barrier: "slow-disk".into(),
+        action: DistributedFaultV1::SlowBlockDevice {
+            participant: "alice".into(),
+            latency_ms: 10,
+        },
+    }];
+    manifest.backend = DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+        driver_contract_version: "1".into(),
+        driver: "test".into(),
+        driver_args: vec!["-f".into(), "{scenario}".into()],
+        cleanup_args: vec!["-f".into(), "{manifest}".into()],
+        timeout_seconds: 5,
+        cleanup_timeout_seconds: 5,
+        capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
+    });
+
+    let receipt = run_manifest(&manifest).await.unwrap();
+    assert!(receipt.completed, "{receipt:#?}");
+    let canonical_path = manifest.output_dir.join("canonical-scenario.json");
+    let materialized: ScenarioSpec =
+        serde_json::from_slice(&std::fs::read(canonical_path).unwrap()).unwrap();
+    assert_eq!(materialized, scenario);
+    let normalized: DistributedCampaignManifestV1 = serde_json::from_slice(
+        &std::fs::read(manifest.output_dir.join("normalized-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        normalized.scenario.canonical_ir_sha256,
+        Some(resolved.provenance.canonical_ir_sha256)
+    );
+}
+
+#[test]
 fn uppercase_yaml_extension_uses_the_yaml_parser() {
     let (root, manifest) = container_manifest();
     let path = root.path().join("campaign.YAML");
@@ -481,7 +599,7 @@ fn vm_plan_rejects_non_utf8_argv_paths() {
         cleanup_timeout_seconds: 300,
         capabilities: BTreeSet::from([VirtualMachineCapabilityV1::BlockDeviceLatency]),
     });
-    manifest.scenario.path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+    manifest.output_dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
     let error = build_execution_plan(&manifest).unwrap_err();
     assert_eq!(error.code, "non_utf8_path");
 }
@@ -594,6 +712,14 @@ fn slow_block_devices_require_a_capable_vm_backend() {
     let plan = build_execution_plan(&manifest).unwrap();
     assert_eq!(plan.backend, "virtual_machine");
     assert!(plan.vm_driver.as_ref().unwrap().args.contains(&"2".into()));
+    assert!(
+        plan.vm_driver
+            .as_ref()
+            .unwrap()
+            .args
+            .iter()
+            .any(|argument| { argument.ends_with("canonical-scenario.json") })
+    );
     assert_eq!(plan.cleanup.len(), 1);
     assert_eq!(plan.cleanup[0].purpose, "cleanup_external_vm_campaign");
     assert!(
