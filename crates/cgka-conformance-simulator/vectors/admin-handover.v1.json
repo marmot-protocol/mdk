@@ -321,6 +321,24 @@
       ]
     },
     {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "handover-carol",
+      "description": ""
+    },
+    {
       "type": "clients_exactly_equivalent",
       "clients": [
         "alice",
