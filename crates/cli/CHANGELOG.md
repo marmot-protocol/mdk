@@ -113,8 +113,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
   providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
-  corruption fix. The pinned Rust toolchain is now 1.95.0, the minimum release
-  that supports this libsqlite3-sys build.
+  corruption fix. Rust 1.95.0 is the minimum release that supports this
+  libsqlite3-sys build; the pinned toolchain moved on to 1.97.1 below.
+
+- The pinned Rust toolchain is now 1.97.1, and the convergence-campaign
+  builder image is digest-pinned to the matching `rust:1.97.1-bookworm`.
+  Rust 1.97's new `unneeded_wildcard_pattern` clippy lint required removing
+  two redundant field bindings in the campaign runner's fault validation.
+  ([#1305](https://github.com/marmot-protocol/mdk/pull/1305))
 
 ## [0.9.10] - 2026-07-29
 

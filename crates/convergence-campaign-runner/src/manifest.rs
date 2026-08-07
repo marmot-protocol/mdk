@@ -464,13 +464,8 @@ impl DistributedFaultV1 {
                 ))
             }
             Self::FillDisk { bytes: 0, .. }
+            | Self::DatabaseContention { workers: 0, .. }
             | Self::DatabaseContention {
-                workers: 0,
-                bytes_per_worker: _,
-                ..
-            }
-            | Self::DatabaseContention {
-                workers: _,
                 bytes_per_worker: 0,
                 ..
             }
