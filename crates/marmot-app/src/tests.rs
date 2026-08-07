@@ -43,9 +43,10 @@ struct ScriptedPushRelayClient {
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
+    block_publish_count: std::sync::atomic::AtomicUsize,
+    blocked_publish_count: std::sync::atomic::AtomicUsize,
     block_account_subscribe_after_next_publish: std::sync::Mutex<Option<Vec<u8>>>,
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
-    account_subscribe_blocked: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -104,12 +105,7 @@ impl ScriptedPushRelayClient {
     }
 
     fn release_subscribe(&self) {
-        self.subscribe_release.notify_one();
-    }
-
-    fn account_subscribe_is_blocked(&self) -> bool {
-        self.account_subscribe_blocked
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.subscribe_release.notify_waiters();
     }
 
     fn zero_ack_next_publish(&self) {
@@ -121,8 +117,23 @@ impl ScriptedPushRelayClient {
         self.publish_started.notified().await;
     }
 
+    fn block_next_publishes(&self, count: usize) {
+        self.block_publish_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_publishes(&self, count: usize) {
+        while self
+            .blocked_publish_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < count
+        {
+            self.publish_started.notified().await;
+        }
+    }
+
     fn release_publish(&self) {
-        self.publish_release.notify_one();
+        self.publish_release.notify_waiters();
     }
 }
 
@@ -141,11 +152,9 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             ));
         }
         let block_for_account = {
-            let mut account_id = self.block_account_subscribe.lock().unwrap();
-            if account_id.as_deref() == Some(subscription.account_id().as_slice()) {
-                account_id.take();
-                self.account_subscribe_blocked
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
+            if blocked_account.as_deref() == Some(subscription.account_id().as_slice()) {
+                blocked_account.take();
                 true
             } else {
                 false
@@ -190,10 +199,21 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         event: &NostrTransportEvent,
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
-        if self
-            .block_next_publish
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        let block_counted_publish = self
+            .block_publish_count
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if block_counted_publish
+            || self
+                .block_next_publish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            self.blocked_publish_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
             self.publish_release.notified().await;
         }
@@ -358,6 +378,14 @@ fn invite_members_keeps_same_account_projection_reads_off_detached_catch_up() {
     run_composed_app_runtime_test(
         "invite-members-detaches-post-mutation-catch-up",
         invite_members_detaches_post_mutation_catch_up_body,
+    );
+}
+
+#[test]
+fn concurrent_invites_coalesce_catch_up_away_from_both_inviting_accounts() {
+    run_composed_app_runtime_test(
+        "concurrent-invites-coalesce-post-mutation-catch-up",
+        concurrent_invites_coalesce_post_mutation_catch_up_body,
     );
 }
 
@@ -568,7 +596,7 @@ async fn account_local_ready_before_subscribe_body() {
 async fn invite_members_detaches_post_mutation_catch_up_body() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let alice = home.create_account("alice").unwrap();
+    home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -581,7 +609,7 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .await
         .unwrap();
 
-    relay.block_account_subscribe_after_next_publish(hex::decode(&alice.account_id_hex).unwrap());
+    relay.block_account_subscribe_after_next_publish(hex::decode(&bob.account_id_hex).unwrap());
     let inviting_runtime = runtime.clone();
     let invite_group_id = group_id.clone();
     let bob_account_id = bob.account_id_hex.clone();
@@ -594,29 +622,17 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
             )
             .await
     });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("non-excluded account catch-up should remain blocked after publication");
     tokio::time::timeout(std::time::Duration::from_millis(250), invite)
         .await
         .expect("confirmed invite must return before read-side catch-up finishes")
         .expect("invite task should not panic")
         .expect("invite should succeed");
-
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let catch_up_finished = runtime
-                .shared_services()
-                .app_performance_telemetry()
-                .snapshot()
-                .group_invite_post_mutation_catch_up
-                .attempts
-                == 1;
-            if relay.account_subscribe_is_blocked() || catch_up_finished {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached catch-up should either skip alice or block on her subscription");
 
     let (members, mls_state) = tokio::time::timeout(std::time::Duration::from_millis(250), async {
         let members = runtime.group_members("alice", &group_id).await?;
@@ -635,8 +651,8 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .snapshot();
     assert_eq!(before_release.group_invite_members.successes, 1);
     assert_eq!(
-        before_release.group_invite_post_mutation_catch_up.successes, 1,
-        "other-account catch-up should finish without using alice's blocked subscription"
+        before_release.group_invite_post_mutation_catch_up.successes, 0,
+        "non-excluded account catch-up must remain unfinished while its subscription is blocked"
     );
 
     relay.release_subscribe();
@@ -657,6 +673,123 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     })
     .await
     .expect("detached post-mutation catch-up should finish after the relay unblocks");
+    runtime.shutdown().await;
+}
+
+async fn concurrent_invites_coalesce_post_mutation_catch_up_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let alice_group = runtime
+        .create_group("alice", "alice invite", &[], None)
+        .await
+        .unwrap();
+    let bob_group = runtime
+        .create_group("bob", "bob invite", &[], None)
+        .await
+        .unwrap();
+    // Hold each invite at its first publication so both accounts enter one
+    // coordinator cohort before either detached catch-up can start.
+    relay.block_next_publishes(2);
+    let alice_runtime = runtime.clone();
+    let alice_group_for_invite = alice_group.clone();
+    let bob_account_id = bob.account_id_hex.clone();
+    let alice_invite = tokio::spawn(async move {
+        alice_runtime
+            .invite_members(
+                "alice",
+                &alice_group_for_invite,
+                std::slice::from_ref(&bob_account_id),
+            )
+            .await
+    });
+    let bob_runtime = runtime.clone();
+    let bob_group_for_invite = bob_group.clone();
+    let alice_account_id = alice.account_id_hex.clone();
+    let bob_invite = tokio::spawn(async move {
+        bob_runtime
+            .invite_members(
+                "bob",
+                &bob_group_for_invite,
+                std::slice::from_ref(&alice_account_id),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publishes(2),
+    )
+    .await
+    .expect("both concurrent invites should reach publication");
+    relay.release_publish();
+    let (alice_result, bob_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(alice_invite, bob_invite)
+        })
+        .await
+        .expect("both confirmed invites should return while detached catch-up is coordinated");
+    alice_result
+        .expect("alice invite task should not panic")
+        .expect("alice invite should succeed");
+    bob_result
+        .expect("bob invite task should not panic")
+        .expect("bob invite should succeed");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let catch_up_finished = runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .group_invite_post_mutation_catch_up
+                .successes
+                == 1;
+            if catch_up_finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coalesced catch-up should finish or expose an inviting-account stall");
+
+    let reads = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        let alice_members = runtime.group_members("alice", &alice_group).await?;
+        let alice_state = runtime.group_mls_state("alice", &alice_group).await?;
+        let bob_members = runtime.group_members("bob", &bob_group).await?;
+        let bob_state = runtime.group_mls_state("bob", &bob_group).await?;
+        Ok::<_, AppError>((alice_members, alice_state, bob_members, bob_state))
+    })
+    .await;
+
+    let (alice_members, alice_state, bob_members, bob_state) = reads
+        .expect("same-account reads must not queue behind a concurrent invite catch-up")
+        .expect("same-account reads should succeed");
+    assert_eq!(alice_members.len(), 2);
+    assert_eq!(alice_state.member_count, 2);
+    assert_eq!(bob_members.len(), 2);
+    assert_eq!(bob_state.member_count, 2);
+    // Give a second, incorrectly detached catch-up enough scheduler time to
+    // report. The publication barrier above makes both invites overlap, so the
+    // coordinator must emit exactly one cohort catch-up.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .group_invite_post_mutation_catch_up
+            .successes,
+        1,
+        "overlapping invites should coalesce into one successful detached catch-up"
+    );
     runtime.shutdown().await;
 }
 
