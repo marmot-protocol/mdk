@@ -716,10 +716,11 @@ impl AppClient {
 
     /// Build a group's member records against a caller-provided account-profile
     /// map, avoiding a fresh `profiles_by_id` load per group. `members` loads the
-    /// map for a single read; [`AppClient::group_read_snapshot`] loads it once
-    /// and reuses it across every group so capturing the snapshot stays a single
-    /// profile read plus in-memory engine reads (it runs on the worker readiness
-    /// path).
+    /// map for a single read;
+    /// [`AppClient::group_read_snapshot_with_stage_telemetry`] loads it once
+    /// and reuses it across every group so capturing the snapshot stays a
+    /// single profile read plus in-memory engine reads (it runs on the worker
+    /// readiness path).
     fn members_with_profiles(
         &self,
         group_id: &GroupId,
@@ -835,12 +836,36 @@ impl AppClient {
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
     /// `account: None` / `local: false` during the catch-up window). The worker
-    /// treats that error as a failed local-readiness attempt.
-    pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
+    /// treats that error as a failed local-readiness attempt (fail-closed
+    /// through the ready/reconcile path).
+    ///
+    /// The per-stage startup telemetry records the shared profile load as
+    /// `AccountProfileLoad` (the caller wraps the whole capture as
+    /// `AccountGroupReadSnapshot`, mdk#1161).
+    pub(crate) fn group_read_snapshot_with_stage_telemetry(
+        &self,
+        telemetry: &crate::app_telemetry::AppPerformanceTelemetry,
+    ) -> Result<GroupReadSnapshot, AppError> {
+        self.group_read_snapshot_inner(Some(telemetry))
+    }
+
+    fn group_read_snapshot_inner(
+        &self,
+        telemetry: Option<&crate::app_telemetry::AppPerformanceTelemetry>,
+    ) -> Result<GroupReadSnapshot, AppError> {
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single
         // storage read to the worker readiness path regardless of group count.
-        let profiles = self.app.profiles_by_id()?;
+        let profile_load_started = Instant::now();
+        let profiles = self.app.profiles_by_id();
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                crate::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
+                profile_load_started.elapsed(),
+                profiles.is_ok(),
+            );
+        }
+        let profiles = profiles?;
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         let mut skipped_malformed_group_records = 0usize;

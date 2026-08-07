@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-06-23
+updated: 2026-08-07
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -192,7 +192,11 @@ Collected operations:
 | `app_start` | `MarmotAppRuntime::start()`, from method entry through directory-storage warmup, telemetry config construction, locally ready account reconciliation, and running-state mark. | Relay connection, subscription registration, directory sync, and catch-up continue asynchronously after `start()` returns. |
 | `directory_subscription_sync` | One directory worker `request_rebuild_and_wait()` pass. | Initial startup schedules this pass asynchronously, so slow directory relays do not hold the splash screen. |
 | `account_reconcile` | `AccountManager::reconcile()`, including local-signing account enumeration, stale-worker stop, pending-worker spawn, and ready wait. | Recorded every time reconcile runs, including implicit reconcile before catch-up. |
-| `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | Covers SQLCipher/session hydration, local engine-group reconciliation, local projection backfill, and read-snapshot capture. It does not include relay work. |
+| `account_open` | One sample per newly spawned account worker, from worker spawn until the ready signal. | Covers SQLCipher/session hydration, local engine-group reconciliation, local projection backfill, and read-snapshot capture; the mdk#1161 stage metrics below attribute those contributors separately. It does not include relay work. |
+| `account_session_open` | `AccountDeviceSession::open` inside the worker's account open: SQLCipher storage open, engine construction (including key-package retirement), and stored-group hydration. | Stage attribution for `account_open`; recorded from `SessionOpenTimings` after a successful open, so it has no failure samples. |
+| `account_group_hydration` | The stored-group enumeration/hydration pass inside `AccountDeviceSession::open`. | Subset of `account_session_open`; the stage that scales with stored group state (mdk#1161). |
+| `account_profile_load` | The one shared account-profile load at the start of the startup group-read-snapshot capture. | Single storage read reused across every group in the snapshot. |
+| `account_group_read_snapshot` | The full startup `GroupReadSnapshot` capture after the ready signal. | Scales with groups × members; snapshot answers worker read commands during initial catch-up. |
 | `account_transport_activation` | Initial account signer installation and inbox transport activation after local readiness. | Runs asynchronously after the worker ready signal; includes no caller-supplied relay label. |
 | `account_subscription_registration` | Initial registration of the hydrated account's group subscriptions. | Runs after transport activation and before relay catch-up; a slow registration cannot delay local readiness. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
@@ -379,6 +383,22 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_open_attempts` | none | Counter | `AppPerformanceSnapshot.account_open.attempts` |
 | `app_account_open_successes` | none | Counter | `AppPerformanceSnapshot.account_open.successes` |
 | `app_account_open_failures` | none | Counter | `AppPerformanceSnapshot.account_open.failures` |
+| `app_account_session_open_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_session_open.duration_ms` |
+| `app_account_session_open_attempts` | none | Counter | `AppPerformanceSnapshot.account_session_open.attempts` |
+| `app_account_session_open_successes` | none | Counter | `AppPerformanceSnapshot.account_session_open.successes` |
+| `app_account_session_open_failures` | none | Counter | `AppPerformanceSnapshot.account_session_open.failures` |
+| `app_account_group_hydration_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_group_hydration.duration_ms` |
+| `app_account_group_hydration_attempts` | none | Counter | `AppPerformanceSnapshot.account_group_hydration.attempts` |
+| `app_account_group_hydration_successes` | none | Counter | `AppPerformanceSnapshot.account_group_hydration.successes` |
+| `app_account_group_hydration_failures` | none | Counter | `AppPerformanceSnapshot.account_group_hydration.failures` |
+| `app_account_profile_load_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_profile_load.duration_ms` |
+| `app_account_profile_load_attempts` | none | Counter | `AppPerformanceSnapshot.account_profile_load.attempts` |
+| `app_account_profile_load_successes` | none | Counter | `AppPerformanceSnapshot.account_profile_load.successes` |
+| `app_account_profile_load_failures` | none | Counter | `AppPerformanceSnapshot.account_profile_load.failures` |
+| `app_account_group_read_snapshot_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_group_read_snapshot.duration_ms` |
+| `app_account_group_read_snapshot_attempts` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.attempts` |
+| `app_account_group_read_snapshot_successes` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.successes` |
+| `app_account_group_read_snapshot_failures` | none | Counter | `AppPerformanceSnapshot.account_group_read_snapshot.failures` |
 | `app_account_transport_activation_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_transport_activation.duration_ms` |
 | `app_account_transport_activation_attempts` | none | Counter | `AppPerformanceSnapshot.account_transport_activation.attempts` |
 | `app_account_transport_activation_successes` | none | Counter | `AppPerformanceSnapshot.account_transport_activation.successes` |

@@ -452,36 +452,64 @@ async fn run_app_runtime_account_worker(
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
     // The session is hydrated. Capture a read snapshot and signal
-    // command-readiness *now*, before the initial relay catch-up. "Ready" means
-    // "hydrated + serving commands", not "caught up": the conversation's
-    // group-detail reads (`Members` / `GroupMlsState` / `QuarantinedGroups`)
-    // route through this worker, and blocking them on the catch-up made the
-    // first conversation opened after a foreground resume take seconds. The
-    // catch-up still runs (below) and its results flow to subscribers via the
-    // normal event mechanism; it is only removed from the readiness/blocking
-    // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
-    // the ready-wait) now measures local hydration and snapshot readiness;
-    // transport activation, subscription registration, and catch-up have
-    // separate asynchronous measurements below.
+    // command-readiness *now*, before the initial relay catch-up. "Ready"
+    // means "hydrated + serving commands", not "caught up": the
+    // conversation's group-detail reads (`Members` / `GroupMlsState` /
+    // `QuarantinedGroups`) route through this worker, and blocking them on
+    // the catch-up made the first conversation opened after a foreground
+    // resume take seconds. The catch-up still runs (below) and its results
+    // flow to subscribers via the normal event mechanism; it is only removed
+    // from the readiness/blocking path. See `GroupReadSnapshot`.
+    // `AccountOpen` (recorded by `reconcile` as the ready-wait) measures
+    // local hydration and snapshot readiness; the mdk#1161 stage telemetry
+    // attributes it (`AccountSessionOpen` / `AccountGroupHydration` for the
+    // open the worker just awaited, `AccountProfileLoad` /
+    // `AccountGroupReadSnapshot` for the capture below).
     //
-    // Snapshot capture is part of local readiness: its only failure is the
-    // shared profile load, and acknowledging readiness without it would queue
-    // supposedly-local reads behind relay catch-up. Surface the error and fail
-    // this worker start instead of weakening the readiness contract.
-    let read_snapshot = match client.group_read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let message = account_error_message("runtime startup snapshot capture failed", &err);
-            publish_app_runtime_account_error(
-                &events,
-                &account_id_hex,
-                &account_label,
-                message.clone(),
-            );
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(err));
+    // Snapshot capture is part of local readiness and stays fail-closed: its
+    // only failure is the shared profile load, and acknowledging readiness
+    // without it would leave `start()` successful with a dead worker — the
+    // failure must surface through the ready/reconcile path, not only the
+    // event stream.
+    {
+        let open_timings = client.runtime.session().open_timings();
+        let telemetry = shared.app_performance_telemetry();
+        telemetry.record(
+            AppPerformanceOperation::AccountSessionOpen,
+            open_timings.total,
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::AccountGroupHydration,
+            open_timings.group_hydration,
+            true,
+        );
+    }
+    let snapshot_started = Instant::now();
+    let read_snapshot = {
+        let capture =
+            client.group_read_snapshot_with_stage_telemetry(&shared.app_performance_telemetry());
+        shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountGroupReadSnapshot,
+            snapshot_started.elapsed(),
+            capture.is_ok(),
+        );
+        match capture {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let message =
+                    account_error_message("runtime startup snapshot capture failed", &err);
+                publish_app_runtime_account_error(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    message,
+                );
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(err));
+                }
+                return;
             }
-            return;
         }
     };
     if let Some(ready) = ready.take() {
