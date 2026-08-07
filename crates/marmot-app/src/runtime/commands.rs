@@ -370,21 +370,24 @@ impl AccountManager {
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
 
-            let catch_up_started_at = Instant::now();
-            let catch_up = self.catch_up_accounts().await;
-            self.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
-                catch_up_started_at.elapsed(),
-                catch_up.is_ok(),
-            );
-            if let Err(error) = catch_up {
-                tracing::warn!(
-                    target: "marmot_app::runtime",
-                    method = "invite_members",
-                    error_kind = error.privacy_safe_kind(),
-                    "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+            let post_mutation = self.clone();
+            tokio::spawn(async move {
+                let catch_up_started_at = Instant::now();
+                let catch_up = post_mutation.catch_up_accounts().await;
+                post_mutation.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::GroupInvitePostMutationCatchUp,
+                    catch_up_started_at.elapsed(),
+                    catch_up.is_ok(),
                 );
-            }
+                if let Err(error) = catch_up {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "invite_members",
+                        error_kind = error.privacy_safe_kind(),
+                        "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+                    );
+                }
+            });
 
             self.schedule_audit_log_tracker_update("invite_members");
             Ok(summary)

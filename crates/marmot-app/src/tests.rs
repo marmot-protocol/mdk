@@ -43,6 +43,7 @@ struct ScriptedPushRelayClient {
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
+    block_subscribe_after_next_publish: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -67,6 +68,11 @@ impl ScriptedPushRelayClient {
 
     fn block_next_publish(&self) {
         self.block_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn block_subscribe_after_next_publish(&self) {
+        self.block_subscribe_after_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -184,6 +190,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
+            if self
+                .block_subscribe_after_next_publish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.block_next_subscribe();
+            }
             Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
@@ -315,6 +327,14 @@ fn account_reconcile_returns_local_readiness_before_relay_subscription_registrat
     run_composed_app_runtime_test(
         "account-local-ready-before-subscribe",
         account_local_ready_before_subscribe_body,
+    );
+}
+
+#[test]
+fn invite_members_returns_before_post_mutation_catch_up_finishes() {
+    run_composed_app_runtime_test(
+        "invite-members-detaches-post-mutation-catch-up",
+        invite_members_detaches_post_mutation_catch_up_body,
     );
 }
 
@@ -519,6 +539,77 @@ async fn account_local_ready_before_subscribe_body() {
         .snapshot();
     assert_eq!(telemetry.account_transport_activation.successes, 1);
     assert_eq!(telemetry.account_subscription_registration.successes, 1);
+    runtime.shutdown().await;
+}
+
+async fn invite_members_detaches_post_mutation_catch_up_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "invite latency", &[], None)
+        .await
+        .unwrap();
+
+    relay.block_subscribe_after_next_publish();
+    let inviting_runtime = runtime.clone();
+    let invite = tokio::spawn(async move {
+        inviting_runtime
+            .invite_members(
+                "alice",
+                &group_id,
+                std::slice::from_ref(&bob.account_id_hex),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("post-mutation catch-up should reach the blocked relay subscription");
+
+    tokio::time::timeout(std::time::Duration::from_millis(250), invite)
+        .await
+        .expect("confirmed invite must return before read-side catch-up finishes")
+        .expect("invite task should not panic")
+        .expect("invite should succeed");
+
+    let before_release = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(before_release.group_invite_members.successes, 1);
+    assert_eq!(
+        before_release.group_invite_post_mutation_catch_up.attempts, 0,
+        "catch-up telemetry records only once the detached work finishes"
+    );
+
+    relay.release_subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .group_invite_post_mutation_catch_up
+                .successes
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached post-mutation catch-up should finish after the relay unblocks");
     runtime.shutdown().await;
 }
 
