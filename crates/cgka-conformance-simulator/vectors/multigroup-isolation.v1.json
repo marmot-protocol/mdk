@@ -6,7 +6,11 @@
   "scenario": {
     "name": "multigroup-isolation/v1",
     "spec_version": "2",
-    "clients": ["alice", "bob", "carol"],
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
     "steps": [
       {
         "type": "in_group",
@@ -15,15 +19,31 @@
           "type": "create_group",
           "creator": "alice",
           "name": "group-a",
-          "invitees": ["bob"],
+          "invitees": [
+            "bob"
+          ],
           "required_features": [],
-          "initial_admins": ["alice"],
+          "initial_admins": [
+            "alice"
+          ],
           "pending": "a-create"
         }
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "a-create", "outcome": "accepted" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["bob"] },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "a-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
       {
         "type": "in_group",
         "group": "b",
@@ -31,88 +51,187 @@
           "type": "create_group",
           "creator": "alice",
           "name": "group-b",
-          "invitees": ["carol"],
+          "invitees": [
+            "carol"
+          ],
           "required_features": [],
-          "initial_admins": ["alice"],
+          "initial_admins": [
+            "alice"
+          ],
           "pending": "b-create"
         }
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "b-create", "outcome": "accepted" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["carol"] },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "b-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol"
+        ]
+      },
       {
         "type": "in_group",
         "group": "a",
-        "action": { "type": "clear_events", "clients": ["alice", "bob"] }
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "alice",
+            "bob"
+          ]
+        }
       },
       {
         "type": "in_group",
         "group": "b",
-        "action": { "type": "clear_events", "clients": ["alice", "carol"] }
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "alice",
+            "carol"
+          ]
+        }
       },
       {
         "type": "in_group",
         "group": "a",
-        "action": { "type": "send_app_message", "sender": "alice", "payload": "multigroup:a:alice" }
+        "action": {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "multigroup:a:alice"
+        }
       },
-      { "type": "acknowledge_outbound", "client": "alice", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
       {
         "type": "in_group",
         "group": "a",
-        "action": { "type": "send_app_message", "sender": "bob", "payload": "multigroup:a:bob" }
+        "action": {
+          "type": "send_app_message",
+          "sender": "bob",
+          "payload": "multigroup:a:bob"
+        }
       },
-      { "type": "acknowledge_outbound", "client": "bob", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "outcome": "accepted"
+      },
       {
         "type": "in_group",
         "group": "b",
-        "action": { "type": "send_app_message", "sender": "alice", "payload": "multigroup:b:alice" }
+        "action": {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "multigroup:b:alice"
+        }
       },
-      { "type": "acknowledge_outbound", "client": "alice", "outcome": "accepted" },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
       {
         "type": "in_group",
         "group": "b",
-        "action": { "type": "send_app_message", "sender": "carol", "payload": "multigroup:b:carol" }
+        "action": {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "multigroup:b:carol"
+        }
       },
-      { "type": "acknowledge_outbound", "client": "carol", "outcome": "accepted" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["alice", "bob", "carol"] },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
       {
         "type": "assert",
         "assertion": {
           "mode": "exactly",
-          "predicate": { "type": "payload_count", "client": "bob", "payload": "multigroup:b:alice", "count": 0 }
+          "predicate": {
+            "type": "payload_count",
+            "client": "bob",
+            "payload": "multigroup:b:alice",
+            "count": 0
+          }
         }
       },
       {
         "type": "assert",
         "assertion": {
           "mode": "exactly",
-          "predicate": { "type": "payload_count", "client": "bob", "payload": "multigroup:b:carol", "count": 0 }
+          "predicate": {
+            "type": "payload_count",
+            "client": "bob",
+            "payload": "multigroup:b:carol",
+            "count": 0
+          }
         }
       },
       {
         "type": "assert",
         "assertion": {
           "mode": "exactly",
-          "predicate": { "type": "payload_count", "client": "carol", "payload": "multigroup:a:alice", "count": 0 }
+          "predicate": {
+            "type": "payload_count",
+            "client": "carol",
+            "payload": "multigroup:a:alice",
+            "count": 0
+          }
         }
       },
       {
         "type": "assert",
         "assertion": {
           "mode": "exactly",
-          "predicate": { "type": "payload_count", "client": "carol", "payload": "multigroup:a:bob", "count": 0 }
+          "predicate": {
+            "type": "payload_count",
+            "client": "carol",
+            "payload": "multigroup:a:bob",
+            "count": 0
+          }
         }
       },
       {
         "type": "in_group",
         "group": "a",
-        "action": { "type": "observe_exact", "clients": ["bob"] }
+        "action": {
+          "type": "observe_exact",
+          "clients": [
+            "bob"
+          ]
+        }
       },
       {
         "type": "in_group",
         "group": "b",
-        "action": { "type": "observe_exact", "clients": ["carol"] }
+        "action": {
+          "type": "observe_exact",
+          "clients": [
+            "carol"
+          ]
+        }
       }
     ]
   },
@@ -136,14 +255,18 @@
       "client": "bob",
       "epoch": 1,
       "member_count": 2,
-      "received_payloads": ["multigroup:a:alice"]
+      "received_payloads": [
+        "multigroup:a:alice"
+      ]
     },
     {
       "type": "client_state",
       "client": "carol",
       "epoch": 1,
       "member_count": 2,
-      "received_payloads": ["multigroup:b:alice"]
+      "received_payloads": [
+        "multigroup:b:alice"
+      ]
     }
   ]
 }
