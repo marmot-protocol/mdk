@@ -37,7 +37,7 @@ pub use identity::{
 pub use socket::{bind_connector_socket, bind_connector_socket_with_mode, default_socket_path};
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -55,7 +55,7 @@ pub(crate) use marmot_app::AppMessageQuery;
 
 use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
-use crate::socket::bind_connector_socket_with_owned_home;
+use crate::socket::{bind_connector_socket_with_owned_home, verify_control_socket_link};
 use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
 use crate::validation::{endpoint, validate_control_plane_config};
 
@@ -106,6 +106,9 @@ pub const MAX_CONTROL_CONNECTIONS: usize = 64;
 /// Long-lived inbound subscriptions are capped separately so one-shot sends,
 /// stream finalization, and policy operations retain connection capacity.
 pub(crate) const MAX_CONTROL_SUBSCRIPTIONS: usize = 16;
+/// Poll interval while `AgentConnector::start` runs so a removed or replaced
+/// control-socket path is detected before the accept loop begins.
+pub(crate) const CONTROL_SOCKET_LINK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) async fn with_control_operation_timeout<T, F>(
     operation: &'static str,
@@ -321,18 +324,35 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
             "DANGER: dev allow-any invite policy is enabled; authenticated welcomers bypass the allowlist"
         );
     }
-    let listener = bind_connector_socket_with_owned_home(
+    let (listener, link_identity) = bind_connector_socket_with_owned_home(
         &config.socket,
         config.socket_dir_mode,
         config.socket_mode,
         Some(&config.home),
     )?;
+    let socket_path = config.socket.clone();
     let max_connections = config.max_connections;
     let connector = AgentConnector::open(config)?;
-    connector.start().await?;
+    let link_loss = wait_control_socket_link_loss(&socket_path, link_identity);
+    tokio::pin!(link_loss);
+    // Losing the published path makes this process unreachable, so cancellation
+    // of startup is intentional: it has the same failure semantics as the
+    // supervisor terminating an orphaned process. Completed startup writes are
+    // retained and the next start rechecks them before applying missing state.
+    // Revisit this contract before adding a non-restart-safe mutation to start().
+    tokio::select! {
+        res = connector.start() => res?,
+        err = &mut link_loss => return Err(err),
+    }
     let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
-        let (mut stream, _peer_addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            err = &mut link_loss => {
+                return Err(err);
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (mut stream, _peer_addr) = match accepted {
             Ok(accepted) => accepted,
             Err(err) => {
                 let connection_error =
@@ -394,5 +414,25 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 );
             }
         });
+    }
+}
+
+async fn wait_control_socket_link_loss(
+    socket_path: &Path,
+    link_identity: fs_private::UnixSocketInode,
+) -> ConnectorError {
+    let mut ticker = tokio::time::interval(CONTROL_SOCKET_LINK_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = verify_control_socket_link(socket_path, link_identity) {
+            tracing::error!(
+                target: "agent_connector",
+                method = "serve_socket",
+                error_code = "control_socket_link_lost",
+                "control socket path no longer names the bound listener"
+            );
+            return err;
+        }
     }
 }
