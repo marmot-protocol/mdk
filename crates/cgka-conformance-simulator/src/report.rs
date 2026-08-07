@@ -6,8 +6,8 @@ use crate::{
     HarnessStorageMode, ScenarioReport, VectorFixture, coverage_matrix_entry,
     generate_adversarial_reliability_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report_with_capture, run_vector_fixture_report_with_capture,
-    write_failure_capsule,
+    generate_stateful_chat_journey_family, run_generated_case_report_with_capture,
+    run_vector_fixture_report_with_capture, write_failure_capsule,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,11 +239,20 @@ async fn run_generated_family_reports(
         "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_family(seed, cases),
         "convergence-chaos/v1" => generate_convergence_chaos_family(seed, cases),
         "adversarial-reliability/v1" => generate_adversarial_reliability_family(seed, cases),
+        "chat-journey/v1" => generate_stateful_chat_journey_family(seed, cases),
         other => return Err(format!("unsupported family {other}").into()),
     };
 
     let mut summaries = Vec::with_capacity(cases.len());
     for case in cases {
+        let input_output = out.join(format!(
+            "{}-seed-{}-case-{}-input.v1.json",
+            case.family_name.replace('/', "-"),
+            case.seed,
+            case.case_index
+        ));
+        let input_fixture = case.to_vector_fixture(env!("CARGO_PKG_VERSION"), None);
+        fs_private::write_private(&input_output, &serde_json::to_vec_pretty(&input_fixture)?)?;
         let (report, failure_capture) = run_generated_case_report_with_capture(
             &case,
             None,
@@ -590,7 +599,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|adversarial-reliability/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|adversarial-reliability/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
 }
 
 #[cfg(test)]

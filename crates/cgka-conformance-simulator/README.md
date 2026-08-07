@@ -418,6 +418,25 @@ The generated `scenario` is a normal `ScenarioSpec`, so a selected generated cas
 without inventing a separate execution path. We promote a case only when it should become a stable named contract, such
 as a regression fixture or the smallest readable example of a semantic edge.
 
+`generate_stateful_chat_journey_family(seed, cases)` adds a legality-aware product journey over the same canonical IR.
+Its symbolic state tracks membership, administrators, connectivity, epoch, group profile, and per-client application
+delivery. Adjacent case indices alternate between late-membership journeys on the engine subject and retained-history
+offline journeys whose offline participants were members from epoch 1. That split is deliberate: a late joiner querying
+full history sees valid pre-admission objects it was never entitled to decrypt, so combining both shapes would make a
+global no-pending assertion a false protocol guarantee. Every case covers application traffic and a full-profile
+update; the corpus additionally rotates invites, removals, admin changes, self-updates, restarts, and reconnect repair.
+Terminal expectations pin the modeled epoch, roster size, profile, admin set, per-client delivery, exact state, and
+active decryptability. Membership cases scope `NoPendingWork` to founding members; retained-history cases require it
+for every surviving member and also require global quiescence.
+
+Run the family directly:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --family chat-journey/v1 --seed 42 --cases 10 \
+  --out target/chat-journey-reports --storage file --strict-oracle
+```
+
 Send/leave and convergence-chaos reliability cases finish with a global transport/mailbox drain, an exact observation,
 and a per-client `NoPendingWork` expectation. Multi-client settled claims also require `ClientsExactlyEquivalent`, and
 delivery-sensitive cases assert recipient ledgers or outputs. These checks are intentionally capable of making a
@@ -440,6 +459,10 @@ the rollback and storm shapes from the seed, so distinct seeds exercise distinct
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed. These cases are ordinary
 `ScenarioSpec`s, so the same runner and report path can turn selected generated cases into fixed vectors when that makes
 the conformance contract clearer.
+
+The report runner writes each generated `*-input.v1.json` fixture with owner-only permissions before executing its
+case. A crash or panic therefore cannot erase the exact canonical input. The post-run report and promotable fixture
+candidate remain separate artifacts.
 
 ## Report artifacts
 

@@ -4,6 +4,8 @@
 //! ids. They capture the deterministic observable outcome a conforming engine
 //! should produce after running the same scripted scenario.
 
+use std::collections::BTreeSet;
+
 use crate::{
     BidirectionalDecryptabilityObservation, HarnessClient, PendingWorkObservation,
     ScenarioInputLedgerEntry, ScenarioSpec,
@@ -270,13 +272,17 @@ impl TraceExpectation {
                 }
             }
             TraceExpectation::AdminPolicy { client, admins } => {
+                let expected_admins = admins.iter().collect::<BTreeSet<_>>();
                 match observed
                     .admin_policies
                     .iter()
                     .rev()
                     .find(|policy| policy.client == *client)
                 {
-                    Some(policy) if &policy.admins == admins => {}
+                    Some(policy)
+                        if policy.admins.iter().collect::<BTreeSet<_>>() == expected_admins =>
+                    {
+                    }
                     Some(policy) => mismatches.push(ExpectationFailure {
                         kind: "admin_policy_mismatch".into(),
                         message: format!(
@@ -1460,6 +1466,28 @@ mod tests {
                 received_payloads: Some(vec!["after-fork".into()]),
                 added_members: None,
                 removed_members: None,
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn admin_policy_expectation_compares_the_semantic_set() {
+        let mut observed = trace(Vec::new());
+        observed
+            .admin_policies
+            .push(ScenarioAdminPolicyObservation {
+                client: "alice".into(),
+                admins: vec!["bob".into(), "alice".into()],
+            });
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::AdminPolicy {
+                client: "alice".into(),
+                admins: vec!["alice".into(), "bob".into()],
             }],
             &observed,
         );

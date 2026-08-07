@@ -50,6 +50,7 @@ mod scenario_authoring;
 mod scenario_faults;
 mod scenario_input_ledger;
 mod scenario_ir;
+mod stateful_generator;
 pub mod subject;
 mod topology;
 pub mod vector;
@@ -152,6 +153,10 @@ pub use scenario_ir::{
     CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_LATEST_VERSION,
     SCENARIO_IR_V2_VERSION, SCENARIO_IR_V3_ONLY_STEP_KINDS, SCENARIO_IR_V3_VERSION,
     ScenarioActionScheduleV2, compile_scenario, preflight_compiled_scenario, stable_action_id,
+};
+pub use stateful_generator::{
+    STATEFUL_CHAT_JOURNEY_FAMILY, STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION,
+    generate_stateful_chat_journey_case, generate_stateful_chat_journey_family,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,

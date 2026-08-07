@@ -63,6 +63,12 @@ the property-test registry. This file is the agent-facing model.
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
     observation passed.
 
+- **Module:** `src/stateful_generator.rs`
+  - **Role:** Legality-aware product journey generation into canonical Scenario IR v3. Tracks membership, admins,
+    connectivity, profile, epoch, and application delivery; alternates late-membership engine cases with founding-member
+    retained-history cases so pre-admission retry state is not mislabeled as a quiescence defect. Add new product actions
+    to the symbolic model and terminal oracle together.
+
 - **Module:** `src/oracle.rs`
   - **Role:** Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed
     behavior classes, weak-oracle warnings, and coverage matrix rows.
@@ -275,9 +281,9 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cgka-conformance-simulator-reports
 ```
 
-Generated-family runs write both `*-case-N.json` reports and `*-case-N-fixture.v1.json` candidates that can be promoted
-into `vectors/` after review. Oracle coverage is strict by default; use `--allow-weak-oracle` only for an explicitly
-exploratory run.
+Generated-family runs first write owner-only `*-input.v1.json` canonical fixtures, then write `*-case-N.json` reports
+and `*-case-N-fixture.v1.json` candidates that can be promoted into `vectors/` after review. Oracle coverage is strict
+by default; use `--allow-weak-oracle` only for an explicitly exploratory run.
 
 Run portable vector fixtures:
 
@@ -303,12 +309,13 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md), and
 [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) when filling a gap.
 
-- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupProfile.** Invite needs client minting
-  inside a strategy; the scripted tests cover it today. Upgrade and profile update lifecycle are covered by separate
-  generated properties, while portable v2/v3 vectors assert the intended public profile values.
+- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupProfile.** It remains the small
+  shrinkable send/leave strategy. `chat-journey/v1` now generates legal invites and profile changes as canonical IR and
+  relies on saved-input semantic reduction; upgrade lifecycle remains separate.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO /
   Reverse / SeededRandom.
-- **Generated family coverage is now convergence-focused but not exhaustive.** `send-leave/v1` records lifecycle
+- **Generated family coverage is broad but not exhaustive.** `chat-journey/v1` covers legal product-shaped membership,
+  admin, profile, application, offline, reconnect, self-update, and restart histories. `send-leave/v1` records lifecycle
   metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and
   `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch
   app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data

@@ -348,6 +348,22 @@ Generated cases are deterministic for a fixed family, seed, and case index. They
 A generated case becomes a vector only when we want it to be a stable named contract: for example, when it caught a
 regression, covers a new semantic edge, or is the smallest readable example of a behavior.
 
+### `chat-journey/v1`
+
+- Generator: `generate_stateful_chat_journey_family` (generator version `1`).
+- Setup: a four-participant legality model emits canonical IR v3 while tracking the roster, administrator set,
+  connectivity, epoch, group profile, and application deliveries.
+- Profiles: even case indices generate late-invite membership journeys on the engine subject; odd indices generate
+  retained-history offline/catch-up journeys whose participants all joined at epoch 1.
+- Pressure: every case contains application traffic and a profile update, while adjacent cases rotate invites,
+  removals, admin changes, self-updates, restarts, offline windows, and reconnect repair.
+- Expected: the modeled terminal epoch, roster size, group profile, admin set, and per-client deliveries match;
+  surviving clients have exact canonical agreement and active bidirectional decryptability. Retained-history cases
+  additionally reach global quiescence and no pending work for every survivor. Late-join cases do not falsely require
+  the invitee's valid pre-admission transport retry rows to disappear.
+- Replay: the report runner saves the exact owner-only canonical input before action zero, then writes the ordinary
+  report, fixture candidate, and any failure capsule.
+
 ### `send-leave/v1`
 
 - Generator: `generate_send_leave_family` (generator version `2`)
