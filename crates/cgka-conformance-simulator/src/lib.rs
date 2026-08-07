@@ -149,8 +149,9 @@ pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
 };
 pub use scenario_ir::{
-    CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_VERSION, ScenarioActionScheduleV2,
-    compile_scenario, preflight_compiled_scenario, stable_action_id,
+    CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_LATEST_VERSION,
+    SCENARIO_IR_V2_VERSION, SCENARIO_IR_V3_ONLY_STEP_KINDS, SCENARIO_IR_V3_VERSION,
+    ScenarioActionScheduleV2, compile_scenario, preflight_compiled_scenario, stable_action_id,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,

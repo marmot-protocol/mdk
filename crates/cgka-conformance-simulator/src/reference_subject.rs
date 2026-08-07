@@ -31,6 +31,7 @@ struct ReferenceClient {
 struct ReferenceGroupState {
     epoch: u64,
     name: String,
+    description: String,
     members: BTreeSet<String>,
     admins: BTreeSet<String>,
 }
@@ -279,6 +280,9 @@ impl ReferenceModelSubject {
             group_name: state
                 .as_ref()
                 .map_or_else(String::new, |state| state.name.clone()),
+            group_description: state
+                .as_ref()
+                .map_or_else(String::new, |state| state.description.clone()),
             canonical_state: None,
             scenario_input_ledger: Vec::new(),
             pending_work: None,
@@ -366,6 +370,7 @@ impl ConvergenceSubject for ReferenceModelSubject {
         let state = ReferenceGroupState {
             epoch: u64::from(!action.invitees.is_empty()),
             name: action.name.into(),
+            description: String::new(),
             members,
             admins: std::iter::once(action.creator.to_owned())
                 .chain(action.initial_admins.iter().cloned())
@@ -393,7 +398,12 @@ impl ConvergenceSubject for ReferenceModelSubject {
     ) -> Result<(), SubjectError> {
         let mut state = self.group_state(action.client)?;
         state.epoch = state.epoch.saturating_add(1);
-        state.name = action.name.into();
+        if let Some(name) = action.name {
+            state.name = name.into();
+        }
+        if let Some(description) = action.description {
+            state.description = description.into();
+        }
         self.stage_state_change(action.client, action.pending, state, &[]);
         Ok(())
     }
@@ -787,6 +797,7 @@ mod tests {
                         observation.epoch,
                         observation.member_count,
                         observation.group_name.clone(),
+                        observation.group_description.clone(),
                         observation.received_payloads.clone(),
                     )
                 })

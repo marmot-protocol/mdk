@@ -519,6 +519,24 @@ impl ProcessOrchestrator {
                 .await?;
                 Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
             }
+            ScenarioStep::UpdateGroupProfile {
+                client,
+                name,
+                description,
+                ..
+            } => {
+                self.select_group(client, &group).await?;
+                self.expect_ack(
+                    client,
+                    NodeCommandV1::UpdateGroupProfile {
+                        action_id: action_id.into(),
+                        name: name.clone(),
+                        description: description.clone(),
+                    },
+                )
+                .await?;
+                Ok((vec![client.clone()], ProcessActionStatusV1::Completed))
+            }
             ScenarioStep::UpdateAdminPolicy { client, admins, .. } => {
                 self.select_group(client, &group).await?;
                 let admin_accounts = self.account_ids(admins).map_err(orchestrator_failure)?;

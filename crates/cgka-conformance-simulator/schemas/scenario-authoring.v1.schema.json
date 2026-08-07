@@ -28,7 +28,7 @@
           "required": ["flow", "step"],
           "properties": {
             "flow": { "const": "action" },
-            "step": { "$ref": "scenario-ir.v2.schema.json#/$defs/step" }
+            "step": { "$ref": "scenario-ir.v3.schema.json#/$defs/step" }
           }
         },
         {

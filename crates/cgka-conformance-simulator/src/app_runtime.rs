@@ -37,6 +37,8 @@ pub struct AppRuntimeProtocolProjectionV1 {
     pub member_identities: Vec<String>,
     pub admin_identities: Vec<String>,
     pub group_name: String,
+    #[serde(default)]
+    pub group_description: String,
     pub member_count: usize,
     /// SHA-256 over the canonical JSON encoding of the preceding public facts.
     /// This is an opaque comparison value, not an MLS secret or engine dump.
@@ -469,6 +471,7 @@ impl AppRuntimeHarness {
             members,
             admins,
             group.profile.name.clone(),
+            group.profile.description.clone(),
             group.member_count.unwrap_or_default() as usize,
         );
         let messages = participant
@@ -547,6 +550,7 @@ impl AppRuntimeHarness {
                     epoch: layered.protocol.epoch,
                     member_count: layered.protocol.member_count,
                     group_name: layered.protocol.group_name,
+                    group_description: layered.protocol.group_description,
                     canonical_state: None,
                     scenario_input_ledger: Vec::<ScenarioInputLedgerEntry>::new(),
                     pending_work: None,
@@ -663,8 +667,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
             .update_group_profile(
                 &participant.account_id,
                 &group_id,
-                Some(action.name.into()),
-                None,
+                action.name.map(str::to_owned),
+                action.description.map(str::to_owned),
             )
             .await
             .map_err(app_error)?;
@@ -961,6 +965,7 @@ pub(crate) fn public_protocol_projection(
     member_identities: Vec<String>,
     admin_identities: Vec<String>,
     group_name: String,
+    group_description: String,
     member_count: usize,
 ) -> AppRuntimeProtocolProjectionV1 {
     #[derive(Serialize)]
@@ -969,6 +974,7 @@ pub(crate) fn public_protocol_projection(
         member_identities: &'a [String],
         admin_identities: &'a [String],
         group_name: &'a str,
+        group_description: &'a str,
         member_count: usize,
     }
     let encoded = serde_json::to_vec(&Commitment {
@@ -976,6 +982,7 @@ pub(crate) fn public_protocol_projection(
         member_identities: &member_identities,
         admin_identities: &admin_identities,
         group_name: &group_name,
+        group_description: &group_description,
         member_count,
     })
     .expect("public convergence commitment is serializable");
@@ -984,6 +991,7 @@ pub(crate) fn public_protocol_projection(
         member_identities,
         admin_identities,
         group_name,
+        group_description,
         member_count,
         state_commitment_sha256: hex::encode(Sha256::digest(encoded)),
     }
@@ -1151,6 +1159,7 @@ mod tests {
             vec!["alice".into()],
             vec!["alice".into()],
             "group".into(),
+            "description".into(),
             0,
         );
         assert_eq!(projection.member_count, 0);

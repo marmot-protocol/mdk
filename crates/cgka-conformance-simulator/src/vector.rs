@@ -120,6 +120,13 @@ pub enum TraceExpectation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removed_members: Option<Vec<String>>,
     },
+    /// Require the latest public profile projection to equal the requested
+    /// values, rather than merely agreeing across clients.
+    GroupProfile {
+        client: String,
+        name: String,
+        description: String,
+    },
     ClientsConverged {
         clients: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +336,30 @@ impl TraceExpectation {
                 }),
                 None => missing_client(client, self, mismatches),
             },
+            TraceExpectation::GroupProfile {
+                client,
+                name,
+                description,
+            } => match client_legacy_observation(observed, client) {
+                Some(observation)
+                    if observation.group_name == *name
+                        && observation.group_description == *description => {}
+                Some(observation) => mismatches.push(ExpectationFailure {
+                    kind: "group_profile_mismatch".into(),
+                    message: format!("client {client} did not project the expected group profile"),
+                    expected: json!({
+                        "client": client,
+                        "name": name,
+                        "description": description,
+                    }),
+                    actual: json!({
+                        "client": client,
+                        "name": observation.group_name,
+                        "description": observation.group_description,
+                    }),
+                }),
+                None => missing_client(client, self, mismatches),
+            },
             TraceExpectation::ClientsConverged {
                 clients,
                 epoch,
@@ -357,10 +388,12 @@ impl TraceExpectation {
                 let first_epoch = observations[0].epoch;
                 let first_member_count = observations[0].member_count;
                 let first_group_name = &observations[0].group_name;
+                let first_group_description = &observations[0].group_description;
                 let converged = observations.iter().all(|observation| {
                     observation.epoch == first_epoch
                         && observation.member_count == first_member_count
                         && &observation.group_name == first_group_name
+                        && &observation.group_description == first_group_description
                 });
                 let epoch_matches = epoch.is_none_or(|expected| expected == first_epoch);
                 let member_count_matches =
@@ -370,13 +403,16 @@ impl TraceExpectation {
                         kind: "clients_not_converged".into(),
                         message: format!(
                             "clients {:?} did not converge to epoch {:?}, member_count {:?} \
-                             (group names: {:?})",
+                             (group profiles: {:?})",
                             clients,
                             epoch,
                             member_count,
                             observations
                                 .iter()
-                                .map(|observation| observation.group_name.as_str())
+                                .map(|observation| (
+                                    observation.group_name.as_str(),
+                                    observation.group_description.as_str(),
+                                ))
                                 .collect::<Vec<_>>()
                         ),
                         expected: json!({
@@ -946,6 +982,9 @@ pub struct ClientObservation {
     /// that predate the field.
     #[serde(default)]
     pub group_name: String,
+    /// Branch-sensitive group description mirrored from signed group-profile state.
+    #[serde(default)]
+    pub group_description: String,
     /// Adopted canonical live-group projection. Legacy observations leave this
     /// absent; strict reliability scenarios opt in through
     /// [`observe_client_exact`].
@@ -1189,6 +1228,7 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
         epoch: client.epoch().0,
         member_count: client.members().len(),
         group_name: client.group_name(),
+        group_description: client.group_description(),
         canonical_state: None,
         scenario_input_ledger: Vec::new(),
         pending_work: None,
@@ -1339,6 +1379,7 @@ mod tests {
             epoch,
             member_count,
             group_name: String::new(),
+            group_description: String::new(),
             canonical_state: None,
             scenario_input_ledger: Vec::new(),
             pending_work: None,
@@ -1684,6 +1725,49 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn group_profile_expectation_rejects_wrong_but_shared_projection() {
+        let mut alice = observation("alice", 2, 2);
+        alice.group_name = "stale".into();
+        let mut bob = observation("bob", 2, 2);
+        bob.group_name = "stale".into();
+        let observed = trace(vec![alice, bob]);
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::GroupProfile {
+                client: "alice".into(),
+                name: "requested".into(),
+                description: "requested description".into(),
+            }],
+            &observed,
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "group_profile_mismatch");
+    }
+
+    #[test]
+    fn clients_converged_rejects_shared_name_with_different_descriptions() {
+        let mut alice = observation("alice", 2, 2);
+        alice.group_name = "same".into();
+        alice.group_description = "alice branch".into();
+        let mut bob = observation("bob", 2, 2);
+        bob.group_name = "same".into();
+        bob.group_description = "bob branch".into();
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsConverged {
+                clients: vec!["alice".into(), "bob".into()],
+                epoch: Some(2),
+                member_count: Some(2),
+            }],
+            &trace(vec![alice, bob]),
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "clients_not_converged");
     }
 
     #[test]

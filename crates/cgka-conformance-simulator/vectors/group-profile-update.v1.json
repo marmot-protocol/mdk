@@ -1,11 +1,11 @@
 {
-  "scenario_name": "group-data-update/v1",
+  "scenario_name": "group-profile-update/v1",
   "vector_version": "1",
   "conformance_version": "0.9.10",
   "seed": null,
   "scenario": {
-    "name": "group-data-update/v1",
-    "spec_version": "2",
+    "name": "group-profile-update/v1",
+    "spec_version": "3",
     "clients": [
       "alice",
       "bob"
@@ -44,15 +44,15 @@
         ]
       },
       {
-        "type": "update_group_data",
+        "type": "update_group_profile",
         "client": "alice",
-        "name": "after",
-        "pending": "rename"
+        "description": "after description",
+        "pending": "description"
       },
       {
         "type": "acknowledge_outbound",
         "client": "alice",
-        "publication": "rename",
+        "publication": "description",
         "outcome": "accepted"
       },
       {
@@ -61,11 +61,48 @@
       {
         "type": "tick",
         "clients": [
+          "alice",
           "bob"
         ]
       },
       {
-        "type": "observe",
+        "type": "update_group_profile",
+        "client": "alice",
+        "name": "after",
+        "pending": "name"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "name",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "probe_bidirectional_decryptability",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe_exact",
         "clients": [
           "alice",
           "bob"
@@ -85,34 +122,39 @@
       "type": "pending_resolution",
       "step_index": 6,
       "client": "alice",
-      "pending": "rename",
+      "pending": "description",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 10,
+      "client": "alice",
+      "pending": "name",
       "resolution": "confirmed"
     },
     {
       "type": "client_state",
       "client": "alice",
-      "epoch": 2,
-      "member_count": 2,
-      "received_payloads": []
+      "epoch": 3,
+      "member_count": 2
     },
     {
       "type": "client_state",
       "client": "bob",
-      "epoch": 2,
-      "member_count": 2,
-      "received_payloads": []
+      "epoch": 3,
+      "member_count": 2
     },
     {
       "type": "group_profile",
       "client": "alice",
       "name": "after",
-      "description": ""
+      "description": "after description"
     },
     {
       "type": "group_profile",
       "client": "bob",
       "name": "after",
-      "description": ""
+      "description": "after description"
     },
     {
       "type": "clients_converged",
@@ -120,8 +162,29 @@
         "alice",
         "bob"
       ],
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 2
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob"
+      ]
+    },
+    {
+      "type": "clients_bidirectionally_decryptable",
+      "clients": [
+        "alice",
+        "bob"
+      ]
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob"
+      ]
     }
   ]
 }

@@ -151,7 +151,7 @@ fn controlled_relay_topology() -> ScenarioTopologyV2 {
 fn cross_adapter_scenario() -> ScenarioSpec {
     ScenarioSpec {
         name: "cross-adapter-public-state".into(),
-        spec_version: "2".into(),
+        spec_version: "3".into(),
         clients: vec!["alice".into()],
         topology: Default::default(),
         steps: vec![
@@ -168,9 +168,10 @@ fn cross_adapter_scenario() -> ScenarioSpec {
             ),
             in_group(
                 "main",
-                ScenarioStep::UpdateGroupData {
+                ScenarioStep::UpdateGroupProfile {
                     client: "alice".into(),
-                    name: "equivalent result".into(),
+                    name: Some("equivalent result".into()),
+                    description: Some("equivalent description".into()),
                     pending: "rename".into(),
                 },
             ),
@@ -278,6 +279,15 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
     );
     assert_eq!(engine.group_name, app_observation.protocol.group_name);
     assert_eq!(engine.group_name, process_observation.protocol.group_name);
+    assert_eq!(
+        engine.group_description,
+        app_observation.protocol.group_description
+    );
+    assert_eq!(
+        engine.group_description,
+        process_observation.protocol.group_description
+    );
+    assert_eq!(engine.group_description, "equivalent description");
     assert_eq!(
         app_observation.protocol.state_commitment_sha256,
         process_observation.protocol.state_commitment_sha256

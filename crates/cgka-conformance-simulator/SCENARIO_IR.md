@@ -2,11 +2,12 @@
 
 The simulator has two deliberately separate inputs:
 
-- `ScenarioSpec` v2 is the canonical adapter-neutral JSON IR. It contains only a linear sequence of executable atomic
-  actions. Its schema is `schemas/scenario-ir.v2.schema.json`.
+- `ScenarioSpec` v2 and v3 are canonical adapter-neutral JSON IRs. Both contain only a linear sequence of executable
+  atomic actions. V2 remains replayable through `schemas/scenario-ir.v2.schema.json`; v3 adds the full
+  `update_group_profile` action through `schemas/scenario-ir.v3.schema.json`.
 - `ScenarioAuthoringSpec` v1 is human-oriented structure. It may be represented as JSON or YAML, but it is never passed
-  to an adapter. The repository compiler deterministically lowers it to canonical JSON first. Its schema is
-  `schemas/scenario-authoring.v1.schema.json`.
+  to an adapter. The repository compiler deterministically lowers it to canonical JSON first, emitting v2 unless an
+  expanded action requires v3. Its schema is `schemas/scenario-authoring.v1.schema.json`.
 
 The canonical document declares accounts, devices, processes, initial groups, relays, account roles, process
 binary/policy versions, and relay implementation/policy versions in `topology`. Each action-facing client label maps to
@@ -23,6 +24,14 @@ derives `declared_virtual_time_ms` as the sum of explicit `advance_time` deltas 
 adapter capabilities before executing action zero. A run report records that exact compiled schedule. Assertions and
 quiescence may advance the subject clock while an action executes, so the declared schedule is not described as the
 adapter's observed clock. Adapters do not interpret loops, concurrency, rates, or barriers.
+
+Scenario IR v2's `update_group_data` action is the stable name-only operation. Scenario IR v3's
+`update_group_profile` action carries optional `name` and `description` fields and requires at least one of them. A
+missing field means preserve the adopted canonical value; an explicitly empty string clears that field. The compiler
+rejects the v3 action in a v2 document rather than silently changing v2 serialization or semantics.
+That split is intentional because canonical JSON is persisted in vectors and failure capsules and exchanged with
+external campaign runners; adding fields to an existing action version would change the meaning accepted by a v2
+consumer even when this repository's current fixtures omit them.
 
 ## Deterministic expansion
 
@@ -100,7 +109,9 @@ adapter and is not used as evidence of offline recovery.
 - `resource` compares a structural-progress metric to an exact, upper, or lower bound.
 
 Current predicates cover client epoch/member state, exact payload multiplicity, exact canonical equivalence, and no
-pending work. Temporal poll intervals must be non-zero, client references are compile-checked, and iteration/time bounds
+pending work. Portable semantic outcomes additionally include an exact expected group profile, so clients agreeing on
+the same stale name or description cannot satisfy a profile-update oracle. Temporal poll intervals must be non-zero,
+client references are compile-checked, and iteration/time bounds
 are watchdogs rather than a redefinition of success. Predicate samples are non-destructive: evaluating an assertion
 does not drain the event window that a later `observe` action records. Predicates that require exact canonical state add
 the exact-observation capability during compilation, so a semantic-only adapter rejects the complete schedule before

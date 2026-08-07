@@ -324,7 +324,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
                 stimuli.insert(ScenarioStimulus::SelfUpdate);
                 commits += 1;
             }
-            ScenarioStep::UpdateGroupData { .. } => {
+            ScenarioStep::UpdateGroupData { .. } | ScenarioStep::UpdateGroupProfile { .. } => {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
                 commits += 1;
             }
@@ -455,7 +455,7 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if evidence.admin_policy_observations > 0 {
         behaviors.insert(OracleBehavior::AdminPolicyObserved);
     }
-    if evidence.delivered_payloads > 0 {
+    if evidence.delivered_payloads > 0 || evidence.decryptability_probe_edges_delivered > 0 {
         behaviors.insert(OracleBehavior::DeliveredPayload);
     }
     if evidence.member_additions > 0 {
@@ -495,10 +495,12 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
         let first_epoch = trace.observations[0].epoch;
         let first_member_count = trace.observations[0].member_count;
         let first_group_name = &trace.observations[0].group_name;
+        let first_group_description = &trace.observations[0].group_description;
         if trace.observations.iter().all(|observation| {
             observation.epoch == first_epoch
                 && observation.member_count == first_member_count
                 && &observation.group_name == first_group_name
+                && &observation.group_description == first_group_description
         }) {
             behaviors.insert(OracleBehavior::ClientConvergence);
         }
@@ -619,6 +621,9 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 behaviors.insert(OracleBehavior::MemberRemoved);
             }
         }
+        TraceExpectation::GroupProfile { .. } => {
+            behaviors.insert(OracleBehavior::ClientState);
+        }
         TraceExpectation::ClientsConverged { member_count, .. } => {
             behaviors.insert(OracleBehavior::ClientConvergence);
             if member_count.is_some_and(|count| count >= 20) {
@@ -649,6 +654,11 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
         }
         TraceExpectation::ClientsBidirectionallyDecryptable { .. } => {
             behaviors.insert(OracleBehavior::BidirectionalDecryptabilityObserved);
+            // A successful active probe is itself application-message delivery
+            // evidence in every requested direction. Do not require a second,
+            // unrelated payload expectation merely because the probe sends app
+            // messages internally.
+            behaviors.insert(OracleBehavior::DeliveredPayload);
         }
         TraceExpectation::ClientEpochChanges { .. } => {
             behaviors.insert(OracleBehavior::EpochChanged);
@@ -809,6 +819,7 @@ mod tests {
             epoch,
             member_count,
             group_name: group_name.into(),
+            group_description: String::new(),
             canonical_state: None,
             scenario_input_ledger: Vec::new(),
             pending_work: None,
@@ -918,5 +929,18 @@ mod tests {
                 .contains(&OracleBehavior::ExactStateNonEquivalence)
         );
         assert!(report.missing_observed_behaviors.is_empty());
+    }
+
+    #[test]
+    fn bidirectional_probe_expectation_is_application_delivery_evidence() {
+        let behaviors = expected_behaviors(
+            None,
+            &[TraceExpectation::ClientsBidirectionallyDecryptable {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+        );
+
+        assert!(behaviors.contains(&OracleBehavior::BidirectionalDecryptabilityObserved));
+        assert!(behaviors.contains(&OracleBehavior::DeliveredPayload));
     }
 }

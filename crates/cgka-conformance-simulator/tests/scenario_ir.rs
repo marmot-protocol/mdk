@@ -3,11 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cgka_conformance_simulator::{
-    HarnessStorageMode, ScenarioAccountV2, ScenarioAssertionV2, ScenarioComparison,
-    ScenarioDeviceV2, ScenarioMessageSelectorV2, ScenarioPredicateV2, ScenarioProcessV2,
-    ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTopologyV2, ScenarioTransportClass,
-    SubjectOutboundOutcome, VectorFixture, compile_scenario, run_scenario_report,
-    run_vector_fixture_report_with_capture,
+    HarnessStorageMode, SCENARIO_IR_V3_ONLY_STEP_KINDS, ScenarioAccountV2, ScenarioAssertionV2,
+    ScenarioComparison, ScenarioDeviceV2, ScenarioMessageSelectorV2, ScenarioPredicateV2,
+    ScenarioProcessV2, ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
+    ScenarioTransportClass, SubjectOutboundOutcome, VectorFixture, compile_scenario,
+    run_scenario_report, run_vector_fixture_report_with_capture,
 };
 
 fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
@@ -48,7 +48,7 @@ fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
 }
 
 #[test]
-fn schema_declares_every_executable_step_kind() {
+fn v2_schema_declares_every_v2_executable_step_kind() {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
             .expect("scenario IR schema parses");
@@ -63,8 +63,108 @@ fn schema_declares_every_executable_step_kind() {
                 .expect("step kind")
         })
         .collect::<BTreeSet<_>>();
-    let executable_kinds = ScenarioStep::KINDS.iter().copied().collect::<BTreeSet<_>>();
+    let v3_only_kinds = SCENARIO_IR_V3_ONLY_STEP_KINDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let executable_kinds = ScenarioStep::KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !v3_only_kinds.contains(kind))
+        .collect::<BTreeSet<_>>();
     assert_eq!(schema_kinds, executable_kinds);
+}
+
+#[test]
+fn v3_schema_adds_full_group_profile_updates_without_rewriting_v2() {
+    let v2_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
+            .expect("scenario IR v2 schema parses");
+    let v3_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-ir.v3.schema.json"))
+            .expect("scenario IR v3 schema parses");
+    assert_eq!(v3_schema["properties"]["spec_version"]["const"], "3");
+    assert_eq!(
+        v3_schema["$defs"]["update_group_profile"]["properties"]["type"]["const"],
+        "update_group_profile"
+    );
+    assert_eq!(
+        v3_schema["$defs"]["step"]["oneOf"][0]["$ref"],
+        "scenario-ir.v2.schema.json#/$defs/step"
+    );
+
+    let v2_kinds = v2_schema["$defs"]["step"]["oneOf"]
+        .as_array()
+        .expect("v2 step variants")
+        .iter()
+        .filter_map(|variant| variant["properties"]["type"]["const"].as_str())
+        .collect::<BTreeSet<_>>();
+    let mut v3_declared_kinds = v3_schema["$defs"]["step"]["oneOf"]
+        .as_array()
+        .expect("v3 step variants")
+        .iter()
+        .filter_map(|variant| variant["properties"]["type"]["const"].as_str())
+        .collect::<BTreeSet<_>>();
+    v3_declared_kinds.insert(
+        v3_schema["$defs"]["update_group_profile"]["properties"]["type"]["const"]
+            .as_str()
+            .expect("v3 profile action kind"),
+    );
+    let all_schema_kinds = v2_kinds
+        .union(&v3_declared_kinds)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        all_schema_kinds,
+        ScenarioStep::KINDS.iter().copied().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        all_schema_kinds
+            .difference(&v2_kinds)
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        SCENARIO_IR_V3_ONLY_STEP_KINDS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn group_profile_update_is_v3_only_and_requires_at_least_one_field() {
+    let mut scenario = ScenarioSpec {
+        name: "scenario-ir/group-profile-v3".into(),
+        spec_version: "3".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![ScenarioStep::UpdateGroupProfile {
+            client: "alice".into(),
+            name: None,
+            description: Some("new description".into()),
+            pending: "profile".into(),
+        }],
+    };
+
+    let compiled = compile_scenario(&scenario).expect("v3 profile update compiles");
+    assert_eq!(
+        compiled.actions[0].schedule.action_type,
+        "update_group_profile"
+    );
+
+    scenario.spec_version = "2".into();
+    let error = compile_scenario(&scenario).expect_err("v2 must reject the v3 action");
+    assert_eq!(error.kind, "scenario_compile_error");
+    assert!(error.message.contains("requires ScenarioSpec version 3"));
+
+    scenario.spec_version = "3".into();
+    scenario.steps = vec![ScenarioStep::UpdateGroupProfile {
+        client: "alice".into(),
+        name: None,
+        description: None,
+        pending: "profile".into(),
+    }];
+    let error = compile_scenario(&scenario).expect_err("empty profile update must fail");
+    assert!(error.message.contains("must change a name or description"));
 }
 
 #[test]
@@ -72,11 +172,13 @@ fn authoring_schema_references_resolve_against_the_ir_schema_id() {
     let authoring: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-authoring.v1.schema.json"))
             .expect("authoring schema parses");
-    let ir: serde_json::Value =
+    let v2_ir: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
-            .expect("scenario IR schema parses");
+            .expect("scenario IR v2 schema parses");
+    let v3_ir: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-ir.v3.schema.json"))
+            .expect("scenario IR v3 schema parses");
     let authoring_id = authoring["$id"].as_str().expect("authoring schema id");
-    let ir_id = ir["$id"].as_str().expect("IR schema id");
     let base = authoring_id
         .rsplit_once('/')
         .map(|(base, _)| format!("{base}/"))
@@ -86,7 +188,15 @@ fn authoring_schema_references_resolve_against_the_ir_schema_id() {
     assert!(!refs.is_empty());
     for reference in refs {
         let (resource, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-        assert_eq!(format!("{base}{resource}"), ir_id);
+        let ir = match resource {
+            "scenario-ir.v2.schema.json" => &v2_ir,
+            "scenario-ir.v3.schema.json" => &v3_ir,
+            _ => panic!("unexpected authoring schema dependency: {resource}"),
+        };
+        assert_eq!(
+            format!("{base}{resource}"),
+            ir["$id"].as_str().expect("IR schema id")
+        );
         if !fragment.is_empty() {
             assert!(
                 ir.pointer(fragment).is_some(),

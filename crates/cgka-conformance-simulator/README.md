@@ -27,10 +27,12 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   subsequent `tick` steps select which participant runtimes wake and observe the elapsed deadline. Its
   `outbound_publication` capability returns exact transport-ready artifacts through non-destructive polling and accepts
   typed `accepted` / `reached_no_endpoint` outcomes through opaque adapter-owned acknowledgement handles.
-- `ScenarioSpec` — the canonical JSON v2 input contract for deterministic scripted scenarios, including explicit
+- `ScenarioSpec` — the canonical JSON v2/v3 input contract for deterministic scripted scenarios, including explicit
   outbound acknowledgement, queue faults, and partitions. The runner compiles the whole document into a stable action
-  schedule and preflights every required adapter capability before executing the first action; the schema is
-  `schemas/scenario-ir.v2.schema.json`. New scenarios can declare accounts, devices, processes, groups, relays, roles,
+  schedule and preflights every required adapter capability before executing the first action. V2 remains stable and
+  replayable; v3 adds full name/description group-profile updates. The schemas are
+  `schemas/scenario-ir.v2.schema.json` and `schemas/scenario-ir.v3.schema.json`. New scenarios can declare accounts,
+  devices, processes, groups, relays, roles,
   and binary/policy versions explicitly; old vectors receive a visible deterministic topology projection in reports.
 - `ScenarioAuthoringSpec` — a non-executable authoring contract with deterministic repeat, logical parallel, rate,
   burst, and barrier lowering. See [`SCENARIO_IR.md`](SCENARIO_IR.md) for the exact schedule semantics.
@@ -68,11 +70,13 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   revision, exercises unequal histories, freeze/settle, crash/restart, temporary resource failure, administrative
   progress, and losing-branch joiner repair, and emits a minimal assumption-labeled starvation trace whose projected
   action kinds are drift-checked against committed Scenario IR.
-- `mutation_adequacy` — nine simulator-only single-rule mutants with minimal deterministic witnesses. The generated
+- `mutation_adequacy` — ten simulator-only single-rule mutants with minimal deterministic witnesses. The generated
   catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
-  publication-ack, and retention-boundary mutations without compiling mutation switches into production. Lifecycle
+  publication-ack, retention-boundary, and group-profile-projection mutations without compiling mutation switches
+  into production. Lifecycle
   mutants run through the shared Rust transition model; publication acknowledgement runs through a real independent
-  reference subject and its structural pending-work observation.
+  reference subject and its structural pending-work observation; the profile mutant runs the production-shaped engine
+  vector and then changes only its app-facing projection before applying the portable expected-value oracle.
 
 ## Testing layers
 
@@ -248,7 +252,7 @@ acknowledgements are idempotent, and a contradictory acknowledgement fails. An a
 the engine's pending state; a `reached_no_endpoint` result rolls back only while the complete publication remains
 unexposed. Welcome outcomes remain independent after a live commit is accepted, and regenerated queued intents are
 retired or re-armed from the same acknowledgement. A state transition with no transport artifacts is confirmed as a
-no-op publication rather than inventing a synthetic artifact. ScenarioSpec v2 drives the same contract through
+no-op publication rather than inventing a synthetic artifact. ScenarioSpec v2 and v3 drive the same contract through
 `acknowledge_outbound`: the runner polls opaque artifacts, optionally selects a stable scenario publication label and
 artifact role, and applies the declared transport outcome. Engine-generated work has no publication label and can be
 acknowledged as the client's current unresolved outbound set. There is no compatibility constructor, silent
@@ -303,7 +307,8 @@ The current vector work is tracked in the engine quality plan:
 `docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`.
 The crate now has [`vectors/manifest.v1.json`](vectors/manifest.v1.json),
 [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json), first app-component byte fixtures, and
-portable scenario vectors for message exchange, pending rollback, invites, group-data updates, admin-policy
+portable scenario vectors for message exchange, pending rollback, invites, name-only group-data updates, full
+name/description group-profile updates, admin-policy
 promotion/demotion (`vectors/admin-policy-update.v1.json`), queue faults, partition repair, leave, delayed past-epoch
 app delivery, restart plus delayed duplicate delivery, and fork recovery. It does not yet have a full byte-level
 wire-event suite.
@@ -334,7 +339,7 @@ observes recovery from epoch 1 to epoch 2, and the winner and invalidated orderi
 `concurrent-invite-fork-recovery/v1` uses the same semantic recovery style for an invite race. It checks convergence and
 recovery without pinning which invite branch wins.
 
-`ScenarioSpec` v2 contains ordered client labels and ordered steps. Supported steps are:
+`ScenarioSpec` v2 and v3 contain ordered client labels and ordered steps. Both support the following v2 actions:
 
 - `create_group`
 - `invite_members`
@@ -375,6 +380,10 @@ recovery without pinning which invite branch wins.
 - `clear_storage_fault`
 - `barrier`
 - `assert`
+
+ScenarioSpec v3 additionally supports `update_group_profile`, whose optional `name` and `description` fields preserve
+omitted values and clear explicitly empty values. At least one field is required. Expected outcomes can use
+`group_profile` to assert the requested values directly; `clients_converged` also compares both profile fields.
 
 Staged publications are referenced by string labels chosen inside the scenario. `acknowledge_outbound.publication`
 selects artifacts emitted by that operation; omitting it selects all currently unresolved artifacts for the client.

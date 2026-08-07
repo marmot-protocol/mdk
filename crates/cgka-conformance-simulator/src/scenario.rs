@@ -91,6 +91,18 @@ pub enum ScenarioStep {
         name: String,
         pending: String,
     },
+    /// Update one or both fields of the canonical Marmot group profile.
+    ///
+    /// This action is available in Scenario IR v3. The v2
+    /// `update_group_data` action remains the stable name-only contract.
+    UpdateGroupProfile {
+        client: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        pending: String,
+    },
     UpdateAdminPolicy {
         client: String,
         admins: Vec<String>,
@@ -228,6 +240,7 @@ impl ScenarioStep {
         "remove_members",
         "self_update",
         "update_group_data",
+        "update_group_profile",
         "update_admin_policy",
         "expect_update_admin_policy_error",
         "acknowledge_outbound",
@@ -290,6 +303,7 @@ impl ScenarioStep {
             ScenarioStep::RemoveMembers { .. } => "remove_members",
             ScenarioStep::SelfUpdate { .. } => "self_update",
             ScenarioStep::UpdateGroupData { .. } => "update_group_data",
+            ScenarioStep::UpdateGroupProfile { .. } => "update_group_profile",
             ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
             ScenarioStep::AcknowledgeOutbound { .. } => "acknowledge_outbound",
@@ -796,7 +810,25 @@ async fn execute_scenario_step(
                 .update_group_data(SubjectUpdateGroupData {
                     action_id,
                     client,
-                    name,
+                    name: Some(name),
+                    description: None,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::UpdateGroupProfile {
+            client,
+            name,
+            description,
+            pending,
+        } => {
+            subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id,
+                    client,
+                    name: name.as_deref(),
+                    description: description.as_deref(),
                     pending,
                 })
                 .await
@@ -1412,7 +1444,8 @@ fn scenario_initial_admins(
 fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
     match step {
         ScenarioStep::InviteMembers { inviter, .. } => Some(inviter),
-        ScenarioStep::UpdateGroupData { client, .. } => Some(client),
+        ScenarioStep::UpdateGroupData { client, .. }
+        | ScenarioStep::UpdateGroupProfile { client, .. } => Some(client),
         ScenarioStep::UpdateAdminPolicy { client, .. } => Some(client),
         _ => None,
     }
@@ -1984,6 +2017,7 @@ mod tests {
             crate::ConformanceCanonicalStateSnapshot::Live(snapshot) => (
                 snapshot.epoch,
                 snapshot.group_name.clone(),
+                snapshot.group_description.clone(),
                 snapshot.sorted_member_identities_hex.clone(),
                 snapshot.admin_identities_hex.clone(),
                 snapshot.protocol_lifecycle,

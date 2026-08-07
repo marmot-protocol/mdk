@@ -179,7 +179,8 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
         .update_group_data(cgka_conformance_simulator::SubjectUpdateGroupData {
             action_id: "rename-1",
             client: "alice",
-            name: "offline epoch one",
+            name: Some("offline epoch one"),
+            description: None,
             pending: "rename-1",
         })
         .await
@@ -196,7 +197,8 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
         .update_group_data(cgka_conformance_simulator::SubjectUpdateGroupData {
             action_id: "rename-2",
             client: "alice",
-            name: "after quiet history",
+            name: Some("after quiet history"),
+            description: Some("after quiet description"),
             pending: "rename-2",
         })
         .await
@@ -245,6 +247,7 @@ async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
         "alice={alice:#?}\nbob={bob:#?}"
     );
     assert_eq!(bob.protocol.group_name, "after quiet history");
+    assert_eq!(bob.protocol.group_description, "after quiet description");
     assert!(
         bob.application
             .visible_plaintexts
