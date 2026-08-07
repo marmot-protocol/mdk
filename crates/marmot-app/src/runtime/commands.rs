@@ -42,11 +42,23 @@ impl AccountManager {
         }
     }
 
-    fn schedule_create_group_post_mutation_catch_up(&self) {
+    async fn schedule_create_group_post_mutation_catch_up(&self) {
+        // Snapshot only workers that already exist when create returns. Calling
+        // the broad `catch_up_accounts()` from the detached task can discover an
+        // account while its setup flow still owns a one-shot AppClient, then
+        // race that setup by trying to start a managed worker for the same
+        // account. Accounts created after this snapshot perform their own
+        // startup catch-up and do not need this repair pass.
+        let commands = self.running_account_commands().await;
         let manager = self.clone();
         tokio::spawn(async move {
             let started_at = Instant::now();
-            let result = manager.catch_up_accounts().await;
+            let result = manager.catch_up_account_commands(commands).await;
+            manager.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountCatchUp,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
             manager.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupCreatePostMutationCatchUp,
                 started_at.elapsed(),
@@ -124,7 +136,7 @@ impl AccountManager {
             result.is_ok(),
         );
         let group_id = result?;
-        self.schedule_create_group_post_mutation_catch_up();
+        self.schedule_create_group_post_mutation_catch_up().await;
         self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
     }

@@ -3661,35 +3661,8 @@ impl AccountManager {
         let result = async {
             self.shared.lifecycle().ensure_running()?;
             self.reconcile().await?;
-            let commands = {
-                let workers = self.workers.lock().await;
-                workers
-                    .values()
-                    .map(|worker| worker.commands.clone())
-                    .collect::<Vec<_>>()
-            };
-            let mut responses = Vec::with_capacity(commands.len());
-            for command in commands {
-                let (respond, response) = oneshot::channel();
-                command
-                    .send(AccountWorkerCommand::CatchUp { respond })
-                    .await
-                    .map_err(|_| AppError::TransportClosed)?;
-                responses.push(response);
-            }
-            for response in responses {
-                match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
-                    Ok(Err(_)) => return Err(AppError::TransportClosed),
-                    Err(_) => {
-                        return Err(AppError::AccountCatchUp(
-                            "account worker catch-up timed out".into(),
-                        ));
-                    }
-                }
-            }
-            Ok(())
+            let commands = self.running_account_commands().await;
+            self.catch_up_account_commands(commands).await
         }
         .await;
         self.shared.app_performance_telemetry().record(
@@ -3698,6 +3671,44 @@ impl AccountManager {
             result.is_ok(),
         );
         result
+    }
+
+    async fn running_account_commands(&self) -> Vec<mpsc::Sender<AccountWorkerCommand>> {
+        self.workers
+            .lock()
+            .await
+            .values()
+            .map(|worker| worker.commands.clone())
+            .collect()
+    }
+
+    async fn catch_up_account_commands(
+        &self,
+        commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let mut responses = Vec::with_capacity(commands.len());
+        for command in commands {
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CatchUp { respond })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
+        }
+        for response in responses {
+            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
+                Ok(Err(_)) => return Err(AppError::TransportClosed),
+                Err(_) => {
+                    return Err(AppError::AccountCatchUp(
+                        "account worker catch-up timed out".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Delete one local JSONL audit log file.
