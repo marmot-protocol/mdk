@@ -223,6 +223,22 @@
     },
     {
       "type": "convergence_decision",
+      "client": "alice",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "bob",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "carol",
+      "selected_tip_epoch": 2
+    },
+    {
+      "type": "convergence_decision",
+      "client": "dave",
       "selected_tip_epoch": 2
     }
   ]

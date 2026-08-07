@@ -169,8 +169,8 @@ These are the scenarios another implementation should be able to load from JSON 
   Dave) — all through the one distributed-convergence route. Both withheld commits are released in reversed
   order before anyone consumes the sibling branch.
 - Expected: all four clients converge at epoch 2 with four members and the same branch-sensitive group name,
-  pass exact canonical equivalence and no-pending-work, and a settled convergence decision at tip epoch 2 is
-  recorded. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
+  pass exact canonical equivalence and no-pending-work, and each of the four records a settled convergence
+  decision at tip epoch 2. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
   route agreed; flipped into the unified-route acceptance pin when the pairwise route was deleted.
 
 ### `conversation/v1`
