@@ -2303,9 +2303,22 @@ impl<S: StorageProvider> Engine<S> {
     /// materialization-time missing-recovery-material halt in
     /// `distributed_convergence` (`MissingRetainedAnchor` /
     /// `MissingOwnCommitCheckpoint`): park the rival reconsiderable, write
-    /// the durable `unrecoverable` marker before the in-memory transition,
-    /// audit the state change, and emit `GroupUnrecoverable` so the app can
-    /// surface repair. Canonical state is left untouched.
+    /// the durable `unrecoverable` marker, audit the state change, and emit
+    /// `GroupUnrecoverable` so the app can surface repair. Canonical state is
+    /// left untouched.
+    ///
+    /// The marker and the park are ONE durable unit, and within it the marker
+    /// comes first. Parking demotes a row that arrived `Created` to
+    /// `ConvergenceDeferred`, which convergence admits to a pass but cannot use
+    /// to *open* one (`convergence_input::can_start_pass`). A park that
+    /// outlives a failed marker therefore halts nothing while removing the only
+    /// input that could re-derive the halt: the group stays `Stable` on a
+    /// possibly-losing branch, redelivery dedups against the parked row, and
+    /// stale-deferred retirement eventually terminalizes it — permanent
+    /// divergence manufactured by the halt's own error path. The convergence
+    /// coordinator's halt needs no transaction only because it persists no
+    /// disposition before its marker, so every input keeps the state that
+    /// re-derives the identical halt on the next run.
     fn fail_closed_missing_fork_recovery_anchor(
         &mut self,
         group_id: GroupId,
@@ -2314,14 +2327,27 @@ impl<S: StorageProvider> Engine<S> {
         msg_epoch: EpochId,
         current: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
-        // Park the rival keyed by its source epoch, as replay requires, so a
-        // verified repair path can still reconsider it.
-        self.persist_openmls_wire_message(
-            openmls_msg,
-            &group_id,
-            msg_epoch,
-            MessageState::ConvergenceDeferred,
-        )?;
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                // Durable marker first: a crash after the commit still halts
+                // the group on the next session open via
+                // `sync_unrecoverable_halt_from_storage` (mdk#971).
+                let mut group = storage.get_group(&group_id)?;
+                if !group.unrecoverable {
+                    group.unrecoverable = true;
+                    storage.put_group(&group)?;
+                }
+                // Park the rival keyed by its source epoch, as replay requires,
+                // so a verified repair path can still reconsider it. This
+                // writes through `self.storage`, which IS the handle the
+                // transaction is running on, so it joins the same unit.
+                self.persist_openmls_wire_message(
+                    openmls_msg,
+                    &group_id,
+                    msg_epoch,
+                    MessageState::ConvergenceDeferred,
+                )
+            })?;
         self.audit_group(
             &group_id,
             crate::audit_helpers::message_state_changed_event(
@@ -2330,14 +2356,8 @@ impl<S: StorageProvider> Engine<S> {
                 "fork_rival_missing_retained_anchor",
             ),
         );
-        // Durable marker first: a crash after this write still halts the
-        // group on the next session open via
-        // `sync_unrecoverable_halt_from_storage` (mdk#971).
-        let mut group = self.storage.get_group(&group_id)?;
-        if !group.unrecoverable {
-            group.unrecoverable = true;
-            self.storage.put_group(&group)?;
-        }
+        // Durable state has committed. From here on the steps are in-memory
+        // transitions and queue pushes, infallible w.r.t. the backend.
         let previous_state = self
             .epoch_manager
             .state(&group_id)
