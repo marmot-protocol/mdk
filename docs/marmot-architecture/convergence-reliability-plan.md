@@ -1058,7 +1058,8 @@ restricted to synthetic shareable capsules with portable expectations.
   windows, full-history catch-up, exact state, and active decryptability across a deterministic seed/case corpus.
 - [x] Keep late-membership and retained-history profiles distinct: valid pre-admission retry rows are not a global
   no-pending defect, while founding-member offline journeys must reach full quiescence and no pending work.
-- [x] Persist the owner-only executable canonical fixture before action zero so a crash cannot erase the reproducer.
+- [x] Persist an owner-only, versioned generated-case input before action zero, including the selected subject adapter
+  and semantic expectations, so a crash cannot erase or change the reproducer.
 - [ ] Expose these saved journeys as first-class selectable app-runtime and process report inputs; this remains the next
   cross-layer usability slice rather than being hidden inside the generator.
 
@@ -1191,7 +1192,7 @@ incorrect result.
 | 2026-08-05 | E9 outbound retention bound | Bounded the per-group durable outbound-intent retention queue at its single insertion point, covering every path that retains — the locally staged publication path, the pre-existing stable-but-unsettled path, and the offline outbox — the over-cap send is refused with a typed non-transient `EngineError` surfaced as a distinct FFI variant, and already-retained intents still drain and reclaim capacity once a publish is accepted | `cargo test -p cgka-engine --features test-policy-overrides --test publish_lifecycle`; `cargo test -p cgka-traits`; `cargo test -p cgka-conformance-simulator --test protocol_decision_gate`; `cargo test -p marmot-uniffi`; `just convergence-ledger-gate` |
 | 2026-08-06 | 6.3 lane policy and evidence foundations | Added single-source PR, nightly, weekly/manual, and release-hardening policy manifests; fail-closed standalone wall/CPU/RSS/disk/artifact/retention/flake evaluation; nonempty byte-verified evidence artifacts; and scheduled entry points without claiming workflow-owned measurement or incident-corpus execution yet | `lane_policy`; `convergence-lane-policy`; `simulator-nightly.yml`; `convergence-hardening.yml` |
 | 2026-08-06 | 6.4 failure corpus lifecycle | Unified simulator/process/distributed failure indexing with the four reviewed classifications, semantic dependency-aware reduction, cross-adapter reduction candidates, safe vector promotion, recurrence counts, and time-to-diagnosis as a separate layer over the campaign runner | `failure_corpus`; `semantic_reduction`; `convergence-failure-corpus` |
-| 2026-08-07 | 6.5 stateful canonical journeys | Added deterministic legality-aware Scenario IR v3 journeys with modeled membership, admin, profile, connectivity, epoch, and delivery outcomes; separated late-membership from founding-member offline history so pre-admission retry state is not mislabeled; and saved owner-only canonical inputs before execution | `stateful_generator`; `chat-journey/v1`; strict two-profile report run |
+| 2026-08-07 | 6.5 stateful canonical journeys | Added deterministic legality-aware Scenario IR v3 journeys with modeled membership, admin, profile, connectivity, epoch, and delivery outcomes; separated late-membership from founding-member offline history so pre-admission retry state is not mislabeled; and saved owner-only, subject-preserving inputs before execution | `stateful_generator`; `chat-journey/v1`; strict eight-case/two-profile rotation plus retained-input replay |
 
 ## Post-Milestone 6 Cleanup
 

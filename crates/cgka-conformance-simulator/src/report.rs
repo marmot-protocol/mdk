@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
-    HarnessStorageMode, ScenarioReport, VectorFixture, coverage_matrix_entry,
-    generate_adversarial_reliability_family, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    generate_stateful_chat_journey_family, run_generated_case_report_with_capture,
-    run_vector_fixture_report_with_capture, write_failure_capsule,
+    GeneratedScenarioInputV1, HarnessStorageMode, ScenarioReport, VectorFixture,
+    coverage_matrix_entry, generate_adversarial_reliability_family,
+    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, generate_stateful_chat_journey_family,
+    run_generated_case_report_with_capture, run_vector_fixture_report_with_capture,
+    write_failure_capsule,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub enum ReportInput {
         cases: usize,
     },
     VectorFixtures {
+        paths: Vec<PathBuf>,
+    },
+    GeneratedInputs {
         paths: Vec<PathBuf>,
     },
 }
@@ -211,6 +215,16 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
             )
             .await?
         }
+        ReportInput::GeneratedInputs { paths } => {
+            run_generated_input_reports(
+                paths,
+                &args.out,
+                args.strict_oracle,
+                args.storage_mode,
+                args.capture_sensitive_replay,
+            )
+            .await?
+        }
     };
 
     let coverage_matrix = scenarios
@@ -246,76 +260,122 @@ async fn run_generated_family_reports(
     let mut summaries = Vec::with_capacity(cases.len());
     for case in cases {
         let input_output = out.join(format!(
-            "{}-seed-{}-case-{}-input.v1.json",
+            "{}-seed-{}-case-{}-generated-input.json",
             case.family_name.replace('/', "-"),
             case.seed,
             case.case_index
         ));
-        let input_fixture = case.to_vector_fixture(env!("CARGO_PKG_VERSION"), None);
-        fs_private::write_private(&input_output, &serde_json::to_vec_pretty(&input_fixture)?)?;
-        let (report, failure_capture) = run_generated_case_report_with_capture(
-            &case,
-            None,
-            storage_mode,
-            capture_sensitive_replay,
-        )
-        .await?;
-        let output = out.join(format!(
-            "{}-seed-{}-case-{}.json",
-            case.family_name.replace('/', "-"),
-            case.seed,
-            case.case_index
-        ));
-        std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
-        let fixture_output = out.join(format!(
-            "{}-seed-{}-case-{}-fixture.v1.json",
-            case.family_name.replace('/', "-"),
-            case.seed,
-            case.case_index
-        ));
-        let fixture = generated_fixture_candidate(&case, &report);
-        std::fs::write(&fixture_output, serde_json::to_string_pretty(&fixture)?)?;
         let source = case.family_name.clone();
-        let coverage = coverage_matrix_entry(source.clone(), &report);
-        let failures = scenario_report_failures(&report, strict_oracle);
-        let failure_count = failures.len();
-        let failure_capsules = if failures.is_empty() {
-            WrittenFailureCapsules::default()
-        } else {
-            let portable_path = out.join(format!(
-                "{}-seed-{}-case-{}-failure-capsule.v1.json",
-                case.family_name.replace('/', "-"),
-                case.seed,
-                case.case_index
-            ));
-            let replay_path = out.join(format!(
-                "{}-seed-{}-case-{}-sensitive-replay-capsule.v1.json",
-                case.family_name.replace('/', "-"),
-                case.seed,
-                case.case_index
-            ));
-            write_report_failure_capsules(
-                &report,
-                failure_capture_for(&failures, failure_capture),
-                portable_path,
-                replay_path,
-            )?
-        };
-        summaries.push(ScenarioReportSummary {
-            scenario_name: report.metadata.scenario_name.clone(),
-            source,
-            output,
-            failure_capsule: failure_capsules.portable,
-            replay_capsule: failure_capsules.replay,
-            expectation_count: report.expected_trace.iter().count()
-                + report.expected_outcomes.len(),
-            failure_count,
-            failures,
-            coverage,
-        });
+        let input = GeneratedScenarioInputV1::new(case.clone());
+        fs_private::write_private(&input_output, &serde_json::to_vec_pretty(&input)?)?;
+        summaries.push(
+            run_generated_case_artifacts(
+                &case,
+                source,
+                out,
+                strict_oracle,
+                storage_mode,
+                capture_sensitive_replay,
+            )
+            .await?,
+        );
     }
 
     Ok(summaries)
+}
+
+async fn run_generated_input_reports(
+    paths: &[PathBuf],
+    out: &Path,
+    strict_oracle: bool,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
+    if paths.is_empty() {
+        return Err("no generated input paths supplied".into());
+    }
+    let mut summaries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let input: GeneratedScenarioInputV1 =
+            serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        input.validate()?;
+        summaries.push(
+            run_generated_case_artifacts(
+                &input.case,
+                path.display().to_string(),
+                out,
+                strict_oracle,
+                storage_mode,
+                capture_sensitive_replay,
+            )
+            .await?,
+        );
+    }
+    Ok(summaries)
+}
+
+async fn run_generated_case_artifacts(
+    case: &GeneratedScenarioCase,
+    source: String,
+    out: &Path,
+    strict_oracle: bool,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+) -> Result<ScenarioReportSummary, Box<dyn Error>> {
+    let (report, failure_capture) =
+        run_generated_case_report_with_capture(case, None, storage_mode, capture_sensitive_replay)
+            .await?;
+    let output = out.join(format!(
+        "{}-seed-{}-case-{}.json",
+        case.family_name.replace('/', "-"),
+        case.seed,
+        case.case_index
+    ));
+    fs_private::write_private(&output, &serde_json::to_vec_pretty(&report)?)?;
+    let fixture_output = out.join(format!(
+        "{}-seed-{}-case-{}-fixture.v1.json",
+        case.family_name.replace('/', "-"),
+        case.seed,
+        case.case_index
+    ));
+    let fixture = generated_fixture_candidate(case, &report);
+    fs_private::write_private(&fixture_output, &serde_json::to_vec_pretty(&fixture)?)?;
+    let coverage = coverage_matrix_entry(source.clone(), &report);
+    let failures = scenario_report_failures(&report, strict_oracle);
+    let failure_count = failures.len();
+    let failure_capsules = if failures.is_empty() {
+        WrittenFailureCapsules::default()
+    } else {
+        let portable_path = out.join(format!(
+            "{}-seed-{}-case-{}-failure-capsule.v1.json",
+            case.family_name.replace('/', "-"),
+            case.seed,
+            case.case_index
+        ));
+        let replay_path = out.join(format!(
+            "{}-seed-{}-case-{}-sensitive-replay-capsule.v1.json",
+            case.family_name.replace('/', "-"),
+            case.seed,
+            case.case_index
+        ));
+        write_report_failure_capsules(
+            &report,
+            failure_capture_for(&failures, failure_capture),
+            portable_path,
+            replay_path,
+        )?
+    };
+    Ok(ScenarioReportSummary {
+        scenario_name: report.metadata.scenario_name.clone(),
+        source,
+        output,
+        failure_capsule: failure_capsules.portable,
+        replay_capsule: failure_capsules.replay,
+        expectation_count: report.expected_trace.iter().count() + report.expected_outcomes.len(),
+        failure_count,
+        failures,
+        coverage,
+    })
 }
 
 fn generated_fixture_candidate(
@@ -361,7 +421,7 @@ async fn run_vector_fixture_reports(
             "{}-report.json",
             fixture.scenario_name.replace('/', "-")
         ));
-        std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
+        fs_private::write_private(&output, &serde_json::to_vec_pretty(&report)?)?;
         let source = path.display().to_string();
         let coverage = coverage_matrix_entry(source.clone(), &report);
         let failures = scenario_report_failures(&report, strict_oracle);
@@ -518,31 +578,40 @@ pub fn parse_report_command(
     let mut seed = 0u64;
     let mut cases = 1usize;
     let mut vectors = Vec::new();
+    let mut generated_inputs = Vec::new();
     let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
     let mut strict_oracle = true;
     let mut storage_mode = None;
     let mut replay_capsule = None;
     let mut capture_sensitive_replay = false;
     let mut scenario_input_selected = false;
+    let mut generated_family_selected = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--family" => {
                 scenario_input_selected = true;
+                generated_family_selected = true;
                 family = next_value(&mut args, "--family")?;
             }
             "--seed" => {
                 scenario_input_selected = true;
+                generated_family_selected = true;
                 seed = next_value(&mut args, "--seed")?.parse()?;
             }
             "--cases" => {
                 scenario_input_selected = true;
+                generated_family_selected = true;
                 cases = next_value(&mut args, "--cases")?.parse()?;
             }
             "--vectors" => {
                 scenario_input_selected = true;
                 vectors.push(PathBuf::from(next_value(&mut args, "--vectors")?));
+            }
+            "--generated-input" => {
+                scenario_input_selected = true;
+                generated_inputs.push(PathBuf::from(next_value(&mut args, "--generated-input")?));
             }
             "--replay-capsule" => {
                 replay_capsule = Some(PathBuf::from(next_value(&mut args, "--replay-capsule")?));
@@ -571,7 +640,18 @@ pub fn parse_report_command(
         return Ok(ReportCommand::ReplayCapsule(path));
     }
 
-    let input = if vectors.is_empty() {
+    if !generated_inputs.is_empty() && (!vectors.is_empty() || generated_family_selected) {
+        return Err(
+            "--generated-input cannot be combined with --vectors, --family, --seed, or --cases"
+                .into(),
+        );
+    }
+
+    let input = if !generated_inputs.is_empty() {
+        ReportInput::GeneratedInputs {
+            paths: generated_inputs,
+        }
+    } else if vectors.is_empty() {
         ReportInput::GeneratedFamily {
             family,
             seed,
@@ -599,7 +679,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|adversarial-reliability/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|adversarial-reliability/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
 }
 
 #[cfg(test)]

@@ -423,7 +423,7 @@ Its symbolic state tracks membership, administrators, connectivity, epoch, group
 delivery. Adjacent case indices alternate between late-membership journeys on the engine subject and retained-history
 offline journeys whose offline participants were members from epoch 1. That split is deliberate: a late joiner querying
 full history sees valid pre-admission objects it was never entitled to decrypt, so combining both shapes would make a
-global no-pending assertion a false protocol guarantee. Every case covers application traffic and a full-profile
+global no-pending assertion a false protocol guarantee. Every case covers application traffic and a profile
 update; the corpus additionally rotates invites, removals, admin changes, self-updates, restarts, and reconnect repair.
 Terminal expectations pin the modeled epoch, roster size, profile, admin set, per-client delivery, exact state, and
 active decryptability. Membership cases scope `NoPendingWork` to founding members; retained-history cases require it
@@ -460,9 +460,10 @@ schedule-invariant convergence, rollback, and payload-set expectations stay fixe
 `ScenarioSpec`s, so the same runner and report path can turn selected generated cases into fixed vectors when that makes
 the conformance contract clearer.
 
-The report runner writes each generated `*-input.v1.json` fixture with owner-only permissions before executing its
-case. A crash or panic therefore cannot erase the exact canonical input. The post-run report and promotable fixture
-candidate remain separate artifacts.
+For every generated family, the report runner writes a versioned `*-generated-input.json` artifact with owner-only
+permissions before executing its case. It preserves the full generated case, including its selected subject adapter and
+semantic expectations, so a crash or panic cannot erase the exact executable input. Replay one directly with
+`--generated-input FILE`. The post-run report and promotable vector candidate remain separate owner-only artifacts.
 
 ## Report artifacts
 

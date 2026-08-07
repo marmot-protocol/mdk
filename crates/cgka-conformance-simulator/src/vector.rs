@@ -4,8 +4,6 @@
 //! ids. They capture the deterministic observable outcome a conforming engine
 //! should produce after running the same scripted scenario.
 
-use std::collections::BTreeSet;
-
 use crate::{
     BidirectionalDecryptabilityObservation, HarnessClient, PendingWorkObservation,
     ScenarioInputLedgerEntry, ScenarioSpec,
@@ -272,17 +270,19 @@ impl TraceExpectation {
                 }
             }
             TraceExpectation::AdminPolicy { client, admins } => {
-                let expected_admins = admins.iter().collect::<BTreeSet<_>>();
+                let mut expected_admins = admins.clone();
+                expected_admins.sort();
                 match observed
                     .admin_policies
                     .iter()
                     .rev()
                     .find(|policy| policy.client == *client)
                 {
-                    Some(policy)
-                        if policy.admins.iter().collect::<BTreeSet<_>>() == expected_admins =>
-                    {
-                    }
+                    Some(policy) if {
+                        let mut observed_admins = policy.admins.clone();
+                        observed_admins.sort();
+                        observed_admins == expected_admins
+                    } => {}
                     Some(policy) => mismatches.push(ExpectationFailure {
                         kind: "admin_policy_mismatch".into(),
                         message: format!(
@@ -1493,6 +1493,29 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn admin_policy_expectation_rejects_duplicate_admins() {
+        let mut observed = trace(Vec::new());
+        observed
+            .admin_policies
+            .push(ScenarioAdminPolicyObservation {
+                client: "alice".into(),
+                admins: vec!["alice".into(), "alice".into()],
+            });
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::AdminPolicy {
+                client: "alice".into(),
+                admins: vec!["alice".into()],
+            }],
+            &observed,
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "admin_policy_mismatch");
     }
 
     #[test]

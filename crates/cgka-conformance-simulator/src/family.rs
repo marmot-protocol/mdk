@@ -19,6 +19,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub const GENERATED_SCENARIO_INPUT_SCHEMA_VERSION: &str = "1";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedScenarioCase {
     pub family_name: String,
@@ -30,6 +32,33 @@ pub struct GeneratedScenarioCase {
     pub scenario: ScenarioSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
+}
+
+/// Versioned executable input for replaying one generated case with the same
+/// subject adapter and expectations used by the original campaign run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedScenarioInputV1 {
+    pub schema_version: String,
+    pub case: GeneratedScenarioCase,
+}
+
+impl GeneratedScenarioInputV1 {
+    pub fn new(case: GeneratedScenarioCase) -> Self {
+        Self {
+            schema_version: GENERATED_SCENARIO_INPUT_SCHEMA_VERSION.into(),
+            case,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != GENERATED_SCENARIO_INPUT_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported generated scenario input version {}",
+                self.schema_version
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Adapter selected by a generated campaign case.

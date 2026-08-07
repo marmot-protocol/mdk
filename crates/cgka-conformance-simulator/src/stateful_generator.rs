@@ -80,6 +80,7 @@ struct JourneyModel {
     group_name: String,
     group_description: String,
     received_payloads: BTreeMap<String, Vec<String>>,
+    self_updated_clients: BTreeSet<String>,
     publication_sequence: u64,
     payload_sequence: u64,
     profile_sequence: u64,
@@ -118,6 +119,7 @@ impl JourneyModel {
                 .cloned()
                 .map(|client| (client, Vec::new()))
                 .collect(),
+            self_updated_clients: BTreeSet::new(),
             publication_sequence: 0,
             payload_sequence: 0,
             profile_sequence: case_index % 3,
@@ -153,6 +155,9 @@ impl JourneyModel {
                     .map(|invitee| JourneyAction::Invite { invitee }),
             );
         }
+        // Keep the two founders active and pending-free for the scoped
+        // Membership terminal oracle, and retain a non-founder victim so the
+        // forced Remove rotation always has at least one legal choice.
         actions.extend(
             self.members
                 .iter()
@@ -188,6 +193,7 @@ impl JourneyModel {
         actions.extend(
             self.members
                 .intersection(&self.online)
+                .filter(|client| !self.self_updated_clients.contains(*client))
                 .cloned()
                 .map(|client| JourneyAction::SelfUpdate { client }),
         );
@@ -213,11 +219,20 @@ impl JourneyModel {
             .into_iter()
             .filter(|action| action.kind() == kind)
             .collect::<Vec<_>>();
+        assert!(
+            !choices.is_empty(),
+            "no legal {kind:?} action in generated case {}",
+            self.case_index
+        );
         choices[rng.gen_range(0..choices.len())].clone()
     }
 
-    fn choose_any(&self, rng: &mut StdRng) -> JourneyAction {
-        let choices = self.legal_actions();
+    fn choose_non_restart(&self, rng: &mut StdRng) -> JourneyAction {
+        let choices = self
+            .legal_actions()
+            .into_iter()
+            .filter(|action| action.kind() != JourneyActionKind::Restart)
+            .collect::<Vec<_>>();
         choices[rng.gen_range(0..choices.len())].clone()
     }
 
@@ -245,6 +260,7 @@ impl JourneyModel {
                     pending: pending.clone(),
                 });
                 self.members.remove(&member);
+                self.online.remove(&member);
                 self.confirmed_mutation("alice", &pending);
             }
             JourneyAction::Send { sender } => {
@@ -332,6 +348,7 @@ impl JourneyModel {
                     client: client.clone(),
                     pending: pending.clone(),
                 });
+                self.self_updated_clients.insert(client.clone());
                 self.confirmed_mutation(&client, &pending);
             }
             JourneyAction::SetOffline => {
@@ -352,6 +369,7 @@ impl JourneyModel {
                     .get_mut(&client)
                     .expect("all clients have a delivery ledger")
                     .clear();
+                self.deliver_to_online();
             }
         }
     }
@@ -542,12 +560,22 @@ pub fn generate_stateful_chat_journey_case(seed: u64, case_index: u64) -> Genera
         2 => JourneyActionKind::Restart,
         _ => JourneyActionKind::Remove,
     };
-    let action = model.choose_kind(&mut rng, required_kind);
-    model.apply(action);
+    if required_kind != JourneyActionKind::Restart {
+        let action = model.choose_kind(&mut rng, required_kind);
+        model.apply(action);
+    }
 
     let extra_actions = 4 + rng.gen_range(0..5);
     for _ in 0..extra_actions {
-        let action = model.choose_any(&mut rng);
+        let action = model.choose_non_restart(&mut rng);
+        model.apply(action);
+    }
+
+    // Restart is a terminal checkpoint in this serialized product-journey
+    // family. Mutation-after-reopen and crash races belong to the dedicated
+    // convergence-chaos family.
+    if required_kind == JourneyActionKind::Restart {
+        let action = model.choose_kind(&mut rng, required_kind);
         model.apply(action);
     }
 

@@ -281,9 +281,11 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cgka-conformance-simulator-reports
 ```
 
-Generated-family runs first write owner-only `*-input.v1.json` canonical fixtures, then write `*-case-N.json` reports
-and `*-case-N-fixture.v1.json` candidates that can be promoted into `vectors/` after review. Oracle coverage is strict
-by default; use `--allow-weak-oracle` only for an explicitly exploratory run.
+Generated-family runs first write owner-only `*-generated-input.json` artifacts containing the full generated case,
+including its subject adapter and expectations. Replay one through the same report path with `--generated-input FILE`.
+Runs then write owner-only `*-case-N.json` reports and `*-case-N-fixture.v1.json` candidates that can be promoted into
+`vectors/` after review. Oracle coverage is strict by default; use `--allow-weak-oracle` only for an explicitly
+exploratory run.
 
 Run portable vector fixtures:
 
@@ -320,6 +322,9 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch
   app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data
   storms, mixed message/commit storms, and restart plus duplicate delivery. Storage-loss families are still future work.
+- **Stateful chat journeys serialize commits by construction.** Each commit is acknowledged and delivered before the
+  next state-changing action, and restart is a terminal checkpoint. Mutation-after-reopen plus concurrent and racing
+  commit coverage remains owned by `convergence-chaos/v1`.
 - **Admin-gated scripted steps need admin setup.** When a scenario has an invitee later send `InviteMembers` or
   `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
   use `create_group_with_admins` explicitly for competing admin commits.

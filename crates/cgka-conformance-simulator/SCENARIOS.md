@@ -361,8 +361,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   surviving clients have exact canonical agreement and active bidirectional decryptability. Retained-history cases
   additionally reach global quiescence and no pending work for every survivor. Late-join cases do not falsely require
   the invitee's valid pre-admission transport retry rows to disappear.
-- Replay: the report runner saves the exact owner-only canonical input before action zero, then writes the ordinary
-  report, fixture candidate, and any failure capsule.
+- Replay: before action zero the report runner saves an owner-only, versioned generated-case input containing the
+  selected subject adapter and expectations. `--generated-input FILE` reexecutes it through the same report path; the
+  ordinary report, promotable vector candidate, and any failure capsule remain separate artifacts.
 
 ### `send-leave/v1`
 

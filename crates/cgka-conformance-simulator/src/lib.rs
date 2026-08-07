@@ -88,7 +88,8 @@ pub use failure_capsule::{
     write_failure_capsule,
 };
 pub use family::{
-    GeneratedScenarioCase, GeneratedSubjectKind, generate_adversarial_reliability_case,
+    GENERATED_SCENARIO_INPUT_SCHEMA_VERSION, GeneratedScenarioCase, GeneratedScenarioInputV1,
+    GeneratedSubjectKind, generate_adversarial_reliability_case,
     generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
     generate_adversarial_reliability_self_update_regression,
     generate_adversarial_reliability_sustained_regression, generate_convergence_chaos_family,

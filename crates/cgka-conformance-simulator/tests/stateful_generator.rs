@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use cgka_conformance_simulator::{
-    GeneratedSubjectKind, HarnessStorageMode, ReportArgs, ReportInput,
+    GeneratedScenarioInputV1, GeneratedSubjectKind, HarnessStorageMode, ReportArgs, ReportInput,
     STATEFUL_CHAT_JOURNEY_FAMILY, ScenarioStep, TraceExpectation, compile_scenario,
     generate_stateful_chat_journey_family, run_report,
 };
@@ -73,13 +73,13 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
     .expect("workspace target exists while tests run");
     let output = tempfile::Builder::new()
         .prefix("stateful-journey-")
-        .tempdir_in(target)
+        .tempdir_in(&target)
         .expect("private report output under target");
     let summary = run_report(&ReportArgs {
         input: ReportInput::GeneratedFamily {
             family: STATEFUL_CHAT_JOURNEY_FAMILY.into(),
             seed: 42,
-            cases: 2,
+            cases: 8,
         },
         out: output.path().to_path_buf(),
         strict_oracle: true,
@@ -89,22 +89,64 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
     .await
     .expect("representative journeys execute");
 
-    assert_eq!(summary.total(), 2);
+    assert_eq!(summary.total(), 8);
     assert_eq!(summary.failed(), 0, "{summary:#?}");
-    for case_index in 0..2 {
+    let mut retained_input = None;
+    for case_index in 0..8 {
         let input = output.path().join(format!(
-            "chat-journey-v1-seed-42-case-{case_index}-input.v1.json"
+            "chat-journey-v1-seed-42-case-{case_index}-generated-input.json"
         ));
         assert!(input.is_file(), "generated input must exist before replay");
+        let saved: GeneratedScenarioInputV1 =
+            serde_json::from_str(&std::fs::read_to_string(&input).expect("read generated input"))
+                .expect("parse generated input");
+        saved.validate().expect("supported generated input version");
+        assert_eq!(saved.case.case_index, case_index);
+        if case_index == 1 {
+            assert_eq!(saved.case.subject, GeneratedSubjectKind::RetainedRelay);
+            retained_input = Some(input.clone());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(input).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
+            for artifact in [
+                input,
+                output
+                    .path()
+                    .join(format!("chat-journey-v1-seed-42-case-{case_index}.json")),
+                output.path().join(format!(
+                    "chat-journey-v1-seed-42-case-{case_index}-fixture.v1.json"
+                )),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(artifact)
+                        .expect("generated artifact metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
         }
     }
+
+    let replay_output = tempfile::Builder::new()
+        .prefix("stateful-journey-replay-")
+        .tempdir_in(&target)
+        .expect("private replay output under target");
+    let replay = run_report(&ReportArgs {
+        input: ReportInput::GeneratedInputs {
+            paths: vec![retained_input.expect("retained input was saved")],
+        },
+        out: replay_output.path().to_path_buf(),
+        strict_oracle: true,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
+    })
+    .await
+    .expect("saved retained-relay input replays");
+    assert_eq!(replay.total(), 1);
+    assert_eq!(replay.failed(), 0, "{replay:#?}");
 }
 
 fn assert_legal_journey(steps: &[ScenarioStep]) {
@@ -156,6 +198,7 @@ fn assert_legal_journey(steps: &[ScenarioStep]) {
                 for member in removed {
                     assert!(members.remove(member));
                     admins.remove(member);
+                    online.remove(member);
                 }
             }
             ScenarioStep::SelfUpdate { client, .. }
