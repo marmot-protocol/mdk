@@ -2,19 +2,23 @@
 //! fault.
 //!
 //! When an in-horizon same-epoch rival arrives with no fork-source anchor, the
-//! engine halts the group: it parks the rival reconsiderable and writes the
-//! durable `unrecoverable` marker. Those two writes are one logical transition.
+//! engine halts the group: it parks the rival reconsiderable, writes the
+//! durable `unrecoverable` marker, and retires the raw transport wrapper that
+//! carried the rival here. Those writes are one logical transition.
 //! A `ConvergenceDeferred` row is admitted to a convergence pass but cannot
 //! *open* one (`convergence_input::can_start_pass`), so a park that survives a
 //! failed marker write is the worst of both: the group is not halted, it keeps
 //! committing on a possibly-losing branch, redelivery dedups against the parked
 //! row, and stale-deferred retirement eventually terminalizes it. Permanent
-//! divergence produced by the halt's own error path.
+//! divergence produced by the halt's own error path. A wrapper retirement that
+//! survives the same failure is that failure through the other input source:
+//! the retry lifecycle drops the wrapper that redelivers the rival to a group
+//! that never halted.
 //!
 //! The invariant these tests pin, at the widest fault window: after the halt
-//! path fails, EITHER the group is durably unrecoverable, OR the rival still
-//! holds a pass-opening state so a follow-up convergence run reaches the halt.
-//! Never neither.
+//! path fails, EITHER the group is durably unrecoverable, OR its inputs still
+//! carry the rival back — the content row in a pass-opening state, the raw
+//! wrapper still awaiting retry. Never neither.
 
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -48,7 +52,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -149,6 +153,58 @@ impl TransportPeeler for MockPeeler {
                 recipient: recipient.clone(),
             },
         })
+    }
+}
+
+/// Peeler that refuses every group-message peel while armed, so an ingested
+/// rival is retained as a raw `PeelDeferred` wrapper. Disarming it lets the
+/// same transport message peel on a later live ingest — the direct-seam
+/// re-entry `PeelDeferred` rows exist for (`recorded_message_outcome` returns
+/// no recorded outcome for them, unlike every other retained state).
+#[derive(Clone, Default)]
+struct DeferringPeeler(Arc<AtomicBool>);
+
+impl DeferringPeeler {
+    fn arm(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn disarm(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for DeferringPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if self.0.load(Ordering::SeqCst) {
+            return Err(PeelerError::DecryptFailed);
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
     }
 }
 
@@ -687,12 +743,20 @@ fn reopen_over_fault_storage(
     f: &StrandedRivalFixture,
     storage: FaultStorage,
 ) -> Engine<FaultStorage> {
+    reopen_over_fault_storage_with_peeler(f, storage, Box::new(MockPeeler))
+}
+
+fn reopen_over_fault_storage_with_peeler(
+    f: &StrandedRivalFixture,
+    storage: FaultStorage,
+    peeler: Box<dyn TransportPeeler>,
+) -> Engine<FaultStorage> {
     let mut engine = EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(&f.local_seed))
         .account_identity_proof_signer(proof_signer(&f.local_seed))
         .feature_registry(selfremove_registry())
-        .peeler(Box::new(MockPeeler))
+        .peeler(peeler)
         .build()
         .unwrap();
     engine.hydrate_all_stored_groups().unwrap();
@@ -711,6 +775,12 @@ fn rival_state(f: &StrandedRivalFixture) -> MessageState {
         .get_message(&content_id(&f.competing))
         .unwrap()
         .state
+}
+
+/// State of the raw transport wrapper that carried the rival — the row keyed
+/// by the outer transport id, not the content-derived one.
+fn raw_wrapper_state(f: &StrandedRivalFixture) -> MessageState {
+    f.local_storage.get_message(&f.competing.id).unwrap().state
 }
 
 /// Whether this device is still sitting on its own epoch-1 branch — i.e. the
@@ -796,11 +866,90 @@ async fn halt_marker_write_failure_leaves_the_rival_able_to_reopen_the_halt() {
 }
 
 #[tokio::test]
+async fn direct_ingest_keeps_the_raw_wrapper_replayable_when_the_halt_write_fails() {
+    // The rival can reach the halt through a live ingest of a wrapper that is
+    // already in the retry lifecycle, and that seam has no compensating error
+    // arm: `do_ingest` propagates the halt's failure untouched. So the
+    // wrapper's retirement is safe only as part of the halt's own transaction.
+    // Retiring it before the marker+park leaves a group that never halted with
+    // the redelivery source of the only input that can re-derive the halt
+    // already out of the retry lifecycle.
+    let f = stranded_rival_fixture("direct").await;
+    let halt_marker_fault = HaltMarkerFault::default();
+    let peeler = DeferringPeeler::default();
+    let mut local = reopen_over_fault_storage_with_peeler(
+        &f,
+        FaultStorage {
+            inner: f.local_storage.clone(),
+            halt_marker_fault: halt_marker_fault.clone(),
+            park_fault: ParkWriteFault::default(),
+        },
+        Box::new(peeler.clone()),
+    );
+
+    // An arrival this context cannot peel is retained as a raw wrapper.
+    peeler.arm();
+    local.ingest(f.competing.clone()).await.unwrap();
+    assert_eq!(
+        raw_wrapper_state(&f),
+        MessageState::PeelDeferred,
+        "an unpeelable arrival must be retained for retry"
+    );
+
+    // Redelivery under a peelable context reaches the fail-closed halt through
+    // the direct seam, with the halt's durable marker write faulted.
+    peeler.disarm();
+    halt_marker_fault.arm();
+    let result = local.ingest(f.competing.clone()).await;
+    assert!(
+        result.is_err(),
+        "the failed halt-marker write must propagate, got {result:?}"
+    );
+
+    assert_ne!(
+        raw_wrapper_state(&f),
+        MessageState::Processed,
+        "a halt that did not commit must not retire the wrapper that carried \
+         the rival to it"
+    );
+    assert_eq!(
+        raw_wrapper_state(&f),
+        MessageState::PeelDeferred,
+        "the wrapper must stay exactly as replayable as it was before the \
+         rolled-back halt"
+    );
+
+    // Same no-silent-divergence invariant as the other halt fault windows.
+    assert!(
+        is_halted(&f) || rival_state(&f) == MessageState::Created,
+        "after a failed halt the group must be durably unrecoverable or the \
+         rival must still hold a pass-opening state; got unrecoverable={} \
+         rival={:?}",
+        is_halted(&f),
+        rival_state(&f)
+    );
+    assert!(still_on_own_branch(&local, &f));
+    assert!(
+        drive_convergence_until_halted(&mut local, &f).await,
+        "a retained pass-opening rival must let a later run reach the halt"
+    );
+    assert!(
+        local.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id } if group_id == &f.group_id
+        )),
+        "the halt must reach the app so it can surface repair"
+    );
+}
+
+#[tokio::test]
 async fn replayed_raw_wrapper_is_not_retired_when_the_halt_write_fails() {
     // The rival can also reach the halt through the replay seam rather than a
     // live ingest. That seam retires the raw transport wrapper `Processed` on a
     // successful outcome, which takes it out of the retry lifecycle for good. A
-    // halt that failed its durable write must never look successful to it.
+    // halt that failed its durable write must never look successful to it —
+    // guarded here twice over, by the halt's own transaction and by the seam's
+    // error arm, so removing either one is visible.
     let f = stranded_rival_fixture("replay").await;
     let halt_marker_fault = HaltMarkerFault::default();
     let mut local = reopen_over_fault_storage(
@@ -845,14 +994,15 @@ async fn replayed_raw_wrapper_is_not_retired_when_the_halt_write_fails() {
     );
 
     assert_ne!(
-        f.local_storage.get_message(&f.competing.id).unwrap().state,
+        raw_wrapper_state(&f),
         MessageState::Processed,
         "the raw wrapper must not be retired while the halt it triggered failed"
     );
     assert_eq!(
-        f.local_storage.get_message(&f.competing.id).unwrap().state,
+        raw_wrapper_state(&f),
         MessageState::Retryable,
-        "the seam's error path must hand the wrapper back for retry"
+        "the wrapper stays replayable twice over: the halt's transaction rolls \
+         its retirement back, and the seam's error path hands it back for retry"
     );
 
     // Same no-silent-divergence invariant as the direct-ingest seam.

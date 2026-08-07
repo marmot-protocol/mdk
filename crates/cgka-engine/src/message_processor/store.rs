@@ -543,36 +543,13 @@ impl<S: StorageProvider> Engine<S> {
         raw_msg_id: &MessageId,
         reason: &str,
     ) -> Result<(), EngineError> {
-        match self.storage.get_message(raw_msg_id) {
-            Ok(record)
-                if matches!(
-                    record.state,
-                    MessageState::PeelDeferred | MessageState::Retryable
-                ) =>
-            {
-                self.storage
-                    .update_message_state(raw_msg_id, MessageState::Failed)?;
-                self.audit_group(
-                    &record.group_id,
-                    crate::audit_helpers::message_state_transition_event(
-                        hex::encode(raw_msg_id.as_slice()),
-                        Some(record.state),
-                        MessageState::Failed,
-                        Some(record.epoch),
-                        reason,
-                    ),
-                );
-                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339);
-                // a `Retryable` row — input buffered pre-peel while the group
-                // could not ingest — sits outside the cap.
-                if record.state == MessageState::PeelDeferred {
-                    self.note_peel_deferred_row_retired(&record.group_id);
-                }
-                Ok(())
-            }
-            Ok(_) | Err(StorageError::NotFound) => Ok(()),
-            Err(err) => Err(EngineError::Storage(err)),
-        }
+        let retired = retire_raw_transport_message_if_awaiting_retry(
+            &self.storage,
+            raw_msg_id,
+            MessageState::Failed,
+        )?;
+        self.note_raw_transport_message_retired(retired, reason);
+        Ok(())
     }
 
     /// Retire a raw transport wrapper whose content-derived row is now the
@@ -587,34 +564,89 @@ impl<S: StorageProvider> Engine<S> {
         raw_msg_id: &MessageId,
         reason: &str,
     ) -> Result<(), EngineError> {
-        match self.storage.get_message(raw_msg_id) {
-            Ok(record)
-                if matches!(
-                    record.state,
-                    MessageState::PeelDeferred | MessageState::Retryable
-                ) =>
-            {
-                self.storage
-                    .update_message_state(raw_msg_id, MessageState::Processed)?;
-                self.audit_group(
-                    &record.group_id,
-                    crate::audit_helpers::message_state_transition_event(
-                        hex::encode(raw_msg_id.as_slice()),
-                        Some(record.state),
-                        MessageState::Processed,
-                        Some(record.epoch),
-                        reason,
-                    ),
-                );
-                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339).
-                if record.state == MessageState::PeelDeferred {
-                    self.note_peel_deferred_row_retired(&record.group_id);
-                }
-                Ok(())
-            }
-            Ok(_) | Err(StorageError::NotFound) => Ok(()),
-            Err(err) => Err(EngineError::Storage(err)),
+        let retired = retire_raw_transport_message_if_awaiting_retry(
+            &self.storage,
+            raw_msg_id,
+            MessageState::Processed,
+        )?;
+        self.note_raw_transport_message_retired(retired, reason);
+        Ok(())
+    }
+
+    /// Audit a completed raw-wrapper retirement and release the flood-cap slot
+    /// the row held, if any.
+    ///
+    /// Split from [`retire_raw_transport_message_if_awaiting_retry`] so a
+    /// caller that runs the durable write inside a transaction performs these
+    /// forensic / in-memory steps only once that transaction has committed.
+    pub(crate) fn note_raw_transport_message_retired(
+        &mut self,
+        retired: Option<RetiredRawTransportWrapper>,
+        reason: &str,
+    ) {
+        let Some(retired) = retired else {
+            return;
+        };
+        self.audit_group(
+            &retired.group_id,
+            crate::audit_helpers::message_state_transition_event(
+                hex::encode(retired.id.as_slice()),
+                Some(retired.previous_state),
+                retired.verdict,
+                Some(retired.epoch),
+                reason,
+            ),
+        );
+        // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339); a
+        // `Retryable` row — input buffered pre-peel while the group could not
+        // ingest — sits outside the cap.
+        if retired.previous_state == MessageState::PeelDeferred {
+            self.note_peel_deferred_row_retired(&retired.group_id);
         }
+    }
+}
+
+/// A raw transport wrapper that just left the retry lifecycle: enough of the
+/// pre-write row to audit the transition and release the cap slot it held.
+pub(crate) struct RetiredRawTransportWrapper {
+    id: MessageId,
+    group_id: GroupId,
+    epoch: EpochId,
+    previous_state: MessageState,
+    verdict: MessageState,
+}
+
+/// Storage-level core of the raw-wrapper retirements: write `verdict` over a
+/// wrapper that is still awaiting retry, and report the row it retired.
+/// `None` means there was nothing to retire — no such row, or one that already
+/// left the retry lifecycle.
+///
+/// Free-standing over the storage handle rather than a method on [`Engine`] so
+/// a caller inside `with_transaction` can join the retirement to the durable
+/// transition it belongs with, instead of committing it separately beforehand.
+pub(crate) fn retire_raw_transport_message_if_awaiting_retry<S: StorageProvider>(
+    storage: &S,
+    raw_msg_id: &MessageId,
+    verdict: MessageState,
+) -> Result<Option<RetiredRawTransportWrapper>, EngineError> {
+    match storage.get_message(raw_msg_id) {
+        Ok(record)
+            if matches!(
+                record.state,
+                MessageState::PeelDeferred | MessageState::Retryable
+            ) =>
+        {
+            storage.update_message_state(raw_msg_id, verdict)?;
+            Ok(Some(RetiredRawTransportWrapper {
+                id: record.id,
+                group_id: record.group_id,
+                epoch: record.epoch,
+                previous_state: record.state,
+                verdict,
+            }))
+        }
+        Ok(_) | Err(StorageError::NotFound) => Ok(None),
+        Err(err) => Err(EngineError::Storage(err)),
     }
 }
 

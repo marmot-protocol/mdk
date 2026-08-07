@@ -859,19 +859,10 @@ impl<S: StorageProvider> Engine<S> {
                 // loudly instead, mirroring the materialization-time
                 // missing-recovery-material precedent.
                 if convergence_refused_for_missing_anchor {
-                    // The fail-closed path parks the rival's content row
-                    // durably; retire a raw wrapper that arrived through the
-                    // retry lifecycle the same way the convergence-buffer
-                    // path does.
-                    if raw_msg_id != msg.id {
-                        self.mark_raw_transport_message_processed_if_awaiting_retry(
-                            &raw_msg_id,
-                            "parked_for_fork_repair",
-                        )?;
-                    }
                     return self.fail_closed_missing_fork_recovery_anchor(
                         group_id,
                         &msg.id,
+                        &raw_msg_id,
                         &openmls_msg,
                         msg_epoch,
                         current,
@@ -2019,7 +2010,8 @@ impl<S: StorageProvider> Engine<S> {
     /// `GroupUnrecoverable` so the app can surface repair. Canonical state is
     /// left untouched.
     ///
-    /// The marker and the park are ONE durable unit, and within it the marker
+    /// The marker, the park, and the retirement of the raw wrapper that
+    /// carried the rival here are ONE durable unit, and within it the marker
     /// comes first. Parking demotes a row that arrived `Created` to
     /// `ConvergenceDeferred`, which convergence admits to a pass but cannot use
     /// to *open* one (`convergence_input::can_start_pass`). A park that
@@ -2027,39 +2019,58 @@ impl<S: StorageProvider> Engine<S> {
     /// input that could re-derive the halt: the group stays `Stable` on a
     /// possibly-losing branch, redelivery dedups against the parked row, and
     /// stale-deferred retirement eventually terminalizes it — permanent
-    /// divergence manufactured by the halt's own error path. The convergence
-    /// coordinator's halt needs no transaction only because it persists no
-    /// disposition before its marker, so every input keeps the state that
-    /// re-derives the identical halt on the next run.
+    /// divergence manufactured by the halt's own error path. Retiring the raw
+    /// wrapper ahead of that unit is the same failure through the other
+    /// source: the retry lifecycle loses the wrapper that redelivers the rival
+    /// while the group it was meant to halt never halted. The direct ingest
+    /// seam has no compensating error arm — `do_ingest` propagates the failure
+    /// untouched — so the retirement is safe only inside the transaction. The
+    /// convergence coordinator's halt needs no transaction only because it
+    /// persists no disposition before its marker, so every input keeps the
+    /// state that re-derives the identical halt on the next run.
     fn fail_closed_missing_fork_recovery_anchor(
         &mut self,
         group_id: GroupId,
         msg_id: &MessageId,
+        raw_msg_id: &MessageId,
         openmls_msg: &TransportMessage,
         msg_epoch: EpochId,
         current: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
-        self.storage
-            .with_transaction(|storage| -> Result<(), EngineError> {
-                // Durable marker first: a crash after the commit still halts
-                // the group on the next session open via
-                // `sync_unrecoverable_halt_from_storage` (mdk#971).
-                let mut group = storage.get_group(&group_id)?;
-                if !group.unrecoverable {
-                    group.unrecoverable = true;
-                    storage.put_group(&group)?;
-                }
-                // Park the rival keyed by its source epoch, as replay requires,
-                // so a verified repair path can still reconsider it. This
-                // writes through `self.storage`, which IS the handle the
-                // transaction is running on, so it joins the same unit.
-                self.persist_openmls_wire_message(
-                    openmls_msg,
-                    &group_id,
-                    msg_epoch,
-                    MessageState::ConvergenceDeferred,
-                )
-            })?;
+        let retired_wrapper =
+            self.storage
+                .with_transaction(|storage| -> Result<_, EngineError> {
+                    // Durable marker first: a crash after the commit still halts
+                    // the group on the next session open via
+                    // `sync_unrecoverable_halt_from_storage` (mdk#971).
+                    let mut group = storage.get_group(&group_id)?;
+                    if !group.unrecoverable {
+                        group.unrecoverable = true;
+                        storage.put_group(&group)?;
+                    }
+                    // Park the rival keyed by its source epoch, as replay requires,
+                    // so a verified repair path can still reconsider it. This
+                    // writes through `self.storage`, which IS the handle the
+                    // transaction is running on, so it joins the same unit.
+                    self.persist_openmls_wire_message(
+                        openmls_msg,
+                        &group_id,
+                        msg_epoch,
+                        MessageState::ConvergenceDeferred,
+                    )?;
+                    // The parked content row is now the durable witness; a raw
+                    // wrapper that arrived through the retry lifecycle has done its
+                    // job and must leave it instead of being re-peeled on every
+                    // later publish-cycle replay (mdk#339), exactly as the
+                    // convergence-buffer path retires it. A no-op on the direct
+                    // path, where no separate raw row is awaiting retry.
+                    super::store::retire_raw_transport_message_if_awaiting_retry(
+                        storage,
+                        raw_msg_id,
+                        MessageState::Processed,
+                    )
+                })?;
+        self.note_raw_transport_message_retired(retired_wrapper, "parked_for_fork_repair");
         self.audit_group(
             &group_id,
             crate::audit_helpers::message_state_changed_event(

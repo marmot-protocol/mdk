@@ -76,8 +76,9 @@ backend on the same rail.
 
 - **File:** `fail_closed_halt_atomicity.rs`
   - **Owns:** Durability of the missing-anchor fail-closed halt under injected `put_group` / `put_message` faults. The
-    durable `unrecoverable` marker and the `ConvergenceDeferred` park of the rival are one transaction, so a failure
-    never leaves the group unhalted with its rival demoted out of a pass-opening state; covers the direct-ingest and
+    durable `unrecoverable` marker, the `ConvergenceDeferred` park of the rival, and the retirement of the raw
+    transport wrapper that carried it are one transaction, so a failure never leaves the group unhalted with its rival
+    demoted out of a pass-opening state or its wrapper out of the retry lifecycle; covers the direct-ingest and
     replay seams
 
 - **File:** `hydration_quarantine.rs`
