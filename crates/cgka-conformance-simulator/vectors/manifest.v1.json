@@ -483,7 +483,7 @@
         "seeded sequential admin churn with per-round traffic",
         "competing same-epoch admin-policy commits with seeded delivery order",
         "restart between commit publish and delivery with post-restart traffic",
-        "latecomer added under commit pressure with forward-secrecy zero-count assertions"
+        "latecomer added under commit pressure with pre-join mailbox-isolation zero-count assertions (ciphertext-exposure forward secrecy stays with latecomer-forward-secrecy/v1)"
       ],
       "next": "Promote a reviewed case into vectors/ once the joiner join-commit deferral is resolved."
     }
