@@ -122,6 +122,9 @@ pub struct AccountManager {
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
     tearing_down: Arc<StdMutex<HashSet<String>>>,
+    worker_transactions: Arc<Mutex<()>>,
+    #[cfg(test)]
+    reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
 }
 
 #[derive(Clone)]
@@ -3306,6 +3309,28 @@ impl AccountManager {
             shared,
             workers: Arc::new(Mutex::new(HashMap::new())),
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
+            worker_transactions: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_reconcile_rollback_waiter(&self, notify: std::sync::mpsc::Sender<()>) {
+        self.reconcile_rollback_waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(notify);
+    }
+
+    #[cfg(test)]
+    fn signal_reconcile_rollback(&self) {
+        let mut waiters = self
+            .reconcile_rollback_waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for notify in waiters.drain(..) {
+            let _ = notify.send(());
         }
     }
 
@@ -3336,6 +3361,8 @@ impl AccountManager {
                 .filter_map(|account_id| workers.remove(account_id))
                 .collect::<Vec<_>>()
         };
+        #[cfg(test)]
+        self.signal_reconcile_rollback();
         let mut shutdowns = JoinSet::new();
         for worker in workers {
             shutdowns.spawn(async move {
@@ -3378,6 +3405,7 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
         self.set_account_tearing_down(&account.account_id_hex, true);
@@ -3415,6 +3443,7 @@ impl AccountManager {
         nsec: &str,
         acknowledge_possible_key_package_orphan: bool,
     ) -> Result<(), AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         if !acknowledge_possible_key_package_orphan {
             return Err(AppError::AccountSetupRecoveryRequired);
@@ -3490,6 +3519,7 @@ impl AccountManager {
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
         self.set_account_tearing_down(&account.account_id_hex, true);
@@ -3511,12 +3541,13 @@ impl AccountManager {
 
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         let account = self
             .app
             .account_home()
             .set_account_signed_out(account_ref, false)?;
-        self.reconcile().await?;
+        self.reconcile_locked().await?;
         let running = self
             .workers
             .lock()
@@ -3533,6 +3564,11 @@ impl AccountManager {
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
+        self.reconcile_locked().await
+    }
+
+    async fn reconcile_locked(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
@@ -3682,6 +3718,7 @@ impl AccountManager {
     }
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
+        let _worker_transaction = self.worker_transactions.lock().await;
         self.shared.lifecycle().ensure_running()?;
         let worker = self.workers.lock().await.remove(account_id_hex);
         if let Some(worker) = worker {
@@ -3689,7 +3726,7 @@ impl AccountManager {
             // Await teardown before reconcile opens the replacement.
             worker.shutdown().await;
         }
-        self.reconcile().await
+        self.reconcile_locked().await
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
@@ -4670,6 +4707,7 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        let _worker_transaction = self.worker_transactions.lock().await;
         let workers = {
             let mut workers = self.workers.lock().await;
             workers

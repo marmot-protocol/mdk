@@ -83,6 +83,8 @@ mod external_signer;
 mod groups;
 mod ids;
 mod key_package_records;
+#[cfg(test)]
+mod local_open_test_gate;
 mod media;
 mod messages;
 mod nostr_secret;
@@ -447,6 +449,8 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    local_open_gates: local_open_test_gate::LocalOpenGates,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
@@ -1160,6 +1164,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1221,6 +1227,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1265,13 +1273,15 @@ impl MarmotApp {
     }
 
     #[cfg(test)]
-    pub(crate) fn account_session_is_owned(&self, label: &str) -> Result<bool, AppError> {
-        let label = self.account_home().account(label)?.label;
-        Ok(self
-            .account_session_owners
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&label))
+    pub(crate) fn install_local_open_gate(
+        &self,
+        account_ref: &str,
+        reached: std::sync::mpsc::Sender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), AppError> {
+        let label = self.account_home().account(account_ref)?.label;
+        self.local_open_gates.install(label, reached, proceed);
+        Ok(())
     }
 
     /// Open the account's exclusive in-memory engine session.
@@ -1345,7 +1355,10 @@ impl MarmotApp {
         let open = blocking_app_task(move || {
             let _permit = permit;
             app.ensure_account_state(&label)?;
-            app.open_account(&label, &relay_plane_for_open)
+            let open = app.open_account(&label, &relay_plane_for_open);
+            #[cfg(test)]
+            app.local_open_gates.wait(&label);
+            open
         })
         .await?;
         if let Some(lifecycle) = &lifecycle {

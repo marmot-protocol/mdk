@@ -112,7 +112,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   before reopening, preventing two engines over one session database from
   staging conflicting epoch work. Failed account reconcile now shuts down every
   worker it spawned before returning, including workers still opening locally,
-  so a contended startup does not leave unrelated account session guards held.
+  so a contended startup does not leave unrelated account session guards held;
+  worker lifecycle transactions are serialized so a concurrent reconcile or
+  teardown cannot remove workers another successful caller relied on.
 
 - Group state changes settle promptly again when messages are queued for
   sending: a queued ordinary message no longer delays the next convergence
