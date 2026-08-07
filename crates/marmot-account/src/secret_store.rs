@@ -10,7 +10,11 @@ use zeroize::Zeroizing;
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, AccountSummary, LOCAL_FILE_SECRET_BACKEND};
 use crate::io::{overwrite_file_with_zeros, read_secret_json, write_secret_json};
-use crate::keyring::{initialize_keyring_store, map_keyring_error};
+#[cfg(target_os = "ios")]
+use crate::keyring::build_legacy_ios_keyring_entry;
+use crate::keyring::{
+    build_keyring_entry, initialize_keyring_store, map_keyring_error, write_keyring_secret,
+};
 
 #[derive(Serialize, Deserialize)]
 struct StoredAccountSecret {
@@ -172,7 +176,74 @@ impl KeychainSecretStore {
     }
 
     fn entry_for_account(&self, account_id_hex: &str) -> AccountHomeResult<keyring_core::Entry> {
-        keyring_core::Entry::new(&self.service_name, account_id_hex).map_err(map_keyring_error)
+        build_keyring_entry(&self.service_name, account_id_hex)
+    }
+
+    #[cfg(target_os = "ios")]
+    fn legacy_entry_for_account(
+        &self,
+        account_id_hex: &str,
+    ) -> AccountHomeResult<keyring_core::Entry> {
+        build_legacy_ios_keyring_entry(&self.service_name, account_id_hex)
+    }
+
+    fn remove_entry(entry: keyring_core::Entry) -> AccountHomeResult<()> {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+            Err(err) => Err(map_keyring_error(err)),
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    fn remove_legacy_ios_secret(&self, account_id_hex: &str) -> AccountHomeResult<()> {
+        Self::remove_entry(self.legacy_entry_for_account(account_id_hex)?)
+    }
+
+    #[cfg(target_os = "ios")]
+    fn cleanup_legacy_ios_secret(&self, account_id_hex: &str) {
+        let _ = self.remove_legacy_ios_secret(account_id_hex);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    fn cleanup_legacy_ios_secret(&self, _account_id_hex: &str) {}
+
+    #[cfg(target_os = "ios")]
+    fn migrate_legacy_ios_secret(
+        &self,
+        account: &AccountSummary,
+    ) -> AccountHomeResult<nostr::Keys> {
+        let legacy_secret = match self
+            .legacy_entry_for_account(&account.account_id_hex)?
+            .get_password()
+        {
+            Ok(secret) => Zeroizing::new(secret),
+            Err(keyring_core::Error::NoEntry) => {
+                return Err(AccountHomeError::SecretNotFound(
+                    account.account_id_hex.clone(),
+                ));
+            }
+            Err(err) => return Err(map_keyring_error(err)),
+        };
+        let keys = nostr::Keys::parse(legacy_secret.as_str())
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
+
+        write_keyring_secret(
+            &self.service_name,
+            &account.account_id_hex,
+            legacy_secret.as_str(),
+        )?;
+        let replacement = self
+            .entry_for_account(&account.account_id_hex)?
+            .get_password()
+            .map(Zeroizing::new)
+            .map_err(map_keyring_error)?;
+        if replacement.as_str() != legacy_secret.as_str() {
+            return Err(AccountHomeError::SecretStore(
+                "iOS background keychain migration verification failed".into(),
+            ));
+        }
+        self.cleanup_legacy_ios_secret(&account.account_id_hex);
+        Ok(keys)
     }
 }
 
@@ -187,6 +258,21 @@ impl AccountSecretStore for KeychainSecretStore {
                 let _secret_key = Zeroizing::new(secret_key);
                 Ok(true)
             }
+            #[cfg(target_os = "ios")]
+            Err(keyring_core::Error::NoEntry) => {
+                match self
+                    .legacy_entry_for_account(account_id_hex)?
+                    .get_password()
+                {
+                    Ok(secret_key) => {
+                        let _secret_key = Zeroizing::new(secret_key);
+                        Ok(true)
+                    }
+                    Err(keyring_core::Error::NoEntry) => Ok(false),
+                    Err(err) => Err(map_keyring_error(err)),
+                }
+            }
+            #[cfg(not(target_os = "ios"))]
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(err) => Err(map_keyring_error(err)),
         }
@@ -194,9 +280,13 @@ impl AccountSecretStore for KeychainSecretStore {
 
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
         let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
-        self.entry_for_account(&account.account_id_hex)?
-            .set_password(secret_key_hex.as_str())
-            .map_err(map_keyring_error)
+        write_keyring_secret(
+            &self.service_name,
+            &account.account_id_hex,
+            secret_key_hex.as_str(),
+        )?;
+        self.cleanup_legacy_ios_secret(&account.account_id_hex);
+        Ok(())
     }
 
     fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
@@ -206,9 +296,14 @@ impl AccountSecretStore for KeychainSecretStore {
         {
             Ok(secret_key) => {
                 let secret_key = Zeroizing::new(secret_key);
-                nostr::Keys::parse(secret_key.as_str())
-                    .map_err(|_| AccountHomeError::InvalidSecretKey)
+                let keys = nostr::Keys::parse(secret_key.as_str())
+                    .map_err(|_| AccountHomeError::InvalidSecretKey)?;
+                self.cleanup_legacy_ios_secret(&account.account_id_hex);
+                Ok(keys)
             }
+            #[cfg(target_os = "ios")]
+            Err(keyring_core::Error::NoEntry) => self.migrate_legacy_ios_secret(account),
+            #[cfg(not(target_os = "ios"))]
             Err(keyring_core::Error::NoEntry) => Err(AccountHomeError::SecretNotFound(
                 account.account_id_hex.clone(),
             )),
@@ -217,12 +312,24 @@ impl AccountSecretStore for KeychainSecretStore {
     }
 
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()> {
-        match self
-            .entry_for_account(&account.account_id_hex)?
-            .delete_credential()
+        #[cfg(target_os = "ios")]
         {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(err) => Err(map_keyring_error(err)),
+            let current_result = self
+                .entry_for_account(&account.account_id_hex)
+                .and_then(Self::remove_entry);
+            let legacy_result = self.remove_legacy_ios_secret(&account.account_id_hex);
+            match (current_result, legacy_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(current), Err(legacy)) => Err(AccountHomeError::SecretStore(format!(
+                    "failed to remove current and legacy iOS keychain entries: current: {current}; legacy: {legacy}"
+                ))),
+            }
+        }
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            Self::remove_entry(self.entry_for_account(&account.account_id_hex)?)
         }
     }
 }
