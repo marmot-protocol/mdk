@@ -48,7 +48,7 @@ fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
 }
 
 #[test]
-fn schema_declares_every_executable_step_kind() {
+fn v2_schema_declares_every_v2_executable_step_kind() {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
             .expect("scenario IR schema parses");
@@ -63,8 +63,65 @@ fn schema_declares_every_executable_step_kind() {
                 .expect("step kind")
         })
         .collect::<BTreeSet<_>>();
-    let executable_kinds = ScenarioStep::KINDS.iter().copied().collect::<BTreeSet<_>>();
+    let executable_kinds = ScenarioStep::KINDS
+        .iter()
+        .copied()
+        .filter(|kind| *kind != "update_group_profile")
+        .collect::<BTreeSet<_>>();
     assert_eq!(schema_kinds, executable_kinds);
+}
+
+#[test]
+fn v3_schema_adds_full_group_profile_updates_without_rewriting_v2() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/scenario-ir.v3.schema.json"))
+            .expect("scenario IR v3 schema parses");
+    assert_eq!(schema["properties"]["spec_version"]["const"], "3");
+    assert_eq!(
+        schema["$defs"]["update_group_profile"]["properties"]["type"]["const"],
+        "update_group_profile"
+    );
+    assert_eq!(
+        schema["$defs"]["step"]["oneOf"][0]["$ref"],
+        "scenario-ir.v2.schema.json#/$defs/step"
+    );
+}
+
+#[test]
+fn group_profile_update_is_v3_only_and_requires_at_least_one_field() {
+    let mut scenario = ScenarioSpec {
+        name: "scenario-ir/group-profile-v3".into(),
+        spec_version: "3".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![ScenarioStep::UpdateGroupProfile {
+            client: "alice".into(),
+            name: None,
+            description: Some("new description".into()),
+            pending: "profile".into(),
+        }],
+    };
+
+    let compiled = compile_scenario(&scenario).expect("v3 profile update compiles");
+    assert_eq!(
+        compiled.actions[0].schedule.action_type,
+        "update_group_profile"
+    );
+
+    scenario.spec_version = "2".into();
+    let error = compile_scenario(&scenario).expect_err("v2 must reject the v3 action");
+    assert_eq!(error.kind, "scenario_compile_error");
+    assert!(error.message.contains("requires ScenarioSpec version 3"));
+
+    scenario.spec_version = "3".into();
+    scenario.steps = vec![ScenarioStep::UpdateGroupProfile {
+        client: "alice".into(),
+        name: None,
+        description: None,
+        pending: "profile".into(),
+    }];
+    let error = compile_scenario(&scenario).expect_err("empty profile update must fail");
+    assert!(error.message.contains("must change a name or description"));
 }
 
 #[test]

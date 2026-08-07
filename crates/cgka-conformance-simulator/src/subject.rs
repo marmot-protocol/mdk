@@ -201,7 +201,8 @@ pub struct SubjectSelfUpdate<'a> {
 pub struct SubjectUpdateGroupData<'a> {
     pub action_id: &'a str,
     pub client: &'a str,
-    pub name: &'a str,
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
     pub pending: &'a str,
 }
 
@@ -611,6 +612,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             | ScenarioStep::RemoveMembers { .. }
             | ScenarioStep::SelfUpdate { .. }
             | ScenarioStep::UpdateGroupData { .. }
+            | ScenarioStep::UpdateGroupProfile { .. }
             | ScenarioStep::UpdateAdminPolicy { .. }
             | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
             | ScenarioStep::Leave { .. } => SubjectCapability::GroupMutation,
@@ -1303,7 +1305,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
     ) -> Result<(), SubjectError> {
         let client = self.client_mut(action.client)?;
         client.name_next_scenario_input(action.action_id);
-        let pending_ref = client.update_group_data(action.name.to_owned()).await;
+        let pending_ref = client
+            .update_group_profile(
+                action.name.map(str::to_owned),
+                action.description.map(str::to_owned),
+            )
+            .await;
         self.insert_pending(action.pending, action.client, pending_ref)
     }
 
@@ -2395,7 +2402,8 @@ mod tests {
                 .update_group_data(SubjectUpdateGroupData {
                     action_id: pending,
                     client,
-                    name,
+                    name: Some(name),
+                    description: None,
                     pending,
                 })
                 .await
@@ -2448,7 +2456,8 @@ mod tests {
                 .update_group_data(SubjectUpdateGroupData {
                     action_id: pending,
                     client,
-                    name,
+                    name: Some(name),
+                    description: None,
                     pending,
                 })
                 .await

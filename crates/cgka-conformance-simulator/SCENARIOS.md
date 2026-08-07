@@ -55,7 +55,17 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/group-data-update.v1.json`
 - Setup: Alice creates a group with Bob, then updates group data.
 - Pressure: normal metadata commit path.
-- Expected: recipients advance one epoch and keep the same member set.
+- Expected: recipients advance one epoch, keep the same member set, and project the requested name with the preserved
+  empty description. This remains the backward-compatible Scenario IR v2 name-only contract.
+
+### `group-profile-update/v1`
+
+- File: `vectors/group-profile-update.v1.json`
+- Setup: Alice creates a group with Bob, sets only the description, then sets only the name through Scenario IR v3.
+- Pressure: partial-update preservation plus full profile propagation through the normal commit, publication,
+  transport, and projection path.
+- Expected: both clients project the requested values, match exact canonical MLS state, actively decrypt in both
+  directions, and retain no pending work. Agreement on the same stale profile fails the expected-value oracle.
 
 ### `current-profile-required-set/v1`
 

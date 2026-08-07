@@ -79,7 +79,7 @@ the property-test registry. This file is the agent-facing model.
     `tests/proptest_invariants.rs` generate symbolic canonicalization, capability, lifecycle, and restart cases locally.
 
 - **Module:** `src/scenario.rs`
-  - **Role:** Serializable `ScenarioSpec` v2 plus `run_scenario_spec` / `run_scenario_report` /
+  - **Role:** Serializable `ScenarioSpec` v2/v3 plus `run_scenario_spec` / `run_scenario_report` /
     `run_vector_fixture_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a
     `ScenarioTrace` or a serializable report with the executed scenario, metadata, step log, flattened epoch changes,
     app invalidations, recoveries, expectation failures, and invariant failures. `ObserveExact` opts a portable scenario
@@ -88,9 +88,10 @@ the property-test registry. This file is the agent-facing model.
     Membership operations include invite, admin removal, leave, and leaf self-update through the same subject contract.
 
 - **Module:** `src/scenario_ir.rs`
-  - **Role:** Canonical ScenarioSpec v2 compiler. It validates input, assigns stable action ids, records the deterministic
-    virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
-    selected subject executes anything. The JSON contract is `schemas/scenario-ir.v2.schema.json`.
+  - **Role:** Canonical ScenarioSpec v2/v3 compiler. It validates input, assigns stable action ids, records the deterministic
+  virtual-time schedule, derives per-action adapter capabilities, and preflights the complete schedule before the
+    selected subject executes anything. V2 remains replayable; v3 adds full group-profile updates. The JSON contracts
+    are `schemas/scenario-ir.v2.schema.json` and `schemas/scenario-ir.v3.schema.json`.
 
 - **Module:** `src/topology.rs`
   - **Role:** Adapter-neutral accounts, devices, processes, groups, relays, roles, and binary/policy versions. The
@@ -302,9 +303,9 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md), and
 [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) when filling a gap.
 
-- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting
-  inside a strategy; the scripted tests cover it today. Upgrade and group-data update lifecycle are covered by separate
-  generated properties.
+- **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupProfile.** Invite needs client minting
+  inside a strategy; the scripted tests cover it today. Upgrade and profile update lifecycle are covered by separate
+  generated properties, while portable v2/v3 vectors assert the intended public profile values.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO /
   Reverse / SeededRandom.
 - **Generated family coverage is now convergence-focused but not exhaustive.** `send-leave/v1` records lifecycle

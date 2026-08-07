@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-07-23",
+  "updated": "2026-08-07",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -60,9 +60,25 @@
       "coverage": [
         "group data update commit",
         "recipient epoch advance",
-        "stable member set across metadata update"
+        "stable member set across metadata update",
+        "requested name and preserved description projection"
       ],
-      "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
+      "next": "Keep as the backward-compatible Scenario IR v2 name-only profile fixture."
+    },
+    {
+      "id": "group-profile-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-profile-update.v1.json",
+      "coverage": [
+        "Scenario IR v3 full group-profile update",
+        "requested name and description projection",
+        "partial-update preservation of omitted profile fields",
+        "exact canonical equivalence",
+        "active bidirectional decryptability",
+        "strict pending-work closure"
+      ],
+      "next": "Use as the canonical full-profile update fixture and mutation sentinel."
     },
     {
       "id": "current-profile-required-set/v1",

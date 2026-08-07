@@ -1105,6 +1105,7 @@ mod tests {
                         observation.epoch,
                         observation.member_count,
                         observation.group_name.clone(),
+                        observation.group_description.clone(),
                         observation.received_payloads.clone(),
                     )
                 })

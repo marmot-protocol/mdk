@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    SCENARIO_IR_VERSION, ScenarioRunError, ScenarioSpec, ScenarioStep, SubjectFailureCategory,
+    SCENARIO_IR_V2_VERSION, ScenarioRunError, ScenarioSpec, ScenarioStep, SubjectFailureCategory,
 };
 
 pub const SCENARIO_AUTHORING_VERSION: &str = "1";
@@ -91,7 +91,7 @@ pub fn compile_authoring_scenario(
     let expanded = expand_sequence(&authored.steps)?;
     let canonical = ScenarioSpec {
         name: authored.name.clone(),
-        spec_version: SCENARIO_IR_VERSION.into(),
+        spec_version: SCENARIO_IR_V2_VERSION.into(),
         clients: authored.clients.clone(),
         topology: authored.topology.clone(),
         steps: expanded
@@ -557,7 +557,7 @@ mod tests {
         let decoded: ScenarioAuthoringSpec =
             serde_json::from_value(json).expect("deserialize authoring document");
         let canonical = compile_authoring_scenario(&decoded).expect("lower authoring document");
-        assert_eq!(canonical.spec_version, SCENARIO_IR_VERSION);
+        assert_eq!(canonical.spec_version, SCENARIO_IR_V2_VERSION);
         assert_eq!(canonical.steps.len(), 2);
         assert!(
             serde_json::to_value(&canonical)
@@ -599,7 +599,7 @@ steps:
           payload: two
 "#;
         let canonical = compile_authoring_yaml(yaml).expect("YAML lowers");
-        assert_eq!(canonical.spec_version, SCENARIO_IR_VERSION);
+        assert_eq!(canonical.spec_version, SCENARIO_IR_V2_VERSION);
         assert!(matches!(
             canonical.steps[1],
             ScenarioStep::AdvanceTime { delta_ms: 500 }

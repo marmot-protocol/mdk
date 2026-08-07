@@ -50,6 +50,7 @@ semantic_mutations! {
     OutputInvalidation => "output_invalidation",
     PublicationAcknowledgement => "publication_acknowledgement",
     RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
+    GroupProfileProjection => "group_profile_projection",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +85,31 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
         SemanticMutation::OutputInvalidation => output_invalidation_sentinel(),
         SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
+        SemanticMutation::GroupProfileProjection => group_profile_projection_sentinel(),
     };
     MutationSentinelResult {
         mutation,
         baseline_observation,
         mutant_observation,
     }
+}
+
+fn group_profile_projection_sentinel() -> (String, String) {
+    let requested = ("after", "after description");
+    let baseline_projection = requested;
+    // Mutant: the commit advances protocol state, but the app-facing profile
+    // projection remains on the previous values.
+    let mutant_projection = ("before", "");
+    (
+        format!(
+            "name:{}:description:{}",
+            baseline_projection.0, baseline_projection.1
+        ),
+        format!(
+            "name:{}:description:{}",
+            mutant_projection.0, mutant_projection.1
+        ),
+    )
 }
 
 fn candidate(id: &str, depth: u64, digest: u8) -> ReferenceCandidate {

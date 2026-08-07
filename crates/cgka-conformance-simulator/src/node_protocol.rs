@@ -82,6 +82,11 @@ pub enum NodeCommandV1 {
         action_id: String,
         name: String,
     },
+    UpdateGroupProfile {
+        action_id: String,
+        name: Option<String>,
+        description: Option<String>,
+    },
     UpdateAdminPolicy {
         action_id: String,
         admin_accounts: Vec<String>,
@@ -480,6 +485,19 @@ impl NodeServer {
                     .map_err(app_node_error)?;
                 Ok(ack(action_id, summary.published, None))
             }
+            NodeCommandV1::UpdateGroupProfile {
+                action_id,
+                name,
+                description,
+            } => {
+                let group_id = active_group(state)?;
+                let summary = state
+                    .runtime
+                    .update_group_profile(&state.account_id, &group_id, name, description)
+                    .await
+                    .map_err(app_node_error)?;
+                Ok(ack(action_id, summary.published, None))
+            }
             NodeCommandV1::UpdateAdminPolicy {
                 action_id,
                 admin_accounts,
@@ -716,6 +734,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
         members,
         admins,
         group.profile.name.clone(),
+        group.profile.description.clone(),
         mls.member_count,
     );
     let messages = state

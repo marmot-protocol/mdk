@@ -324,7 +324,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
                 stimuli.insert(ScenarioStimulus::SelfUpdate);
                 commits += 1;
             }
-            ScenarioStep::UpdateGroupData { .. } => {
+            ScenarioStep::UpdateGroupData { .. } | ScenarioStep::UpdateGroupProfile { .. } => {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
                 commits += 1;
             }
@@ -495,10 +495,12 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
         let first_epoch = trace.observations[0].epoch;
         let first_member_count = trace.observations[0].member_count;
         let first_group_name = &trace.observations[0].group_name;
+        let first_group_description = &trace.observations[0].group_description;
         if trace.observations.iter().all(|observation| {
             observation.epoch == first_epoch
                 && observation.member_count == first_member_count
                 && &observation.group_name == first_group_name
+                && &observation.group_description == first_group_description
         }) {
             behaviors.insert(OracleBehavior::ClientConvergence);
         }
@@ -618,6 +620,9 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
             {
                 behaviors.insert(OracleBehavior::MemberRemoved);
             }
+        }
+        TraceExpectation::GroupProfile { .. } => {
+            behaviors.insert(OracleBehavior::ClientState);
         }
         TraceExpectation::ClientsConverged { member_count, .. } => {
             behaviors.insert(OracleBehavior::ClientConvergence);
@@ -809,6 +814,7 @@ mod tests {
             epoch,
             member_count,
             group_name: group_name.into(),
+            group_description: String::new(),
             canonical_state: None,
             scenario_input_ledger: Vec::new(),
             pending_work: None,

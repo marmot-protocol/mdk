@@ -146,8 +146,8 @@ Used by selector, canonicalization, capability, quiescence, and restart properti
 
 ## Current Gaps
 
-- Generated `HarnessIntent` values do not include invite or group-data updates. Fixed scenarios and separate lifecycle
-  properties cover those today.
+- Generated `HarnessIntent` values do not include invite or group-profile updates. Fixed v2/v3 scenarios, an explicit
+  expected-value profile oracle, and separate publish-lifecycle properties cover those today.
 - Partition behavior is covered by fixed scenarios and generated families. The property-test delivery profiles cover
   FIFO, reverse, and seeded random delivery.
 - File-backed restart and subprocess-kill coverage exercises close/reopen and crash recovery with an intact encrypted

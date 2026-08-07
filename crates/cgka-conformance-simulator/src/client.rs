@@ -1077,16 +1077,24 @@ impl HarnessClient {
     }
 
     pub async fn update_group_data(&mut self, name: impl Into<String>) -> PendingStateRef {
+        self.update_group_profile(Some(name.into()), None).await
+    }
+
+    pub async fn update_group_profile(
+        &mut self,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> PendingStateRef {
         let gid = self.default_group.clone().expect("group");
         let res = self
             .engine_mut()
             .send(SendIntent::UpdateGroupData {
                 group_id: gid.clone(),
-                name: Some(name.into()),
-                description: None,
+                name,
+                description,
             })
             .await
-            .expect("update group data");
+            .expect("update group profile");
         self.publish_group_evolution(res, &gid, "update_group_data")
             .await
     }
@@ -1767,6 +1775,15 @@ impl HarnessClient {
     pub fn group_name(&self) -> String {
         let gid = self.default_group.clone().expect("group");
         self.engine().group_record(&gid).expect("group record").name
+    }
+
+    /// Current app-facing group description mirrored from signed group-profile state.
+    pub fn group_description(&self) -> String {
+        let gid = self.default_group.clone().expect("group");
+        self.engine()
+            .group_record(&gid)
+            .expect("group record")
+            .description
     }
 
     pub fn group_id(&self) -> GroupId {

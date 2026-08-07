@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marmot-protocol.org/schemas/scenario-ir.v3.schema.json",
+  "title": "MDK adapter-neutral scenario IR v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "spec_version", "clients", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "spec_version": { "const": "3" },
+    "clients": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "topology": { "$ref": "scenario-ir.v2.schema.json#/$defs/topology" },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    }
+  },
+  "$defs": {
+    "update_group_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "client", "pending"],
+      "properties": {
+        "type": { "const": "update_group_profile" },
+        "client": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "pending": { "type": "string", "minLength": 1 }
+      },
+      "anyOf": [
+        { "required": ["name"] },
+        { "required": ["description"] }
+      ]
+    },
+    "step": {
+      "oneOf": [
+        { "$ref": "scenario-ir.v2.schema.json#/$defs/step" },
+        { "$ref": "#/$defs/update_group_profile" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "group", "action"],
+          "properties": {
+            "type": { "const": "in_group" },
+            "group": { "type": "string", "minLength": 1 },
+            "action": { "$ref": "#/$defs/update_group_profile" }
+          }
+        }
+      ]
+    }
+  }
+}
