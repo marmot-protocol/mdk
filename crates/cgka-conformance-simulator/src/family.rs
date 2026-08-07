@@ -391,16 +391,21 @@ where
 /// commonly produces a different terminal failure. These units are attempted
 /// before individual noise steps.
 pub fn semantic_reduction_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
-    let mut open = std::collections::BTreeMap::<String, usize>::new();
+    let mut open = std::collections::BTreeMap::<SemanticPairKey, Vec<usize>>::new();
     let mut units = Vec::new();
     for (index, step) in steps.iter().enumerate() {
-        let Some((key, opens)) = semantic_pair_marker(step, None) else {
+        let Some((key, opens)) = semantic_pair_marker(step, &[]) else {
             continue;
         };
         if opens {
-            open.insert(key, index);
-        } else if let Some(start) = open.remove(&key) {
-            units.push(vec![start, index]);
+            open.entry(key).or_default().push(index);
+        } else if let Some(mut starts) = open.remove(&key) {
+            if let Some(start) = starts.pop() {
+                units.push(vec![start, index]);
+            }
+            if !starts.is_empty() {
+                open.insert(key, starts);
+            }
         }
     }
     units
@@ -415,44 +420,70 @@ fn semantic_minimization_units(steps: &[ScenarioStep]) -> Vec<Vec<usize>> {
     units
 }
 
-fn semantic_pair_marker(step: &ScenarioStep, group: Option<&str>) -> Option<(String, bool)> {
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SemanticPairKey {
+    group_path: Vec<String>,
+    resource: SemanticPairResource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SemanticPairResource {
+    Withheld(String),
+    Partition,
+    Offline(String),
+    Process(String),
+    Storage(String),
+}
+
+fn semantic_pair_marker(
+    step: &ScenarioStep,
+    group_path: &[String],
+) -> Option<(SemanticPairKey, bool)> {
     if let ScenarioStep::InGroup {
         group: nested_group,
         action,
     } = step
     {
-        return semantic_pair_marker(action, Some(nested_group));
+        let mut nested_path = group_path.to_vec();
+        nested_path.push(nested_group.clone());
+        return semantic_pair_marker(action, &nested_path);
     }
-    let prefix = group.map_or_else(String::new, |group| format!("group:{group}:"));
-    match step {
+    let (resource, opens) = match step {
         ScenarioStep::WithholdMessage { label, .. } => {
-            Some((format!("{prefix}withhold:{label}"), true))
+            (SemanticPairResource::Withheld(label.clone()), true)
         }
         ScenarioStep::ReleaseWithheld { label } => {
-            Some((format!("{prefix}withhold:{label}"), false))
+            (SemanticPairResource::Withheld(label.clone()), false)
         }
-        ScenarioStep::SetPartition { .. } => Some((format!("{prefix}partition"), true)),
-        ScenarioStep::ClearPartition => Some((format!("{prefix}partition"), false)),
+        ScenarioStep::SetPartition { .. } => (SemanticPairResource::Partition, true),
+        ScenarioStep::ClearPartition => (SemanticPairResource::Partition, false),
         ScenarioStep::SetClientOffline { client } => {
-            Some((format!("{prefix}offline:{client}"), true))
+            (SemanticPairResource::Offline(client.clone()), true)
         }
         ScenarioStep::ReconnectClient { client } => {
-            Some((format!("{prefix}offline:{client}"), false))
+            (SemanticPairResource::Offline(client.clone()), false)
         }
         ScenarioStep::CrashProcess { process } => {
-            Some((format!("{prefix}process:{process}"), true))
+            (SemanticPairResource::Process(process.clone()), true)
         }
         ScenarioStep::RestartProcess { process } => {
-            Some((format!("{prefix}process:{process}"), false))
+            (SemanticPairResource::Process(process.clone()), false)
         }
         ScenarioStep::InjectStorageFault { fault } => {
-            Some((format!("{prefix}storage:{}", fault.target), true))
+            (SemanticPairResource::Storage(fault.target.clone()), true)
         }
         ScenarioStep::ClearStorageFault { target } => {
-            Some((format!("{prefix}storage:{target}"), false))
+            (SemanticPairResource::Storage(target.clone()), false)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((
+        SemanticPairKey {
+            group_path: group_path.to_vec(),
+            resource,
+        },
+        opens,
+    ))
 }
 
 fn remove_step_indices(steps: &mut Vec<ScenarioStep>, indices: &[usize]) {

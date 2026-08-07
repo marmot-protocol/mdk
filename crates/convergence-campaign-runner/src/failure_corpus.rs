@@ -208,7 +208,11 @@ impl FailureCorpusV1 {
         fingerprint: &str,
         classification: FailureClassificationV1,
     ) -> Result<(), RunnerError> {
-        self.entry_mut(fingerprint)?.classification = classification;
+        let entry = self.entry_mut(fingerprint)?;
+        entry.classification = classification;
+        if classification == FailureClassificationV1::EnvironmentFailure {
+            entry.reduction_candidate = None;
+        }
         Ok(())
     }
 
@@ -386,6 +390,63 @@ fn write_private_atomic(path: &Path, bytes: &[u8], code: &str) -> Result<(), Run
     Ok(())
 }
 
+fn write_private_atomic_new(path: &Path, bytes: &[u8], code: &str) -> Result<(), RunnerError> {
+    let parent = artifact_parent(path);
+    fs_private::create_dir_all_private(parent)
+        .map_err(|error| RunnerError::environment(format!("{code}_directory"), error))?;
+    let file_name = path.file_name().ok_or_else(|| {
+        RunnerError::validation(format!("{code}_path"), "artifact path has no file name")
+    })?;
+    let temporary = loop {
+        let sequence = PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            sequence
+        ));
+        match fs_private::create_new_private(&candidate) {
+            Ok(mut file) => {
+                let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+                if let Err(error) = write_result {
+                    drop(file);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(RunnerError::environment(format!("{code}_write"), error));
+                }
+                drop(file);
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(RunnerError::environment(format!("{code}_write"), error));
+            }
+        }
+    };
+    if let Err(error) = std::fs::hard_link(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Err(RunnerError::validation(
+                format!("{code}_exists"),
+                "artifact output path already exists",
+            ))
+        } else {
+            Err(RunnerError::environment(format!("{code}_publish"), error))
+        };
+    }
+    if let Err(error) = std::fs::remove_file(&temporary) {
+        let _ = std::fs::remove_file(path);
+        return Err(RunnerError::environment(
+            format!("{code}_temporary_cleanup"),
+            error,
+        ));
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| RunnerError::environment(format!("{code}_directory_sync"), error))?;
+    Ok(())
+}
+
 pub fn promote_capsule_into_corpus(
     corpus_path: &Path,
     fingerprint: &str,
@@ -409,6 +470,12 @@ pub fn promote_capsule_into_corpus(
     capsule
         .validate()
         .map_err(|error| RunnerError::validation("promotion_capsule_invalid", error.to_string()))?;
+    if capsule.failure.digest != fingerprint {
+        return Err(RunnerError::validation(
+            "promotion_capsule_fingerprint_mismatch",
+            "source capsule failure digest does not match the selected corpus fingerprint",
+        ));
+    }
     let vector =
         cgka_conformance_simulator::promote_failure_capsule_to_vector(&capsule, generator_version)
             .map_err(|error| {
@@ -424,7 +491,19 @@ pub fn promote_capsule_into_corpus(
     };
     update_failure_corpus(corpus_path, |corpus| {
         corpus.entry_mut(fingerprint)?;
-        write_private_atomic(output_path, &vector_bytes, "promoted_vector")?;
+        for existing in corpus
+            .entries
+            .values()
+            .flat_map(|entry| &entry.promoted_vectors)
+        {
+            if paths_refer_to_same_artifact(&existing.path, output_path)? {
+                return Err(RunnerError::validation(
+                    "promoted_vector_path_recorded",
+                    "promoted vector output path is already recorded in the corpus",
+                ));
+            }
+        }
+        write_private_atomic_new(output_path, &vector_bytes, "promoted_vector")?;
         corpus.record_promotion(fingerprint, promotion.clone())
     })?;
     Ok(promotion)
@@ -514,13 +593,13 @@ pub fn observation_from_node_capsule(
     } else {
         FailureClassificationV1::ProductDefect
     };
-    let fingerprint = hex::encode(Sha256::digest(
-        format!(
-            "{scenario_digest}:{}:{}:{}",
-            capsule.participant, capsule.action_id, capsule.code
-        )
-        .as_bytes(),
-    ));
+    let fingerprint = fingerprint_parts(&[
+        "node_failure_v1",
+        scenario_digest,
+        &capsule.participant,
+        &capsule.action_id,
+        &capsule.code,
+    ]);
     let terminal = if classification == FailureClassificationV1::EnvironmentFailure {
         TerminalOutcomeClassification::EnvironmentFailure
     } else {
@@ -583,9 +662,6 @@ pub fn record_distributed_failure(
         crate::DistributedBackendV1::VirtualMachine(_) => CampaignAdapterV1::VirtualMachine,
     };
     let classification = classify_runner_error(error);
-    let fingerprint = hex::encode(Sha256::digest(
-        format!("{}:{}:{adapter:?}", manifest.scenario.sha256, error.code).as_bytes(),
-    ));
     let build_matrix = manifest
         .participants
         .iter()
@@ -602,17 +678,19 @@ pub fn record_distributed_failure(
             TerminalOutcomeClassification::OracleViolation
         }
     };
+    let failure_identity = FailureIdentityV1 {
+        classification: terminal,
+        failing_action_type: "distributed_run".into(),
+        failure_kind: error.code.clone(),
+    };
+    let fingerprint = semantic_failure_fingerprint(&manifest.scenario.sha256, &failure_identity);
     let observation = observation_from_scenario_failure(
         fingerprint,
         classification,
         adapter,
         build_matrix,
         scenario.clone(),
-        FailureIdentityV1 {
-            classification: terminal,
-            failing_action_type: "distributed_run".into(),
-            failure_kind: error.code.clone(),
-        },
+        failure_identity,
         classification == FailureClassificationV1::EnvironmentFailure,
     );
     update_failure_corpus(&path, |corpus| corpus.record(observation))?;
@@ -635,6 +713,35 @@ fn artifact_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+fn fingerprint_parts(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn semantic_failure_fingerprint(
+    scenario_digest: &str,
+    failure_identity: &FailureIdentityV1,
+) -> String {
+    #[derive(Serialize)]
+    struct FingerprintMaterial<'a> {
+        version: &'static str,
+        scenario_digest: &'a str,
+        failure_identity: &'a FailureIdentityV1,
+    }
+
+    let material = serde_json::to_vec(&FingerprintMaterial {
+        version: "semantic_failure_v1",
+        scenario_digest,
+        failure_identity,
+    })
+    .expect("serializing semantic failure identity cannot fail");
+    hex::encode(Sha256::digest(material))
 }
 
 fn validate_digest(digest: &str, code: &str) -> Result<(), RunnerError> {

@@ -3,15 +3,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_conformance_simulator::{
     FailureCapsuleSensitivity, FailureCapsuleV1, FailureIdentityV1, ScenarioSpec,
     ScenarioStepLogEntry, ScenarioStepStatus, ScenarioTopologyV2, SubjectFailureCategory,
-    TerminalOutcomeClassification, TraceExpectation, VectorMismatch, run_scenario_report,
-    write_failure_capsule,
+    TerminalOutcomeClassification, TraceExpectation, VectorMismatch,
+    node_protocol::{NodeErrorV1, NodeFailureCapsuleV1},
+    run_scenario_report, write_failure_capsule,
 };
 use convergence_campaign_runner::{
     CampaignAdapterV1, ContainerBackendV1, DistributedBackendV1, DistributedCampaignManifestV1,
     DistributedParticipantV1, FailureClassificationV1, FailureCorpusObservationV1, FailureCorpusV1,
-    OciRuntimeV1, RunnerError, ScenarioArtifactV1, build_adapter_reduction_candidate,
-    observation_from_capsule, promote_capsule_into_corpus, read_failure_corpus,
-    record_distributed_failure, update_failure_corpus, write_failure_corpus,
+    OciRuntimeV1, RunnerError, ScenarioArtifactV1, VirtualMachineBackendV1,
+    build_adapter_reduction_candidate, observation_from_capsule, observation_from_node_capsule,
+    promote_capsule_into_corpus, read_failure_corpus, record_distributed_failure,
+    update_failure_corpus, write_failure_corpus,
 };
 use sha2::Digest;
 
@@ -113,6 +115,46 @@ fn non_layer_specific_failures_move_to_the_next_smaller_adapter() {
 }
 
 #[test]
+fn environmental_reclassification_clears_cross_adapter_reduction() {
+    let fingerprint = "e".repeat(64);
+    let scenario = ScenarioSpec {
+        name: "reclassified-environment/v1".into(),
+        spec_version: "2".into(),
+        clients: Vec::new(),
+        topology: ScenarioTopologyV2::default(),
+        steps: Vec::new(),
+    };
+    let mut corpus = FailureCorpusV1::default();
+    corpus
+        .record(FailureCorpusObservationV1 {
+            fingerprint: fingerprint.clone(),
+            classification: FailureClassificationV1::ProductDefect,
+            adapter: CampaignAdapterV1::Process,
+            build_matrix: BTreeMap::new(),
+            seeds: BTreeSet::new(),
+            capsule_paths: BTreeSet::new(),
+            reduction_candidate: build_adapter_reduction_candidate(
+                CampaignAdapterV1::Process,
+                false,
+                scenario,
+                FailureIdentityV1 {
+                    classification: TerminalOutcomeClassification::OracleViolation,
+                    failing_action_type: "tick".into(),
+                    failure_kind: "timeout".into(),
+                },
+            ),
+        })
+        .unwrap();
+    assert!(corpus.entries[&fingerprint].reduction_candidate.is_some());
+
+    corpus
+        .reclassify(&fingerprint, FailureClassificationV1::EnvironmentFailure)
+        .unwrap();
+
+    assert!(corpus.entries[&fingerprint].reduction_candidate.is_none());
+}
+
+#[test]
 fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
     let root = tempfile::tempdir().unwrap();
     let scenario = ScenarioSpec {
@@ -153,18 +195,48 @@ fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
         faults: Vec::new(),
         output_dir: root.path().join("output"),
     };
-    let path = record_distributed_failure(
-        &manifest,
+    let primary_error = RunnerError {
+        code: "container_scenario".into(),
+        message: "not persisted".into(),
+    };
+    let path = record_distributed_failure(&manifest, &primary_error, &scenario).unwrap();
+    let vm_manifest = DistributedCampaignManifestV1 {
+        backend: DistributedBackendV1::VirtualMachine(VirtualMachineBackendV1 {
+            driver_contract_version: "1".into(),
+            driver: "vm-driver".into(),
+            driver_args: Vec::new(),
+            cleanup_args: vec!["cleanup".into(), "{manifest}".into()],
+            timeout_seconds: 30,
+            cleanup_timeout_seconds: 10,
+            capabilities: BTreeSet::new(),
+        }),
+        ..manifest.clone()
+    };
+    record_distributed_failure(&vm_manifest, &primary_error, &scenario).unwrap();
+    record_distributed_failure(
+        &vm_manifest,
         &RunnerError {
-            code: "container_scenario".into(),
-            message: "not persisted".into(),
+            code: "container_node_launch".into(),
+            message: "also not persisted".into(),
         },
         &scenario,
     )
     .unwrap();
     let corpus = read_failure_corpus(&path).unwrap();
-    let entry = corpus.entries.values().next().unwrap();
+    assert_eq!(corpus.entries.len(), 2);
+    let entry = corpus
+        .entries
+        .values()
+        .find(|entry| entry.recurrence_count == 2)
+        .unwrap();
     assert_eq!(entry.classification, FailureClassificationV1::ProductDefect);
+    assert_eq!(
+        entry.adapters,
+        BTreeSet::from([
+            CampaignAdapterV1::Container,
+            CampaignAdapterV1::VirtualMachine,
+        ])
+    );
     assert_eq!(
         entry.reduction_candidate.as_ref().unwrap().target_adapter,
         CampaignAdapterV1::Process
@@ -271,6 +343,14 @@ async fn successful_promotion_records_validated_capsule_and_vector_digests() {
         corpus.record(observation(&fingerprint, CampaignAdapterV1::Engine))
     })
     .unwrap();
+    let unrelated_fingerprint = "f".repeat(64);
+    update_failure_corpus(&corpus_path, |corpus| {
+        corpus.record(observation(
+            &unrelated_fingerprint,
+            CampaignAdapterV1::Engine,
+        ))
+    })
+    .unwrap();
 
     let alias_error = promote_capsule_into_corpus(
         &corpus_path,
@@ -282,6 +362,33 @@ async fn successful_promotion_records_validated_capsule_and_vector_digests() {
     .unwrap_err();
     assert_eq!(alias_error.code, "promotion_output_alias");
     assert!(read_failure_corpus(&corpus_path).is_ok());
+
+    let mismatch_error = promote_capsule_into_corpus(
+        &corpus_path,
+        &unrelated_fingerprint,
+        &capsule_path,
+        &vector_path,
+        "test",
+    )
+    .unwrap_err();
+    assert_eq!(
+        mismatch_error.code,
+        "promotion_capsule_fingerprint_mismatch"
+    );
+    assert!(!vector_path.exists());
+
+    let occupied_path = root.path().join("occupied-vector.v1.json");
+    fs_private::write_private(&occupied_path, b"existing evidence").unwrap();
+    let occupied_error = promote_capsule_into_corpus(
+        &corpus_path,
+        &fingerprint,
+        &capsule_path,
+        &occupied_path,
+        "test",
+    )
+    .unwrap_err();
+    assert_eq!(occupied_error.code, "promoted_vector_exists");
+    assert_eq!(std::fs::read(&occupied_path).unwrap(), b"existing evidence");
 
     let promoted = promote_capsule_into_corpus(
         &corpus_path,
@@ -305,6 +412,58 @@ async fn successful_promotion_records_validated_capsule_and_vector_digests() {
             .promoted_vectors
             .contains(&promoted)
     );
+
+    let reused_path_error = promote_capsule_into_corpus(
+        &corpus_path,
+        &fingerprint,
+        &capsule_path,
+        &vector_path,
+        "test",
+    )
+    .unwrap_err();
+    assert_eq!(reused_path_error.code, "promoted_vector_path_recorded");
+    assert_eq!(
+        read_failure_corpus(&corpus_path).unwrap().entries[&fingerprint]
+            .promoted_vectors
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn node_capsule_fingerprints_are_unambiguous_for_delimiter_fields() {
+    let error = NodeErrorV1 {
+        code: "failure".into(),
+        category: SubjectFailureCategory::Protocol,
+        retryable: false,
+        message: "normalized".into(),
+    };
+    let first = NodeFailureCapsuleV1::from_error("a:b", "c", &error);
+    let second = NodeFailureCapsuleV1::from_error("a", "b:c", &error);
+    let scenario = ScenarioSpec {
+        name: "node-fingerprint/v1".into(),
+        spec_version: "2".into(),
+        clients: Vec::new(),
+        topology: ScenarioTopologyV2::default(),
+        steps: Vec::new(),
+    };
+
+    let first = observation_from_node_capsule(
+        &first,
+        "first.json".into(),
+        scenario.clone(),
+        &"a".repeat(64),
+        BTreeMap::new(),
+    );
+    let second = observation_from_node_capsule(
+        &second,
+        "second.json".into(),
+        scenario,
+        &"a".repeat(64),
+        BTreeMap::new(),
+    );
+
+    assert_ne!(first.fingerprint, second.fingerprint);
 }
 
 #[tokio::test]
