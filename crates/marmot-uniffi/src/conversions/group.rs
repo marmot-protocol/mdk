@@ -6,8 +6,8 @@ use marmot_app::{
     AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
     AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupLifecycleState,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppProtocolProfile, AppQuarantinedGroup,
-    GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
+    AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
+    AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
@@ -376,6 +376,52 @@ pub(crate) fn group_details_ffi(
     })
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupRosterFfi {
+    pub group_id_hex: String,
+    pub members: Vec<GroupMemberDetailsFfi>,
+    pub epoch: u64,
+    /// Mirrors [`Self::epoch`] for cheap membership-screen change detection.
+    /// Non-roster MLS commits may bump this revision; directory-only display-name
+    /// changes do not.
+    pub roster_revision: u64,
+    pub self_membership: SelfMembershipFfi,
+    pub member_count: u32,
+    pub lifecycle_state: GroupLifecycleStateFfi,
+}
+
+pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi, MarmotKitError> {
+    let members = roster
+        .members
+        .into_iter()
+        .map(|member| {
+            let npub = npub_for_account_id(&member.member_id_hex).map_err(|err| {
+                MarmotKitError::InvalidIdentity {
+                    details: err.to_string(),
+                }
+            })?;
+            Ok(GroupMemberDetailsFfi {
+                member_id_hex: member.member_id_hex,
+                account: member.account,
+                local: member.local,
+                is_admin: member.is_admin,
+                is_self: member.is_self,
+                npub,
+                display_name: member.display_name,
+            })
+        })
+        .collect::<Result<Vec<_>, MarmotKitError>>()?;
+    Ok(GroupRosterFfi {
+        group_id_hex: roster.group_id_hex,
+        members,
+        epoch: roster.epoch,
+        roster_revision: roster.roster_revision,
+        self_membership: roster.self_membership.into(),
+        member_count: super::saturating_u32(roster.member_count),
+        lifecycle_state: roster.lifecycle_state.into(),
+    })
+}
+
 pub(crate) fn group_management_state_ffi(
     my_account_id_hex: &str,
     details: &GroupDetailsFfi,
@@ -654,5 +700,40 @@ mod profile_presence_tests {
             profile_ffi_fields(profile(true)),
             (true, String::new(), String::new())
         );
+    }
+}
+
+#[cfg(test)]
+mod group_roster_tests {
+    use super::*;
+    use marmot_app::{
+        AppGroupLifecycleState, AppGroupRoster, AppGroupRosterMember, SelfMembership,
+    };
+
+    #[test]
+    fn group_roster_ffi_preserves_self_membership_and_revision() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let roster = AppGroupRoster {
+            group_id_hex: "01".repeat(16),
+            members: vec![AppGroupRosterMember {
+                member_id_hex: self_id.to_owned(),
+                account: Some("alice".to_owned()),
+                local: true,
+                is_admin: true,
+                is_self: true,
+                display_name: Some("Alice".to_owned()),
+            }],
+            epoch: 12,
+            roster_revision: 12,
+            self_membership: SelfMembership::Removed,
+            member_count: 1,
+            lifecycle_state: AppGroupLifecycleState::Stable,
+        };
+        let ffi = group_roster_ffi(roster).expect("ffi roster");
+        assert_eq!(ffi.epoch, 12);
+        assert_eq!(ffi.roster_revision, 12);
+        assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
+        assert_eq!(ffi.members.len(), 1);
+        assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
     }
 }

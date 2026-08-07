@@ -38,6 +38,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   typed `RuntimeBusy` contention so foreground apps can retry and notification
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
+
+- MarmotKit exposes `groupRoster`, a single lightweight membership projection
+  with enriched roster rows, MLS epoch, caller self-membership or eviction
+  state, lifecycle state, and a roster revision derived from epoch for cheap
+  membership-screen change detection. Existing `groupDetails`, `groupMlsState`,
+  and `groupMembers` remain available for compatibility.
   
 - Outbound messages waiting in a group's durable queue are now bounded at 256
   per group. The bound covers every reason a message waits: a group resolving a
