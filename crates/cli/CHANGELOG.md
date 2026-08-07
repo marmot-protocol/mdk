@@ -32,9 +32,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   pipeline that runs after local readiness in chat-list recency order, so
   cold-start readiness no longer scales with stored group count. Group reads
   issued before a group hydrates wait for exactly that group; mutations and
-  catch-ups keep their existing startup deferral order. MarmotKit surfaces a
-  new retryable `GroupHydrationPending` error, distinct from `UnknownGroup`,
-  for the remaining direct-read window.
+  catch-ups keep their existing startup deferral order — `start()` returning
+  therefore does NOT mean a subsequent send is unblocked: sends issued
+  before the initial catch-up completes are queued and replayed in arrival
+  order after it, covering any remaining hydration plus catch-up latency.
+  MarmotKit surfaces a new retryable `GroupHydrationPending` error, distinct
+  from `UnknownGroup`, for the remaining direct-read window.
 
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an

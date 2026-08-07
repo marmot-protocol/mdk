@@ -1147,16 +1147,23 @@ async fn run_startup_hydration_pipeline(
         })
         .unwrap_or_default();
     let batch_delay = startup_hydration_batch_test_delay(app);
+    let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+    let mut pipeline_ok = true;
     loop {
         // Test-only pre-batch hold (`test-policy-overrides` builds): keeps
         // groups in the seeded state so integration tests can assert the
         // persisted chat projection and per-group read behavior. Commands are
-        // still served while holding.
+        // still served while holding, and shutdown interrupts the hold so
+        // teardown exercises the graceful exit rather than the abort timeout.
         if !batch_delay.is_zero() {
             let hold_until = TokioInstant::now() + batch_delay;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(hold_until) => break,
+                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                        return StartupHydrationOutcome::Shutdown;
+                    }
+                    _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
                     command = commands.recv() => match command {
                         Some(command) => {
                             handle_startup_hydration_command(client, command, deferred).await;
@@ -1194,6 +1201,9 @@ async fn run_startup_hydration_pipeline(
                 let message =
                     account_error_message("startup group hydration failed", &AppError::from(err));
                 publish_app_runtime_account_error(events, account_id_hex, account_label, message);
+                // Remaining groups stay gated retryable; the stage sample
+                // below must not report this aborted pipeline as a success.
+                pipeline_ok = false;
                 break;
             }
         };
@@ -1211,7 +1221,7 @@ async fn run_startup_hydration_pipeline(
     shared.app_performance_telemetry().record(
         AppPerformanceOperation::AccountGroupHydration,
         pipeline_started.elapsed(),
-        true,
+        pipeline_ok,
     );
     // Rosters are readable now; finish the once-only self-membership
     // backfill the deferred open had to leave pending.
