@@ -6,13 +6,19 @@
 //!
 //! 1. `MarmotApp::chat_list` on a fresh app instance, **before** any runtime
 //!    exists — the persisted chat-projection read a host renders first.
-//! 2. `MarmotAppRuntime::start()` — full account-worker command readiness.
+//! 2. `MarmotAppRuntime::start()` (the readiness acknowledgement wait), then
+//!    a completed worker-routed `group_members` read — the actual
+//!    group-command readiness boundary hosts experience. The read is what
+//!    proves the worker serves commands; `start()` alone only proves the
+//!    ready signal was observed.
 //!
-//! The two are reported separately because the issue's acceptance criterion is
-//! that (1) stays flat while (2) is allowed to scale until the hydration work
-//! is bounded. Stage attribution (session open, group hydration, profile load,
-//! read-snapshot capture) comes from the `AppPerformanceTelemetry` stage
-//! metrics added alongside this benchmark.
+//! The measurements are reported separately because the issue's acceptance
+//! criterion is that (1) stays flat while (2) is allowed to scale until the
+//! hydration work is bounded. Stage attribution (session open, group
+//! hydration, profile load, read-snapshot capture) comes from the
+//! `AppPerformanceTelemetry` stage metrics added alongside this benchmark,
+//! sampled only after the group read completes so every startup stage sample
+//! is present regardless of executor scheduling.
 //!
 //! Results are printed as stable `MDK_BENCH ...` lines so CI can grep and
 //! archive them; there are no timing assertions (except the smoke case's
@@ -51,6 +57,10 @@ struct BenchReport {
     chat_list: Duration,
     /// `MarmotAppRuntime::start()` wall clock on the same cold store.
     start_ready: Duration,
+    /// First worker-routed `group_members` read after `start()` — the
+    /// completed group command that defines command readiness. Zero for the
+    /// zero-group case.
+    group_read: Duration,
     /// Stage sums from the runtime's `AppPerformanceSnapshot` (one account,
     /// so each stage holds exactly one startup sample).
     account_open_wait_ms: u64,
@@ -64,12 +74,14 @@ impl BenchReport {
     fn print(&self, case: &str) {
         println!(
             "MDK_BENCH startup_scaling case={case} groups={} roster={} \
-             chat_list_ms={} ready_ms={} account_open_wait_ms={} session_open_ms={} \
-             group_hydration_ms={} profile_load_ms={} read_snapshot_ms={}",
+             chat_list_ms={} ready_ms={} group_read_ms={} account_open_wait_ms={} \
+             session_open_ms={} group_hydration_ms={} profile_load_ms={} \
+             read_snapshot_ms={}",
             self.groups,
             self.roster,
             self.chat_list.as_millis(),
             self.start_ready.as_millis(),
+            self.group_read.as_millis(),
             self.account_open_wait_ms,
             self.session_open_ms,
             self.group_hydration_ms,
@@ -101,15 +113,18 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
     let dir_bench = tempfile::tempdir().unwrap();
     let home_bench = AccountHome::open(dir_bench.path());
     home_bench.create_account(BENCH_ACCOUNT).unwrap();
+    let mut group_ids = Vec::with_capacity(groups);
     {
         let app_fixture = open_store(&dir_bench, &url);
         let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
         let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
         for group in 0..groups {
-            client
-                .create_group(&format!("bench group {group}"), &member_refs)
-                .await
-                .unwrap();
+            group_ids.push(
+                client
+                    .create_group(&format!("bench group {group}"), &member_refs)
+                    .await
+                    .unwrap(),
+            );
         }
     }
 
@@ -125,6 +140,25 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
     runtime.start().await.unwrap();
     let start_ready = start_started.elapsed();
 
+    // Group-command readiness is a completed worker-routed read, not the
+    // `start()` return: readiness acknowledgement and the worker entering its
+    // command loop are separate steps whose gap depends on executor
+    // scheduling. Timing a real `group_members` round-trip probes the
+    // boundary hosts actually experience, and sampling telemetry only after
+    // it guarantees the post-open stage samples are present.
+    let group_read = match group_ids.last() {
+        Some(group_id) => {
+            let read_started = Instant::now();
+            let members = runtime
+                .group_members(BENCH_ACCOUNT, group_id)
+                .await
+                .unwrap();
+            assert_eq!(members.len(), roster + 1, "roster plus the creator");
+            read_started.elapsed()
+        }
+        None => Duration::ZERO,
+    };
+
     let snapshot = runtime
         .shared_services()
         .app_performance_telemetry()
@@ -134,6 +168,7 @@ async fn run_case(groups: usize, roster: usize) -> BenchReport {
         roster,
         chat_list,
         start_ready,
+        group_read,
         account_open_wait_ms: snapshot.account_open.duration_ms.sum_ms,
         session_open_ms: snapshot.account_session_open.duration_ms.sum_ms,
         group_hydration_ms: snapshot.account_group_hydration.duration_ms.sum_ms,

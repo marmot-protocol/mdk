@@ -716,10 +716,11 @@ impl AppClient {
 
     /// Build a group's member records against a caller-provided account-profile
     /// map, avoiding a fresh `profiles_by_id` load per group. `members` loads the
-    /// map for a single read; [`AppClient::group_read_snapshot`] loads it once
-    /// and reuses it across every group so capturing the snapshot stays a single
-    /// profile read plus in-memory engine reads (it runs on the worker readiness
-    /// path).
+    /// map for a single read;
+    /// [`AppClient::group_read_snapshot_with_stage_telemetry`] loads it once
+    /// and reuses it across every group so capturing the snapshot stays a
+    /// single profile read plus in-memory engine reads (it runs on the worker
+    /// readiness path).
     fn members_with_profiles(
         &self,
         group_id: &GroupId,
@@ -835,7 +836,8 @@ impl AppClient {
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
     /// `account: None` / `local: false` during the catch-up window). The worker
-    /// surfaces that error on the account event stream and stops.
+    /// treats that error as a failed local-readiness attempt (fail-closed
+    /// through the ready/reconcile path).
     ///
     /// The per-stage startup telemetry records the shared profile load as
     /// `AccountProfileLoad` (the caller wraps the whole capture as

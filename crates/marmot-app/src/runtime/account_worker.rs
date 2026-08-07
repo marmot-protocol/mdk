@@ -451,21 +451,26 @@ async fn run_app_runtime_account_worker(
     );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
-    // The session is hydrated. Signal command-readiness *now*, before the
-    // read-snapshot capture and the initial relay catch-up. "Ready" means
-    // "hydrated + serving commands", not "caught up": the conversation's
-    // group-detail reads (`Members` / `GroupMlsState` / `QuarantinedGroups`)
-    // route through this worker, and blocking them on the catch-up made the
-    // first conversation opened after a foreground resume take seconds. The
-    // catch-up still runs (below) and its results flow to subscribers via the
-    // normal event mechanism; it is only removed from the readiness/blocking
-    // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
-    // the ready-wait) now measures local hydration readiness; the snapshot
-    // capture, transport activation, subscription registration, and catch-up
-    // have separate asynchronous measurements (mdk#1161 stage telemetry:
-    // `AccountSessionOpen` / `AccountGroupHydration` attribute the open the
-    // worker just awaited, `AccountProfileLoad` / `AccountGroupReadSnapshot`
-    // attribute the capture below).
+    // The session is hydrated. Capture a read snapshot and signal
+    // command-readiness *now*, before the initial relay catch-up. "Ready"
+    // means "hydrated + serving commands", not "caught up": the
+    // conversation's group-detail reads (`Members` / `GroupMlsState` /
+    // `QuarantinedGroups`) route through this worker, and blocking them on
+    // the catch-up made the first conversation opened after a foreground
+    // resume take seconds. The catch-up still runs (below) and its results
+    // flow to subscribers via the normal event mechanism; it is only removed
+    // from the readiness/blocking path. See `GroupReadSnapshot`.
+    // `AccountOpen` (recorded by `reconcile` as the ready-wait) measures
+    // local hydration and snapshot readiness; the mdk#1161 stage telemetry
+    // attributes it (`AccountSessionOpen` / `AccountGroupHydration` for the
+    // open the worker just awaited, `AccountProfileLoad` /
+    // `AccountGroupReadSnapshot` for the capture below).
+    //
+    // Snapshot capture is part of local readiness and stays fail-closed: its
+    // only failure is the shared profile load, and acknowledging readiness
+    // without it would leave `start()` successful with a dead worker — the
+    // failure must surface through the ready/reconcile path, not only the
+    // event stream.
     {
         let open_timings = client.runtime.session().open_timings();
         let telemetry = shared.app_performance_telemetry();
@@ -480,16 +485,6 @@ async fn run_app_runtime_account_worker(
             true,
         );
     }
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(Ok(()));
-    }
-
-    // The snapshot's only failure is the shared profile load. It no longer
-    // gates the ready signal (mdk#1161): a host that raced a group read into
-    // the gap would previously have waited on the full capture even when it
-    // never issued one. On failure, surface the error on the account event
-    // stream and stop this worker — read commands must not silently fall
-    // through to a snapshotless catch-up window.
     let snapshot_started = Instant::now();
     let read_snapshot = {
         let capture =
@@ -510,10 +505,16 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                     message,
                 );
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(err));
+                }
                 return;
             }
         }
     };
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been

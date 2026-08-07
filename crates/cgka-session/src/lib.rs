@@ -197,9 +197,9 @@ pub struct SessionOpenTimings {
     pub engine_build: std::time::Duration,
     /// Stored-group enumeration and hydration time.
     pub group_hydration: std::time::Duration,
-    /// Stored groups that hydrated into live state.
-    pub groups_live: u64,
-    /// Stored groups quarantined during hydration.
+    /// Stored groups quarantined during hydration (in-memory count; the live
+    /// count is deliberately absent — deriving it would re-list storage on
+    /// the open critical path).
     pub groups_quarantined: u64,
 }
 
@@ -355,12 +355,14 @@ impl AccountDeviceSession {
             .set_convergence_policy(config.convergence_policy)
             .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         engine.audit_recorder_health();
+        // In-memory count only: telemetry bookkeeping must neither re-list
+        // storage on the open critical path nor add a failure mode after
+        // hydration already succeeded.
         let open_timings = SessionOpenTimings {
             total: opened_at.elapsed(),
             storage_open,
             engine_build,
             group_hydration,
-            groups_live: engine.live_group_ids()?.len() as u64,
             groups_quarantined: engine.quarantined_groups().len() as u64,
         };
         tracing::debug!(
@@ -370,7 +372,6 @@ impl AccountDeviceSession {
             storage_open_ms = open_timings.storage_open.as_millis() as u64,
             engine_build_ms = open_timings.engine_build.as_millis() as u64,
             group_hydration_ms = open_timings.group_hydration.as_millis() as u64,
-            groups_live = open_timings.groups_live,
             groups_quarantined = open_timings.groups_quarantined,
             "account device session opened"
         );
