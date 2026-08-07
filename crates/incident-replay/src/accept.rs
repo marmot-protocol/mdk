@@ -30,9 +30,10 @@ pub fn accept(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptE
 
 /// Group-data fork: bounded label search. For each ordering, run the synthesized
 /// scenario and accept iff every expectation holds. Branch survival is one of
-/// them — the `ClientsConverged` expectation pins the winner's group name — so
-/// the ordering search and the acceptance gate are the same comparison, and the
-/// persisted vector carries the winner check into CI instead of leaving it here.
+/// them — a per-client `GroupProfile` expectation pins the winner's group name
+/// — so the ordering search and the acceptance gate are the same comparison,
+/// and the persisted vector carries the winner check into CI instead of
+/// leaving it here.
 fn accept_group_data_fork(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()

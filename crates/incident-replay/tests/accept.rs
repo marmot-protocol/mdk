@@ -35,20 +35,27 @@ fn metadata_fork_accepts_with_a_reproducible_vector() {
 
     assert_eq!(vector.scenario_name, "test-topic-fork/v1");
     assert_eq!(vector.scenario.clients.len(), 2);
-    // Three step-level resolution outcomes + ConvergenceDecision + ClientsConverged.
-    assert_eq!(vector.expected_outcomes.len(), 5);
+    // Three step-level resolution outcomes + ConvergenceDecision +
+    // ClientsConverged + one GroupProfile pin per committer.
+    assert_eq!(vector.expected_outcomes.len(), 7);
     // The winner check is not bespoke to this crate any more: it rides in the
     // vector's own expectations, so replaying the persisted artifact in CI also
-    // rejects a run in which the loser's branch was the one that survived.
-    assert!(
-        vector.expected_outcomes.iter().any(|expectation| matches!(
-            expectation,
-            TraceExpectation::ClientsConverged {
-                group_name: Some(name),
-                ..
-            } if name == WINNER_BRANCH
-        )),
-        "accepted vector must pin the winning branch: {:#?}",
+    // rejects a run in which the loser's branch was the one that survived. It
+    // is pinned per client because agreement is not attribution — both
+    // committers sitting on the loser's branch is convergence too.
+    let pinned_to_the_winning_branch = vector
+        .expected_outcomes
+        .iter()
+        .filter(|expectation| {
+            matches!(
+                expectation,
+                TraceExpectation::GroupProfile { name, .. } if name == WINNER_BRANCH
+            )
+        })
+        .count();
+    assert_eq!(
+        pinned_to_the_winning_branch, 2,
+        "accepted vector must pin both committers to the winning branch: {:#?}",
         vector.expected_outcomes
     );
 }
@@ -66,15 +73,20 @@ fn membership_fork_accepts_with_a_reproducible_vector() {
     // ClientsConverged(member_count 3).
     assert_eq!(vector.expected_outcomes.len(), 5);
     // Winner-agnostic by design: a real export cannot attribute the surviving
-    // membership branch, so this shape must not pin a group name.
+    // membership branch, so this shape must not pin a group profile.
     assert!(
-        vector.expected_outcomes.iter().any(|expectation| matches!(
-            expectation,
-            TraceExpectation::ClientsConverged {
-                group_name: None,
-                ..
-            }
-        )),
+        vector
+            .expected_outcomes
+            .iter()
+            .any(|expectation| matches!(expectation, TraceExpectation::ClientsConverged { .. })),
+        "membership fork must assert convergence: {:#?}",
+        vector.expected_outcomes
+    );
+    assert!(
+        !vector
+            .expected_outcomes
+            .iter()
+            .any(|expectation| matches!(expectation, TraceExpectation::GroupProfile { .. })),
         "membership fork must stay winner-agnostic: {:#?}",
         vector.expected_outcomes
     );

@@ -2489,7 +2489,6 @@ fn clients_converged<const N: usize>(
         clients: labels(clients),
         epoch,
         member_count,
-        group_name: None,
     }
 }
 
@@ -2502,7 +2501,6 @@ fn clients_converged_vec(
         clients,
         epoch,
         member_count,
-        group_name: None,
     }
 }
 

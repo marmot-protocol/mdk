@@ -130,12 +130,6 @@ pub enum TraceExpectation {
         epoch: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         member_count: Option<usize>,
-        /// Pin *which* branch survived, not merely that the clients share one.
-        /// On a group-data fork the branches agree on epoch and member count,
-        /// so the name is the only stable winner observable — the selected
-        /// branch id digests randomized MLS bytes and changes every run.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        group_name: Option<String>,
     },
     /// Require the adopted canonical live-group projection to match exactly.
     ///
@@ -354,7 +348,6 @@ impl TraceExpectation {
                 clients,
                 epoch,
                 member_count,
-                group_name,
             } => {
                 let mut observations = Vec::with_capacity(clients.len());
                 for client in clients {
@@ -389,10 +382,7 @@ impl TraceExpectation {
                 let epoch_matches = epoch.is_none_or(|expected| expected == first_epoch);
                 let member_count_matches =
                     member_count.is_none_or(|expected| expected == first_member_count);
-                let group_name_matches = group_name
-                    .as_ref()
-                    .is_none_or(|expected| expected == first_group_name);
-                if !(converged && epoch_matches && member_count_matches && group_name_matches) {
+                if !(converged && epoch_matches && member_count_matches) {
                     mismatches.push(ExpectationFailure {
                         kind: "clients_not_converged".into(),
                         message: format!(
@@ -413,7 +403,6 @@ impl TraceExpectation {
                             "clients": clients,
                             "epoch": epoch,
                             "member_count": member_count,
-                            "group_name": group_name,
                         }),
                         actual: json!(observations),
                     });
@@ -1347,7 +1336,6 @@ mod tests {
                 clients: vec!["alice".into(), "bob".into()],
                 epoch: None,
                 member_count: None,
-                group_name: None,
             }],
             &observed,
         );
@@ -1564,61 +1552,12 @@ mod tests {
                 clients: vec!["alice".into(), "bob".into()],
                 epoch: Some(2),
                 member_count: Some(21),
-                group_name: None,
             }],
             &observed,
         );
 
         assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
         assert_eq!(failures[0].kind, "clients_not_converged");
-    }
-
-    #[test]
-    fn clients_converged_expectation_rejects_the_wrong_winning_branch() {
-        // Agreement is not attribution: both clients settled on one branch, but
-        // it is the loser's. Without a pinned group_name the expectation passes
-        // either way, which is how a group-data fork vector can survive the
-        // winner and the loser trading places.
-        let mut alice = observation("alice", 2, 2);
-        alice.group_name = "loser-branch".into();
-        let mut bob = observation("bob", 2, 2);
-        bob.group_name = "loser-branch".into();
-        let observed = trace(vec![alice, bob]);
-        let failures = compare_trace_expectations(
-            None,
-            &[TraceExpectation::ClientsConverged {
-                clients: vec!["alice".into(), "bob".into()],
-                epoch: Some(2),
-                member_count: Some(2),
-                group_name: Some("winner-branch".into()),
-            }],
-            &observed,
-        );
-
-        assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
-        assert_eq!(failures[0].kind, "clients_not_converged");
-    }
-
-    #[test]
-    fn clients_converged_expectation_accepts_the_pinned_winning_branch() {
-        // The same clients on the branch the expectation names must pass.
-        let mut alice = observation("alice", 2, 2);
-        alice.group_name = "winner-branch".into();
-        let mut bob = observation("bob", 2, 2);
-        bob.group_name = "winner-branch".into();
-        let observed = trace(vec![alice, bob]);
-        let failures = compare_trace_expectations(
-            None,
-            &[TraceExpectation::ClientsConverged {
-                clients: vec!["alice".into(), "bob".into()],
-                epoch: Some(2),
-                member_count: Some(2),
-                group_name: Some("winner-branch".into()),
-            }],
-            &observed,
-        );
-
-        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
     }
 
     #[test]
@@ -1636,7 +1575,6 @@ mod tests {
                 clients: vec!["alice".into(), "bob".into()],
                 epoch: Some(2),
                 member_count: Some(21),
-                group_name: None,
             }],
             &observed,
         );
@@ -1680,7 +1618,6 @@ mod tests {
                 clients: vec!["alice".into(), "bob".into()],
                 epoch: Some(2),
                 member_count: Some(2),
-                group_name: None,
             }],
             &trace(vec![alice, bob]),
         );

@@ -201,8 +201,31 @@
         "dave"
       ],
       "epoch": 2,
-      "member_count": 4,
-      "group_name": "bob branch"
+      "member_count": 4
+    },
+    {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "bob branch",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "dave",
+      "name": "bob branch",
+      "description": ""
     },
     {
       "type": "clients_exactly_equivalent",

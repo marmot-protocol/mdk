@@ -17,8 +17,8 @@ use cgka_conformance_simulator::{
 use crate::convergence::{ConvergenceDecisionKind, RecoveredConvergence};
 use crate::fork::{ForkCommitKind, RecoveredFork};
 
-/// The group name the winning branch commits; the vector pins it on
-/// `ClientsConverged`, so its survival after convergence is how both the accept
+/// The group name the winning branch commits; the vector pins it per client on
+/// `GroupProfile`, so its survival after convergence is how both the accept
 /// path and every later replay confirm the designated winner won.
 pub const WINNER_BRANCH: &str = "winner-branch";
 /// The group name the losing branch commits.
@@ -132,15 +132,29 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
                 witness_quorum_met: None,
                 min_app_witness_score: None,
             },
-            // Both committers settle on the one surviving branch, and it is the
-            // designated winner's. The two branches agree on epoch and member
-            // count — a group-data commit changes only the name — so the name is
-            // the only stable observable that tells the winner from the loser.
+            // Both committers settle on one surviving branch...
             TraceExpectation::ClientsConverged {
                 clients: vec![winner.to_owned(), loser.to_owned()],
                 epoch: Some(2),
                 member_count: Some(2),
-                group_name: Some(WINNER_BRANCH.to_owned()),
+            },
+            // ...and it is the designated winner's. The two branches agree on
+            // epoch and member count — a group-data commit changes only the
+            // name — so the name is the only stable observable that tells the
+            // winner from the loser: the selected branch id digests randomized
+            // MLS bytes and changes every run, which is why the convergence
+            // decision above leaves it unpinned. Pinned per client, because
+            // agreement is not attribution: both committers sitting on
+            // `loser-branch` is convergence too.
+            TraceExpectation::GroupProfile {
+                client: winner.to_owned(),
+                name: WINNER_BRANCH.to_owned(),
+                description: String::new(),
+            },
+            TraceExpectation::GroupProfile {
+                client: loser.to_owned(),
+                name: WINNER_BRANCH.to_owned(),
+                description: String::new(),
             },
         ],
     }
@@ -252,13 +266,13 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
                 min_app_witness_score: None,
             },
             // member_count 3 == exactly one branch's invite survived (both would
-            // be 4, neither 2): the winner-agnostic survival proof. No group
-            // name to pin — real exports cannot attribute the surviving branch.
+            // be 4, neither 2): the winner-agnostic survival proof. No
+            // `GroupProfile` pin — real exports cannot attribute the surviving
+            // membership branch.
             TraceExpectation::ClientsConverged {
                 clients: vec![winner.to_owned(), loser.to_owned()],
                 epoch: Some(2),
                 member_count: Some(3),
-                group_name: None,
             },
         ],
     }

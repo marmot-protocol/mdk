@@ -168,7 +168,8 @@ These are the scenarios another implementation should be able to load from JSON 
   ordering loser), the restarted committer over hydrated storage (Bob), and the passive observers (Carol and
   Dave) — all through the one distributed-convergence route. Both withheld commits are released in reversed
   order before anyone consumes the sibling branch.
-- Expected: all four clients converge at epoch 2 with four members on the ordering winner's branch (`bob branch`),
+- Expected: all four clients converge at epoch 2 with four members, each projecting the ordering winner's branch
+  (`bob branch`, pinned per client so agreement is not mistaken for attribution),
   pass exact canonical equivalence and no-pending-work, and each of the four records a settled convergence
   decision at tip epoch 2. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
   route agreed; flipped into the unified-route acceptance pin when the pairwise route was deleted.

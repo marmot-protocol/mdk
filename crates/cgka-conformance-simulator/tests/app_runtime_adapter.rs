@@ -127,7 +127,6 @@ async fn app_runtime_adapter_is_selectable_for_a_saved_generated_case() {
             clients: vec!["alice".into(), "bob".into()],
             epoch: Some(1),
             member_count: Some(2),
-            group_name: None,
         }],
     };
 
