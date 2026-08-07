@@ -31,6 +31,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
 use openmls::component::ComponentData;
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::{
@@ -289,6 +290,22 @@ fn build_client_with_storage(
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_client_with_storage_and_recorder(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    recorder: JsonlRecorder,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
         .build()
         .unwrap()
 }
@@ -839,6 +856,257 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
             .expect("pending convergence query succeeds"),
         "the epoch-invalidated loser must not keep gating ordinary app traffic"
     );
+}
+
+/// Regression for the Android-visible "This message is no longer valid"
+/// banner on a device's own sent message. OpenMLS cannot decrypt an own
+/// private-message ciphertext during candidate replay, so convergence must use
+/// the authenticated send-time stamp retained with the `Sent` row instead of
+/// classifying the message as undecryptable.
+#[tokio::test]
+async fn rebuilt_sender_keeps_own_sent_app_valid_through_convergence() {
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("own-sent-convergence.jsonl");
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "own-sent-app-convergence".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let own_app = send_app(
+        &mut carol,
+        &group_id,
+        b"must remain valid on the sender".to_vec(),
+    )
+    .await;
+    let stored_before_restart = carol_storage
+        .get_message(&own_app.id)
+        .expect("own sent row is durable");
+    assert_eq!(stored_before_restart.state, MessageState::Sent);
+    let payload = StoredMessagePayload::decode(&stored_before_restart.payload)
+        .expect("own sent payload decodes");
+    assert!(
+        payload.own_application_stamp().is_some(),
+        "own application provenance must survive in the durable Sent row"
+    );
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _pending) = evolution(invite);
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, route(commit, &group_id), 1_000)
+        .expect("commit buffered alongside own Sent row");
+
+    drop(carol);
+    let recorder = JsonlRecorder::open(&audit_path, "own-sent-regression".into()).unwrap();
+    let mut restarted =
+        build_client_with_storage_and_recorder(b"carol", carol_storage.clone(), recorder);
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("restart hydrates the persisted group");
+    let result = restarted
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("rebuilt sender converges stored messages");
+
+    let own_app_id = hex::encode(own_app.id.as_slice());
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![own_app_id.clone()],
+        "own app was not credited to its branch: {result:?}"
+    );
+    assert!(
+        result
+            .invalidated_app_messages
+            .iter()
+            .all(|invalidated| invalidated.message_id != own_app_id),
+        "own sent message must not be invalidated: {:?}",
+        result.invalidated_app_messages
+    );
+    assert_eq!(
+        carol_storage
+            .get_message(&own_app.id)
+            .expect("own sent row remains stored")
+            .state,
+        MessageState::Processed
+    );
+    let events = restarted.drain_events();
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == own_app.id
+        )),
+        "sender must not receive an invalidation for its own message: {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            GroupEvent::MessageReceived { group_id: event_group, .. } if *event_group == group_id
+        )),
+        "convergence must not echo the sender's own app back as received: {events:?}"
+    );
+    drop(restarted);
+    let audit_events: Vec<AuditEvent> = std::fs::read_to_string(&audit_path)
+        .expect("read convergence audit")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse convergence audit event"))
+        .collect();
+    assert!(
+        audit_events.iter().any(|event| matches!(
+            &event.kind,
+            AuditEventKind::MessageStateChanged {
+                previous_state: Some(previous_state),
+                new_state,
+                reason,
+                ..
+            } if previous_state == "sent"
+                && new_state == "processed"
+                && reason == "canonicalization_accepted"
+        )),
+        "forensic audit must expose the atomic Sent -> Processed convergence disposition"
+    );
+}
+
+/// A locally authored app is a witness only for the branch whose authenticated
+/// source state created it. Choose the branch that would lose the deterministic
+/// commit tie-break, then prove the own-message stamp credits only that branch
+/// and lets its real app witness win selection.
+#[tokio::test]
+async fn own_sent_app_witnesses_only_its_matching_fork_branch() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "own-app-fork-provenance".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commits = [route(alice_commit, &group_id), route(bob_commit, &group_id)];
+    let own_branch = 1 - commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
+
+    let (own_app, sender_storage, events) = if own_branch == 0 {
+        alice.confirm_published(alice_pending).await.unwrap();
+        let own_app = send_app(
+            &mut alice,
+            &group_id,
+            b"alice own app selects matching branch".to_vec(),
+        )
+        .await;
+        alice
+            .buffer_openmls_convergence_message_at(&group_id, commits[1].clone(), 1_000)
+            .expect("competing Bob commit buffered");
+        let result = alice
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .expect("Alice converges the fork");
+        let events = alice.drain_events();
+        (own_app, alice_storage, (result, events))
+    } else {
+        bob.confirm_published(bob_pending).await.unwrap();
+        let own_app = send_app(
+            &mut bob,
+            &group_id,
+            b"bob own app selects matching branch".to_vec(),
+        )
+        .await;
+        bob.buffer_openmls_convergence_message_at(&group_id, commits[0].clone(), 1_000)
+            .expect("competing Alice commit buffered");
+        let result = bob
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .expect("Bob converges the fork");
+        let events = bob.drain_events();
+        (own_app, bob_storage, (result, events))
+    };
+    let (result, events) = events;
+    let own_app_id = hex::encode(own_app.id.as_slice());
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![own_app_id.clone()],
+        "own app was not credited to its branch: {result:?}"
+    );
+    assert!(
+        result
+            .accepted_commits
+            .iter()
+            .any(|message_id| message_id == &hex::encode(commits[own_branch].id.as_slice())),
+        "the own app witness must select its matching branch: {result:?}"
+    );
+    assert!(result.invalidated_app_messages.iter().all(|invalidated| {
+        invalidated.message_id != own_app_id
+            && invalidated.reason != InvalidatedAppMessageReason::UndecryptableInCanonicalState
+    }));
+    assert_eq!(
+        sender_storage
+            .get_message(&own_app.id)
+            .expect("own app remains durable")
+            .state,
+        MessageState::Processed
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == own_app.id
+    )));
 }
 
 #[tokio::test]

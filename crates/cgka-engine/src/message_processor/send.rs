@@ -12,6 +12,7 @@ use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
+use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -19,6 +20,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
@@ -852,6 +854,14 @@ impl<S: StorageProvider> Engine<S> {
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
         let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let own_application_stamp = OwnApplicationConvergenceStamp {
+            sender: self.identity.self_id().clone(),
+            source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),
+            decrypted_payload_ref: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(payload.as_slice()))
+            ),
+        };
         let source_retention_seconds =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?;
         let retention = cgka_traits::app_event::AppMessageRetentionDecision::new(
@@ -883,7 +893,13 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
 
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
-        self.record_sent_openmls_message(&wrapped, out_bytes.as_slice(), &group_id, source_epoch)?;
+        self.record_sent_openmls_application_message(
+            &wrapped,
+            out_bytes.as_slice(),
+            &group_id,
+            source_epoch,
+            own_application_stamp,
+        )?;
 
         Ok(SendResult::ApplicationMessage {
             msg: wrapped,

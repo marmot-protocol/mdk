@@ -12,7 +12,9 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::{Member, ProtocolProfile};
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    MessageRecord, MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload,
+};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -72,6 +74,10 @@ pub struct OpenMlsMaterializedCandidate {
     pub commit_message_ids: Vec<String>,
     pub consumed_proposal_refs: Vec<String>,
     pub observations: Vec<OpenMlsReplayObservation>,
+    /// Authenticated state identity at every epoch materialized while replaying
+    /// this branch. Locally authored applications use it to prove which
+    /// candidate state encrypted their otherwise undecryptable own ciphertext.
+    pub epoch_authenticators: BTreeMap<u64, String>,
 }
 
 impl OpenMlsMaterializedCandidate {
@@ -300,6 +306,13 @@ pub enum OpenMlsReplayObservation {
         retention: AppMessageRetentionDecision,
         decrypted_payload_ref: String,
     },
+    OwnApplicationSent {
+        message_id: String,
+        source_epoch: u64,
+        sender: Vec<u8>,
+        source_epoch_authenticator: String,
+        decrypted_payload_ref: String,
+    },
     Ignored {
         message_id: String,
         kind: OpenMlsContentKind,
@@ -311,6 +324,7 @@ struct OpenMlsReplayOutput {
     observations: Vec<OpenMlsReplayObservation>,
     final_epoch: u64,
     final_members: Vec<Member>,
+    epoch_authenticators: BTreeMap<u64, String>,
 }
 
 #[derive(Debug)]
@@ -433,6 +447,10 @@ pub(crate) struct PrevalidatedOwnCommits {
     /// prefix stays canonical: it was created from the canonical state at its
     /// source epoch, so on any diverging prefix it must NOT apply.
     canonical_digests: BTreeSet<[u8; 32]>,
+    /// Locally authenticated app-message stamps, keyed by their stored wire id.
+    /// These are loaded before a retained-anchor rollback because the rollback
+    /// intentionally removes rows created after that anchor.
+    application_by_id: BTreeMap<Vec<u8>, OwnApplicationConvergenceStamp>,
 }
 
 impl PrevalidatedOwnCommits {
@@ -454,6 +472,15 @@ impl PrevalidatedOwnCommits {
 
     fn is_canonical(&self, digest: &[u8; 32]) -> bool {
         self.canonical_digests.contains(digest)
+    }
+
+    fn insert_application(&mut self, message_id: MessageId, stamp: OwnApplicationConvergenceStamp) {
+        self.application_by_id
+            .insert(message_id.as_slice().to_vec(), stamp);
+    }
+
+    fn application_stamp(&self, message_id: &MessageId) -> Option<&OwnApplicationConvergenceStamp> {
+        self.application_by_id.get(message_id.as_slice())
     }
 }
 
@@ -596,11 +623,13 @@ pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
         StoredMessagePayload::SignedOpenMlsWire {
             exact_message,
             openmls_message,
+            own_application_stamp,
             ..
         } => StoredMessagePayload::SignedOpenMlsWire {
             exact_message,
             openmls_message,
             stamp: Some(stamp),
+            own_application_stamp,
         },
         // Raw-transport rows never enter the OpenMLS candidate graph; a plain
         // state update preserves their shape.
@@ -721,6 +750,23 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    replay_openmls_messages_prevalidated_output(
+        storage,
+        group_id,
+        messages,
+        own_commits,
+        profile_policy,
+    )
+    .map(|output| output.observations)
+}
+
+fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
     // RAII: on any unwind path (panic during replay, early error)
@@ -732,8 +778,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let result =
-        process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy)
-            .map(|out| out.observations);
+        process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy);
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -771,13 +816,14 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             ));
         }
         budget.consume()?;
-        let observations = replay_openmls_messages_prevalidated(
+        let replay = replay_openmls_messages_prevalidated_output(
             storage,
             group_id,
             &path.messages,
             own_commits,
             profile_policy,
         )?;
+        let observations = replay.observations;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
         let mut tip_digest: Option<[u8; 32]> = None;
@@ -833,6 +879,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             commit_message_ids,
             consumed_proposal_refs,
             observations,
+            epoch_authenticators: replay.epoch_authenticators,
         });
     }
     candidates.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
@@ -994,6 +1041,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
         let own_commit_stamp = payload.own_commit_stamp().cloned();
+        let own_application_stamp = payload.own_application_stamp().cloned();
         let Some(message) = payload.as_openmls_wire().cloned() else {
             continue;
         };
@@ -1056,6 +1104,9 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 if record_state_can_contribute_to_openmls_graph(record.state)
                     && source_epoch.is_some_and(|epoch| epoch >= state.retained_anchor_epoch) =>
             {
+                if let Some(stamp) = own_application_stamp {
+                    own_commits.insert_application(message.id.clone(), stamp);
+                }
                 if record.state == MessageState::Processed {
                     already_delivered_app_ids.insert(hex::encode(message.id.as_slice()));
                 }
@@ -1826,12 +1877,49 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
 ) -> Result<(), OpenMlsProjectionError> {
+    for disposition in openmls_canonicalization_dispositions(result)? {
+        storage
+            .update_message_state(&disposition.message_id, disposition.state)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenMlsCanonicalizationDisposition {
+    pub message_id: MessageId,
+    pub state: MessageState,
+    pub reason: &'static str,
+}
+
+pub(crate) fn openmls_canonicalization_dispositions(
+    result: &CanonicalizationResult,
+) -> Result<Vec<OpenMlsCanonicalizationDisposition>, OpenMlsProjectionError> {
     let mut state_by_message_id = BTreeMap::new();
 
     for dropped in &result.dropped_messages {
         state_by_message_id.insert(
             dropped.message_id.clone(),
-            message_state_for_dropped_reason(dropped.reason),
+            (
+                message_state_for_dropped_reason(dropped.reason),
+                match dropped.reason {
+                    DroppedMessageReason::Malformed => "canonicalization_dropped_malformed",
+                    DroppedMessageReason::UnsupportedPolicy => {
+                        "canonicalization_dropped_unsupported_policy"
+                    }
+                    DroppedMessageReason::BeyondRollbackHorizon => {
+                        "canonicalization_dropped_beyond_rollback_horizon"
+                    }
+                    DroppedMessageReason::BeyondAnchor => "canonicalization_dropped_beyond_anchor",
+                    DroppedMessageReason::BeyondAppRetention => {
+                        "canonicalization_dropped_beyond_app_retention"
+                    }
+                    DroppedMessageReason::InvalidAgainstCandidateState => {
+                        "canonicalization_dropped_invalid_candidate_state"
+                    }
+                },
+            ),
         );
     }
     // The epoch convergence settled on: the selected branch tip, or the
@@ -1840,17 +1928,36 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
     for invalidated in &result.invalidated_app_messages {
         state_by_message_id.insert(
             invalidated.message_id.clone(),
-            message_state_for_invalidated_reason(
-                invalidated.reason,
-                invalidated.epoch,
-                resulting_tip,
+            (
+                message_state_for_invalidated_reason(
+                    invalidated.reason,
+                    invalidated.epoch,
+                    resulting_tip,
+                ),
+                match invalidated.reason {
+                    InvalidatedAppMessageReason::LosingBranch => {
+                        "canonicalization_invalidated_losing_branch"
+                    }
+                    InvalidatedAppMessageReason::UndecryptableInCanonicalState => {
+                        "canonicalization_invalidated_undecryptable"
+                    }
+                    InvalidatedAppMessageReason::BeyondAnchor => {
+                        "canonicalization_invalidated_beyond_anchor"
+                    }
+                    InvalidatedAppMessageReason::BeyondAppRetention => {
+                        "canonicalization_invalidated_beyond_app_retention"
+                    }
+                },
             ),
         );
     }
     for deferred in &result.deferred_messages {
         state_by_message_id.insert(
             deferred.message_id.clone(),
-            MessageState::ConvergenceDeferred,
+            (
+                MessageState::ConvergenceDeferred,
+                "canonicalization_deferred",
+            ),
         );
     }
     for accepted in result
@@ -1859,17 +1966,22 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
         .chain(&result.accepted_proposals)
         .chain(&result.accepted_app_messages)
     {
-        state_by_message_id.insert(accepted.clone(), MessageState::Processed);
+        state_by_message_id.insert(
+            accepted.clone(),
+            (MessageState::Processed, "canonicalization_accepted"),
+        );
     }
 
-    for (hex_message_id, state) in state_by_message_id {
-        let message_id = message_id_from_hex(&hex_message_id)?;
-        storage
-            .update_message_state(&message_id, state)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    }
-
-    Ok(())
+    state_by_message_id
+        .into_iter()
+        .map(|(hex_message_id, (state, reason))| {
+            Ok(OpenMlsCanonicalizationDisposition {
+                message_id: message_id_from_hex(&hex_message_id)?,
+                state,
+                reason,
+            })
+        })
+        .collect()
 }
 
 /// The longest leading run of accepted commits already applied on the live
@@ -2514,15 +2626,36 @@ fn app_messages_by_id(
     let mut app_messages = BTreeMap::new();
     for candidate in candidates {
         for observation in &candidate.observations {
-            let OpenMlsReplayObservation::ApplicationProcessed {
-                message_id,
-                source_epoch,
-                sender,
-                decrypted_payload_ref,
-                ..
-            } = observation
-            else {
-                continue;
+            let (message_id, source_epoch, sender, decrypted_payload_ref) = match observation {
+                OpenMlsReplayObservation::ApplicationProcessed {
+                    message_id,
+                    source_epoch,
+                    sender,
+                    decrypted_payload_ref,
+                    ..
+                } => (message_id, source_epoch, sender, decrypted_payload_ref),
+                OpenMlsReplayObservation::OwnApplicationSent {
+                    message_id,
+                    source_epoch,
+                    sender,
+                    source_epoch_authenticator,
+                    decrypted_payload_ref,
+                } => {
+                    let matches_candidate = candidate
+                        .epoch_authenticators
+                        .get(source_epoch)
+                        .map(|candidate_authenticator| {
+                            candidate_authenticator == source_epoch_authenticator
+                        })
+                        // A source epoch older than the replay anchor is part
+                        // of every candidate's common pre-fork history.
+                        .unwrap_or(*source_epoch <= candidate.fork_epoch);
+                    if !matches_candidate {
+                        continue;
+                    }
+                    (message_id, source_epoch, sender, decrypted_payload_ref)
+                }
+                _ => continue,
             };
             let entry =
                 app_messages
@@ -2616,6 +2749,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
 
     let mut observations = Vec::new();
+    let mut epoch_authenticators = BTreeMap::from([(
+        mls_group.epoch().as_u64(),
+        own_commit_post_merge_epoch_authenticator(&mls_group),
+    )]);
     // An own commit is pre-validated only while every commit replayed before
     // it was canonical (`Processed`): it was created from the canonical state
     // at its source epoch, so on a diverging prefix its anchor state would
@@ -2637,6 +2774,24 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
+        if projection.kind == OpenMlsContentKind::Application
+            && let Some(stamp) = own_commits.application_stamp(&message.id)
+        {
+            // A locally authored private message cannot be authenticated by
+            // replaying its ciphertext: MLS sender ratchets are encryption-
+            // only. Carry the durable send-time evidence forward and let the
+            // candidate epoch-authenticator comparison below decide whether
+            // this branch may claim it. Do not consult OpenMLS's unauthenticated
+            // OwnPrivateMessage classification.
+            observations.push(OpenMlsReplayObservation::OwnApplicationSent {
+                message_id,
+                source_epoch,
+                sender: stamp.sender.as_slice().to_vec(),
+                source_epoch_authenticator: stamp.source_epoch_authenticator.clone(),
+                decrypted_payload_ref: stamp.decrypted_payload_ref.clone(),
+            });
+            continue;
+        }
         if projection.kind == OpenMlsContentKind::Commit
             && prefix_canonical
             && let Some(stamp) = own_commits.stamp(&projection.message_digest)
@@ -2676,6 +2831,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 resulting_epoch,
                 expected_authenticator,
             )?;
+            epoch_authenticators.insert(
+                mls_group.epoch().as_u64(),
+                own_commit_post_merge_epoch_authenticator(&mls_group),
+            );
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,
                 source_epoch,
@@ -2920,6 +3079,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                epoch_authenticators.insert(
+                    mls_group.epoch().as_u64(),
+                    own_commit_post_merge_epoch_authenticator(&mls_group),
+                );
                 crate::app_components::validate_current_profile_group_invariants(&mls_group)
                     .map_err(|error| OpenMlsProjectionError::InvalidCommit {
                         message_id,
@@ -2986,10 +3149,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             ProcessedMessageContent::OwnPendingCommit
             | ProcessedMessageContent::OwnPrivateMessage => {
-                // Own sends are replay evidence only. In particular, never
-                // merge an OwnPendingCommit here: MDK realizes confirmed own
-                // commits from retained anchor snapshots above, preserving
-                // the publish-before-apply lifecycle.
+                // Never merge an OwnPendingCommit here: MDK realizes confirmed
+                // own commits from retained anchor snapshots above, preserving
+                // the publish-before-apply lifecycle. A stamped own private
+                // message was handled before OpenMLS processing above; an
+                // unstamped OwnPrivateMessage is not trusted as provenance.
                 observations.push(OpenMlsReplayObservation::Ignored {
                     message_id,
                     kind: projection.kind,
@@ -3010,6 +3174,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         observations,
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
+        epoch_authenticators,
     })
 }
 

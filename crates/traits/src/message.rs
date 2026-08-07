@@ -40,6 +40,24 @@ pub struct OwnCommitConvergenceStamp {
     pub resulting_epoch_authenticator: Option<String>,
 }
 
+/// Branch provenance for an application message authored by this device.
+///
+/// MLS sender ratchets are encryption-only, so a device cannot later decrypt
+/// and authenticate its own private-message ciphertext during candidate
+/// replay. The send path therefore captures the authenticated local source
+/// state while it still owns it. Stored convergence may credit the message
+/// only to candidate states whose epoch authenticator matches this stamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnApplicationConvergenceStamp {
+    /// This device's authenticated Marmot member identity at send time.
+    pub sender: MemberId,
+    /// Hex-encoded MLS epoch authenticator of the state that encrypted the
+    /// application message.
+    pub source_epoch_authenticator: String,
+    /// Stable local reference to the validated plaintext payload.
+    pub decrypted_payload_ref: String,
+}
+
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].
 ///
 /// The database column remains a byte blob so backends do not need a schema
@@ -54,11 +72,12 @@ pub struct OwnCommitConvergenceStamp {
 ///   recovery find only delivery obligations created by versions that track
 ///   their completion.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
-///   wire bytes. Only this variant and `OwnCommitWire` are eligible for
-///   OpenMLS projection and convergence replay.
+///   wire bytes. This variant, `SignedOpenMlsWire`, and `OwnCommitWire` are
+///   eligible for OpenMLS projection and convergence replay.
 /// - `SignedOpenMlsWire`: the exact signed outer transport message alongside
 ///   the projection-friendly MLS wire message. This is the current outbound
-///   representation and supports byte-identical retry after restart.
+///   representation and supports byte-identical retry after restart. Locally
+///   authored applications also carry [`OwnApplicationConvergenceStamp`].
 /// - `OwnCommitWire`: an `OpenMlsWire` commit this device published and
 ///   confirmed, enriched with its [`OwnCommitConvergenceStamp`] so stored
 ///   convergence can treat it as a pre-validated candidate branch after a
@@ -74,6 +93,8 @@ pub enum StoredMessagePayload {
         openmls_message: TransportMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stamp: Option<OwnCommitConvergenceStamp>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        own_application_stamp: Option<Box<OwnApplicationConvergenceStamp>>,
     },
     OwnCommitWire {
         message: TransportMessage,
@@ -102,6 +123,20 @@ impl StoredMessagePayload {
             exact_message,
             openmls_message,
             stamp: None,
+            own_application_stamp: None,
+        }
+    }
+
+    pub fn signed_openmls_application_wire(
+        exact_message: TransportMessage,
+        openmls_message: TransportMessage,
+        own_application_stamp: OwnApplicationConvergenceStamp,
+    ) -> Self {
+        Self::SignedOpenMlsWire {
+            exact_message,
+            openmls_message,
+            stamp: None,
+            own_application_stamp: Some(Box::new(own_application_stamp)),
         }
     }
 
@@ -169,6 +204,20 @@ impl StoredMessagePayload {
             Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::OpenMlsWire(_) => None,
             Self::SignedOpenMlsWire { stamp, .. } => stamp.as_ref(),
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
+        }
+    }
+
+    /// Send-time branch provenance for a locally authored application message.
+    pub fn own_application_stamp(&self) -> Option<&OwnApplicationConvergenceStamp> {
+        match self {
+            Self::SignedOpenMlsWire {
+                own_application_stamp,
+                ..
+            } => own_application_stamp.as_deref(),
+            Self::RawTransport(_)
+            | Self::OutboundWelcome(_)
+            | Self::OpenMlsWire(_)
+            | Self::OwnCommitWire { .. } => None,
         }
     }
 
