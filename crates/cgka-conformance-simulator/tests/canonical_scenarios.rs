@@ -10,10 +10,10 @@ use cgka_conformance_simulator::{
     ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioMessageSelectorV2, ScenarioReport,
     ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
     TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
-    run_vector_fixture_report,
+    generate_admin_churn_family, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    observe_client_exact, run_generated_case_report, run_scenario_report,
+    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -1599,6 +1599,58 @@ fn without_strict_reliability_outcomes(mut case: GeneratedScenarioCase) -> Gener
         )
     });
     case
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_churn_family_generates_deterministic_arms_that_pass() {
+    let cases = generate_admin_churn_family(123, 4);
+
+    assert_eq!(cases, generate_admin_churn_family(123, 4));
+    assert_eq!(cases.len(), 4);
+    assert!(
+        cases.iter().all(|case| !case.expected_outcomes.is_empty()),
+        "admin-churn cases should carry semantic expectations"
+    );
+    assert!(cases[..3].iter().all(|case| {
+        case.scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. }))
+    }));
+    assert!(
+        cases[2]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::RestartClient { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::InviteMembers { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+        "the latecomer arm carries forward-secrecy zero-count assertions"
+    );
+
+    for case in &cases {
+        let report = run_generated_case_report(case, None)
+            .await
+            .expect("admin-churn case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {} failed: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
