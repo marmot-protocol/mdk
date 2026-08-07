@@ -1095,7 +1095,7 @@ impl HarnessClient {
             })
             .await
             .expect("update group profile");
-        self.publish_group_evolution(res, &gid, "update_group_data")
+        self.publish_group_evolution(res, &gid, "update_group_profile")
             .await
     }
 

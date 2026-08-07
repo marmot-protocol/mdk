@@ -34,6 +34,10 @@ async fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() 
             SemanticMutation::RetainedHistoryExpirationBoundary,
             "Accepted",
         ),
+        (
+            SemanticMutation::GroupProfileProjection,
+            "expectation_failures:none",
+        ),
     ];
     for (mutation, baseline) in expected {
         assert_eq!(

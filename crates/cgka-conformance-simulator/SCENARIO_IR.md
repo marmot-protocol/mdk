@@ -6,8 +6,8 @@ The simulator has two deliberately separate inputs:
   atomic actions. V2 remains replayable through `schemas/scenario-ir.v2.schema.json`; v3 adds the full
   `update_group_profile` action through `schemas/scenario-ir.v3.schema.json`.
 - `ScenarioAuthoringSpec` v1 is human-oriented structure. It may be represented as JSON or YAML, but it is never passed
-  to an adapter. The repository compiler deterministically lowers it to canonical JSON first. Its schema is
-  `schemas/scenario-authoring.v1.schema.json`.
+  to an adapter. The repository compiler deterministically lowers it to canonical JSON first, emitting v2 unless an
+  expanded action requires v3. Its schema is `schemas/scenario-authoring.v1.schema.json`.
 
 The canonical document declares accounts, devices, processes, initial groups, relays, account roles, process
 binary/policy versions, and relay implementation/policy versions in `topology`. Each action-facing client label maps to
@@ -29,6 +29,9 @@ Scenario IR v2's `update_group_data` action is the stable name-only operation. S
 `update_group_profile` action carries optional `name` and `description` fields and requires at least one of them. A
 missing field means preserve the adopted canonical value; an explicitly empty string clears that field. The compiler
 rejects the v3 action in a v2 document rather than silently changing v2 serialization or semantics.
+That split is intentional because canonical JSON is persisted in vectors and failure capsules and exchanged with
+external campaign runners; adding fields to an existing action version would change the meaning accepted by a v2
+consumer even when this repository's current fixtures omit them.
 
 ## Deterministic expansion
 

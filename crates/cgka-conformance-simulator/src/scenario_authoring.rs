@@ -6,9 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    SCENARIO_IR_V2_VERSION, ScenarioRunError, ScenarioSpec, ScenarioStep, SubjectFailureCategory,
-};
+use crate::{ScenarioRunError, ScenarioSpec, ScenarioStep, SubjectFailureCategory};
 
 pub const SCENARIO_AUTHORING_VERSION: &str = "1";
 /// Hard compiler resource bound. Execution campaigns may choose lower limits,
@@ -89,18 +87,19 @@ pub fn compile_authoring_scenario(
         )));
     }
     let expanded = expand_sequence(&authored.steps)?;
+    let steps = expanded
+        .into_iter()
+        .map(|flow| match flow {
+            ExpandedFlow::Action(step) => step,
+            ExpandedFlow::Barrier(name) => ScenarioStep::Barrier { name },
+        })
+        .collect::<Vec<_>>();
     let canonical = ScenarioSpec {
         name: authored.name.clone(),
-        spec_version: SCENARIO_IR_V2_VERSION.into(),
+        spec_version: crate::scenario_ir::minimum_ir_version(&steps).into(),
         clients: authored.clients.clone(),
         topology: authored.topology.clone(),
-        steps: expanded
-            .into_iter()
-            .map(|flow| match flow {
-                ExpandedFlow::Action(step) => step,
-                ExpandedFlow::Barrier(name) => ScenarioStep::Barrier { name },
-            })
-            .collect(),
+        steps,
     };
     crate::compile_scenario(&canonical)?;
     Ok(canonical)
@@ -557,7 +556,7 @@ mod tests {
         let decoded: ScenarioAuthoringSpec =
             serde_json::from_value(json).expect("deserialize authoring document");
         let canonical = compile_authoring_scenario(&decoded).expect("lower authoring document");
-        assert_eq!(canonical.spec_version, SCENARIO_IR_V2_VERSION);
+        assert_eq!(canonical.spec_version, crate::SCENARIO_IR_V2_VERSION);
         assert_eq!(canonical.steps.len(), 2);
         assert!(
             serde_json::to_value(&canonical)
@@ -599,11 +598,34 @@ steps:
           payload: two
 "#;
         let canonical = compile_authoring_yaml(yaml).expect("YAML lowers");
-        assert_eq!(canonical.spec_version, SCENARIO_IR_V2_VERSION);
+        assert_eq!(canonical.spec_version, crate::SCENARIO_IR_V2_VERSION);
         assert!(matches!(
             canonical.steps[1],
             ScenarioStep::AdvanceTime { delta_ms: 500 }
         ));
         assert_eq!(canonical.steps.len(), 3);
+    }
+
+    #[test]
+    fn authoring_selects_v3_when_a_full_profile_action_is_present() {
+        let authored = ScenarioAuthoringSpec {
+            name: "authoring/group-profile".into(),
+            authoring_version: SCENARIO_AUTHORING_VERSION.into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![action(ScenarioStep::UpdateGroupProfile {
+                client: "alice".into(),
+                name: None,
+                description: Some("new description".into()),
+                pending: "profile".into(),
+            })],
+        };
+
+        let canonical = compile_authoring_scenario(&authored).expect("profile authoring lowers");
+        assert_eq!(canonical.spec_version, crate::SCENARIO_IR_V3_VERSION);
+        assert!(matches!(
+            canonical.steps.as_slice(),
+            [ScenarioStep::UpdateGroupProfile { .. }]
+        ));
     }
 }

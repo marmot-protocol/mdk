@@ -14,10 +14,14 @@ use crate::{
     SubjectFailureCategory, required_capabilities,
 };
 
-/// Current canonical Scenario IR version for newly authored full-profile scenarios.
-pub const SCENARIO_IR_VERSION: &str = "3";
-/// Stable legacy target retained by Scenario Authoring v1.
+/// Stable canonical version for the original Scenario IR action set.
 pub const SCENARIO_IR_V2_VERSION: &str = "2";
+/// Canonical version that adds full group-profile updates.
+pub const SCENARIO_IR_V3_VERSION: &str = "3";
+/// Newest Scenario IR version emitted when newly authored actions require it.
+pub const SCENARIO_IR_LATEST_VERSION: &str = SCENARIO_IR_V3_VERSION;
+/// Action kinds introduced after Scenario IR v2.
+pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &["update_group_profile"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioActionScheduleV2 {
@@ -72,7 +76,7 @@ pub fn stable_action_id(source_step_index: usize, step: &ScenarioStep) -> String
 pub fn compile_scenario(spec: &ScenarioSpec) -> Result<CompiledScenarioV2, ScenarioRunError> {
     if !matches!(
         spec.spec_version.as_str(),
-        SCENARIO_IR_V2_VERSION | SCENARIO_IR_VERSION
+        SCENARIO_IR_V2_VERSION | SCENARIO_IR_V3_VERSION
     ) {
         return Err(ScenarioRunError {
             step_index: None,
@@ -223,15 +227,29 @@ fn validate_step_version(
     spec_version: &str,
     step: &ScenarioStep,
 ) -> Result<(), ScenarioRunError> {
-    if spec_version == SCENARIO_IR_V2_VERSION
-        && matches!(step, ScenarioStep::UpdateGroupProfile { .. })
-    {
+    if spec_version == SCENARIO_IR_V2_VERSION && step_requires_v3(step) {
         return Err(compile_error(
             Some(step_index),
-            "update_group_profile requires ScenarioSpec version 3".into(),
+            format!("{} requires ScenarioSpec version 3", step.kind()),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn minimum_ir_version(steps: &[ScenarioStep]) -> &'static str {
+    if steps.iter().any(step_requires_v3) {
+        SCENARIO_IR_V3_VERSION
+    } else {
+        SCENARIO_IR_V2_VERSION
+    }
+}
+
+fn step_requires_v3(step: &ScenarioStep) -> bool {
+    let executable = match step {
+        ScenarioStep::InGroup { action, .. } => action.as_ref(),
+        step => step,
+    };
+    SCENARIO_IR_V3_ONLY_STEP_KINDS.contains(&executable.kind())
 }
 
 fn validate_step(
@@ -302,25 +320,27 @@ fn validate_step(
             validate_client(step_index, remover, clients, "member removal")?;
             validate_clients(step_index, members, clients, "member removal")?;
         }
-        ScenarioStep::SelfUpdate { client, .. }
-        | ScenarioStep::UpdateGroupData { client, .. }
-        | ScenarioStep::UpdateGroupProfile { client, .. }
-        | ScenarioStep::Leave { client }
-        | ScenarioStep::RestartClient { client }
-        | ScenarioStep::SetClientOffline { client }
-        | ScenarioStep::ReconnectClient { client } => {
+        ScenarioStep::UpdateGroupProfile {
+            client,
+            name,
+            description,
+            ..
+        } => {
             validate_client(step_index, client, clients, step.kind())?;
-            if let ScenarioStep::UpdateGroupProfile {
-                name, description, ..
-            } = step
-                && name.is_none()
-                && description.is_none()
-            {
+            if name.is_none() && description.is_none() {
                 return Err(compile_error(
                     Some(step_index),
                     "group profile update must change a name or description".into(),
                 ));
             }
+        }
+        ScenarioStep::SelfUpdate { client, .. }
+        | ScenarioStep::UpdateGroupData { client, .. }
+        | ScenarioStep::Leave { client }
+        | ScenarioStep::RestartClient { client }
+        | ScenarioStep::SetClientOffline { client }
+        | ScenarioStep::ReconnectClient { client } => {
+            validate_client(step_index, client, clients, step.kind())?;
         }
         ScenarioStep::UpdateAdminPolicy { client, admins, .. }
         | ScenarioStep::ExpectUpdateAdminPolicyError { client, admins, .. } => {

@@ -455,7 +455,7 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if evidence.admin_policy_observations > 0 {
         behaviors.insert(OracleBehavior::AdminPolicyObserved);
     }
-    if evidence.delivered_payloads > 0 {
+    if evidence.delivered_payloads > 0 || evidence.decryptability_probe_edges_delivered > 0 {
         behaviors.insert(OracleBehavior::DeliveredPayload);
     }
     if evidence.member_additions > 0 {
@@ -654,6 +654,11 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
         }
         TraceExpectation::ClientsBidirectionallyDecryptable { .. } => {
             behaviors.insert(OracleBehavior::BidirectionalDecryptabilityObserved);
+            // A successful active probe is itself application-message delivery
+            // evidence in every requested direction. Do not require a second,
+            // unrelated payload expectation merely because the probe sends app
+            // messages internally.
+            behaviors.insert(OracleBehavior::DeliveredPayload);
         }
         TraceExpectation::ClientEpochChanges { .. } => {
             behaviors.insert(OracleBehavior::EpochChanged);
@@ -924,5 +929,18 @@ mod tests {
                 .contains(&OracleBehavior::ExactStateNonEquivalence)
         );
         assert!(report.missing_observed_behaviors.is_empty());
+    }
+
+    #[test]
+    fn bidirectional_probe_expectation_is_application_delivery_evidence() {
+        let behaviors = expected_behaviors(
+            None,
+            &[TraceExpectation::ClientsBidirectionallyDecryptable {
+                clients: vec!["alice".into(), "bob".into()],
+            }],
+        );
+
+        assert!(behaviors.contains(&OracleBehavior::BidirectionalDecryptabilityObserved));
+        assert!(behaviors.contains(&OracleBehavior::DeliveredPayload));
     }
 }

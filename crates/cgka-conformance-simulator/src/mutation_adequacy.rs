@@ -15,6 +15,7 @@ use crate::reference_convergence::{
 };
 use crate::{
     ConvergenceSubject, ReferenceModelSubject, SubjectCreateGroup, SubjectOutboundOutcome,
+    VectorFixture, run_vector_fixture_report,
 };
 
 macro_rules! semantic_mutations {
@@ -85,7 +86,7 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
         SemanticMutation::OutputInvalidation => output_invalidation_sentinel(),
         SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
-        SemanticMutation::GroupProfileProjection => group_profile_projection_sentinel(),
+        SemanticMutation::GroupProfileProjection => group_profile_projection_sentinel().await,
     };
     MutationSentinelResult {
         mutation,
@@ -94,20 +95,47 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
     }
 }
 
-fn group_profile_projection_sentinel() -> (String, String) {
-    let requested = ("after", "after description");
-    let baseline_projection = requested;
+async fn group_profile_projection_sentinel() -> (String, String) {
+    let fixture: VectorFixture =
+        serde_json::from_str(include_str!("../vectors/group-profile-update.v1.json"))
+            .expect("group-profile mutation vector parses");
+    let report = run_vector_fixture_report(&fixture)
+        .await
+        .expect("group-profile mutation baseline executes");
+    let observed = report
+        .observed_trace
+        .expect("group-profile mutation baseline records observations");
+    let baseline_failures = fixture.compare_observed_trace(&observed);
+    assert!(
+        baseline_failures.is_empty(),
+        "group-profile mutation baseline must satisfy the real vector oracle: {baseline_failures:#?}"
+    );
+
     // Mutant: the commit advances protocol state, but the app-facing profile
-    // projection remains on the previous values.
-    let mutant_projection = ("before", "");
+    // projection remains on the previous values. Mutate only that projection
+    // boundary, then run the same portable expected-value oracle.
+    let mut mutant_observed = observed;
+    for observation in &mut mutant_observed.observations {
+        observation.group_name = "before".into();
+        observation.group_description.clear();
+    }
+    let mutant_failures = fixture.compare_observed_trace(&mutant_observed);
+    assert!(
+        mutant_failures
+            .iter()
+            .all(|failure| failure.kind == "group_profile_mismatch"),
+        "profile projection mutant must be rejected specifically by the group-profile oracle: {mutant_failures:#?}"
+    );
+    assert!(
+        !mutant_failures.is_empty(),
+        "profile projection mutant unexpectedly survived"
+    );
+
     (
+        "expectation_failures:none".into(),
         format!(
-            "name:{}:description:{}",
-            baseline_projection.0, baseline_projection.1
-        ),
-        format!(
-            "name:{}:description:{}",
-            mutant_projection.0, mutant_projection.1
+            "expectation_failures:group_profile_mismatch:{}",
+            mutant_failures.len()
         ),
     )
 }
