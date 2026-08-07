@@ -599,3 +599,51 @@ async fn rotated_route_is_retired_once_retention_window_passes() {
     assert!(reopened.unhydrated_group_ids().is_empty());
     assert!(reopened.members(&group_id).is_ok());
 }
+
+#[tokio::test]
+async fn failed_promotion_in_convergence_buffer_persists_no_row() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
+    insert_marmot_group_without_openmls_state(&storage, &broken_group, 7);
+
+    let mut engine = build_engine(storage.clone());
+    engine
+        .hydrate_stable_groups_from_storage()
+        .expect("cheap pass");
+    assert_eq!(engine.unhydrated_group_ids(), vec![broken_group.clone()]);
+
+    // The buffering entry point promotes the seeded group first; the failed
+    // promotion quarantines it and MUST propagate — silently continuing
+    // would take the no-epoch-state admission branch and durably retain a
+    // convergence row for a group validation just rejected.
+    let result = engine.buffer_openmls_convergence_message(
+        &broken_group,
+        TransportMessage {
+            id: MessageId::new(b"buffered-into-broken".to_vec()),
+            payload: b"not real mls bytes".to_vec(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: broken_group.as_slice().to_vec(),
+            },
+        },
+    );
+    assert!(
+        result.is_err(),
+        "failed promotion must propagate: {result:?}"
+    );
+    assert_eq!(
+        engine.quarantined_groups(),
+        vec![(
+            broken_group.clone(),
+            GroupHydrationQuarantineReason::OpenMlsGroupMissing
+        )]
+    );
+    assert!(
+        cgka_traits::storage::MessageStorage::list_messages(&storage, &broken_group, EpochId(0))
+            .unwrap()
+            .is_empty(),
+        "no convergence row may be persisted for the failed group"
+    );
+}
