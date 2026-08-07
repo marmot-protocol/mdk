@@ -1,10 +1,10 @@
 {
-  "scenario_name": "reconnect-catchup/v1",
+  "scenario_name": "deferred-tick-catchup/v1",
   "vector_version": "1",
   "conformance_version": "0.9.10",
   "seed": null,
   "scenario": {
-    "name": "reconnect-catchup/v1",
+    "name": "deferred-tick-catchup/v1",
     "spec_version": "2",
     "clients": [
       "alice",
@@ -23,7 +23,10 @@
           "dave"
         ],
         "required_features": [],
-        "pending": "create"
+        "pending": "create",
+        "initial_admins": [
+          "alice"
+        ]
       },
       {
         "type": "acknowledge_outbound",
@@ -220,6 +223,30 @@
         "reconnect:back:bob",
         "reconnect:back:carol"
       ]
+    },
+    {
+      "type": "group_profile",
+      "client": "alice",
+      "name": "reconnect-renamed",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "bob",
+      "name": "reconnect-renamed",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "carol",
+      "name": "reconnect-renamed",
+      "description": ""
+    },
+    {
+      "type": "group_profile",
+      "client": "dave",
+      "name": "reconnect-renamed",
+      "description": ""
     },
     {
       "type": "clients_converged",

@@ -241,11 +241,12 @@ These are the scenarios another implementation should be able to load from JSON 
   the final transcript delivered and no pending work. Complements `admin-policy-update/v1`, which covers policy
   validation on a single promotion.
 
-### `reconnect-catchup/v1`
+### `deferred-tick-catchup/v1`
 
-- File: `vectors/reconnect-catchup.v1.json`
+- File: `vectors/deferred-tick-catchup.v1.json`
 - Provenance: ported from the external multi-VM harness scenario catalog (`reconnect.rb`, with the soak/hour offline
-  essence).
+  essence). Named for what the steps actually do: the engine subject declares no `ParticipantConnectivity`, so no
+  transport-level disconnect happens; "offline" is modelled purely as Dave not ticking while his mailbox fills.
 - Setup: four members chat, Dave stops ticking (daemon down; transport keeps delivering to his mailbox), the others
   chat and Alice renames the group, then Dave ticks once and catches up on everything.
 - Pressure: offline catch-up across both missed application traffic and a missed epoch-advancing commit.

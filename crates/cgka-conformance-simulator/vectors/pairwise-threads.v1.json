@@ -151,11 +151,6 @@
         }
       },
       {
-        "type": "acknowledge_outbound",
-        "client": "alice",
-        "outcome": "accepted"
-      },
-      {
         "type": "in_group",
         "group": "ab",
         "action": {
@@ -163,11 +158,6 @@
           "sender": "bob",
           "payload": "pairs:ab:bob"
         }
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "bob",
-        "outcome": "accepted"
       },
       {
         "type": "in_group",
@@ -179,11 +169,6 @@
         }
       },
       {
-        "type": "acknowledge_outbound",
-        "client": "alice",
-        "outcome": "accepted"
-      },
-      {
         "type": "in_group",
         "group": "ac",
         "action": {
@@ -191,11 +176,6 @@
           "sender": "carol",
           "payload": "pairs:ac:carol"
         }
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "carol",
-        "outcome": "accepted"
       },
       {
         "type": "in_group",
@@ -207,11 +187,6 @@
         }
       },
       {
-        "type": "acknowledge_outbound",
-        "client": "bob",
-        "outcome": "accepted"
-      },
-      {
         "type": "in_group",
         "group": "bc",
         "action": {
@@ -219,11 +194,6 @@
           "sender": "carol",
           "payload": "pairs:bc:carol"
         }
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "carol",
-        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -268,6 +238,42 @@
             "type": "payload_count",
             "client": "alice",
             "payload": "pairs:bc:bob",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "alice",
+            "payload": "pairs:bc:carol",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "bob",
+            "payload": "pairs:ac:carol",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "carol",
+            "payload": "pairs:ab:bob",
             "count": 0
           }
         }

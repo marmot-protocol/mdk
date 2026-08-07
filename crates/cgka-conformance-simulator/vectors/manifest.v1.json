@@ -459,13 +459,13 @@
       "next": "Add a competing-promotion race variant to the churn family."
     },
     {
-      "id": "reconnect-catchup/v1",
+      "id": "deferred-tick-catchup/v1",
       "kind": "scenario_vector",
       "status": "portable",
-      "artifact": "reconnect-catchup.v1.json",
+      "artifact": "deferred-tick-catchup.v1.json",
       "coverage": [
-        "member offline across app traffic and a rename commit",
-        "single-tick catch-up on reconnect",
+        "member stops ticking across app traffic and a rename commit",
+        "single-tick catch-up spanning a missed epoch-advancing commit",
         "full-group convergence including group name"
       ],
       "next": "Keep durable-relay offline recovery in the adversarial-reliability family; this vector models mailbox catch-up."

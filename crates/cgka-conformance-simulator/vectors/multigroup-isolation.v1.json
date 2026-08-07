@@ -108,11 +108,6 @@
         }
       },
       {
-        "type": "acknowledge_outbound",
-        "client": "alice",
-        "outcome": "accepted"
-      },
-      {
         "type": "in_group",
         "group": "a",
         "action": {
@@ -120,11 +115,6 @@
           "sender": "bob",
           "payload": "multigroup:a:bob"
         }
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "bob",
-        "outcome": "accepted"
       },
       {
         "type": "in_group",
@@ -136,11 +126,6 @@
         }
       },
       {
-        "type": "acknowledge_outbound",
-        "client": "alice",
-        "outcome": "accepted"
-      },
-      {
         "type": "in_group",
         "group": "b",
         "action": {
@@ -148,11 +133,6 @@
           "sender": "carol",
           "payload": "multigroup:b:carol"
         }
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "carol",
-        "outcome": "accepted"
       },
       {
         "type": "deliver_all"
@@ -219,6 +199,7 @@
         "action": {
           "type": "observe_exact",
           "clients": [
+            "alice",
             "bob"
           ]
         }
@@ -249,6 +230,16 @@
       "client": "alice",
       "pending": "b-create",
       "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 1,
+      "member_count": 2,
+      "received_payloads": [
+        "multigroup:a:bob",
+        "multigroup:b:carol"
+      ]
     },
     {
       "type": "client_state",
