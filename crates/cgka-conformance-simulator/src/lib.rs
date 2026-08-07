@@ -50,6 +50,7 @@ mod scenario_authoring;
 mod scenario_faults;
 mod scenario_input_ledger;
 mod scenario_ir;
+mod stateful_generator;
 pub mod subject;
 mod topology;
 pub mod vector;
@@ -87,7 +88,8 @@ pub use failure_capsule::{
     write_failure_capsule,
 };
 pub use family::{
-    GeneratedScenarioCase, GeneratedSubjectKind, generate_adversarial_reliability_case,
+    GENERATED_SCENARIO_INPUT_SCHEMA_VERSION, GeneratedScenarioCase, GeneratedScenarioInputV1,
+    GeneratedSubjectKind, generate_adversarial_reliability_case,
     generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
     generate_adversarial_reliability_self_update_regression,
     generate_adversarial_reliability_sustained_regression, generate_convergence_chaos_family,
@@ -152,6 +154,10 @@ pub use scenario_ir::{
     CompiledScenarioActionV2, CompiledScenarioV2, SCENARIO_IR_LATEST_VERSION,
     SCENARIO_IR_V2_VERSION, SCENARIO_IR_V3_ONLY_STEP_KINDS, SCENARIO_IR_V3_VERSION,
     ScenarioActionScheduleV2, compile_scenario, preflight_compiled_scenario, stable_action_id,
+};
+pub use stateful_generator::{
+    STATEFUL_CHAT_JOURNEY_FAMILY, STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION,
+    generate_stateful_chat_journey_case, generate_stateful_chat_journey_family,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,

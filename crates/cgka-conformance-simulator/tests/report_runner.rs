@@ -101,6 +101,55 @@ fn parse_vector_fixture_report_args() {
 }
 
 #[test]
+fn parse_generated_input_report_args() {
+    let command = parse_report_command([
+        "--generated-input".into(),
+        "target/case-1-generated-input.json".into(),
+        "--generated-input".into(),
+        "target/case-3-generated-input.json".into(),
+        "--out".into(),
+        "target/generated-input-reports".into(),
+    ])
+    .expect("generated input args parse");
+
+    assert_eq!(
+        command,
+        ReportCommand::Run(ReportArgs {
+            input: ReportInput::GeneratedInputs {
+                paths: vec![
+                    PathBuf::from("target/case-1-generated-input.json"),
+                    PathBuf::from("target/case-3-generated-input.json"),
+                ],
+            },
+            out: PathBuf::from("target/generated-input-reports"),
+            strict_oracle: true,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
+        })
+    );
+}
+
+#[test]
+fn parse_generated_input_rejects_other_scenario_sources() {
+    for conflicting in ["--vectors", "--family", "--seed", "--cases"] {
+        let value = match conflicting {
+            "--vectors" => "crates/cgka-conformance-simulator/vectors",
+            "--family" => "chat-journey/v1",
+            "--seed" | "--cases" => "2",
+            _ => unreachable!(),
+        };
+        let error = parse_report_command([
+            "--generated-input".into(),
+            "target/case-generated-input.json".into(),
+            conflicting.into(),
+            value.into(),
+        ])
+        .expect_err("generated input must be the only scenario source");
+        assert!(error.to_string().contains("--generated-input"));
+    }
+}
+
+#[test]
 fn parse_strict_oracle_report_args() {
     let command = parse_report_command([
         "--family".into(),

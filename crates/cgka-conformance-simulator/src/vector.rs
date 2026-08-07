@@ -270,13 +270,19 @@ impl TraceExpectation {
                 }
             }
             TraceExpectation::AdminPolicy { client, admins } => {
+                let mut expected_admins = admins.clone();
+                expected_admins.sort();
                 match observed
                     .admin_policies
                     .iter()
                     .rev()
                     .find(|policy| policy.client == *client)
                 {
-                    Some(policy) if &policy.admins == admins => {}
+                    Some(policy) if {
+                        let mut observed_admins = policy.admins.clone();
+                        observed_admins.sort();
+                        observed_admins == expected_admins
+                    } => {}
                     Some(policy) => mismatches.push(ExpectationFailure {
                         kind: "admin_policy_mismatch".into(),
                         message: format!(
@@ -1465,6 +1471,51 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn admin_policy_expectation_compares_the_semantic_set() {
+        let mut observed = trace(Vec::new());
+        observed
+            .admin_policies
+            .push(ScenarioAdminPolicyObservation {
+                client: "alice".into(),
+                admins: vec!["bob".into(), "alice".into()],
+            });
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::AdminPolicy {
+                client: "alice".into(),
+                admins: vec!["alice".into(), "bob".into()],
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn admin_policy_expectation_rejects_duplicate_admins() {
+        let mut observed = trace(Vec::new());
+        observed
+            .admin_policies
+            .push(ScenarioAdminPolicyObservation {
+                client: "alice".into(),
+                admins: vec!["alice".into(), "alice".into()],
+            });
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::AdminPolicy {
+                client: "alice".into(),
+                admins: vec!["alice".into()],
+            }],
+            &observed,
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "admin_policy_mismatch");
     }
 
     #[test]
