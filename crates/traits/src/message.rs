@@ -54,8 +54,6 @@ pub struct OwnApplicationConvergenceStamp {
     /// Hex-encoded MLS epoch authenticator of the state that encrypted the
     /// application message.
     pub source_epoch_authenticator: String,
-    /// Stable local reference to the validated plaintext payload.
-    pub decrypted_payload_ref: String,
 }
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].

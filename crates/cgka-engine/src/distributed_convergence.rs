@@ -1336,16 +1336,20 @@ impl<S: StorageProvider> Engine<S> {
         // Snapshot their prior values first, then emit forensic transitions
         // only after that transaction commits so Goggles never observes a
         // state change that rolled back.
-        let disposition_transitions = openmls_canonicalization_dispositions(&result)?
-            .into_iter()
-            .map(|disposition| {
-                let record = self
-                    .storage
-                    .get_message(&disposition.message_id)
-                    .map_err(storage_projection_error)?;
-                Ok((disposition, record.state, record.epoch))
-            })
-            .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?;
+        let disposition_transitions = if self.recorder.is_enabled() {
+            openmls_canonicalization_dispositions(&result)?
+                .into_iter()
+                .map(|disposition| {
+                    let record = self
+                        .storage
+                        .get_message(&disposition.message_id)
+                        .map_err(storage_projection_error)?;
+                    Ok((disposition, record.state, record.epoch))
+                })
+                .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?
+        } else {
+            Vec::new()
+        };
         let observations = self.storage.with_transaction(|storage| {
             let observations = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,

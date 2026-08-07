@@ -20,7 +20,6 @@ use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
@@ -857,10 +856,6 @@ impl<S: StorageProvider> Engine<S> {
         let own_application_stamp = OwnApplicationConvergenceStamp {
             sender: self.identity.self_id().clone(),
             source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),
-            decrypted_payload_ref: format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(payload.as_slice()))
-            ),
         };
         let source_retention_seconds =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?;

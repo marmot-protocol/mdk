@@ -221,27 +221,21 @@ impl<S: StorageProvider> Engine<S> {
             ..msg.clone()
         };
         self.storage.with_transaction(|_storage| {
-            if let Some(stamp) = application_stamp.clone() {
-                self.persist_stored_message_payload(
-                    msg.id.clone(),
-                    group_id,
-                    epoch,
-                    MessageState::Sent,
-                    StoredMessagePayload::signed_openmls_application_wire(
-                        msg.clone(),
-                        openmls_msg.clone(),
-                        stamp,
-                    ),
-                )?;
-            } else {
-                self.persist_signed_openmls_wire_message(
-                    msg,
-                    &openmls_msg,
-                    group_id,
-                    epoch,
-                    MessageState::Sent,
-                )?;
-            }
+            let payload = match application_stamp {
+                Some(stamp) => StoredMessagePayload::signed_openmls_application_wire(
+                    msg.clone(),
+                    openmls_msg.clone(),
+                    stamp,
+                ),
+                None => StoredMessagePayload::signed_openmls_wire(msg.clone(), openmls_msg.clone()),
+            };
+            self.persist_stored_message_payload(
+                msg.id.clone(),
+                group_id,
+                epoch,
+                MessageState::Sent,
+                payload,
+            )?;
             self.persist_sent_openmls_content_marker(
                 &openmls_msg,
                 content_id.clone(),
@@ -386,26 +380,6 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
-        )
-    }
-
-    pub(crate) fn persist_signed_openmls_wire_message(
-        &self,
-        exact_message: &TransportMessage,
-        openmls_message: &TransportMessage,
-        group_id: &GroupId,
-        epoch: EpochId,
-        state: MessageState,
-    ) -> Result<(), EngineError> {
-        self.persist_stored_message_payload(
-            exact_message.id.clone(),
-            group_id,
-            epoch,
-            state,
-            StoredMessagePayload::signed_openmls_wire(
-                exact_message.clone(),
-                openmls_message.clone(),
-            ),
         )
     }
 

@@ -22,6 +22,7 @@ fn jsonl_recorder_appends_events_with_monotonic_seq() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");
     let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    assert!(recorder.is_enabled());
     recorder.record(AuditRecord::new(
         None,
         AuditEventKind::SendEntry {
@@ -141,6 +142,7 @@ fn jsonl_recorder_rotate_discards_old_lines_and_keeps_recording() {
 #[test]
 fn noop_recorder_has_no_path_and_rotate_is_a_no_op() {
     let recorder = NoopRecorder;
+    assert!(!recorder.is_enabled());
     assert!(recorder.audit_log_path().is_none());
     recorder.rotate().unwrap();
 }

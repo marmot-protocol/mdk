@@ -1165,6 +1165,15 @@ pub enum PeelerOutcomeKind {
 pub trait ForensicRecorder: Send + Sync {
     fn record(&self, record: AuditRecord);
 
+    /// Whether this recorder consumes audit events.
+    ///
+    /// Producers may use this to skip audit-only data loads on hot paths. The
+    /// default is enabled so custom recorders remain observable without code
+    /// changes; [`NoopRecorder`] is the sole disabled implementation.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     fn health_snapshot(&self) -> AuditRecorderHealthSnapshot {
         AuditRecorderHealthSnapshot::default()
     }
@@ -1214,6 +1223,10 @@ pub struct NoopRecorder;
 
 impl ForensicRecorder for NoopRecorder {
     fn record(&self, _record: AuditRecord) {}
+
+    fn is_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// JSONL recorder. Appends one JSON line per event to the configured path.

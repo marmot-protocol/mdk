@@ -356,7 +356,6 @@ fn stored_signed_application_payload_round_trips_and_old_rows_default_to_unstamp
     let stamp = OwnApplicationConvergenceStamp {
         sender: MemberId::new(vec![0xEE; 32]),
         source_epoch_authenticator: "ab".repeat(32),
-        decrypted_payload_ref: format!("sha256:{}", "cd".repeat(32)),
     };
     let payload = StoredMessagePayload::signed_openmls_application_wire(
         exact.clone(),

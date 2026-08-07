@@ -311,7 +311,6 @@ pub enum OpenMlsReplayObservation {
         source_epoch: u64,
         sender: Vec<u8>,
         source_epoch_authenticator: String,
-        decrypted_payload_ref: String,
     },
     Ignored {
         message_id: String,
@@ -2272,12 +2271,15 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // inside an open one. The snapshot guards in-process error returns; this
     // transaction guards hard crashes mid-merge.
     storage.with_transaction(|storage| {
-        // No pre-validated own commits here: snapshot rollforward cannot nest
+        // No pre-validated own messages here. Snapshot rollforward cannot nest
         // inside this transaction, and every own commit on the accepted
         // branch was excluded from `replay_messages` before this call —
         // either as part of the already-applied prefix or as a
         // checkpoint-realizable own-commit run whose exact restore the
         // caller performs itself (`checkpoint_realizable_own_commit_prefix`).
+        // Leaving own-application stamps out is also load-bearing: those apps
+        // reach OpenMLS as `OwnPrivateMessage` and remain `Ignored`, so apply
+        // replay never echoes a sender's own message as `MessageReceived`.
         let output = process_openmls_messages_inner(
             storage,
             group_id,
@@ -2617,7 +2619,7 @@ struct AppMessageBranches {
     source_epoch: u64,
     sender: Vec<u8>,
     branch_ids: BTreeSet<String>,
-    decrypted_payload_ref: String,
+    decrypted_payload_ref: Option<String>,
 }
 
 fn app_messages_by_id(
@@ -2633,13 +2635,17 @@ fn app_messages_by_id(
                     sender,
                     decrypted_payload_ref,
                     ..
-                } => (message_id, source_epoch, sender, decrypted_payload_ref),
+                } => (
+                    message_id,
+                    source_epoch,
+                    sender,
+                    Some(decrypted_payload_ref),
+                ),
                 OpenMlsReplayObservation::OwnApplicationSent {
                     message_id,
                     source_epoch,
                     sender,
                     source_epoch_authenticator,
-                    decrypted_payload_ref,
                 } => {
                     let matches_candidate = candidate
                         .epoch_authenticators
@@ -2653,7 +2659,7 @@ fn app_messages_by_id(
                     if !matches_candidate {
                         continue;
                     }
-                    (message_id, source_epoch, sender, decrypted_payload_ref)
+                    (message_id, source_epoch, sender, None)
                 }
                 _ => continue,
             };
@@ -2664,7 +2670,7 @@ fn app_messages_by_id(
                         source_epoch: *source_epoch,
                         sender: sender.clone(),
                         branch_ids: BTreeSet::new(),
-                        decrypted_payload_ref: decrypted_payload_ref.clone(),
+                        decrypted_payload_ref: decrypted_payload_ref.cloned(),
                     });
             entry.branch_ids.insert(candidate.branch_id.clone());
         }
@@ -2703,7 +2709,7 @@ fn project_pending_canonicalization_messages(
                         .map(|observed| observed.branch_ids.iter().cloned().collect())
                         .unwrap_or_default(),
                     decrypted_payload_ref: observed
-                        .map(|observed| observed.decrypted_payload_ref.clone()),
+                        .and_then(|observed| observed.decrypted_payload_ref.clone()),
                     already_delivered: already_delivered_app_ids.contains(&message_id),
                 }
             }
@@ -2788,7 +2794,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 source_epoch,
                 sender: stamp.sender.as_slice().to_vec(),
                 source_epoch_authenticator: stamp.source_epoch_authenticator.clone(),
-                decrypted_payload_ref: stamp.decrypted_payload_ref.clone(),
             });
             continue;
         }
@@ -3129,9 +3134,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             app_event.created_at,
                             retention_seconds,
                         ),
-                        decrypted_payload_ref: format!(
-                            "sha256:{}",
-                            hex::encode(message_digest(payload.as_slice()))
+                        decrypted_payload_ref: crate::app_payload::decrypted_payload_ref(
+                            payload.as_slice(),
                         ),
                     });
                 } else {
