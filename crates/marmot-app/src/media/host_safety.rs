@@ -72,14 +72,14 @@ pub(crate) fn validate_profile_image_fetch_url(url: &Url) -> Result<(), String> 
 /// Trim and bound-check the raw profile-image URL before WHATWG parse
 /// normalization can collapse an over-limit dot-segment path.
 pub(crate) fn parse_profile_image_fetch_url(raw: &str) -> Result<Url, String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err("profile image URL must not be empty".into());
-    }
     if raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
         return Err(format!(
             "profile image URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
         ));
+    }
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("profile image URL must not be empty".into());
     }
     let url = Url::parse(raw).map_err(|e| format!("profile image URL is invalid: {e}"))?;
     validate_profile_image_fetch_url(&url)?;
@@ -91,12 +91,12 @@ pub(crate) fn parse_profile_image_redirect_url(
     current: &Url,
     raw_location: &str,
 ) -> Result<Url, String> {
-    let raw_location = raw_location.trim();
     if raw_location.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
         return Err(format!(
             "profile image redirect URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
         ));
     }
+    let raw_location = raw_location.trim();
     let url = current
         .join(raw_location)
         .map_err(|e| format!("profile image redirect URL is invalid: {e}"))?;
