@@ -642,6 +642,7 @@ pub(crate) fn create_group_outcome_event(result: &SendResult) -> AuditEventKind 
 pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
     match err {
         EngineError::UnknownGroup(_) => "unknown_group",
+        EngineError::GroupNotHydrated(_) => "group_not_hydrated",
         EngineError::UnknownPending => "unknown_pending",
         EngineError::NotAMember { .. } => "not_a_member",
         EngineError::NotGroupAdmin { .. } => "not_group_admin",

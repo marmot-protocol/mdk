@@ -281,7 +281,7 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
 
     let mut reopened = build_client_with_storage(CAROL_SEED, storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydrate killed database");
 
     assert_eq!(
@@ -422,7 +422,7 @@ fn run_transition_parent_case(point: &str) {
     );
     let mut reopened = build_client_with_storage(CAROL_SEED, storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .unwrap_or_else(|error| panic!("hydrate after {point}: {error}"));
     assert_eq!(
         storage

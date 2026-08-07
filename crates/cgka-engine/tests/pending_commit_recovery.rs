@@ -8,7 +8,7 @@
 //! stranded: every later commit-creating operation fails on the leftover
 //! pending commit forever.
 //!
-//! `hydrate_stable_groups_from_storage` (called by `AccountDeviceSession::open`)
+//! `hydrate_all_stored_groups` (the eager path behind `AccountDeviceSession::open`)
 //! must detect that surviving pending commit, clear it (treating it as
 //! publish-failed), re-derive the Marmot record, and surface a typed
 //! `GroupEvent::PendingCommitRecovered` so the app can resync.
@@ -246,7 +246,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 
     let mut alice = build_client(reopened_store, b"alice-pcr");
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydrate must recover, not error");
 
     // The recovery event was surfaced so the app can resync.
@@ -403,7 +403,7 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
 
     let mut alice = build_selfremove_client(reopened_store, b"alice-dsr");
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydrate must not error on a deferred selfremove");
 
     let events = alice.drain_events();

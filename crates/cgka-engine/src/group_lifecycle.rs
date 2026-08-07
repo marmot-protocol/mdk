@@ -541,8 +541,16 @@ impl<S: StorageProvider> Engine<S> {
             if let Ok(transport_group_id) =
                 crate::app_components::transport_group_id_of_group(&mls_group)
             {
+                // Inlined `index_transport_group_route` (field-split borrows:
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
                 self.transport_group_id_index
-                    .insert(transport_group_id, group_id.clone());
+                    .insert(transport_group_id.clone(), group_id.clone());
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
             }
         }
 
@@ -705,8 +713,7 @@ impl<S: StorageProvider> Engine<S> {
             if let Ok(transport_group_id) =
                 crate::app_components::transport_group_id_of_group(&mls_group)
             {
-                self.transport_group_id_index
-                    .insert(transport_group_id, group_id.clone());
+                self.index_transport_group_route(transport_group_id, &group_id, canonical_epoch);
             }
             self.epoch_manager
                 .set_stable(group_id.clone(), canonical_epoch);
@@ -1194,8 +1201,8 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+            let joined_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, &group_id, joined_epoch);
         }
 
         // 7. State machine: Stable at the post-welcome epoch.
@@ -1265,6 +1272,12 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         self.seen_message_ids.insert(welcome_id);
+        // An authenticated welcome re-validated every leaf and wrote fresh
+        // group state, which supersedes any outstanding lazy hydration for
+        // this id (mdk#1161): the group is fully live now, and its route was
+        // indexed above.
+        self.unhydrated_groups.remove(&group_id);
+        self.route_backfill_pending.remove(&group_id);
         // An authenticated welcome re-validated every leaf and wrote fresh
         // group state — strictly stronger evidence of health than
         // `retry_hydrate_quarantined_group` re-reading stored state. Clear a

@@ -11,6 +11,7 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
     let member_hex = hex::encode(member_id.as_slice());
     let errors = [
         EngineError::UnknownGroup(group_id.clone()).to_string(),
+        EngineError::GroupNotHydrated(group_id.clone()).to_string(),
         EngineError::NotAMember {
             group_id: group_id.clone(),
         }

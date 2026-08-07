@@ -419,7 +419,7 @@ async fn self_update_restart_republishes_the_identical_signed_event() {
     drop(alice);
 
     let mut restarted = build_engine_with_storage(b"alice", storage);
-    restarted.hydrate_stable_groups_from_storage().unwrap();
+    restarted.hydrate_all_stored_groups().unwrap();
     let recovered = restarted.drain_auto_publish();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].msg, original);

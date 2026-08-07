@@ -217,7 +217,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
         .expect("build reopened engine");
 
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration skips bad group instead of aborting account open");
 
     assert_eq!(reopened.epoch(&healthy_group).unwrap(), healthy_epoch);
@@ -276,7 +276,7 @@ async fn hydration_classifies_stored_wire_profile_mismatch_as_member_validation_
 
     let mut reopened = build_engine(storage);
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("profile mismatch quarantines instead of aborting account open");
 
     assert_eq!(
@@ -309,7 +309,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration skips the first bad group and continues");
 
     assert_eq!(reopened.epoch(&healthy_group).unwrap(), healthy_epoch);
@@ -750,7 +750,7 @@ async fn welcome_delivery_accessors_hide_quarantined_groups() {
     storage.set_fail_get_group(true);
     let mut engine = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
     engine
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("unreadable group is quarantined");
     assert_eq!(
         engine.quarantined_groups(),
@@ -814,7 +814,7 @@ async fn retry_recovers_a_transiently_quarantined_group() {
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group, does not abort");
 
     assert!(matches!(
@@ -865,7 +865,7 @@ async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
     storage.set_fail_disband_tombstone(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("per-group tombstone failure is quarantined");
 
     assert_eq!(
@@ -933,7 +933,7 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
     storage.set_fail_list_queued_outbound_intents(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("per-group failure is quarantined");
     assert!(matches!(
         reopened.quarantined_groups().as_slice(),
@@ -1017,7 +1017,7 @@ async fn retry_keeps_group_quarantined_when_still_unhealthy() {
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group");
     reopened.drain_events();
 
@@ -1137,7 +1137,7 @@ async fn quarantined_alice_with_live_bob() -> (
     storage.set_fail_get_group(true);
     let mut reopened = build_flaky_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the unreadable group");
     assert_eq!(
         reopened.quarantined_groups(),
@@ -1395,7 +1395,7 @@ async fn rejoin_welcome_clears_quarantine() {
         .expect("build alice");
     insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the corrupted copy");
     assert_eq!(
         alice.quarantined_groups(),
@@ -1476,7 +1476,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
         .expect("build alice");
     insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
     alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration quarantines the corrupted copy");
     assert_eq!(alice.quarantined_groups().len(), 1);
     alice.drain_events();
@@ -1561,9 +1561,7 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
     );
 
     let mut first = build_engine(storage.clone());
-    first
-        .hydrate_stable_groups_from_storage()
-        .expect("first hydration");
+    first.hydrate_all_stored_groups().expect("first hydration");
     assert_eq!(first.epoch(&group).unwrap(), epoch);
 
     // First open validated the tree and persisted a marker.
@@ -1577,7 +1575,7 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
     // because the tree bytes are identical.
     let mut second = build_engine(storage.clone());
     second
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("second hydration of unchanged group");
     assert_eq!(second.epoch(&group).unwrap(), epoch);
     assert_eq!(
@@ -1624,7 +1622,7 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydrate recovers orphaned probe");
 
     assert_eq!(
@@ -1669,7 +1667,7 @@ async fn hydration_recovers_interrupted_convergence_apply() {
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydrate recovers interrupted apply");
 
     assert_eq!(
@@ -1709,7 +1707,7 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
 
     let mut reopened = build_engine(storage.clone());
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("hydration revalidates and accepts the healthy group");
     assert_eq!(reopened.epoch(&group).unwrap(), epoch);
 

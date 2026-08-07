@@ -199,6 +199,10 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Option<u64>, OpenMlsProjectionError> {
+        // Convergence scheduling for a seeded-but-unhydrated group promotes
+        // it first (mdk#1161); a hydration failure quarantines it and the
+        // gate below reports no work.
+        let _ = self.ensure_hydrated(group_id);
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
@@ -244,6 +248,11 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         policy: CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Promote a seeded-but-unhydrated group first (mdk#1161) so the audit
+        // context snapshot below reads validated state; a hydration failure
+        // quarantines and the write proceeds as it does for quarantined
+        // groups today (the policy is durable config, not group state).
+        let _ = self.ensure_hydrated(group_id);
         self.accept_convergence_policy(&policy)?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
@@ -364,6 +373,8 @@ impl<S: StorageProvider> Engine<S> {
         message: TransportMessage,
         monotonic_ms: u64,
     ) -> Result<(), OpenMlsProjectionError> {
+        // See `buffer_openmls_convergence_message` (mdk#1161).
+        self.ensure_hydrated_for_convergence(group_id)?;
         self.buffer_openmls_convergence_message_with_time(
             group_id,
             message,
@@ -380,7 +391,30 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message: TransportMessage,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Promote a seeded-but-unhydrated group before persisting convergence
+        // input against it (mdk#1161): the group's interrupted probe/apply
+        // recovery must run before any of its stored state is extended.
+        self.ensure_hydrated_for_convergence(group_id)?;
         self.buffer_openmls_convergence_message_with_time(group_id, message, self.convergence_now())
+    }
+
+    /// Fail-closed hydration promotion for the public convergence-buffering
+    /// entry points (mdk#1161): a failed promotion quarantines the group and
+    /// retracts its provisional epoch state, so continuing would take the
+    /// no-epoch-state admission branch and durably retain a convergence row
+    /// for a group validation just rejected. Propagate instead — the caller
+    /// observes the same missing-group view every quarantined group presents,
+    /// and no durable state is extended.
+    fn ensure_hydrated_for_convergence(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.ensure_hydrated(group_id).map_err(|e| match e {
+            cgka_traits::error::EngineError::UnknownGroup(_) => {
+                OpenMlsProjectionError::MissingGroup
+            }
+            other => OpenMlsProjectionError::Storage(format!("{other}")),
+        })
     }
 
     pub(crate) fn buffer_openmls_convergence_message_with_time(
@@ -967,6 +1001,10 @@ impl<S: StorageProvider> Engine<S> {
         now: ConvergenceTime,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
         let now_ms = now.monotonic_ms;
+        // A convergence pass over a seeded-but-unhydrated group promotes it
+        // first (mdk#1161); a hydration failure quarantines it and the gate
+        // below reports the blocked run.
+        let _ = self.ensure_hydrated(group_id);
         // A hydration-quarantined group is frozen until explicit repair: no
         // canonicalization pass may read or mutate its state, and no
         // set_stable may re-activate it out of band (mdk#364). Check this

@@ -366,6 +366,24 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
+- **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
+  `hydrate_stable_groups_from_storage` is the cheap seed pass: per stored group it reads only the durable record —
+  no MLS load, snapshot list, or message scan — seeds a provisional `Stable(record.epoch)` entry so `live_group_ids`
+  keeps listing the group, restores disband/unrecoverable terminal state, seeds the inbound routing index from the
+  durable `transport_group_routes` table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
+  through the same `ensure_group_live` chokepoint with the retryable `GroupNotHydrated` (never a partial view);
+  `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
+  seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
+  the epoch entry — a quarantined group must never hold one). `hydrate_all_stored_groups` is the eager compatibility
+  path (seed + drain-all) used by `AccountDeviceSession::open` until the app-layer background pipeline lands, and it
+  drains every seeded group — including unrecoverable ones, whose halt re-emits from full hydration exactly once per
+  open. Durable route rows carry a `source_epoch` stamp refreshed at every commit apply: the seed trusts a group's
+  route set only when a stamp matches the record epoch (a lagging stamp means a crash or write failure between the
+  commit and the route refresh), and stale/route-less groups sit in `route_backfill_pending`. Ingest probes at most
+  `ROUTE_BACKFILL_PROBES_PER_MISS` pending groups per unknown route (bounded per event — mdk#408's O(groups)
+  amplification stays closed), removing an id only on successful indexing or the terminal no-routing-component
+  disposition; MLS-load failures stay owned by hydration/quarantine. Route refreshes also retire durable rows the
+  retained-history window (pinned v1 `max_rewind_commits`) has moved past, per routing-v1's overlap rule.
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the

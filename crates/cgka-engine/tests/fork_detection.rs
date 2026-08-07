@@ -212,7 +212,7 @@ fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<Sql
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
-    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine.hydrate_all_stored_groups().unwrap();
     engine
 }
 
@@ -225,7 +225,7 @@ fn reopen_legacy_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<Sqli
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
-    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine.hydrate_all_stored_groups().unwrap();
     engine
 }
 

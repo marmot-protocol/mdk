@@ -609,6 +609,13 @@ impl<S: StorageProvider> Engine<S> {
 
         self.transport_group_id_index
             .retain(|_, mapped_group| mapped_group != group_id);
+        // A disbanded group must be unroutable across restarts too; the
+        // durable delete shares the in-memory retain's best-effort policy
+        // (the tombstone keeps inbound handling terminal either way).
+        let _ = self
+            .storage
+            .delete_transport_group_routes_for_group(group_id);
+        self.route_backfill_pending.remove(group_id);
         self.pending_convergence_groups.remove(group_id);
         self.engine_metrics.forget_group(group_id);
         self.leaving_groups.remove(group_id);

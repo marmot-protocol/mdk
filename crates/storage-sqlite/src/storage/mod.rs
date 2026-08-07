@@ -14,6 +14,7 @@ mod member_validation_cache;
 mod messages;
 mod outbound;
 pub(crate) mod snapshots;
+mod transport_routes;
 mod welcomes;
 
 #[cfg(test)]

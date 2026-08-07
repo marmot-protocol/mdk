@@ -63,7 +63,7 @@ backend on the same rail.
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
 
 - **File:** `pending_commit_recovery.rs`
-  - **Owns:** Crash-during-publish recovery at session open — `hydrate_stable_groups_from_storage` detects a surviving
+  - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `auto_commit_atomicity.rs`
@@ -75,6 +75,12 @@ backend on the same rail.
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
+
+- **File:** `two_phase_hydration.rs`
+  - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
+    promotion and quarantine parity, cheap-pass idempotency, durable transport-route seeding, the bounded ingest
+    route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
+    retention-window route retirement across rotation and restart
 
 - **File:** `snapshot_privacy.rs`
   - **Owns:** Snapshot names do not expose plaintext group ids
