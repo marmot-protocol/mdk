@@ -116,6 +116,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   corruption fix. The pinned Rust toolchain is now 1.95.0, the minimum release
   that supports this libsqlite3-sys build.
 
+- The pinned Rust toolchain is now 1.97.1, and the convergence-campaign
+  builder image is digest-pinned to the matching `rust:1.97.1-bookworm`.
+  Rust 1.97's new `unneeded_wildcard_pattern` clippy lint required removing
+  two redundant field bindings in the campaign runner's fault validation.
+  ([#1303](https://github.com/marmot-protocol/mdk/pull/1303))
+
 ## [0.9.10] - 2026-07-29
 
 ### Added
