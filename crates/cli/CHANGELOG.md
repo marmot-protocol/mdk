@@ -120,7 +120,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   builder image is digest-pinned to the matching `rust:1.97.1-bookworm`.
   Rust 1.97's new `unneeded_wildcard_pattern` clippy lint required removing
   two redundant field bindings in the campaign runner's fault validation.
-  ([#1303](https://github.com/marmot-protocol/mdk/pull/1303))
+  ([#1305](https://github.com/marmot-protocol/mdk/pull/1305))
 
 ## [0.9.10] - 2026-07-29
 
