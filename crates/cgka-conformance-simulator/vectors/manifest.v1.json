@@ -420,6 +420,55 @@
         "full-group convergence at final epoch"
       ],
       "next": "Scale the cohort schedule into a generated family for larger rosters."
+    },
+    {
+      "id": "multigroup-isolation/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "multigroup-isolation.v1.json",
+      "coverage": [
+        "first multi-group in_group vector",
+        "overlapping membership across two live groups",
+        "cross-group plaintext isolation via zero-count assertions"
+      ],
+      "next": "Grow to three groups with rename traffic if cross-group state bleed is suspected."
+    },
+    {
+      "id": "pairwise-threads/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "pairwise-threads.v1.json",
+      "coverage": [
+        "full pairwise thread mesh over three clients",
+        "same-account thread isolation",
+        "per-thread transcript completeness"
+      ],
+      "next": "Scale the mesh in a generated family when quadratic growth is needed."
+    },
+    {
+      "id": "admin-handover/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "admin-handover.v1.json",
+      "coverage": [
+        "multi-hop admin promotion chain",
+        "renames by each newly promoted admin",
+        "demotion and post-demotion denial",
+        "exact cross-client equivalence after five commits"
+      ],
+      "next": "Add a competing-promotion race variant to the churn family."
+    },
+    {
+      "id": "reconnect-catchup/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "reconnect-catchup.v1.json",
+      "coverage": [
+        "member offline across app traffic and a rename commit",
+        "single-tick catch-up on reconnect",
+        "full-group convergence including group name"
+      ],
+      "next": "Keep durable-relay offline recovery in the adversarial-reliability family; this vector models mailbox catch-up."
     }
   ]
 }

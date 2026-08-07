@@ -1,0 +1,351 @@
+{
+  "scenario_name": "pairwise-threads/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.10",
+  "seed": null,
+  "scenario": {
+    "name": "pairwise-threads/v1",
+    "spec_version": "2",
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
+    "steps": [
+      {
+        "type": "in_group",
+        "group": "ab",
+        "action": {
+          "type": "create_group",
+          "creator": "alice",
+          "name": "pair-ab",
+          "invitees": [
+            "bob"
+          ],
+          "required_features": [],
+          "initial_admins": [
+            "alice"
+          ],
+          "pending": "ab-create"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "ab-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "in_group",
+        "group": "ac",
+        "action": {
+          "type": "create_group",
+          "creator": "alice",
+          "name": "pair-ac",
+          "invitees": [
+            "carol"
+          ],
+          "required_features": [],
+          "initial_admins": [
+            "alice"
+          ],
+          "pending": "ac-create"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "ac-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol"
+        ]
+      },
+      {
+        "type": "in_group",
+        "group": "bc",
+        "action": {
+          "type": "create_group",
+          "creator": "bob",
+          "name": "pair-bc",
+          "invitees": [
+            "carol"
+          ],
+          "required_features": [],
+          "initial_admins": [
+            "bob"
+          ],
+          "pending": "bc-create"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "bc-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol"
+        ]
+      },
+      {
+        "type": "in_group",
+        "group": "ab",
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "alice",
+            "bob"
+          ]
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "ac",
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "alice",
+            "carol"
+          ]
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "bc",
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "bob",
+            "carol"
+          ]
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "ab",
+        "action": {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "pairs:ab:alice"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
+      {
+        "type": "in_group",
+        "group": "ab",
+        "action": {
+          "type": "send_app_message",
+          "sender": "bob",
+          "payload": "pairs:ab:bob"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "in_group",
+        "group": "ac",
+        "action": {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "pairs:ac:alice"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "outcome": "accepted"
+      },
+      {
+        "type": "in_group",
+        "group": "ac",
+        "action": {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "pairs:ac:carol"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "in_group",
+        "group": "bc",
+        "action": {
+          "type": "send_app_message",
+          "sender": "bob",
+          "payload": "pairs:bc:bob"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "outcome": "accepted"
+      },
+      {
+        "type": "in_group",
+        "group": "bc",
+        "action": {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "pairs:bc:carol"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "bob",
+            "payload": "pairs:ac:alice",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "carol",
+            "payload": "pairs:ab:alice",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "alice",
+            "payload": "pairs:bc:bob",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "bc",
+        "action": {
+          "type": "observe_exact",
+          "clients": [
+            "bob",
+            "carol"
+          ]
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "ab",
+        "action": {
+          "type": "observe_exact",
+          "clients": [
+            "alice"
+          ]
+        }
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "ab-create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 5,
+      "client": "alice",
+      "pending": "ac-create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "bob",
+      "pending": "bc-create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 1,
+      "member_count": 2,
+      "received_payloads": [
+        "pairs:ab:bob",
+        "pairs:ac:carol"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 1,
+      "member_count": 2,
+      "received_payloads": [
+        "pairs:ab:alice",
+        "pairs:bc:carol"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "carol",
+      "epoch": 1,
+      "member_count": 2,
+      "received_payloads": [
+        "pairs:ac:alice",
+        "pairs:bc:bob"
+      ]
+    }
+  ]
+}

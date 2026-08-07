@@ -209,6 +209,51 @@ These are the scenarios another implementation should be able to load from JSON 
   covers the founders only: as in the latecomer vector, Carol and Dave legitimately retain their undecryptable
   pre-join inputs as deferred transport work, so including them would fail on intended behavior.
 
+### `multigroup-isolation/v1`
+
+- File: `vectors/multigroup-isolation.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`multigroup.rb`).
+- Setup: the first multi-group vector. Alice founds group `a` with Bob and group `b` with Carol; Alice is the only
+  overlap. Both groups exchange application traffic through `in_group`-scoped steps.
+- Pressure: cross-group encryption boundaries under overlapping membership.
+- Expected: Bob never observes group-b plaintext and Carol never observes group-a plaintext (`payload_count` zero
+  assertions); each single-group member's exact transcript holds only its own group's traffic.
+
+### `pairwise-threads/v1`
+
+- File: `vectors/pairwise-threads.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`pairs.rb`).
+- Setup: the full pairwise mesh over three clients (`ab`, `ac`, `bc`); each thread carries one message in each
+  direction.
+- Pressure: same-account thread isolation. Every client sits in two private threads at once.
+- Expected: each client observes exactly its own threads' payloads, and one representative foreign-thread payload per
+  client is pinned at zero. Observation buffers are per-client, so the exact lists span both threads a client is in;
+  the zero-count assertions carry the isolation claim.
+
+### `admin-handover/v1`
+
+- File: `vectors/admin-handover.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`handover.rb`).
+- Setup: Alice promotes Bob, Bob renames, Bob promotes Carol, Carol renames, Alice demotes Bob, and the demoted Bob is
+  denied a further admin edit. A final all-hands message round follows.
+- Pressure: multi-hop admin succession where each newly promoted member exercises its authority, then loses it.
+- Expected: all clients settle on the same admin set, converge exactly (`clients_exactly_equivalent`) at epoch 6 with
+  the final transcript delivered and no pending work. Complements `admin-policy-update/v1`, which covers policy
+  validation on a single promotion.
+
+### `reconnect-catchup/v1`
+
+- File: `vectors/reconnect-catchup.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`reconnect.rb`, with the soak/hour offline
+  essence).
+- Setup: four members chat, Dave stops ticking (daemon down; transport keeps delivering to his mailbox), the others
+  chat and Alice renames the group, then Dave ticks once and catches up on everything.
+- Pressure: offline catch-up across both missed application traffic and a missed epoch-advancing commit.
+- Expected: Dave's exact transcript contains every message from all three phases, and all four clients converge on
+  epoch, member count, and the renamed group with no pending work. Durable-relay offline recovery (subscription
+  replay from retained histories) stays in the `adversarial-reliability` generated family per `retained_relay.rs`
+  doctrine; this vector models mailbox catch-up.
+
 ## Incident-Replay Vectors
 
 These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
