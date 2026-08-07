@@ -2357,22 +2357,30 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     last_exc = exc
                     if attempt < len(SEND_MEDIA_RETRY_BACKOFF_S) and is_retryable(exc):
                         logger.debug(
-                            "Marmot send_media failed; retrying (attempt %d): %s",
+                            "Marmot send_media failed; retrying (attempt %d, %s)",
                             attempt + 1,
-                            exc,
+                            type(exc).__name__,
                         )
                         await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[attempt])
                         continue
-                    logger.debug("Marmot send_media failed: %s", exc)
-                    return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+                    logger.debug("Marmot send_media failed (%s)", type(exc).__name__)
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send failed",
+                        retryable=is_retryable(exc),
+                    )
             return SendResult(
                 success=False,
-                error=str(last_exc) if last_exc else "Marmot media send failed",
+                error="Marmot media send failed",
                 retryable=is_retryable(last_exc) if last_exc else False,
             )
         except Exception as exc:
-            logger.debug("Marmot outbound media staging failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+            logger.debug("Marmot outbound media staging failed (%s)", type(exc).__name__)
+            return SendResult(
+                success=False,
+                error="Marmot outbound media staging failed",
+                retryable=is_retryable(exc),
+            )
         finally:
             for staged_path in staged_paths:
                 staged_path.unlink(missing_ok=True)
@@ -3561,10 +3569,11 @@ async def _standalone_send(
                     "file_name": path.name,
                 }
             )
+        caption = str(message or "")
         result = await adapter._send_media_batch(
             str(chat_id),
             attachments,
-            caption=str(message or ""),
+            caption=caption if caption.strip() else None,
         )
         if not result.success:
             return {"error": result.error or "Marmot media send failed"}

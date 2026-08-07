@@ -473,13 +473,13 @@ impl AgentConnector {
                 thumbhash: attachment.thumbhash,
             });
         }
-        let fingerprint = send_media_fingerprint(
-            account_id_hex,
-            &group_id_hex,
-            caption.as_deref(),
-            &upload_attachments,
-        );
         let idempotency = if let Some(key) = idempotency_key {
+            let fingerprint = send_media_fingerprint(
+                account_id_hex,
+                &group_id_hex,
+                caption.as_deref(),
+                &upload_attachments,
+            );
             match self.idempotency.acquire(&key, &fingerprint).await? {
                 SendIdempotencyAcquisition::Completed((
                     message_ids_hex,
@@ -490,7 +490,9 @@ impl AgentConnector {
                         maintenance_disposition,
                     });
                 }
-                SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
+                SendIdempotencyAcquisition::Leader(reservation) => {
+                    Some((key, fingerprint, reservation))
+                }
             }
         } else {
             None
@@ -516,7 +518,7 @@ impl AgentConnector {
         };
         let message_ids_hex = sent.message_ids;
         let maintenance_disposition = agent_maintenance_disposition(sent.maintenance_disposition);
-        if let Some((key, reservation)) = idempotency {
+        if let Some((key, fingerprint, reservation)) = idempotency {
             self.idempotency.record_with_disposition(
                 key,
                 fingerprint,

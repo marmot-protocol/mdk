@@ -4526,7 +4526,10 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     self.calls += 1
                     self.staged_paths = [Path(item["path"]) for item in attachments]
                     self.asserted_bytes = [path.read_bytes() for path in self.staged_paths]
-                    raise self_error("second upload failed", retryable=False)
+                    raise self_error(
+                        f"second upload failed at {self.staged_paths[1]}",
+                        retryable=False,
+                    )
 
             self_error = self.adapter_module.AgentControlError
             fake_client = FakeClient()
@@ -4539,15 +4542,49 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 client=fake_client,
             )
-            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "second upload failed"):
-                await adapter.send_multiple_images(
-                    "22" * 32,
-                    [(first.as_uri(), "caption"), (second.as_uri(), "")],
-                )
+            with self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs:
+                with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+                    await adapter.send_multiple_images(
+                        "22" * 32,
+                        [(first.as_uri(), "caption"), (second.as_uri(), "")],
+                    )
 
+            self.assertEqual(str(raised.exception), "Marmot media send failed")
+            self.assertNotIn(str(adapter._outbound_media_dir), str(raised.exception))
+            self.assertNotIn(str(adapter._outbound_media_dir), "\n".join(logs.output))
             self.assertEqual(fake_client.calls, 1)
             self.assertEqual(fake_client.asserted_bytes, [b"one", b"two"])
             self.assertTrue(all(not path.exists() for path in fake_client.staged_paths))
+
+    async def test_outbound_media_staging_failure_redacts_local_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "private.png"
+            image.write_bytes(b"private")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=object(),
+            )
+            staged_path = adapter._outbound_media_dir / "private-staged.png"
+
+            with (
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "stage_outbound_media_file",
+                    side_effect=OSError(f"could not stage {staged_path}"),
+                ),
+                self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs,
+            ):
+                result = await adapter.send_image_file("22" * 32, str(image))
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "Marmot outbound media staging failed")
+            self.assertNotIn(str(staged_path), "\n".join(logs.output))
 
     async def test_multiple_images_retry_reuses_staged_paths_and_idempotency_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4681,17 +4718,25 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             response = await self.adapter_module._standalone_send(
                 object(),
                 "22" * 32,
-                "one caption",
+                " one caption ",
                 media_files=["first.png", "second.jpg"],
             )
+            blank_response = await self.adapter_module._standalone_send(
+                object(),
+                "22" * 32,
+                "   ",
+                media_files=["first.png"],
+            )
 
-        self.assertEqual(len(fake_adapter.batches), 1)
+        self.assertEqual(len(fake_adapter.batches), 2)
         batch = fake_adapter.batches[0]
         self.assertEqual(batch[0], "22" * 32)
         self.assertEqual([item["file_name"] for item in batch[1]], ["first.png", "second.jpg"])
-        self.assertEqual(batch[2], "one caption")
+        self.assertEqual(batch[2], " one caption ")
         self.assertEqual(response["message_ids"], ["88" * 32, "99" * 32])
         self.assertEqual(len(response["attachment_outcomes"]), 2)
+        self.assertIsNone(fake_adapter.batches[1][2])
+        self.assertTrue(blank_response["success"])
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
