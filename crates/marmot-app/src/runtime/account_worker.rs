@@ -97,6 +97,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<(), String>>,
     },
     CreateGroup {
+        queued_at: Instant,
         name: String,
         members: Vec<String>,
         description: Option<String>,
@@ -1122,25 +1123,29 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::CreateGroup {
+            queued_at,
             name,
             members,
             description,
             initial_image,
             respond,
         } => {
-            let result = async {
-                let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                let group_id = client
-                    .create_group_with_initial_image(&name, &member_refs, initial_image)
-                    .await?;
-                if description.is_some() {
-                    client
-                        .update_group_profile(&group_id, None, description.as_deref())
-                        .await?;
-                }
-                Ok(group_id)
-            }
-            .await;
+            let telemetry = shared.app_performance_telemetry();
+            telemetry.record(
+                AppPerformanceOperation::GroupCreateQueueWait,
+                queued_at.elapsed(),
+                true,
+            );
+            let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+            let result = client
+                .create_group_with_initial_profile_and_telemetry(
+                    &name,
+                    description.as_deref().unwrap_or_default(),
+                    &member_refs,
+                    initial_image,
+                    &telemetry,
+                )
+                .await;
             if let Ok(group_id) = &result {
                 publish_app_runtime_group_state_updated(
                     events,
@@ -1150,9 +1155,24 @@ async fn handle_account_worker_command(
                 );
             }
             publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
-            let retry_after_response = result.is_ok();
+            let created = result.is_ok();
             let _ = respond.send(result);
-            if retry_after_response {
+            if created {
+                let subscription_started_at = Instant::now();
+                let subscription_refresh = client.sync_runtime_groups().await;
+                telemetry.record(
+                    AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+                    subscription_started_at.elapsed(),
+                    subscription_refresh.is_ok(),
+                );
+                if let Err(error) = subscription_refresh {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "create_group_subscription_refresh",
+                        error_kind = error.privacy_safe_kind(),
+                        "confirmed group creation could not refresh subscriptions immediately"
+                    );
+                }
                 client
                     .retry_pending_push_registration_shares_best_effort()
                     .await;

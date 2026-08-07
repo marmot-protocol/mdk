@@ -51,6 +51,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Group creation now performs member KeyPackage lookup and founding Welcome
+  publication with bounded concurrency, includes the initial description in the
+  founding MLS state, and returns once the founder projection is locally usable.
+  Repairable subscription refresh and broad catch-up continue in the background,
+  while privacy-safe stage histograms expose the remaining latency budget.
+
 - Account setup interruptions now have stable JSON recovery codes and repair
   hints instead of falling through to the generic `command_failed` bucket.
 

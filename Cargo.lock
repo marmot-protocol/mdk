@@ -1920,6 +1920,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -3211,6 +3212,7 @@ dependencies = [
  "cgka-session",
  "cgka-traits",
  "fs-private",
+ "futures",
  "hex",
  "keyring-core",
  "libc",
@@ -3241,6 +3243,7 @@ dependencies = [
  "cgka-traits",
  "chacha20poly1305",
  "fs-private",
+ "futures",
  "hex",
  "hkdf 0.12.4",
  "image",

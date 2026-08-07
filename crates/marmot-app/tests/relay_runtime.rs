@@ -1939,15 +1939,58 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
+    runtime.catch_up_accounts().await.unwrap();
+    let account_sync_attempts = || {
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .account_sync
+            .attempts
+    };
+    let sync_attempts_before_create = account_sync_attempts();
+
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
             "runtime intents",
             std::slice::from_ref(&bob.account.account_id_hex),
-            None,
+            Some("initial description".to_owned()),
         )
         .await
         .unwrap();
+    assert_eq!(
+        account_sync_attempts(),
+        sync_attempts_before_create,
+        "create_group must return before the repairable account-wide catch-up completes",
+    );
+    let alice_group = app
+        .groups(&alice.account.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == hex::encode(group_id.as_slice()))
+        .expect("founder projection is queryable when create returns");
+    assert_eq!(alice_group.profile.description, "initial description");
+    assert_eq!(
+        runtime
+            .group_mls_state(&alice.account.account_id_hex, &group_id)
+            .await
+            .unwrap()
+            .epoch,
+        1,
+        "one invited member should require only the founding epoch transition"
+    );
+    let catch_up_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if account_sync_attempts() > sync_attempts_before_create {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < catch_up_deadline,
+            "post-create catch-up must still complete in the background",
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -1956,6 +1999,13 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         )
     })
     .await;
+    let bob_group = app
+        .groups(&bob.account.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == hex::encode(group_id.as_slice()))
+        .expect("joiner projected the founding Welcome");
+    assert_eq!(bob_group.profile.description, "initial description");
 
     runtime
         .send_message(
