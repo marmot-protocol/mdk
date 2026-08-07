@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 
+#[cfg(target_os = "ios")]
+const IOS_BACKGROUND_KEYRING_SERVICE_SUFFIX: &str = ".after-first-unlock-v1";
+
 pub(crate) fn initialize_keyring_store() -> AccountHomeResult<()> {
     static KEYRING_STORE_INIT: Mutex<()> = Mutex::new(());
     let _guard = KEYRING_STORE_INIT.lock().map_err(|_| {
@@ -13,6 +16,64 @@ pub(crate) fn initialize_keyring_store() -> AccountHomeResult<()> {
         return Ok(());
     }
     initialize_platform_keyring_store()
+}
+
+pub(crate) fn build_keyring_entry(
+    service: &str,
+    account: &str,
+) -> AccountHomeResult<keyring_core::Entry> {
+    keyring_core::Entry::new(&keyring_service_name(service), account).map_err(map_keyring_error)
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn build_legacy_ios_keyring_entry(
+    service: &str,
+    account: &str,
+) -> AccountHomeResult<keyring_core::Entry> {
+    keyring_core::Entry::new(service, account).map_err(map_keyring_error)
+}
+
+#[cfg(target_os = "ios")]
+fn keyring_service_name(service: &str) -> String {
+    // Keychain access control is add-only. A versioned service lets migration
+    // verify the replacement before deleting the foreground-only legacy item.
+    format!("{service}{IOS_BACKGROUND_KEYRING_SERVICE_SUFFIX}")
+}
+
+#[cfg(not(target_os = "ios"))]
+fn keyring_service_name(service: &str) -> String {
+    service.to_owned()
+}
+
+pub(crate) fn write_keyring_secret(
+    service: &str,
+    account: &str,
+    secret: &str,
+) -> AccountHomeResult<()> {
+    #[cfg(target_os = "ios")]
+    {
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::passwords::{PasswordOptions, set_generic_password_options};
+
+        let mut options =
+            PasswordOptions::new_generic_password(&keyring_service_name(service), account);
+        options.use_protected_keychain();
+        let access_control = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            0,
+        )
+        .map_err(|error| AccountHomeError::SecretStore(error.to_string()))?;
+        options.set_access_control(access_control);
+        set_generic_password_options(secret.as_bytes(), options)
+            .map_err(|error| AccountHomeError::SecretStore(error.to_string()))
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        build_keyring_entry(service, account)?
+            .set_password(secret)
+            .map_err(map_keyring_error)
+    }
 }
 
 fn initialize_platform_keyring_store() -> AccountHomeResult<()> {
