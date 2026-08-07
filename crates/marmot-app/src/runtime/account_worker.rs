@@ -111,6 +111,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    GroupRoster {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::groups::AppGroupRosterSession, AppError>>,
+    },
     EnableGroupDisbanding {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -455,11 +459,11 @@ async fn run_app_runtime_account_worker(
     // command-readiness *now*, before the initial relay catch-up. "Ready"
     // means "hydrated + serving commands", not "caught up": the
     // conversation's group-detail reads (`Members` / `GroupMlsState` /
-    // `QuarantinedGroups`) route through this worker, and blocking them on
-    // the catch-up made the first conversation opened after a foreground
-    // resume take seconds. The catch-up still runs (below) and its results
-    // flow to subscribers via the normal event mechanism; it is only removed
-    // from the readiness/blocking path. See `GroupReadSnapshot`.
+    // `GroupRoster` / `QuarantinedGroups`) route through this worker, and
+    // blocking them on the catch-up made the first conversation opened after a
+    // foreground resume take seconds. The catch-up still runs (below) and its
+    // results flow to subscribers via the normal event mechanism; it is only
+    // removed from the readiness/blocking path. See `GroupReadSnapshot`.
     // `AccountOpen` (recorded by `reconcile` as the ready-wait) measures
     // local hydration and snapshot readiness; the mdk#1161 stage telemetry
     // attributes it (`AccountSessionOpen` / `AccountGroupHydration` for the
@@ -549,6 +553,9 @@ async fn run_app_runtime_account_worker(
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                             let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                        }
+                        Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
+                            let _ = respond.send(read_snapshot.group_roster(&group_id));
                         }
                         Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
                             let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
@@ -1033,7 +1040,7 @@ async fn run_app_runtime_account_worker(
 /// Extracted so the worker can drive commands from two places: the steady-state
 /// command loop, and the deferred-command replay that runs after the initial
 /// catch-up completes (commands that arrived while the catch-up held
-/// `&mut client`). Read commands (`Members` / `GroupMlsState` /
+/// `&mut client`). Read commands (`Members` / `GroupMlsState` / `GroupRoster` /
 /// `QuarantinedGroups`) are also intercepted inline during the initial catch-up
 /// and answered from a `GroupReadSnapshot`; here they read the live session.
 async fn handle_account_worker_command(
@@ -1164,6 +1171,10 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let result = client.group_roster_session(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
