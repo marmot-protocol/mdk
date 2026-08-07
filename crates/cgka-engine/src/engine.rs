@@ -1254,7 +1254,23 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
-        let group = self
+        // A retained-anchor convergence probe durably rewinds the group while
+        // it explores historical candidates. Process termination cannot run
+        // the in-process rollback guard, so restore its pre-probe live snapshot
+        // before loading any MLS or Marmot state — including the group record
+        // read below, whose epoch seeds the epoch manager.
+        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
+            &self.storage,
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        // The one group-record read for this hydration (mdk#1161): every later
+        // consumer (tombstone check, profile mirror check, pending-commit
+        // recovery, epoch seeding) shares this post-recovery record.
+        let mut group = self
             .storage
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
@@ -1274,17 +1290,6 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
             return Ok(epoch);
         }
-        // A retained-anchor convergence probe durably rewinds the group while
-        // it explores historical candidates. Process termination cannot run
-        // the in-process rollback guard, so restore its pre-probe live snapshot
-        // before loading any MLS or Marmot state.
-        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
-            &self.storage,
-            group_id,
-        )
-        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = {
@@ -1359,10 +1364,6 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        let mut group = self
-            .storage
-            .get_group(group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if group.protocol_profile != wire_protocol_profile {
             return Err(GroupHydrationQuarantineReason::MemberValidationFailed);
         }
@@ -1493,12 +1494,28 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
+        // The one full message scan for this hydration (mdk#1161): the
+        // leave-request probe, the convergence-input gate, the deferred-peel
+        // check, and the self-remove schedule restore below all classify
+        // subsets of the same rows, so they share this fetch instead of each
+        // re-reading the whole group message table.
+        let stored_message_records = self
+            .storage
+            .list_messages(group_id, EpochId(0))
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
         );
         let leave_request = self
-            .leave_request_to_restore_on_hydrate(group_id, &mut mls_group, &group, &provider)
+            .leave_request_to_restore_on_hydrate(
+                group_id,
+                &mut mls_group,
+                &group,
+                &provider,
+                &stored_message_records,
+            )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         // Startup must recreate the in-memory scheduling edge for durable
@@ -1511,13 +1528,14 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
             .is_empty();
         let has_convergence_inputs = self
-            .has_pending_convergence_inputs(group_id)
+            .has_unresolved_convergence_inputs_in_records(
+                group_id,
+                &group,
+                &stored_message_records,
+            )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let has_deferred_peels = self
-            .storage
-            .list_messages(group_id, EpochId(0))
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
-            .into_iter()
+        let has_deferred_peels = stored_message_records
+            .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
 
         // Do not expose any recovered pending state until every fallible
@@ -1594,10 +1612,11 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let restored_self_remove_work = self
-            .restore_self_remove_auto_commit_schedules_for_group(
+            .restore_self_remove_auto_commit_schedules_in_records(
                 group_id,
                 group.epoch,
                 self.convergence_now_ms(),
+                &stored_message_records,
             )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if has_queued_intents
@@ -1746,6 +1765,7 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &mut openmls::group::MlsGroup,
         group: &Group,
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+        stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<Option<LeaveRequest>, StorageError> {
         let self_is_still_member = group
             .members
@@ -1759,7 +1779,11 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(mut request) = self.storage.leave_request(group_id)? {
             if request.last_proposed_epoch.is_none()
                 && self.sent_self_remove_leaving_gate_should_restore(
-                    group_id, mls_group, group, provider,
+                    group_id,
+                    mls_group,
+                    group,
+                    provider,
+                    stored_message_records,
                 )?
             {
                 request.last_proposed_epoch = Some(group.epoch);
@@ -1768,9 +1792,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Some(request));
         }
 
-        if self
-            .sent_self_remove_leaving_gate_should_restore(group_id, mls_group, group, provider)?
-        {
+        if self.sent_self_remove_leaving_gate_should_restore(
+            group_id,
+            mls_group,
+            group,
+            provider,
+            stored_message_records,
+        )? {
             let request = LeaveRequest {
                 group_id: group_id.clone(),
                 requested_at_ms: self.convergence_now_ms(),
@@ -1914,6 +1942,7 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &mut openmls::group::MlsGroup,
         group: &Group,
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
+        stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<bool, cgka_traits::storage::StorageError> {
         if !group
             .members
@@ -1923,7 +1952,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
 
-        for record in self.storage.list_messages(group_id, EpochId(0))? {
+        for record in stored_message_records {
             if record.state != MessageState::Sent {
                 continue;
             }

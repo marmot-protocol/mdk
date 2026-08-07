@@ -26,7 +26,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{
     InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
-use cgka_traits::message::{MessageState, StoredMessagePayload};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -737,8 +737,27 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         now_ms: u64,
     ) -> Result<bool, EngineError> {
+        let records = self.storage.list_messages(group_id, source_epoch)?;
+        self.restore_self_remove_auto_commit_schedules_in_records(
+            group_id,
+            source_epoch,
+            now_ms,
+            &records,
+        )
+    }
+
+    /// [`Self::restore_self_remove_auto_commit_schedules_for_group`] over an
+    /// already-fetched record list, so session-open hydration can share one
+    /// `list_messages` scan across every work-detection pass (mdk#1161).
+    pub(crate) fn restore_self_remove_auto_commit_schedules_in_records(
+        &mut self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        now_ms: u64,
+        records: &[MessageRecord],
+    ) -> Result<bool, EngineError> {
         let mut restored = false;
-        for record in self.storage.list_messages(group_id, source_epoch)? {
+        for record in records {
             if record.epoch != source_epoch
                 || !matches!(
                     record.state,
@@ -838,49 +857,94 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
+        if self.has_unresolved_non_record_convergence_state(group_id)? {
+            return Ok(true);
+        }
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
+        let (anchor, ceiling) = self.convergence_gate_horizon(group_id, &group)?;
+        let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        Ok(self.any_gating_convergence_input(anchor, ceiling, &records))
+    }
+
+    /// [`Self::has_unresolved_convergence_inputs`] over an already-fetched
+    /// full record list, so session-open hydration can share one
+    /// `list_messages` scan across every work-detection pass (mdk#1161).
+    pub(crate) fn has_unresolved_convergence_inputs_in_records(
+        &self,
+        group_id: &GroupId,
+        group: &cgka_traits::group::Group,
+        records: &[MessageRecord],
+    ) -> Result<bool, EngineError> {
+        if self.has_unresolved_non_record_convergence_state(group_id)? {
+            return Ok(true);
+        }
+        let (anchor, ceiling) = self.convergence_gate_horizon(group_id, group)?;
+        Ok(self.any_gating_convergence_input(anchor, ceiling, records))
+    }
+
+    fn has_unresolved_non_record_convergence_state(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
         if let Some(pass) = self.storage.convergence_pass(group_id)?
             && pass.is_active()
             && self.convergence_pass_gates_outbound(&pass)
         {
             return Ok(true);
         }
-        if self.disband_candidate_pending(group_id)? {
-            return Ok(true);
-        }
-        // The convergence horizon is bounded on BOTH sides (mdk#736). The past
-        // side (`anchor`) drops inputs older than the retained-anchor window.
-        // The future side (`ceiling`) is symmetric: a convergence input more
-        // than `max_rewind_commits` epochs ahead of the current tip cannot chain
-        // from the tip yet (the candidate-path BFS in `openmls_projection` only
-        // extends `source_epoch == tip_epoch`), so it is not *resolvable
-        // convergence work* and must not gate outbound sends. Without the
-        // ceiling, a single member could forge one far-future-epoch (e.g. 2^63)
-        // plaintext message whose buffered `Created` row is never materialized
-        // and never given a terminal disposition, permanently gating every send
-        // for the whole group. The row is left in storage (not dropped here), so
-        // it gates again correctly once the tip advances into `[anchor, ceiling]`.
-        let (anchor, ceiling) = match self.storage.get_group(group_id) {
-            Ok(group) => {
-                // Ungated: hydration calls this while the group is still
-                // quarantined to decide whether to schedule post-repair
-                // convergence. Live send/convergence paths already gate via
-                // `ensure_group_live` before reaching here.
-                let policy = self
-                    .convergence_policy_for_group_ungated(group_id)
-                    .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
-                let rewind = policy.convergence.max_rewind_commits;
-                (
-                    group.epoch.0.saturating_sub(rewind),
-                    group.epoch.0.saturating_add(rewind),
-                )
-            }
-            Err(StorageError::NotFound) => return Ok(false),
-            Err(e) => return Err(EngineError::Storage(e)),
-        };
-        let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        self.disband_candidate_pending(group_id)
+    }
+
+    /// The convergence horizon is bounded on BOTH sides (mdk#736). The past
+    /// side (`anchor`) drops inputs older than the retained-anchor window.
+    /// The future side (`ceiling`) is symmetric: a convergence input more
+    /// than `max_rewind_commits` epochs ahead of the current tip cannot chain
+    /// from the tip yet (the candidate-path BFS in `openmls_projection` only
+    /// extends `source_epoch == tip_epoch`), so it is not *resolvable
+    /// convergence work* and must not gate outbound sends. Without the
+    /// ceiling, a single member could forge one far-future-epoch (e.g. 2^63)
+    /// plaintext message whose buffered `Created` row is never materialized
+    /// and never given a terminal disposition, permanently gating every send
+    /// for the whole group. The row is left in storage (not dropped here), so
+    /// it gates again correctly once the tip advances into `[anchor, ceiling]`.
+    fn convergence_gate_horizon(
+        &self,
+        group_id: &GroupId,
+        group: &cgka_traits::group::Group,
+    ) -> Result<(u64, u64), EngineError> {
+        // Ungated: hydration calls this while the group is still
+        // quarantined to decide whether to schedule post-repair
+        // convergence. Live send/convergence paths already gate via
+        // `ensure_group_live` before reaching here.
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+        let rewind = policy.convergence.max_rewind_commits;
+        Ok((
+            group.epoch.0.saturating_sub(rewind),
+            group.epoch.0.saturating_add(rewind),
+        ))
+    }
+
+    fn any_gating_convergence_input(
+        &self,
+        anchor: u64,
+        ceiling: u64,
+        records: &[MessageRecord],
+    ) -> bool {
         let mut skipped_non_resolvable: usize = 0;
         let mut classified = Vec::new();
         for record in records {
+            // Below the anchor: callers fetching via `list_messages(anchor)`
+            // never produce such rows; the shared-scan hydration path fetches
+            // from epoch 0 and filters here instead.
+            if record.epoch.0 < anchor {
+                continue;
+            }
             if !matches!(
                 record.state,
                 MessageState::Sent
@@ -934,7 +998,7 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .any(|input| context.gates_outbound(input))
         {
-            return Ok(true);
+            return true;
         }
         // Reached only when nothing gates: surface any fail-open skips so an
         // insider spraying undecodable rows (which no longer wedges the gate but
@@ -948,7 +1012,7 @@ impl<S: StorageProvider> Engine<S> {
                 "skipped non-resolvable convergence rows (fail-open)"
             );
         }
-        Ok(false)
+        false
     }
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
