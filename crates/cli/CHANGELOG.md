@@ -32,7 +32,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
   kind:0 profile `picture` URLs (HTTPS-only, pinned public resolution, bounded
   redirects, and streaming limits) so Android and Swift hosts do not maintain a
-  separate SSRF stack for public avatars.
+  separate SSRF stack for public avatars
+  ([#1288](https://github.com/marmot-protocol/mdk/pull/1288)).
 
 - Outbound messages waiting in a group's durable queue are now bounded at 256
   per group. The bound covers every reason a message waits: a group resolving a
