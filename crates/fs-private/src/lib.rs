@@ -929,13 +929,7 @@ fn unix_socket_inode(path: &Path) -> io::Result<UnixSocketInode> {
 pub fn verify_unix_socket_inode(path: &Path, expected: UnixSocketInode) -> io::Result<()> {
     const LINK_LOST: &str = "unix socket path no longer names the bound listener";
 
-    let actual = match unix_socket_inode(path) {
-        Ok(identity) => identity,
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, LINK_LOST));
-        }
-        Err(err) => return Err(err),
-    };
+    let actual = unix_socket_inode(path)?;
     if actual != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, LINK_LOST));
     }

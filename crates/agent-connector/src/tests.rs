@@ -679,20 +679,59 @@ async fn connector_serve_fails_fast_when_control_socket_link_removed() {
     let socket = dir.path().join("dev").join("wn-agent.sock");
     let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
     let server = tokio::spawn(serve_socket(config));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !socket.exists() {
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("control socket should appear at the final path");
+    let response = send_control_request(
+        &socket,
+        "steady-state-before-unlink",
+        AgentControlRequest::AccountList,
+    )
+    .await;
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::AccountList { .. }
+    ));
     std::fs::remove_file(&socket).expect("unlink final control socket path");
     let err = tokio::time::timeout(Duration::from_secs(2), server)
         .await
         .expect("serve must fail fast after the control socket link is removed")
         .expect("serve task must not panic")
         .expect_err("serve must exit with an error");
-    assert_eq!(err.code(), "io_error");
+    let crate::ConnectorError::Io(err) = err else {
+        panic!("expected control-socket I/O error");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn connector_serve_fails_fast_when_control_socket_link_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let replacement_path = dir.path().join("dev").join("replacement.sock");
+    let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    let server = tokio::spawn(serve_socket(config));
+    let response = send_control_request(
+        &socket,
+        "steady-state-before-replacement",
+        AgentControlRequest::AccountList,
+    )
+    .await;
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::AccountList { .. }
+    ));
+
+    let _replacement = std::os::unix::net::UnixListener::bind(&replacement_path)
+        .expect("bind replacement control socket");
+    std::fs::rename(&replacement_path, &socket)
+        .expect("atomically replace final control socket path");
+    let err = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve must fail fast after the control socket link is replaced")
+        .expect("serve task must not panic")
+        .expect_err("serve must exit with an error");
+    let crate::ConnectorError::Io(err) = err else {
+        panic!("expected control-socket I/O error");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[tokio::test]

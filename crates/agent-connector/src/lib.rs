@@ -335,15 +335,20 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     let connector = AgentConnector::open(config)?;
     let link_loss = wait_control_socket_link_loss(&socket_path, link_identity);
     tokio::pin!(link_loss);
+    // Losing the published path makes this process unreachable, so cancellation
+    // of startup is intentional: it has the same failure semantics as the
+    // supervisor terminating an orphaned process. Completed startup writes are
+    // retained and the next start rechecks them before applying missing state.
+    // Revisit this contract before adding a non-restart-safe mutation to start().
     tokio::select! {
         res = connector.start() => res?,
-        res = &mut link_loss => res?,
+        err = &mut link_loss => return Err(err),
     }
     let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
         let accepted = tokio::select! {
-            res = &mut link_loss => {
-                return res;
+            err = &mut link_loss => {
+                return Err(err);
             }
             accepted = listener.accept() => accepted,
         };
@@ -415,9 +420,9 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
 async fn wait_control_socket_link_loss(
     socket_path: &Path,
     link_identity: fs_private::UnixSocketInode,
-) -> Result<(), ConnectorError> {
+) -> ConnectorError {
     let mut ticker = tokio::time::interval(CONTROL_SOCKET_LINK_POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         if let Err(err) = verify_control_socket_link(socket_path, link_identity) {
@@ -427,7 +432,7 @@ async fn wait_control_socket_link_loss(
                 error_code = "control_socket_link_lost",
                 "control socket path no longer names the bound listener"
             );
-            return Err(err);
+            return err;
         }
     }
 }
