@@ -275,7 +275,7 @@ impl ProcessOrchestrator {
         if processes.values().collect::<BTreeSet<_>>().len() != processes.len() {
             return Err(ProcessOrchestratorError::new(
                 "shared_process_unsupported",
-                "Milestone 5 nodes require one account-device participant per process",
+                "process-adapter nodes require one account-device participant per process",
             ));
         }
         let process_relays = compiled
