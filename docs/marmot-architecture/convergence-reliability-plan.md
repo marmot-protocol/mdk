@@ -1093,15 +1093,16 @@ restricted to synthetic shareable capsules with portable expectations.
 - [x] Persist an owner-only, versioned generated-case input before action zero, including the selected subject adapter
   and semantic expectations, so a crash cannot erase or change the reproducer.
 - [ ] Expose these saved journeys as first-class selectable app-runtime, process, container, and VM campaign inputs.
-  Every wider adapter must execute the canonical Scenario IR embedded in the saved generated-input envelope, preserve
-  its generator/profile provenance and semantic expectations, and record the exact IR digest in distributed manifests;
-  this remains the next cross-layer usability slice rather than being hidden inside the generator.
+  Every wider adapter must select the canonical Scenario IR embedded in the saved generated-input envelope, preserve
+  its generator/profile provenance and semantic expectations, and record the selected IR digest in distributed
+  manifests. An adapter that deterministically lowers the selected history must also record the executed IR digest;
+  this remains a cross-layer usability slice rather than being hidden inside the generator.
 
-Selection plumbing now resolves raw Scenario IR and saved generated inputs through one parser, records source and
-canonical-IR digests, preserves generator provenance and expectations in app/process/container reports, and hands VM
-drivers a privately materialized canonical file. This item remains open until representative stateful journeys pass the
-capability and oracle contracts of every listed adapter; an adapter merely rejecting an engine-only observation during
-preflight is useful evidence, not completion.
+Selection plumbing now resolves raw Scenario IR and saved generated inputs through one parser, records source,
+selected-IR, and (after adapter lowering) executed-IR digests, preserves generator provenance and expectations in
+app/process/container reports, and hands VM drivers a privately materialized canonical file. This item remains open
+until representative stateful journeys pass the capability and oracle contracts of every listed adapter; an adapter
+merely rejecting an engine-only observation during preflight is useful evidence, not completion.
 
 ### 6.6 Shared legality model and workload profiles (planned follow-up)
 

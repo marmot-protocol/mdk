@@ -88,14 +88,19 @@ pub async fn run_manifest(
     let plan = build_execution_plan(&normalized_manifest)?;
     fs_private::create_dir_all_private(&normalized_manifest.output_dir)
         .map_err(|error| RunnerError::environment("output_directory", error))?;
-    fs_private::write_private(
-        &normalized_manifest
-            .output_dir
-            .join("canonical-scenario.json"),
-        &serde_json::to_vec(&scenario_input.scenario)
-            .map_err(|error| RunnerError::environment("scenario_serialize", error))?,
-    )
-    .map_err(|error| RunnerError::environment("scenario_write", error))?;
+    if matches!(
+        &normalized_manifest.backend,
+        DistributedBackendV1::VirtualMachine(_)
+    ) {
+        fs_private::write_private(
+            &normalized_manifest
+                .output_dir
+                .join("canonical-scenario.json"),
+            &serde_json::to_vec(&scenario_input.scenario)
+                .map_err(|error| RunnerError::environment("scenario_serialize", error))?,
+        )
+        .map_err(|error| RunnerError::environment("scenario_write", error))?;
+    }
     fs_private::write_private(
         &normalized_manifest
             .output_dir
@@ -431,6 +436,7 @@ async fn run_container_scenario(
         scenario,
         expected_outcomes: input.expected_outcomes.clone(),
         provenance: input.provenance.clone(),
+        generated_case: input.generated_case.clone(),
     };
     let mut orchestrator = ProcessOrchestrator::launch_resolved_with(
         node_launch,
@@ -1297,6 +1303,11 @@ mod tests {
             }],
         };
         let lowered = lower_container_host_faults(&manifest, &scenario).unwrap();
+        assert_ne!(
+            cgka_conformance_simulator::canonical_scenario_ir_sha256(&scenario).unwrap(),
+            cgka_conformance_simulator::canonical_scenario_ir_sha256(&lowered).unwrap(),
+            "selected and executed digests must distinguish host-crash lowering"
+        );
         assert!(matches!(
             &lowered.steps[1],
             cgka_conformance_simulator::ScenarioStep::CrashProcess { process }

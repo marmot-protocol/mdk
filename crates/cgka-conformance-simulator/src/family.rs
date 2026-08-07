@@ -83,9 +83,17 @@ impl GeneratedSubjectKind {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "engine" => Ok(Self::Engine),
-            "retained-relay" | "retained_relay" => Ok(Self::RetainedRelay),
-            "app-runtime" | "app_runtime" => Ok(Self::AppRuntime),
+            "retained-relay" => Ok(Self::RetainedRelay),
+            "app-runtime" => Ok(Self::AppRuntime),
             other => Err(format!("unsupported generated-case adapter {other}")),
+        }
+    }
+
+    pub(crate) fn artifact_label(self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::RetainedRelay => "retained-relay",
+            Self::AppRuntime => "app-runtime",
         }
     }
 }

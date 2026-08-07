@@ -21,7 +21,7 @@ use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
     ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
     SubjectCapability, SubjectDescriptor, SubjectFailureCategory, TraceExpectation,
-    compile_scenario, preflight_compiled_scenario,
+    canonical_scenario_ir_sha256, compile_scenario, preflight_compiled_scenario,
 };
 
 pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
@@ -109,8 +109,14 @@ fn render_node_arg(
 pub struct ProcessScenarioReportV1 {
     pub schema_version: String,
     pub scenario_name: String,
+    /// Identity of the selected source input, before any adapter-owned lowering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_provenance: Option<ScenarioInputProvenanceV1>,
+    /// Digest of the canonical Scenario IR this process executor compiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_scenario_ir_sha256: Option<String>,
+    /// Carried as source provenance for downstream oracle tooling. The process
+    /// executor does not evaluate these semantic expectations itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
@@ -182,6 +188,7 @@ pub struct ProcessOrchestrator {
     groups: BTreeMap<String, String>,
     lifecycle: Vec<ProcessLifecycleEventV1>,
     input_provenance: Option<ScenarioInputProvenanceV1>,
+    executed_scenario_ir_sha256: String,
     expected_outcomes: Vec<TraceExpectation>,
 }
 
@@ -232,6 +239,8 @@ impl ProcessOrchestrator {
         scenario: &ScenarioSpec,
         artifact_directory: impl AsRef<Path>,
     ) -> Result<Self, ProcessOrchestratorError> {
+        let executed_scenario_ir_sha256 = canonical_scenario_ir_sha256(scenario)
+            .map_err(|error| ProcessOrchestratorError::new("scenario_digest", error.to_string()))?;
         let compiled = compile_scenario(scenario).map_err(|error| {
             ProcessOrchestratorError::new("scenario_compile", error.to_string())
         })?;
@@ -319,6 +328,7 @@ impl ProcessOrchestrator {
             groups: BTreeMap::new(),
             lifecycle: Vec::new(),
             input_provenance: None,
+            executed_scenario_ir_sha256,
             expected_outcomes: Vec::new(),
         };
         for client in &clients {
@@ -389,6 +399,7 @@ impl ProcessOrchestrator {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
             scenario_name: compiled.name.clone(),
             input_provenance: self.input_provenance.clone(),
+            executed_scenario_ir_sha256: Some(self.executed_scenario_ir_sha256.clone()),
             expected_outcomes: self.expected_outcomes.clone(),
             canonical_schedule: schedule,
             actions: Vec::new(),
@@ -1449,6 +1460,7 @@ mod tests {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
             scenario_name: "round-trip".into(),
             input_provenance: None,
+            executed_scenario_ir_sha256: None,
             expected_outcomes: Vec::new(),
             canonical_schedule: Vec::new(),
             actions: Vec::new(),

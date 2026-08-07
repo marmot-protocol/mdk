@@ -42,10 +42,12 @@ unless the campaign requests behavior that the container backend cannot faithful
 latency. Driver capability declarations make the reason for escalation reviewable. Provisioning belongs in the
 dedicated multi-VM harness rather than this repository.
 
-Before either backend starts, the runner resolves the selected input through the simulator-owned parser and writes the
-compact canonical IR privately to `canonical-scenario.json` in the campaign output directory. Container orchestration
-uses that resolved value directly. The VM `{scenario}` placeholder names the materialized canonical file, so external
-drivers never need a second generated-envelope parser and cannot accidentally execute envelope metadata as Scenario IR.
+Before either backend starts, the runner resolves the selected input through the simulator-owned parser. Container
+orchestration consumes that value in memory; manifest-declared host crashes deterministically lower into process crash
+and restart steps, and the process report records a distinct digest for the post-lowering IR it compiles. VM runs write
+the selected canonical IR privately to `canonical-scenario.json`. The VM `{scenario}` placeholder names that file, so
+external drivers never need a second generated-envelope parser and cannot accidentally execute envelope metadata as
+Scenario IR.
 
 VM driver lifecycle contract v1 contains two argv-only invocations on the same driver: the campaign action and an
 idempotent cancellation/cleanup action. The runner executes cleanup after success, failure, or campaign timeout under
@@ -68,10 +70,10 @@ Every manifest contains:
 
 `validate` checks the manifest, participant-to-scenario binding, digest, fault parameters, and backend suitability.
 It also rejects a heal without a matching active partition and a duplicate partition that has not first been healed.
-`plan` emits the exact normalized command plan without running it. `run` first writes the resolved
-`canonical-scenario.json` and normalized manifest with owner-only permissions, then writes the process report and
-distributed run receipt. The normalized manifest always records the resolved canonical digest. Container cleanup is attempted on
-both success and failure and cleanup failures remain visible in the receipt.
+`plan` emits the exact normalized command plan without running it. `run` first writes the normalized manifest with
+owner-only permissions; VM runs also write the selected `canonical-scenario.json`. It then writes the process report and
+distributed run receipt. The normalized manifest always records the selected canonical digest. Container cleanup is
+attempted on both success and failure and cleanup failures remain visible in the receipt.
 
 External container faults run immediately before the named barrier. Host crash faults are different: the runner lowers
 them into scenario-owned process crash and restart actions immediately after the named barrier, so evidence describes

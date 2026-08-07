@@ -466,8 +466,9 @@ semantic expectations, so a crash or panic cannot erase the exact executable inp
 `--generated-input FILE`. Add `--adapter engine|retained-relay|app-runtime` to deliberately run the embedded canonical
 Scenario IR through a different in-process adapter; capability preflight still rejects unsupported operations before
 action zero. Reports retain the producer's family/version/seed/case/subject provenance plus separate SHA-256 digests for
-the selected envelope bytes and the canonical Scenario IR inside it. The post-run report and promotable vector candidate
-remain separate owner-only artifacts.
+the selected envelope bytes and the selected canonical Scenario IR inside it. An adapter override adds the executing
+adapter to report and failure-capsule filenames so A/B runs cannot overwrite one another. Override runs do not mint a
+promotable vector candidate; only the generator-recorded subject may supply that adapter-neutral fixture.
 
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 
@@ -478,9 +479,11 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-process -- \
   target/chat-journey-process-report.json
 ```
 
-Its report preserves the same provenance, canonical digest, and semantic expectations. Container and VM manifests use
-the same envelope through `convergence-campaign-runner`; the distributed runner resolves and privately materializes the
-canonical IR before launching nodes or an external VM driver.
+Its report preserves the same provenance and carries semantic expectations for downstream oracle tooling; the process
+executor does not evaluate those expectations itself. It separately records the digest of the Scenario IR it compiled.
+Container and VM manifests use the same envelope through `convergence-campaign-runner`. Containers resolve it in memory
+and may apply deterministic manifest-declared host-crash lowering; VM runs privately materialize the selected canonical
+IR before launching the external driver.
 
 ## Report artifacts
 
@@ -506,10 +509,11 @@ canonical IR before launching nodes or an external VM driver.
 case index, and an optional `minimized_case` field. Failing generated cases run a conservative greedy minimizer that
 removes removable delivery/app steps only when the semantic failure identity (classification, action type, and failure
 kind) still reproduces. The complete fingerprint, including the state digest, remains in the capsule for diagnosis.
-Generated report runs also write
-a sibling `*-fixture.v1.json` candidate. Cases with semantic expectations keep those expectations; cases without them
-use the observed trace as an exact expected trace in the candidate. When a failing generated case has a minimized
-reproducer, the fixture candidate uses that minimized scenario.
+Generated report runs on the generator-recorded subject also write a sibling `*-fixture.v1.json` candidate. Adapter
+override runs deliberately do not, because their observed trace is an A/B result rather than an adapter-neutral source
+of truth. Cases with semantic expectations keep those expectations; cases without them use the observed trace as an
+exact expected trace in the candidate. When a failing generated case has a minimized reproducer, the fixture candidate
+uses that minimized scenario.
 
 To run the current generated family and write JSON reports:
 

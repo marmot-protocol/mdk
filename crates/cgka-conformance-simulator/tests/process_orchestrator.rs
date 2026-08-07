@@ -329,6 +329,10 @@ async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
     let report = process.run().await.unwrap();
     assert!(report.completed, "{report:#?}");
     assert_eq!(report.expected_outcomes, input.case.expected_outcomes);
+    assert_eq!(
+        report.executed_scenario_ir_sha256.as_deref(),
+        Some(resolved.provenance.canonical_ir_sha256.as_str())
+    );
     let provenance = report.input_provenance.unwrap();
     assert_eq!(
         provenance.canonical_ir_sha256,

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use crate::scenario_input::generated_scenario_input_provenance;
 use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
     GeneratedScenarioInputV1, HarnessStorageMode, ScenarioInputProvenanceV1, ScenarioReport,
@@ -271,7 +272,7 @@ async fn run_generated_family_reports(
         let source = case.family_name.clone();
         let input = GeneratedScenarioInputV1::new(case.clone());
         let input_bytes = serde_json::to_vec_pretty(&input)?;
-        let provenance = resolve_scenario_input_bytes(&input_bytes)?.provenance;
+        let provenance = generated_scenario_input_provenance(&input_bytes, &case)?;
         fs_private::write_private(&input_output, &input_bytes)?;
         summaries.push(
             run_generated_case_artifacts(
@@ -308,11 +309,12 @@ async fn run_generated_input_reports(
     for path in paths {
         let input_bytes = std::fs::read(path)?;
         let resolved = resolve_scenario_input_bytes(&input_bytes)?;
-        let input: GeneratedScenarioInputV1 = serde_json::from_slice(&input_bytes)?;
-        input.validate()?;
+        let case = resolved
+            .generated_case
+            .ok_or("--generated-input requires a GeneratedScenarioInputV1 envelope")?;
         summaries.push(
             run_generated_case_artifacts(
-                &input.case,
+                &case,
                 GeneratedCaseArtifactSource {
                     adapter,
                     provenance: resolved.provenance,
@@ -343,48 +345,33 @@ async fn run_generated_case_artifacts(
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
 ) -> Result<ScenarioReportSummary, Box<dyn Error>> {
+    let execution_subject = source.adapter.unwrap_or(case.subject);
+    let adapter_overridden = execution_subject != case.subject;
     let (mut report, failure_capture) = crate::run_generated_case_report_with_capture_on_subject(
         case,
-        source.adapter.unwrap_or(case.subject),
+        execution_subject,
         None,
         storage_mode,
         capture_sensitive_replay,
     )
     .await?;
     report.metadata.input_provenance = Some(source.provenance);
-    let output = out.join(format!(
-        "{}-seed-{}-case-{}.json",
-        case.family_name.replace('/', "-"),
-        case.seed,
-        case.case_index
-    ));
+    let artifact_stem = generated_artifact_stem(case, execution_subject);
+    let output = out.join(format!("{artifact_stem}.json"));
     fs_private::write_private(&output, &serde_json::to_vec_pretty(&report)?)?;
-    let fixture_output = out.join(format!(
-        "{}-seed-{}-case-{}-fixture.v1.json",
-        case.family_name.replace('/', "-"),
-        case.seed,
-        case.case_index
-    ));
-    let fixture = generated_fixture_candidate(case, &report);
-    fs_private::write_private(&fixture_output, &serde_json::to_vec_pretty(&fixture)?)?;
+    if !adapter_overridden {
+        let fixture_output = out.join(format!("{artifact_stem}-fixture.v1.json"));
+        let fixture = generated_fixture_candidate(case, &report);
+        fs_private::write_private(&fixture_output, &serde_json::to_vec_pretty(&fixture)?)?;
+    }
     let coverage = coverage_matrix_entry(source.label.clone(), &report);
     let failures = scenario_report_failures(&report, strict_oracle);
     let failure_count = failures.len();
     let failure_capsules = if failures.is_empty() {
         WrittenFailureCapsules::default()
     } else {
-        let portable_path = out.join(format!(
-            "{}-seed-{}-case-{}-failure-capsule.v1.json",
-            case.family_name.replace('/', "-"),
-            case.seed,
-            case.case_index
-        ));
-        let replay_path = out.join(format!(
-            "{}-seed-{}-case-{}-sensitive-replay-capsule.v1.json",
-            case.family_name.replace('/', "-"),
-            case.seed,
-            case.case_index
-        ));
+        let portable_path = out.join(format!("{artifact_stem}-failure-capsule.v1.json"));
+        let replay_path = out.join(format!("{artifact_stem}-sensitive-replay-capsule.v1.json"));
         write_report_failure_capsules(
             &report,
             failure_capture_for(&failures, failure_capture),
@@ -403,6 +390,23 @@ async fn run_generated_case_artifacts(
         failures,
         coverage,
     })
+}
+
+fn generated_artifact_stem(
+    case: &GeneratedScenarioCase,
+    execution_subject: crate::GeneratedSubjectKind,
+) -> String {
+    let base = format!(
+        "{}-seed-{}-case-{}",
+        case.family_name.replace('/', "-"),
+        case.seed,
+        case.case_index
+    );
+    if execution_subject == case.subject {
+        base
+    } else {
+        format!("{base}-{}", execution_subject.artifact_label())
+    }
 }
 
 fn generated_fixture_candidate(

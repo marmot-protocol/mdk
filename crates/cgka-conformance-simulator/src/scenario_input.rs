@@ -2,15 +2,19 @@
 //!
 //! Wider adapters consume this boundary so a saved generated case keeps one
 //! scenario meaning. The source-byte digest identifies the selected artifact;
-//! the canonical-IR digest identifies the exact [`ScenarioSpec`] every adapter
-//! must execute after resolving the envelope.
+//! the canonical-IR digest identifies the selected [`ScenarioSpec`] inside it.
+//! An adapter that deterministically lowers that selected history must record a
+//! separate digest for the history it actually executes.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{GeneratedScenarioInputV1, GeneratedSubjectKind, ScenarioSpec, TraceExpectation};
+use crate::{
+    GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind, ScenarioSpec,
+    TraceExpectation,
+};
 
 pub const SCENARIO_INPUT_PROVENANCE_SCHEMA_VERSION: &str = "1";
 
@@ -47,6 +51,9 @@ pub struct ResolvedScenarioInputV1 {
     pub scenario: ScenarioSpec,
     pub expected_outcomes: Vec<TraceExpectation>,
     pub provenance: ScenarioInputProvenanceV1,
+    /// The parsed source envelope, when one was selected. Wider adapters use
+    /// `scenario`; report tooling retains the case without parsing twice.
+    pub generated_case: Option<GeneratedScenarioCase>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +84,6 @@ pub fn resolve_scenario_input_bytes(
 ) -> Result<ResolvedScenarioInputV1, ScenarioInputError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| ScenarioInputError::new("scenario_input_parse", error.to_string()))?;
-    let source_sha256 = hex::encode(Sha256::digest(bytes));
 
     if value.get("schema_version").is_some() && value.get("case").is_some() {
         let input: GeneratedScenarioInputV1 = serde_json::from_value(value).map_err(|error| {
@@ -87,23 +93,12 @@ pub fn resolve_scenario_input_bytes(
             ScenarioInputError::new("generated_scenario_input_version", message)
         })?;
         let case = input.case;
-        let canonical_ir_sha256 = canonical_scenario_ir_sha256(&case.scenario)?;
+        let provenance = generated_scenario_input_provenance(bytes, &case)?;
         return Ok(ResolvedScenarioInputV1 {
-            scenario: case.scenario,
-            expected_outcomes: case.expected_outcomes,
-            provenance: ScenarioInputProvenanceV1 {
-                schema_version: SCENARIO_INPUT_PROVENANCE_SCHEMA_VERSION.into(),
-                format: ScenarioInputFormatV1::GeneratedScenarioInputV1,
-                source_sha256,
-                canonical_ir_sha256,
-                generated: Some(GeneratedScenarioProvenanceV1 {
-                    family_name: case.family_name,
-                    generator_version: case.generator_version,
-                    seed: case.seed,
-                    case_index: case.case_index,
-                    recorded_subject: case.subject,
-                }),
-            },
+            scenario: case.scenario.clone(),
+            expected_outcomes: case.expected_outcomes.clone(),
+            provenance,
+            generated_case: Some(case),
         });
     }
 
@@ -117,10 +112,30 @@ pub fn resolve_scenario_input_bytes(
         provenance: ScenarioInputProvenanceV1 {
             schema_version: SCENARIO_INPUT_PROVENANCE_SCHEMA_VERSION.into(),
             format: ScenarioInputFormatV1::CanonicalScenarioIr,
-            source_sha256,
+            source_sha256: hex::encode(Sha256::digest(bytes)),
             canonical_ir_sha256,
             generated: None,
         },
+        generated_case: None,
+    })
+}
+
+pub(crate) fn generated_scenario_input_provenance(
+    source_bytes: &[u8],
+    case: &GeneratedScenarioCase,
+) -> Result<ScenarioInputProvenanceV1, ScenarioInputError> {
+    Ok(ScenarioInputProvenanceV1 {
+        schema_version: SCENARIO_INPUT_PROVENANCE_SCHEMA_VERSION.into(),
+        format: ScenarioInputFormatV1::GeneratedScenarioInputV1,
+        source_sha256: hex::encode(Sha256::digest(source_bytes)),
+        canonical_ir_sha256: canonical_scenario_ir_sha256(&case.scenario)?,
+        generated: Some(GeneratedScenarioProvenanceV1 {
+            family_name: case.family_name.clone(),
+            generator_version: case.generator_version.clone(),
+            seed: case.seed,
+            case_index: case.case_index,
+            recorded_subject: case.subject,
+        }),
     })
 }
 
@@ -165,6 +180,8 @@ mod tests {
         let generated = resolve_scenario_input_bytes(&generated).unwrap();
         assert_eq!(raw.scenario, scenario);
         assert_eq!(generated.scenario, scenario);
+        assert!(raw.generated_case.is_none());
+        assert_eq!(generated.generated_case.as_ref().unwrap().seed, 42);
         assert_eq!(
             raw.provenance.canonical_ir_sha256,
             generated.provenance.canonical_ir_sha256

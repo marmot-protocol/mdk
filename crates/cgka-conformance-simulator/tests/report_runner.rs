@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    FailureCapsuleSensitivity, GeneratedSubjectKind, HarnessStorageMode, OracleBehavior,
-    ReportArgs, ReportCommand, ReportInput, ScenarioStimulus, parse_report_command,
+    FailureCapsuleSensitivity, GeneratedScenarioCase, GeneratedScenarioInputV1,
+    GeneratedSubjectKind, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
+    ReportInput, ScenarioSpec, ScenarioStep, ScenarioStimulus, parse_report_command,
     promote_failure_capsule_to_vector, property_test_coverage_entries, read_failure_capsule,
     replay_engine_bytes, run_report,
 };
@@ -151,6 +152,71 @@ fn parse_generated_input_rejects_other_scenario_sources() {
         .expect_err("generated input must be the only scenario source");
         assert!(error.to_string().contains("--generated-input"));
     }
+}
+
+#[test]
+fn parse_adapter_accepts_only_the_documented_hyphenated_names() {
+    for adapter in ["retained_relay", "app_runtime"] {
+        let error = parse_report_command([
+            "--generated-input".into(),
+            "target/case-generated-input.json".into(),
+            "--adapter".into(),
+            adapter.into(),
+        ])
+        .expect_err("undocumented adapter alias must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported generated-case adapter")
+        );
+    }
+}
+
+#[tokio::test]
+async fn adapter_override_uses_distinct_artifacts_without_minting_a_fixture() {
+    let root = tempfile::tempdir().unwrap();
+    let input_path = root.path().join("case.json");
+    let out = root.path().join("reports");
+    let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
+        family_name: "selectable-report/v1".into(),
+        generator_version: "1".into(),
+        seed: 5,
+        case_index: 2,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: ScenarioSpec {
+            name: "selectable-report/v1/case-2".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::DeliverAll],
+        },
+        expected_outcomes: Vec::new(),
+    });
+    fs_private::write_private(&input_path, &serde_json::to_vec_pretty(&input).unwrap()).unwrap();
+
+    for adapter in [None, Some(GeneratedSubjectKind::AppRuntime)] {
+        run_report(&ReportArgs {
+            input: ReportInput::GeneratedInputs {
+                paths: vec![input_path.clone()],
+                adapter,
+            },
+            out: out.clone(),
+            strict_oracle: false,
+            storage_mode: HarnessStorageMode::InMemorySqlite,
+            capture_sensitive_replay: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    let base = "selectable-report-v1-seed-5-case-2";
+    assert!(out.join(format!("{base}.json")).exists());
+    assert!(out.join(format!("{base}-fixture.v1.json")).exists());
+    assert!(out.join(format!("{base}-app-runtime.json")).exists());
+    assert!(
+        !out.join(format!("{base}-app-runtime-fixture.v1.json"))
+            .exists()
+    );
 }
 
 #[test]
