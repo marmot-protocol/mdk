@@ -22,6 +22,10 @@ pub(crate) enum AppPerformanceOperation {
     DirectorySubscriptionSync,
     AccountReconcile,
     AccountOpen,
+    AccountSessionOpen,
+    AccountGroupHydration,
+    AccountProfileLoad,
+    AccountGroupReadSnapshot,
     AccountTransportActivation,
     AccountSubscriptionRegistration,
     AccountCatchUp,
@@ -81,6 +85,14 @@ pub struct AppPerformanceSnapshot {
     pub account_reconcile: AppPerformanceOperationSnapshot,
     pub account_open: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub account_session_open: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_group_hydration: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_profile_load: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_group_read_snapshot: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub account_transport_activation: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub account_subscription_registration: AppPerformanceOperationSnapshot,
@@ -129,6 +141,10 @@ struct AppPerformanceTelemetryInner {
     directory_subscription_sync: AppPerformanceOperationTelemetry,
     account_reconcile: AppPerformanceOperationTelemetry,
     account_open: AppPerformanceOperationTelemetry,
+    account_session_open: AppPerformanceOperationTelemetry,
+    account_group_hydration: AppPerformanceOperationTelemetry,
+    account_profile_load: AppPerformanceOperationTelemetry,
+    account_group_read_snapshot: AppPerformanceOperationTelemetry,
     account_transport_activation: AppPerformanceOperationTelemetry,
     account_subscription_registration: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
@@ -247,6 +263,18 @@ impl AppPerformanceTelemetry {
                 inner.account_reconcile.record(duration, success);
             }
             AppPerformanceOperation::AccountOpen => inner.account_open.record(duration, success),
+            AppPerformanceOperation::AccountSessionOpen => {
+                inner.account_session_open.record(duration, success);
+            }
+            AppPerformanceOperation::AccountGroupHydration => {
+                inner.account_group_hydration.record(duration, success);
+            }
+            AppPerformanceOperation::AccountProfileLoad => {
+                inner.account_profile_load.record(duration, success);
+            }
+            AppPerformanceOperation::AccountGroupReadSnapshot => {
+                inner.account_group_read_snapshot.record(duration, success);
+            }
             AppPerformanceOperation::AccountTransportActivation => {
                 inner.account_transport_activation.record(duration, success);
             }
@@ -348,6 +376,10 @@ impl AppPerformanceTelemetry {
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),
             account_open: inner.account_open.snapshot(),
+            account_session_open: inner.account_session_open.snapshot(),
+            account_group_hydration: inner.account_group_hydration.snapshot(),
+            account_profile_load: inner.account_profile_load.snapshot(),
+            account_group_read_snapshot: inner.account_group_read_snapshot.snapshot(),
             account_transport_activation: inner.account_transport_activation.snapshot(),
             account_subscription_registration: inner.account_subscription_registration.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
@@ -482,6 +514,29 @@ mod tests {
                 .any(|bucket| bucket.upper_bound_ms == 50 && bucket.count == 1)
         );
         assert_eq!(snapshot.app_start.duration_ms.overflow_count, 1);
+    }
+
+    #[test]
+    fn records_account_open_stage_operations() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms) in [
+            (AppPerformanceOperation::AccountSessionOpen, 120),
+            (AppPerformanceOperation::AccountGroupHydration, 80),
+            (AppPerformanceOperation::AccountProfileLoad, 15),
+            (AppPerformanceOperation::AccountGroupReadSnapshot, 40),
+        ] {
+            telemetry.record(operation, Duration::from_millis(duration_ms), true);
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_session_open.successes, 1);
+        assert_eq!(snapshot.account_session_open.duration_ms.sum_ms, 120);
+        assert_eq!(snapshot.account_group_hydration.successes, 1);
+        assert_eq!(snapshot.account_group_hydration.duration_ms.sum_ms, 80);
+        assert_eq!(snapshot.account_profile_load.successes, 1);
+        assert_eq!(snapshot.account_profile_load.duration_ms.sum_ms, 15);
+        assert_eq!(snapshot.account_group_read_snapshot.successes, 1);
+        assert_eq!(snapshot.account_group_read_snapshot.duration_ms.sum_ms, 40);
     }
 
     #[test]

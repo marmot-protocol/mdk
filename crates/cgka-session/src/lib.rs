@@ -176,6 +176,31 @@ impl SessionConfig {
 
 pub struct AccountDeviceSession {
     engine: Engine<SqliteAccountStorage>,
+    open_timings: SessionOpenTimings,
+}
+
+/// Privacy-safe stage timings captured during [`AccountDeviceSession::open`].
+///
+/// Durations and aggregate counts only — no account, group, or key identifiers
+/// — so callers can feed them straight into fixed-bucket telemetry (mdk#1161).
+/// `total` covers the whole `open` call; the stage fields attribute its
+/// dominant contributors: SQLCipher storage open, engine construction
+/// (including strict-cutover key-package retirement), and stored-group
+/// hydration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionOpenTimings {
+    /// Wall-clock duration of the whole `open` call.
+    pub total: std::time::Duration,
+    /// SQLCipher database open, keying, and migration time.
+    pub storage_open: std::time::Duration,
+    /// Engine construction, including local key-package retirement.
+    pub engine_build: std::time::Duration,
+    /// Stored-group enumeration and hydration time.
+    pub group_hydration: std::time::Duration,
+    /// Stored groups that hydrated into live state.
+    pub groups_live: u64,
+    /// Stored groups quarantined during hydration.
+    pub groups_quarantined: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,11 +296,14 @@ impl AccountDeviceSession {
             method = "open",
             "opening account device session"
         );
+        let opened_at = std::time::Instant::now();
         let storage = SqliteAccountStorage::open_encrypted_with_options(
             config.database_path,
             &config.database_key,
             config.storage_options,
         )?;
+        let storage_open = opened_at.elapsed();
+        let build_started = std::time::Instant::now();
         let builder = EngineBuilder::new(storage)
             .identity(config.identity)
             .account_identity_proof_signer(config.account_identity_proof_signer.ok_or_else(
@@ -319,17 +347,43 @@ impl AccountDeviceSession {
                 "completed strict-cutover local key package retirement"
             );
         }
+        let engine_build = build_started.elapsed();
+        let hydration_started = std::time::Instant::now();
         engine.hydrate_stable_groups_from_storage()?;
+        let group_hydration = hydration_started.elapsed();
         engine
             .set_convergence_policy(config.convergence_policy)
             .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
         engine.audit_recorder_health();
+        let open_timings = SessionOpenTimings {
+            total: opened_at.elapsed(),
+            storage_open,
+            engine_build,
+            group_hydration,
+            groups_live: engine.live_group_ids()?.len() as u64,
+            groups_quarantined: engine.quarantined_groups().len() as u64,
+        };
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
+            total_ms = open_timings.total.as_millis() as u64,
+            storage_open_ms = open_timings.storage_open.as_millis() as u64,
+            engine_build_ms = open_timings.engine_build.as_millis() as u64,
+            group_hydration_ms = open_timings.group_hydration.as_millis() as u64,
+            groups_live = open_timings.groups_live,
+            groups_quarantined = open_timings.groups_quarantined,
             "account device session opened"
         );
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            open_timings,
+        })
+    }
+
+    /// Stage timings captured by [`Self::open`]; durations and aggregate
+    /// counts only, safe for fixed-bucket telemetry.
+    pub fn open_timings(&self) -> &SessionOpenTimings {
+        &self.open_timings
     }
 
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {

@@ -451,8 +451,8 @@ async fn run_app_runtime_account_worker(
     );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
-    // The session is hydrated. Capture a read snapshot and signal
-    // command-readiness *now*, before the initial relay catch-up. "Ready" means
+    // The session is hydrated. Signal command-readiness *now*, before the
+    // read-snapshot capture and the initial relay catch-up. "Ready" means
     // "hydrated + serving commands", not "caught up": the conversation's
     // group-detail reads (`Members` / `GroupMlsState` / `QuarantinedGroups`)
     // route through this worker, and blocking them on the catch-up made the
@@ -460,33 +460,60 @@ async fn run_app_runtime_account_worker(
     // catch-up still runs (below) and its results flow to subscribers via the
     // normal event mechanism; it is only removed from the readiness/blocking
     // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
-    // the ready-wait) now measures local hydration and snapshot readiness;
-    // transport activation, subscription registration, and catch-up have
-    // separate asynchronous measurements below.
-    //
-    // Snapshot capture is part of local readiness: its only failure is the
-    // shared profile load, and acknowledging readiness without it would queue
-    // supposedly-local reads behind relay catch-up. Surface the error and fail
-    // this worker start instead of weakening the readiness contract.
-    let read_snapshot = match client.group_read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let message = account_error_message("runtime startup snapshot capture failed", &err);
-            publish_app_runtime_account_error(
-                &events,
-                &account_id_hex,
-                &account_label,
-                message.clone(),
-            );
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(err));
-            }
-            return;
-        }
-    };
+    // the ready-wait) now measures local hydration readiness; the snapshot
+    // capture, transport activation, subscription registration, and catch-up
+    // have separate asynchronous measurements (mdk#1161 stage telemetry:
+    // `AccountSessionOpen` / `AccountGroupHydration` attribute the open the
+    // worker just awaited, `AccountProfileLoad` / `AccountGroupReadSnapshot`
+    // attribute the capture below).
+    {
+        let open_timings = client.runtime.session().open_timings();
+        let telemetry = shared.app_performance_telemetry();
+        telemetry.record(
+            AppPerformanceOperation::AccountSessionOpen,
+            open_timings.total,
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::AccountGroupHydration,
+            open_timings.group_hydration,
+            true,
+        );
+    }
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(()));
     }
+
+    // The snapshot's only failure is the shared profile load. It no longer
+    // gates the ready signal (mdk#1161): a host that raced a group read into
+    // the gap would previously have waited on the full capture even when it
+    // never issued one. On failure, surface the error on the account event
+    // stream and stop this worker — read commands must not silently fall
+    // through to a snapshotless catch-up window.
+    let snapshot_started = Instant::now();
+    let read_snapshot = {
+        let capture =
+            client.group_read_snapshot_with_stage_telemetry(&shared.app_performance_telemetry());
+        shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountGroupReadSnapshot,
+            snapshot_started.elapsed(),
+            capture.is_ok(),
+        );
+        match capture {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let message =
+                    account_error_message("runtime startup snapshot capture failed", &err);
+                publish_app_runtime_account_error(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    message,
+                );
+                return;
+            }
+        }
+    };
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been
