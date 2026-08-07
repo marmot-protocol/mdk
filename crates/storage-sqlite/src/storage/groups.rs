@@ -1,8 +1,8 @@
 use crate::openmls_storage::mls_group_key;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, serialize};
 use cgka_traits::group::Group;
-use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
-use cgka_traits::types::GroupId;
+use cgka_traits::storage::{GroupStorage, StorageError, StorageResult, TransportGroupRoute};
+use cgka_traits::types::{EpochId, GroupId};
 use rusqlite::{OptionalExtension, params};
 
 impl GroupStorage for SqliteAccountStorage {
@@ -88,12 +88,25 @@ impl GroupStorage for SqliteAccountStorage {
         &self,
         transport_group_id: &[u8],
         group_id: &GroupId,
+        source_epoch: EpochId,
     ) -> StorageResult<()> {
-        super::transport_routes::put(self, transport_group_id, group_id)
+        super::transport_routes::put(self, transport_group_id, group_id, source_epoch)
     }
 
-    fn list_transport_group_routes(&self) -> StorageResult<Vec<(Vec<u8>, GroupId)>> {
+    fn list_transport_group_routes(&self) -> StorageResult<Vec<TransportGroupRoute>> {
         super::transport_routes::list(self)
+    }
+
+    fn delete_transport_group_route(&self, transport_group_id: &[u8]) -> StorageResult<()> {
+        super::transport_routes::delete_route(self, transport_group_id)
+    }
+
+    fn delete_transport_group_routes_below_epoch(
+        &self,
+        group_id: &GroupId,
+        cutoff: EpochId,
+    ) -> StorageResult<()> {
+        super::transport_routes::delete_below_epoch(self, group_id, cutoff)
     }
 
     fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
@@ -111,7 +124,7 @@ mod tests {
     use cgka_traits::group::ProtocolProfile;
     use cgka_traits::storage::{
         CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
-        OutboundIntentStorage, StorageError, StorageProvider,
+        OutboundIntentStorage, StorageError, StorageProvider, TransportGroupRoute,
     };
     use cgka_traits::types::EpochId;
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -129,6 +142,24 @@ mod tests {
         assert!(records.contains(&second));
     }
 
+    fn route(
+        transport_group_id: [u8; 32],
+        group_id: &cgka_traits::types::GroupId,
+        source_epoch: u64,
+    ) -> TransportGroupRoute {
+        TransportGroupRoute {
+            transport_group_id: transport_group_id.to_vec(),
+            group_id: group_id.clone(),
+            source_epoch: EpochId(source_epoch),
+        }
+    }
+
+    fn sorted_routes(store: &SqliteAccountStorage) -> Vec<TransportGroupRoute> {
+        let mut routes = store.list_transport_group_routes().unwrap();
+        routes.sort_by(|a, b| a.transport_group_id.cmp(&b.transport_group_id));
+        routes
+    }
+
     #[test]
     fn transport_group_routes_roundtrip_and_rotation_keeps_prior_route() {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -138,44 +169,83 @@ mod tests {
         // Rotation overlap (mdk#740): both the prior and the current route
         // resolve to the group until the prior route is retired.
         store
-            .put_transport_group_route(&[0xAA; 32], &group.id)
+            .put_transport_group_route(&[0xAA; 32], &group.id, EpochId(3))
             .unwrap();
         store
-            .put_transport_group_route(&[0xBB; 32], &group.id)
+            .put_transport_group_route(&[0xBB; 32], &group.id, EpochId(4))
             .unwrap();
-        let mut routes = store.list_transport_group_routes().unwrap();
-        routes.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            routes,
+            sorted_routes(&store),
             vec![
-                (vec![0xAA; 32], group.id.clone()),
-                (vec![0xBB; 32], group.id.clone()),
+                route([0xAA; 32], &group.id, 3),
+                route([0xBB; 32], &group.id, 4)
             ]
         );
 
-        // Re-pointing an existing route replaces its target instead of
-        // erroring, matching the in-memory index's insert semantics.
+        // Re-pointing an existing route replaces its target and refreshes its
+        // source epoch, matching the in-memory index's insert semantics.
         let other = sample_group(gid(2), 1, 1);
         store.put_group(&other).unwrap();
         store
-            .put_transport_group_route(&[0xBB; 32], &other.id)
+            .put_transport_group_route(&[0xBB; 32], &other.id, EpochId(9))
             .unwrap();
-        let mut routes = store.list_transport_group_routes().unwrap();
-        routes.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            routes,
+            sorted_routes(&store),
             vec![
-                (vec![0xAA; 32], group.id.clone()),
-                (vec![0xBB; 32], other.id.clone()),
+                route([0xAA; 32], &group.id, 3),
+                route([0xBB; 32], &other.id, 9)
             ]
         );
 
         store
             .delete_transport_group_routes_for_group(&group.id)
             .unwrap();
+        assert_eq!(sorted_routes(&store), vec![route([0xBB; 32], &other.id, 9)]);
+    }
+
+    #[test]
+    fn transport_group_route_retirement_is_per_route_and_per_epoch_window() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        let bystander = sample_group(gid(2), 1, 1);
+        store.put_group(&bystander).unwrap();
+
+        store
+            .put_transport_group_route(&[0x01; 32], &group.id, EpochId(2))
+            .unwrap();
+        store
+            .put_transport_group_route(&[0x02; 32], &group.id, EpochId(7))
+            .unwrap();
+        store
+            .put_transport_group_route(&[0x03; 32], &group.id, EpochId(12))
+            .unwrap();
+        store
+            .put_transport_group_route(&[0x04; 32], &bystander.id, EpochId(1))
+            .unwrap();
+
+        // Bulk retirement below the retention cutoff touches only the named
+        // group; the bystander's old route survives.
+        store
+            .delete_transport_group_routes_below_epoch(&group.id, EpochId(7))
+            .unwrap();
         assert_eq!(
-            store.list_transport_group_routes().unwrap(),
-            vec![(vec![0xBB; 32], other.id.clone())]
+            sorted_routes(&store),
+            vec![
+                route([0x02; 32], &group.id, 7),
+                route([0x03; 32], &group.id, 12),
+                route([0x04; 32], &bystander.id, 1),
+            ]
+        );
+
+        // Single-route retirement.
+        store.delete_transport_group_route(&[0x02; 32]).unwrap();
+        assert_eq!(
+            sorted_routes(&store),
+            vec![
+                route([0x03; 32], &group.id, 12),
+                route([0x04; 32], &bystander.id, 1),
+            ]
         );
     }
 
@@ -185,7 +255,7 @@ mod tests {
         let group = sample_group(gid(1), 1, 1);
         store.put_group(&group).unwrap();
         store
-            .put_transport_group_route(&[0xCC; 32], &group.id)
+            .put_transport_group_route(&[0xCC; 32], &group.id, EpochId(1))
             .unwrap();
         store.delete_group(&group.id).unwrap();
         assert!(store.list_transport_group_routes().unwrap().is_empty());

@@ -542,12 +542,15 @@ impl<S: StorageProvider> Engine<S> {
                 crate::app_components::transport_group_id_of_group(&mls_group)
             {
                 // Inlined `index_transport_group_route` (field-split borrows:
-                // `provider` above still holds `&self`).
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
                 self.transport_group_id_index
                     .insert(transport_group_id.clone(), group_id.clone());
-                let _ = self
-                    .storage
-                    .put_transport_group_route(&transport_group_id, &group_id);
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
             }
         }
 
@@ -710,7 +713,7 @@ impl<S: StorageProvider> Engine<S> {
             if let Ok(transport_group_id) =
                 crate::app_components::transport_group_id_of_group(&mls_group)
             {
-                self.index_transport_group_route(transport_group_id, &group_id);
+                self.index_transport_group_route(transport_group_id, &group_id, canonical_epoch);
             }
             self.epoch_manager
                 .set_stable(group_id.clone(), canonical_epoch);
@@ -1198,7 +1201,8 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.index_transport_group_route(transport_group_id, &group_id);
+            let joined_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, &group_id, joined_epoch);
         }
 
         // 7. State machine: Stable at the post-welcome epoch.

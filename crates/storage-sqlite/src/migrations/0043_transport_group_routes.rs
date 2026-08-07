@@ -5,22 +5,27 @@ use rusqlite::Transaction;
 /// Durable transport-route index (mdk#1161): opaque transport routing-id
 /// bytes -> MLS group id, so session open can seed inbound routing without
 /// loading each group's MLS state. Many-to-one per group: a routing rotation
-/// keeps the prior route for its overlap window (mdk#740). Deliberately not
-/// captured by group snapshots — routes are a regenerable projection of MLS
-/// state, and a rollback must not delete a still-valid route. Groups stored
-/// before this migration have no rows; the engine backfills their routes on
-/// first full hydration.
+/// keeps the prior route for its overlap window (mdk#740). `source_epoch`
+/// records the group epoch of the last write that observed the route as
+/// current: session open uses it to detect a stale route set (a crash
+/// between a commit apply and the route refresh), and the engine retires
+/// rows once the retained-history window moves past them (routing-v1 overlap
+/// rule). Deliberately not captured by group snapshots — routes are a
+/// regenerable projection of MLS state, and a rollback must not delete a
+/// still-valid route. Groups stored before this migration have no rows; the
+/// engine backfills their routes on first full hydration.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
 CREATE TABLE cgka_transport_group_routes (
     transport_group_id BLOB PRIMARY KEY,
     group_id BLOB NOT NULL,
+    source_epoch INTEGER NOT NULL,
     FOREIGN KEY (group_id) REFERENCES cgka_groups(id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_cgka_transport_group_routes_group
-    ON cgka_transport_group_routes(group_id);
+    ON cgka_transport_group_routes(group_id, source_epoch);
 "#,
     )
     .storage()

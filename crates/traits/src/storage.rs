@@ -98,30 +98,66 @@ pub trait GroupStorage {
 
     /// Durable transport-route index: opaque transport routing-id bytes to
     /// MLS group id, many-to-one (a routing rotation retains the prior route
-    /// for its overlap window, mdk#740). Routes are a regenerable projection
-    /// of MLS state — the engine rebuilds a missing route from the loaded
-    /// group on demand — so the default implementations store nothing and
-    /// return nothing. Backends without an override are correct but pay a
-    /// per-group MLS load to re-derive routes on the first inbound lookup
-    /// after reopen. No transport *types* here: routes are bytes only
-    /// (`group.rs` invariants).
+    /// for its overlap window, mdk#740). Each row carries the group epoch of
+    /// the last write that observed the route as current, so the session-open
+    /// seed can detect a stale route set (a crash between a commit apply and
+    /// the route refresh) and the engine can retire prior routes once no
+    /// epoch using them remains inside the retained-history window
+    /// (routing-v1 overlap rule). Routes are a regenerable projection of MLS
+    /// state — the engine rebuilds a missing route from the loaded group on
+    /// demand — so the default implementations store nothing and return
+    /// nothing. Backends without an override are correct but pay a per-group
+    /// MLS load to re-derive routes on the first inbound lookup after
+    /// reopen. No transport *types* here: routes are bytes only (`group.rs`
+    /// invariants).
     fn put_transport_group_route(
         &self,
         transport_group_id: &[u8],
         group_id: &GroupId,
+        source_epoch: EpochId,
     ) -> StorageResult<()> {
-        let _ = (transport_group_id, group_id);
+        let _ = (transport_group_id, group_id, source_epoch);
         Ok(())
     }
 
-    fn list_transport_group_routes(&self) -> StorageResult<Vec<(Vec<u8>, GroupId)>> {
+    fn list_transport_group_routes(&self) -> StorageResult<Vec<TransportGroupRoute>> {
         Ok(Vec::new())
+    }
+
+    /// Retire one route (routing-v1: a prior address stops being accepted
+    /// once no epoch using it remains in either retained-history window).
+    fn delete_transport_group_route(&self, transport_group_id: &[u8]) -> StorageResult<()> {
+        let _ = transport_group_id;
+        Ok(())
+    }
+
+    /// Retire every route of `group_id` whose `source_epoch` is below
+    /// `cutoff` — the bulk form the engine uses when a route refresh advances
+    /// the retention horizon.
+    fn delete_transport_group_routes_below_epoch(
+        &self,
+        group_id: &GroupId,
+        cutoff: EpochId,
+    ) -> StorageResult<()> {
+        let _ = (group_id, cutoff);
+        Ok(())
     }
 
     fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
         let _ = group_id;
         Ok(())
     }
+}
+
+/// One durable transport-route row; see
+/// [`GroupStorage::put_transport_group_route`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportGroupRoute {
+    /// Opaque transport routing-id bytes (no transport types).
+    pub transport_group_id: Vec<u8>,
+    pub group_id: GroupId,
+    /// Group epoch of the last write that observed this route as current.
+    pub source_epoch: EpochId,
 }
 
 // ── MessageStorage ──────────────────────────────────────────────────────────

@@ -1155,40 +1155,43 @@ impl<S: StorageProvider> Engine<S> {
         rows
     }
 
-    /// Restore stable epoch state for groups already present in storage.
+    /// Insert one transport route into the in-memory resolver AND the durable
+    /// route table (mdk#1161), stamped with the group epoch that observed the
+    /// route as current, then retire durable rows the retained-history window
+    /// has moved past (routing-v1: a prior address is accepted only until no
+    /// epoch using it remains in either retained window).
     ///
-    /// This is used by production session startup after opening durable
-    /// storage. The application is expected to resolve publish success/failure
-    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
-    /// between transport publish and that resolution violates the
-    /// precondition: OpenMLS durably persists the staged commit
-    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
-    /// the in-memory `PendingStateRef` that `confirm_published` /
-    /// `publish_failed` require is gone (the `EpochManager` starts empty on
-    /// every open). Left untouched, the group is stranded: every subsequent
-    /// commit-creating operation fails with a pending-commit error forever.
-    ///
-    /// So at hydrate time we detect a surviving pending commit and clear it,
-    /// treating an unresolved pending publish as publish-failed (the same
-    /// rewind `do_publish_failed` performs). The MLS group returns to its
-    /// pre-stage epoch, we re-derive the Marmot record from that cleared
-    /// state, and we surface a typed `PendingCommitRecovered` event so the
-    /// application can run a recovery / resync path — if relays accepted the
-    /// commit before the crash, this device is now behind and must catch up.
-    ///
-    /// **Member-removing commits are deliberately left untouched.** A surviving
-    /// pending commit is NOT a reliable crash signal on its own: a deferred
-    /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
-    /// staged commit across process boundaries — a remaining member stages the
-    /// commit, projects the departing member out of the Marmot record
-    /// *forward*, and a later run publishes + confirms it. Rolling that
-    /// back re-derives the record from the pre-stage MLS state and so re-adds a
-    /// member who already left, forking convergence (the remaining members
-    /// advance past the leave while this device silently rewinds it). Clearing
-    /// an additive (invite) commit is safe — it only drops an invitee who never
-    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
-    /// scope crash-recovery to staged commits that remove no members, matching
-    /// the prior (pre-recovery) behaviour for removal-bearing commits.
+    /// The durable writes are best-effort with the same policy as every route
+    /// refresh: a failure only forfeits the next cold-start route seed, never
+    /// routing correctness — the in-memory insert stays authoritative for
+    /// this session, and the session-open seed detects the resulting stale
+    /// epoch stamp and schedules a backfill repair.
+    pub(crate) fn index_transport_group_route(
+        &mut self,
+        transport_group_id: Vec<u8>,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+    ) {
+        self.transport_group_id_index
+            .insert(transport_group_id.clone(), group_id.clone());
+        let _ = self
+            .storage
+            .put_transport_group_route(&transport_group_id, group_id, source_epoch);
+        // Durable retirement: rows last observed current before the retained
+        // horizon can no longer carry acceptable traffic. (The in-memory map
+        // stays session-scoped; its growth is tracked separately as #896.)
+        if let Ok(policy) = self.convergence_policy_for_group_ungated(group_id) {
+            let cutoff = EpochId(
+                source_epoch
+                    .0
+                    .saturating_sub(policy.convergence.max_rewind_commits),
+            );
+            let _ = self
+                .storage
+                .delete_transport_group_routes_below_epoch(group_id, cutoff);
+        }
+    }
+
     /// Additively refresh a group's `transport_group_id_index` entry from live
     /// MLS state after a commit that may have changed the Nostr routing
     /// component (#740 rotation). Inserts the group's CURRENT `transport_group_id`;
@@ -1200,24 +1203,10 @@ impl<S: StorageProvider> Engine<S> {
     /// only fire on commit application, not per app message, so the extra
     /// `MlsGroup::load` is cost-appropriate. Best-effort: a load / routing-read
     /// failure just forfeits the fast path for this group (inbound would fall to
-    /// the unknown-group disposition), never fails the merge.
-    /// Insert one transport route into the in-memory resolver AND the durable
-    /// route table (mdk#1161). The durable write is best-effort with the same
-    /// policy as every route refresh: a failure only forfeits the next
-    /// cold-start route seed, never routing correctness — the in-memory
-    /// insert stays authoritative for this session.
-    pub(crate) fn index_transport_group_route(
-        &mut self,
-        transport_group_id: Vec<u8>,
-        group_id: &GroupId,
-    ) {
-        self.transport_group_id_index
-            .insert(transport_group_id.clone(), group_id.clone());
-        let _ = self
-            .storage
-            .put_transport_group_route(&transport_group_id, group_id);
-    }
-
+    /// the unknown-group disposition), never fails the merge — and because this
+    /// runs after the commit transaction, the durable route row can lag the
+    /// record epoch; the session-open seed treats that lag as a stale route
+    /// set and schedules a backfill repair (mdk#1161).
     pub(crate) fn reindex_transport_group_id(&mut self, group_id: &GroupId) {
         let mls_group = {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -1238,7 +1227,8 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.index_transport_group_route(transport_group_id, group_id);
+            let current_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, group_id, current_epoch);
         }
     }
 
@@ -1276,7 +1266,7 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .collect();
         let mut stored_group_ids = HashSet::with_capacity(records.len());
-        let mut seedable_group_ids = HashSet::new();
+        let mut seeded_group_epochs: HashMap<GroupId, EpochId> = HashMap::new();
         for record in records {
             let group = match record {
                 Ok(group) => group,
@@ -1312,12 +1302,18 @@ impl<S: StorageProvider> Engine<S> {
             }
             if group.unrecoverable {
                 // mdk#971: a durable Unrecoverable halt must survive process
-                // restart, and the durable lifecycle marker is also an
-                // application-facing repair requirement — re-emit it on every
-                // session open because the original transition event belonged
-                // to the prior process. Terminal until a verified repair path
-                // (re-join welcome) clears the marker, so the group is NOT
-                // queued for lazy hydration.
+                // restart. Seed the halted epoch entry so every convergence /
+                // ingest gate observes it immediately, and queue the group
+                // for full hydration like any other seeded group: an
+                // unrecoverable group still needs its per-group hydration
+                // work (route indexing, interrupted probe/apply recovery,
+                // leave-request restore) — the pre-mdk#1161 open always ran
+                // it, and `hydrate_all_stored_groups` must stay
+                // behavior-preserving. `hydrate_one_stored_group` restores
+                // the halt and re-emits the application-facing
+                // `GroupUnrecoverable` event when it runs, so the event
+                // stays once-per-open on the eager path and arrives with the
+                // group's promotion on the deferred path.
                 self.epoch_manager
                     .restore_unrecoverable(group.id.clone(), group.epoch);
                 self.audit_group(
@@ -1331,10 +1327,8 @@ impl<S: StorageProvider> Engine<S> {
                         None,
                     ),
                 );
-                self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
-                    group_id: group.id.clone(),
-                });
-                seedable_group_ids.insert(group.id);
+                self.unhydrated_groups.insert(group.id.clone());
+                seeded_group_epochs.insert(group.id, group.epoch);
                 continue;
             }
             // Provisional seed: the durable record's epoch mirror keeps
@@ -1357,26 +1351,38 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             );
             self.unhydrated_groups.insert(group.id.clone());
-            seedable_group_ids.insert(group.id);
+            seeded_group_epochs.insert(group.id, group.epoch);
         }
 
         // Seed inbound routing from the durable route table so unhydrated
         // groups still resolve (mdk#740 semantics preserved: many-to-one,
-        // rotation overlap retained). Groups without a durable route —
-        // records predating migration 0043 or a provider without a route
-        // store — go to the backfill set: ingest re-derives their route from
-        // one MLS load on demand, and the background pipeline orders them
-        // first.
-        let mut routed_group_ids = HashSet::new();
-        for (transport_group_id, group_id) in self.storage.list_transport_group_routes()? {
-            if stored_group_ids.contains(&group_id) {
-                routed_group_ids.insert(group_id.clone());
-                self.transport_group_id_index
-                    .insert(transport_group_id, group_id);
+        // rotation overlap retained). A group's route set is trusted only if
+        // some row was stamped at the record's current epoch: every commit
+        // apply refreshes the current route's epoch stamp, so a lagging stamp
+        // means the last commit (which may have rotated the route) was not
+        // followed by a route write — a crash or write failure — and current
+        // traffic could miss the index. Untrusted and route-less groups —
+        // including records predating migration 0043 or providers without a
+        // route store — go to the backfill set: ingest re-derives their
+        // current route from one MLS load on demand, and the background
+        // pipeline orders them first. Stale rows still seed the index so
+        // overlap-window traffic keeps resolving.
+        let mut current_routed_group_ids = HashSet::new();
+        for route in self.storage.list_transport_group_routes()? {
+            if !stored_group_ids.contains(&route.group_id) {
+                continue;
             }
+            if seeded_group_epochs
+                .get(&route.group_id)
+                .is_some_and(|epoch| route.source_epoch >= *epoch)
+            {
+                current_routed_group_ids.insert(route.group_id.clone());
+            }
+            self.transport_group_id_index
+                .insert(route.transport_group_id, route.group_id);
         }
-        for group_id in seedable_group_ids {
-            if !routed_group_ids.contains(&group_id) {
+        for group_id in seeded_group_epochs.into_keys() {
+            if !current_routed_group_ids.contains(&group_id) {
                 self.route_backfill_pending.insert(group_id);
             }
         }
@@ -1448,6 +1454,40 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Full per-group hydration: load and validate one stored group's MLS and
+    /// Marmot state, run its crash recovery, and restore its live epoch entry.
+    ///
+    /// The application is expected to resolve publish success/failure
+    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
+    /// between transport publish and that resolution violates the
+    /// precondition: OpenMLS durably persists the staged commit
+    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
+    /// the in-memory `PendingStateRef` that `confirm_published` /
+    /// `publish_failed` require is gone (the `EpochManager` starts empty on
+    /// every open). Left untouched, the group is stranded: every subsequent
+    /// commit-creating operation fails with a pending-commit error forever.
+    ///
+    /// So hydration detects a surviving pending commit and clears it,
+    /// treating an unresolved pending publish as publish-failed (the same
+    /// rewind `do_publish_failed` performs). The MLS group returns to its
+    /// pre-stage epoch, we re-derive the Marmot record from that cleared
+    /// state, and we surface a typed `PendingCommitRecovered` event so the
+    /// application can run a recovery / resync path — if relays accepted the
+    /// commit before the crash, this device is now behind and must catch up.
+    ///
+    /// **Member-removing commits are deliberately left untouched.** A surviving
+    /// pending commit is NOT a reliable crash signal on its own: a deferred
+    /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
+    /// staged commit across process boundaries — a remaining member stages the
+    /// commit, projects the departing member out of the Marmot record
+    /// *forward*, and a later run publishes + confirms it. Rolling that
+    /// back re-derives the record from the pre-stage MLS state and so re-adds a
+    /// member who already left, forking convergence (the remaining members
+    /// advance past the leave while this device silently rewinds it). Clearing
+    /// an additive (invite) commit is safe — it only drops an invitee who never
+    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
+    /// scope crash-recovery to staged commits that remove no members, matching
+    /// the prior (pre-recovery) behaviour for removal-bearing commits.
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
@@ -1511,7 +1551,8 @@ impl<S: StorageProvider> Engine<S> {
         if let Ok(transport_group_id) =
             crate::app_components::transport_group_id_of_group(&mls_group)
         {
-            self.index_transport_group_route(transport_group_id, group_id);
+            let current_epoch = EpochId(mls_group.epoch().as_u64());
+            self.index_transport_group_route(transport_group_id, group_id, current_epoch);
         }
         self.route_backfill_pending.remove(group_id);
         let wire_protocol_profile =

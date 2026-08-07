@@ -78,8 +78,9 @@ backend on the same rail.
 
 - **File:** `two_phase_hydration.rs`
   - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
-    promotion and quarantine parity, cheap-pass idempotency, durable transport-route seeding, and the one-shot
-    ingest route backfill for records predating the route table
+    promotion and quarantine parity, cheap-pass idempotency, durable transport-route seeding, the bounded ingest
+    route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
+    retention-window route retirement across rotation and restart
 
 - **File:** `snapshot_privacy.rs`
   - **Owns:** Snapshot names do not expose plaintext group ids

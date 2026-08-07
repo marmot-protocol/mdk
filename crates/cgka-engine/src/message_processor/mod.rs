@@ -820,6 +820,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<bool, EngineError> {
+        // Promote a seeded-but-unhydrated group before reading its stored
+        // inputs (mdk#1161); a hydration failure quarantines it and the
+        // converge call below reports the blocked run as before.
+        let _ = self.ensure_hydrated(group_id);
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
             if self.has_unresolved_convergence_inputs(group_id)? {
                 let result = self
@@ -1307,6 +1311,13 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<Option<u64>, EngineError> {
         if self.quarantined_reason(group_id).is_some() {
+            return Ok(None);
+        }
+        // A seeded-but-unhydrated group holds a provisional Stable entry, so
+        // the state gate below would fall through and persist deferred-peel
+        // lifecycle normalization against unvalidated state (mdk#1161). No
+        // deadline yet; the scheduler re-asks after hydration promotes it.
+        if self.unhydrated_groups.contains(group_id) {
             return Ok(None);
         }
         if let Some(state) = self.epoch_manager.state(group_id)

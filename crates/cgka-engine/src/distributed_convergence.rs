@@ -248,6 +248,11 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         policy: CanonicalizationPolicy,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Promote a seeded-but-unhydrated group first (mdk#1161) so the audit
+        // context snapshot below reads validated state; a hydration failure
+        // quarantines and the write proceeds as it does for quarantined
+        // groups today (the policy is durable config, not group state).
+        let _ = self.ensure_hydrated(group_id);
         self.accept_convergence_policy(&policy)?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
@@ -368,6 +373,8 @@ impl<S: StorageProvider> Engine<S> {
         message: TransportMessage,
         monotonic_ms: u64,
     ) -> Result<(), OpenMlsProjectionError> {
+        // See `buffer_openmls_convergence_message` (mdk#1161).
+        let _ = self.ensure_hydrated(group_id);
         self.buffer_openmls_convergence_message_with_time(
             group_id,
             message,
@@ -384,6 +391,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message: TransportMessage,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Promote a seeded-but-unhydrated group before persisting convergence
+        // input against it (mdk#1161): the group's interrupted probe/apply
+        // recovery must run before any of its stored state is extended.
+        let _ = self.ensure_hydrated(group_id);
         self.buffer_openmls_convergence_message_with_time(group_id, message, self.convergence_now())
     }
 

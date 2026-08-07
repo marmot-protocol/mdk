@@ -15,7 +15,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendResult,
+    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendIntent,
+    SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::Group;
@@ -334,7 +335,7 @@ async fn ingest_hydrates_seeded_group_resolved_through_durable_route() {
 
     // Group establishment persisted the transport route durably.
     assert_eq!(
-        storage.list_transport_group_routes().unwrap(),
+        route_pairs(&storage),
         vec![(ROUTE_BYTES.to_vec(), group_id.clone())]
     );
 
@@ -405,9 +406,196 @@ async fn ingest_backfills_route_for_record_predating_route_table() {
         "backfilled route must resolve and hydrate the group"
     );
     assert_eq!(
-        storage.list_transport_group_routes().unwrap(),
+        route_pairs(&storage),
         vec![(ROUTE_BYTES.to_vec(), group_id.clone())],
         "backfill must repopulate the durable route table"
     );
+    assert!(reopened.members(&group_id).is_ok());
+}
+
+/// (route bytes, group id) pairs, epoch stamps elided, sorted for comparison.
+fn route_pairs(storage: &SqliteAccountStorage) -> Vec<(Vec<u8>, GroupId)> {
+    let mut pairs: Vec<(Vec<u8>, GroupId)> = storage
+        .list_transport_group_routes()
+        .unwrap()
+        .into_iter()
+        .map(|route| (route.transport_group_id, route.group_id))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+async fn confirm_evolution(engine: &mut Engine<SqliteAccountStorage>, result: SendResult) {
+    match result {
+        SendResult::GroupEvolution { pending, .. } => {
+            engine.confirm_published(pending).await.expect("confirm");
+        }
+        other => panic!("expected group evolution, got {other:?}"),
+    }
+}
+
+async fn rotate_route(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    new_route: [u8; 32],
+) {
+    let routing = NostrRoutingV1::new(new_route, vec!["wss://rotated.example".into()])
+        .expect("routing component");
+    let result = engine
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing).expect("encode routing"),
+            }],
+        })
+        .await
+        .expect("rotate routing");
+    confirm_evolution(engine, result).await;
+}
+
+async fn rename_group(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId, name: &str) {
+    let result = engine
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some(name.into()),
+            description: None,
+        })
+        .await
+        .expect("rename group");
+    confirm_evolution(engine, result).await;
+}
+
+fn inbound(route: [u8; 32], id: &[u8]) -> TransportMessage {
+    TransportMessage {
+        id: MessageId::new(id.to_vec()),
+        payload: b"not real mls bytes".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: route.to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn hydrate_all_fully_hydrates_unrecoverable_groups() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_routed_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial, true).await;
+    drop(initial);
+
+    // Mark the durable halt and wipe the route rows: full hydration must
+    // still run for the halted group (pre-mdk#1161 open always did) and
+    // re-derive its route from MLS state.
+    let mut record = storage.get_group(&group_id).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    storage
+        .delete_transport_group_routes_for_group(&group_id)
+        .unwrap();
+
+    let mut reopened = build_routed_engine(storage.clone());
+    reopened.hydrate_all_stored_groups().expect("eager hydrate");
+
+    assert!(
+        reopened.unhydrated_group_ids().is_empty(),
+        "the eager path must finish unrecoverable groups too"
+    );
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(
+        route_pairs(&storage),
+        vec![(ROUTE_BYTES.to_vec(), group_id.clone())],
+        "full hydration must re-index the halted group's transport route"
+    );
+    let events = reopened.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                GroupEvent::GroupUnrecoverable { group_id: id } if id == &group_id
+            ))
+            .count(),
+        1,
+        "the halt re-emits exactly once per open: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_route_stamp_triggers_backfill_repair_after_restart() {
+    const ROTATED: [u8; 32] = [0x42; 32];
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_routed_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial, true).await;
+    rotate_route(&mut initial, &group_id, ROTATED).await;
+    drop(initial);
+
+    // Simulate a crash between the rotation commit apply and the post-commit
+    // route refresh: the current route's row is missing, and the surviving
+    // prior row's epoch stamp lags the record epoch.
+    storage.delete_transport_group_route(&ROTATED).unwrap();
+
+    let mut reopened = build_routed_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("cheap pass");
+
+    // The stale stamp must schedule backfill: a message on the CURRENT route
+    // resolves through the bounded probe, hydrates the group, and repairs
+    // the durable row. (Trusting any surviving row would send this message
+    // down the UnknownGroup path instead.)
+    let _ = reopened.ingest(inbound(ROTATED, b"post-rotation")).await;
+    assert!(
+        reopened.unhydrated_group_ids().is_empty(),
+        "current-route traffic must resolve and hydrate after the crash window"
+    );
+    assert!(reopened.members(&group_id).is_ok());
+    assert!(
+        route_pairs(&storage).contains(&(ROTATED.to_vec(), group_id.clone())),
+        "the backfill must repair the current route row"
+    );
+}
+
+#[tokio::test]
+async fn rotated_route_is_retired_once_retention_window_passes() {
+    const ROTATED: [u8; 32] = [0x42; 32];
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut engine = build_routed_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut engine, true).await;
+    rotate_route(&mut engine, &group_id, ROTATED).await;
+
+    // Both routes coexist through the overlap window right after rotation.
+    assert_eq!(
+        route_pairs(&storage),
+        vec![
+            (ROUTE_BYTES.to_vec(), group_id.clone()),
+            (ROTATED.to_vec(), group_id.clone()),
+        ]
+    );
+
+    // Advance the tip past the retained-history window (pinned v1
+    // max_rewind_commits = 5); each commit apply refreshes the current
+    // route's stamp and retires rows the window moved past.
+    for step in 0..7 {
+        rename_group(&mut engine, &group_id, &format!("rename {step}")).await;
+    }
+    assert_eq!(
+        route_pairs(&storage),
+        vec![(ROTATED.to_vec(), group_id.clone())],
+        "the pre-rotation route must be retired once no retained epoch uses it"
+    );
+    drop(engine);
+
+    // Restart: the surviving current route seeds the index and is trusted
+    // (stamp matches the record epoch), so current traffic resolves without
+    // any backfill probing.
+    let mut reopened = build_routed_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("cheap pass");
+    let _ = reopened.ingest(inbound(ROTATED, b"post-retirement")).await;
+    assert!(reopened.unhydrated_group_ids().is_empty());
     assert!(reopened.members(&group_id).is_ok());
 }

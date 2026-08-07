@@ -375,9 +375,15 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
   seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
   the epoch entry — a quarantined group must never hold one). `hydrate_all_stored_groups` is the eager compatibility
-  path (seed + drain-all) used by `AccountDeviceSession::open` until the app-layer background pipeline lands. Groups
-  without a durable route row sit in `route_backfill_pending`; ingest backfills each with one MLS load ever
-  (amortized preservation of the mdk#740 attacker-paced-scan bound).
+  path (seed + drain-all) used by `AccountDeviceSession::open` until the app-layer background pipeline lands, and it
+  drains every seeded group — including unrecoverable ones, whose halt re-emits from full hydration exactly once per
+  open. Durable route rows carry a `source_epoch` stamp refreshed at every commit apply: the seed trusts a group's
+  route set only when a stamp matches the record epoch (a lagging stamp means a crash or write failure between the
+  commit and the route refresh), and stale/route-less groups sit in `route_backfill_pending`. Ingest probes at most
+  `ROUTE_BACKFILL_PROBES_PER_MISS` pending groups per unknown route (bounded per event — mdk#408's O(groups)
+  amplification stays closed), removing an id only on successful indexing or the terminal no-routing-component
+  disposition; MLS-load failures stay owned by hydration/quarantine. Route refreshes also retire durable rows the
+  retained-history window (pinned v1 `max_rewind_commits`) has moved past, per routing-v1's overlap rule.
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the
