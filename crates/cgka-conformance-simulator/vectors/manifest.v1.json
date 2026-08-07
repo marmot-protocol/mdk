@@ -368,6 +368,58 @@
         "duplicate relay rejection"
       ],
       "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
+    },
+    {
+      "id": "conversation/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "conversation.v1.json",
+      "coverage": [
+        "multi-round turn-taking application traffic",
+        "exact per-client transcript completeness",
+        "no duplicate delivery across rounds",
+        "cross-client convergence with no pending work"
+      ],
+      "next": "Extend rounds or member count if turn-taking regressions appear."
+    },
+    {
+      "id": "latecomer-forward-secrecy/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "latecomer-forward-secrecy.v1.json",
+      "coverage": [
+        "mid-conversation invite",
+        "forward secrecy: latecomer never observes pre-join plaintext",
+        "pre-join ciphertext retained as deferred transport input",
+        "post-join transcript completeness for all members"
+      ],
+      "next": "Add a multi-epoch pre-join history variant once deferred-input expiry is modeled."
+    },
+    {
+      "id": "leaver-removal-secrecy/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "leaver-removal-secrecy.v1.json",
+      "coverage": [
+        "admin removal commit",
+        "post-removal secrecy: removed member receives and processes all post-removal ciphertext, decrypts none",
+        "self-leave witness commit",
+        "post-leave secrecy: departed member receives and processes all post-leave ciphertext, decrypts none"
+      ],
+      "next": "Add the removed-member re-add leg once welcome-after-eviction is supported by the engine harness."
+    },
+    {
+      "id": "incremental-growth/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "incremental-growth.v1.json",
+      "coverage": [
+        "one-member-at-a-time growth",
+        "group-data rename per growth phase",
+        "cohort-era forward secrecy: each joiner sees only its era onward",
+        "full-group convergence at final epoch"
+      ],
+      "next": "Scale the cohort schedule into a generated family for larger rosters."
     }
   ]
 }
