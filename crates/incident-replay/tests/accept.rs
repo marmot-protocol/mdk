@@ -1,8 +1,10 @@
 //! End-to-end accept path: a recovered metadata fork synthesizes a vector whose
 //! scenario the simulator reproduces — the designated winner's branch survives
-//! and the full `RecoverySummary` matches. `accept` returning `Ok` *is* that
-//! proof (it run-and-compares internally).
+//! and every expectation matches. `accept` returning `Ok` *is* that proof (it
+//! run-and-compares internally).
 
+use cgka_conformance_simulator::TraceExpectation;
+use incident_replay::synth::WINNER_BRANCH;
 use incident_replay::{accept, parse, recover_fork};
 
 const PURE_METADATA_FORK: &str = r#"{
@@ -33,8 +35,22 @@ fn metadata_fork_accepts_with_a_reproducible_vector() {
 
     assert_eq!(vector.scenario_name, "test-topic-fork/v1");
     assert_eq!(vector.scenario.clients.len(), 2);
-    // Three step-level resolution outcomes + RecoverySummary + ClientsConverged.
+    // Three step-level resolution outcomes + ConvergenceDecision + ClientsConverged.
     assert_eq!(vector.expected_outcomes.len(), 5);
+    // The winner check is not bespoke to this crate any more: it rides in the
+    // vector's own expectations, so replaying the persisted artifact in CI also
+    // rejects a run in which the loser's branch was the one that survived.
+    assert!(
+        vector.expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::ClientsConverged {
+                group_name: Some(name),
+                ..
+            } if name == WINNER_BRANCH
+        )),
+        "accepted vector must pin the winning branch: {:#?}",
+        vector.expected_outcomes
+    );
 }
 
 #[test]
@@ -46,6 +62,20 @@ fn membership_fork_accepts_with_a_reproducible_vector() {
     assert_eq!(vector.scenario_name, "test-membership-fork/v1");
     // Two committers race competing invites; the two invitees round it out.
     assert_eq!(vector.scenario.clients.len(), 4);
-    // Three step-level resolution outcomes + RecoverySummary + ClientsConverged(member_count 3).
+    // Three step-level resolution outcomes + ConvergenceDecision +
+    // ClientsConverged(member_count 3).
     assert_eq!(vector.expected_outcomes.len(), 5);
+    // Winner-agnostic by design: a real export cannot attribute the surviving
+    // membership branch, so this shape must not pin a group name.
+    assert!(
+        vector.expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::ClientsConverged {
+                group_name: None,
+                ..
+            }
+        )),
+        "membership fork must stay winner-agnostic: {:#?}",
+        vector.expected_outcomes
+    );
 }

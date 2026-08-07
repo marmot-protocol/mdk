@@ -119,7 +119,8 @@
         "alice"
       ],
       "epoch": 2,
-      "member_count": 2
+      "member_count": 2,
+      "group_name": "winner-branch"
     }
   ]
 }

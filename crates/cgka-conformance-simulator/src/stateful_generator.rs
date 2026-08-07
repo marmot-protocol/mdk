@@ -482,6 +482,9 @@ impl JourneyModel {
             clients: active.clone(),
             epoch: Some(self.epoch),
             member_count: Some(active.len()),
+            // The per-client `GroupProfile` expectations above already pin the
+            // exact name; repeating it here would assert nothing new.
+            group_name: None,
         });
         self.expected
             .push(TraceExpectation::ClientsExactlyEquivalent {

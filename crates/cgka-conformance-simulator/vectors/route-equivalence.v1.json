@@ -201,7 +201,8 @@
         "dave"
       ],
       "epoch": 2,
-      "member_count": 4
+      "member_count": 4,
+      "group_name": "bob branch"
     },
     {
       "type": "clients_exactly_equivalent",
