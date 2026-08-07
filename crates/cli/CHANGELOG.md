@@ -11,6 +11,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Account-open startup is now stage-attributed in app telemetry: engine
+  session open, stored-group hydration, the shared startup profile load, and
+  the group-read-snapshot capture each get fixed-bucket duration metrics, and
+  the account worker signals local readiness before capturing the startup
+  read snapshot. New `just bench-startup` scaling benchmarks separate
+  chat-projection readiness from full account-command readiness across
+  0/10/100/1000 stored groups.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`
