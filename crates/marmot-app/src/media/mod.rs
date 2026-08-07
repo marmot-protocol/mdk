@@ -217,13 +217,12 @@ pub async fn download_profile_image(url: String, max_bytes: u64) -> Result<Vec<u
 }
 
 #[cfg(test)]
-pub(crate) async fn download_profile_image_with_injected_addrs(
-    url: &str,
+pub(crate) async fn download_profile_image_with_test_loopback(
+    url: String,
     max_bytes: u64,
-    injected_addrs: Vec<std::net::SocketAddr>,
 ) -> Result<Vec<u8>, AppError> {
     let max_bytes = normalize_profile_image_max_bytes(max_bytes)?;
-    blossom::fetch_profile_image_with_injected_addrs(url, max_bytes, injected_addrs).await
+    blossom::fetch_profile_image_with_loopback(&url, max_bytes).await
 }
 
 #[cfg(test)]

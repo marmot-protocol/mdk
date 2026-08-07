@@ -1,22 +1,24 @@
 //! Profile-image dial-safe fetch acceptance tests (mdk#1287).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
-
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 use url::Url;
 
-use super::blossom::{
-    plan_profile_image_pin, profile_operation_timeout_for_test, read_limited_blossom_body,
+use super::blossom::{read_limited_blossom_body, vet_profile_fetch_resolved_addresses};
+use super::host_safety::{parse_profile_image_fetch_url, validate_profile_image_fetch_url};
+use super::tests::{
+    http_ok_response, http_redirect_response, spawn_http_response, spawn_http_responses,
 };
-use super::host_safety::validate_profile_image_fetch_url;
 use super::{
-    MAX_PROFILE_IMAGE_BYTES, download_profile_image, download_profile_image_with_injected_addrs,
+    MAX_PROFILE_IMAGE_BYTES, download_profile_image, download_profile_image_with_test_loopback,
     normalize_profile_image_max_bytes_for_test,
 };
+use crate::AppError;
 
-fn public_socket_addr(byte: u8) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, byte)), 443)
+fn localhost_url(raw: &str) -> String {
+    let mut url = Url::parse(raw).expect("test listener URL");
+    url.set_host(Some("localhost"))
+        .expect("replace loopback literal with localhost");
+    url.into()
 }
 
 #[tokio::test]
@@ -25,8 +27,8 @@ async fn download_profile_image_rejects_loopback_literal_before_network() {
         .await
         .expect_err("loopback profile URL must not be dialed");
     assert!(
-        err.to_string().contains("localhost") || err.to_string().contains("public unicast"),
-        "expected pre-dial rejection, got {err}"
+        matches!(err, AppError::UnsafeMediaFetch(_)),
+        "expected pre-dial safety rejection, got {err}"
     );
 }
 
@@ -79,6 +81,19 @@ fn profile_image_fetch_url_length_boundary_and_over_limit() {
         "a".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN - prefix.len() + 1)
     );
     let err = validate_profile_image_fetch_url(&Url::parse(&over).unwrap()).unwrap_err();
+    assert!(err.contains("exceeds"));
+}
+
+#[test]
+fn profile_image_raw_url_length_checked_before_parse_normalization() {
+    let prefix = "https://media.example/";
+    let padding = ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN - prefix.len() + 64;
+    let raw = format!("{prefix}{}/avatar.png", "../".repeat(padding));
+    assert!(raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
+    let normalized = Url::parse(&raw).expect("url must parse");
+    assert!(normalized.as_str().len() <= ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
+
+    let err = parse_profile_image_fetch_url(&raw).unwrap_err();
     assert!(err.contains("exceeds"));
 }
 
@@ -154,60 +169,82 @@ fn profile_image_max_bytes_zero_ceiling_and_exact_ceiling() {
     );
 }
 
+#[test]
+fn profile_image_vet_resolved_addresses_rejects_private_before_dial() {
+    let err = vet_profile_fetch_resolved_addresses(&[
+        std::net::SocketAddr::from(([93, 184, 216, 34], 443)),
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+    ])
+    .expect_err("one unsafe answer must reject the whole DNS result");
+    assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
+}
+
 #[tokio::test]
-async fn download_profile_image_rejects_injected_private_resolve_before_dial() {
-    let err = download_profile_image_with_injected_addrs(
-        "https://profile.example/avatar.png",
-        1024,
-        vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)],
-    )
-    .await
-    .expect_err("private injected resolve");
-    assert!(err.to_string().contains("public unicast"));
+async fn download_profile_image_follows_redirect_to_local_listener() {
+    let final_server = localhost_url(&spawn_http_response(http_ok_response(b"avatar-bytes")));
+    let final_url = format!("{final_server}/avatar.png");
+    let redirecting_server =
+        localhost_url(&spawn_http_response(http_redirect_response(&final_url)));
+    let url = format!("{redirecting_server}/start.png");
+
+    let bytes = download_profile_image_with_test_loopback(url, 1024)
+        .await
+        .expect("profile fetch should follow one redirect to the final body");
+
+    assert_eq!(bytes, b"avatar-bytes");
 }
 
-#[test]
-fn profile_image_pin_plan_rejects_private_injected_addresses_before_dial() {
-    let url = Url::parse("https://profile.example/avatar.png").unwrap();
-    let public = public_socket_addr(34);
-    let err = plan_profile_image_pin(
-        &url,
-        &[
-            public,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
-        ],
-    )
-    .expect_err("mixed public/private inject");
-    assert!(err.to_string().contains("public unicast"));
-}
+#[tokio::test]
+async fn download_profile_image_rejects_redirect_chain_over_limit() {
+    let responses = (0..6)
+        .map(|idx| http_redirect_response(&format!("/hop-{idx}/avatar.png")))
+        .collect::<Vec<_>>();
+    let server = localhost_url(&spawn_http_responses(responses));
+    let url = format!("{server}/start.png");
 
-#[test]
-fn profile_image_pin_plan_returns_exact_vetted_set_for_one_hop() {
-    let url = Url::parse("https://profile.example/avatar.png").unwrap();
-    let first = vec![public_socket_addr(34), public_socket_addr(35)];
-    let (domain, pinned) = plan_profile_image_pin(&url, &first)
-        .expect("pin plan")
-        .expect("domain pin");
-    assert_eq!(domain, "profile.example");
-    assert_eq!(pinned, first);
+    let err = download_profile_image_with_test_loopback(url, 1024)
+        .await
+        .expect_err("six redirects must exceed the hop cap");
 
-    let rebound = vec![public_socket_addr(36)];
-    let (_, second_pin) = plan_profile_image_pin(&url, &rebound)
-        .expect("second plan")
-        .expect("second pin");
-    assert_eq!(second_pin, rebound);
-    assert_ne!(
-        pinned, second_pin,
-        "rebound answers must not merge across plans"
+    assert!(
+        err.to_string().contains("exceeded 5 hops"),
+        "expected hop-limit error, got {err}"
     );
 }
 
 #[tokio::test]
-async fn profile_image_operation_deadline_covers_the_whole_future() {
-    let err = profile_operation_timeout_for_test(Duration::from_millis(1))
+async fn download_profile_image_classifies_unsafe_redirect_before_dial() {
+    let redirecting_server = localhost_url(&spawn_http_response(http_redirect_response(
+        "https://127.0.0.1/avatar.png",
+    )));
+    let url = format!("{redirecting_server}/start.png");
+
+    let err = download_profile_image_with_test_loopback(url, 1024)
         .await
-        .expect_err("pending operation must hit the overall deadline");
-    assert!(err.to_string().contains("timed out"));
+        .expect_err("unsafe redirect target must be rejected before its dial");
+
+    assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
+}
+
+#[tokio::test]
+async fn download_profile_image_bounds_raw_redirect_before_normalization() {
+    let raw_location = format!(
+        "/{}/avatar.png",
+        "../".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN)
+    );
+    assert!(raw_location.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
+
+    let server = localhost_url(&spawn_http_responses(vec![
+        http_redirect_response(&raw_location),
+        http_ok_response(b"must-not-be-fetched"),
+    ]));
+    let url = format!("{server}/start.png");
+
+    let err = download_profile_image_with_test_loopback(url, 1024)
+        .await
+        .expect_err("raw redirect target must be bounded before URL normalization");
+
+    assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
 #[tokio::test]
@@ -247,10 +284,28 @@ async fn profile_image_shared_reader_bounds_content_length_and_chunked_to_caller
     );
 }
 
-fn spawn_http_response(response: Vec<u8>) -> String {
-    super::tests::spawn_http_response(response)
+#[tokio::test]
+async fn unsafe_profile_url_maps_to_unsafe_media_fetch_not_blob_store() {
+    let err = download_profile_image("https://127.0.0.1/avatar.png".into(), 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
-fn http_ok_response(body: &[u8]) -> Vec<u8> {
-    super::tests::http_ok_response(body)
+#[tokio::test]
+async fn dns_operational_failure_stays_blob_store_for_retryable_runtime() {
+    let err = download_profile_image(
+        "https://this-host-should-not-resolve.invalid.test/avatar.png".into(),
+        1024,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::BlobStore(_)),
+        "DNS failure should remain operational, got {err}"
+    );
+    assert!(
+        err.to_string().contains("DNS lookup failed"),
+        "unexpected message: {err}"
+    );
 }

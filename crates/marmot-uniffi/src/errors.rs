@@ -225,6 +225,7 @@ impl From<AppError> for MarmotKitError {
             // errors; map them to the typed variant so send/upload/download
             // agree with build/parse even when a call site uses `?`/`From`.
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
+            AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference { details },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
@@ -451,6 +452,13 @@ mod tests {
             matches!(ffi, MarmotKitError::Runtime { .. }),
             "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn unsafe_media_fetch_crosses_ffi_as_typed_media_reference() {
+        let app_err = AppError::UnsafeMediaFetch("unsafe profile image URL".into());
+        let ffi: MarmotKitError = app_err.into();
+        assert!(matches!(ffi, MarmotKitError::InvalidMediaReference { .. }));
     }
 
     #[test]
