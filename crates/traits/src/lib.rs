@@ -94,7 +94,10 @@ pub use maintenance::{
     SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
     TransportFanoutTarget, WallClock,
 };
-pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
+pub use message::{
+    MessageRecord, MessageState, OwnApplicationConvergenceStamp, OwnCommitConvergenceStamp,
+    StoredMessagePayload,
+};
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
     CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,

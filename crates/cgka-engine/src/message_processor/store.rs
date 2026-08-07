@@ -7,7 +7,8 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome, InputRejectionCategory};
 use cgka_traits::message::{
-    DeferredPeelLifecycle, MessageRecord, MessageState, StoredMessagePayload,
+    DeferredPeelLifecycle, MessageRecord, MessageState, OwnApplicationConvergenceStamp,
+    StoredMessagePayload,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -179,6 +180,36 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
+        self.record_sent_openmls_message_with_application_stamp(
+            msg, mls_bytes, group_id, epoch, None,
+        )
+    }
+
+    pub(crate) fn record_sent_openmls_application_message(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        stamp: OwnApplicationConvergenceStamp,
+    ) -> Result<(), EngineError> {
+        self.record_sent_openmls_message_with_application_stamp(
+            msg,
+            mls_bytes,
+            group_id,
+            epoch,
+            Some(stamp),
+        )
+    }
+
+    fn record_sent_openmls_message_with_application_stamp(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        application_stamp: Option<OwnApplicationConvergenceStamp>,
+    ) -> Result<(), EngineError> {
         // Also remember and persist the content-derived id so our own commit /
         // app message echoed back inside a freshly re-wrapped transport envelope
         // (different transport id) is still classified `OwnEcho` by the
@@ -190,12 +221,20 @@ impl<S: StorageProvider> Engine<S> {
             ..msg.clone()
         };
         self.storage.with_transaction(|_storage| {
-            self.persist_signed_openmls_wire_message(
-                msg,
-                &openmls_msg,
+            let payload = match application_stamp {
+                Some(stamp) => StoredMessagePayload::signed_openmls_application_wire(
+                    msg.clone(),
+                    openmls_msg.clone(),
+                    stamp,
+                ),
+                None => StoredMessagePayload::signed_openmls_wire(msg.clone(), openmls_msg.clone()),
+            };
+            self.persist_stored_message_payload(
+                msg.id.clone(),
                 group_id,
                 epoch,
                 MessageState::Sent,
+                payload,
             )?;
             self.persist_sent_openmls_content_marker(
                 &openmls_msg,
@@ -341,26 +380,6 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
-        )
-    }
-
-    pub(crate) fn persist_signed_openmls_wire_message(
-        &self,
-        exact_message: &TransportMessage,
-        openmls_message: &TransportMessage,
-        group_id: &GroupId,
-        epoch: EpochId,
-        state: MessageState,
-    ) -> Result<(), EngineError> {
-        self.persist_stored_message_payload(
-            exact_message.id.clone(),
-            group_id,
-            epoch,
-            state,
-            StoredMessagePayload::signed_openmls_wire(
-                exact_message.clone(),
-                openmls_message.clone(),
-            ),
         )
     }
 

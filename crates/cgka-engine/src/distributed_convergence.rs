@@ -35,7 +35,8 @@ use crate::engine::Engine;
 use crate::openmls_projection::{
     OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
     StoredCanonicalizationOptions, apply_openmls_canonicalization_result_with_profile_policy,
-    canonicalize_stored_openmls_messages_with_profile_policy, project_mls_message,
+    canonicalize_stored_openmls_messages_with_profile_policy,
+    openmls_canonicalization_dispositions, project_mls_message,
     retain_current_group_epoch_snapshot, retire_stale_convergence_deferred_commits,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1331,6 +1332,24 @@ impl<S: StorageProvider> Engine<S> {
         let mut completed_pass = pass.clone();
         completed_pass.phase = ConvergencePassPhase::Completed;
         completed_pass.fairness_slot_available = true;
+        // The disposition writes are part of the atomic convergence apply.
+        // Snapshot their prior values first, then emit forensic transitions
+        // only after that transaction commits so Goggles never observes a
+        // state change that rolled back.
+        let disposition_transitions = if self.recorder.is_enabled() {
+            openmls_canonicalization_dispositions(&result)?
+                .into_iter()
+                .map(|disposition| {
+                    let record = self
+                        .storage
+                        .get_message(&disposition.message_id)
+                        .map_err(storage_projection_error)?;
+                    Ok((disposition, record.state, record.epoch))
+                })
+                .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?
+        } else {
+            Vec::new()
+        };
         let observations = self.storage.with_transaction(|storage| {
             let observations = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
@@ -1342,6 +1361,21 @@ impl<S: StorageProvider> Engine<S> {
             storage.put_convergence_pass(&completed_pass)?;
             Ok::<_, OpenMlsProjectionError>(observations)
         })?;
+        for (disposition, previous_state, epoch) in disposition_transitions {
+            if previous_state == disposition.state {
+                continue;
+            }
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(disposition.message_id.as_slice()),
+                    Some(previous_state),
+                    disposition.state,
+                    Some(epoch),
+                    disposition.reason,
+                ),
+            );
+        }
         crate::test_crash_hooks::pause_if_requested("convergence-pass-completed-durable");
         // Diagnostic only: settling-latency telemetry for the remediation
         // plan — pass open → apply, and the gap since the previous completed

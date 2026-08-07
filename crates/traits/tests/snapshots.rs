@@ -336,6 +336,52 @@ fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
 }
 
 #[test]
+fn stored_signed_application_payload_round_trips_and_old_rows_default_to_unstamped() {
+    use cgka_traits::message::OwnApplicationConvergenceStamp;
+
+    let exact = TransportMessage {
+        id: mid(),
+        payload: vec![0x01, 0x02],
+        timestamp: Timestamp(1717171717),
+        causal_deps: vec![],
+        source: TransportSource("nostr".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xCC; 4],
+        },
+    };
+    let openmls = TransportMessage {
+        payload: vec![0xAB, 0xCD],
+        ..exact.clone()
+    };
+    let stamp = OwnApplicationConvergenceStamp {
+        sender: MemberId::new(vec![0xEE; 32]),
+        source_epoch_authenticator: "ab".repeat(32),
+    };
+    let payload = StoredMessagePayload::signed_openmls_application_wire(
+        exact.clone(),
+        openmls.clone(),
+        stamp.clone(),
+    );
+    let decoded = StoredMessagePayload::decode(&payload.encode().unwrap()).unwrap();
+    assert_eq!(decoded.as_exact_transport(), Some(&exact));
+    assert_eq!(decoded.as_openmls_wire(), Some(&openmls));
+    assert_eq!(decoded.own_application_stamp(), Some(&stamp));
+
+    // The new field is serde-defaulted and omitted when absent, so every
+    // pre-upgrade SignedOpenMlsWire row remains decodable.
+    let legacy_signed = StoredMessagePayload::signed_openmls_wire(exact, openmls);
+    let legacy_json = serde_json::to_value(&legacy_signed).unwrap();
+    assert!(
+        legacy_json["message"]
+            .get("own_application_stamp")
+            .is_none()
+    );
+    let decoded_legacy =
+        StoredMessagePayload::decode(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+    assert!(decoded_legacy.own_application_stamp().is_none());
+}
+
+#[test]
 fn stored_message_payload_decodes_legacy_transport_message_as_openmls_wire() {
     let legacy = TransportMessage {
         id: mid(),
