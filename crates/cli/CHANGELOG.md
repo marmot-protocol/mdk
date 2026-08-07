@@ -110,7 +110,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session
   before reopening, preventing two engines over one session database from
-  staging conflicting epoch work.
+  staging conflicting epoch work. Failed account reconcile now shuts down every
+  worker it spawned before returning, including workers still opening locally,
+  so a contended startup does not leave unrelated account session guards held.
 
 - Group state changes settle promptly again when messages are queued for
   sending: a queued ordinary message no longer delays the next convergence

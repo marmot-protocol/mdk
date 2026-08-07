@@ -1684,3 +1684,27 @@ async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
         .expect_err("create_identity must not accept import_nsec");
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
+
+#[tokio::test]
+async fn reconcile_failure_releases_spawned_worker_session_guards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("bob")
+        .expect("create bob");
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let alice_client = app.client("alice").await.expect("open alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let err = runtime
+        .reconcile_accounts()
+        .await
+        .expect_err("reconcile should fail while alice is busy");
+    assert!(matches!(err, AppError::AccountSessionBusy));
+    assert!(
+        !app.account_session_is_owned("bob").expect("resolve bob"),
+        "spawned workers must release session guards when reconcile fails"
+    );
+    drop(alice_client);
+}

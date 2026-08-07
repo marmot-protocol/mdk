@@ -3328,6 +3328,23 @@ impl AccountManager {
             .contains(account_id_hex)
     }
 
+    async fn shutdown_workers_for_account_ids(&self, account_ids: &[String]) {
+        let workers = {
+            let mut workers = self.workers.lock().await;
+            account_ids
+                .iter()
+                .filter_map(|account_id| workers.remove(account_id))
+                .collect::<Vec<_>>()
+        };
+        let mut shutdowns = JoinSet::new();
+        for worker in workers {
+            shutdowns.spawn(async move {
+                worker.shutdown().await;
+            });
+        }
+        while shutdowns.join_next().await.is_some() {}
+    }
+
     pub fn managed_accounts(&self) -> Result<Vec<ManagedAccount>, AppError> {
         let running = self
             .workers
@@ -3570,6 +3587,7 @@ impl AccountManager {
                 .collect::<Vec<_>>();
 
             let mut ready_receivers = Vec::new();
+            let mut spawned_account_ids = Vec::new();
             {
                 let mut workers = self.workers.lock().await;
                 for account in pending {
@@ -3578,6 +3596,7 @@ impl AccountManager {
                     {
                         continue;
                     }
+                    spawned_account_ids.push(account.account_id_hex.clone());
                     let (ready_tx, ready_rx) = oneshot::channel();
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
@@ -3615,9 +3634,16 @@ impl AccountManager {
                 });
             }
             while let Some(joined) = ready_waits.join_next().await {
-                let (account_open_elapsed, ready_result) = joined.map_err(|err| {
-                    AppError::BlockingTask(format!("account worker readiness wait failed: {err}"))
-                })?;
+                let (account_open_elapsed, ready_result) = match joined {
+                    Ok(joined) => joined,
+                    Err(err) => {
+                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
+                            .await;
+                        return Err(AppError::BlockingTask(format!(
+                            "account worker readiness wait failed: {err}"
+                        )));
+                    }
+                };
                 self.shared.app_performance_telemetry().record(
                     AppPerformanceOperation::AccountOpen,
                     account_open_elapsed,
@@ -3625,9 +3651,19 @@ impl AccountManager {
                 );
                 match ready_result {
                     Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(error))) => return Err(error),
-                    Ok(Err(_closed)) => return Err(AppError::TransportClosed),
+                    Ok(Ok(Err(error))) => {
+                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
+                            .await;
+                        return Err(error);
+                    }
+                    Ok(Err(_closed)) => {
+                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
+                            .await;
+                        return Err(AppError::TransportClosed);
+                    }
                     Err(_elapsed) => {
+                        self.shutdown_workers_for_account_ids(&spawned_account_ids)
+                            .await;
                         return Err(AppError::BlockingTask(
                             "account worker startup timed out".into(),
                         ));

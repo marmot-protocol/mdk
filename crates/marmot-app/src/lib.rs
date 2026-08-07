@@ -1264,6 +1264,16 @@ impl MarmotApp {
             .contains_key(label)
     }
 
+    #[cfg(test)]
+    pub(crate) fn account_session_is_owned(&self, label: &str) -> Result<bool, AppError> {
+        let label = self.account_home().account(label)?.label;
+        Ok(self
+            .account_session_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&label))
+    }
+
     /// Open the account's exclusive in-memory engine session.
     ///
     /// Only one [`AppClient`] for an account may exist within a [`MarmotApp`]

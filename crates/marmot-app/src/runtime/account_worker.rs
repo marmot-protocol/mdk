@@ -411,8 +411,11 @@ async fn run_app_runtime_account_worker(
         shared,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+    let mut open_client =
+        std::pin::pin!(app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(),));
     let mut client = match tokio::select! {
         _ = &mut shutdown => {
+            release_startup_client_if_opened(open_client.as_mut()).await;
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err(AppError::BlockingTask(
                     "runtime startup cancelled".into(),
@@ -421,6 +424,7 @@ async fn run_app_runtime_account_worker(
             return;
         }
         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+            release_startup_client_if_opened(open_client.as_mut()).await;
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err(AppError::BlockingTask(
                     "runtime startup cancelled".into(),
@@ -428,7 +432,7 @@ async fn run_app_runtime_account_worker(
             }
             return;
         }
-        result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+        result = open_client.as_mut() => result,
     } {
         Ok(client) => client,
         Err(err) => {
@@ -2432,6 +2436,16 @@ fn agent_stream_runtime_event(
 /// can embed relay URLs, which the privacy invariant forbids surfacing.
 fn account_error_message(prefix: &str, err: &AppError) -> String {
     format!("{prefix}: {}", err.privacy_safe_kind())
+}
+
+async fn release_startup_client_if_opened(
+    open_client: Pin<&mut impl std::future::Future<Output = Result<AppClient, AppError>>>,
+) {
+    // Let an in-flight local open finish so its AppClient (and session guard)
+    // destructors run before a replacement worker can contend on the same label.
+    if let Ok(client) = open_client.await {
+        drop(client);
+    }
 }
 
 fn publish_app_runtime_account_error(
