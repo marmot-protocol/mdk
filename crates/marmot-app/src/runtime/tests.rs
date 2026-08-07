@@ -1684,3 +1684,146 @@ async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
         .expect_err("create_identity must not accept import_nsec");
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
+
+fn install_local_open_gate(
+    app: &MarmotApp,
+    account_ref: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    app.install_local_open_gate(account_ref, reached_tx, proceed_rx)
+        .expect("install local-open gate");
+    (reached_rx, proceed_tx)
+}
+
+async fn wait_for_test_signal(receiver: std::sync::mpsc::Receiver<()>, signal: &'static str) {
+    tokio::task::spawn_blocking(move || {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|err| panic!("timed out waiting for {signal}: {err}"));
+    })
+    .await
+    .expect("test signal waiter");
+}
+
+async fn open_runtime_local_test_client(
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+) -> crate::AppClient {
+    let shared = runtime.shared_services();
+    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle())
+        .await
+        .expect("open local test client")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_failure_releases_spawned_worker_session_guards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("bob")
+        .expect("create bob");
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
+    let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
+    let (rollback_waiter, rollback_started) = std::sync::mpsc::channel();
+    runtime
+        .accounts()
+        .register_reconcile_rollback_waiter(rollback_waiter);
+
+    let reconcile_runtime = runtime.clone();
+    let reconcile = tokio::spawn(async move { reconcile_runtime.reconcile_accounts().await });
+    let ((), ()) = tokio::join!(
+        wait_for_test_signal(alice_reached, "alice open result"),
+        wait_for_test_signal(bob_reached, "bob open result"),
+    );
+
+    alice_proceed.send(()).expect("release alice open result");
+    wait_for_test_signal(rollback_started, "failed-reconcile rollback").await;
+    assert!(
+        !reconcile.is_finished(),
+        "rollback must wait for Bob's in-flight open to release its session guard"
+    );
+    bob_proceed.send(()).expect("release bob open result");
+
+    let err = reconcile
+        .await
+        .expect("reconcile task")
+        .expect_err("reconcile should fail while alice is busy");
+    assert!(matches!(err, AppError::AccountSessionBusy));
+    drop(open_runtime_local_test_client(&app, &runtime, "bob").await);
+    drop(alice_client);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("bob")
+        .expect("create bob");
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice_client = open_runtime_local_test_client(&app, &runtime, "alice").await;
+    let (alice_reached, alice_proceed) = install_local_open_gate(&app, "alice");
+    let (bob_reached, bob_proceed) = install_local_open_gate(&app, "bob");
+
+    let accounts_a = runtime.accounts();
+    let reconcile_a = tokio::spawn(async move { accounts_a.reconcile().await });
+    let ((), ()) = tokio::join!(
+        wait_for_test_signal(alice_reached, "alice open result"),
+        wait_for_test_signal(bob_reached, "bob open result"),
+    );
+
+    let accounts_b = runtime.accounts();
+    let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
+    let reconcile_b = tokio::spawn(async move {
+        b_started_tx.send(()).expect("signal reconcile B start");
+        accounts_b.reconcile().await
+    });
+    wait_for_test_signal(b_started_rx, "reconcile B start").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !reconcile_b.is_finished(),
+        "reconcile B must not return while reconcile A can still roll back its workers"
+    );
+
+    // Alice's failed open result is already captured behind its gate. Releasing
+    // the one-shot owner now lets B open Alice after A finishes rolling back.
+    drop(alice_client);
+    alice_proceed.send(()).expect("release alice open result");
+    bob_proceed.send(()).expect("release bob open result");
+
+    let err_a = reconcile_a
+        .await
+        .expect("reconcile A task")
+        .expect_err("reconcile A should preserve Alice's captured busy error");
+    assert!(matches!(err_a, AppError::AccountSessionBusy));
+    reconcile_b
+        .await
+        .expect("reconcile B task")
+        .expect("reconcile B should install fresh workers after A rolls back");
+
+    let managed = runtime
+        .accounts()
+        .managed_accounts()
+        .expect("managed accounts");
+    let tested = managed
+        .iter()
+        .filter(|account| account.label == "alice" || account.label == "bob")
+        .collect::<Vec<_>>();
+    assert_eq!(tested.len(), 2, "both test accounts must remain managed");
+    assert!(
+        tested.iter().all(|account| account.running),
+        "successful reconcile B must retain both running workers"
+    );
+    runtime.shutdown().await;
+}
