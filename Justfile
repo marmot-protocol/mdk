@@ -313,9 +313,13 @@ convergence-verification-ci:
 convergence-lane-policy:
     cargo nextest run -p convergence-campaign-runner --test lane_policy --locked
 
+convergence-failure-corpus:
+    cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
+    cargo nextest run -p cgka-conformance-simulator --test semantic_reduction --locked
+
 # Capability-level entry points used by the scheduled workflows. PR checks
 # remain split into separately named steps for useful failure attribution.
-convergence-nightly-lane: convergence-lane-policy simulator-full adversarial-reliability-ci convergence-verification-ci
+convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus simulator-full adversarial-reliability-ci convergence-verification-ci
     cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked
     cargo nextest run -p convergence-campaign-runner --locked
 

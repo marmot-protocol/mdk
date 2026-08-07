@@ -130,8 +130,9 @@ The four lanes are:
   build ids and, for containers, at least two effective participant images.
 
 The source revision must already have passed the mandatory PR formal gate; scheduled workflows do not repeat the same
-state-independent proof. Incident-corpus coverage is deliberately false in these manifests until the failure-corpus
-slice lands.
+state-independent proof. The failure-corpus lifecycle validation recipe is a dependency of every lane in this slice;
+it validates indexing, classification, reduction, and promotion mechanics but does not execute an incident corpus.
+Accordingly, `incident_corpus` is false until a lane has a real, reviewed incident-derived input set and runner.
 
 Every lane defines maximum wall time, CPU time, peak RSS, disk use, artifact bytes, artifact retention, flake retries,
 and flake rate. `cgka-distributed-campaign check-budget` consumes an observed-usage JSON document and exits nonzero if
@@ -147,6 +148,29 @@ surfaces, a passing same-lane budget evaluation, and at least one digest-pinned 
 the evaluation from the recorded observation and reviewed lane policy instead of trusting producer-supplied result
 fields. It rejects incomplete bundles, parent-traversing artifact paths, missing files, and SHA-256 mismatches by
 resolving artifacts relative to the bundle's directory. Valid bundles are written with owner-only permissions.
+
+## Failure corpus lifecycle
+
+Generated simulator failures already write a portable capsule, a minimized Scenario IR reproducer, and—when enabled—a
+sensitive byte-replay capsule. Distributed execution now also appends a message-free record to a private version-1
+corpus whenever a run fails. Simulator capsules and process-node capsules can be indexed with their pinned scenario;
+the corpus groups them by semantic fingerprint, counts recurrence across adapters/build matrices, retains seeds and
+capsule paths, and records the best time-to-diagnosis plus digest-pinned promoted-vector provenance.
+
+Every entry has exactly one reviewable classification: product defect, protocol ambiguity, environment failure, or
+expected resource refusal. Environment failures are recognized conservatively. Resource and protocol failures remain
+product defects until an operator explicitly establishes that a refusal was expected or that the protocol is
+ambiguous; the tooling does not turn an unexpected failure into an expected outcome automatically.
+
+Scenario minimization first removes semantic dependency units—partition/heal, offline/reconnect, crash/restart,
+storage-fault/clear, and withhold/release pairs—then removes independent transport noise while requiring the same
+semantic failure identity. Non-layer-specific VM, container, process, and app-runtime failures emit a candidate for the
+next smaller adapter. The candidate carries the minimized canonical scenario and failure identity, so the smaller
+adapter must reproduce the same failure before the layer is removed from the diagnosis.
+
+Only validated synthetic-shareable capsules with portable expectations may be promoted into fixed vector candidates.
+The promotion command writes the candidate before recording its path, SHA-256 digest, and source-capsule path/digest
+in the corpus. The diagnosis command cannot assert promotion. Sensitive capsules remain local and are never eligible.
 
 ## What this evidence means
 

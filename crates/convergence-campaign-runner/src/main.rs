@@ -1,12 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 use convergence_campaign_runner::{
-    CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1, ConvergenceEvidenceBundleV1,
-    DistributedBackendV1, INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan,
-    evidence_bundle_base_dir, load_manifest, run_manifest, validate_scenario_bytes,
-    verify_manifest_inputs,
+    CampaignAdapterV1, CampaignLaneConfigV1, CampaignLaneObservationV1, CampaignLaneV1,
+    ConvergenceEvidenceBundleV1, DistributedBackendV1, FailureClassificationV1,
+    INFRASTRUCTURE_COMMAND_TIMEOUT, build_execution_plan, evidence_bundle_base_dir, load_manifest,
+    observation_from_capsule, promote_capsule_into_corpus, run_manifest, update_failure_corpus,
+    validate_scenario_bytes, verify_manifest_inputs,
 };
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -53,6 +55,41 @@ enum Commands {
     },
     /// Validate that an evidence bundle contains every required assurance section.
     CheckEvidence { bundle: PathBuf },
+    /// Add an automatically written simulator capsule to the durable failure corpus.
+    IndexCapsule {
+        corpus: PathBuf,
+        capsule: PathBuf,
+        adapter: String,
+        build_id: String,
+    },
+    /// Index a process-node capsule together with its pinned canonical scenario.
+    IndexNodeCapsule {
+        corpus: PathBuf,
+        capsule: PathBuf,
+        scenario: PathBuf,
+        build_id: String,
+    },
+    /// Apply the reviewed four-way classification to a corpus entry.
+    ClassifyFailure {
+        corpus: PathBuf,
+        fingerprint: String,
+        classification: String,
+    },
+    /// Record time-to-diagnosis for a corpus entry.
+    DiagnoseFailure {
+        corpus: PathBuf,
+        fingerprint: String,
+        elapsed_seconds: u64,
+    },
+    /// Turn a stable synthetic failure capsule into a fixed vector candidate.
+    PromoteCapsule {
+        corpus: PathBuf,
+        fingerprint: String,
+        capsule: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        generator_version: String,
+    },
 }
 
 #[tokio::main]
@@ -165,6 +202,83 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_slice(&std::fs::read(&bundle_path)?)?;
             bundle.validate_artifacts(base_dir)?;
             println!("valid-evidence {}", bundle.source_revision);
+        }
+        Commands::IndexCapsule {
+            corpus,
+            capsule,
+            adapter,
+            build_id,
+        } => {
+            let failure = cgka_conformance_simulator::read_failure_capsule(&capsule)?;
+            let observation = observation_from_capsule(
+                &failure,
+                capsule,
+                adapter.parse::<CampaignAdapterV1>()?,
+                BTreeMap::from([("indexed_build".into(), build_id)]),
+            );
+            let fingerprint = observation.fingerprint.clone();
+            update_failure_corpus(&corpus, |index| index.record(observation))?;
+            println!("indexed-failure {fingerprint}");
+        }
+        Commands::IndexNodeCapsule {
+            corpus,
+            capsule,
+            scenario,
+            build_id,
+        } => {
+            use sha2::Digest;
+
+            let node_capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
+                serde_json::from_slice(&std::fs::read(&capsule)?)?;
+            let scenario_bytes = std::fs::read(scenario)?;
+            let scenario = serde_json::from_slice(&scenario_bytes)?;
+            let observation = convergence_campaign_runner::observation_from_node_capsule(
+                &node_capsule,
+                capsule,
+                scenario,
+                &hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+                BTreeMap::from([("indexed_build".into(), build_id)]),
+            );
+            let fingerprint = observation.fingerprint.clone();
+            update_failure_corpus(&corpus, |index| index.record(observation))?;
+            println!("indexed-failure {fingerprint}");
+        }
+        Commands::ClassifyFailure {
+            corpus,
+            fingerprint,
+            classification,
+        } => {
+            let classification = classification.parse::<FailureClassificationV1>()?;
+            update_failure_corpus(&corpus, |index| {
+                index.reclassify(&fingerprint, classification)
+            })?;
+            println!("classified-failure {fingerprint}");
+        }
+        Commands::DiagnoseFailure {
+            corpus,
+            fingerprint,
+            elapsed_seconds,
+        } => {
+            update_failure_corpus(&corpus, |index| {
+                index.mark_diagnosed(&fingerprint, elapsed_seconds)
+            })?;
+            println!("diagnosed-failure {fingerprint}");
+        }
+        Commands::PromoteCapsule {
+            corpus,
+            fingerprint,
+            capsule,
+            output,
+            generator_version,
+        } => {
+            promote_capsule_into_corpus(
+                &corpus,
+                &fingerprint,
+                &capsule,
+                &output,
+                &generator_version,
+            )?;
+            println!("promoted-vector {}", output.display());
         }
     }
     Ok(())

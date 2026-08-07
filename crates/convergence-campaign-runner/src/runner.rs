@@ -18,7 +18,9 @@ use crate::plan::{
     DistributedExecutionPlanV1, NODE_RELAY_PROXY_LISTEN, PlannedCommandV1, PlannedFaultV1,
     build_execution_plan,
 };
-use crate::{RunnerError, container_node_launch, verify_manifest_inputs};
+use crate::{
+    RunnerError, container_node_launch, record_distributed_failure, verify_manifest_inputs,
+};
 
 pub const DISTRIBUTED_RUN_RECEIPT_VERSION: &str = "1";
 pub const INFRASTRUCTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
@@ -86,10 +88,30 @@ pub async fn run_manifest(
             .map_err(|error| RunnerError::environment("manifest_serialize", error))?,
     )
     .map_err(|error| RunnerError::environment("manifest_write", error))?;
-    match &manifest.backend {
+    let result = match &manifest.backend {
         DistributedBackendV1::Container(_) => run_container(manifest, &plan, &scenario).await,
         DistributedBackendV1::VirtualMachine(_) => run_vm(manifest, &plan).await,
+    };
+    match result {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let corpus_error = record_distributed_failure(manifest, &error, &scenario).err();
+            Err(with_secondary_corpus_error(error, corpus_error.as_ref()))
+        }
     }
+}
+
+fn with_secondary_corpus_error(
+    mut primary: RunnerError,
+    corpus_error: Option<&RunnerError>,
+) -> RunnerError {
+    if let Some(corpus_error) = corpus_error {
+        primary.message.push_str(&format!(
+            "; secondary failure corpus recording error: {}",
+            corpus_error.code
+        ));
+    }
+    primary
 }
 
 /// Parse the pinned canonical scenario and run all cross-manifest scheduling
@@ -840,6 +862,22 @@ mod tests {
             args,
             success_exit_codes: vec![0],
         }
+    }
+
+    #[test]
+    fn corpus_recording_failure_keeps_campaign_error_primary() {
+        let primary = RunnerError {
+            code: "command_timeout".into(),
+            message: "campaign timed out".into(),
+        };
+        let secondary = RunnerError {
+            code: "failure_corpus_write".into(),
+            message: "omitted".into(),
+        };
+        let combined = with_secondary_corpus_error(primary, Some(&secondary));
+        assert_eq!(combined.code, "command_timeout");
+        assert!(combined.message.contains("failure_corpus_write"));
+        assert!(!combined.message.contains("omitted"));
     }
 
     #[test]
