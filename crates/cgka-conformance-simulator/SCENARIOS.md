@@ -157,6 +157,50 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: Bob's message is delayed, Alice restarts, and the released message is duplicated and reordered.
 - Expected: Alice hydrates the stable group after restart and receives Bob's payload once.
 
+### `conversation/v1`
+
+- File: `vectors/conversation.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`conversation.rb`).
+- Setup: Alice creates a group with Bob and Carol. Three round-robin rounds where every member sends one message per
+  round.
+- Pressure: none beyond sustained turn-taking traffic. This is the transcript-completeness smoke path.
+- Expected: every client holds the exact six-payload transcript of the other members with no duplicates, all clients
+  converge at epoch 1 with three members, and no pending work remains.
+
+### `latecomer-forward-secrecy/v1`
+
+- File: `vectors/latecomer-forward-secrecy.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`latecomer.rb`).
+- Setup: Alice and Bob chat two pre-join rounds, then Alice invites Carol mid-conversation, then all three chat two
+  post-join rounds. Pre-join ciphertext does reach Carol's mailbox.
+- Pressure: forward secrecy. Carol must decrypt nothing from before her join even though she holds the ciphertext.
+- Expected: originals hold pre+post transcripts; Carol's exact transcript contains only post-join payloads, and
+  `payload_count` assertions pin two pre-join payloads at zero for her. Carol legitimately retains one undecryptable
+  pre-join input as deferred transport work, so `no_pending_work` covers the original members only.
+
+### `leaver-removal-secrecy/v1`
+
+- File: `vectors/leaver-removal-secrecy.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`leaver.rb`), minus the re-add leg.
+- Setup: four members chat, Alice removes Dave (transport unsubscribes him, modeled as a partition), the remaining
+  members chat a gap phase, Carol self-leaves via the witness-commit path, and Alice and Bob chat a tail phase.
+- Pressure: post-removal and post-leave secrecy plus the admin-removal and self-leave commit paths.
+- Expected: Dave never observes gap plaintext and Carol never observes tail plaintext (`payload_count` zero
+  assertions); Alice and Bob hold the full transcript minus the departed members' silence and converge at epoch 3 with
+  two members and no pending work. The original harness scenario's re-add leg (removed member rejoins via a fresh KeyPackage) is
+  deliberately absent: welcome-after-eviction currently fails in the engine harness with
+  `GroupStateError(UseAfterEviction)` and is tracked as a coverage gap.
+
+### `incremental-growth/v1`
+
+- File: `vectors/incremental-growth.v1.json`
+- Provenance: ported from the external multi-VM harness scenario catalog (`build.rb` + `growth.rb`).
+- Setup: two founders chat, then Alice grows the group one member at a time (Carol, then Dave), renaming the group and
+  running a full message round after each add.
+- Pressure: staged growth with a commit per phase, and cohort-era forward secrecy across two join boundaries.
+- Expected: each member's exact transcript starts at their own join era (`payload_count` assertions pin earlier-era
+  payloads at zero for Carol and Dave), and all four clients converge at epoch 5 with four members.
+
 ## Incident-Replay Vectors
 
 These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
