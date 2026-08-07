@@ -82,6 +82,8 @@ mod migration_0040_disband_requests;
 mod migration_0041_secure_delete_checkpoint_intents;
 #[path = "migrations/0042_group_state_checkpoints.rs"]
 mod migration_0042_group_state_checkpoints;
+#[path = "migrations/0043_transport_group_routes.rs"]
+mod migration_0043_transport_group_routes;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -303,6 +305,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 42,
         name: "0042_group_state_checkpoints",
         apply: migration_0042_group_state_checkpoints::apply,
+    },
+    Migration {
+        version: 43,
+        name: "0043_transport_group_routes",
+        apply: migration_0043_transport_group_routes::apply,
     },
 ];
 

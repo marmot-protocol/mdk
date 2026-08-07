@@ -70,6 +70,35 @@ impl GroupStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()
     }
+
+    fn list_group_records(&self) -> StorageResult<Vec<Group>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT record FROM cgka_groups ORDER BY id")
+            .storage()?;
+        let records = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn put_transport_group_route(
+        &self,
+        transport_group_id: &[u8],
+        group_id: &GroupId,
+    ) -> StorageResult<()> {
+        super::transport_routes::put(self, transport_group_id, group_id)
+    }
+
+    fn list_transport_group_routes(&self) -> StorageResult<Vec<(Vec<u8>, GroupId)>> {
+        super::transport_routes::list(self)
+    }
+
+    fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
+        super::transport_routes::delete_for_group(self, group_id)
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +115,81 @@ mod tests {
     };
     use cgka_traits::types::EpochId;
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+    #[test]
+    fn list_group_records_returns_every_stored_record() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let first = sample_group(gid(1), 7, 3);
+        let second = sample_group(gid(2), 4, 2);
+        store.put_group(&first).unwrap();
+        store.put_group(&second).unwrap();
+        let records = store.list_group_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&first));
+        assert!(records.contains(&second));
+    }
+
+    #[test]
+    fn transport_group_routes_roundtrip_and_rotation_keeps_prior_route() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+
+        // Rotation overlap (mdk#740): both the prior and the current route
+        // resolve to the group until the prior route is retired.
+        store
+            .put_transport_group_route(&[0xAA; 32], &group.id)
+            .unwrap();
+        store
+            .put_transport_group_route(&[0xBB; 32], &group.id)
+            .unwrap();
+        let mut routes = store.list_transport_group_routes().unwrap();
+        routes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            routes,
+            vec![
+                (vec![0xAA; 32], group.id.clone()),
+                (vec![0xBB; 32], group.id.clone()),
+            ]
+        );
+
+        // Re-pointing an existing route replaces its target instead of
+        // erroring, matching the in-memory index's insert semantics.
+        let other = sample_group(gid(2), 1, 1);
+        store.put_group(&other).unwrap();
+        store
+            .put_transport_group_route(&[0xBB; 32], &other.id)
+            .unwrap();
+        let mut routes = store.list_transport_group_routes().unwrap();
+        routes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            routes,
+            vec![
+                (vec![0xAA; 32], group.id.clone()),
+                (vec![0xBB; 32], other.id.clone()),
+            ]
+        );
+
+        store
+            .delete_transport_group_routes_for_group(&group.id)
+            .unwrap();
+        assert_eq!(
+            store.list_transport_group_routes().unwrap(),
+            vec![(vec![0xBB; 32], other.id.clone())]
+        );
+    }
+
+    #[test]
+    fn deleting_a_group_cascades_its_transport_routes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        store
+            .put_transport_group_route(&[0xCC; 32], &group.id)
+            .unwrap();
+        store.delete_group(&group.id).unwrap();
+        assert!(store.list_transport_group_routes().unwrap().is_empty());
+    }
 
     #[test]
     fn group_roundtrip_preserves_every_field() {

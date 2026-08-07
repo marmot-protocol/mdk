@@ -85,6 +85,43 @@ pub trait GroupStorage {
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;
     fn list_groups(&self) -> StorageResult<Vec<GroupId>>;
+
+    /// Every stored group record in one pass. The engine's session-open seed
+    /// walks all records (mdk#1161); backends should override the default
+    /// `list_groups` + `get_group` loop with a single query.
+    fn list_group_records(&self) -> StorageResult<Vec<Group>> {
+        self.list_groups()?
+            .iter()
+            .map(|id| self.get_group(id))
+            .collect()
+    }
+
+    /// Durable transport-route index: opaque transport routing-id bytes to
+    /// MLS group id, many-to-one (a routing rotation retains the prior route
+    /// for its overlap window, mdk#740). Routes are a regenerable projection
+    /// of MLS state — the engine rebuilds a missing route from the loaded
+    /// group on demand — so the default implementations store nothing and
+    /// return nothing. Backends without an override are correct but pay a
+    /// per-group MLS load to re-derive routes on the first inbound lookup
+    /// after reopen. No transport *types* here: routes are bytes only
+    /// (`group.rs` invariants).
+    fn put_transport_group_route(
+        &self,
+        transport_group_id: &[u8],
+        group_id: &GroupId,
+    ) -> StorageResult<()> {
+        let _ = (transport_group_id, group_id);
+        Ok(())
+    }
+
+    fn list_transport_group_routes(&self) -> StorageResult<Vec<(Vec<u8>, GroupId)>> {
+        Ok(Vec::new())
+    }
+
+    fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
+        let _ = group_id;
+        Ok(())
+    }
 }
 
 // ── MessageStorage ──────────────────────────────────────────────────────────
