@@ -4811,6 +4811,27 @@ fn send_media_fingerprint_is_content_bound() {
         first,
         send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
     );
+    let ordered = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"one"), attachment(b"two")],
+    );
+    assert_ne!(
+        ordered,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"two"), attachment(b"one")],
+        ),
+        "attachment order must change the fingerprint"
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
+        "destination group must change the fingerprint"
+    );
 }
 
 #[tokio::test]
