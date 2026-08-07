@@ -232,6 +232,12 @@ shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct a
 schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
 without re-pinning vectors.
 
+The `bounded-convergence-pressure/v1` generated family is the finite-pressure acceptance campaign for the unified
+fork-resolution route: a same-epoch commit race, application sends issued inside the quiescence window, a committer
+restart taken mid-resolution, and a bounded self-update/profile/admin tail. It activates controlled virtual time before
+the race, so every later settle must be `AwaitQuiescence`; the driver's watchdog budget is the bounded-time assertion.
+The campaign is finite by construction and claims nothing about progress under unbounded self-updates.
+
 ## How to add a new scripted scenario
 
 1. Prefer a `ScenarioSpec` when the case should become portable or reportable.

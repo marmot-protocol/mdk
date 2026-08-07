@@ -93,9 +93,10 @@ pub use family::{
     GeneratedSubjectKind, generate_adversarial_reliability_case,
     generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
     generate_adversarial_reliability_self_update_regression,
-    generate_adversarial_reliability_sustained_regression, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family,
-    run_generated_case_report, run_generated_case_report_with_capture,
+    generate_adversarial_reliability_sustained_regression,
+    generate_bounded_convergence_pressure_case, generate_bounded_convergence_pressure_family,
+    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, run_generated_case_report, run_generated_case_report_with_capture,
     run_generated_case_report_with_capture_on_subject, run_generated_case_report_with_storage_mode,
     semantic_reduction_units,
 };

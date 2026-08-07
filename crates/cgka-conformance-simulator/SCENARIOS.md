@@ -491,6 +491,31 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Pressure: duplicate, delay, release, and reorder before observer clients tick.
 - Expected: observers converge on one selected branch and emit only the selected branch payload.
 
+### `bounded-convergence-pressure/v1`
+
+- Generator: `generate_bounded_convergence_pressure_family` (generator version `1`).
+- Setup: four clients, Alice and Bob admins. Both admins race same-epoch `update_group_data` commits and both confirm
+  publication; each rival commit is withheld, then released in a seed-derived order so every member ingests the fork.
+- Pressure: **finite** and deliberately so. One application send per client is issued after the rival branch is ingested
+  — inside the quiescence window the committers wait out — then one committer restarts mid-resolution and a further send
+  follows. The settled tail applies exactly three self-updates, one profile commit, and one admin-policy commit, ordered
+  by seed.
+- Time discipline: an explicit `advance_time` before the race activates controlled virtual time, so the quiescence
+  window is a real deadline rather than the far-future tick shortcut. Every settle from that point on is
+  `await_quiescence`; the bare ticks that remain deliberately wake participants *without* settling them.
+- Expected: eventual quiescence, exact canonical equivalence and no pending work across all four clients, the pinned
+  post-race group profile and admin set, and bidirectional decryptability. The decryptability probe runs before the
+  terminal `observe_exact` for the reason given in the `route-equivalence/v1` row. Bounded queue behavior is a
+  `scenario_inputs_pending` resource assertion at peak pressure; bounded time is the `await_quiescence` watchdog budget
+  itself, whose `TimedOut` status is a failure — no separate metric is invented.
+- Scope fence: the campaign claims eventual quiescence for **bounded** input only. It makes no progress claim under an
+  unbounded self-update stream (reliability plan PDR-2/L3), which is a deliberate non-guarantee.
+- Status: `bounded_convergence_pressure_family_generates_the_declared_campaign_shape` gates the generator in CI. The
+  runnable gate `bounded_convergence_pressure_family_settles_every_seeded_permutation` is `#[ignore]`d because it fails
+  on engine behavior, not on the campaign: an application message accepted while the group is resolving a same-epoch
+  fork is queued durably and then stranded, because nothing re-arms the retained-intent drain once the pass completes.
+  Do not weaken the assertions to make it pass.
+
 ### `convergence-chaos/v1`
 
 - Generator: `generate_convergence_chaos_family` (generator version `6`).
