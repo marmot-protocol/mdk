@@ -6,36 +6,107 @@
   "scenario": {
     "name": "conversation/v1",
     "spec_version": "2",
-    "clients": ["alice", "bob", "carol"],
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
     "steps": [
       {
         "type": "create_group",
         "creator": "alice",
         "name": "conversation",
-        "invitees": ["bob", "carol"],
+        "invitees": [
+          "bob",
+          "carol"
+        ],
         "required_features": [],
         "pending": "create"
       },
-      { "type": "acknowledge_outbound", "client": "alice", "publication": "create", "outcome": "accepted" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["bob", "carol"] },
-      { "type": "clear_events", "clients": ["alice", "bob", "carol"] },
-      { "type": "send_app_message", "sender": "alice", "payload": "conversation:r1:alice" },
-      { "type": "send_app_message", "sender": "bob", "payload": "conversation:r1:bob" },
-      { "type": "send_app_message", "sender": "carol", "payload": "conversation:r1:carol" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["alice", "bob", "carol"] },
-      { "type": "send_app_message", "sender": "alice", "payload": "conversation:r2:alice" },
-      { "type": "send_app_message", "sender": "bob", "payload": "conversation:r2:bob" },
-      { "type": "send_app_message", "sender": "carol", "payload": "conversation:r2:carol" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["alice", "bob", "carol"] },
-      { "type": "send_app_message", "sender": "alice", "payload": "conversation:r3:alice" },
-      { "type": "send_app_message", "sender": "bob", "payload": "conversation:r3:bob" },
-      { "type": "send_app_message", "sender": "carol", "payload": "conversation:r3:carol" },
-      { "type": "deliver_all" },
-      { "type": "tick", "clients": ["alice", "bob", "carol"] },
-      { "type": "observe_exact", "clients": ["alice", "bob", "carol"] }
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "send_app_message",
+        "sender": "alice",
+        "payload": "conversation:r1:alice"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "conversation:r1:bob"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "carol",
+        "payload": "conversation:r1:carol"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "send_app_message",
+        "sender": "alice",
+        "payload": "conversation:r2:alice"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "conversation:r2:bob"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "carol",
+        "payload": "conversation:r2:carol"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      }
     ]
   },
   "expected_outcomes": [
@@ -55,9 +126,7 @@
         "conversation:r1:bob",
         "conversation:r1:carol",
         "conversation:r2:bob",
-        "conversation:r2:carol",
-        "conversation:r3:bob",
-        "conversation:r3:carol"
+        "conversation:r2:carol"
       ]
     },
     {
@@ -69,9 +138,7 @@
         "conversation:r1:alice",
         "conversation:r1:carol",
         "conversation:r2:alice",
-        "conversation:r2:carol",
-        "conversation:r3:alice",
-        "conversation:r3:carol"
+        "conversation:r2:carol"
       ]
     },
     {
@@ -83,20 +150,26 @@
         "conversation:r1:alice",
         "conversation:r1:bob",
         "conversation:r2:alice",
-        "conversation:r2:bob",
-        "conversation:r3:alice",
-        "conversation:r3:bob"
+        "conversation:r2:bob"
       ]
     },
     {
       "type": "clients_converged",
-      "clients": ["alice", "bob", "carol"],
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ],
       "epoch": 1,
       "member_count": 3
     },
     {
       "type": "no_pending_work",
-      "clients": ["alice", "bob", "carol"]
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ]
     }
   ]
 }

@@ -402,9 +402,9 @@
       "artifact": "leaver-removal-secrecy.v1.json",
       "coverage": [
         "admin removal commit",
-        "post-removal secrecy for the removed member",
+        "post-removal secrecy: removed member receives and processes all post-removal ciphertext, decrypts none",
         "self-leave witness commit",
-        "post-leave secrecy for the departed member"
+        "post-leave secrecy: departed member receives and processes all post-leave ciphertext, decrypts none"
       ],
       "next": "Add the removed-member re-add leg once welcome-after-eviction is supported by the engine harness."
     },
