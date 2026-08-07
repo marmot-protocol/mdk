@@ -474,6 +474,18 @@
         "full-group convergence including group name"
       ],
       "next": "Keep durable-relay offline recovery in the adversarial-reliability family; this vector models mailbox catch-up."
+    },
+    {
+      "id": "admin-churn/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "seeded sequential admin churn with per-round traffic",
+        "competing same-epoch admin-policy commits with seeded delivery order",
+        "restart between commit publish and delivery with post-restart traffic",
+        "latecomer added under commit pressure with forward-secrecy zero-count assertions"
+      ],
+      "next": "Promote a reviewed case into vectors/ once the joiner join-commit deferral is resolved."
     }
   ]
 }

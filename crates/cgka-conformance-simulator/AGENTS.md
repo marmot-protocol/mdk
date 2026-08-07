@@ -57,7 +57,8 @@ the property-test registry. This file is the agent-facing model.
 
 - **Module:** `src/family.rs`
   - **Role:** Deterministic generated scenario families. `generate_send_leave_family`,
-    `generate_convergence_e2e_delivery_family`, and `generate_convergence_chaos_family` record family name, generator
+    `generate_convergence_e2e_delivery_family`, `generate_convergence_chaos_family`, and
+    `generate_admin_churn_family` record family name, generator
     version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report`
     adds generated metadata to report artifacts. Reliability families append a final global drain, exact canonical
     observation, and pending-work assertion; do not remove a red strict result merely because an earlier legacy
@@ -326,7 +327,11 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and
   `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch
   app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data
-  storms, mixed message/commit storms, and restart plus duplicate delivery. Storage-loss families are still future work.
+  storms, mixed message/commit storms, and restart plus duplicate delivery. `admin-churn/v1` covers seeded admin-set
+  churn, competing same-epoch admin-policy commits, restart between publish and delivery, and latecomer joins under
+  commit pressure. Storage-loss families are still future work. A welcome-joined member retains its own join commit as
+  a permanently deferred transport input; latecomer arms scope their pending-work oracle to the founders until that is
+  resolved.
 - **Stateful chat journeys serialize commits by construction.** Each commit is acknowledged and delivered before the
   next state-changing action, and restart is a terminal checkpoint. Mutation-after-reopen plus concurrent and racing
   commit coverage remains owned by `convergence-chaos/v1`.
