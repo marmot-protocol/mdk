@@ -34,14 +34,14 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
     AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings, ChatPinState,
-    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS,
-    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
-    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
+    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
+    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
+    ChatPinState, GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget,
+    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
     PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
@@ -1197,6 +1197,21 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<AppGroupMlsState, AppError> {
         self.accounts.group_mls_state(account_ref, group_id).await
+    }
+
+    pub async fn group_roster(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupRoster, AppError> {
+        let started_at = Instant::now();
+        let result = self.accounts.group_roster(account_ref, group_id).await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupRosterRead,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn enable_group_disbanding(

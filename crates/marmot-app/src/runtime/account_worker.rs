@@ -111,6 +111,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    GroupRoster {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::groups::AppGroupRosterSession, AppError>>,
+    },
     EnableGroupDisbanding {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -454,13 +458,15 @@ async fn run_app_runtime_account_worker(
     // The session's cheap open pass has seeded every stored group. Signal
     // command-readiness *now*: the hydration pipeline right below enters its
     // command-serving loop immediately, so "ready" genuinely means "serving
-    // commands" — group reads issued from this point hydrate exactly the
-    // group they name and answer live, and everything else joins the startup
+    // commands" — group reads (`Members` / `GroupMlsState` / `GroupRoster` /
+    // `QuarantinedGroups`) issued from this point hydrate exactly the group
+    // they name and answer live, and everything else joins the startup
     // deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
     // measures the seeded open; the mdk#1161 stage telemetry attributes it
     // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
     // worker just awaited, with the pipeline and snapshot capture measured
     // separately below).
+
     {
         let open_timings = client.runtime.session().open_timings();
         let telemetry = shared.app_performance_telemetry();
@@ -583,6 +589,16 @@ async fn run_app_runtime_account_worker(
                                 }
                                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
                                     AccountWorkerCommand::GroupMlsState { group_id, respond },
+                                ))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.group_roster(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::GroupRoster { group_id, respond },
                                 ))),
                             }
                         }
@@ -1434,7 +1450,7 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
 }
 
 /// Serve one command that arrived while the startup hydration pipeline was
-/// running. The three local reads answer live — hydrating exactly the group
+/// running. Group-local reads answer live — hydrating exactly the group
 /// they name first, so a read "waits for that group only". The quarantine
 /// list answers the incrementally-growing set; later additions reach
 /// subscribers through their `GroupHydrationQuarantined` events. Everything
@@ -1458,6 +1474,13 @@ async fn handle_startup_hydration_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.group_roster(&group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
@@ -1619,6 +1642,10 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let result = client.group_roster_session(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {

@@ -2303,9 +2303,30 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         "restart must become command-ready before the initial catch-up completes",
     );
 
-    // And the read is answered with correct membership while (or right after)
-    // the catch-up runs — served from the post-hydration snapshot during the
-    // window, from the live session afterwards. Either way it must not block.
+    // The combined roster read is answered with a session-consistent group
+    // record, member list, and MLS state while (or right after) catch-up runs.
+    // During the catch-up window it comes from the post-hydration snapshot;
+    // afterwards it comes from the live session. Either way it must not block.
+    let roster = timeout(
+        Duration::from_secs(2),
+        runtime.group_roster(&bob_id, &group_id),
+    )
+    .await
+    .expect("roster read must not block on the initial catch-up")
+    .unwrap();
+    assert_eq!(roster.epoch, roster.roster_revision);
+    assert_eq!(roster.self_membership, SelfMembership::Member);
+    let roster_member_ids = roster
+        .members
+        .into_iter()
+        .map(|member| member.member_id_hex)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        roster_member_ids.contains(&alice_id) && roster_member_ids.contains(&bob_id),
+        "snapshot/live roster read must report the full roster",
+    );
+
+    // The existing member-only read remains command-ready as well.
     let members = timeout(
         Duration::from_secs(2),
         runtime.group_members(&bob_id, &group_id),

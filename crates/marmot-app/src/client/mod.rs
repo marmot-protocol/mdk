@@ -141,7 +141,7 @@ fn recover_post_canonical_result<T: Default>(
 }
 
 /// A point-in-time copy of the live session's read-only group projections
-/// (`members`, `group_mls_state`, `quarantined_groups`).
+/// (`groups`, `members`, `group_mls_state`, `quarantined_groups`).
 ///
 /// The account worker captures this from the live session and uses it to answer
 /// read commands while a relay catch-up runs in the background. The catch-up
@@ -157,6 +157,7 @@ fn recover_post_canonical_result<T: Default>(
 /// the same shape the live path returns for a group the session does not hold.
 #[derive(Default)]
 pub(crate) struct GroupReadSnapshot {
+    groups: HashMap<GroupId, AppGroupRecord>,
     members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
     mls_state: HashMap<GroupId, AppGroupMlsState>,
     quarantined: Vec<AppQuarantinedGroup>,
@@ -178,6 +179,21 @@ impl GroupReadSnapshot {
             .get(group_id)
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub(crate) fn group_roster(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record: self
+                .groups
+                .get(group_id)
+                .cloned()
+                .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            members: self.members(group_id)?,
+            mls_state: self.group_mls_state(group_id)?,
+        })
     }
 
     pub(crate) fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
@@ -756,6 +772,28 @@ impl AppClient {
         self.group_mls_state_unchecked(group_id)
     }
 
+    pub(crate) fn group_roster_session(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group_record = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+        let profiles = self.app.profiles_by_id()?;
+        let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record,
+            members,
+            mls_state,
+        })
+    }
+
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
         let lifecycle_state = self
@@ -870,6 +908,7 @@ impl AppClient {
             );
         }
         let profiles = profiles?;
+        let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         let mut skipped_malformed_group_records = 0usize;
@@ -879,6 +918,7 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(bytes);
+            groups.insert(group_id.clone(), group.clone());
             if let Ok(records) = self.members_with_profiles_unchecked(&group_id, &profiles) {
                 members.insert(group_id.clone(), records);
             }
@@ -895,6 +935,7 @@ impl AppClient {
             );
         }
         Ok(GroupReadSnapshot {
+            groups,
             members,
             mls_state,
             quarantined: self.quarantined_groups(),
