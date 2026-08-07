@@ -125,6 +125,34 @@ jobs:
       - name: Run clippy with all features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  ios-account-clippy:
+    name: iOS account keychain clippy
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
+          rustup default "$toolchain"
+          rustup target add aarch64-apple-ios
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Check iOS account keychain code
+        run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
+
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers
   # reject every non-v1 convergence policy (mdk#970).

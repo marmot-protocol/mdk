@@ -199,10 +199,13 @@ impl KeychainSecretStore {
         Self::remove_entry(self.legacy_entry_for_account(account_id_hex)?)
     }
 
-    #[cfg(not(target_os = "ios"))]
-    fn remove_legacy_ios_secret(&self, _account_id_hex: &str) -> AccountHomeResult<()> {
-        Ok(())
+    #[cfg(target_os = "ios")]
+    fn cleanup_legacy_ios_secret(&self, account_id_hex: &str) {
+        let _ = self.remove_legacy_ios_secret(account_id_hex);
     }
+
+    #[cfg(not(target_os = "ios"))]
+    fn cleanup_legacy_ios_secret(&self, _account_id_hex: &str) {}
 
     #[cfg(target_os = "ios")]
     fn migrate_legacy_ios_secret(
@@ -239,7 +242,7 @@ impl KeychainSecretStore {
                 "iOS background keychain migration verification failed".into(),
             ));
         }
-        self.remove_legacy_ios_secret(&account.account_id_hex)?;
+        self.cleanup_legacy_ios_secret(&account.account_id_hex);
         Ok(keys)
     }
 }
@@ -282,7 +285,8 @@ impl AccountSecretStore for KeychainSecretStore {
             &account.account_id_hex,
             secret_key_hex.as_str(),
         )?;
-        self.remove_legacy_ios_secret(&account.account_id_hex)
+        self.cleanup_legacy_ios_secret(&account.account_id_hex);
+        Ok(())
     }
 
     fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
@@ -294,7 +298,7 @@ impl AccountSecretStore for KeychainSecretStore {
                 let secret_key = Zeroizing::new(secret_key);
                 let keys = nostr::Keys::parse(secret_key.as_str())
                     .map_err(|_| AccountHomeError::InvalidSecretKey)?;
-                self.remove_legacy_ios_secret(&account.account_id_hex)?;
+                self.cleanup_legacy_ios_secret(&account.account_id_hex);
                 Ok(keys)
             }
             #[cfg(target_os = "ios")]
@@ -308,8 +312,25 @@ impl AccountSecretStore for KeychainSecretStore {
     }
 
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()> {
-        Self::remove_entry(self.entry_for_account(&account.account_id_hex)?)?;
-        self.remove_legacy_ios_secret(&account.account_id_hex)
+        #[cfg(target_os = "ios")]
+        {
+            let current_result = self
+                .entry_for_account(&account.account_id_hex)
+                .and_then(Self::remove_entry);
+            let legacy_result = self.remove_legacy_ios_secret(&account.account_id_hex);
+            match (current_result, legacy_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(current), Err(legacy)) => Err(AccountHomeError::SecretStore(format!(
+                    "failed to remove current and legacy iOS keychain entries: current: {current}; legacy: {legacy}"
+                ))),
+            }
+        }
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            Self::remove_entry(self.entry_for_account(&account.account_id_hex)?)
+        }
     }
 }
 

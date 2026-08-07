@@ -1,4 +1,5 @@
-//! Platform keyring store initialization and keyring-error mapping.
+//! Platform keyring entry construction, secret writes, store initialization,
+//! and keyring-error mapping.
 
 use std::sync::{Arc, Mutex};
 
@@ -52,20 +53,20 @@ pub(crate) fn write_keyring_secret(
 ) -> AccountHomeResult<()> {
     #[cfg(target_os = "ios")]
     {
-        use security_framework::access_control::{ProtectionMode, SecAccessControl};
-        use security_framework::passwords::{PasswordOptions, set_generic_password_options};
+        use apple_native_keyring_store::protected::{AccessPolicy, Cred};
 
-        let mut options =
-            PasswordOptions::new_generic_password(&keyring_service_name(service), account);
-        options.use_protected_keychain();
-        let access_control = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
-            0,
+        // apple-native-keyring-store 1.0.0's string modifier parser maps this
+        // device-only policy to AfterFirstUnlock. The typed API preserves it.
+        Cred::build(
+            &keyring_service_name(service),
+            account,
+            AccessPolicy::AfterFirstUnlockThisDeviceOnly,
+            None,
+            false,
         )
-        .map_err(|error| AccountHomeError::SecretStore(error.to_string()))?;
-        options.set_access_control(access_control);
-        set_generic_password_options(secret.as_bytes(), options)
-            .map_err(|error| AccountHomeError::SecretStore(error.to_string()))
+        .map_err(map_keyring_error)?
+        .set_password(secret)
+        .map_err(map_keyring_error)
     }
 
     #[cfg(not(target_os = "ios"))]
