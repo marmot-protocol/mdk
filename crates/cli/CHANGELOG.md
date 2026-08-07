@@ -53,8 +53,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Existing-group invite commands now return after the required relay
   acknowledgement and durable local refresh instead of waiting for an
-  all-account read-side catch-up. The catch-up continues asynchronously and
-  remains visible in the existing invite-stage telemetry.
+  all-account read-side catch-up. Other local accounts catch up asynchronously
+  without occupying the inviting account's worker, and the work remains visible
+  in the existing invite-stage telemetry.
 
 - Account setup interruptions now have stable JSON recovery codes and repair
   hints instead of falling through to the generic `command_failed` bucket.

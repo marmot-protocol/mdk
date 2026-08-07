@@ -43,7 +43,9 @@ struct ScriptedPushRelayClient {
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
-    block_subscribe_after_next_publish: std::sync::atomic::AtomicBool,
+    block_account_subscribe_after_next_publish: std::sync::Mutex<Option<Vec<u8>>>,
+    block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
+    account_subscribe_blocked: std::sync::atomic::AtomicBool,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -71,9 +73,11 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn block_subscribe_after_next_publish(&self) {
-        self.block_subscribe_after_next_publish
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    fn block_account_subscribe_after_next_publish(&self, account_id: Vec<u8>) {
+        *self
+            .block_account_subscribe_after_next_publish
+            .lock()
+            .unwrap() = Some(account_id);
     }
 
     fn block_next_subscribe(&self) {
@@ -103,6 +107,11 @@ impl ScriptedPushRelayClient {
         self.subscribe_release.notify_one();
     }
 
+    fn account_subscribe_is_blocked(&self) -> bool {
+        self.account_subscribe_blocked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn zero_ack_next_publish(&self) {
         self.zero_ack_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -121,7 +130,7 @@ impl ScriptedPushRelayClient {
 impl NostrRelayClient for ScriptedPushRelayClient {
     async fn subscribe(
         &self,
-        _subscription: NostrSubscription,
+        subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         if self
             .fail_next_subscribe
@@ -131,9 +140,21 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 "injected subscribe failure".to_owned(),
             ));
         }
-        let blocked = self
-            .block_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let block_for_account = {
+            let mut account_id = self.block_account_subscribe.lock().unwrap();
+            if account_id.as_deref() == Some(subscription.account_id().as_slice()) {
+                account_id.take();
+                self.account_subscribe_blocked
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
+        let blocked = block_for_account
+            || self
+                .block_next_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
         if blocked {
             self.subscribe_started.notify_one();
             self.subscribe_release.notified().await;
@@ -190,11 +211,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
-            if self
-                .block_subscribe_after_next_publish
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            if let Some(account_id) = self
+                .block_account_subscribe_after_next_publish
+                .lock()
+                .unwrap()
+                .take()
             {
-                self.block_next_subscribe();
+                *self.block_account_subscribe.lock().unwrap() = Some(account_id);
             }
             Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
         } else {
@@ -331,7 +354,7 @@ fn account_reconcile_returns_local_readiness_before_relay_subscription_registrat
 }
 
 #[test]
-fn invite_members_returns_before_post_mutation_catch_up_finishes() {
+fn invite_members_keeps_same_account_projection_reads_off_detached_catch_up() {
     run_composed_app_runtime_test(
         "invite-members-detaches-post-mutation-catch-up",
         invite_members_detaches_post_mutation_catch_up_body,
@@ -545,7 +568,7 @@ async fn account_local_ready_before_subscribe_body() {
 async fn invite_members_detaches_post_mutation_catch_up_body() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
+    let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -558,29 +581,53 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .await
         .unwrap();
 
-    relay.block_subscribe_after_next_publish();
+    relay.block_account_subscribe_after_next_publish(hex::decode(&alice.account_id_hex).unwrap());
     let inviting_runtime = runtime.clone();
+    let invite_group_id = group_id.clone();
+    let bob_account_id = bob.account_id_hex.clone();
     let invite = tokio::spawn(async move {
         inviting_runtime
             .invite_members(
                 "alice",
-                &group_id,
-                std::slice::from_ref(&bob.account_id_hex),
+                &invite_group_id,
+                std::slice::from_ref(&bob_account_id),
             )
             .await
     });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_subscribe(),
-    )
-    .await
-    .expect("post-mutation catch-up should reach the blocked relay subscription");
-
     tokio::time::timeout(std::time::Duration::from_millis(250), invite)
         .await
         .expect("confirmed invite must return before read-side catch-up finishes")
         .expect("invite task should not panic")
         .expect("invite should succeed");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let catch_up_finished = runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .group_invite_post_mutation_catch_up
+                .attempts
+                == 1;
+            if relay.account_subscribe_is_blocked() || catch_up_finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached catch-up should either skip alice or block on her subscription");
+
+    let (members, mls_state) = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        let members = runtime.group_members("alice", &group_id).await?;
+        let mls_state = runtime.group_mls_state("alice", &group_id).await?;
+        Ok::<_, AppError>((members, mls_state))
+    })
+    .await
+    .expect("same-account post-invite projection reads must not queue behind catch-up")
+    .expect("same-account post-invite projection reads should succeed");
+    assert_eq!(members.len(), 2);
+    assert_eq!(mls_state.member_count, 2);
 
     let before_release = runtime
         .shared_services()
@@ -588,8 +635,8 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .snapshot();
     assert_eq!(before_release.group_invite_members.successes, 1);
     assert_eq!(
-        before_release.group_invite_post_mutation_catch_up.attempts, 0,
-        "catch-up telemetry records only once the detached work finishes"
+        before_release.group_invite_post_mutation_catch_up.successes, 1,
+        "other-account catch-up should finish without using alice's blocked subscription"
     );
 
     relay.release_subscribe();

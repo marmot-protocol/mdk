@@ -3657,6 +3657,13 @@ impl AccountManager {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
+        self.catch_up_accounts_excluding(None).await
+    }
+
+    async fn catch_up_accounts_excluding(
+        &self,
+        excluded_account_id_hex: Option<&str>,
+    ) -> Result<(), AppError> {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
@@ -3664,8 +3671,9 @@ impl AccountManager {
             let commands = {
                 let workers = self.workers.lock().await;
                 workers
-                    .values()
-                    .map(|worker| worker.commands.clone())
+                    .iter()
+                    .filter(|(account_id, _)| excluded_account_id_hex != Some(account_id.as_str()))
+                    .map(|(_, worker)| worker.commands.clone())
                     .collect::<Vec<_>>()
             };
             let mut responses = Vec::with_capacity(commands.len());

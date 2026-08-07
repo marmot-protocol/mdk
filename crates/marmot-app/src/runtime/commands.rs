@@ -358,6 +358,7 @@ impl AccountManager {
     ) -> Result<SendSummary, AppError> {
         let started_at = Instant::now();
         let result = async {
+            let inviting_account_id = self.resolve(account_ref)?.account_id_hex;
             let command = self.worker_commands(account_ref).await?;
             let (respond, response) = oneshot::channel();
             command
@@ -373,7 +374,9 @@ impl AccountManager {
             let post_mutation = self.clone();
             tokio::spawn(async move {
                 let catch_up_started_at = Instant::now();
-                let catch_up = post_mutation.catch_up_accounts().await;
+                let catch_up = post_mutation
+                    .catch_up_accounts_excluding(Some(&inviting_account_id))
+                    .await;
                 post_mutation.shared.app_performance_telemetry().record(
                     AppPerformanceOperation::GroupInvitePostMutationCatchUp,
                     catch_up_started_at.elapsed(),
