@@ -226,17 +226,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             scenario,
             build_id,
         } => {
-            use sha2::Digest;
-
             let node_capsule: cgka_conformance_simulator::node_protocol::NodeFailureCapsuleV1 =
                 serde_json::from_slice(&std::fs::read(&capsule)?)?;
             let scenario_bytes = std::fs::read(scenario)?;
-            let scenario = serde_json::from_slice(&scenario_bytes)?;
+            let scenario =
+                cgka_conformance_simulator::resolve_scenario_input_bytes(&scenario_bytes)?;
             let observation = convergence_campaign_runner::observation_from_node_capsule(
                 &node_capsule,
                 capsule,
-                scenario,
-                &hex::encode(sha2::Sha256::digest(&scenario_bytes)),
+                scenario.scenario,
+                &scenario.provenance.canonical_ir_sha256,
                 BTreeMap::from([("indexed_build".into(), build_id)]),
             );
             let fingerprint = observation.fingerprint.clone();

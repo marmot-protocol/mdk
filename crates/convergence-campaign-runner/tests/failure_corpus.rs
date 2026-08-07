@@ -173,6 +173,7 @@ fn distributed_product_failures_are_saved_with_a_process_reduction_candidate() {
         scenario: ScenarioArtifactV1 {
             path: scenario_path,
             sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+            canonical_ir_sha256: None,
         },
         participants: ["alice", "bob"]
             .into_iter()

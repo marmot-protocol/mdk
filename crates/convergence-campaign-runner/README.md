@@ -14,6 +14,13 @@ manifest selects either:
   filesystem, or stronger host-isolation behavior that containers cannot
   represent faithfully.
 
+The selected scenario path may contain raw canonical Scenario IR or a
+`GeneratedScenarioInputV1` saved by the simulator report runner. Generated
+inputs pin both their exact envelope digest and their resolved canonical-IR
+digest. The runner writes the resolved IR privately as `canonical-scenario.json`;
+container nodes and external VM drivers therefore execute the same scenario
+without needing to understand the generator envelope.
+
 Commands are always built as argv arrays. Manifests do not contain shell
 fragments, credentials, key material, plaintext application payloads, or
 public relay endpoints. Campaign artifacts are written with owner-only modes.

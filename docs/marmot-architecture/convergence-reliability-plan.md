@@ -1097,6 +1097,12 @@ restricted to synthetic shareable capsules with portable expectations.
   its generator/profile provenance and semantic expectations, and record the exact IR digest in distributed manifests;
   this remains the next cross-layer usability slice rather than being hidden inside the generator.
 
+Selection plumbing now resolves raw Scenario IR and saved generated inputs through one parser, records source and
+canonical-IR digests, preserves generator provenance and expectations in app/process/container reports, and hands VM
+drivers a privately materialized canonical file. This item remains open until representative stateful journeys pass the
+capability and oracle contracts of every listed adapter; an adapter merely rejecting an engine-only observation during
+preflight is useful evidence, not completion.
+
 ### 6.6 Shared legality model and workload profiles (planned follow-up)
 
 The current generated families are useful coverage slices, but they should not mature into independent mini-simulators

@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, ConvergenceSubject, ScenarioSpec, ScenarioStep,
-    run_scenario_report_with_subject,
+    AppRuntimeHarness, ConvergenceSubject, GeneratedScenarioCase, GeneratedSubjectKind,
+    HarnessStorageMode, ScenarioSpec, ScenarioStep, TraceExpectation,
+    run_generated_case_report_with_capture_on_subject, run_scenario_report_with_subject,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -111,6 +112,38 @@ async fn app_runtime_subject_uses_distinct_private_encrypted_roots_and_public_pr
         );
     }
     subject.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_runtime_adapter_is_selectable_for_a_saved_generated_case() {
+    let case = GeneratedScenarioCase {
+        family_name: "selectable-app-runtime/v1".into(),
+        generator_version: "2".into(),
+        seed: 23,
+        case_index: 5,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: two_client_scenario(),
+        expected_outcomes: vec![TraceExpectation::ClientsConverged {
+            clients: vec!["alice".into(), "bob".into()],
+            epoch: Some(1),
+            member_count: Some(2),
+        }],
+    };
+
+    let (report, _) = run_generated_case_report_with_capture_on_subject(
+        &case,
+        GeneratedSubjectKind::AppRuntime,
+        None,
+        HarnessStorageMode::InMemorySqlite,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.metadata.subject.as_ref().unwrap().adapter,
+        "marmot_app_runtime"
+    );
+    assert!(report.expectation_failures.is_empty(), "{report:#?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

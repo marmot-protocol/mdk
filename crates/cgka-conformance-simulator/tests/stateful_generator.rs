@@ -137,6 +137,7 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
     let replay = run_report(&ReportArgs {
         input: ReportInput::GeneratedInputs {
             paths: vec![retained_input.expect("retained input was saved")],
+            adapter: None,
         },
         out: replay_output.path().to_path_buf(),
         strict_oracle: true,

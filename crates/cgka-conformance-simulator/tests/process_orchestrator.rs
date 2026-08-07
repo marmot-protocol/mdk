@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::process_orchestrator::{ProcessNodeLaunchV1, ProcessOrchestrator};
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2,
-    ScenarioSpec, ScenarioStep, ScenarioTopologyV2, compile_scenario, run_scenario_report,
-    run_scenario_report_with_subject,
+    AppRuntimeHarness, GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind,
+    ScenarioAccountV2, ScenarioDeviceV2, ScenarioProcessV2, ScenarioRelayV2, ScenarioSpec,
+    ScenarioStep, ScenarioTopologyV2, TraceExpectation, compile_scenario,
+    resolve_scenario_input_bytes, run_scenario_report, run_scenario_report_with_subject,
 };
 
 fn in_group(group: &str, action: ScenarioStep) -> ScenarioStep {
@@ -297,6 +298,47 @@ async fn engine_app_runtime_and_process_adapters_reach_equivalent_public_state()
 
     process.shutdown().await;
     app.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_adapter_executes_the_ir_embedded_in_a_saved_generated_input() {
+    let spec = cross_adapter_scenario();
+    let input = GeneratedScenarioInputV1::new(GeneratedScenarioCase {
+        family_name: "selectable-process/v1".into(),
+        generator_version: "4".into(),
+        seed: 17,
+        case_index: 2,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: spec.clone(),
+        expected_outcomes: vec![TraceExpectation::GroupProfile {
+            client: "alice".into(),
+            name: "equivalent result".into(),
+            description: "equivalent description".into(),
+        }],
+    });
+    let resolved = resolve_scenario_input_bytes(&serde_json::to_vec(&input).unwrap()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let mut process = ProcessOrchestrator::launch_resolved(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &resolved,
+        artifacts.path(),
+    )
+    .await
+    .unwrap();
+
+    let report = process.run().await.unwrap();
+    assert!(report.completed, "{report:#?}");
+    assert_eq!(report.expected_outcomes, input.case.expected_outcomes);
+    let provenance = report.input_provenance.unwrap();
+    assert_eq!(
+        provenance.canonical_ir_sha256,
+        resolved.provenance.canonical_ir_sha256
+    );
+    assert_eq!(
+        provenance.generated.unwrap().family_name,
+        "selectable-process/v1"
+    );
+    process.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -463,7 +463,24 @@ the conformance contract clearer.
 For every generated family, the report runner writes a versioned `*-generated-input.json` artifact with owner-only
 permissions before executing its case. It preserves the full generated case, including its selected subject adapter and
 semantic expectations, so a crash or panic cannot erase the exact executable input. Replay one directly with
-`--generated-input FILE`. The post-run report and promotable vector candidate remain separate owner-only artifacts.
+`--generated-input FILE`. Add `--adapter engine|retained-relay|app-runtime` to deliberately run the embedded canonical
+Scenario IR through a different in-process adapter; capability preflight still rejects unsupported operations before
+action zero. Reports retain the producer's family/version/seed/case/subject provenance plus separate SHA-256 digests for
+the selected envelope bytes and the canonical Scenario IR inside it. The post-run report and promotable vector candidate
+remain separate owner-only artifacts.
+
+The process adapter accepts the same saved input in place of a raw Scenario IR file:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-process -- \
+  target/cgka-conformance-simulator-reports/chat-journey-v1-seed-42-case-0-generated-input.json \
+  target/debug/cgka-conformance-node \
+  target/chat-journey-process-report.json
+```
+
+Its report preserves the same provenance, canonical digest, and semantic expectations. Container and VM manifests use
+the same envelope through `convergence-campaign-runner`; the distributed runner resolves and privately materializes the
+canonical IR before launching nodes or an external VM driver.
 
 ## Report artifacts
 

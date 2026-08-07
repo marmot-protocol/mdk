@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use cgka_conformance_simulator::{ScenarioSpec, process_orchestrator::ProcessOrchestrator};
+use cgka_conformance_simulator::{
+    process_orchestrator::ProcessOrchestrator, resolve_scenario_input_bytes,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -25,7 +27,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err("unexpected extra arguments".into());
     }
-    let scenario: ScenarioSpec = serde_json::from_slice(&std::fs::read(scenario_path)?)?;
+    let input = resolve_scenario_input_bytes(&std::fs::read(scenario_path)?)?;
     let artifact_name = format!(
         "{}.artifacts",
         out.file_stem()
@@ -37,7 +39,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(artifact_name);
     let mut orchestrator =
-        ProcessOrchestrator::launch(node_bin, &scenario, artifact_directory).await?;
+        ProcessOrchestrator::launch_resolved(node_bin, &input, artifact_directory).await?;
     let report_result = orchestrator.run().await.and_then(|report| {
         orchestrator.write_report_private(&report, &out)?;
         Ok(report)

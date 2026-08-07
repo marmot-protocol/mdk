@@ -23,8 +23,14 @@ pub struct DistributedCampaignManifestV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioArtifactV1 {
     pub path: PathBuf,
-    /// SHA-256 of the exact scenario bytes, accepted in either hex case.
+    /// SHA-256 of the exact selected source bytes, accepted in either hex case.
+    /// The source may be raw canonical Scenario IR or a generated-input envelope.
     pub sha256: String,
+    /// SHA-256 of the resolved canonical Scenario IR. Required for generated
+    /// inputs so distributed evidence remains tied to the executable history,
+    /// not only to its surrounding envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_ir_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +226,19 @@ impl DistributedCampaignManifestV1 {
             return Err(RunnerError::validation(
                 "scenario_digest",
                 "scenario sha256 must be 64 hexadecimal characters",
+            ));
+        }
+        if self
+            .scenario
+            .canonical_ir_sha256
+            .as_ref()
+            .is_some_and(|digest| {
+                digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(RunnerError::validation(
+                "canonical_scenario_ir_digest",
+                "canonical scenario IR sha256 must be 64 hexadecimal characters",
             ));
         }
         let mut participants = BTreeSet::new();

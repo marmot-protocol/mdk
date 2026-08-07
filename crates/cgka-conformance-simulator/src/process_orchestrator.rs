@@ -18,9 +18,10 @@ use crate::node_protocol::{
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::{
-    CompiledScenarioV2, ScenarioActionScheduleV2, ScenarioRelaySyncModeV2, ScenarioSpec,
-    ScenarioStep, SubjectCapability, SubjectDescriptor, SubjectFailureCategory, compile_scenario,
-    preflight_compiled_scenario,
+    CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
+    ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
+    SubjectCapability, SubjectDescriptor, SubjectFailureCategory, TraceExpectation,
+    compile_scenario, preflight_compiled_scenario,
 };
 
 pub const PROCESS_SCENARIO_REPORT_SCHEMA_VERSION: &str = "1";
@@ -108,6 +109,10 @@ fn render_node_arg(
 pub struct ProcessScenarioReportV1 {
     pub schema_version: String,
     pub scenario_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_provenance: Option<ScenarioInputProvenanceV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_outcomes: Vec<TraceExpectation>,
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
     pub actions: Vec<ProcessActionResultV1>,
     pub observations: Vec<NodeObservationV1>,
@@ -176,6 +181,8 @@ pub struct ProcessOrchestrator {
     process_relays: BTreeMap<String, Vec<String>>,
     groups: BTreeMap<String, String>,
     lifecycle: Vec<ProcessLifecycleEventV1>,
+    input_provenance: Option<ScenarioInputProvenanceV1>,
+    expected_outcomes: Vec<TraceExpectation>,
 }
 
 struct NodeProcess {
@@ -201,6 +208,18 @@ impl ProcessOrchestrator {
             artifact_directory,
         )
         .await
+    }
+
+    pub async fn launch_resolved(
+        node_executable: impl AsRef<Path>,
+        input: &ResolvedScenarioInputV1,
+        artifact_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProcessOrchestratorError> {
+        let mut orchestrator =
+            Self::launch(node_executable, &input.scenario, artifact_directory).await?;
+        orchestrator.input_provenance = Some(input.provenance.clone());
+        orchestrator.expected_outcomes = input.expected_outcomes.clone();
+        Ok(orchestrator)
     }
 
     /// Launch participant nodes through a caller-supplied argv template and,
@@ -299,6 +318,8 @@ impl ProcessOrchestrator {
             process_relays,
             groups: BTreeMap::new(),
             lifecycle: Vec::new(),
+            input_provenance: None,
+            expected_outcomes: Vec::new(),
         };
         for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
@@ -308,6 +329,24 @@ impl ProcessOrchestrator {
             .barrier_all("launch", "all_nodes_initialized")
             .await
             .map_err(process_action_error)?;
+        Ok(orchestrator)
+    }
+
+    pub async fn launch_resolved_with(
+        node_launch: ProcessNodeLaunchV1,
+        external_relay_urls: Option<BTreeMap<String, String>>,
+        input: &ResolvedScenarioInputV1,
+        artifact_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProcessOrchestratorError> {
+        let mut orchestrator = Self::launch_with(
+            node_launch,
+            external_relay_urls,
+            &input.scenario,
+            artifact_directory,
+        )
+        .await?;
+        orchestrator.input_provenance = Some(input.provenance.clone());
+        orchestrator.expected_outcomes = input.expected_outcomes.clone();
         Ok(orchestrator)
     }
 
@@ -349,6 +388,8 @@ impl ProcessOrchestrator {
         let mut report = ProcessScenarioReportV1 {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
             scenario_name: compiled.name.clone(),
+            input_provenance: self.input_provenance.clone(),
+            expected_outcomes: self.expected_outcomes.clone(),
             canonical_schedule: schedule,
             actions: Vec::new(),
             observations: Vec::new(),
@@ -1407,6 +1448,8 @@ mod tests {
         let report = ProcessScenarioReportV1 {
             schema_version: PROCESS_SCENARIO_REPORT_SCHEMA_VERSION.into(),
             scenario_name: "round-trip".into(),
+            input_provenance: None,
+            expected_outcomes: Vec::new(),
             canonical_schedule: Vec::new(),
             actions: Vec::new(),
             observations: Vec::new(),

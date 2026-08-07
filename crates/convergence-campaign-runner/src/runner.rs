@@ -7,7 +7,10 @@ use cgka_conformance_simulator::process_orchestrator::{
     ProcessBarrierHook, ProcessOrchestrator, ProcessOrchestratorError, ProcessScenarioReportV1,
     process_participant_token,
 };
-use cgka_conformance_simulator::{ScenarioSpec, compile_scenario};
+use cgka_conformance_simulator::{
+    ResolvedScenarioInputV1, ScenarioInputFormatV1, ScenarioSpec, compile_scenario,
+    resolve_scenario_input_bytes,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -78,24 +81,41 @@ pub async fn run_manifest(
     manifest: &DistributedCampaignManifestV1,
 ) -> Result<DistributedRunReceiptV1, RunnerError> {
     let scenario_bytes = verify_manifest_inputs(manifest)?;
-    let plan = build_execution_plan(manifest)?;
-    let scenario = validate_scenario_bytes(manifest, &scenario_bytes)?;
-    fs_private::create_dir_all_private(&manifest.output_dir)
+    let scenario_input = validate_scenario_bytes(manifest, &scenario_bytes)?;
+    let mut normalized_manifest = manifest.clone();
+    normalized_manifest.scenario.canonical_ir_sha256 =
+        Some(scenario_input.provenance.canonical_ir_sha256.clone());
+    let plan = build_execution_plan(&normalized_manifest)?;
+    fs_private::create_dir_all_private(&normalized_manifest.output_dir)
         .map_err(|error| RunnerError::environment("output_directory", error))?;
     fs_private::write_private(
-        &manifest.output_dir.join("normalized-manifest.json"),
-        &serde_json::to_vec_pretty(manifest)
+        &normalized_manifest
+            .output_dir
+            .join("canonical-scenario.json"),
+        &serde_json::to_vec(&scenario_input.scenario)
+            .map_err(|error| RunnerError::environment("scenario_serialize", error))?,
+    )
+    .map_err(|error| RunnerError::environment("scenario_write", error))?;
+    fs_private::write_private(
+        &normalized_manifest
+            .output_dir
+            .join("normalized-manifest.json"),
+        &serde_json::to_vec_pretty(&normalized_manifest)
             .map_err(|error| RunnerError::environment("manifest_serialize", error))?,
     )
     .map_err(|error| RunnerError::environment("manifest_write", error))?;
-    let result = match &manifest.backend {
-        DistributedBackendV1::Container(_) => run_container(manifest, &plan, &scenario).await,
-        DistributedBackendV1::VirtualMachine(_) => run_vm(manifest, &plan).await,
+    let result = match &normalized_manifest.backend {
+        DistributedBackendV1::Container(_) => {
+            run_container(&normalized_manifest, &plan, &scenario_input).await
+        }
+        DistributedBackendV1::VirtualMachine(_) => run_vm(&normalized_manifest, &plan).await,
     };
     match result {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
-            let corpus_error = record_distributed_failure(manifest, &error, &scenario).err();
+            let corpus_error =
+                record_distributed_failure(&normalized_manifest, &error, &scenario_input.scenario)
+                    .err();
             Err(with_secondary_corpus_error(error, corpus_error.as_ref()))
         }
     }
@@ -119,11 +139,32 @@ fn with_secondary_corpus_error(
 pub fn validate_scenario_bytes(
     manifest: &DistributedCampaignManifestV1,
     scenario_bytes: &[u8],
-) -> Result<ScenarioSpec, RunnerError> {
-    let scenario: ScenarioSpec = serde_json::from_slice(scenario_bytes)
-        .map_err(|error| RunnerError::environment("scenario_parse", error))?;
-    validate_scenario_binding(manifest, &scenario)?;
-    Ok(scenario)
+) -> Result<ResolvedScenarioInputV1, RunnerError> {
+    let input = resolve_scenario_input_bytes(scenario_bytes)
+        .map_err(|error| RunnerError::environment(error.code, error))?;
+    if input.provenance.format == ScenarioInputFormatV1::GeneratedScenarioInputV1
+        && manifest.scenario.canonical_ir_sha256.is_none()
+    {
+        return Err(RunnerError::validation(
+            "canonical_scenario_ir_digest_required",
+            "generated scenario inputs require canonical_ir_sha256 in the distributed manifest",
+        ));
+    }
+    if manifest
+        .scenario
+        .canonical_ir_sha256
+        .as_ref()
+        .is_some_and(|expected| {
+            !expected.eq_ignore_ascii_case(&input.provenance.canonical_ir_sha256)
+        })
+    {
+        return Err(RunnerError::validation(
+            "canonical_scenario_ir_digest_mismatch",
+            "resolved canonical Scenario IR does not match the distributed manifest digest",
+        ));
+    }
+    validate_scenario_binding(manifest, &input.scenario)?;
+    Ok(input)
 }
 
 fn validate_scenario_binding(
@@ -241,7 +282,7 @@ fn fault_peer_key(peer: &crate::FaultPeerV1) -> String {
 async fn run_container(
     manifest: &DistributedCampaignManifestV1,
     plan: &DistributedExecutionPlanV1,
-    scenario: &ScenarioSpec,
+    input: &ResolvedScenarioInputV1,
 ) -> Result<DistributedRunReceiptV1, RunnerError> {
     let resource_lease = ContainerResourceLease::acquire()?;
     let resource_token = resource_lease.token.as_str();
@@ -285,8 +326,7 @@ async fn run_container(
         }
     }
 
-    let result =
-        run_container_scenario(manifest, plan, scenario, resource_token, &mut receipts).await;
+    let result = run_container_scenario(manifest, plan, input, resource_token, &mut receipts).await;
     let run_token = match &result {
         Ok(result) => Some(result.run_token.as_str()),
         Err(failure) => failure.run_token.as_deref(),
@@ -353,7 +393,7 @@ struct ContainerScenarioFailure {
 async fn run_container_scenario(
     manifest: &DistributedCampaignManifestV1,
     plan: &DistributedExecutionPlanV1,
-    scenario: &ScenarioSpec,
+    input: &ResolvedScenarioInputV1,
     resource_token: &str,
     receipts: &mut Vec<CommandReceiptV1>,
 ) -> Result<ContainerScenarioResult, ContainerScenarioFailure> {
@@ -363,7 +403,7 @@ async fn run_container_scenario(
             run_token: None,
         }
     })?;
-    let scenario = lower_container_host_faults(manifest, scenario).map_err(|error| {
+    let scenario = lower_container_host_faults(manifest, &input.scenario).map_err(|error| {
         ContainerScenarioFailure {
             error,
             run_token: None,
@@ -387,10 +427,15 @@ async fn run_container_scenario(
         .into_iter()
         .map(|label| (label, format!("ws://{NODE_RELAY_PROXY_LISTEN}")))
         .collect::<BTreeMap<_, _>>();
-    let mut orchestrator = ProcessOrchestrator::launch_with(
+    let resolved = ResolvedScenarioInputV1 {
+        scenario,
+        expected_outcomes: input.expected_outcomes.clone(),
+        provenance: input.provenance.clone(),
+    };
+    let mut orchestrator = ProcessOrchestrator::launch_resolved_with(
         node_launch,
         Some(relay_urls),
-        &scenario,
+        &resolved,
         &manifest.output_dir,
     )
     .await
@@ -840,6 +885,7 @@ mod tests {
             scenario: ScenarioArtifactV1 {
                 path: root.join("scenario.json"),
                 sha256: "00".repeat(32),
+                canonical_ir_sha256: None,
             },
             participants: ["alice", "bob"]
                 .into_iter()
@@ -1189,6 +1235,8 @@ mod tests {
             topology: cgka_conformance_simulator::ScenarioTopologyV2::default(),
             steps: Vec::new(),
         };
+        let scenario =
+            resolve_scenario_input_bytes(&serde_json::to_vec(&scenario).unwrap()).unwrap();
         let error = run_container(&manifest, &plan, &scenario)
             .await
             .unwrap_err();

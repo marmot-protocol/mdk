@@ -48,6 +48,7 @@ pub mod scenario;
 mod scenario_assertions;
 mod scenario_authoring;
 mod scenario_faults;
+mod scenario_input;
 mod scenario_input_ledger;
 mod scenario_ir;
 mod stateful_generator;
@@ -95,7 +96,8 @@ pub use family::{
     generate_adversarial_reliability_sustained_regression, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report, run_generated_case_report_with_capture,
-    run_generated_case_report_with_storage_mode, semantic_reduction_units,
+    run_generated_case_report_with_capture_on_subject, run_generated_case_report_with_storage_mode,
+    semantic_reduction_units,
 };
 pub use oracle::{
     BehaviorEvidenceSummary, CoverageMatrixEntry, OracleBehavior, OracleCoverageWarning,
@@ -146,6 +148,11 @@ pub use scenario_authoring::{
 pub use scenario_faults::{
     ScenarioMessageSelectorV2, ScenarioStorageFaultKind, ScenarioStorageFaultV2,
     ScenarioTransportClass,
+};
+pub use scenario_input::{
+    GeneratedScenarioProvenanceV1, ResolvedScenarioInputV1,
+    SCENARIO_INPUT_PROVENANCE_SCHEMA_VERSION, ScenarioInputError, ScenarioInputFormatV1,
+    ScenarioInputProvenanceV1, canonical_scenario_ir_sha256, resolve_scenario_input_bytes,
 };
 pub use scenario_input_ledger::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,

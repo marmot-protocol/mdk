@@ -92,7 +92,8 @@ pub fn build_execution_plan(
         DistributedBackendV1::VirtualMachine(vm) => {
             let normalized_manifest = manifest.output_dir.join("normalized-manifest.json");
             let normalized_manifest = utf8_path(&normalized_manifest, "normalized_manifest")?;
-            let scenario = utf8_path(&manifest.scenario.path, "scenario")?;
+            let scenario_path = manifest.output_dir.join("canonical-scenario.json");
+            let scenario = utf8_path(&scenario_path, "scenario")?;
             let output_dir = utf8_path(&manifest.output_dir, "output_dir")?;
             let driver = utf8_path(&vm.driver, "vm_driver")?;
             let render_args = |args: &[String]| {

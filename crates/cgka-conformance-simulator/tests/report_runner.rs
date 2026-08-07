@@ -2,9 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    FailureCapsuleSensitivity, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
-    ReportInput, ScenarioStimulus, parse_report_command, promote_failure_capsule_to_vector,
-    property_test_coverage_entries, read_failure_capsule, replay_engine_bytes, run_report,
+    FailureCapsuleSensitivity, GeneratedSubjectKind, HarnessStorageMode, OracleBehavior,
+    ReportArgs, ReportCommand, ReportInput, ScenarioStimulus, parse_report_command,
+    promote_failure_capsule_to_vector, property_test_coverage_entries, read_failure_capsule,
+    replay_engine_bytes, run_report,
 };
 
 #[test]
@@ -107,6 +108,8 @@ fn parse_generated_input_report_args() {
         "target/case-1-generated-input.json".into(),
         "--generated-input".into(),
         "target/case-3-generated-input.json".into(),
+        "--adapter".into(),
+        "app-runtime".into(),
         "--out".into(),
         "target/generated-input-reports".into(),
     ])
@@ -120,6 +123,7 @@ fn parse_generated_input_report_args() {
                     PathBuf::from("target/case-1-generated-input.json"),
                     PathBuf::from("target/case-3-generated-input.json"),
                 ],
+                adapter: Some(GeneratedSubjectKind::AppRuntime),
             },
             out: PathBuf::from("target/generated-input-reports"),
             strict_oracle: true,
