@@ -445,10 +445,24 @@ naming-gate:
     #!/usr/bin/env bash
     set -euo pipefail
     ./scripts/check_legacy_naming.sh
-    tracked_milestone_names="$(git ls-files | awk -F/ 'tolower($NF) ~ /milestone/ { print }')"
-    if [[ -n "$tracked_milestone_names" ]]; then
-        echo "tracked filenames must use capability names, not milestone names:" >&2
-        echo "$tracked_milestone_names" >&2
+    is_milestone_path() {
+        local lowercase
+        lowercase="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+        [[ "$lowercase" == *milestone* ]]
+    }
+    is_milestone_path "docs/milestone-5/design.md"
+    is_milestone_path "docs/design-milestone.md"
+    is_milestone_path "docs/MileStone-6/design.md"
+    ! is_milestone_path "docs/capability/design.md"
+    tracked_milestone_paths=()
+    while IFS= read -r -d '' path; do
+        if is_milestone_path "$path"; then
+            tracked_milestone_paths+=("$path")
+        fi
+    done < <(git ls-files -z)
+    if (( ${#tracked_milestone_paths[@]} > 0 )); then
+        echo "tracked paths must use capability names, not milestone names:" >&2
+        printf '%s\n' "${tracked_milestone_paths[@]}" >&2
         exit 1
     fi
 
