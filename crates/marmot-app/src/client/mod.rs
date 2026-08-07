@@ -777,13 +777,14 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let group_record = self
+        let mut group_record = self
             .state
             .groups
             .iter()
             .find(|group| group.group_id_hex == group_id_hex)
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+        self.overlay_storage_self_membership(&mut group_record)?;
         let profiles = self.app.profiles_by_id()?;
         let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
         let mls_state = self.group_mls_state_unchecked(group_id)?;
@@ -792,6 +793,19 @@ impl AppClient {
             members,
             mls_state,
         })
+    }
+
+    fn overlay_storage_self_membership(
+        &self,
+        group_record: &mut AppGroupRecord,
+    ) -> Result<(), AppError> {
+        if let Some(membership) = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
+        {
+            group_record.self_membership = membership;
+        }
+        Ok(())
     }
 
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -904,6 +918,7 @@ impl AppClient {
             );
         }
         let profiles = profiles?;
+        let stored_self_memberships = self.app.account_group_self_memberships(&self.state.label)?;
         let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
@@ -914,7 +929,11 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(bytes);
-            groups.insert(group_id.clone(), group.clone());
+            let mut group_record = group.clone();
+            if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
+                group_record.self_membership = *membership;
+            }
+            groups.insert(group_id.clone(), group_record);
             if let Ok(records) = self.members_with_profiles_unchecked(&group_id, &profiles) {
                 members.insert(group_id.clone(), records);
             }

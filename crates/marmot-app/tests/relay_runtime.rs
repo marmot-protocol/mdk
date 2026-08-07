@@ -2288,6 +2288,127 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
 }
 
 #[tokio::test]
+async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "roster leave",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+
+    runtime.leave_group(&bob_id, &group_id).await.unwrap();
+
+    let roster = runtime.group_roster(&bob_id, &group_id).await.unwrap();
+    assert_eq!(
+        roster.self_membership,
+        SelfMembership::Left,
+        "groupRoster must read storage-owned self_membership without restarting the worker"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_roster_reports_removed_after_admin_eviction_without_worker_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "roster eviction",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+
+    runtime
+        .remove_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupEvent(group_event)
+                if group_event.account_id_hex == bob_id
+                    && matches!(
+                        &group_event.event,
+                        cgka_traits::engine::GroupEvent::GroupStateChanged {
+                            group_id: changed_group,
+                            change:
+                                cgka_traits::engine::GroupStateChange::MemberRemoved { member },
+                            ..
+                        } if changed_group == &group_id
+                            && hex::encode(member.as_slice()) == bob_id
+                    )
+        )
+    })
+    .await;
+
+    let roster = runtime.group_roster(&bob_id, &group_id).await.unwrap();
+    assert_eq!(
+        roster.self_membership,
+        SelfMembership::Removed,
+        "groupRoster must read storage-owned self_membership without restarting the worker"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;

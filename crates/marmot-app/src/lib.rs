@@ -2533,6 +2533,30 @@ impl MarmotApp {
         Ok(())
     }
 
+    /// Storage-owned `account_groups.self_membership` for roster and chat-list
+    /// reads. In-memory `AppClient.state.groups` may lag after a local leave or
+    /// observed self-eviction because those paths write storage directly.
+    pub(crate) fn stored_group_self_membership(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .group_self_membership(group_id_hex)?)
+    }
+
+    pub(crate) fn account_group_self_memberships(
+        &self,
+        label: &str,
+    ) -> Result<std::collections::HashMap<String, SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .account_group_self_memberships()?)
+    }
+
     /// `group_id_hex` of every `account_groups` row still carrying the migration
     /// default `self_membership = 'member'`. The one-time open/upgrade backfill
     /// uses this to derive membership for legacy rows from current engine state.
