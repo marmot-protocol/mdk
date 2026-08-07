@@ -1911,9 +1911,8 @@ impl<S: StorageProvider> Engine<S> {
     /// The canonicalization drop set only covers commits the candidate BFS
     /// could materialize. A device's OWN published-and-confirmed commit is not
     /// replayable through `process_message` (MLS cannot process own messages),
-    /// so when a reorg supersedes it — e.g. after a restart cleared the
-    /// in-memory `committed_from` guard and routed a same-epoch sibling into
-    /// stored convergence — the own commit gets no disposition at all: no
+    /// so when a reorg supersedes it — a same-epoch sibling adjudicated
+    /// through stored convergence — the own commit gets no disposition at all: no
     /// `CommitRolledBack`, no withdrawal, and the confirm-time
     /// `GroupStateChanged` rows survive as the issue #363 lie.
     ///
