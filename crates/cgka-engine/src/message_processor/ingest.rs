@@ -767,6 +767,15 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
+            // Set when convergence admission is refused ONLY because the
+            // fork-source anchor snapshot is gone. Within the rewind horizon
+            // that absence is abnormal by construction — every canonical
+            // advance retains a source-epoch anchor and pruning runs only
+            // beyond the horizon — so the WrongEpoch arm below must fail
+            // closed loudly instead of silently classifying the rival stale.
+            // Commits forking from before this device's join epoch are the
+            // one legitimate in-horizon absence and keep the stale fallback.
+            let mut convergence_refused_for_missing_anchor = false;
             let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
                 if msg_epoch >= current_epoch {
                     true
@@ -780,10 +789,17 @@ impl<S: StorageProvider> Engine<S> {
                         .storage
                         .convergence_pass(&group_id)?
                         .is_some_and(|pass| pass.is_active());
+                    let we_committed_from_source =
+                        self.epoch_manager.we_committed_from(&group_id, msg_epoch);
+                    let has_source_anchor =
+                        self.has_retained_anchor_snapshot(&group_id, msg_epoch)?;
+                    convergence_refused_for_missing_anchor = within_rewind_horizon
+                        && !active_pass
+                        && !we_committed_from_source
+                        && !has_source_anchor
+                        && !self.msg_is_pre_membership(&group_id, msg_epoch);
                     within_rewind_horizon
-                        && (active_pass
-                            || (!self.epoch_manager.we_committed_from(&group_id, msg_epoch)
-                                && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?))
+                        && (active_pass || (!we_committed_from_source && has_source_anchor))
                 }
             } else {
                 false
@@ -982,6 +998,24 @@ impl<S: StorageProvider> Engine<S> {
                                 ));
                             }
                         }
+                    }
+
+                    // An in-horizon rival commit refused convergence admission
+                    // only because its fork-source anchor is gone SHOULD have
+                    // been adjudicated by distributed convergence. Falling
+                    // through to the stale fallback would silently keep our
+                    // own (possibly losing) branch — permanent divergence
+                    // invisible to the app and to forensics. Fail closed
+                    // loudly instead, mirroring the materialization-time
+                    // missing-recovery-material precedent.
+                    if pending_recovery.is_none() && convergence_refused_for_missing_anchor {
+                        return self.fail_closed_missing_fork_recovery_anchor(
+                            group_id,
+                            &msg.id,
+                            &openmls_msg,
+                            msg_epoch,
+                            current,
+                        );
                     }
 
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
@@ -2258,6 +2292,104 @@ impl<S: StorageProvider> Engine<S> {
             last_stable: msg_epoch,
             conflicting_epoch: current,
         }
+    }
+
+    /// Fail-closed loud handling for an in-horizon rival commit whose
+    /// fork-source anchor snapshot is gone (pre-mechanism database, storage
+    /// loss). The rival SHOULD have been adjudicated by distributed
+    /// convergence; without the anchor this device cannot adjudicate it, and
+    /// silently keeping its own (possibly losing) branch would be permanent
+    /// divergence invisible to the app and to forensics. Mirrors the
+    /// materialization-time missing-recovery-material halt in
+    /// `distributed_convergence` (`MissingRetainedAnchor` /
+    /// `MissingOwnCommitCheckpoint`): park the rival reconsiderable, write
+    /// the durable `unrecoverable` marker, audit the state change, and emit
+    /// `GroupUnrecoverable` so the app can surface repair. Canonical state is
+    /// left untouched.
+    ///
+    /// The marker and the park are ONE durable unit, and within it the marker
+    /// comes first. Parking demotes a row that arrived `Created` to
+    /// `ConvergenceDeferred`, which convergence admits to a pass but cannot use
+    /// to *open* one (`convergence_input::can_start_pass`). A park that
+    /// outlives a failed marker therefore halts nothing while removing the only
+    /// input that could re-derive the halt: the group stays `Stable` on a
+    /// possibly-losing branch, redelivery dedups against the parked row, and
+    /// stale-deferred retirement eventually terminalizes it — permanent
+    /// divergence manufactured by the halt's own error path. The convergence
+    /// coordinator's halt needs no transaction only because it persists no
+    /// disposition before its marker, so every input keeps the state that
+    /// re-derives the identical halt on the next run.
+    fn fail_closed_missing_fork_recovery_anchor(
+        &mut self,
+        group_id: GroupId,
+        msg_id: &MessageId,
+        openmls_msg: &TransportMessage,
+        msg_epoch: EpochId,
+        current: EpochId,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                // Durable marker first: a crash after the commit still halts
+                // the group on the next session open via
+                // `sync_unrecoverable_halt_from_storage` (mdk#971).
+                let mut group = storage.get_group(&group_id)?;
+                if !group.unrecoverable {
+                    group.unrecoverable = true;
+                    storage.put_group(&group)?;
+                }
+                // Park the rival keyed by its source epoch, as replay requires,
+                // so a verified repair path can still reconsider it. This
+                // writes through `self.storage`, which IS the handle the
+                // transaction is running on, so it joins the same unit.
+                self.persist_openmls_wire_message(
+                    openmls_msg,
+                    &group_id,
+                    msg_epoch,
+                    MessageState::ConvergenceDeferred,
+                )
+            })?;
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::message_state_changed_event(
+                hex::encode(msg_id.as_slice()),
+                MessageState::ConvergenceDeferred,
+                "fork_rival_missing_retained_anchor",
+            ),
+        );
+        // Durable state has committed. From here on the steps are in-memory
+        // transitions and queue pushes, infallible w.r.t. the backend.
+        let previous_state = self
+            .epoch_manager
+            .state(&group_id)
+            .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
+        self.epoch_manager.mark_unrecoverable(&group_id);
+        let epoch = self.epoch_manager.epoch(&group_id).unwrap_or(current);
+        // Same reason tag as the convergence coordinator's halt for this
+        // material (`canonicalization_error_tag(MissingRetainedAnchor)`); the
+        // ingest-time site is distinguished by the parked-rival row above and
+        // by the absence of a convergence-run context.
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                previous_state.as_deref(),
+                "unrecoverable",
+                epoch,
+                "missing_retained_anchor",
+                None,
+                None,
+            ),
+        );
+        self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
+            group_id: group_id.clone(),
+        });
+        // `Buffered` promises the retained row a later replay; keep that
+        // promise by scheduling the group so the post-repair convergence
+        // drain seeds the parked rival (see `IngestOutcome::Buffered` docs).
+        self.schedule_pending_convergence_group(&group_id);
+        Ok(IngestOutcome::Buffered {
+            group_id,
+            epoch: current,
+        })
     }
 
     fn probe_commit_ordering_metadata_for_recovery(

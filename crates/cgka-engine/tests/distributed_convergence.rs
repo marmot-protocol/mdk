@@ -3597,6 +3597,130 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
     );
 }
 
+/// U6 resolution (option-c plan): the historical-rewind route and the
+/// no-rewind route agree — a within-horizon losing commit is deferred as
+/// `ConvergenceDeferred` / `NonSelectedEligibleBranch` on BOTH, so a later
+/// pass can reconsider it. There is no third terminality asymmetry.
+///
+/// The three rewind tests above
+/// (`engine_replays_late_same_epoch_commit_from_retained_anchor`,
+/// `engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon`,
+/// `rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor`)
+/// *appear* to pin `EpochInvalidated` for the same shape, but their
+/// `bob_wins == false` arms are dead: `committer_wins(&bob, &alice)` is
+/// deterministically true for the label-derived identities, so the late
+/// commit always WINS there and the terminal expectation never executes
+/// (verified empirically by tracing every `EpochInvalidated` write site —
+/// none fires during those tests). This test exercises the mirrored,
+/// previously uncovered arm: the deterministic tiebreak WINNER is applied
+/// first, and the LOSER arrives late within the rewind horizon.
+#[tokio::test]
+async fn rewind_and_no_rewind_routes_agree_on_losing_commit_disposition() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "u6-probe".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+
+    // Bob is the deterministic tiebreak winner against Alice.
+    assert!(committer_wins(&bob.self_id(), &alice.self_id()));
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 1_000)
+        .expect("bob commit buffered");
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("bob branch applies and retains epoch 1 anchor");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit.clone(), 2_000)
+        .expect("late alice commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .expect("late losing commit resolves");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    // The rewind route defers the within-horizon loser exactly like the
+    // no-rewind route (`convergence_rollback_emits_commit_rolled_back_for_
+    // losing_branch` above): reconsiderable, not terminal.
+    assert!(
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.kind == MessageKind::Commit
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+                && deferred.message_id == content_hex(&alice_commit)
+        }),
+        "expected the late losing commit deferred as NonSelectedEligibleBranch, got {:?}",
+        result.deferred_messages
+    );
+    assert_message_state(
+        &carol_storage,
+        &alice_commit,
+        MessageState::ConvergenceDeferred,
+    );
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let members = carol.members(&group_id).unwrap();
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
+}
+
 #[tokio::test]
 async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     let (mut alice, _alice_storage) = build_client(b"alice");
