@@ -160,6 +160,15 @@
         ]
       },
       {
+        "type": "probe_bidirectional_decryptability",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "dave"
+        ]
+      },
+      {
         "type": "observe_exact",
         "clients": [
           "alice",
@@ -264,6 +273,15 @@
       "type": "convergence_decision",
       "client": "dave",
       "selected_tip_epoch": 2
+    },
+    {
+      "type": "clients_bidirectionally_decryptable",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "dave"
+      ]
     }
   ]
 }

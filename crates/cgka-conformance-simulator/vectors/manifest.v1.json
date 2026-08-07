@@ -230,7 +230,7 @@
         "same-epoch group-data commit race resolved by the unified convergence route in one trace",
         "live committer, observer, and restarted committer agreeing at depth 1",
         "restarted committer resolving the same fork through convergence over hydrated storage",
-        "strict exact-equivalence, per-client winning-branch profile pins, and no-pending-work tail"
+        "strict exact-equivalence, per-client winning-branch profile pins, bidirectional decryptability, and no-pending-work tail"
       ],
       "next": "Route-unification acceptance pin (option C Slice B->C, flipped with the pairwise-route deletion): committer, observer, and restarted committer all resolve through distributed convergence and stay exactly equivalent."
     },

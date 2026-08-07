@@ -170,8 +170,10 @@ These are the scenarios another implementation should be able to load from JSON 
   order before anyone consumes the sibling branch.
 - Expected: all four clients converge at epoch 2 with four members, each projecting the ordering winner's branch
   (`bob branch`, pinned per client so agreement is not mistaken for attribution),
-  pass exact canonical equivalence and no-pending-work, and each of the four records a settled convergence
-  decision at tip epoch 2. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
+  pass exact canonical equivalence, bidirectional decryptability in every direction, and no-pending-work, and each of
+  the four records a settled convergence decision at tip epoch 2. The decryptability probe runs before the terminal
+  `observe_exact` — it is a mutating probe, and a later observation is what the per-client convergence-decision pins
+  read. Originally authored (as Slice B of option C) to prove the pairwise fast-path and the convergence
   route agreed; flipped into the unified-route acceptance pin when the pairwise route was deleted.
 
 ### `conversation/v1`
