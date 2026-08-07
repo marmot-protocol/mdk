@@ -1480,7 +1480,7 @@ async fn handle_startup_hydration_command(
                 .runtime
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
-            let _ = respond.send(client.group_roster(&group_id));
+            let _ = respond.send(client.group_roster_session(&group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
