@@ -570,7 +570,7 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
         carol_storage.clone(),
         clock.clone(),
     );
-    restarted.hydrate_stable_groups_from_storage().unwrap();
+    restarted.hydrate_all_stored_groups().unwrap();
     restarted.set_deferred_peel_residence_ms(1_000);
     assert_eq!(
         restarted.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
@@ -595,7 +595,7 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
         carol_storage.clone(),
         clock.clone(),
     );
-    backwards.hydrate_stable_groups_from_storage().unwrap();
+    backwards.hydrate_all_stored_groups().unwrap();
     backwards.set_deferred_peel_residence_ms(1_000);
     assert_eq!(
         backwards.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),

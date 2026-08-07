@@ -164,7 +164,7 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
-        let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
+        let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
         // Authenticated terminal evidence is permanent. Drop late traffic
         // before the missing-OpenMLS fallback can retain it as retryable
@@ -175,6 +175,12 @@ impl<S: StorageProvider> Engine<S> {
                 category: InputRejectionCategory::UnknownGroup,
             });
         }
+
+        // mdk#1161: an inbound message for a seeded-but-unhydrated group runs
+        // that group's full hydration first, so the peel below sees validated
+        // live state. A hydration failure quarantines the group and the
+        // quarantine gate below retains this input for post-repair replay.
+        let _ = self.ensure_hydrated(&group_id);
 
         // Quarantine gate (mdk#364): a group frozen by hydration
         // quarantine must not process any input — its OpenMLS state may load
@@ -2364,6 +2370,61 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         Ok(direct)
+    }
+
+    /// [`Self::group_id_for_transport_group_id`] plus the pre-migration route
+    /// backfill (mdk#1161): while any stored group has no durable transport
+    /// route yet, an index miss cannot be trusted, so this loads each
+    /// backfill-pending group's MLS state once, persists + indexes its route,
+    /// and retries the match. Every probed group leaves the pending set
+    /// permanently — matched or not — so a kind-445 flood costs at most one
+    /// MLS load per stored group *ever*, preserving mdk#740's
+    /// attacker-paced-scan bound in amortized form. Once the set is empty
+    /// this is exactly the O(1) resolver.
+    fn resolve_or_backfill_group_id_for_transport(
+        &mut self,
+        transport_group_id: &[u8],
+    ) -> Result<GroupId, EngineError> {
+        let resolved = self.group_id_for_transport_group_id(transport_group_id)?;
+        if self.route_backfill_pending.is_empty()
+            || self
+                .transport_group_id_index
+                .contains_key(transport_group_id)
+            || self.storage.get_group(&resolved).is_ok()
+        {
+            return Ok(resolved);
+        }
+        let pending: Vec<GroupId> = self.route_backfill_pending.drain().collect();
+        let mut matched = None;
+        for group_id in pending {
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            let mls_group = {
+                let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                    &self.crypto,
+                    self.storage.mls_storage(),
+                );
+                match openmls::group::MlsGroup::load(
+                    <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                        &provider,
+                    ),
+                    &mls_gid,
+                ) {
+                    Ok(Some(group)) => group,
+                    // Unreadable MLS state resolves nothing here; the group's
+                    // full hydration (or quarantine) owns that failure.
+                    _ => continue,
+                }
+            };
+            let Ok(route) = crate::app_components::transport_group_id_of_group(&mls_group) else {
+                continue;
+            };
+            let is_match = route == transport_group_id;
+            self.index_transport_group_route(route, &group_id);
+            if is_match && matched.is_none() {
+                matched = Some(group_id);
+            }
+        }
+        Ok(matched.unwrap_or(resolved))
     }
 
     async fn try_peel_group_message_from_available_snapshots(

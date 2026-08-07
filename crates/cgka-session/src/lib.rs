@@ -349,7 +349,10 @@ impl AccountDeviceSession {
         }
         let engine_build = build_started.elapsed();
         let hydration_started = std::time::Instant::now();
-        engine.hydrate_stable_groups_from_storage()?;
+        // Eager for now: the app-layer background hydration pipeline
+        // (mdk#1161 layer 3) switches this to the cheap seed pass once hosts
+        // drive per-group hydration after readiness.
+        engine.hydrate_all_stored_groups()?;
         let group_hydration = hydration_started.elapsed();
         engine
             .set_convergence_policy(config.convergence_policy)

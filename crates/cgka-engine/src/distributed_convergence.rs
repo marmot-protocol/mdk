@@ -199,6 +199,10 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Option<u64>, OpenMlsProjectionError> {
+        // Convergence scheduling for a seeded-but-unhydrated group promotes
+        // it first (mdk#1161); a hydration failure quarantines it and the
+        // gate below reports no work.
+        let _ = self.ensure_hydrated(group_id);
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
@@ -967,6 +971,10 @@ impl<S: StorageProvider> Engine<S> {
         now: ConvergenceTime,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
         let now_ms = now.monotonic_ms;
+        // A convergence pass over a seeded-but-unhydrated group promotes it
+        // first (mdk#1161); a hydration failure quarantines it and the gate
+        // below reports the blocked run.
+        let _ = self.ensure_hydrated(group_id);
         // A hydration-quarantined group is frozen until explicit repair: no
         // canonicalization pass may read or mutate its state, and no
         // set_stable may re-activate it out of band (mdk#364). Check this

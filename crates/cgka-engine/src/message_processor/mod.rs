@@ -389,6 +389,10 @@ impl<S: StorageProvider> Engine<S> {
 
     fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
         let group_id = send_intent_group_id(intent).clone();
+        // A send targeting a seeded-but-unhydrated group promotes it first
+        // (mdk#1161); a hydration failure quarantines it and falls through to
+        // the gate below as UnknownGroup.
+        let _ = self.ensure_hydrated(&group_id);
         // Quarantine gate: a group frozen by hydration quarantine must not
         // stage, queue, or publish anything — a confirm would set_stable and
         // silently un-quarantine it out of band (mdk#364).
@@ -473,6 +477,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<Vec<SendResult>, EngineError> {
+        // Draining a seeded-but-unhydrated group promotes it first
+        // (mdk#1161); a hydration failure quarantines it and the gate below
+        // reports UnknownGroup.
+        let _ = self.ensure_hydrated(group_id);
         // Quarantined groups vanish from every live surface; convergence and
         // queued-intent drains must not touch their state (mdk#364).
         self.ensure_group_live(group_id)?;
@@ -1049,6 +1057,13 @@ impl<S: StorageProvider> Engine<S> {
         // the very state validation rejected (mdk#364). The rows replay
         // once repair clears the quarantine.
         if self.quarantined_reason(group_id).is_some() {
+            return Ok(0);
+        }
+        // A seeded-but-unhydrated group holds a provisional Stable entry, so
+        // the gate below would fall through and re-ingest retained rows
+        // against unvalidated state (mdk#1161). Skip; the sweep after
+        // `ensure_hydrated` promotes the group picks the rows up.
+        if self.unhydrated_groups.contains(group_id) {
             return Ok(0);
         }
         if let Some(state) = self.epoch_manager.state(group_id)

@@ -1112,7 +1112,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .unwrap();
-    reopened.hydrate_stable_groups_from_storage().unwrap();
+    reopened.hydrate_all_stored_groups().unwrap();
     let reopened_group = reopened.group_record(&group_id).unwrap();
     assert_eq!(reopened_group.protocol_profile, ProtocolProfile::Current);
     assert_eq!(reopened_group.epoch, cgka_traits::types::EpochId(1));
@@ -1373,7 +1373,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     drop(alice);
     let mut reopened =
         build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
-    reopened.hydrate_stable_groups_from_storage().unwrap();
+    reopened.hydrate_all_stored_groups().unwrap();
     assert!(matches!(
         reopened.epoch_state(&group_id),
         Some(cgka_traits::EpochState::Disbanded(_))
@@ -1397,7 +1397,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     );
     let mut tombstone_only =
         build_profile_client_on_storage(identity, storage, ProtocolProfile::Current);
-    tombstone_only.hydrate_stable_groups_from_storage().unwrap();
+    tombstone_only.hydrate_all_stored_groups().unwrap();
     assert!(matches!(
         tombstone_only.epoch_state(&group_id),
         Some(cgka_traits::EpochState::Disbanded(_))
@@ -1448,7 +1448,7 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .unwrap();
-    current.hydrate_stable_groups_from_storage().unwrap();
+    current.hydrate_all_stored_groups().unwrap();
     assert_eq!(
         current.group_record(&group_id).unwrap().protocol_profile,
         ProtocolProfile::Legacy

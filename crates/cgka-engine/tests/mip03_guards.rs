@@ -747,7 +747,7 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
         .build()
         .unwrap();
     reopened
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("reopen after rejected proposal");
     assert!(reopened.drain_auto_publish().is_empty());
     assert_eq!(

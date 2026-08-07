@@ -1530,7 +1530,7 @@ async fn buffered_legacy_own_echo_retires_raw_retry_row() {
     // Rebuild to clear the hot-process sent-id cache as a real restart would.
     drop(alice);
     let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
-    alice.hydrate_stable_groups_from_storage().unwrap();
+    alice.hydrate_all_stored_groups().unwrap();
 
     // Buffer the echo before peeling while a local commit awaits publication.
     let staged = match alice
@@ -1642,7 +1642,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
     assert_eq!(marker.state, MessageState::Sent);
 
     let mut alice = build_client_with_storage(reopened_store, b"alice-own-restart");
-    alice.hydrate_stable_groups_from_storage().unwrap();
+    alice.hydrate_all_stored_groups().unwrap();
     let rewrapped = TransportMessage {
         id: MessageId::new(b"fresh-own-echo-transport-id".to_vec()),
         timestamp: Timestamp(app_msg.timestamp.0 + 1),

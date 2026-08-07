@@ -366,6 +366,18 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
+- **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
+  `hydrate_stable_groups_from_storage` is the cheap seed pass: per stored group it reads only the durable record —
+  no MLS load, snapshot list, or message scan — seeds a provisional `Stable(record.epoch)` entry so `live_group_ids`
+  keeps listing the group, restores disband/unrecoverable terminal state, seeds the inbound routing index from the
+  durable `transport_group_routes` table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
+  through the same `ensure_group_live` chokepoint with the retryable `GroupNotHydrated` (never a partial view);
+  `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
+  seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
+  the epoch entry — a quarantined group must never hold one). `hydrate_all_stored_groups` is the eager compatibility
+  path (seed + drain-all) used by `AccountDeviceSession::open` until the app-layer background pipeline lands. Groups
+  without a durable route row sit in `route_backfill_pending`; ingest backfills each with one MLS load ever
+  (amortized preservation of the mdk#740 attacker-paced-scan bound).
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the

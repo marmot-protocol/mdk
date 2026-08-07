@@ -2039,6 +2039,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::InvalidWelcome
         | EngineError::WelcomeAlreadyProcessed
         | EngineError::UnknownGroup(_)
+        | EngineError::GroupNotHydrated(_)
         | EngineError::UnknownMember { .. }
         | EngineError::NotAMember { .. }
         | EngineError::MissingRequiredCapabilities { .. }
@@ -2093,6 +2094,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::UnknownGroup(_) => "unknown_group",
+        EngineError::GroupNotHydrated(_) => "group_not_hydrated",
         EngineError::UnknownMember { .. } => "unknown_member",
         EngineError::NotAMember { .. } => "not_a_member",
         EngineError::Other(_) => "other",

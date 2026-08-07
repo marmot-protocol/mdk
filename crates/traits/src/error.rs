@@ -12,6 +12,15 @@ pub enum EngineError {
     #[error("unknown group")]
     UnknownGroup(GroupId),
 
+    /// The group was seeded by the session-open cheap pass but its full
+    /// per-group hydration (MLS load, validation, pending-commit recovery)
+    /// has not run yet (mdk#1161). Retryable: the caller can wait for the
+    /// background hydration pipeline or drive `ensure_hydrated` on a `&mut`
+    /// entry point. Distinct from [`Self::UnknownGroup`] so hosts can render
+    /// "still loading" instead of "no such group".
+    #[error("group not hydrated yet; retry after hydration")]
+    GroupNotHydrated(GroupId),
+
     #[error("unknown pending send reference")]
     UnknownPending,
 

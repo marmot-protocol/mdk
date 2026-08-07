@@ -690,7 +690,7 @@ async fn strict_cutover_rejects_inbound_adds_to_legacy_groups_during_convergence
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
-    bob.hydrate_stable_groups_from_storage().unwrap();
+    bob.hydrate_all_stored_groups().unwrap();
     assert_eq!(
         bob.group_record(&group_id).unwrap().protocol_profile,
         ProtocolProfile::Legacy
@@ -804,7 +804,7 @@ async fn strict_cutover_add_replay_retires_raw_and_content_rows() {
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap();
-    bob.hydrate_stable_groups_from_storage().unwrap();
+    bob.hydrate_all_stored_groups().unwrap();
 
     let local_pending = match bob
         .send(SendIntent::UpdateGroupData {
@@ -2180,7 +2180,7 @@ async fn selfremove_local_selection_uses_lowest_complete_message_digest_after_re
     ));
     drop(alice);
     let mut alice = build_client_on_storage(b"alice", alice_storage.clone());
-    alice.hydrate_stable_groups_from_storage().unwrap();
+    alice.hydrate_all_stored_groups().unwrap();
     advance_selfremove_auto_commit(&mut alice, &group_id).await;
 
     let crypto = RustCrypto::default();
@@ -2567,7 +2567,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
 
     drop(bob);
     let mut bob = build_client_on_storage(b"bob", bob_storage);
-    bob.hydrate_stable_groups_from_storage().unwrap();
+    bob.hydrate_all_stored_groups().unwrap();
     let blocked = bob
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),

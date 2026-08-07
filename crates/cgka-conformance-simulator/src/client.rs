@@ -711,7 +711,7 @@ impl HarnessClient {
             },
         );
         engine
-            .hydrate_stable_groups_from_storage()
+            .hydrate_all_stored_groups()
             .expect("engine hydrates from storage");
         self.storage = Some(storage);
         self.engine = Some(engine);

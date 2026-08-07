@@ -18,6 +18,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   chat-projection readiness from full account-command readiness across
   0/10/100/1000 stored groups.
 
+- Engine session open now uses two-phase hydration: a cheap seed pass reads
+  only durable group records (plus a new durable transport-route table) and
+  full per-group hydration — MLS load, validation, pending-commit recovery —
+  runs per group, on demand from send/ingest/convergence entry points or
+  eagerly via the compatibility path. Per-group hydration itself got cheaper:
+  one group-record read and one message scan replace the former three record
+  reads and four full message-table scans per group. Groups awaiting
+  hydration report a new retryable "not hydrated yet" state instead of
+  partial data.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`

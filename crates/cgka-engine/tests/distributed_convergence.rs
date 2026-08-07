@@ -3015,7 +3015,7 @@ async fn restart_preserves_admin_reservation() {
 
     let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
     restarted
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("session-open hydration succeeds");
     let preserved = carol_storage
         .convergence_pass(&group_id)
@@ -3068,7 +3068,7 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
 
     let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
     restarted
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("session-open hydration succeeds");
 
     restarted
@@ -3879,7 +3879,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
 
     let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
     restarted
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("session-open hydration succeeds");
     let hydration_events = restarted.drain_events();
     assert!(
@@ -4189,7 +4189,7 @@ async fn intent_retained_before_a_halt_is_delivered_after_a_verified_repair() {
     drop(carol);
     let mut repaired = build_client_with_storage(b"carol", carol_storage.clone());
     repaired
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("session-open hydration succeeds after repair");
     assert!(
         repaired
@@ -5577,7 +5577,7 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
     clock.set_wall_ms(10_400);
     let mut restarted = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
     restarted
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("restart hydrates the persisted group");
     restarted
         .set_convergence_policy(CanonicalizationPolicy {
@@ -5836,7 +5836,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
 
     let mut restarted_alice = build_client_with_storage(b"alice", alice_storage.clone());
     restarted_alice
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("rebuild after proposal-consuming commit");
     assert_message_state(&alice_storage, &proposal, MessageState::Processed);
     assert!(
@@ -8024,7 +8024,7 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
 
     let mut restarted = build_client_with_storage(b"alice-restart-queued", alice_storage);
     restarted
-        .hydrate_stable_groups_from_storage()
+        .hydrate_all_stored_groups()
         .expect("session-open hydration succeeds");
     let scheduled = restarted.drain_pending_convergence_groups();
     assert!(
