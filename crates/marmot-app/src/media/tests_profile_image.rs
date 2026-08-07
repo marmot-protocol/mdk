@@ -98,6 +98,37 @@ fn profile_image_raw_url_length_checked_before_parse_normalization() {
 }
 
 #[test]
+fn profile_image_raw_url_length_checked_before_whitespace_trimming() {
+    let valid = "https://media.example/avatar.png";
+    let raw = format!(
+        "{}{}",
+        " ".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN),
+        valid
+    );
+    assert!(raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
+    assert_eq!(raw.trim(), valid);
+
+    let err = parse_profile_image_fetch_url(&raw).unwrap_err();
+    assert!(err.contains("exceeds"));
+}
+
+#[test]
+fn profile_image_redirect_length_checked_before_whitespace_trimming() {
+    let current = Url::parse("https://media.example/start.png").unwrap();
+    let raw_location = format!(
+        "{}{}",
+        " ".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN),
+        "/avatar.png"
+    );
+    assert!(raw_location.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
+    assert_eq!(raw_location.trim(), "/avatar.png");
+
+    let err =
+        super::host_safety::parse_profile_image_redirect_url(&current, &raw_location).unwrap_err();
+    assert!(err.contains("exceeds"));
+}
+
+#[test]
 fn profile_image_fetch_url_rejects_credentials_fragments_scheme_and_custom_port() {
     let base = "https://media.example/avatar.png";
     for (url, needle) in [
