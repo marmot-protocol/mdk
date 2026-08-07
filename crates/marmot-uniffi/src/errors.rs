@@ -10,6 +10,13 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    /// The group exists but its full hydration has not completed yet
+    /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
+    /// group shortly after account readiness, and worker-routed reads wait
+    /// for exactly the named group. Distinct from `UnknownGroup` so hosts can
+    /// render "still loading" instead of "no such group".
+    #[error("group hydration pending: {group_id_hex}")]
+    GroupHydrationPending { group_id_hex: String },
     #[error("invalid chat pin: {details}")]
     InvalidChatPin { details: String },
     /// Host-supplied draft attachment metadata is malformed.
@@ -275,6 +282,9 @@ impl MarmotKitError {
     fn from_engine_error(value: &EngineError) -> Self {
         match value {
             EngineError::UnknownGroup(group_id) => Self::UnknownGroup {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
+            EngineError::GroupNotHydrated(group_id) => Self::GroupHydrationPending {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
             EngineError::NotGroupAdmin { group_id } => Self::NotGroupAdmin {

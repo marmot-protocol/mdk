@@ -1,0 +1,148 @@
+//! mdk#1161 regression: with group hydration deliberately held, the account
+//! runtime still signals readiness and the persisted chat-list projection is
+//! fully readable, while a group read issued during the hold waits for
+//! exactly the group it names. A later unheld boot proves the pipeline
+//! completes and every group serves details.
+//!
+//! The hold uses the `dev_startup_hydration_batch_delay_ms` test knob
+//! (honored only with `test-policy-overrides`), which delays each hydration
+//! batch while the worker keeps serving commands — so this file is compiled
+//! only under that feature, matching how CI runs the integration matrix.
+#![cfg(feature = "test-policy-overrides")]
+
+use std::time::{Duration, Instant};
+
+use cgka_traits::types::GroupId;
+use marmot_account::AccountHome;
+use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime};
+use nostr_relay_builder::MockRelay;
+
+const BENCH_ACCOUNT: &str = "held";
+const GROUP_COUNT: usize = 6;
+/// Long enough that no hydration batch completes during the held boot's
+/// assertions, short enough that worker shutdown remains prompt.
+const BATCH_HOLD_MS: u64 = 30_000;
+
+fn open_store(dir: &tempfile::TempDir, relay_url: &str, hold_ms: Option<u64>) -> MarmotApp {
+    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    if let Some(ms) = hold_ms {
+        config = config.with_dev_startup_hydration_batch_delay_ms(ms);
+    }
+    MarmotApp::with_relay_and_config(dir.path(), relay_url.to_owned(), config)
+}
+
+#[test]
+fn chat_list_is_readable_and_group_reads_wait_per_group_while_hydration_is_held() {
+    let thread = std::thread::Builder::new()
+        .name("startup-hydration-hold".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(held_hydration_body());
+        })
+        .unwrap();
+    thread.join().unwrap();
+}
+
+async fn held_hydration_body() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+
+    // --- one member key-package donor in its own store ---
+    let dir_donor = tempfile::tempdir().unwrap();
+    let home_donor = AccountHome::open(dir_donor.path());
+    home_donor.create_account("donor").unwrap();
+    let donor_id = home_donor.account("donor").unwrap().account_id_hex;
+    {
+        let app_donor = open_store(&dir_donor, &url, None);
+        let mut donor = app_donor.client("donor").await.unwrap();
+        donor.publish_key_package().await.unwrap();
+    }
+
+    // --- fixture store with GROUP_COUNT groups ---
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account(BENCH_ACCOUNT).unwrap();
+    let mut group_ids = Vec::new();
+    {
+        let app_fixture = open_store(&dir, &url, None);
+        let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
+        for group in 0..GROUP_COUNT {
+            group_ids.push(
+                client
+                    .create_group(&format!("held group {group}"), &[donor_id.as_str()])
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+
+    // --- boot 1: hydration held; readiness and the chat list must not wait ---
+    let app = open_store(&dir, &url, Some(BATCH_HOLD_MS));
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let start_started = Instant::now();
+    runtime.start().await.unwrap();
+    let ready_elapsed = start_started.elapsed();
+    assert!(
+        ready_elapsed < Duration::from_millis(BATCH_HOLD_MS / 2),
+        "readiness must not wait on the held hydration pipeline (took {ready_elapsed:?})"
+    );
+
+    let rows = app.chat_list(BENCH_ACCOUNT, false).unwrap();
+    assert_eq!(
+        rows.len(),
+        GROUP_COUNT,
+        "persisted chat list must hold every group while hydration is held"
+    );
+
+    // A group read issued during the hold hydrates exactly the group it
+    // names and answers from live state — it must not wait out the hold.
+    let probed: &GroupId = group_ids.last().unwrap();
+    let read_started = Instant::now();
+    let members = tokio::time::timeout(
+        Duration::from_millis(BATCH_HOLD_MS / 2),
+        runtime.group_members(BENCH_ACCOUNT, probed),
+    )
+    .await
+    .expect("group read during the hold must wait for its group only")
+    .unwrap();
+    assert!(
+        !members.is_empty(),
+        "per-group hydration must produce the real roster"
+    );
+    assert!(
+        read_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
+        "group read must not wait out the pipeline hold"
+    );
+
+    // The pipeline itself is still held: only the session-open stage sample
+    // exists (the pipeline records its own AccountGroupHydration sample when
+    // it completes).
+    let hydration_attempts = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot()
+        .account_group_hydration
+        .attempts;
+    assert_eq!(
+        hydration_attempts, 1,
+        "hydration pipeline must still be held while assertions run"
+    );
+    runtime.shutdown().await;
+
+    // --- boot 2: unheld; the pipeline completes and every group serves ---
+    let app = open_store(&dir, &url, None);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    for group_id in &group_ids {
+        let members = runtime
+            .group_members(BENCH_ACCOUNT, group_id)
+            .await
+            .unwrap();
+        assert!(!members.is_empty());
+    }
+    runtime.shutdown().await;
+}

@@ -1366,6 +1366,7 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
+        let mut hydration_pending = false;
         for group_id_hex in self
             .app
             .account_group_ids_defaulting_to_member(&self.state.label)?
@@ -1377,8 +1378,22 @@ impl AppClient {
             // Authoritative roster from engine state. On any engine error
             // (unknown/quarantined group, partially-missing live state) leave
             // the row at the preserving default — uncertainty never suppresses.
-            let Ok(members) = self.runtime.members(&group_id) else {
-                continue;
+            let members = match self.runtime.members(&group_id) {
+                Ok(members) => members,
+                Err(err) => {
+                    // A deferred-hydration open (mdk#1161) answers every
+                    // roster read with the retryable not-hydrated state.
+                    // Skipping is correct, but the once-only marker must not
+                    // burn on a pass that could not see any roster — the
+                    // worker re-runs this after its hydration pipeline.
+                    if matches!(
+                        AppError::from(err).as_engine_error(),
+                        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+                    ) {
+                        hydration_pending = true;
+                    }
+                    continue;
+                }
             };
             if local_account_removed_from_roster(&members, &local_account_id_hex) {
                 self.app.set_group_self_membership(
@@ -1388,10 +1403,12 @@ impl AppClient {
                 )?;
             }
         }
-        self.app.mark_account_import_complete(
-            &self.state.label,
-            crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
-        )?;
+        if !hydration_pending {
+            self.app.mark_account_import_complete(
+                &self.state.label,
+                crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
+            )?;
+        }
         Ok(())
     }
 
