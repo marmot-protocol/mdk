@@ -428,22 +428,11 @@
       "artifact": "multigroup-isolation.v1.json",
       "coverage": [
         "first multi-group in_group vector",
-        "overlapping membership across two live groups",
-        "cross-group plaintext isolation via zero-count assertions"
+        "three live pairwise groups over three clients, one not created by alice",
+        "overlapping membership for every client",
+        "cross-group plaintext isolation via zero-count assertions on all six foreign edges"
       ],
-      "next": "Grow to three groups with rename traffic if cross-group state bleed is suspected."
-    },
-    {
-      "id": "pairwise-threads/v1",
-      "kind": "scenario_vector",
-      "status": "portable",
-      "artifact": "pairwise-threads.v1.json",
-      "coverage": [
-        "full pairwise thread mesh over three clients",
-        "same-account thread isolation",
-        "per-thread transcript completeness"
-      ],
-      "next": "Scale the mesh in a generated family when quadratic growth is needed."
+      "next": "Add rename traffic per group if cross-group metadata bleed is suspected; scale the mesh in a generated family when quadratic growth is needed."
     },
     {
       "id": "admin-handover/v1",

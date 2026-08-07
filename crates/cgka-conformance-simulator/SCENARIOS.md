@@ -212,23 +212,18 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `multigroup-isolation/v1`
 
 - File: `vectors/multigroup-isolation.v1.json`
-- Provenance: ported from the external multi-VM harness scenario catalog (`multigroup.rb`).
-- Setup: the first multi-group vector. Alice founds group `a` with Bob and group `b` with Carol; Alice is the only
-  overlap. Both groups exchange application traffic through `in_group`-scoped steps.
-- Pressure: cross-group encryption boundaries under overlapping membership.
-- Expected: Bob never observes group-b plaintext and Carol never observes group-a plaintext (`payload_count` zero
-  assertions); each single-group member's exact transcript holds only its own group's traffic.
-
-### `pairwise-threads/v1`
-
-- File: `vectors/pairwise-threads.v1.json`
-- Provenance: ported from the external multi-VM harness scenario catalog (`pairs.rb`).
-- Setup: the full pairwise mesh over three clients (`ab`, `ac`, `bc`); each thread carries one message in each
-  direction.
-- Pressure: same-account thread isolation. Every client sits in two private threads at once.
-- Expected: each client observes exactly its own threads' payloads, and one representative foreign-thread payload per
-  client is pinned at zero. Observation buffers are per-client, so the exact lists span both threads a client is in;
-  the zero-count assertions carry the isolation claim.
+- Provenance: ported from the external multi-VM harness scenario catalog (`multigroup.rb` and `pairs.rb`).
+- Setup: the first multi-group vector, covering the full pairwise mesh over three clients. Alice founds group `a`
+  with Bob and group `b` with Carol, and Bob founds group `c` with Carol, so every client sits in exactly two groups
+  and one group's creator is not Alice. All three groups exchange application traffic through `in_group`-scoped
+  steps.
+- Pressure: cross-group encryption boundaries under overlapping membership, including a group whose creator is not
+  the shared founder.
+- Expected: every foreign payload is pinned at zero — Bob never observes group-b plaintext, Carol never observes
+  group-a plaintext, and Alice never observes group-c plaintext (six `payload_count` assertions, one per foreign
+  edge). Observation buffers are per-client, so each client's exact `received_payloads` list spans both groups it
+  belongs to; the zero-count assertions carry the isolation claim. This vector absorbed `pairwise-threads/v1`, whose
+  one addition over the two-group form was the group with a non-Alice creator.
 
 ### `admin-handover/v1`
 

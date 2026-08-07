@@ -78,6 +78,38 @@
       },
       {
         "type": "in_group",
+        "group": "c",
+        "action": {
+          "type": "create_group",
+          "creator": "bob",
+          "name": "group-c",
+          "invitees": [
+            "carol"
+          ],
+          "required_features": [],
+          "initial_admins": [
+            "bob"
+          ],
+          "pending": "c-create"
+        }
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "c-create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol"
+        ]
+      },
+      {
+        "type": "in_group",
         "group": "a",
         "action": {
           "type": "clear_events",
@@ -94,6 +126,17 @@
           "type": "clear_events",
           "clients": [
             "alice",
+            "carol"
+          ]
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "c",
+        "action": {
+          "type": "clear_events",
+          "clients": [
+            "bob",
             "carol"
           ]
         }
@@ -132,6 +175,24 @@
           "type": "send_app_message",
           "sender": "carol",
           "payload": "multigroup:b:carol"
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "c",
+        "action": {
+          "type": "send_app_message",
+          "sender": "bob",
+          "payload": "multigroup:c:bob"
+        }
+      },
+      {
+        "type": "in_group",
+        "group": "c",
+        "action": {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "multigroup:c:carol"
         }
       },
       {
@@ -194,6 +255,30 @@
         }
       },
       {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "alice",
+            "payload": "multigroup:c:bob",
+            "count": 0
+          }
+        }
+      },
+      {
+        "type": "assert",
+        "assertion": {
+          "mode": "exactly",
+          "predicate": {
+            "type": "payload_count",
+            "client": "alice",
+            "payload": "multigroup:c:carol",
+            "count": 0
+          }
+        }
+      },
+      {
         "type": "in_group",
         "group": "a",
         "action": {
@@ -232,6 +317,13 @@
       "resolution": "confirmed"
     },
     {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "bob",
+      "pending": "c-create",
+      "resolution": "confirmed"
+    },
+    {
       "type": "client_state",
       "client": "alice",
       "epoch": 1,
@@ -247,7 +339,8 @@
       "epoch": 1,
       "member_count": 2,
       "received_payloads": [
-        "multigroup:a:alice"
+        "multigroup:a:alice",
+        "multigroup:c:carol"
       ]
     },
     {
@@ -256,7 +349,8 @@
       "epoch": 1,
       "member_count": 2,
       "received_payloads": [
-        "multigroup:b:alice"
+        "multigroup:b:alice",
+        "multigroup:c:bob"
       ]
     }
   ]
