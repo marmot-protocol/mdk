@@ -8,10 +8,13 @@ use serde::Deserialize;
 use url::{Host, Url};
 
 use super::host_safety::{
-    is_loopback_host, reject_non_public_ip, validate_blossom_fetch_url,
-    validate_profile_image_fetch_url,
+    is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
+    reject_non_public_ip, validate_blossom_fetch_url,
 };
 use crate::{AppError, unix_now_seconds};
+
+#[cfg(test)]
+use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
@@ -171,107 +174,118 @@ pub(crate) async fn fetch_blossom_blob(
     url: &str,
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
-    let mut current = Url::parse(url)
+    let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
-    let mut redirects = 0_usize;
-
-    loop {
-        let client = media_http_client_for_url(&current, allow_loopback_http).await?;
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(reqwest_blob_error)?;
-        let status = response.status();
-        if status.is_success() {
-            return read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await;
-        }
-        if !status.is_redirection() {
-            return Err(AppError::BlobStore(format!(
-                "download returned HTTP {}",
-                status.as_u16()
-            )));
-        }
-
-        if redirects >= BLOSSOM_REDIRECT_LIMIT {
-            return Err(AppError::BlobStore(format!(
-                "media redirect chain exceeded {BLOSSOM_REDIRECT_LIMIT} hops"
-            )));
-        }
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .ok_or_else(|| {
-                AppError::BlobStore("redirect response did not include Location".into())
-            })?
-            .to_str()
-            .map_err(|_| AppError::BlobStore("redirect Location header is invalid".into()))?;
-        let next = current.join(location).map_err(|_| {
-            AppError::BlobStore("redirect Location header is not a valid URL".into())
-        })?;
-        validate_blossom_redirect_target(&current, &next, allow_loopback_http)?;
-        current = next;
-        redirects += 1;
-    }
-}
-
-pub(crate) async fn fetch_profile_image(url: &str, max_bytes: u64) -> Result<Vec<u8>, AppError> {
-    profile_operation_timeout(
-        MEDIA_HTTP_TOTAL_TIMEOUT,
-        fetch_profile_image_impl(url, max_bytes, ProfileResolveMode::Production),
+    fetch_http_with_bounded_redirects(
+        current,
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        move |url| {
+            let allow_loopback_http = allow_loopback_http;
+            async move { media_http_client_for_url(&url, allow_loopback_http).await }
+        },
+        move |current, location| {
+            let next = current.join(location).map_err(|_| {
+                AppError::BlobStore("redirect Location header is not a valid URL".into())
+            })?;
+            validate_blossom_redirect_target(current, &next, allow_loopback_http)?;
+            Ok(next)
+        },
     )
     .await
 }
 
+pub(crate) async fn fetch_profile_image(url: &str, max_bytes: u64) -> Result<Vec<u8>, AppError> {
+    profile_operation_timeout(fetch_profile_image_impl(url, max_bytes)).await
+}
+
 #[cfg(test)]
-pub(crate) async fn fetch_profile_image_with_injected_addrs(
+pub(crate) async fn fetch_profile_image_with_loopback(
     url: &str,
     max_bytes: u64,
-    injected_addrs: Vec<SocketAddr>,
 ) -> Result<Vec<u8>, AppError> {
-    profile_operation_timeout(
-        MEDIA_HTTP_TOTAL_TIMEOUT,
-        fetch_profile_image_impl(url, max_bytes, ProfileResolveMode::Injected(injected_addrs)),
-    )
+    let raw = url.trim();
+    if raw.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(AppError::UnsafeMediaFetch(format!(
+            "profile image URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        )));
+    }
+    let current = Url::parse(raw).map_err(|err| {
+        AppError::UnsafeMediaFetch(format!("profile image URL is invalid: {err}"))
+    })?;
+    validate_blossom_fetch_url(&current, true).map_err(AppError::UnsafeMediaFetch)?;
+    profile_operation_timeout(fetch_http_with_bounded_redirects(
+        current,
+        max_bytes,
+        move |url| async move { media_http_client_for_url(&url, true).await },
+        move |current, location| {
+            let raw_location = location.trim();
+            if raw_location.len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+                return Err(AppError::UnsafeMediaFetch(format!(
+                    "profile image redirect URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+                )));
+            }
+            let next = current.join(raw_location).map_err(|err| {
+                AppError::UnsafeMediaFetch(format!(
+                    "profile image redirect URL is invalid: {err}"
+                ))
+            })?;
+            validate_blossom_fetch_url(&next, true).map_err(AppError::UnsafeMediaFetch)?;
+            Ok(next)
+        },
+    ))
     .await
 }
 
 async fn profile_operation_timeout<T>(
-    timeout: Duration,
     operation: impl std::future::Future<Output = Result<T, AppError>>,
 ) -> Result<T, AppError> {
-    tokio::time::timeout(timeout, operation)
+    tokio::time::timeout(MEDIA_HTTP_TOTAL_TIMEOUT, operation)
         .await
         .map_err(|_| AppError::BlobStore("request timed out".into()))?
 }
 
-#[cfg(test)]
-pub(super) async fn profile_operation_timeout_for_test(timeout: Duration) -> Result<(), AppError> {
-    profile_operation_timeout(timeout, std::future::pending()).await
+async fn fetch_profile_image_impl(url: &str, max_bytes: u64) -> Result<Vec<u8>, AppError> {
+    let current = parse_profile_image_fetch_url(url).map_err(AppError::UnsafeMediaFetch)?;
+    fetch_http_with_bounded_redirects(
+        current,
+        max_bytes,
+        move |url| async move { media_http_client_for_profile(&url).await },
+        move |current, location| {
+            parse_profile_image_redirect_url(current, location).map_err(AppError::UnsafeMediaFetch)
+        },
+    )
+    .await
 }
 
-enum ProfileResolveMode {
-    Production,
-    #[cfg(test)]
-    Injected(Vec<SocketAddr>),
+/// Vet every DNS answer before pinning a profile-image fetch.
+pub(crate) fn vet_profile_fetch_resolved_addresses(addrs: &[SocketAddr]) -> Result<(), AppError> {
+    for addr in addrs {
+        reject_non_public_ip(addr.ip(), false).map_err(|err| {
+            AppError::UnsafeMediaFetch(format!("unsafe profile image host address: {err}"))
+        })?;
+    }
+    Ok(())
 }
 
-async fn fetch_profile_image_impl(
-    url: &str,
-    max_bytes: u64,
-    resolve_mode: ProfileResolveMode,
-) -> Result<Vec<u8>, AppError> {
-    let mut current = Url::parse(url)
-        .map_err(|_| AppError::InvalidAppMessagePayload("profile image URL is invalid".into()))?;
-    validate_profile_image_fetch_url(&current).map_err(|err| {
-        AppError::InvalidAppMessagePayload(format!("unsafe profile image URL: {err}"))
-    })?;
+/// Shared manual redirect loop for Blossom blob and profile-image fetches.
+/// Keep policy differences in the caller-supplied client and redirect validators.
+async fn fetch_http_with_bounded_redirects<C, CFut, R>(
+    mut current: Url,
+    max_body_bytes: u64,
+    mut client_for_url: C,
+    mut redirect_target: R,
+) -> Result<Vec<u8>, AppError>
+where
+    C: FnMut(Url) -> CFut,
+    CFut: std::future::Future<Output = Result<reqwest::Client, AppError>>,
+    R: FnMut(&Url, &str) -> Result<Url, AppError>,
+{
     let mut redirects = 0_usize;
 
     loop {
-        let client = media_http_client_for_profile(&current, &resolve_mode).await?;
+        let client = client_for_url(current.clone()).await?;
         let response = client
             .get(current.clone())
             .send()
@@ -279,7 +293,7 @@ async fn fetch_profile_image_impl(
             .map_err(reqwest_blob_error)?;
         let status = response.status();
         if status.is_success() {
-            return read_limited_blossom_body(response, max_bytes).await;
+            return read_limited_blossom_body(response, max_body_bytes).await;
         }
         if !status.is_redirection() {
             return Err(AppError::BlobStore(format!(
@@ -301,28 +315,8 @@ async fn fetch_profile_image_impl(
             })?
             .to_str()
             .map_err(|_| AppError::BlobStore("redirect Location header is invalid".into()))?;
-        let next = current.join(location).map_err(|_| {
-            AppError::BlobStore("redirect Location header is not a valid URL".into())
-        })?;
-        validate_profile_image_fetch_url(&next).map_err(|err| {
-            AppError::InvalidAppMessagePayload(format!("unsafe profile image redirect URL: {err}"))
-        })?;
-        current = next;
+        current = redirect_target(&current, location)?;
         redirects += 1;
-    }
-}
-
-#[cfg(test)]
-pub(super) fn plan_profile_image_pin(
-    url: &Url,
-    injected_addrs: &[SocketAddr],
-) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
-    match url
-        .host()
-        .ok_or_else(|| AppError::BlobStore("media URL is missing a host".into()))?
-    {
-        Host::Domain(domain) => validated_media_domain_pin(domain, injected_addrs, false).map(Some),
-        _ => Ok(None),
     }
 }
 
@@ -343,23 +337,47 @@ fn validated_media_domain_pin(
     Ok((domain.to_ascii_lowercase(), addrs.to_vec()))
 }
 
-async fn profile_media_pin(
-    url: &Url,
-    resolve_mode: &ProfileResolveMode,
-) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
-    match resolve_mode {
-        ProfileResolveMode::Production => resolve_media_host(url, false).await,
-        #[cfg(test)]
-        ProfileResolveMode::Injected(addrs) => plan_profile_image_pin(url, addrs),
-    }
+async fn media_http_client_for_profile(url: &Url) -> Result<reqwest::Client, AppError> {
+    let pin = resolve_media_host_for_profile(url).await?;
+    build_pinned_media_http_client(pin)
 }
 
-async fn media_http_client_for_profile(
+async fn resolve_media_host_for_profile(
     url: &Url,
-    resolve_mode: &ProfileResolveMode,
-) -> Result<reqwest::Client, AppError> {
-    let pin = profile_media_pin(url, resolve_mode).await?;
-    build_pinned_media_http_client(MEDIA_HTTP_TOTAL_TIMEOUT, pin)
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+    match url
+        .host()
+        .ok_or_else(|| AppError::UnsafeMediaFetch("profile image URL is missing a host".into()))?
+    {
+        Host::Domain(domain) => {
+            let port = url.port_or_known_default().ok_or_else(|| {
+                AppError::UnsafeMediaFetch("profile image URL is missing a fetch port".into())
+            })?;
+            let addrs = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|_| AppError::BlobStore("media host DNS lookup failed".into()))?
+                .collect::<Vec<_>>();
+            if addrs.is_empty() {
+                return Err(AppError::BlobStore(
+                    "media host DNS lookup returned no addresses".into(),
+                ));
+            }
+            vet_profile_fetch_resolved_addresses(&addrs)?;
+            Ok(Some((domain.to_ascii_lowercase(), addrs)))
+        }
+        Host::Ipv4(addr) => {
+            reject_non_public_ip(IpAddr::V4(addr), false).map_err(|err| {
+                AppError::UnsafeMediaFetch(format!("unsafe profile image host address: {err}"))
+            })?;
+            Ok(None)
+        }
+        Host::Ipv6(addr) => {
+            reject_non_public_ip(IpAddr::V6(addr), false).map_err(|err| {
+                AppError::UnsafeMediaFetch(format!("unsafe profile image host address: {err}"))
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 pub(super) fn validate_blossom_redirect_target(
@@ -421,20 +439,17 @@ async fn media_http_client_for_url(
         && allow_loopback_http
         && url.host().map(is_loopback_host).unwrap_or(false);
     let pin = resolve_media_host(url, allow_loopback).await?;
-    build_pinned_media_http_client(MEDIA_HTTP_TOTAL_TIMEOUT, pin)
+    build_pinned_media_http_client(pin)
 }
 
 fn build_pinned_media_http_client(
-    operation_timeout: Duration,
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
-    let connect_timeout = operation_timeout.min(MEDIA_HTTP_CONNECT_TIMEOUT);
-    let read_timeout = operation_timeout.min(MEDIA_HTTP_READ_TIMEOUT);
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout)
-        .timeout(operation_timeout)
+        .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
+        .read_timeout(MEDIA_HTTP_READ_TIMEOUT)
+        .timeout(MEDIA_HTTP_TOTAL_TIMEOUT)
         .no_proxy()
         .no_gzip()
         .no_brotli()
