@@ -180,7 +180,7 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
 /// scenario catalog (cheeky, committy, crashy essences). Case indices rotate
 /// through four arms: seeded sequential admin churn, competing same-epoch
 /// admin-policy commits, restart during a commit burst, and a latecomer added
-/// under commit pressure with a forward-secrecy check.
+/// under commit pressure with a pre-join mailbox-isolation check.
 pub fn generate_admin_churn_family(seed: u64, cases: usize) -> Vec<GeneratedScenarioCase> {
     let mut out = Vec::with_capacity(cases);
     for case_index in 0..cases {

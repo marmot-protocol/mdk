@@ -1637,7 +1637,7 @@ async fn admin_churn_family_generates_deterministic_arms_that_pass() {
             .steps
             .iter()
             .any(|step| matches!(step, ScenarioStep::Assert { .. })),
-        "the latecomer arm carries forward-secrecy zero-count assertions"
+        "the latecomer arm carries pre-join mailbox-isolation zero-count assertions"
     );
 
     for case in &cases {
