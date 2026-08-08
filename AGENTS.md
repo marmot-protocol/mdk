@@ -73,7 +73,8 @@ The canonical protocol specification lives in
   account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. See
   `docs/marmot-architecture/overview/observability.md`.
 - Create local files, sockets, and databases restrictive-by-construction via `crates/fs-private` (or equivalent
-  posture with an on-disk mode test); see `docs/marmot-architecture/overview/local-artifact-safety.md`.
+  posture with an on-disk mode test), and release their file locks explicitly before a host suspends
+  (`MarmotAppRuntime::shutdown_and_close`); see `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Route every outbound connection through the host-safety dial discipline: validate each resolved address with
   `cgka_traits::app_components::reject_non_public_ip`, pin the validated address, choose TLS trust from config (never a
   resolved IP), apply a connect timeout, and gate loopback behind an explicit dev flag. See

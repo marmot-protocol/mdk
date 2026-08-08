@@ -34,7 +34,7 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `overview/local-artifact-safety.md`
   - **Role:** Restrictive-by-construction creation policy for local files, sockets, and databases; the
-    `crates/fs-private` helper contract.
+    `crates/fs-private` helper contract; the close-before-suspension rules for WAL connections and the root lease.
 
 - **Path:** `overview/dial-safety.md`
   - **Role:** One host-safety discipline for every outbound connection (validate resolved addresses, pin, trust from

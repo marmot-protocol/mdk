@@ -1,14 +1,16 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+use storage_sqlite::{
+    CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher,
+};
 
 use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
 
@@ -24,9 +26,12 @@ use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMe
 /// profile; the alternative risks hiding accounts that do.
 pub(crate) const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
-#[derive(Clone)]
+/// Message carried by every storage error this cache raises after a close.
+const CLOSED_DETAIL: &str = "directory cache is closed";
+
+#[derive(Clone, Debug)]
 pub(crate) struct DirectoryCache {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<CloseableConnection>,
     #[cfg(test)]
     put_count: Arc<AtomicUsize>,
 }
@@ -65,7 +70,7 @@ impl DirectoryCache {
     fn from_connection(conn: Connection) -> Result<Self, AppError> {
         initialize_schema(&conn)?;
         let cache = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
             #[cfg(test)]
             put_count: Arc::new(AtomicUsize::new(0)),
         };
@@ -83,17 +88,22 @@ impl DirectoryCache {
         self.put_count.store(0, Ordering::SeqCst);
     }
 
-    fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Close this cache's database, releasing its file handle and any locks.
+    /// Terminal and idempotent: later reads and writes fail with a closed
+    /// storage error and nothing reopens.
+    pub(crate) fn close(&self) -> Result<(), AppError> {
+        Ok(self.conn.close()?)
+    }
+
+    fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {
+        Ok(self.conn.lock()?)
     }
 
     pub(crate) fn entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let Some(row) = Self::directory_user_row(&conn, account_id_hex)? else {
             return Ok(None);
         };
@@ -101,7 +111,7 @@ impl DirectoryCache {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
                     relay_lists_json, key_package_json
@@ -145,7 +155,7 @@ impl DirectoryCache {
     ) -> Result<(), AppError> {
         #[cfg(test)]
         self.put_count.fetch_add(1, Ordering::SeqCst);
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         Self::put_with_reason_locked(&tx, entry, reason)?;
         tx.commit()?;
@@ -250,7 +260,7 @@ impl DirectoryCache {
         account_id_hex: &str,
         now: i64,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let Some(row) = conn
             .query_row(
                 "SELECT account_id_hex, npub, profile_json, follows_known, metadata_expires_at
@@ -329,7 +339,7 @@ impl DirectoryCache {
         &self,
         account_id_hex: &str,
     ) -> Result<Option<Vec<String>>, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let known = conn
             .query_row(
                 "SELECT follows_known FROM directory_search_graph_users WHERE account_id_hex = ?1",
@@ -355,7 +365,7 @@ impl DirectoryCache {
         record: &DirectorySearchGraphRecord,
         now: i64,
     ) -> Result<(), AppError> {
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         Self::put_search_graph_record_locked(&tx, record, now)?;
         tx.commit()?;
@@ -376,7 +386,7 @@ impl DirectoryCache {
         follows: &[String],
     ) -> Result<(), AppError> {
         let now = unix_now_seconds() as i64;
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO directory_search_graph_users (
@@ -590,7 +600,7 @@ impl DirectoryCache {
     }
 
     fn migrate_legacy_json_records(&self) -> Result<(), AppError> {
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         if !Self::table_exists_locked(&conn, "user_directory_records")? {
             return Ok(());
         }
@@ -615,7 +625,7 @@ impl DirectoryCache {
 
     #[cfg(test)]
     fn table_exists(&self, table: &str) -> Result<bool, AppError> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         Self::table_exists_locked(&conn, table)
     }
 
@@ -864,7 +874,7 @@ mod tests {
             .put(&directory_record(alice.clone(), vec![bob.clone()]))
             .unwrap();
 
-        let conn = cache.lock();
+        let conn = cache.lock().unwrap();
         let user_count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM directory_users WHERE account_id_hex = ?1",
@@ -1076,7 +1086,7 @@ mod tests {
 
         let cache = DirectoryCache::open(path, &key).unwrap();
         let entry = cache.entry(&alice).unwrap().unwrap();
-        let conn = cache.lock();
+        let conn = cache.lock().unwrap();
         let user_count: i64 = conn
             .query_row("SELECT count(*) FROM directory_users", [], |row| row.get(0))
             .unwrap();

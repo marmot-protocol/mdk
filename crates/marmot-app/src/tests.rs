@@ -5343,3 +5343,244 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
         "the receive seam must publish the escalation recorded during its ingest"
     );
 }
+
+/// Every SQLite database this app can open, plus the root runtime lease, must
+/// be released by one `close_storage` call — that is the whole contract iOS
+/// depends on before it suspends the process (`0xdead10cc` is raised for *any*
+/// lock held in the shared App Group container, not just the session database).
+#[test]
+fn close_storage_releases_every_database_and_the_root_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = AccountHome::open(root).create_account("closing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    // Open, and dirty, all three database families. Keep the handles: they are
+    // the only way to prove the *connections* were closed rather than merely
+    // dropped from the app's caches.
+    let session_storage = app.account_storage(&account.label).unwrap();
+    session_storage.app_message_count().unwrap();
+    let shared_storage = app.shared_storage().unwrap();
+    shared_storage
+        .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        })
+        .unwrap();
+    let directory_cache = app.directory_cache_for_account(&account).unwrap();
+    directory_cache.entries().unwrap();
+
+    let session_db = app.account_storage_path(&account.label);
+    let shared_db = app.shared_storage_path();
+    let sidecars = |db: &std::path::Path| {
+        [
+            PathBuf::from(format!("{}-wal", db.display())),
+            PathBuf::from(format!("{}-shm", db.display())),
+        ]
+    };
+    assert!(
+        sidecars(&shared_db).iter().all(|p| p.exists()),
+        "the shared database should hold WAL sidecars while open",
+    );
+    // The lease is held for as long as the app is alive.
+    assert!(matches!(
+        MarmotRootRuntimeLease::try_acquire(root),
+        Err(AppError::RuntimeBusy)
+    ));
+
+    app.close_storage().expect("close_storage should succeed");
+
+    assert!(app.storage_is_closed());
+    for db in [&session_db, &shared_db] {
+        for sidecar in sidecars(db) {
+            assert!(
+                !sidecar.exists(),
+                "{} must be gone once the last connection closes",
+                sidecar.display(),
+            );
+        }
+    }
+    // The directory cache is opened in rollback-journal mode, so it has no WAL
+    // sidecars to check. Its connection still has to be closed, and the handle
+    // taken before the close is what proves it: a cache that was merely evicted
+    // from the app's map would keep answering.
+    assert!(
+        matches!(
+            directory_cache.entries(),
+            Err(AppError::Storage(err)) if err.is_closed()
+        ),
+        "the directory cache connection must be closed, not just uncached",
+    );
+    // Same for the two WAL databases, via the handles rather than the caches.
+    assert!(session_storage.is_closed());
+    assert!(shared_storage.is_closed());
+
+    // The lease is an advisory lock on a file in the same container, so it has
+    // to go too; a second acquirer proves it did.
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+
+    // Nothing reopens: a late read must report the close instead of re-locking
+    // the container the host was just told is clear.
+    for error in [
+        app.account_storage(&account.label).err(),
+        app.shared_storage().err(),
+        app.directory_cache_for_account(&account).err(),
+    ]
+    .into_iter()
+    .map(|error| error.expect("a closed app must not hand out a database"))
+    {
+        assert!(
+            matches!(&error, AppError::Storage(err) if err.is_closed()),
+            "expected a closed-storage error, got {error:?}",
+        );
+    }
+}
+
+/// `close_storage` must not return — or release the root lease — while a
+/// database open is still in flight. Otherwise a host that awaited it, or
+/// another process that saw the lease free, would proceed while a freshly
+/// created SQLite connection still held locks in the container.
+///
+/// The read side of `storage_lifecycle` is exactly what an in-flight open
+/// holds, so taking it here stands in for one deterministically.
+#[test]
+fn close_storage_waits_for_an_open_that_is_already_in_flight() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    AccountHome::open(root).create_account("racing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    let in_flight_open = app
+        .storage_lifecycle
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let closing_app = app.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let result = closing_app.close_storage();
+        let _ = closed_tx.send(());
+        result
+    });
+
+    // While the open is in flight the close must make no observable progress:
+    // it has not returned, and the root lease is still held.
+    assert!(
+        closed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "close_storage must not return while an open is in flight",
+    );
+    assert!(
+        matches!(
+            MarmotRootRuntimeLease::try_acquire(root),
+            Err(AppError::RuntimeBusy)
+        ),
+        "the root lease must not be released while an open is in flight",
+    );
+
+    drop(in_flight_open);
+    closer
+        .join()
+        .unwrap()
+        .expect("close_storage should succeed once the open finishes");
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+}
+
+/// Concurrent `close_storage` callers must serialize: no caller may return
+/// while another is still closing connections, or the host gets a lock-free
+/// answer that is not yet true.
+#[test]
+fn concurrent_close_storage_callers_serialize() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = AccountHome::open(root).create_account("closing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+    let session_storage = app.account_storage(&account.label).unwrap();
+    app.shared_storage().unwrap();
+    app.directory_cache_for_account(&account).unwrap();
+
+    let closers = (0..4)
+        .map(|_| {
+            let app = app.clone();
+            std::thread::spawn(move || app.close_storage())
+        })
+        .collect::<Vec<_>>();
+    for closer in closers {
+        // Every caller returns only after the teardown is complete, so every
+        // caller's return is a truthful "nothing is locked any more".
+        closer
+            .join()
+            .unwrap()
+            .expect("close_storage should succeed");
+        assert!(session_storage.is_closed());
+        drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+    }
+}
+
+#[test]
+fn close_storage_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("closing-twice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    app.account_storage(&account.label).unwrap();
+
+    app.close_storage().expect("first close should succeed");
+    app.close_storage().expect("second close should be a no-op");
+    // Closing a never-opened app is fine too.
+    let untouched = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    untouched
+        .close_storage()
+        .expect("closing an app that opened nothing should succeed");
+}
+
+/// `shutdown_and_close` must work as the host's single call, with or without a
+/// preceding `shutdown`, and must stay safe when repeated.
+#[tokio::test]
+async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    let runtime = app.runtime();
+    assert!(!runtime.storage_is_closed());
+
+    // No preceding `shutdown`: the method performs its own.
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(runtime.storage_is_closed());
+
+    // Repeat, and repeat after an explicit `shutdown`, without panicking.
+    runtime.shutdown_and_close().await.unwrap();
+    runtime.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
+}
