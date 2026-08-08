@@ -1295,7 +1295,10 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
     ) -> Result<AppClient, AppError> {
-        self.local_client_with_relay_plane(label, relay_plane, Some(lifecycle))
+        // Deferred hydration (mdk#1161): the account worker drives the
+        // background per-group hydration pipeline after signalling local
+        // readiness, so runtime opens stay flat in stored-group count.
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, Some(lifecycle), true)
             .await
     }
 
@@ -1323,6 +1326,17 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false)
+            .await
+    }
+
+    async fn local_client_with_relay_plane_and_hydration(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+    ) -> Result<AppClient, AppError> {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -1335,7 +1349,7 @@ impl MarmotApp {
         let open = blocking_app_task(move || {
             let _permit = permit;
             app.ensure_account_state(&label)?;
-            app.open_account(&label, &relay_plane_for_open)
+            app.open_account(&label, &relay_plane_for_open, defer_group_hydration)
         })
         .await?;
         if let Some(lifecycle) = &lifecycle {
@@ -2699,6 +2713,7 @@ impl MarmotApp {
         &self,
         label: &str,
         relay_plane: &MarmotRelayPlane,
+        defer_group_hydration: bool,
     ) -> Result<OpenAppAccount, AppError> {
         let account = self.account_home().account(label)?;
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
@@ -2735,6 +2750,9 @@ impl MarmotApp {
         .account_identity_proof_signer(signer.as_proof_signer())
         .feature_registry(app_feature_registry())
         .supported_app_components(self.supported_app_component_ids());
+        if defer_group_hydration {
+            session_config = session_config.defer_group_hydration();
+        }
         // Production uses the protocol-pinned convergence policy (SessionConfig's
         // default). Only an explicit test-policy build may change it; normal
         // debug and release builds ignore the knob (mdk#970).

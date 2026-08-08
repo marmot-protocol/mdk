@@ -1954,7 +1954,8 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     assert!(!app.key_package_record_path(&account.label).exists());
 
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
-    app.open_account(&account.label, &relay_plane).unwrap();
+    app.open_account(&account.label, &relay_plane, false)
+        .unwrap();
     assert!(app.key_package_cutover_replacement_pending(&account.label));
     assert!(
         app.reusable_key_package_slot_id(&account.label, &account.account_id_hex)
