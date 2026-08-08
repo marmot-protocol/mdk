@@ -47,6 +47,18 @@ pub enum StorageError {
     /// it as a transient (not fatal) error.
     #[error("backend busy: {0}")]
     Busy(String),
+    /// The backend has been closed and will not serve further operations.
+    ///
+    /// Distinct from [`StorageError::Backend`] because it is an *expected*
+    /// terminal state, not a fault: a host that closes its store to release
+    /// database file locks before process suspension (see
+    /// `docs/marmot-architecture/overview/local-artifact-safety.md`) will race
+    /// a small amount of in-flight work, and that work must be reportable as
+    /// "we shut down" rather than as storage corruption. Never retryable —
+    /// a closed backend is terminal for the handle, and callers reopen a fresh
+    /// one instead.
+    #[error("backend closed: {0}")]
+    Closed(String),
     #[error("backend failure: {0}")]
     Backend(String),
     #[error("serialization failure: {0}")]
@@ -61,6 +73,16 @@ impl StorageError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, StorageError::Busy(_))
+    }
+
+    /// Whether this error means the backend has been deliberately closed.
+    ///
+    /// Callers use this to classify a failure as orderly shutdown rather than
+    /// a storage fault — for example to downgrade log severity or to suppress
+    /// a user-visible error while an app is being suspended.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        matches!(self, StorageError::Closed(_))
     }
 }
 

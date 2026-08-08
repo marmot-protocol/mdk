@@ -1,7 +1,8 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::connection::{CloseableConnection, ConnectionGuard};
 use crate::{
     SqliteResultExt, bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64,
     unix_now_ms, usize_to_i64,
@@ -20,9 +21,16 @@ const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// realistic result set; a warn fires if it is ever hit.
 const PUBLIC_DIRECTORY_USERS_MAX: usize = 10_000;
 
+/// Message carried by every [`StorageError::Closed`] this module raises.
+const CLOSED_DETAIL: &str = "sqlite shared storage is closed";
+
 #[derive(Clone, Debug)]
 pub struct SqliteSharedStorage {
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Closeable because this database is opened in WAL mode: an open
+    /// connection holds a persistent lock on its `-shm` sidecar, so a host that
+    /// must be lock-free at suspension needs an explicit close, not a dropped
+    /// clone.
+    conn: Arc<CloseableConnection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +83,21 @@ impl SqliteSharedStorage {
 
     pub fn in_memory() -> StorageResult<Self> {
         Self::from_connection(rusqlite::Connection::open_in_memory().storage()?)
+    }
+
+    /// Checkpoint the WAL and close this shared database, releasing its file
+    /// locks. Terminal and idempotent, with the same contract as
+    /// [`SqliteAccountStorage::close`][crate::SqliteAccountStorage::close]:
+    /// surviving clones fail with [`StorageError::Closed`] and nothing
+    /// reopens.
+    pub fn close(&self) -> StorageResult<()> {
+        self.conn.close()
+    }
+
+    /// Whether [`Self::close`] has run on this database.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.conn.is_closed()
     }
 
     fn from_connection(conn: rusqlite::Connection) -> StorageResult<Self> {
@@ -132,7 +155,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
         Self::ensure_audit_log_data_mode_column(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
     }
 
@@ -171,7 +194,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         record: &PublicDirectoryUserRecord,
     ) -> StorageResult<()> {
         retry_on_busy(|| {
-            let mut conn = self.lock();
+            let mut conn = self.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
@@ -230,7 +253,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let Some(mut record) = tx
             .query_row(
@@ -294,7 +317,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         // loads the whole cache. Ordering preserved (users by account_id_hex;
         // each user's follows by position then follow id).
         let cap = i64::try_from(max).unwrap_or(i64::MAX);
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
@@ -373,7 +396,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     pub fn relay_telemetry_settings(&self) -> StorageResult<StoredRelayTelemetrySettings> {
         self.ensure_relay_telemetry_settings()?;
-        self.lock()
+        self.lock()?
             .query_row(
                 "SELECT export_enabled, export_interval_seconds
                  FROM relay_telemetry_settings
@@ -395,7 +418,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         settings: &StoredRelayTelemetrySettings,
     ) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()
+            self.lock()?
                 .execute(
                     "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
@@ -417,7 +440,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     }
 
     pub fn telemetry_install_id(&self) -> StorageResult<Option<String>> {
-        self.lock()
+        self.lock()?
             .query_row(
                 "SELECT install_id
                  FROM telemetry_install
@@ -431,7 +454,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()
+            self.lock()?
                 .execute(
                     "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
                  VALUES (1, ?1, ?2)
@@ -447,7 +470,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
         self.ensure_audit_log_settings()?;
-        self.lock()
+        self.lock()?
             .query_row(
                 "SELECT enabled, data_mode
                  FROM audit_log_settings
@@ -465,7 +488,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()
+            self.lock()?
                 .execute(
                     "INSERT INTO audit_log_settings (
                     id, enabled, data_mode, updated_at_ms
@@ -488,7 +511,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     #[cfg(test)]
     fn table_columns(&self, table: &str) -> Vec<String> {
-        let conn = self.lock();
+        let conn = self.lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
@@ -498,15 +521,13 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             .unwrap()
     }
 
-    fn lock(&self) -> MutexGuard<'_, rusqlite::Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        self.conn.lock()
     }
 
     fn ensure_relay_telemetry_settings(&self) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()
+            self.lock()?
                 .execute(
                     "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
@@ -542,7 +563,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     fn ensure_audit_log_settings(&self) -> StorageResult<()> {
         retry_on_busy(|| {
-            self.lock()
+            self.lock()?
                 .execute(
                     "INSERT INTO audit_log_settings (
                     id, enabled, updated_at_ms
@@ -609,7 +630,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.sqlite");
         let storage = SqliteSharedStorage::open(&path).unwrap();
-        let conn = storage.lock();
+        let conn = storage.lock().unwrap();
 
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

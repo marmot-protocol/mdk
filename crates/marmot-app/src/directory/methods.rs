@@ -1066,6 +1066,7 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
+        self.ensure_storage_open("directory cache")?;
         self.clean_future_dated_directory_caches_for_all_accounts_once()?;
         if let Some(cache) = self
             .directory_caches
@@ -1107,6 +1108,13 @@ impl MarmotApp {
             .directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // See `MarmotApp::account_storage`: a close that latched mid-open must
+        // not leave this cache published and holding its database open.
+        if let Err(error) = self.ensure_storage_open("directory cache") {
+            drop(caches);
+            let _ = cache.close();
+            return Err(error);
+        }
         Ok(caches
             .entry(account.label.clone())
             .or_insert_with(|| cache.clone())

@@ -7,8 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_engine::{
@@ -432,10 +433,18 @@ type AppRuntime = AccountDeviceRuntime<
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
-    /// Present for exclusive-root entry points. Every clone shares this lease
+    /// Present for exclusive-root entry points. Every clone shares this cell,
     /// so the root remains exclusively owned until all database-capable app and
-    /// runtime handles have been released.
-    _root_runtime_lease: Option<Arc<MarmotRootRuntimeLease>>,
+    /// runtime handles have been released — or until [`Self::close_storage`]
+    /// takes the lease out, which is the only way to release it early. The
+    /// lease is an advisory lock on a file *inside the Marmot root*, so on iOS
+    /// it counts against the same App Group suspension rule as the databases
+    /// (see [`Self::close_storage`]).
+    root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Latched by [`Self::close_storage`]. Every database accessor checks it so
+    /// a late call cannot silently reopen a database — and re-lock a container
+    /// the host has just been told is lock-free.
+    storage_closed: Arc<AtomicBool>,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
@@ -1148,7 +1157,8 @@ impl MarmotApp {
         Self {
             account_home: AccountHome::open(&root),
             root,
-            _root_runtime_lease: None,
+            root_runtime_lease: Arc::new(Mutex::new(None)),
+            storage_closed: Arc::new(AtomicBool::new(false)),
             relay_urls,
             relay_plane,
             config,
@@ -1208,7 +1218,8 @@ impl MarmotApp {
         );
         Self {
             root: root.as_ref().to_path_buf(),
-            _root_runtime_lease: None,
+            root_runtime_lease: Arc::new(Mutex::new(None)),
+            storage_closed: Arc::new(AtomicBool::new(false)),
             relay_urls,
             account_home,
             relay_plane,
@@ -1245,10 +1256,12 @@ impl MarmotApp {
         config: MarmotAppConfig,
     ) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
-        let lease = Arc::new(MarmotRootRuntimeLease::try_acquire(&root)?);
-        let mut app =
+        let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
-        app._root_runtime_lease = Some(lease);
+        *app.root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
         Ok(app)
     }
 
@@ -4088,7 +4101,122 @@ impl MarmotApp {
         self.account_dir(label).join(SESSION_DB_FILE)
     }
 
+    /// Close every SQLite database this app has open and release the root
+    /// runtime lease, so nothing this process owns holds a file lock inside the
+    /// Marmot root.
+    ///
+    /// Callers must quiesce first — this closes databases out from under any
+    /// work still running (see [`SqliteAccountStorage::close`] for what that
+    /// does to in-flight transactions). [`MarmotAppRuntime::shutdown_and_close`]
+    /// is the sequenced entry point host apps should use; it drains the account
+    /// workers before calling this.
+    ///
+    /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
+    /// accessor then fails with
+    /// [`StorageError::Closed`][cgka_traits::storage::StorageError::Closed]
+    /// rather than reopening;
+    /// otherwise a stray background read would re-lock the container a host has
+    /// just been told is lock-free. Construct a new [`MarmotApp`] to use the
+    /// root again. Idempotent.
+    ///
+    /// This exists for hosts that share the Marmot root across processes
+    /// through a container the OS polices. On iOS the root lives in an App
+    /// Group container shared with the Notification Service Extension, and a
+    /// process suspended while holding *any* lock there is killed with
+    /// `0xdead10cc` — which a WAL connection does for its whole lifetime, and
+    /// the root lease does by design. Dropping handles cannot fix that: the
+    /// databases sit behind `Arc`s reachable from the engine, the OpenMLS
+    /// adapter, and app projections, so the host can neither observe nor await
+    /// the last clone going away.
+    ///
+    /// Every database is attempted even if an earlier one fails; the first
+    /// error is returned once all of them have been closed.
+    pub fn close_storage(&self) -> Result<(), AppError> {
+        let started_at = Instant::now();
+        self.storage_closed.store(true, Ordering::Release);
+        let mut first_error = None;
+        let mut closed = 0usize;
+
+        let account_storages = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, storage)| storage)
+            .collect::<Vec<_>>();
+        let directory_caches = self
+            .directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, cache)| cache)
+            .collect::<Vec<_>>();
+        let shared_storage = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        for storage in account_storages {
+            closed += 1;
+            if let Err(error) = storage.close() {
+                first_error.get_or_insert(AppError::from(error));
+            }
+        }
+        for cache in directory_caches {
+            closed += 1;
+            if let Err(error) = cache.close() {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(storage) = shared_storage {
+            closed += 1;
+            if let Err(error) = storage.close() {
+                first_error.get_or_insert(AppError::from(error));
+            }
+        }
+
+        // Last: the lease guards the databases, so it outlives them.
+        drop(
+            self.root_runtime_lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+
+        tracing::debug!(
+            target: "marmot_app::storage",
+            method = "close_storage",
+            databases_closed = closed,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            failed = first_error.is_some(),
+            "app storage closed",
+        );
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether [`Self::close_storage`] has run. Databases are unreachable from
+    /// this handle once it returns true.
+    #[must_use]
+    pub fn storage_is_closed(&self) -> bool {
+        self.storage_closed.load(Ordering::Acquire)
+    }
+
+    /// Fail rather than reopen a database after [`Self::close_storage`].
+    fn ensure_storage_open(&self, database: &'static str) -> Result<(), AppError> {
+        if self.storage_is_closed() {
+            return Err(AppError::from(cgka_traits::StorageError::Closed(format!(
+                "{database} unavailable: app storage is closed"
+            ))));
+        }
+        Ok(())
+    }
+
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
             .account_storages
             .lock()
@@ -4122,6 +4250,17 @@ impl MarmotApp {
             .account_storages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A close that latched while this open was in flight has already
+        // drained the map, so publishing here would strand an open connection
+        // — and its file locks — past `close_storage`. Close it instead. The
+        // ordering holds both ways: `close_storage` sets the flag before it
+        // takes this same lock, so either we observe the flag or the drain
+        // observes our entry.
+        if let Err(error) = self.ensure_storage_open("account storage") {
+            drop(storages);
+            let _ = storage.close();
+            return Err(error);
+        }
         Ok(storages
             .entry(label.to_owned())
             .or_insert_with(|| storage.clone())
@@ -4455,6 +4594,7 @@ impl MarmotApp {
     }
 
     pub(crate) fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
+        self.ensure_storage_open("shared storage")?;
         if let Some(storage) = self
             .shared_storage
             .lock()
@@ -4475,6 +4615,13 @@ impl MarmotApp {
             .shared_storage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // See `account_storage`: a close that latched mid-open must not leave
+        // this connection published and holding the shared database's locks.
+        if let Err(error) = self.ensure_storage_open("shared storage") {
+            drop(shared);
+            let _ = storage.close();
+            return Err(error);
+        }
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 

@@ -5342,3 +5342,134 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
         "the receive seam must publish the escalation recorded during its ingest"
     );
 }
+
+/// Every SQLite database this app can open, plus the root runtime lease, must
+/// be released by one `close_storage` call — that is the whole contract iOS
+/// depends on before it suspends the process (`0xdead10cc` is raised for *any*
+/// lock held in the shared App Group container, not just the session database).
+#[test]
+fn close_storage_releases_every_database_and_the_root_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = AccountHome::open(root).create_account("closing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    // Open, and dirty, all three database families so each has live WAL state.
+    app.account_storage(&account.label)
+        .unwrap()
+        .app_message_count()
+        .unwrap();
+    app.shared_storage()
+        .unwrap()
+        .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        })
+        .unwrap();
+    app.directory_cache_for_account(&account).unwrap();
+
+    let session_db = app.account_storage_path(&account.label);
+    let shared_db = app.shared_storage_path();
+    let sidecars = |db: &std::path::Path| {
+        [
+            PathBuf::from(format!("{}-wal", db.display())),
+            PathBuf::from(format!("{}-shm", db.display())),
+        ]
+    };
+    assert!(
+        sidecars(&shared_db).iter().all(|p| p.exists()),
+        "the shared database should hold WAL sidecars while open",
+    );
+    // The lease is held for as long as the app is alive.
+    assert!(matches!(
+        MarmotRootRuntimeLease::try_acquire(root),
+        Err(AppError::RuntimeBusy)
+    ));
+
+    app.close_storage().expect("close_storage should succeed");
+
+    assert!(app.storage_is_closed());
+    for db in [&session_db, &shared_db] {
+        for sidecar in sidecars(db) {
+            assert!(
+                !sidecar.exists(),
+                "{} must be gone once the last connection closes",
+                sidecar.display(),
+            );
+        }
+    }
+    // The lease is an advisory lock on a file in the same container, so it has
+    // to go too; a second acquirer proves it did.
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+
+    // Nothing reopens: a late read must report the close instead of re-locking
+    // the container the host was just told is clear.
+    for error in [
+        app.account_storage(&account.label).err(),
+        app.shared_storage().err(),
+        app.directory_cache_for_account(&account).err(),
+    ]
+    .into_iter()
+    .map(|error| error.expect("a closed app must not hand out a database"))
+    {
+        assert!(
+            matches!(&error, AppError::Storage(err) if err.is_closed()),
+            "expected a closed-storage error, got {error:?}",
+        );
+    }
+}
+
+#[test]
+fn close_storage_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("closing-twice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    app.account_storage(&account.label).unwrap();
+
+    app.close_storage().expect("first close should succeed");
+    app.close_storage().expect("second close should be a no-op");
+    // Closing a never-opened app is fine too.
+    let untouched = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    untouched
+        .close_storage()
+        .expect("closing an app that opened nothing should succeed");
+}
+
+/// `shutdown_and_close` must work as the host's single call, with or without a
+/// preceding `shutdown`, and must stay safe when repeated.
+#[tokio::test]
+async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    let runtime = app.runtime();
+    assert!(!runtime.storage_is_closed());
+
+    // No preceding `shutdown`: the method performs its own.
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(runtime.storage_is_closed());
+
+    // Repeat, and repeat after an explicit `shutdown`, without panicking.
+    runtime.shutdown_and_close().await.unwrap();
+    runtime.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
+}

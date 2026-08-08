@@ -680,7 +680,29 @@ async fn run_app_runtime_account_worker(
                 let groups = scheduled_convergence.take_ready();
                 match client.sync_runtime_groups().await {
                     Ok(()) => {
+                        let mut remaining = groups.len();
                         for group_id in groups {
+                            // Each group's convergence pass is a long blocking
+                            // stretch of synchronous engine + SQLite work with
+                            // no await inside it, so `JoinHandle::abort` cannot
+                            // land there: without this check the shutdown budget
+                            // is spent running the whole batch to completion.
+                            // The group boundary is the only cut point where no
+                            // snapshot guard is live, so it is also the only one
+                            // that cannot leave a group half-rolled-back.
+                            // Undispatched groups need no hand-off — their
+                            // convergence inputs are durable, so the next
+                            // runtime rediscovers them at catch-up.
+                            if lifecycle.is_stopping() {
+                                tracing::debug!(
+                                    target: "marmot_app::runtime",
+                                    method = "scheduled_convergence",
+                                    skipped_groups = remaining,
+                                    "shutdown requested; leaving remaining convergence passes for the next runtime",
+                                );
+                                break;
+                            }
+                            remaining -= 1;
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
@@ -946,6 +968,13 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = maintenance_tick.tick() => {
+                // Periodic maintenance is never urgent, and its catch-up leg is
+                // capped at 15s — three times the whole shutdown budget. Skip
+                // the tick outright once shutdown is requested rather than
+                // starting work the drain would then have to wait out.
+                if lifecycle.is_stopping() {
+                    continue 'worker;
+                }
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(Duration::from_secs(15), client.sync()).await {
                         Ok(Ok(summary)) => {

@@ -290,6 +290,7 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::AlreadyExists => "storage_already_exists",
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
         StorageError::Busy(_) => "storage_busy",
+        StorageError::Closed(_) => "storage_closed",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
     }

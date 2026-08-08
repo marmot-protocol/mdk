@@ -24,9 +24,7 @@ impl SqliteOpenMlsStorage {
         Ok(serde_json::to_vec(group_id)?)
     }
 
-    fn lock(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, SqliteOpenMlsStorageError> {
+    fn lock(&self) -> Result<crate::connection::ConnectionGuard<'_>, SqliteOpenMlsStorageError> {
         self.connection
             .lock()
             .map_err(|e| SqliteOpenMlsStorageError::Lock(e.to_string()))
