@@ -122,6 +122,14 @@ pub struct AccountManager {
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
     tearing_down: Arc<StdMutex<HashSet<String>>>,
+    invite_catch_up: Arc<StdMutex<InviteCatchUpCoordinator>>,
+}
+
+#[derive(Default)]
+struct InviteCatchUpCoordinator {
+    active_by_account: HashMap<String, usize>,
+    cohort_accounts: HashSet<String>,
+    committed_mutation_pending: bool,
 }
 
 #[derive(Clone)]
@@ -3306,6 +3314,7 @@ impl AccountManager {
             shared,
             workers: Arc::new(Mutex::new(HashMap::new())),
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
+            invite_catch_up: Arc::new(StdMutex::new(InviteCatchUpCoordinator::default())),
         }
     }
 
@@ -3657,6 +3666,13 @@ impl AccountManager {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
+        self.catch_up_accounts_excluding(&HashSet::new()).await
+    }
+
+    async fn catch_up_accounts_excluding(
+        &self,
+        excluded_account_ids: &HashSet<String>,
+    ) -> Result<(), AppError> {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
@@ -3664,8 +3680,9 @@ impl AccountManager {
             let commands = {
                 let workers = self.workers.lock().await;
                 workers
-                    .values()
-                    .map(|worker| worker.commands.clone())
+                    .iter()
+                    .filter(|(account_id, _)| !excluded_account_ids.contains(account_id.as_str()))
+                    .map(|(_, worker)| worker.commands.clone())
                     .collect::<Vec<_>>()
             };
             let mut responses = Vec::with_capacity(commands.len());
