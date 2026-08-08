@@ -8,7 +8,7 @@
 // contract tests.
 
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,10 +20,12 @@ import {
   type MessageReceipt,
   type MessageReceiptPart,
 } from "openclaw/plugin-sdk/channel-outbound";
-import {
-  assertLocalMediaAllowed,
-  getDefaultLocalRoots,
-} from "openclaw/plugin-sdk/media-runtime";
+// `readLocalFileFromRoots` (allowlist check + hardened read) and the local media
+// access types are imported from the subpaths that export them on both the
+// `latest` and `beta` OpenClaw channels. The `plugin-sdk/media-runtime` barrel
+// dropped `assertLocalMediaAllowed`/`getDefaultLocalRoots` in 2026.7.2-beta.
+import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
+import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 
 import type { AgentControlMediaUpload, MarmotAgentControlClient } from "./client.js";
 
@@ -193,8 +195,8 @@ function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly
  * Resolve `ctx.mediaUrl` to a local `AgentControlMediaUpload` the connector can
  * read by path. Handles two cases the ctx can express with the real SDK types:
  *
- * 1. A local filesystem path or `file://` URL — validated against the send's
- *    allowlisted media roots (`assertLocalMediaAllowed`), then copied to the
+ * 1. A local filesystem path or `file://` URL — read only through the send's
+ *    allowlisted media roots (`readLocalFileFromRoots`), then copied to the
  *    connector-shared staging root. Without the source guard
  *    an agent-influenced `mediaUrl` (e.g. `~/.ssh/id_rsa`) would let a prompt-
  *    injected agent exfiltrate any connector-host file into a group. This
@@ -207,8 +209,8 @@ function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
  *
  * Throws `LocalMediaAccessError` (from the SDK) when a local path escapes the
- * allowlist; the caller surfaces that as a failed send rather than reading the
- * file.
+ * allowlist; the caller surfaces that as a failed send. The file is never read
+ * in that case — the allowlist check and the read are the same operation.
  */
 async function resolveOutboundMediaUpload(
   ctx: ChannelMessageSendMediaContext,
@@ -217,12 +219,23 @@ async function resolveOutboundMediaUpload(
   const { mediaUrl } = ctx;
   if (isLocalMediaUrl(mediaUrl)) {
     const localPath = mediaUrl.startsWith("file://") ? fileURLToPath(mediaUrl) : mediaUrl;
-    // Defense against exfiltration via a tool/prompt-influenced path: the
-    // Keep OpenClaw's source policy as the first layer; wn-agent independently
-    // confines the staged path it ultimately reads. Throws on violation.
-    await assertLocalMediaAllowed(localPath, resolveAllowedMediaRoots(ctx));
+    // Defense against exfiltration via a tool/prompt-influenced path: the read
+    // itself is confined to the allowlisted roots, so a path outside them is
+    // never opened. Keep OpenClaw's source policy as the first layer; wn-agent
+    // independently confines the staged path it ultimately reads.
+    const read = await readLocalFileFromRoots({
+      filePath: localPath,
+      roots: resolveAllowedMediaRoots(ctx),
+      label: "outbound media roots",
+    });
+    if (!read) {
+      throw new LocalMediaAccessError(
+        "path-not-allowed",
+        "marmot: outbound media path is outside the allowed local media roots",
+      );
+    }
     const fileName = basename(localPath) || "attachment";
-    const path = await writeTempMedia(fileName, await readFile(localPath));
+    const path = await writeTempMedia(fileName, read.buffer);
     return {
       upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
       cleanup: () => rm(path, { force: true }),
