@@ -265,6 +265,36 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_send_media_includes_idempotency_key_only_when_supplied(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                    "maintenance_disposition": "not_required",
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
+
+        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="media-key-1")
+        await client.send_media("11" * 32, "22" * 32, attachment, idempotency_key="  ")
+        await client.send_media("11" * 32, "22" * 32, attachment)
+
+        self.assertEqual(requests[0]["idempotency_key"], "media-key-1")
+        self.assertNotIn("idempotency_key", requests[1])
+        self.assertNotIn("idempotency_key", requests[2])
+
     async def test_timeline_reads_write_exact_message_and_cursor_requests(self):
         requests = []
 
@@ -4199,19 +4229,26 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
-    async def test_inbound_media_download_populates_message_event(self):
+    async def test_inbound_media_download_populates_ordered_message_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "inbound.png"
-            source.write_bytes(b"png")
+            first_source = Path(tmpdir) / "inbound.png"
+            second_source = Path(tmpdir) / "inbound.jpg"
+            first_source.write_bytes(b"png")
+            second_source.write_bytes(b"jpg")
+            sources = {
+                "inbound.png": (first_source, "image/png"),
+                "inbound.jpg": (second_source, "image/jpeg"),
+            }
 
             class FakeClient:
                 async def download_media(self, account_id_hex, group_id_hex, media):
+                    source, media_type = sources[media["file_name"]]
                     return {
                         "type": "media_downloaded",
                         "path": str(source),
-                        "media_type": "image/png",
-                        "file_name": "inbound.png",
-                        "size_bytes": 12,
+                        "media_type": media_type,
+                        "file_name": media["file_name"],
+                        "size_bytes": source.stat().st_size,
                     }
 
             adapter = self.adapter_module.MarmotPlatformAdapter(
@@ -4220,23 +4257,36 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             )
             adapter.handle_message = unittest.mock.AsyncMock()
 
+            base_media = {
+                "ciphertext_sha256": "aa",
+                "plaintext_sha256": "bb",
+                "nonce_hex": "cc",
+                "version": "1",
+                "source_epoch": 1,
+                "locators": [],
+            }
             event = {
                 "type": "inbound_message",
                 "account_id_hex": "11" * 32,
                 "group_id_hex": "22" * 32,
                 "message_id_hex": "33" * 32,
                 "sender_account_id_hex": "44" * 32,
-                "text": "photo",
+                "text": "photo album",
                 "mentions_self": True,
-                "media": [{"file_name": "inbound.png", "media_type": "image/png", "ciphertext_sha256": "aa", "plaintext_sha256": "bb", "nonce_hex": "cc", "version": "1", "source_epoch": 1, "locators": []}],
+                "media": [
+                    {**base_media, "file_name": "inbound.png", "media_type": "image/png"},
+                    {**base_media, "file_name": "inbound.jpg", "media_type": "image/jpeg"},
+                ],
             }
             await adapter._dispatch_inbound_message(event)
 
             dispatched = adapter.handle_message.await_args.args[0]
             staged_root = str(Path(tmpdir) / "dev" / "inbound-media")
-            self.assertTrue(dispatched.media_urls[0].startswith(staged_root))
-            self.assertEqual(dispatched.media_types, ["image/png"])
-            self.assertFalse(source.exists())
+            self.assertEqual(len(dispatched.media_urls), 2)
+            self.assertTrue(all(url.startswith(staged_root) for url in dispatched.media_urls))
+            self.assertEqual(dispatched.media_types, ["image/png", "image/jpeg"])
+            self.assertFalse(first_source.exists())
+            self.assertFalse(second_source.exists())
 
     async def test_outbound_send_image_file_routes_to_send_media(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4249,9 +4299,19 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self):
                     self.media_sends = []
 
-                async def send_media(self, account_id_hex, group_id_hex, attachments, *, caption=None, reply_to_message_id_hex=None):
+                async def send_media(
+                    self,
+                    account_id_hex,
+                    group_id_hex,
+                    attachments,
+                    *,
+                    caption=None,
+                    idempotency_key=None,
+                ):
                     self.assert_staged = Path(attachments[0]["path"]).read_bytes()
-                    self.media_sends.append((account_id_hex, group_id_hex, attachments, caption))
+                    self.media_sends.append(
+                        (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+                    )
                     return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
 
             fake_client = FakeClient()
@@ -4270,6 +4330,413 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(staged_path.exists())
             self.assertTrue(image_path.exists())
             self.assertEqual(fake_client.media_sends[0][3], "look")
+
+    async def test_outbound_send_multiple_images_routes_one_ordered_batch_to_send_media(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "dev" / "inbound-media"
+            media_dir.mkdir(parents=True)
+            first_path = media_dir / "first.png"
+            second_path = media_dir / "second.jpg"
+            first_path.write_bytes(b"first")
+            second_path.write_bytes(b"second")
+
+            class FakeClient:
+                def __init__(self):
+                    self.media_sends = []
+                    self.staged_bytes = []
+
+                async def send_media(
+                    self,
+                    account_id_hex,
+                    group_id_hex,
+                    attachments,
+                    *,
+                    caption=None,
+                    idempotency_key=None,
+                ):
+                    self.staged_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    self.media_sends.append(
+                        (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+                    )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
+                client=fake_client,
+            )
+            result = await adapter.send_multiple_images(
+                "22" * 32,
+                [(f"file://{first_path}", "album caption"), (f"file://{second_path}", "")],
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(len(fake_client.media_sends), 1)
+            sent = fake_client.media_sends[0]
+            self.assertEqual(fake_client.staged_bytes, [b"first", b"second"])
+            self.assertEqual(
+                [(item["file_name"], item["media_type"]) for item in sent[2]],
+                [("first.png", "image/png"), ("second.jpg", "image/jpeg")],
+            )
+            self.assertEqual(sent[3], "album caption")
+            self.assertTrue(sent[4])
+            self.assertTrue(all(not Path(item["path"]).exists() for item in sent[2]))
+            self.assertTrue(first_path.exists())
+            self.assertTrue(second_path.exists())
+
+    async def test_multiple_images_preflight_rejects_mixed_valid_and_invalid_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            valid = root / "valid.png"
+            valid.write_bytes(b"valid")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = 0
+
+                async def send_media(self, *args, **kwargs):
+                    self.calls += 1
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "not a readable file"):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(valid.as_uri(), "caption"), ((root / "missing.png").as_uri(), "")],
+                )
+
+            self.assertEqual(fake_client.calls, 0)
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_preserves_duplicate_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "same.png"
+            image.write_bytes(b"same")
+
+            class FakeClient:
+                def __init__(self):
+                    self.attachments = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.attachments = attachments
+                    self.asserted_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            await adapter.send_multiple_images(
+                "22" * 32,
+                [(image.as_uri(), "caption"), (image.as_uri(), "")],
+            )
+
+            self.assertEqual([item["file_name"] for item in fake_client.attachments], ["same.png", "same.png"])
+            self.assertEqual(fake_client.asserted_bytes, [b"same", b"same"])
+            self.assertNotEqual(fake_client.attachments[0]["path"], fake_client.attachments[1]["path"])
+
+    async def test_multiple_images_count_and_byte_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = []
+            for index in range(4):
+                path = root / f"{index}.png"
+                path.write_bytes(b"1234")
+                paths.append(path)
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls.append(attachments)
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with (
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_ATTACHMENTS", 3),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_FILE_BYTES", 4),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_BATCH_BYTES", 12),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(path.as_uri(), "") for path in paths[:3]],
+                )
+                with self.assertRaisesRegex(self.adapter_module.AgentControlError, "at most 3"):
+                    await adapter.send_multiple_images(
+                        "22" * 32,
+                        [(path.as_uri(), "") for path in paths],
+                    )
+                oversize = root / "oversize.png"
+                oversize.write_bytes(b"12345")
+                with self.assertRaisesRegex(self.adapter_module.AgentControlError, "blob size limit"):
+                    await adapter.send_multiple_images("22" * 32, [(oversize.as_uri(), "")])
+                with unittest.mock.patch.object(
+                    self.adapter_module,
+                    "MAX_OUTBOUND_MEDIA_BATCH_BYTES",
+                    7,
+                ):
+                    with self.assertRaisesRegex(self.adapter_module.AgentControlError, "total size limit"):
+                        await adapter.send_multiple_images(
+                            "22" * 32,
+                            [(path.as_uri(), "") for path in paths[:2]],
+                        )
+
+            self.assertEqual(len(fake_client.calls), 1)
+
+    async def test_multiple_images_partial_upload_failure_is_all_error_and_cleans_staging(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first.png"
+            second = root / "second.jpg"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = 0
+                    self.staged_paths = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls += 1
+                    self.staged_paths = [Path(item["path"]) for item in attachments]
+                    self.asserted_bytes = [path.read_bytes() for path in self.staged_paths]
+                    raise self_error(
+                        f"second upload failed at {self.staged_paths[1]}",
+                        retryable=False,
+                    )
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs:
+                with self.assertRaises(self.adapter_module.AgentControlError) as raised:
+                    await adapter.send_multiple_images(
+                        "22" * 32,
+                        [(first.as_uri(), "caption"), (second.as_uri(), "")],
+                    )
+
+            self.assertEqual(str(raised.exception), "Marmot media send failed")
+            self.assertNotIn(str(adapter._outbound_media_dir), str(raised.exception))
+            self.assertNotIn(str(adapter._outbound_media_dir), "\n".join(logs.output))
+            self.assertEqual(fake_client.calls, 1)
+            self.assertEqual(fake_client.asserted_bytes, [b"one", b"two"])
+            self.assertTrue(all(not path.exists() for path in fake_client.staged_paths))
+
+    async def test_outbound_media_staging_failure_redacts_local_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "private.png"
+            image.write_bytes(b"private")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=object(),
+            )
+            staged_path = adapter._outbound_media_dir / "private-staged.png"
+
+            with (
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "stage_outbound_media_file",
+                    side_effect=OSError(f"could not stage {staged_path}"),
+                ),
+                self.assertLogs(self.adapter_module.logger, level="DEBUG") as logs,
+            ):
+                result = await adapter.send_image_file("22" * 32, str(image))
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "Marmot outbound media staging failed")
+            self.assertNotIn(str(staged_path), "\n".join(logs.output))
+
+    async def test_multiple_images_retry_reuses_staged_paths_and_idempotency_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first.png"
+            second = root / "second.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+
+            class FakeClient:
+                def __init__(self):
+                    self.calls = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.calls.append(
+                        ([item["path"] for item in attachments], kwargs["idempotency_key"])
+                    )
+                    if len(self.calls) == 1:
+                        raise self_error(
+                            "timed out",
+                            code="request_timed_out",
+                            retryable=True,
+                        )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "SEND_MEDIA_RETRY_BACKOFF_S",
+                (0.0,),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(first.as_uri(), "caption"), (second.as_uri(), "")],
+                )
+
+            self.assertEqual(len(fake_client.calls), 2)
+            self.assertEqual(fake_client.calls[0], fake_client.calls[1])
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_cancellation_cleans_staged_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "cancel.png"
+            image.write_bytes(b"cancel")
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            class FakeClient:
+                async def send_media(self, account, group, attachments, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=FakeClient(),
+            )
+            task = asyncio.create_task(
+                adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_reply_metadata_remains_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "reply.png"
+            image.write_bytes(b"reply")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=object(),
+            )
+            with self.assertRaisesRegex(self.adapter_module.AgentControlError, "reply threading"):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(image.as_uri(), "caption")],
+                    metadata={"reply_to_message_id_hex": "33" * 32},
+                )
+
+    async def test_standalone_media_files_use_one_batch_send(self):
+        class FakeAdapter:
+            def __init__(self):
+                self.batches = []
+
+            async def _send_media_batch(self, chat_id, attachments, *, caption=None, reply_to=None):
+                self.batches.append((chat_id, attachments, caption, reply_to))
+                return self_module.SendResult(
+                    success=True,
+                    message_id="99" * 32,
+                    continuation_message_ids=("88" * 32,),
+                    raw_response={
+                        "attachment_outcomes": [
+                            {"file_name": item["file_name"], "status": "sent"}
+                            for item in attachments
+                        ]
+                    },
+                )
+
+        self_module = self.adapter_module
+        fake_adapter = FakeAdapter()
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "MarmotPlatformAdapter",
+            return_value=fake_adapter,
+        ):
+            response = await self.adapter_module._standalone_send(
+                object(),
+                "22" * 32,
+                " one caption ",
+                media_files=["first.png", "second.jpg"],
+            )
+            blank_response = await self.adapter_module._standalone_send(
+                object(),
+                "22" * 32,
+                "   ",
+                media_files=["first.png"],
+            )
+
+        self.assertEqual(len(fake_adapter.batches), 2)
+        batch = fake_adapter.batches[0]
+        self.assertEqual(batch[0], "22" * 32)
+        self.assertEqual([item["file_name"] for item in batch[1]], ["first.png", "second.jpg"])
+        self.assertEqual(batch[2], " one caption ")
+        self.assertEqual(response["message_ids"], ["88" * 32, "99" * 32])
+        self.assertEqual(len(response["attachment_outcomes"]), 2)
+        self.assertIsNone(fake_adapter.batches[1][2])
+        self.assertTrue(blank_response["success"])
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:

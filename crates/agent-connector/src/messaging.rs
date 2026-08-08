@@ -19,6 +19,8 @@ use crate::validation::normalize_hex;
 
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
+/// Current schema version for persisted `send_media` request fingerprints.
+pub(crate) const SEND_MEDIA_FINGERPRINT_VERSION: u8 = 1;
 
 /// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
 /// over the destination (account + group), message text, and optional reply target.
@@ -40,6 +42,41 @@ pub(crate) fn send_final_fingerprint(
         reply_to_message_id_hex,
     ]);
     let bytes = serde_json::to_vec(&preimage).expect("send_final fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Server-derived fingerprint of a media send. Local paths are deliberately
+/// excluded; retries may stage the same bytes under a different private path.
+/// Attachment order, safe metadata, caption, destination, and plaintext bytes
+/// are all bound so one key cannot return ids for a different album.
+pub(crate) fn send_media_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    caption: Option<&str>,
+    attachments: &[MediaUploadAttachmentRequest],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let attachments = attachments
+        .iter()
+        .map(|attachment| {
+            serde_json::json!([
+                attachment.file_name,
+                attachment.media_type,
+                hex::encode(Sha256::digest(&attachment.plaintext)),
+                attachment.dim,
+                attachment.thumbhash,
+            ])
+        })
+        .collect::<Vec<_>>();
+    let preimage = serde_json::json!([
+        SEND_MEDIA_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        caption,
+        attachments,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("send_media fingerprint preimage cannot fail");
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -417,6 +454,7 @@ impl AgentConnector {
         group_id_hex: &str,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
@@ -435,6 +473,30 @@ impl AgentConnector {
                 thumbhash: attachment.thumbhash,
             });
         }
+        let idempotency = if let Some(key) = idempotency_key {
+            let fingerprint = send_media_fingerprint(
+                account_id_hex,
+                &group_id_hex,
+                caption.as_deref(),
+                &upload_attachments,
+            );
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => {
+                    Some((key, fingerprint, reservation))
+                }
+            }
+        } else {
+            None
+        };
         let result = self
             .runtime
             .upload_media(
@@ -448,15 +510,26 @@ impl AgentConnector {
                 },
             )
             .await?;
-        let sent = result.sent;
+        let Some(sent) = result.sent else {
+            return Ok(AgentControlResponse::FinalSent {
+                message_ids_hex: Vec::new(),
+                maintenance_disposition: AgentControlSendMaintenanceDisposition::default(),
+            });
+        };
+        let message_ids_hex = sent.message_ids;
+        let maintenance_disposition = agent_maintenance_disposition(sent.maintenance_disposition);
+        if let Some((key, fingerprint, reservation)) = idempotency {
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids_hex.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids_hex.clone(), maintenance_disposition);
+        }
         Ok(AgentControlResponse::FinalSent {
-            message_ids_hex: sent
-                .as_ref()
-                .map(|sent| sent.message_ids.clone())
-                .unwrap_or_default(),
-            maintenance_disposition: sent
-                .map(|sent| agent_maintenance_disposition(sent.maintenance_disposition))
-                .unwrap_or_default(),
+            message_ids_hex,
+            maintenance_disposition,
         })
     }
 

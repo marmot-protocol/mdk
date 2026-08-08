@@ -4781,6 +4781,59 @@ fn send_final_fingerprint_includes_reply_to_target() {
     );
 }
 
+#[test]
+fn send_media_fingerprint_is_content_bound() {
+    use crate::messaging::send_media_fingerprint;
+    use marmot_app::MediaUploadAttachmentRequest;
+
+    let attachment = |plaintext: &[u8]| MediaUploadAttachmentRequest {
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        plaintext: plaintext.to_vec(),
+        dim: None,
+        thumbhash: None,
+    };
+    let first = send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")]);
+    assert_eq!(
+        first,
+        send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")],)
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"different bytes")],
+        )
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
+    );
+    let ordered = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"one"), attachment(b"two")],
+    );
+    assert_ne!(
+        ordered,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"two"), attachment(b"one")],
+        ),
+        "attachment order must change the fingerprint"
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
+        "destination group must change the fingerprint"
+    );
+}
+
 #[tokio::test]
 async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
     use std::time::{Duration, SystemTime};
