@@ -35,18 +35,15 @@ const EVENT: &str = "event";
 /// terminal `{"t":"error","complete":false}` line with no `eof`.
 const ERROR: &str = "error";
 
-/// Whether `input` is a Goggles NDJSON group-export stream. The v1 contract
-/// requires the first line to be the manifest, so this checks exactly that; an
-/// `agent-state.json` document (one JSON object, no `t` discriminator) is never
-/// mistaken for a stream.
+/// Whether `input` is a Goggles NDJSON group-export stream. A stream line is
+/// discriminated by a `t` field; checking whether the first non-empty line
+/// carries a `t` discriminator prevents a manifest-less or corrupt stream from
+/// falling back to the document parser and fail-opening as a healthy export.
 pub fn is_stream(input: &str) -> bool {
     let Some(first_line) = input.lines().find(|line| !line.trim().is_empty()) else {
         return false;
     };
-    matches!(
-        serde_json::from_str::<TagProbe>(first_line),
-        Ok(TagProbe { t }) if t == MANIFEST
-    )
+    serde_json::from_str::<TagProbe>(first_line).is_ok()
 }
 
 /// Parse a streamed group export into the same [`AgentStateExport`] the rest of
@@ -77,6 +74,9 @@ pub fn parse_stream(input: &str) -> Result<AgentStateExport, StreamParseError> {
             })?;
 
         if !saw_manifest {
+            if t == ERROR {
+                return Err(StreamParseError::ServerReportedError { line: number });
+            }
             if t != MANIFEST {
                 return Err(StreamParseError::MissingManifest);
             }
