@@ -429,11 +429,11 @@ impl From<StorageError> for OpenMlsProjectionError {
 /// segments during stored-convergence materialization.
 ///
 /// MLS cannot process a device's own commit through `process_message`, so a
-/// candidate path containing one cannot be materialized by replay alone: after
-/// a restart clears the in-memory `committed_from` guard, the own commit's
-/// branch would silently drop out of branch selection and the device could be
-/// reorged onto a losing sibling (or, with two restarted committers, the group
-/// could fork permanently). Instead, an own `Processed` commit whose ordering
+/// candidate path containing one cannot be materialized by replay alone: the
+/// own commit's branch would silently drop out of branch selection and the
+/// device could be reorged onto a losing sibling (or, with two forked
+/// committers, the group could fork permanently). Instead, an own `Processed`
+/// commit whose ordering
 /// stamp was persisted at confirm time is realized from its immutable,
 /// commit-addressed canonical-state checkpoint, and its `CommitStaged`
 /// observation is synthesized from that stamp.

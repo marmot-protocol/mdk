@@ -4,7 +4,7 @@ use cgka_conformance_simulator::{VectorFixture, run_scenario_spec};
 
 use crate::convergence::RecoveredConvergence;
 use crate::fork::{ForkCommitKind, RecoveredFork};
-use crate::synth::{WINNER_BRANCH, synthesize, synthesize_convergence};
+use crate::synth::{synthesize, synthesize_convergence};
 
 /// Why an accept attempt produced no vector (fail-closed).
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +29,11 @@ pub fn accept(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptE
 }
 
 /// Group-data fork: bounded label search. For each ordering, run the synthesized
-/// scenario and accept iff the full `RecoverySummary` expectations hold **and**
-/// the designated winner's branch (its group name) is the one that survived. The
-/// summary is the gate; branch survival only selects the correct ordering.
+/// scenario and accept iff every expectation holds. Branch survival is one of
+/// them — a per-client `GroupProfile` expectation pins the winner's group name
+/// — so the ordering search and the acceptance gate are the same comparison,
+/// and the persisted vector carries the winner check into CI instead of
+/// leaving it here.
 fn accept_group_data_fork(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -44,12 +46,7 @@ fn accept_group_data_fork(fork: &RecoveredFork, name: &str) -> Result<VectorFixt
             .block_on(run_scenario_spec(&vector.scenario))
             .map_err(|err| AcceptError::Run(err.to_string()))?;
 
-        let summary_matches = vector.compare_observed_trace(&trace).is_empty();
-        let winner_branch_survived = trace
-            .observations
-            .iter()
-            .any(|observation| observation.group_name == WINNER_BRANCH);
-        if summary_matches && winner_branch_survived {
+        if vector.compare_observed_trace(&trace).is_empty() {
             return Ok(vector);
         }
     }

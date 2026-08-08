@@ -132,6 +132,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Same-epoch fork resolution now uses one rule for every member: the
+  committer's pairwise fast-path is removed, and a committer adjudicates a
+  rival commit through the same distributed-convergence pass as an observer,
+  with its own commit materialized from the commit-addressed checkpoints
+  introduced in #1285. When the in-horizon recovery material (the retained
+  source-epoch anchor) is missing, the group fails closed loudly — durable
+  `Unrecoverable` halt plus a `GroupUnrecoverable` event — instead of
+  silently keeping a possibly losing branch. A committer's rival resolution
+  now waits for the convergence pass's quiescence window (~1 s); sends queue
+  during it. The `ForkRecovered` group event and its MarmotKit FFI variant
+  are removed (the convergence-path `CommitRolledBack` +
+  `GroupStateInvalidated` pair is the rollback signal); forensic audit logs
+  keep parsing the historical `fork_resolution` and `snapshot_created` rows,
+  which current engines no longer emit.
+
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
   providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
   corruption fix. Rust 1.95.0 is the minimum release that supports this

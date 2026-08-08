@@ -9,7 +9,7 @@ use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
-use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
+use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
@@ -181,32 +181,9 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
-        // The pre-commit epoch is the commit origin for fork detection.
-        // `committed_from` bookkeeping is deliberately NOT recorded here: it
-        // happens atomically inside `begin_pending` below, after staging
-        // succeeds. Recording it earlier left a phantom "we committed from
-        // this epoch" entry behind when staging failed (the cleanup guard
-        // clears the OpenMLS commit but nothing prunes `committed_from`),
-        // which later mis-routed legitimate sibling commits into
-        // fail-closed fork recovery. The post-staging counterpart —
-        // `publish_failed` after a successful `begin_pending` — is handled by
-        // `rollback_publish`, which removes the provisional entry again.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        // Arm the cleanup guard before creating the snapshot so the snapshot is
-        // released on early return / cancellation even before a pending commit
-        // is staged.
-        let mut pending_commit_guard =
+        let pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let recovery_snapshot =
-            self.fork_recovery
-                .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
-        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
-        self.audit_snapshot_created(
-            &group_id,
-            &recovery_snapshot,
-            pre_commit_epoch,
-            "pre_invite_commit",
-        );
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -308,10 +285,6 @@ impl<S: StorageProvider> Engine<S> {
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -337,19 +310,7 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
-        self.track_pending_commit_for_recovery(
-            pending_ref,
-            group_id.clone(),
-            prior_epoch,
-            commit_msg.id.clone(),
-            CommitOrderingKey::from_commit_bytes(
-                prior_epoch,
-                commit_priority,
-                self.identity.self_id().clone(),
-                &commit_bytes,
-            ),
-            recovery_snapshot,
-        );
+        self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
         // Buffer the additions so confirm_published emits an attributed
         // GroupStateChanged (and the app a kind-1210 row) once the commit merges.
         let added_changes = parsed_kps
@@ -456,21 +417,8 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        // Arm the cleanup guard before creating the snapshot so the snapshot is
-        // released on early return / cancellation even before a pending commit
-        // is staged.
-        let mut pending_commit_guard =
+        let pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let recovery_snapshot =
-            self.fork_recovery
-                .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
-        pending_commit_guard.set_snapshot(recovery_snapshot.clone());
-        self.audit_snapshot_created(
-            &group_id,
-            &recovery_snapshot,
-            pre_commit_epoch,
-            "pre_remove_members_commit",
-        );
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -546,8 +494,6 @@ impl<S: StorageProvider> Engine<S> {
             staged_commit,
             mls_group.own_leaf_index(),
         )?;
-        let commit_priority =
-            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -604,19 +550,7 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
-        self.track_pending_commit_for_recovery(
-            pending_ref,
-            group_id.clone(),
-            prior_epoch,
-            commit_msg.id.clone(),
-            CommitOrderingKey::from_commit_bytes(
-                prior_epoch,
-                commit_priority,
-                self.identity.self_id().clone(),
-                &commit_bytes,
-            ),
-            recovery_snapshot,
-        );
+        self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
         let mut removed_changes: Vec<crate::engine::PendingGroupStateChange> = unique_targets
             .iter()
             .cloned()

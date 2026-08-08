@@ -126,7 +126,6 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             }
             GroupEvent::GroupStateChanged { .. }
             | GroupEvent::EpochChanged { .. }
-            | GroupEvent::ForkRecovered { .. }
             | GroupEvent::CommitRolledBack { .. }
             | GroupEvent::GroupStateInvalidated { .. }
             | GroupEvent::GroupUnrecoverable { .. }
@@ -161,7 +160,6 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::AppMessageInvalidated { group_id, .. }
         | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
-        | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupStateInvalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }

@@ -467,30 +467,14 @@ pub enum GroupEvent {
         from: EpochId,
         to: EpochId,
     },
-    ForkRecovered {
-        group_id: GroupId,
-        source_epoch: EpochId,
-        recovered_epoch: EpochId,
-        winner: CommitOrderingKey,
-        invalidated: CommitOrderingKey,
-        /// Transport-layer `MessageId` of the rolled-back (losing) commit. The
-        /// application uses it to invalidate any kind-1210 group system rows that
-        /// commit synthesized (matched by `origin_commit_id`), so a losing
-        /// branch's "Alice added Bob"-style rows do not persist as stale history.
-        invalidated_commit_id: MessageId,
-    },
     /// A previously-applied commit lost a same-epoch fork during a stored
     /// distributed-convergence reorg and was rolled back off the canonical
-    /// branch. Unlike [`GroupEvent::ForkRecovered`] (which fires on the direct
-    /// staged-commit seam), this fires from the convergence path, where a
-    /// commit routed through stored convergence — not the direct seam — is
-    /// later superseded by a sibling commit that wins branch selection.
+    /// branch.
     ///
     /// The application uses `invalidated_commit_id` to invalidate any kind-1210
     /// group system rows that commit synthesized (matched by `origin_commit_id`),
     /// so a losing branch's "Alice added Bob"-style rows do not persist as stale
-    /// history. This is the convergence-path analog of the `invalidated_commit_id`
-    /// carried on [`GroupEvent::ForkRecovered`].
+    /// history.
     CommitRolledBack {
         group_id: GroupId,
         /// Transport-layer `MessageId` of the rolled-back (losing) commit.
@@ -507,9 +491,8 @@ pub enum GroupEvent {
     /// e.g. a losing concurrent rename must not survive as a completed
     /// "renamed the group" system row.
     ///
-    /// The engine emits this alongside the commit-level rollback events
-    /// ([`GroupEvent::ForkRecovered`] on the direct staged-commit seam,
-    /// [`GroupEvent::CommitRolledBack`] on the stored-convergence seam), as the
+    /// The engine emits this alongside the commit-level rollback event
+    /// ([`GroupEvent::CommitRolledBack`] on the stored-convergence seam), as the
     /// explicit withdrawal signal for state notifications. `invalidated_commit_id`
     /// is in the same identifier space as `origin_commit_id` on
     /// [`GroupEvent::GroupStateChanged`], so withdrawal is an exact match over

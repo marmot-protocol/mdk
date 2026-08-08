@@ -1417,10 +1417,10 @@ async fn openmls_rejects_bare_gce_dictionary_tampering_at_construction() {
 /// `GroupEvent::CommitRolledBack` for the losing commit so the app can tombstone
 /// the kind-1210 rows that losing commit synthesized.
 ///
-/// Unlike the direct staged-commit seam (which fires `ForkRecovered`), this path
-/// routes commits into convergence (`msg_epoch >= current_epoch`), so before
-/// this fix the losing branch's synthesized rows had `origin_commit_id = NULL`
-/// and no event ever targeted them — leaving stale contradictory history.
+/// This path routes commits into convergence (`msg_epoch >= current_epoch`),
+/// so before this fix the losing branch's synthesized rows had
+/// `origin_commit_id = NULL` and no event ever targeted them — leaving stale
+/// contradictory history.
 #[tokio::test]
 async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -1540,7 +1540,7 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     let events = carol.drain_events();
 
     // (b) The losing commit emits CommitRolledBack so the app can tombstone the
-    // kind-1210 rows it synthesized — there is no ForkRecovered on this path.
+    // kind-1210 rows it synthesized.
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -1576,15 +1576,6 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         )),
         "the accepted commit must not be named by a withdrawal, got {events:?}"
     );
-    // No ForkRecovered fires here: this is the convergence path, not the direct
-    // staged-commit seam.
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
-        "convergence path must not emit ForkRecovered, got {events:?}"
-    );
-
     // (a) The winning branch's MemberAdded row is attributed to the accepted
     // commit, so a later rollback of *that* commit could tombstone it too.
     let selected_invitee = if app_branch_index == 0 {
@@ -1802,8 +1793,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         )),
         "expected CommitRolledBack for the superseded removal, got {events:?}"
     );
-    // The winning rename is never withdrawn, and no direct-seam ForkRecovered
-    // fires on the stored-convergence path.
+    // The winning rename is never withdrawn.
     assert!(
         !events.iter().any(|event| matches!(
             event,
@@ -1811,12 +1801,6 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
                 if *invalidated_commit_id == content_id(&rename_commit)
         )),
         "the accepted rename must not be withdrawn, got {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
-        "stored convergence must not emit ForkRecovered, got {events:?}"
     );
     // Roster correction: the reorg diff re-announces our membership relative
     // to the previously presented (removed) roster, attributed to the

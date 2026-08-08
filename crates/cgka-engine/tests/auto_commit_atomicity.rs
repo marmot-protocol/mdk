@@ -777,22 +777,17 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     assert!(!record.members.iter().any(|m| m.id == bob_member_id));
 }
 
-/// Fork recovery rolls the losing side back to its pre-commit snapshot and
-/// re-applies the winning commit through the inbound apply seam, which mirrors
-/// the recovered epoch into the durable group record. A storage fault at that
-/// mirror must not leave the engine reporting the recovered epoch while the
-/// record still holds the pre-fork one: hydration seeds the in-memory epoch
-/// FROM that record, so an in-process split becomes a wrong epoch on the next
-/// session open.
+/// A same-epoch rival that wins branch selection is applied by the
+/// convergence pass, which mirrors the selected epoch into the durable group
+/// record. A storage fault at that mirror must not leave the engine reporting
+/// one epoch while the record holds another: hydration seeds the in-memory
+/// epoch FROM that record, so an in-process split becomes a wrong epoch on
+/// the next session open.
 ///
-/// Undoing the apply is only half the obligation. Fork resolution already
-/// consumed side effects this seam cannot compensate (the incumbent snapshot is
-/// released, the incumbent commit is `EpochInvalidated`), and the winning commit
-/// stays durably retained. So the failure must also release the recovery
-/// snapshot it created for the apply it abandoned and hand the retained winner
-/// back to stored convergence — otherwise the group is parked one epoch behind
-/// with a durable winner nothing will ever apply, and redelivery answers
-/// `Buffered` forever.
+/// The winning commit stays durably retained across the failure, so a later
+/// pass (the fault is transient) must still reorg the loser onto the winning
+/// branch, after which redelivery is a plain duplicate — never a `Buffered`
+/// promise of a replay that would never come.
 #[tokio::test]
 async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     let alice_fault = PutGroupFault::default();
@@ -879,23 +874,33 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         (&mut bob, &bob_handle, &bob_fault, alice_commit)
     };
     assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
-    let snapshots_before: std::collections::HashSet<String> = loser_handle
-        .list_group_snapshots(&group_id)
-        .unwrap()
-        .into_iter()
-        .collect();
 
-    // Fail exactly the epoch mirror's record write on the fork-recovery apply
-    // (no other `put_group` runs on this ingest path).
-    loser_fault.arm(1);
+    // The winning rival routes into distributed convergence like any other
+    // same-epoch fork commit.
     let routed_winner = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
         ..winning_commit
     };
-    let ingested = loser.ingest(routed_winner.clone()).await;
+    let ingested = loser.ingest(routed_winner.clone()).await.unwrap();
+    assert!(
+        matches!(ingested, IngestOutcome::Buffered { .. }),
+        "the winning rival must enter convergence, got {ingested:?}"
+    );
 
+    // Fail exactly the epoch mirror's record write inside the settling pass's
+    // apply of the selected branch.
+    loser_fault.arm(1);
+    let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+    assert!(
+        faulted.is_err(),
+        "the storage fault must surface from the settling pass, got {faulted:?}"
+    );
+
+    // Both stores stay consistent across the failed apply: engine and durable
+    // record agree on epoch and roster (the loser keeps its own branch until
+    // a pass actually lands the winner).
     let record = loser_handle.get_group(&group_id).unwrap();
     assert_eq!(
         loser.epoch(&group_id).unwrap(),
@@ -903,59 +908,19 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         "the engine's epoch and the durable record must never split"
     );
     assert_eq!(
-        record.epoch,
-        EpochId(1),
-        "a failed mirror must undo the apply, not half-commit it"
-    );
-    assert!(
-        matches!(ingested, Err(EngineError::Storage(StorageError::Busy(_)))),
-        "the storage fault must surface as a retryable error, got {ingested:?}"
-    );
-
-    // Both stores are consistent at the rolled-back epoch, roster included:
-    // neither forked invitee is present, and the group stays live.
-    let members = loser.members(&group_id).expect("group must stay live");
-    assert_eq!(members.len(), 2, "both forked invites are rolled back");
-    assert_eq!(record.members.len(), 2);
-
-    // Fork resolution legitimately releases the incumbent's snapshot, so the
-    // retained set may shrink — but the abandoned apply must not add its own
-    // recovery snapshot to it.
-    let snapshots_after: std::collections::HashSet<String> = loser_handle
-        .list_group_snapshots(&group_id)
-        .unwrap()
-        .into_iter()
-        .collect();
-    assert!(
-        snapshots_after.is_subset(&snapshots_before),
-        "the failed apply leaked its recovery snapshot: {:?}",
-        snapshots_after
-            .difference(&snapshots_before)
-            .collect::<Vec<_>>()
+        loser
+            .members(&group_id)
+            .expect("group must stay live")
+            .len(),
+        record.members.len(),
+        "the engine's roster and the durable record must never split"
     );
 
-    // The winning commit is durably retained but unapplied, and the consumed
-    // fork-resolution side effects cannot be undone. The only repair left is
-    // stored convergence, so the failure must schedule it.
-    let scheduled = loser.drain_pending_convergence_groups();
-    assert!(
-        scheduled.contains(&group_id),
-        "a failed apply must reschedule the retained winner for convergence"
-    );
-
-    // Drive recovery only through what the drain scheduled: the first pass
-    // opens on the retained commit edge, the second settles it past quiescence.
-    let mut recovered = None;
-    for g in &scheduled {
-        loser.converge_stored_openmls_messages_at(g, 0).unwrap();
-        let settled = loser
-            .converge_stored_openmls_messages_at(g, 60_000)
-            .unwrap();
-        if g == &group_id {
-            recovered = Some(settled);
-        }
-    }
-    let recovered = recovered.expect("the faulted group is scheduled");
+    // The fault is transient and one-shot: the retained winner must still
+    // land on the next pass.
+    let recovered = loser
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the retry pass settles after the transient fault");
     assert!(
         recovered
             .accepted_commits
@@ -966,7 +931,7 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     assert_eq!(
         loser.epoch(&group_id).unwrap(),
         EpochId(2),
-        "the scheduled convergence pass must eventually apply the winner"
+        "the convergence pass must eventually apply the winner"
     );
     let record = loser_handle.get_group(&group_id).unwrap();
     assert_eq!(record.epoch, EpochId(2));
@@ -1095,26 +1060,34 @@ async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
             .unwrap()
             .is_none()
     );
-    let snapshots_before: std::collections::HashSet<String> = loser_storage
-        .list_group_snapshots(&group_id)
-        .unwrap()
-        .into_iter()
-        .collect();
 
-    // The added-member cache write is first; fail the self refresh after the
-    // merge and group-record write have both run inside the transaction.
-    loser_fault.arm_on_call(2);
-    let failed = loser.ingest(routed_winner.clone()).await;
+    // The winning rival routes into distributed convergence like any other
+    // same-epoch fork commit.
+    let ingested = loser.ingest(routed_winner.clone()).await.unwrap();
     assert!(
-        matches!(failed, Err(EngineError::Storage(StorageError::Busy(_)))),
-        "self-capability mirror failure must surface as retryable, got {failed:?}"
+        matches!(ingested, IngestOutcome::Buffered { .. }),
+        "the winning rival must enter convergence, got {ingested:?}"
     );
 
+    // The added-member cache write is first; fail the self refresh after the
+    // merge and group-record write have both run inside the settling pass's
+    // apply transaction.
+    loser_fault.arm_on_call(2);
+    let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+    assert!(
+        faulted.is_err(),
+        "self-capability mirror failure must surface from the settling pass, got {faulted:?}"
+    );
+
+    // All inbound projections roll back together: engine and record agree,
+    // and the added-member cache write did not outlive the failed self
+    // refresh.
     let record = loser_storage.get_group(&group_id).unwrap();
-    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(1));
-    assert_eq!(record.epoch, EpochId(1));
-    assert_eq!(loser.members(&group_id).unwrap().len(), 2);
-    assert_eq!(record.members.len(), 2);
+    assert_eq!(loser.epoch(&group_id).unwrap(), record.epoch);
+    assert_eq!(
+        loser.members(&group_id).unwrap().len(),
+        record.members.len()
+    );
     assert!(
         loser_storage
             .member_capabilities(&group_id, &winning_invitee)
@@ -1122,27 +1095,12 @@ async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
             .is_none(),
         "the added-member cache write must roll back with the failed self refresh"
     );
-    let snapshots_after: std::collections::HashSet<String> = loser_storage
-        .list_group_snapshots(&group_id)
-        .unwrap()
-        .into_iter()
-        .collect();
-    assert!(
-        snapshots_after.is_subset(&snapshots_before),
-        "the abandoned direct apply leaked a recovery snapshot"
-    );
 
-    let scheduled = loser.drain_pending_convergence_groups();
-    assert!(
-        scheduled.contains(&group_id),
-        "the retained commit must be scheduled for stored-convergence retry"
-    );
+    // The fault is transient and one-shot: the retained winner lands on the
+    // next pass.
     loser
-        .converge_stored_openmls_messages_at(&group_id, 0)
-        .unwrap();
-    loser
-        .converge_stored_openmls_messages_at(&group_id, 60_000)
-        .unwrap();
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the retry pass settles after the transient fault");
 
     let record = loser_storage.get_group(&group_id).unwrap();
     assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));

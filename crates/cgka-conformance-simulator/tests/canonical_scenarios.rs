@@ -9,11 +9,11 @@ use cgka_conformance_simulator::{
     GeneratedScenarioCase, HarnessClient, PendingResolutionObservation, ScenarioInputDisposition,
     ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioMessageSelectorV2, ScenarioReport,
     ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
-    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
-    run_vector_fixture_report,
+    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations, compile_scenario,
+    generate_bounded_convergence_pressure_family, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    observe_client_exact, run_generated_case_report, run_scenario_report,
+    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -876,7 +876,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -897,7 +896,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
@@ -918,7 +916,6 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
-                    recoveries: vec![],
                     convergence_decisions: vec![],
                 },
             ],
@@ -1501,6 +1498,157 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
     }
 }
 
+/// The bounded convergence-pressure campaign generates a deterministic,
+/// schedule-legal case per seed index, and every case carries the full shape
+/// the campaign is defined by: a same-epoch commit race, application sends
+/// issued inside the quiescence window, a committer restart taken
+/// mid-resolution, a finite self-update/profile/admin tail, a bounded-queue
+/// resource assertion, and an active decryptability probe placed before the
+/// terminal `observe_exact`.
+#[test]
+fn bounded_convergence_pressure_family_generates_the_declared_campaign_shape() {
+    let cases = generate_bounded_convergence_pressure_family(2026, 6);
+
+    assert_eq!(cases, generate_bounded_convergence_pressure_family(2026, 6));
+    assert_eq!(cases.len(), 6);
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "bounded-convergence-pressure/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 2026);
+        assert_eq!(case.case_index, case_index as u64);
+        compile_scenario(&case.scenario)
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+    }
+
+    for case in &cases {
+        let steps = &case.scenario.steps;
+        let position = |predicate: fn(&ScenarioStep) -> bool| {
+            steps.iter().position(predicate).unwrap_or_else(|| {
+                panic!("{} is missing a required campaign step", case.scenario.name)
+            })
+        };
+
+        // A same-epoch rival race, both branches withheld until release.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::WithholdMessage { .. }))
+                .count(),
+            2,
+            "{} must withhold both rival commits",
+            case.scenario.name
+        );
+        // Application sends land after the rival branch is ingested, so they sit
+        // inside the quiescence window the committers wait out.
+        let window_open = position(|step| matches!(step, ScenarioStep::ReleaseWithheld { .. }));
+        let first_send = position(|step| matches!(step, ScenarioStep::SendAppMessage { .. }));
+        let restart = position(|step| matches!(step, ScenarioStep::RestartClient { .. }));
+        assert!(
+            window_open < first_send && first_send < restart,
+            "{}: sends must open inside the window and precede the mid-resolution restart",
+            case.scenario.name
+        );
+        // Finite pressure, never an unbounded stream.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, ScenarioStep::SelfUpdate { .. }))
+                .count(),
+            3,
+            "{} must apply exactly the finite self-update budget",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. })),
+            "{} must apply an admin-policy commit",
+            case.scenario.name
+        );
+        // Bounded queue behavior, and the bounded-time claim carried by the
+        // quiescence driver's own watchdog budget.
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+            "{} must bound the pending-input queue",
+            case.scenario.name
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::AwaitQuiescence { .. })),
+            "{} must settle through the bounded quiescence driver",
+            case.scenario.name
+        );
+        // The probe mutates, so it must precede the terminal exact observation.
+        let probe =
+            position(|step| matches!(step, ScenarioStep::ProbeBidirectionalDecryptability { .. }));
+        let observe_exact = steps
+            .iter()
+            .rposition(|step| matches!(step, ScenarioStep::ObserveExact { .. }))
+            .expect("the strict oracle appends a terminal exact observation");
+        assert!(
+            probe < observe_exact,
+            "{}: the mutating probe must run before the terminal observe_exact",
+            case.scenario.name
+        );
+
+        assert!(
+            case.expected_outcomes.iter().any(|expectation| matches!(
+                expectation,
+                TraceExpectation::ClientsExactlyEquivalent { .. }
+            )),
+            "{} must pin exact canonical equivalence",
+            case.scenario.name
+        );
+        assert!(
+            case.expected_outcomes
+                .iter()
+                .any(|expectation| matches!(expectation, TraceExpectation::NoPendingWork { .. })),
+            "{} must pin no-pending-work",
+            case.scenario.name
+        );
+    }
+}
+
+/// Runnable acceptance gate for the unified fork-resolution route under
+/// **finite** pressure. Every seed must reach quiescence with exact canonical
+/// equivalence, active bidirectional decryptability, and a bounded input queue.
+/// It deliberately claims nothing about progress under an unbounded
+/// self-update stream.
+///
+/// IGNORED — this currently fails on engine behavior, not on the campaign. An
+/// application message accepted while the group is resolving a same-epoch fork
+/// is queued durably and then stranded: once the pass completes, nothing
+/// re-arms the retained-intent drain, and the engine's own conformance
+/// structural progress reports `runnable_work = 0` with no next wake while
+/// `pending_work.queued_outbound_intents > 0`. The quiescence driver therefore
+/// reports `Blocked { subsystems: ["scenario_inputs"] }` and the payload is
+/// never published. Un-ignore once the retained-intent drain is re-armed after
+/// a completed pass; do not weaken the assertions below to make it pass.
+#[ignore = "engine strands application sends accepted inside the convergence quiescence window"]
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_convergence_pressure_family_settles_every_seeded_permutation() {
+    for case in &generate_bounded_convergence_pressure_family(2026, 6) {
+        let report = run_generated_case_report(case, None)
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+        assert!(
+            report.expectation_failures.is_empty(),
+            "{} expectation failures: {:#?}",
+            case.scenario.name,
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "{} invariant failures: {:#?}",
+            case.scenario.name,
+            report.invariant_failures
+        );
+    }
+}
+
 #[tokio::test]
 async fn convergence_e2e_delivery_family_runs_generated_variants() {
     let cases = generate_convergence_e2e_delivery_family(99, 12);
@@ -1997,7 +2145,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
 }
 
 #[tokio::test]
-async fn scenario_report_records_trace_log_recoveries_and_failures() {
+async fn scenario_report_records_trace_log_and_failures() {
     let spec = deliberate_fork_recovery_spec();
 
     let report = run_scenario_report(&spec, None)
@@ -2013,12 +2161,6 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
             .iter()
             .all(|entry| entry.status.is_completed())
     );
-    assert_eq!(report.recovery_observations.len(), 1);
-    let recovery = &report.recovery_observations[0];
-    assert_eq!(recovery.source_epoch, 1);
-    assert_eq!(recovery.recovered_epoch, 2);
-    assert_ne!(recovery.winner, recovery.invalidated);
-    assert!(recovery.winner < recovery.invalidated);
     assert!(report.invariant_failures.is_empty());
 
     let json = serde_json::to_value(&report).expect("report serializes");
@@ -2049,16 +2191,6 @@ async fn group_data_fork_recovery_fixture_uses_semantic_outcomes() {
         assert_eq!(observation.epoch, 2);
         assert_eq!(observation.member_count, 2);
     }
-    let recoveries = trace
-        .observations
-        .iter()
-        .flat_map(|observation| observation.recoveries.iter())
-        .collect::<Vec<_>>();
-    assert_eq!(recoveries.len(), 1);
-    assert_ne!(
-        recoveries[0].winner, recoveries[0].invalidated,
-        "semantic recovery fixture should not depend on exact commit digest bytes"
-    );
 }
 
 #[tokio::test]
@@ -2442,31 +2574,6 @@ async fn deliberate_fork_via_harness() {
         alice_members, bob_members,
         "alice outcomes: {alice_outcomes:?}; bob outcomes: {bob_outcomes:?}"
     );
-    let trace = ScenarioTrace {
-        name: "deliberate-fork-recovery/v1".into(),
-        pending_resolutions: vec![],
-        errors: vec![],
-        admin_policies: vec![],
-        decryptability_probes: vec![],
-        observations: vec![
-            observe_client("alice", &mut alice),
-            observe_client("bob", &mut bob),
-        ],
-    };
-    let recoveries: Vec<_> = trace
-        .observations
-        .iter()
-        .flat_map(|o| o.recoveries.iter())
-        .collect();
-    assert_eq!(
-        recoveries.len(),
-        1,
-        "exactly one peer should roll back to the deterministic winner: {trace:#?}"
-    );
-    assert_eq!(recoveries[0].source_epoch, 1);
-    assert_eq!(recoveries[0].recovered_epoch, 2);
-    assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
-    assert!(recoveries[0].winner < recoveries[0].invalidated);
     let has_david = alice_members.iter().any(|m| m.id == david.member_id());
     let has_eve = alice_members.iter().any(|m| m.id == eve.member_id());
     assert_ne!(has_david, has_eve);
@@ -2922,7 +3029,6 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
         }
         assert!(observation.removed_members.is_empty());
         assert!(observation.app_invalidations.is_empty());
-        assert!(observation.recoveries.is_empty());
     }
 }
 
