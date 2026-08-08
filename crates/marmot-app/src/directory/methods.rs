@@ -1077,6 +1077,7 @@ impl MarmotApp {
         {
             return Ok(cache);
         }
+        let _lifecycle = self.begin_storage_open("directory cache")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::directory",
             "directory_cache_handle_open",
@@ -1104,17 +1105,12 @@ impl MarmotApp {
         #[cfg(test)]
         self.directory_cache_open_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Publishing under `_lifecycle` is what keeps this cache reachable by a
+        // later `close_storage`; see `MarmotApp::begin_storage_open`.
         let mut caches = self
             .directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // See `MarmotApp::account_storage`: a close that latched mid-open must
-        // not leave this cache published and holding its database open.
-        if let Err(error) = self.ensure_storage_open("directory cache") {
-            drop(caches);
-            let _ = cache.close();
-            return Err(error);
-        }
         Ok(caches
             .entry(account.label.clone())
             .or_insert_with(|| cache.clone())

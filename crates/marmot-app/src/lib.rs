@@ -445,6 +445,11 @@ pub struct MarmotApp {
     /// a late call cannot silently reopen a database — and re-lock a container
     /// the host has just been told is lock-free.
     storage_closed: Arc<AtomicBool>,
+    /// Admission control that makes the close *atomic* rather than merely
+    /// latched: database opens hold the read side across create-and-publish,
+    /// [`Self::close_storage`] holds the write side across its whole teardown.
+    /// See [`Self::begin_storage_open`].
+    storage_lifecycle: Arc<RwLock<()>>,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
@@ -1159,6 +1164,7 @@ impl MarmotApp {
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             relay_plane,
             config,
@@ -1220,6 +1226,7 @@ impl MarmotApp {
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             account_home,
             relay_plane,
@@ -4133,6 +4140,19 @@ impl MarmotApp {
     /// error is returned once all of them have been closed.
     pub fn close_storage(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
+        // Exclusive for the whole teardown. The `storage_closed` flag alone
+        // would not make this atomic: two concurrent closes could interleave so
+        // that one released the root lease and returned while the other was
+        // still closing connections, and an open already in flight could finish
+        // creating its connection after this method returned. Either way the
+        // host would be told the container is lock-free while a lock still
+        // existed. Holding the writer means every opener has either published
+        // (so the drain below closes it) or has not yet checked the flag (so it
+        // will refuse).
+        let _lifecycle = self
+            .storage_lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
         let mut first_error = None;
         let mut closed = 0usize;
@@ -4215,6 +4235,30 @@ impl MarmotApp {
         Ok(())
     }
 
+    /// Admission for a database *open*, held from the closed check through
+    /// publication into the handle cache.
+    ///
+    /// Opens are readers, so they still run concurrently with each other;
+    /// [`Self::close_storage`] is the writer. That is what makes the close's
+    /// promise true: an open holding this guard either publishes before the
+    /// close can start draining, or has not yet checked the flag and will
+    /// refuse. No connection can be created after the close returns.
+    ///
+    /// Cache *hits* deliberately skip this — a handle already in the cache is
+    /// one the close will drain and shut, so returning a clone of it cannot
+    /// leak a lock, and the hot read path stays uncontended.
+    fn begin_storage_open(
+        &self,
+        database: &'static str,
+    ) -> Result<RwLockReadGuard<'_, ()>, AppError> {
+        let guard = self
+            .storage_lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_storage_open(database)?;
+        Ok(guard)
+    }
+
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
@@ -4226,6 +4270,7 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        let _lifecycle = self.begin_storage_open("account storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
             "account_storage_open",
@@ -4246,21 +4291,12 @@ impl MarmotApp {
             )?
         };
         let storage = SqliteAccountStorage::open_encrypted(&path, &key)?;
+        // Publishing under `_lifecycle` is what keeps this connection reachable
+        // by a later `close_storage`; see `begin_storage_open`.
         let mut storages = self
             .account_storages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A close that latched while this open was in flight has already
-        // drained the map, so publishing here would strand an open connection
-        // — and its file locks — past `close_storage`. Close it instead. The
-        // ordering holds both ways: `close_storage` sets the flag before it
-        // takes this same lock, so either we observe the flag or the drain
-        // observes our entry.
-        if let Err(error) = self.ensure_storage_open("account storage") {
-            drop(storages);
-            let _ = storage.close();
-            return Err(error);
-        }
         Ok(storages
             .entry(label.to_owned())
             .or_insert_with(|| storage.clone())
@@ -4604,6 +4640,7 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        let _lifecycle = self.begin_storage_open("shared storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
             "shared_storage_open",
@@ -4615,13 +4652,6 @@ impl MarmotApp {
             .shared_storage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // See `account_storage`: a close that latched mid-open must not leave
-        // this connection published and holding the shared database's locks.
-        if let Err(error) = self.ensure_storage_open("shared storage") {
-            drop(shared);
-            let _ = storage.close();
-            return Err(error);
-        }
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
