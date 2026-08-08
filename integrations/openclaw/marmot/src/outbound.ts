@@ -208,9 +208,11 @@ function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly
  * Returns `null` when the ctx provides only a remote URL and no buffer accessor;
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
  *
- * Throws `LocalMediaAccessError` (from the SDK) when a local path escapes the
- * allowlist; the caller surfaces that as a failed send. The file is never read
- * in that case — the allowlist check and the read are the same operation.
+ * Throws `LocalMediaAccessError` (from the SDK) when a local path cannot be read
+ * from the allowlisted roots; the caller surfaces that as a failed send. A path
+ * outside the roots is never opened — the allowlist check and the read are the
+ * same operation — but the error does not distinguish that from an in-root read
+ * failure, so treat it as "refused", not specifically "escaped the allowlist".
  */
 async function resolveOutboundMediaUpload(
   ctx: ChannelMessageSendMediaContext,
@@ -228,10 +230,15 @@ async function resolveOutboundMediaUpload(
       roots: resolveAllowedMediaRoots(ctx),
       label: "outbound media roots",
     });
+    // `readLocalFileFromRoots` collapses every failure to `null`: an allowlist
+    // miss, but also a missing file, an IO error, or a symlink/hardlink policy
+    // rejection *under* an allowed root. Fail closed on all of them, but do not
+    // claim which one it was — a missing in-root attachment should not read as
+    // an exfiltration attempt in the logs.
     if (!read) {
       throw new LocalMediaAccessError(
         "path-not-allowed",
-        "marmot: outbound media path is outside the allowed local media roots",
+        "marmot: outbound media is not readable from the allowed local media roots",
       );
     }
     const fileName = basename(localPath) || "attachment";
