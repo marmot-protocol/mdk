@@ -278,7 +278,7 @@ fn imeta_parser_rejects_duplicate_single_occurrence_field() {
     assert!(media_attachment_from_imeta_tag(&multi, None, false).is_ok());
 }
 
-fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
+pub(super) fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("test server addr");
     thread::spawn(move || {
@@ -293,18 +293,18 @@ fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
     format!("http://{addr}")
 }
 
-fn spawn_http_response(response: Vec<u8>) -> String {
+pub(super) fn spawn_http_response(response: Vec<u8>) -> String {
     spawn_http_responses(vec![response])
 }
 
-fn http_redirect_response(location: &str) -> Vec<u8> {
+pub(super) fn http_redirect_response(location: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .into_bytes()
 }
 
-fn http_ok_response(body: &[u8]) -> Vec<u8> {
+pub(super) fn http_ok_response(body: &[u8]) -> Vec<u8> {
     let mut response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
