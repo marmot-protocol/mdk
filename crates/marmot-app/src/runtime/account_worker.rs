@@ -1104,6 +1104,14 @@ async fn run_app_runtime_account_worker(
 /// its own group's hydration.
 const STARTUP_HYDRATION_BATCH_SIZE: usize = 4;
 
+/// Commands served between hydration batches. Bounded so sustained
+/// account-worker traffic cannot starve the pipeline: without a budget, an
+/// unbounded drain-until-empty could defer hydration (and the mutation
+/// replay behind it) indefinitely while the `deferred` vec grows. The
+/// command channel itself holds 8, so under continuous producers each batch
+/// interleaves one channel's worth of commands with one batch of hydration.
+const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
+
 enum StartupHydrationOutcome {
     Completed,
     Shutdown,
@@ -1173,9 +1181,11 @@ async fn run_startup_hydration_pipeline(
                 }
             }
         }
-        loop {
+        let mut commands_served = 0usize;
+        while commands_served < STARTUP_HYDRATION_COMMAND_BUDGET {
             match commands.try_recv() {
                 Ok(command) => {
+                    commands_served += 1;
                     handle_startup_hydration_command(client, command, deferred).await;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1410,10 +1420,24 @@ async fn handle_account_worker_command(
             }
         }
         AccountWorkerCommand::Members { group_id, respond } => {
+            // On-demand promotion (mdk#1161): normally a no-op (the startup
+            // pipeline hydrated everything), but if the pipeline aborted on a
+            // storage error the leftover groups must still promote on first
+            // read instead of surfacing GroupHydrationPending forever.
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
             let _ = respond.send(result);
         }

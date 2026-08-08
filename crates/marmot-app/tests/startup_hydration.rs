@@ -32,6 +32,101 @@ fn open_store(dir: &tempfile::TempDir, relay_url: &str, hold_ms: Option<u64>) ->
 }
 
 #[test]
+fn sustained_command_traffic_does_not_starve_the_hydration_pipeline() {
+    let thread = std::thread::Builder::new()
+        .name("startup-hydration-flood".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(sustained_traffic_body());
+        })
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// The pipeline serves a bounded command budget between batches (mdk#1161
+/// review): a host hammering worker-routed reads from the moment `start()`
+/// returns must not defer hydration indefinitely. A per-batch hold keeps the
+/// pipeline slow enough that the read flood genuinely overlaps it; the
+/// pipeline's completion telemetry sample proves it finished under load.
+async fn sustained_traffic_body() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+
+    let dir_donor = tempfile::tempdir().unwrap();
+    let home_donor = AccountHome::open(dir_donor.path());
+    home_donor.create_account("donor").unwrap();
+    let donor_id = home_donor.account("donor").unwrap().account_id_hex;
+    {
+        let app_donor = open_store(&dir_donor, &url, None);
+        let mut donor = app_donor.client("donor").await.unwrap();
+        donor.publish_key_package().await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account(BENCH_ACCOUNT).unwrap();
+    let mut group_ids = Vec::new();
+    {
+        let app_fixture = open_store(&dir, &url, None);
+        let mut client = app_fixture.client(BENCH_ACCOUNT).await.unwrap();
+        for group in 0..GROUP_COUNT {
+            group_ids.push(
+                client
+                    .create_group(&format!("flooded group {group}"), &[donor_id.as_str()])
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+
+    // Slow the pipeline down (200ms per batch, GROUP_COUNT groups over
+    // batches of 4 => >= 2 batches) so the flood overlaps it.
+    let app = open_store(&dir, &url, Some(200));
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+
+    // Continuous worker-routed reads: every one either answers from live
+    // state or promotes its group; the budget guarantees the pipeline still
+    // advances between them.
+    let telemetry = runtime.shared_services().app_performance_telemetry();
+    let flooded = group_ids.first().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut flood_reads = 0u64;
+    loop {
+        // The pipeline records its own AccountGroupHydration sample when it
+        // completes (sample 2; sample 1 is the seed pass inside open).
+        if telemetry.snapshot().account_group_hydration.attempts >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hydration pipeline starved by sustained reads ({flood_reads} served)"
+        );
+        runtime.group_members(BENCH_ACCOUNT, flooded).await.unwrap();
+        flood_reads += 1;
+    }
+    assert!(
+        flood_reads > 0,
+        "flood must overlap the pipeline for this regression to mean anything"
+    );
+    // Every group finished hydrating despite the traffic.
+    for group_id in &group_ids {
+        assert!(
+            !runtime
+                .group_members(BENCH_ACCOUNT, group_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[test]
 fn chat_list_is_readable_and_group_reads_wait_per_group_while_hydration_is_held() {
     let thread = std::thread::Builder::new()
         .name("startup-hydration-hold".to_owned())
