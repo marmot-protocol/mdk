@@ -41,6 +41,14 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
   `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
   re-verify the deliberate test-only `dist/plugins/loader.js` import used by the
   connector E2E (the pinned SDK exposes no supported plugin-loader subpath).
+- Keep `test/plugin-sdk-surface.test.ts` in sync when adding or removing a
+  runtime (non-type) `openclaw/plugin-sdk/*` import. A named import the host SDK
+  no longer exports is an ESM link error that fails the *whole* plugin load, not
+  just the feature using it, so the channel disappears from OpenClaw entirely.
+  Prefer subpaths that carry the symbol on both the `latest` and `beta` release
+  channels; the SDK's barrels get re-cut between them (2026.7.2-beta moved
+  `getDefaultLocalRoots` out of `plugin-sdk/media-runtime` and dropped
+  `assertLocalMediaAllowed` from the public surface altogether).
 - The inbound→agent and live-preview-pipeline seams use OpenClaw gateway runtime
   internals and are validated by the deterministic connector E2E plus the docker
   phone test, not the unit tests alone.
