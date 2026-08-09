@@ -360,6 +360,12 @@ pub(crate) enum AccountWorkerCommand {
         reason: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    /// Count seeded groups the session has not fully hydrated yet, without
+    /// promoting them on demand (mdk#1337 regression probe).
+    #[cfg(test)]
+    UnhydratedGroupCount {
+        respond: oneshot::Sender<usize>,
+    },
 }
 
 impl AccountWorkerCommand {
@@ -1545,6 +1551,11 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
         }
+        #[cfg(test)]
+        AccountWorkerCommand::UnhydratedGroupCount { respond } => {
+            let count = client.runtime.session().unhydrated_group_ids().len();
+            let _ = respond.send(count);
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
@@ -1572,6 +1583,11 @@ async fn handle_account_worker_command(
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
             let _ = respond.send(());
+        }
+        #[cfg(test)]
+        AccountWorkerCommand::UnhydratedGroupCount { respond } => {
+            let count = client.runtime.session().unhydrated_group_ids().len();
+            let _ = respond.send(count);
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();

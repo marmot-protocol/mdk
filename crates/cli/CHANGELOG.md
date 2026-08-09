@@ -49,6 +49,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   MarmotKit surfaces a new retryable `GroupHydrationPending` error, distinct
   from `UnknownGroup`, for the remaining direct-read window.
 
+- Regression coverage (mdk#1337): after a receive-error transport reconnect,
+  the managed account worker eagerly drains every deferred stored group (more
+  than one hydration batch) before resuming steady-state commands, so groups
+  are not left gated until a later read or send promotes them individually.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`

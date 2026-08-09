@@ -39,6 +39,7 @@ use crate::messages::{AppMessageIntent, build_inner_event};
 struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
@@ -135,6 +136,21 @@ impl ScriptedPushRelayClient {
     fn release_publish(&self) {
         self.publish_release.notify_waiters();
     }
+
+    fn inbox_subscription_count(&self, expected_account_id: &MemberId) -> usize {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::AccountInbox { account_id, .. }
+                        if account_id == expected_account_id
+                )
+            })
+            .count()
+    }
 }
 
 #[async_trait]
@@ -176,6 +192,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 ));
             }
         }
+        self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
 
@@ -4248,6 +4265,118 @@ fn account_worker_reconnect_backoff_doubles_caps_and_resets() {
         backoff.next_delay_with_jitter(Duration::ZERO),
         Duration::from_secs(2)
     );
+}
+
+#[test]
+fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups() {
+    run_composed_app_runtime_test(
+        "reconnect-deferred-hydration",
+        reconnect_drains_deferred_hydration_before_steady_state_serves_groups_body,
+    );
+}
+
+async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_body() {
+    const ACCOUNT: &str = "bench";
+    const GROUP_COUNT: usize = 6;
+
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("donor").unwrap();
+    home.create_account(ACCOUNT).unwrap();
+    let donor_id = home.account("donor").unwrap().account_id_hex;
+    let account_id =
+        MemberId::new(hex::decode(home.account(ACCOUNT).unwrap().account_id_hex).unwrap());
+    let mut group_ids = Vec::new();
+    {
+        let app_fixture = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut donor = app_fixture.client("donor").await.unwrap();
+        donor.publish_key_package().await.unwrap();
+        let mut client = app_fixture.client(ACCOUNT).await.unwrap();
+        for group in 0..GROUP_COUNT {
+            group_ids.push(
+                client
+                    .create_group(&format!("reconnect group {group}"), &[donor_id.as_str()])
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+    const {
+        assert!(
+            GROUP_COUNT > 4,
+            "fixture must span more than one startup hydration batch"
+        );
+    }
+
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.start().await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if relay.inbox_subscription_count(&account_id) >= 1
+                && matches!(
+                    runtime.unhydrated_group_count_for_test(ACCOUNT).await,
+                    Ok(0)
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial startup should finish hydration and transport activation");
+
+    let subscriptions_before_recovery = relay.inbox_subscription_count(&account_id);
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(3);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if relay.inbox_subscription_count(&account_id) <= subscriptions_before_recovery {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
+                Ok(0) => break,
+                Ok(_) | Err(AppError::TransportClosed) => tokio::task::yield_now().await,
+                Err(err) => panic!("unexpected worker error during reconnect: {err:?}"),
+            }
+        }
+    })
+    .await
+    .expect("notification recovery should reconnect and drain deferred hydration");
+
+    assert_eq!(
+        runtime
+            .unhydrated_group_count_for_test(ACCOUNT)
+            .await
+            .unwrap(),
+        0,
+        "reconnect must drain deferred hydration before steady-state group reads"
+    );
+
+    for group_id in &group_ids {
+        let members = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runtime.group_members(ACCOUNT, group_id),
+        )
+        .await
+        .expect("group read should succeed once reconnect is steady")
+        .unwrap();
+        assert!(
+            !members.is_empty(),
+            "every stored group must be readable once reconnect settles"
+        );
+    }
+
+    runtime.shutdown().await;
 }
 
 #[test]

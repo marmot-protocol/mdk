@@ -1232,6 +1232,18 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Count groups the worker session has seeded but not fully hydrated,
+    /// without issuing a read that would promote them (mdk#1337).
+    #[cfg(test)]
+    pub(crate) async fn unhydrated_group_count_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<usize, AppError> {
+        self.accounts
+            .unhydrated_group_count_for_test(account_ref)
+            .await
+    }
+
     pub async fn group_mls_state(
         &self,
         account_ref: &str,
