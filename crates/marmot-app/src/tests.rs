@@ -382,10 +382,10 @@ fn invite_members_keeps_same_account_projection_reads_off_detached_catch_up() {
 }
 
 #[test]
-fn concurrent_invites_coalesce_catch_up_away_from_both_inviting_accounts() {
+fn concurrent_invites_keep_both_accounts_readable_during_catch_up() {
     run_composed_app_runtime_test(
-        "concurrent-invites-coalesce-post-mutation-catch-up",
-        concurrent_invites_coalesce_post_mutation_catch_up_body,
+        "concurrent-invites-keep-projections-readable",
+        concurrent_invites_keep_projections_readable_body,
     );
 }
 
@@ -609,7 +609,9 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .await
         .unwrap();
 
-    relay.block_account_subscribe_after_next_publish(hex::decode(&bob.account_id_hex).unwrap());
+    relay.block_account_subscribe_after_next_publish(
+        hex::decode(home.account("alice").unwrap().account_id_hex).unwrap(),
+    );
     let inviting_runtime = runtime.clone();
     let invite_group_id = group_id.clone();
     let bob_account_id = bob.account_id_hex.clone();
@@ -627,7 +629,7 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         relay.wait_for_blocked_subscribe(),
     )
     .await
-    .expect("non-excluded account catch-up should remain blocked after publication");
+    .expect("inviting-account catch-up should remain blocked after publication");
     tokio::time::timeout(std::time::Duration::from_millis(250), invite)
         .await
         .expect("confirmed invite must return before read-side catch-up finishes")
@@ -652,7 +654,7 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     assert_eq!(before_release.group_invite_members.successes, 1);
     assert_eq!(
         before_release.group_invite_post_mutation_catch_up.successes, 0,
-        "non-excluded account catch-up must remain unfinished while its subscription is blocked"
+        "inviting-account catch-up must remain unfinished while its subscription is blocked"
     );
 
     relay.release_subscribe();
@@ -676,7 +678,7 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     runtime.shutdown().await;
 }
 
-async fn concurrent_invites_coalesce_post_mutation_catch_up_body() {
+async fn concurrent_invites_keep_projections_readable_body() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
@@ -695,8 +697,8 @@ async fn concurrent_invites_coalesce_post_mutation_catch_up_body() {
         .create_group("bob", "bob invite", &[], None)
         .await
         .unwrap();
-    // Hold each invite at its first publication so both accounts enter one
-    // coordinator cohort before either detached catch-up can start.
+    // Hold each invite at its first publication so both mutations overlap
+    // before either detached catch-up can start.
     relay.block_next_publishes(2);
     let alice_runtime = runtime.clone();
     let alice_group_for_invite = alice_group.clone();
@@ -742,54 +744,55 @@ async fn concurrent_invites_coalesce_post_mutation_catch_up_body() {
         .expect("bob invite task should not panic")
         .expect("bob invite should succeed");
 
+    let alice_members = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_members("alice", &alice_group),
+    )
+    .await
+    .expect("alice members must not queue behind concurrent invite catch-up")
+    .expect("alice members should succeed");
+    let alice_state = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_mls_state("alice", &alice_group),
+    )
+    .await
+    .expect("alice MLS state must not queue behind concurrent invite catch-up")
+    .expect("alice MLS state should succeed");
+    let bob_members = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_members("bob", &bob_group),
+    )
+    .await
+    .expect("bob members must not queue behind concurrent invite catch-up")
+    .expect("bob members should succeed");
+    let bob_state = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_mls_state("bob", &bob_group),
+    )
+    .await
+    .expect("bob MLS state must not queue behind concurrent invite catch-up")
+    .expect("bob MLS state should succeed");
+    assert_eq!(alice_members.len(), 2);
+    assert_eq!(alice_state.member_count, 2);
+    assert_eq!(bob_members.len(), 2);
+    assert_eq!(bob_state.member_count, 2);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let catch_up_finished = runtime
+            if runtime
                 .shared_services()
                 .app_performance_telemetry()
                 .snapshot()
                 .group_invite_post_mutation_catch_up
                 .successes
-                == 1;
-            if catch_up_finished {
+                == 2
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("coalesced catch-up should finish or expose an inviting-account stall");
-
-    let reads = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-        let alice_members = runtime.group_members("alice", &alice_group).await?;
-        let alice_state = runtime.group_mls_state("alice", &alice_group).await?;
-        let bob_members = runtime.group_members("bob", &bob_group).await?;
-        let bob_state = runtime.group_mls_state("bob", &bob_group).await?;
-        Ok::<_, AppError>((alice_members, alice_state, bob_members, bob_state))
-    })
-    .await;
-
-    let (alice_members, alice_state, bob_members, bob_state) = reads
-        .expect("same-account reads must not queue behind a concurrent invite catch-up")
-        .expect("same-account reads should succeed");
-    assert_eq!(alice_members.len(), 2);
-    assert_eq!(alice_state.member_count, 2);
-    assert_eq!(bob_members.len(), 2);
-    assert_eq!(bob_state.member_count, 2);
-    // Give a second, incorrectly detached catch-up enough scheduler time to
-    // report. The publication barrier above makes both invites overlap, so the
-    // coordinator must emit exactly one cohort catch-up.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        runtime
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .group_invite_post_mutation_catch_up
-            .successes,
-        1,
-        "overlapping invites should coalesce into one successful detached catch-up"
-    );
+    .expect("both detached catch-ups should complete after the relay unblocks");
     runtime.shutdown().await;
 }
 

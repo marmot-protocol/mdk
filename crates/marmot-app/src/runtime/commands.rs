@@ -4,7 +4,7 @@
 
 use zeroize::Zeroizing;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -26,85 +26,12 @@ use crate::{
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
 
-struct InviteCatchUpGuard {
-    manager: AccountManager,
-    account_id: String,
-    finished: bool,
-}
-
-impl InviteCatchUpGuard {
-    fn new(manager: &AccountManager, account_id: String) -> Self {
-        manager.begin_invite_catch_up(&account_id);
-        Self {
-            manager: manager.clone(),
-            account_id,
-            finished: false,
-        }
-    }
-
-    fn finish(mut self, committed: bool) {
-        self.finished = true;
-        self.manager
-            .finish_invite_catch_up(&self.account_id, committed);
-    }
-}
-
-impl Drop for InviteCatchUpGuard {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.manager.finish_invite_catch_up(&self.account_id, false);
-        }
-    }
-}
-
 impl AccountManager {
-    fn begin_invite_catch_up(&self, account_id: &str) {
-        let mut coordinator = self
-            .invite_catch_up
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *coordinator
-            .active_by_account
-            .entry(account_id.to_owned())
-            .or_default() += 1;
-        coordinator.cohort_accounts.insert(account_id.to_owned());
-    }
-
-    fn finish_invite_catch_up(&self, account_id: &str, committed: bool) {
-        let excluded_accounts = {
-            let mut coordinator = self
-                .invite_catch_up
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            coordinator.committed_mutation_pending |= committed;
-            if let Some(active) = coordinator.active_by_account.get_mut(account_id) {
-                *active -= 1;
-                if *active == 0 {
-                    coordinator.active_by_account.remove(account_id);
-                }
-            }
-            if !coordinator.active_by_account.is_empty() {
-                None
-            } else if coordinator.committed_mutation_pending {
-                coordinator.committed_mutation_pending = false;
-                Some(std::mem::take(&mut coordinator.cohort_accounts))
-            } else {
-                coordinator.cohort_accounts.clear();
-                None
-            }
-        };
-        if let Some(excluded_accounts) = excluded_accounts {
-            self.spawn_invite_catch_up(excluded_accounts);
-        }
-    }
-
-    fn spawn_invite_catch_up(&self, excluded_accounts: HashSet<String>) {
+    fn spawn_invite_catch_up(&self) {
         let post_mutation = self.clone();
         tokio::spawn(async move {
             let catch_up_started_at = Instant::now();
-            let catch_up = post_mutation
-                .catch_up_accounts_excluding(&excluded_accounts)
-                .await;
+            let catch_up = post_mutation.catch_up_accounts().await;
             post_mutation.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupInvitePostMutationCatchUp,
                 catch_up_started_at.elapsed(),
@@ -452,8 +379,6 @@ impl AccountManager {
     ) -> Result<SendSummary, AppError> {
         let started_at = Instant::now();
         let result = async {
-            let inviting_account_id = self.resolve(account_ref)?.account_id_hex;
-            let catch_up_guard = InviteCatchUpGuard::new(self, inviting_account_id);
             let command = self.worker_commands(account_ref).await?;
             let (respond, response) = oneshot::channel();
             command
@@ -465,7 +390,7 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-            catch_up_guard.finish(true);
+            self.spawn_invite_catch_up();
 
             self.schedule_audit_log_tracker_update("invite_members");
             Ok(summary)
