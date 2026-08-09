@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, DEFAULT_MAXIMUM_FORWARD_DISTANCE, DEFAULT_OUT_OF_ORDER_TOLERANCE,
-    PURE_PLAINTEXT_WIRE_FORMAT_POLICY,
+    PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config,
 };
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
@@ -235,6 +235,11 @@ async fn hydration_migrates_and_persists_existing_sender_ratchet_policy() {
     alice.confirm_published(pending).await.expect("confirm");
 
     let mut stored_group = load_openmls_group(&alice_inspection, &group_id);
+    assert_eq!(
+        stored_group.configuration(),
+        &join_config(DEFAULT_MAX_PAST_EPOCHS),
+        "group creation and Welcome join must share the complete engine-owned runtime config"
+    );
     let openmls_default = SenderRatchetConfiguration::default();
     assert_eq!(openmls_default.out_of_order_tolerance(), 5);
     assert_eq!(openmls_default.maximum_forward_distance(), 1_000);
@@ -242,7 +247,10 @@ async fn hydration_migrates_and_persists_existing_sender_ratchet_policy() {
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(DEFAULT_MAX_PAST_EPOCHS)
         .use_ratchet_tree_extension(true)
-        .sender_ratchet_configuration(openmls_default)
+        .sender_ratchet_configuration(SenderRatchetConfiguration::new(
+            openmls_default.out_of_order_tolerance(),
+            DEFAULT_MAXIMUM_FORWARD_DISTANCE - 1,
+        ))
         .build();
     stored_group
         .set_configuration(
@@ -290,5 +298,13 @@ async fn hydration_migrates_and_persists_existing_sender_ratchet_policy() {
             .out_of_order_tolerance(),
         DEFAULT_OUT_OF_ORDER_TOLERANCE,
         "migration must survive another process restart"
+    );
+    assert_eq!(
+        persisted_group
+            .configuration()
+            .sender_ratchet_configuration()
+            .maximum_forward_distance(),
+        DEFAULT_MAXIMUM_FORWARD_DISTANCE,
+        "maximum forward-distance migration must survive another process restart"
     );
 }
