@@ -3324,7 +3324,8 @@ impl MarmotAppRuntime {
     /// whatever SQLite statement is executing.
     pub async fn shutdown_and_close(&self) -> Result<(), AppError> {
         self.shutdown().await;
-        self.accounts.app.close_storage()
+        let app = self.accounts.app.clone();
+        blocking_app_task(move || app.close_storage()).await
     }
 
     /// Whether this runtime's storage has been closed by

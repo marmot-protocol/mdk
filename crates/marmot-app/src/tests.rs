@@ -5430,6 +5430,7 @@ fn close_storage_releases_every_database_and_the_root_lease() {
         app.account_storage(&account.label).err(),
         app.shared_storage().err(),
         app.directory_cache_for_account(&account).err(),
+        app.projection_status(&account.label).err(),
     ]
     .into_iter()
     .map(|error| error.expect("a closed app must not hand out a database"))
@@ -5495,6 +5496,77 @@ fn close_storage_waits_for_an_open_that_is_already_in_flight() {
         .join()
         .unwrap()
         .expect("close_storage should succeed once the open finishes");
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+}
+
+/// Legacy account projection import opens a short-lived raw SQLite connection
+/// after the cached account storage has already been returned. That entire
+/// window must count as an in-flight storage open; otherwise terminal close can
+/// return and release the root lease immediately before the migration reopens
+/// the legacy database in the shared container.
+#[test]
+fn close_storage_waits_for_legacy_projection_import() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let home = AccountHome::open(root);
+    home.create_account("legacy-racing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    let keys = app
+        .account_home()
+        .load_signing_keys("legacy-racing")
+        .unwrap();
+    let legacy_path = app.legacy_account_projection_path("legacy-racing");
+    let legacy_key = app
+        .sqlcipher_key(
+            "legacy-racing",
+            &keys,
+            &legacy_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        )
+        .unwrap();
+    drop(LegacyAccountProjectionDb::open(legacy_path, &legacy_key).unwrap());
+
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let hook_entered = std::sync::Arc::clone(&entered);
+    let hook_release = std::sync::Arc::clone(&release);
+    app.set_legacy_projection_open_hook_for_test(std::sync::Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+
+    let migrating_app = app.clone();
+    let migration = std::thread::spawn(move || migrating_app.ensure_account_state("legacy-racing"));
+    entered.wait();
+
+    let closing_app = app.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let result = closing_app.close_storage();
+        closed_tx.send(()).unwrap();
+        result
+    });
+    assert!(
+        closed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "terminal close must wait for the legacy database import window",
+    );
+    assert!(matches!(
+        MarmotRootRuntimeLease::try_acquire(root),
+        Err(AppError::RuntimeBusy)
+    ));
+
+    release.wait();
+    migration.join().unwrap().unwrap();
+    closer.join().unwrap().unwrap();
     drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
 }
 

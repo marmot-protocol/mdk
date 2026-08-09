@@ -148,10 +148,10 @@ impl DerefMut for ConnectionGuard<'_> {
 #[derive(Debug)]
 pub struct CloseableConnection {
     slot: Mutex<Option<rusqlite::Connection>>,
-    /// Mirrors "the slot is empty" so [`Self::is_closed`] can answer without
-    /// taking the connection mutex — a caller asking whether the database is
-    /// closed must not have to queue behind whatever statement is running on
-    /// it.
+    /// Published before [`Self::close`] waits for the connection mutex. New
+    /// operations must stop being admitted as soon as closing begins; otherwise
+    /// racing callers could repeatedly acquire `slot` ahead of the closer and
+    /// extend the host's suspension-critical teardown indefinitely.
     closed: AtomicBool,
     /// Detail carried by the [`StorageError::Closed`] this connection raises,
     /// naming which database is closed.
@@ -171,19 +171,25 @@ impl CloseableConnection {
     }
 
     /// Borrow the connection, or fail with [`StorageError::Closed`] if it has
-    /// been closed.
+    /// been closed or is currently closing.
     pub fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        if self.is_closed() {
+            return Err(StorageError::Closed(self.closed_detail.to_string()));
+        }
         let guard = self
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_none() {
+        // `close` may have published after the optimistic check but before this
+        // mutex acquisition. Recheck under the mutex so a caller that queued
+        // behind the closer cannot start fresh work during teardown.
+        if self.is_closed() || guard.is_none() {
             return Err(StorageError::Closed(self.closed_detail.to_string()));
         }
         Ok(ConnectionGuard { guard })
     }
 
-    /// Whether [`Self::close`] has already taken the connection. Nonblocking.
+    /// Whether [`Self::close`] has started. Nonblocking.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -202,13 +208,15 @@ impl CloseableConnection {
     /// larger `-wal` behind costs the next open a replay, whereas leaving the
     /// connection open costs the host its process.
     pub fn close(&self) -> StorageResult<()> {
+        // Close admission before waiting for the currently executing operation.
+        // Do not return early when this was already set: concurrent close
+        // callers still have to serialize on `slot` so every return truthfully
+        // means the connection has been taken and closed.
+        self.closed.store(true, Ordering::Release);
         let mut slot = self
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Publish under the mutex, alongside the take, so `is_closed` can never
-        // report open for a slot that is already empty.
-        self.closed.store(true, Ordering::Release);
         let Some(connection) = slot.take() else {
             return Ok(());
         };
@@ -1594,6 +1602,57 @@ mod tests {
             cgka_traits::storage::GroupStorage::list_groups(&store).err(),
             Some(StorageError::Closed(_))
         ));
+    }
+
+    /// Once closing starts, later callers must fail without queueing for the
+    /// connection mutex. Otherwise a stream of racing operations can repeatedly
+    /// get ahead of the closer and defeat the host's suspension deadline.
+    #[test]
+    fn close_rejects_new_admissions_while_waiting_for_the_active_operation() {
+        let connection = Arc::new(CloseableConnection::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            "admission test connection is closed",
+        ));
+        let active_operation = connection.lock().unwrap();
+
+        let closing_connection = Arc::clone(&connection);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let result = closing_connection.close();
+            closed_tx.send(()).unwrap();
+            result
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !connection.is_closed() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            connection.is_closed(),
+            "the closer must publish terminal admission before waiting for slot",
+        );
+
+        let waiting_connection = Arc::clone(&connection);
+        let (admission_tx, admission_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            admission_tx
+                .send(waiting_connection.lock().map(|_| ()))
+                .unwrap();
+        });
+        assert!(matches!(
+            admission_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("new admission must be rejected without waiting for slot"),
+            Err(StorageError::Closed(_)),
+        ));
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "close must still wait for the operation that was active before it began",
+        );
+
+        drop(active_operation);
+        closer.join().unwrap().unwrap();
+        waiter.join().unwrap();
     }
 
     /// A transaction that is open when the store closes must report the close,

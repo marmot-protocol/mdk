@@ -430,6 +430,9 @@ type AppRuntime = AccountDeviceRuntime<
     AppKeyPackagePublisher,
 >;
 
+#[cfg(test)]
+type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct MarmotApp {
     root: PathBuf,
@@ -461,6 +464,8 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
@@ -1176,6 +1181,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
@@ -1238,6 +1245,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
@@ -1467,7 +1476,7 @@ impl MarmotApp {
             transport: self.transport_label().to_owned(),
             group_count: state.groups.len(),
             message_count,
-            projections: self.projection_status(label),
+            projections: self.projection_status(label)?,
             groups: state.groups,
             seen_events: state.seen_events.len(),
             relay_lists: self.account_relay_list_status_for_account_id(&account.account_id_hex)?,
@@ -4499,6 +4508,14 @@ impl MarmotApp {
             return Ok(());
         }
 
+        // The cached account-storage lookup above releases its open guard before
+        // returning. Take a new lifecycle admission across the raw legacy
+        // connection and the complete import so `close_storage` cannot latch,
+        // release the root lease, and then have this path reopen a database in
+        // the supposedly lock-free root.
+        let _lifecycle = self.begin_storage_open("legacy account projection")?;
+        #[cfg(test)]
+        self.run_legacy_projection_open_hook_for_test();
         let legacy = self.legacy_account_projection(label)?;
         let state = legacy.load_state(label)?;
         storage.save_account_projection_state(
@@ -4538,6 +4555,26 @@ impl MarmotApp {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn set_legacy_projection_open_hook_for_test(&self, hook: LegacyProjectionOpenHook) {
+        *self
+            .legacy_projection_open_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_legacy_projection_open_hook_for_test(&self) {
+        let hook = self
+            .legacy_projection_open_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn legacy_account_projection(
         &self,
         label: &str,
@@ -4563,10 +4600,15 @@ impl MarmotApp {
         LegacyAccountProjectionDb::open(path, &key)
     }
 
-    fn projection_status(&self, label: &str) -> AppProjectionStatus {
+    fn projection_status(&self, label: &str) -> Result<AppProjectionStatus, AppError> {
+        // These probes use short-lived raw SQLite connections rather than the
+        // cached handles. Admit the complete probe through the same lifecycle
+        // gate so a status call already in flight cannot reopen either database
+        // after terminal close has returned.
+        let _lifecycle = self.begin_storage_open("projection status")?;
         let account_path = self.account_storage_path(label);
         let shared_path = self.shared_storage_path();
-        AppProjectionStatus {
+        Ok(AppProjectionStatus {
             account: AppDatabaseStatus {
                 path: account_path.display().to_string(),
                 exists: account_path.exists(),
@@ -4577,7 +4619,7 @@ impl MarmotApp {
                 exists: shared_path.exists(),
                 encrypted: sqlite_file_requires_key(&shared_path),
             },
-        }
+        })
     }
 
     fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
