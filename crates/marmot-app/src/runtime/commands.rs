@@ -52,6 +52,14 @@ impl AccountManager {
         let commands = self.running_account_commands().await;
         let manager = self.clone();
         tokio::spawn(async move {
+            // Test-only barrier (`test-policy-overrides`): lets integration
+            // tests prove the caller returned while this catch-up was still
+            // blocked, instead of depending on scheduler timing.
+            if cfg!(feature = "test-policy-overrides")
+                && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
+            {
+                barrier.notified().await;
+            }
             let started_at = Instant::now();
             let result = manager.catch_up_account_commands(commands).await;
             manager.shared.app_performance_telemetry().record(

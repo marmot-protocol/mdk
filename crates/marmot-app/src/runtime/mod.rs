@@ -135,6 +135,11 @@ pub struct RuntimeSharedServices {
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
+    /// Test-only barrier the detached post-create-group catch-up waits on, so
+    /// integration tests can observe the caller boundary without depending on
+    /// scheduler timing. Consulted only with the `test-policy-overrides`
+    /// feature; always `None` in production.
+    create_group_catch_up_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
@@ -212,6 +217,7 @@ impl Default for RuntimeSharedServices {
             audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
+            create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -237,6 +243,7 @@ impl RuntimeSharedServices {
             audit_log_tracker_config,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
+            create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -250,6 +257,19 @@ impl RuntimeSharedServices {
 
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
         self.agent_streams.clone()
+    }
+
+    /// Test-only hook: install the barrier the detached post-create-group
+    /// catch-up waits on before touching account workers. Honored only with
+    /// the `test-policy-overrides` feature. Not a production entry point;
+    /// hidden from the public API docs.
+    #[doc(hidden)]
+    pub fn set_create_group_catch_up_barrier(&self, barrier: Option<Arc<tokio::sync::Notify>>) {
+        *self.create_group_catch_up_barrier.lock().unwrap() = barrier;
+    }
+
+    fn create_group_catch_up_barrier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.create_group_catch_up_barrier.lock().unwrap().clone()
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {

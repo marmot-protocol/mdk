@@ -55,7 +55,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   publication with bounded concurrency, includes the initial description in the
   founding MLS state, and returns once the founder projection is locally usable.
   Repairable subscription refresh and broad catch-up continue in the background,
-  while privacy-safe stage histograms expose the remaining latency budget.
+  while privacy-safe stage histograms expose the remaining latency budget. A
+  completion-bookkeeping failure for one published Welcome no longer skips the
+  remaining recipients: every exposed publish is durably reconciled before the
+  first error surfaces, so a restart cannot republish an already-delivered
+  Welcome.
 
 - Account setup interruptions now have stable JSON recovery codes and repair
   hints instead of falling through to the generic `command_failed` bucket.

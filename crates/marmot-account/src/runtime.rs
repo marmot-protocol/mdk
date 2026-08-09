@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
-    SessionEffects,
+    SessionEffects, SessionError,
 };
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
@@ -24,10 +24,10 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome, Timestamp,
-    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome,
+    StorageError, Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -131,6 +131,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Test-only fault injection: while armed, the finish stage of a prepared
+    /// legacy publish for this message id fails with a transient storage
+    /// error. Never set by production code.
+    finish_stage_failure: Option<cgka_traits::MessageId>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -150,7 +154,16 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
+            finish_stage_failure: None,
         }
+    }
+
+    /// Test-only hook: arm a one-message finish-stage failure so tests can
+    /// exercise reconciliation of already-exposed publishes. Not a production
+    /// entry point; hidden from the public API docs.
+    #[doc(hidden)]
+    pub fn arm_finish_stage_failure(&mut self, message_id: cgka_traits::MessageId) {
+        self.finish_stage_failure = Some(message_id);
     }
 
     pub fn with_maintenance_sources(
@@ -2294,30 +2307,52 @@ where
             }
         }
 
+        // Every network attempt above has already been exposed to relays, so a
+        // finish-stage failure for one recipient must not skip completion
+        // bookkeeping for the rest: reconcile every completion in input order
+        // and surface the first error only after all exposed publishes have
+        // been durably finished. Otherwise later recipients' fanout state
+        // would stay `Unattempted` and a restart could republish Welcomes that
+        // were already delivered.
+        let mut first_error = None;
         for ((recipient, welcome_id, mut effects), completion) in
             metadata.into_iter().zip(completions)
         {
             let status = match completion.expect("every Welcome publish completed") {
-                LegacyPublishCompletion::Complete(status) => status,
+                LegacyPublishCompletion::Complete(status) => Ok(status),
                 LegacyPublishCompletion::Network(attempt, result) => {
                     self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
-                        .await?
+                        .await
                 }
             };
-            if status.met_required_acks {
-                self.mark_welcome_delivered_best_effort(&welcome_id);
-            } else if let Some(recipient) = recipient {
-                effects.welcome_failures.push(self.welcome_delivery_failure(
-                    welcome_id,
-                    recipient,
-                    group_id.clone(),
-                    &effects,
-                    0,
-                ));
+            let status = match status {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    None
+                }
+            };
+            if let Some(status) = status {
+                if status.met_required_acks {
+                    self.mark_welcome_delivered_best_effort(&welcome_id);
+                } else if let Some(recipient) = recipient {
+                    effects.welcome_failures.push(self.welcome_delivery_failure(
+                        welcome_id,
+                        recipient,
+                        group_id.clone(),
+                        &effects,
+                        0,
+                    ));
+                }
             }
             output.extend(effects);
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn publish_group_evolution(
@@ -3042,6 +3077,13 @@ where
             defers_remaining_fanout_until_confirmation,
             request: _,
         } = attempt;
+        // Test-only fault injection (`arm_finish_stage_failure`): behaves like
+        // the durable fanout persist below failing with transient contention.
+        if self.finish_stage_failure.as_ref() == Some(&message_id) {
+            return Err(AccountError::Session(SessionError::Storage(
+                StorageError::Busy("injected finish-stage failure".into()),
+            )));
+        }
         let report = match result {
             Ok(report) => report,
             Err(error) => {

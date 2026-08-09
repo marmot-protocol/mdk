@@ -2951,6 +2951,135 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
 }
 
 #[tokio::test]
+async fn current_founding_welcome_finish_failure_still_reconciles_later_recipients() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot current founding finish failure key").unwrap();
+    let mut bob_session =
+        current_session(dir.path().join("bob-finish.sqlite"), &key, b"bob-finish");
+    let mut carol_session = current_session(
+        dir.path().join("carol-finish.sqlite"),
+        &key,
+        b"carol-finish",
+    );
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let carol_id = carol_session.self_id();
+    let alice_path = dir.path().join("alice-finish.sqlite");
+    let session = current_session(&alice_path, &key, b"alice-finish");
+    let adapter = RecordingAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id.clone(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
+
+    // Prepare the founding create without transport side effects so the
+    // finish-stage failure can be armed for exactly one exposed Welcome.
+    let prepared = runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "founding finish failure".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match &prepared.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
+        other => panic!("expected founding Welcome work, got {other:?}"),
+    };
+    assert_eq!(welcomes.len(), 2);
+    let welcome_id_for = |recipient: &MemberId| {
+        welcomes
+            .iter()
+            .find(|welcome| {
+                matches!(
+                    &welcome.envelope,
+                    TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+                )
+            })
+            .map(|welcome| welcome.id.clone())
+            .expect("welcome addressed to recipient")
+    };
+    let bob_welcome_id = welcome_id_for(&bob_id);
+    let carol_welcome_id = welcome_id_for(&carol_id);
+
+    // Bob's Welcome is published to the network, but its completion
+    // bookkeeping fails as if the durable fanout persist lost the database
+    // lock. Carol's identical work must still be reconciled.
+    runtime.arm_finish_stage_failure(bob_welcome_id.clone());
+    let error = runtime
+        .publish_session_effects(prepared.effects)
+        .await
+        .expect_err("the armed finish-stage failure must surface");
+    assert!(
+        matches!(error, AccountError::Session(_)),
+        "expected the injected session failure, got {error:?}"
+    );
+    assert_eq!(
+        adapter.publishes().len(),
+        2,
+        "both Welcomes were exposed to the network before the failure"
+    );
+
+    // Carol's completion bookkeeping still ran: her fanout record carries the
+    // delivered acknowledgement instead of the pre-publication snapshot.
+    let carol_fanout = runtime
+        .session()
+        .transport_fanout(&carol_welcome_id)
+        .unwrap()
+        .expect("carol fanout persisted");
+    assert!(
+        carol_fanout.targets.iter().all(|target| matches!(
+            target.state,
+            cgka_traits::maintenance::TransportFanoutAttemptState::Accepted
+        )),
+        "carol's exposed Welcome retained its delivered fanout state"
+    );
+    let bob_fanout = runtime
+        .session()
+        .transport_fanout(&bob_welcome_id)
+        .unwrap()
+        .expect("bob fanout persisted");
+    assert!(
+        bob_fanout.targets.iter().all(|target| matches!(
+            target.state,
+            cgka_traits::maintenance::TransportFanoutAttemptState::Unattempted
+        )),
+        "bob's failed finish leaves the pre-publication fanout snapshot retryable"
+    );
+
+    // Across a restart only bob's Welcome remains an outstanding delivery
+    // obligation; carol's already-delivered Welcome is not republished.
+    drop(runtime);
+    let restarted = AccountDeviceRuntime::new(
+        current_session(&alice_path, &key, b"alice-finish"),
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let outstanding = restarted.outstanding_welcome_deliveries().unwrap();
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].0, prepared.group_id);
+    assert_eq!(outstanding[0].1.id, bob_welcome_id);
+}
+
+#[tokio::test]
 async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot partial create key").unwrap();
