@@ -4277,7 +4277,7 @@ fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups() {
 
 async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_body() {
     const ACCOUNT: &str = "bench";
-    const GROUP_COUNT: usize = 6;
+    const GROUP_COUNT: usize = crate::runtime::STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST + 1;
 
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dir = tempfile::tempdir().unwrap();
@@ -4303,13 +4303,6 @@ async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_b
             );
         }
     }
-    const {
-        assert!(
-            GROUP_COUNT > 4,
-            "fixture must span more than one startup hydration batch"
-        );
-    }
-
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app);

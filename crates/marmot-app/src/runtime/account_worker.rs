@@ -1354,6 +1354,9 @@ async fn handle_account_worker_catch_up(
 /// its own group's hydration.
 const STARTUP_HYDRATION_BATCH_SIZE: usize = 4;
 
+#[cfg(test)]
+pub(crate) const STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST: usize = STARTUP_HYDRATION_BATCH_SIZE;
+
 /// Commands served between hydration batches. Bounded so sustained
 /// account-worker traffic cannot starve the pipeline: without a budget, an
 /// unbounded drain-until-empty could defer hydration (and the mutation

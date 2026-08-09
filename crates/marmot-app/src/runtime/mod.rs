@@ -80,7 +80,9 @@ pub(crate) use audit_tracker::{AuditLogTrackerUploader, post_audit_log_tracker_u
 // (a child of this module) via `super::*`. Test-only, so gate them out of the
 // production build to avoid unused-import noise.
 #[cfg(test)]
-pub(crate) use account_worker::AccountWorkerReconnectBackoff;
+pub(crate) use account_worker::{
+    AccountWorkerReconnectBackoff, STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST,
+};
 #[cfg(test)]
 pub(crate) use agent_stream_watch::{
     broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
