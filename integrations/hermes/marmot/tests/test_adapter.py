@@ -328,6 +328,33 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["message_ids_hex"], ["44" * 32])
         self.assertEqual(publishes, 1)
 
+    async def test_send_media_times_out_when_connector_never_responds(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            self.assertEqual(request["type"], "send_media")
+            await reader.read()
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
+
+        with unittest.mock.patch.object(
+            self.adapter,
+            "SEND_MEDIA_COMPLETION_TIMEOUT_S",
+            0.01,
+        ):
+            with self.assertRaises(self.adapter.AgentControlError) as raised:
+                await client.send_media(
+                    "11" * 32,
+                    "22" * 32,
+                    attachment,
+                    idempotency_key="media-key-1",
+                )
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
     def test_send_in_progress_error_remains_retryable(self):
         with self.assertRaises(self.adapter.AgentControlError) as raised:
             self.adapter.MarmotAgentControlClient._raise_if_error(
@@ -4360,6 +4387,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     *,
                     caption=None,
                     idempotency_key=None,
+                    response_timeout=None,
                 ):
                     self.assert_staged = Path(attachments[0]["path"]).read_bytes()
                     self.media_sends.append(
@@ -4406,6 +4434,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     *,
                     caption=None,
                     idempotency_key=None,
+                    response_timeout=None,
                 ):
                     self.staged_bytes = [Path(item["path"]).read_bytes() for item in attachments]
                     self.media_sends.append(
@@ -4866,6 +4895,59 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(len(fake_client.idempotency_keys), 5)
+            self.assertEqual(len(set(fake_client.idempotency_keys)), 1)
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_times_out_when_send_stays_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "image.png"
+            image.write_bytes(b"image")
+
+            class FakeClient:
+                def __init__(self):
+                    self.idempotency_keys = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.idempotency_keys.append(kwargs["idempotency_key"])
+                    raise self_error(
+                        "send remains in progress",
+                        code="send_in_progress",
+                        retryable=True,
+                    )
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with (
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "SEND_MEDIA_COMPLETION_TIMEOUT_S",
+                    0.02,
+                ),
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "SEND_MEDIA_RETRY_BACKOFF_S",
+                    (0.005,),
+                ),
+            ):
+                result = await adapter._send_media_batch(
+                    "22" * 32,
+                    [{"path": str(image), "media_type": "image/png", "file_name": image.name}],
+                )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "Marmot media send timed out")
+            self.assertTrue(result.retryable)
+            self.assertGreater(len(fake_client.idempotency_keys), 1)
             self.assertEqual(len(set(fake_client.idempotency_keys)), 1)
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 

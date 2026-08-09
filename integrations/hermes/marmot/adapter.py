@@ -54,6 +54,10 @@ TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
 SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
 SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
+# Ten sequential uploads may each consume the connector's 60-second media
+# operation budget. Leave headroom for publication while bounding staged-file
+# and descriptor retention if the connector never reaches a terminal result.
+SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
 # Hermes albums and the native Telegram/Discord/Slack batch APIs share a
@@ -1296,6 +1300,7 @@ class MarmotAgentControlClient:
         *,
         caption: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        response_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "type": "send_media",
@@ -1309,10 +1314,15 @@ class MarmotAgentControlClient:
             payload["idempotency_key"] = key
         # Media upload duration is bounded by connector attachment/byte limits
         # and per-endpoint HTTP deadlines, not by the generic 30-second control
-        # timeout. Keep the response wait attached to the one durable operation
-        # instead of reporting a timeout while it can still publish. Socket
+        # timeout. Keep the response wait attached to the one durable operation,
+        # but retain a finite ceiling for a connector that never answers. Socket
         # writes remain timed; transport failures retry with the same key.
-        return await self.request(payload, response_timeout=None)
+        completion_timeout = (
+            SEND_MEDIA_COMPLETION_TIMEOUT_S
+            if response_timeout is None
+            else max(0.0, float(response_timeout))
+        )
+        return await self.request(payload, response_timeout=completion_timeout)
 
     async def download_media(
         self,
@@ -2421,14 +2431,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             idempotency_key = uuid.uuid4().hex
             retry_attempt = 0
             in_progress_attempt = 0
+            completion_deadline = time.monotonic() + SEND_MEDIA_COMPLETION_TIMEOUT_S
             while True:
+                remaining = completion_deadline - time.monotonic()
+                if remaining <= 0:
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send timed out",
+                        retryable=True,
+                    )
                 try:
-                    response = await self.client.send_media(
-                        account_id,
-                        normalized_chat_id,
-                        wire_attachments,
-                        caption=caption,
-                        idempotency_key=idempotency_key,
+                    response = await asyncio.wait_for(
+                        self.client.send_media(
+                            account_id,
+                            normalized_chat_id,
+                            wire_attachments,
+                            caption=caption,
+                            idempotency_key=idempotency_key,
+                            response_timeout=remaining,
+                        ),
+                        timeout=remaining,
                     )
                     message_ids = tuple(response.get("message_ids_hex") or ())
                     if response.get("type") != "final_sent" or not message_ids:
@@ -2457,6 +2479,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                         raw_response=audit_response,
                         continuation_message_ids=message_ids[:-1],
                     )
+                except asyncio.TimeoutError:
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send timed out",
+                        retryable=True,
+                    )
                 except Exception as exc:
                     if isinstance(exc, AgentControlError) and exc.code == "send_in_progress":
                         logger.debug(
@@ -2467,7 +2495,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                             in_progress_attempt,
                             len(SEND_MEDIA_RETRY_BACKOFF_S) - 1,
                         )
-                        await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[backoff_index])
+                        await asyncio.sleep(
+                            min(
+                                SEND_MEDIA_RETRY_BACKOFF_S[backoff_index],
+                                max(0.0, completion_deadline - time.monotonic()),
+                            )
+                        )
                         in_progress_attempt += 1
                         continue
                     if retry_attempt < len(SEND_MEDIA_RETRY_BACKOFF_S) and is_retryable(exc):
@@ -2476,7 +2509,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                             retry_attempt + 1,
                             type(exc).__name__,
                         )
-                        await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[retry_attempt])
+                        await asyncio.sleep(
+                            min(
+                                SEND_MEDIA_RETRY_BACKOFF_S[retry_attempt],
+                                max(0.0, completion_deadline - time.monotonic()),
+                            )
+                        )
                         retry_attempt += 1
                         continue
                     logger.debug("Marmot send_media failed (%s)", type(exc).__name__)

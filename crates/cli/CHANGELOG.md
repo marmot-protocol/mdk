@@ -16,8 +16,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   The adapter pins approved source files before bounded staging, while the
   connector independently enforces the attachment-count and byte limits. Album
   sends apply the caption once, report every durable message id and attachment
-  outcome, wait for terminal upload completion, and retry transport failures
-  with connector-persisted idempotency so a retry cannot duplicate the album.
+  outcome, wait up to 15 minutes for terminal upload completion, and return a
+  retryable timeout while cleaning staged files if the connector never finishes.
+  Transport retries reuse connector-persisted idempotency so they cannot
+  duplicate the album.
 
 - Account-open startup is now stage-attributed in app telemetry: engine
   session open, stored-group hydration, the shared startup profile load, and
