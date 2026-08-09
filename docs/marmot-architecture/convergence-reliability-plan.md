@@ -806,8 +806,10 @@ witnesses. The campaign requires every mutant to change the adopted observation;
 It kills raw-depth-first selection, non-deduplicated witnesses, witness removal, exclusive cutoff, crash-lost durable
 frozen state, suppressed post-settlement re-arm, retained losing output, uncleared accepted publication, and inclusive
 expiration, as well as stale group-profile projection and terminalized pairwise losers. Frozen-state, scheduler, and
-route-choice mutants execute alternate transitions through shared independent Rust lifecycle models; the publication
-mutant drives a real `ReferenceModelSubject` and compares structural pending work before and after acknowledgement. The
+frozen-state and scheduler mutants execute alternate transitions through the shared independent Rust lifecycle model.
+The route-choice mutant is a bounded sibling-model witness only; it distinguishes the adopted abstract rule from a
+terminal-loser rule but is not production route-equivalence evidence. The publication mutant drives a real
+`ReferenceModelSubject` and compares structural pending work before and after acknowledgement. The
 machine-checked
 [`MUTATION_MATRIX.md`](../../crates/cgka-conformance-simulator/MUTATION_MATRIX.md) has exactly one row per executable
 mutant and maps each to its primary independent layer plus a production-shaped regression. There are no surviving
@@ -997,8 +999,9 @@ engine repair or scaling the existing corpus is sufficient.
   into a permanent synthetic regression family with at least four participants, simultaneous same-source-epoch
   committers, committer-versus-observer routing, ordering-key-versus-depth disagreement, branch growth, application
   traffic, delivery permutations, and restarts around every durable transition.
-- [x] Extend the independent selector/lifecycle models and mutation matrix with route choice, reconsiderable versus
-  terminal loser disposition, volatile routing history, restart, and deliberately inconsistent decision seams.
+- [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
+  disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
+  comparison remains part of the open route-equivalence work above.
 - [ ] Require exact cryptographic-state commitment equality and active bidirectional decryptability after settlement
   in every adapter that can expose them. Epoch, roster, profile, and visible projection equality are insufficient on
   their own.
@@ -1313,7 +1316,7 @@ incorrect result.
 | 2026-08-07 | Capability naming cleanup | Renamed long-lived simulator/process artifacts around their owned capability and added a fast-CI gate rejecting any tracked filename whose basename contains `milestone`, case-insensitively | [MDK #1273](https://github.com/marmot-protocol/mdk/pull/1273); `just naming-gate`; required GitHub CI |
 | 2026-08-07 | 6.5 stateful canonical journeys | Added deterministic legality-aware Scenario IR v3 journeys with modeled membership, admin, profile, connectivity, epoch, and delivery outcomes; separated late-membership from founding-member offline history so pre-admission retry state is not mislabeled; and saved owner-only, subject-preserving inputs before execution | [MDK #1302](https://github.com/marmot-protocol/mdk/pull/1302); `stateful_generator`; `chat-journey/v1`; strict eight-case/two-profile rotation plus retained-input replay |
 | 2026-08-07 | Planned shared legality model and workload profiles | Recorded the follow-up architecture: one canonical product-action legality model, separately typed composable faults, thin workload profiles, explicit size controls, and corpus-level operation/interaction coverage rather than independent family semantics or overloaded case counts | Section 6.6; planned verification and migration gates |
-| 2026-08-09 | 6.1 decision-route inventory, model, and claim lifecycle | Registered every current production decision route with source markers, adopted rule, independent-model owner, mutation sentinel, campaign owner, and explicit partial/gap limitations; modeled route choice and restart with durable branches plus volatile provisional state; added a pairwise-loser terminalization mutant and stable assurance claims whose known falsifications cannot be cleared by an unrelated green run | `route_assurance`; `pairwise_losing_branch_terminalization`; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md); focused source-drift, route-invariance, mutation, matrix, serialization, and claim-lifecycle tests |
+| 2026-08-09 | 6.1 decision-route inventory, abstract model, and claim lifecycle | Registered every current production decision route with specific source markers, adopted rule, evidence owner, mutation sentinel, campaign owner, and explicit partial/gap limitations; modeled route choice and restart as a bounded abstract witness without treating it as production route-equivalence proof; added a pairwise-loser terminalization mutant and stable assurance claims whose recurring falsifications reopen cleanly and require explicit reviewed resolution | `route_assurance`; `pairwise_losing_branch_terminalization`; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md); focused source-drift, abstract lifecycle, mutation, matrix, serialization, and claim-lifecycle tests |
 
 ## Capability Naming Cleanup
 

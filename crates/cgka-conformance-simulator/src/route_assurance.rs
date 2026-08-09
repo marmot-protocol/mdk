@@ -19,8 +19,10 @@ pub enum DecisionRouteId {
     ApplicationDisposition,
 }
 
+const DECISION_ROUTE_VARIANT_COUNT: usize = 7;
+
 impl DecisionRouteId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; DECISION_ROUTE_VARIANT_COUNT] = [
         Self::OrdinaryIngest,
         Self::PairwiseForkRecovery,
         Self::StoredConvergence,
@@ -43,6 +45,8 @@ impl DecisionRouteId {
     }
 }
 
+const _: [(); DECISION_ROUTE_VARIANT_COUNT] = [(); DecisionRouteId::ALL.len()];
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteBranchV1 {
     pub id: u8,
@@ -52,8 +56,12 @@ pub struct RouteBranchV1 {
     pub ordering_key: u8,
 }
 
-/// Bounded independent lifecycle for route choice and restart. Candidate
+/// Bounded abstract lifecycle for a closed durable branch set. Candidate
 /// branches are durable; the route and any provisional winner are volatile.
+///
+/// This is a deterministic bookkeeping model and mutation witness, not an
+/// exhaustively explored transition system or a production route-equivalence
+/// proof.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteLifecycleStateV1 {
     pub durable_branches: Vec<RouteBranchV1>,
@@ -104,6 +112,7 @@ impl RouteLifecycleStateV1 {
                 left.effective_depth
                     .cmp(&right.effective_depth)
                     .then_with(|| right.ordering_key.cmp(&left.ordering_key))
+                    .then_with(|| right.id.cmp(&left.id))
             })
             .map(|branch| branch.id);
         self
@@ -158,6 +167,14 @@ impl AssuranceOwnerV1 {
             limitation,
         }
     }
+
+    pub const fn gap(owner: &'static str, limitation: &'static str) -> Self {
+        Self {
+            status: AssuranceOwnershipStatus::Gap,
+            owner,
+            limitation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -172,54 +189,54 @@ pub struct DecisionRouteInventoryEntryV1 {
 
 const ORDINARY_INGEST_SITES: &[ProductionDecisionSiteV1] = &[ProductionDecisionSiteV1 {
     path: "crates/cgka-engine/src/message_processor/ingest.rs",
-    marker: "commit_should_enter_convergence",
+    marker: "let commit_should_enter_convergence =",
 }];
 const PAIRWISE_FORK_RECOVERY_SITES: &[ProductionDecisionSiteV1] = &[
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/message_processor/ingest.rs",
-        marker: "resolve_fork_candidate",
+        marker: ".resolve_fork_candidate(",
     },
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/fork_recovery.rs",
-        marker: "ForkRecoveryManager",
+        marker: "struct ForkRecoveryManager",
     },
 ];
 const STORED_CONVERGENCE_SITES: &[ProductionDecisionSiteV1] = &[ProductionDecisionSiteV1 {
     path: "crates/cgka-engine/src/distributed_convergence.rs",
-    marker: "converge_stored_openmls_messages_with_time",
+    marker: "fn converge_stored_openmls_messages_with_time(",
 }];
 const CANDIDATE_MATERIALIZATION_SITES: &[ProductionDecisionSiteV1] = &[ProductionDecisionSiteV1 {
     path: "crates/cgka-engine/src/openmls_projection.rs",
-    marker: "canonicalize_stored_openmls_messages_with_profile_policy",
+    marker: "fn canonicalize_stored_openmls_messages_with_profile_policy<",
 }];
 const RETAINED_HISTORY_REPLAY_SITES: &[ProductionDecisionSiteV1] = &[
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/message_processor/ingest.rs",
-        marker: "convergence_ingest_outcome",
+        marker: "fn convergence_ingest_outcome(",
     },
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/openmls_projection.rs",
-        marker: "MissingRetainedAnchor",
+        marker: "CanonicalizationError::MissingRetainedAnchor",
     },
 ];
 const CRASH_RESTART_RECOVERY_SITES: &[ProductionDecisionSiteV1] = &[
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/engine.rs",
-        marker: "hydrate",
+        marker: "fn hydrate_one_stored_group(",
     },
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/distributed_convergence.rs",
-        marker: "discard_stale_convergence_pass",
+        marker: "fn discard_stale_convergence_pass(",
     },
 ];
 const APPLICATION_DISPOSITION_SITES: &[ProductionDecisionSiteV1] = &[
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/message_processor/ingest.rs",
-        marker: "convergence_ingest_outcome",
+        marker: "fn convergence_ingest_outcome(",
     },
     ProductionDecisionSiteV1 {
         path: "crates/cgka-engine/src/openmls_projection.rs",
-        marker: "persist_openmls_canonicalization_dispositions",
+        marker: "fn persist_openmls_canonicalization_dispositions<",
     },
 ];
 
@@ -247,8 +264,14 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         route: DecisionRouteId::PairwiseForkRecovery,
         production_sites: PAIRWISE_FORK_RECOVERY_SITES,
         adopted_rule: "A pairwise winner is provisional and every authenticated eligible loser remains reconsiderable by the shared closed-input selector.",
-        reference_model: AssuranceOwnerV1::covered("route_assurance::RouteLifecycleStateV1"),
-        mutation_sentinel: AssuranceOwnerV1::covered("pairwise_losing_branch_terminalization"),
+        reference_model: AssuranceOwnerV1::partial(
+            "route_assurance::RouteLifecycleStateV1",
+            "Models closed-input route volatility abstractly; it is not exhaustively explored or compared against production routing.",
+        ),
+        mutation_sentinel: AssuranceOwnerV1::partial(
+            "pairwise_losing_branch_terminalization",
+            "The sibling-model mutant proves the witness distinguishes two abstract rules, not that production takes the adopted transition.",
+        ),
         campaign: AssuranceOwnerV1::partial(
             "pairwise_incumbent_defers_to_deeper_convergence_branch and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
             "Engine regressions cover reconsideration, but the cross-adapter #1236 topology remains open.",
@@ -331,7 +354,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum AssuranceClaimId {
     RouteEquivalence,
     ReconsiderableLoser,
@@ -350,6 +373,17 @@ impl AssuranceClaimId {
         Self::ActiveBidirectionalDecryptability,
         Self::CompleteApplicationDisposition,
     ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RouteEquivalence => "route_equivalence",
+            Self::ReconsiderableLoser => "reconsiderable_loser",
+            Self::RestartInvariance => "restart_invariance",
+            Self::ExactCryptographicAgreement => "exact_cryptographic_agreement",
+            Self::ActiveBidirectionalDecryptability => "active_bidirectional_decryptability",
+            Self::CompleteApplicationDisposition => "complete_application_disposition",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,11 +432,13 @@ impl AssuranceClaimRecordV1 {
 
     pub fn reopen(&mut self, evidence_id: impl Into<String>) {
         let evidence_id = evidence_id.into();
-        if !self
+        if let Some(existing) = self
             .falsifications
-            .iter()
-            .any(|existing| existing.evidence_id == evidence_id)
+            .iter_mut()
+            .find(|existing| existing.evidence_id == evidence_id)
         {
+            existing.resolved_by = None;
+        } else {
             self.falsifications.push(AssuranceFalsificationV1 {
                 evidence_id,
                 resolved_by: None,

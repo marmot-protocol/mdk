@@ -52,7 +52,7 @@ fn every_registered_route_has_live_source_and_named_owners() {
 }
 
 #[test]
-fn route_choice_and_restart_do_not_change_the_closed_input_winner() {
+fn abstract_closed_input_model_is_deterministic_across_registered_route_labels() {
     let branches = vec![
         RouteBranchV1 {
             id: 1,
@@ -65,13 +65,7 @@ fn route_choice_and_restart_do_not_change_the_closed_input_winner() {
             ordering_key: 1,
         },
     ];
-    for route in [
-        DecisionRouteId::OrdinaryIngest,
-        DecisionRouteId::PairwiseForkRecovery,
-        DecisionRouteId::StoredConvergence,
-        DecisionRouteId::RetainedHistoryReplay,
-        DecisionRouteId::CrashRestartRecovery,
-    ] {
+    for route in DecisionRouteId::ALL {
         let uninterrupted = RouteLifecycleStateV1::new(branches.clone())
             .observe_route(route, Some(1))
             .settle();
@@ -88,23 +82,85 @@ fn route_choice_and_restart_do_not_change_the_closed_input_winner() {
 }
 
 #[test]
-fn human_route_matrix_has_exactly_one_row_per_registered_route() {
-    let matrix = include_str!("../CONVERGENCE_ROUTE_MATRIX.md");
+fn closed_input_winner_uses_branch_id_as_the_final_order_independent_tie_break() {
+    let branch_one = RouteBranchV1 {
+        id: 1,
+        effective_depth: 2,
+        ordering_key: 3,
+    };
+    let branch_two = RouteBranchV1 {
+        id: 2,
+        effective_depth: 2,
+        ordering_key: 3,
+    };
+    for durable_branches in [
+        vec![branch_one.clone(), branch_two.clone()],
+        vec![branch_two, branch_one],
+    ] {
+        let settled = RouteLifecycleStateV1 {
+            durable_branches,
+            volatile_route: None,
+            volatile_provisional_winner: None,
+            canonical_winner: None,
+            crashed: false,
+        }
+        .settle();
+        assert_eq!(settled.canonical_winner, Some(1));
+    }
+}
+
+#[test]
+fn route_and_claim_labels_match_their_serialized_schema_names() {
     for route in DecisionRouteId::ALL {
         assert_eq!(
-            matrix.matches(&format!("`{}`", route.as_str())).count(),
+            serde_json::to_string(&route).expect("serialize route"),
+            format!("\"{}\"", route.as_str())
+        );
+    }
+    for claim in AssuranceClaimId::ALL {
+        assert_eq!(
+            serde_json::to_string(&claim).expect("serialize claim"),
+            format!("\"{}\"", claim.as_str())
+        );
+    }
+}
+
+#[test]
+fn human_route_matrix_has_exactly_one_row_per_registered_route() {
+    let matrix = include_str!("../CONVERGENCE_ROUTE_MATRIX.md");
+    let route_rows = matrix
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    for route in DecisionRouteId::ALL {
+        assert_eq!(
+            route_rows
+                .iter()
+                .filter(|line| line.contains(&format!("`{}`", route.as_str())))
+                .count(),
             1,
             "matrix must contain exactly one row for {}",
             route.as_str()
         );
     }
-    assert_eq!(
-        matrix
-            .lines()
-            .filter(|line| line.starts_with("| `"))
-            .count(),
-        DecisionRouteId::ALL.len()
-    );
+    assert_eq!(route_rows.len(), DecisionRouteId::ALL.len());
+
+    let claim_lines = matrix
+        .lines()
+        .filter(|line| line.starts_with("- `"))
+        .collect::<Vec<_>>();
+    for claim in AssuranceClaimId::ALL {
+        assert_eq!(
+            claim_lines
+                .iter()
+                .filter(|line| line.contains(&format!("`{}`", claim.as_str())))
+                .count(),
+            1,
+            "matrix must contain exactly one claim bullet for {}",
+            claim.as_str()
+        );
+    }
+    assert_eq!(claim_lines.len(), AssuranceClaimId::ALL.len());
 }
 
 #[test]
@@ -154,5 +210,25 @@ fn a_green_run_cannot_silently_close_a_known_counterexample() {
             "reviewed-fix-b",
             "unrelated-green-rerun",
         ]
+    );
+}
+
+#[test]
+fn recurring_counterexample_reopens_resolved_evidence_and_can_be_resolved_again() {
+    let mut claim = AssuranceClaimRecordV1::open(AssuranceClaimId::RouteEquivalence);
+    claim.reopen("counterexample-a");
+    assert!(claim.resolve_falsification("counterexample-a", "fix-a"));
+    assert_eq!(claim.status, AssuranceClaimStatus::Covered);
+
+    claim.reopen("counterexample-a");
+    assert_eq!(claim.status, AssuranceClaimStatus::Reopened);
+    assert_eq!(claim.falsifications.len(), 1);
+    assert_eq!(claim.falsifications[0].resolved_by, None);
+
+    assert!(claim.resolve_falsification("counterexample-a", "fix-a2"));
+    assert_eq!(claim.status, AssuranceClaimStatus::Covered);
+    assert_eq!(
+        claim.falsifications[0].resolved_by.as_deref(),
+        Some("fix-a2")
     );
 }
