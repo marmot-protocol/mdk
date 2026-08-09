@@ -125,6 +125,12 @@ pub struct AccountManager {
     worker_transactions: Arc<Mutex<()>>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
+    invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
+}
+
+struct InviteCatchUpTasks {
+    accepting: bool,
+    handles: Vec<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -3354,6 +3360,10 @@ impl AccountManager {
             worker_transactions: Arc::new(Mutex::new(())),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
+            invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
+                accepting: true,
+                handles: Vec::new(),
+            })),
         }
     }
 
@@ -4749,6 +4759,24 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        let invite_catch_up_tasks = {
+            let mut tasks = self
+                .invite_catch_up_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.accepting = false;
+            std::mem::take(&mut tasks.handles)
+        };
+        // A catch-up may already have passed reconcile's lifecycle check and
+        // still be replacing a stale worker. Reap every tracked catch-up
+        // before the final worker-map drain so no replacement can escape
+        // shutdown. This must run *before* taking `worker_transactions`:
+        // catch-up tasks call `catch_up_accounts` -> `reconcile`, which
+        // acquires that lock, so awaiting them while holding it would
+        // deadlock.
+        for task in invite_catch_up_tasks {
+            let _ = task.await;
+        }
         let _worker_transaction = self.worker_transactions.lock().await;
         let workers = {
             let mut workers = self.workers.lock().await;

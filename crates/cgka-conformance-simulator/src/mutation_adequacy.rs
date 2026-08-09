@@ -13,6 +13,7 @@ use crate::reference_convergence::{
     ReferenceAppMessage, ReferenceCandidate, ReferenceDisposition, ReferenceInput, ReferencePolicy,
     ReferencePriority, ReferenceWitness, WitnessMode, compare, evaluate, score, select,
 };
+use crate::route_assurance::{DecisionRouteId, RouteBranchV1, RouteLifecycleStateV1};
 use crate::{
     ConvergenceSubject, ReferenceModelSubject, SubjectCreateGroup, SubjectOutboundOutcome,
     VectorFixture, run_vector_fixture_report,
@@ -52,6 +53,7 @@ semantic_mutations! {
     PublicationAcknowledgement => "publication_acknowledgement",
     RetainedHistoryExpirationBoundary => "retained_history_expiration_boundary",
     GroupProfileProjection => "group_profile_projection",
+    PairwiseLosingBranchTerminalization => "pairwise_losing_branch_terminalization",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,12 +89,36 @@ pub async fn run_mutation_sentinel(mutation: SemanticMutation) -> MutationSentin
         SemanticMutation::PublicationAcknowledgement => publication_ack_sentinel().await,
         SemanticMutation::RetainedHistoryExpirationBoundary => expiration_sentinel(),
         SemanticMutation::GroupProfileProjection => group_profile_projection_sentinel().await,
+        SemanticMutation::PairwiseLosingBranchTerminalization => {
+            pairwise_loser_terminalization_sentinel()
+        }
     };
     MutationSentinelResult {
         mutation,
         baseline_observation,
         mutant_observation,
     }
+}
+
+fn pairwise_loser_terminalization_sentinel() -> (String, String) {
+    let routed = RouteLifecycleStateV1::new(vec![
+        RouteBranchV1 {
+            id: 1,
+            effective_depth: 1,
+            ordering_key: 0,
+        },
+        RouteBranchV1 {
+            id: 2,
+            effective_depth: 2,
+            ordering_key: 1,
+        },
+    ])
+    .observe_route(DecisionRouteId::PairwiseForkRecovery, Some(1));
+    let baseline = routed.clone().settle().canonical_winner;
+    let mutant = routed
+        .settle_with_terminal_pairwise_loser()
+        .canonical_winner;
+    (format!("winner:{baseline:?}"), format!("winner:{mutant:?}"))
 }
 
 async fn group_profile_projection_sentinel() -> (String, String) {
