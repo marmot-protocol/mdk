@@ -119,6 +119,17 @@ pub enum MarmotKitError {
     /// surfacing it as a fatal "Send failed".
     #[error("storage busy: {details}")]
     StorageBusy { details: String },
+    /// The store has been closed by [`Marmot::shutdown_and_close`][crate::Marmot::shutdown_and_close]
+    /// and this call reached a database that is no longer open.
+    ///
+    /// Typed, and deliberately not [`MarmotKitError::Runtime`], because it is
+    /// an *expected* outcome rather than a fault: a host closing its store
+    /// before suspension races whatever work was still in flight, and that work
+    /// must be reportable as "we shut down" instead of as a storage failure the
+    /// user gets told about. Never retryable — the handle is spent; construct a
+    /// new `Marmot` when the app resumes.
+    #[error("storage closed: {details}")]
+    StorageClosed { details: String },
     /// The account exists but its raw private key could not be located in the
     /// keystore — e.g. a public-only / watch-only account, or a secret that was
     /// never loaded. Distinct, typed variant (#543) so a key-backup surface can
@@ -267,6 +278,12 @@ impl From<AppError> for MarmotKitError {
             AppError::Storage(ref storage_err) if storage_err.is_transient() => Self::StorageBusy {
                 details: storage_err.to_string(),
             },
+            // A store closed for suspension is an orderly end state, not a
+            // fault. Give it its own variant so hosts can drop the result
+            // silently instead of surfacing an error while backgrounding.
+            AppError::Storage(ref storage_err) if storage_err.is_closed() => Self::StorageClosed {
+                details: storage_err.to_string(),
+            },
             AppError::ExternalSignerUnavailable(account) => {
                 Self::ExternalSignerUnavailable { account }
             }
@@ -331,6 +348,11 @@ impl MarmotKitError {
             // untyped `Runtime` bucket. `StorageError::is_transient()` is the
             // single source of truth for which storage errors are transient.
             EngineError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
+                details: storage_err.to_string(),
+            },
+            // Engine work racing a close for suspension: an orderly end state,
+            // reported as such rather than as a runtime fault.
+            EngineError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
             other => Self::Runtime {

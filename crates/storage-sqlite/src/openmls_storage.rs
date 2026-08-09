@@ -24,12 +24,16 @@ impl SqliteOpenMlsStorage {
         Ok(serde_json::to_vec(group_id)?)
     }
 
-    fn lock(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, SqliteOpenMlsStorageError> {
-        self.connection
-            .lock()
-            .map_err(|e| SqliteOpenMlsStorageError::Lock(e.to_string()))
+    /// Borrow the shared connection, preserving the [`StorageError`] variant.
+    ///
+    /// Flattening it to a stringly-typed lock error would erase the
+    /// distinction the variants exist for — most importantly
+    /// [`StorageError::Closed`], which every OpenMLS value-store path can now
+    /// see when a host closes the store to release its file locks before
+    /// suspension. That has to stay reportable as orderly shutdown rather than
+    /// as an opaque lock fault.
+    fn lock(&self) -> Result<crate::connection::ConnectionGuard<'_>, SqliteOpenMlsStorageError> {
+        Ok(self.connection.lock()?)
     }
 
     pub(crate) fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
@@ -96,8 +100,6 @@ pub enum SqliteOpenMlsStorageError {
     Serialization(#[from] serde_json::Error),
     #[error("queued proposal reference was present without a queued proposal")]
     MissingQueuedProposal,
-    #[error("connection lock poisoned: {0}")]
-    Lock(String),
 }
 
 impl crate::connection::TransientError for SqliteOpenMlsStorageError {
