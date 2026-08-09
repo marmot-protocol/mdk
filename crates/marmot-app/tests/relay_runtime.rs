@@ -2314,7 +2314,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     .await
     .expect("roster read must not block on the initial catch-up")
     .unwrap();
-    assert_eq!(roster.epoch, roster.roster_revision);
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
     assert_eq!(roster.self_membership, SelfMembership::Member);
     let roster_member_ids = roster
         .members
@@ -2398,6 +2398,12 @@ async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
     })
     .await;
 
+    let revision_before_leave = runtime
+        .group_roster(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .roster_revision;
+
     runtime.leave_group(&bob_id, &group_id).await.unwrap();
 
     let roster = runtime.group_roster(&bob_id, &group_id).await.unwrap();
@@ -2405,6 +2411,10 @@ async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
         roster.self_membership,
         SelfMembership::Left,
         "groupRoster must read storage-owned self_membership without restarting the worker"
+    );
+    assert_ne!(
+        roster.roster_revision, revision_before_leave,
+        "caller membership changes must invalidate the roster revision"
     );
 
     runtime.shutdown().await;
@@ -2448,6 +2458,12 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
     })
     .await;
 
+    let revision_before_eviction = runtime
+        .group_roster(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .roster_revision;
+
     runtime
         .remove_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
         .await
@@ -2476,6 +2492,10 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
         roster.self_membership,
         SelfMembership::Removed,
         "groupRoster must read storage-owned self_membership without restarting the worker"
+    );
+    assert_ne!(
+        roster.roster_revision, revision_before_eviction,
+        "observed eviction must invalidate the roster revision"
     );
 
     runtime.shutdown().await;

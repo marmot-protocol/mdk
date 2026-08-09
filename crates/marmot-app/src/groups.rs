@@ -223,9 +223,9 @@ pub struct AppGroupRoster {
     pub group_id_hex: String,
     pub members: Vec<AppGroupRosterMember>,
     pub epoch: u64,
-    /// Mirrors [`Self::epoch`] from the authoritative MLS projection. Non-roster
-    /// MLS commits may bump this revision; directory-only display-name changes
-    /// do not.
+    /// Monotonic change token for MLS roster state plus caller membership.
+    /// Non-roster MLS commits may bump this revision; directory-only
+    /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembership,
     pub member_count: usize,
@@ -260,11 +260,16 @@ pub(crate) fn app_group_roster_from_session(
         })
         .collect();
     let epoch = mls_state.epoch;
+    let membership_revision = match group_record.self_membership {
+        SelfMembership::Member => 0,
+        SelfMembership::Left => 1,
+        SelfMembership::Removed => 2,
+    };
     AppGroupRoster {
         group_id_hex: group_record.group_id_hex,
         members,
         epoch,
-        roster_revision: epoch,
+        roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
         self_membership: group_record.self_membership,
         member_count: mls_state.member_count,
         lifecycle_state: mls_state.lifecycle_state,
@@ -2585,7 +2590,7 @@ mod group_roster_api_tests {
             HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
         );
         assert_eq!(roster.epoch, 7);
-        assert_eq!(roster.roster_revision, 7);
+        assert_eq!(roster.roster_revision, 23);
         assert_eq!(roster.self_membership, SelfMembership::Removed);
         assert_eq!(roster.member_count, 1);
         assert_eq!(roster.lifecycle_state, AppGroupLifecycleState::Stable);

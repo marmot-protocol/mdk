@@ -381,9 +381,9 @@ pub struct GroupRosterFfi {
     pub group_id_hex: String,
     pub members: Vec<GroupMemberDetailsFfi>,
     pub epoch: u64,
-    /// Mirrors [`Self::epoch`] for cheap membership-screen change detection.
-    /// Non-roster MLS commits may bump this revision; directory-only display-name
-    /// changes do not.
+    /// Monotonic change token for MLS roster state plus caller membership.
+    /// Non-roster MLS commits may bump this revision; directory-only
+    /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembershipFfi,
     pub member_count: u32,

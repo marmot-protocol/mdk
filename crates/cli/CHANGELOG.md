@@ -52,9 +52,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - MarmotKit exposes `groupRoster`, a single lightweight membership projection
   with enriched roster rows, MLS epoch, caller self-membership or eviction
-  state, lifecycle state, and a roster revision derived from epoch for cheap
-  membership-screen change detection. Existing `groupDetails`, `groupMlsState`,
-  and `groupMembers` remain available for compatibility.
+  state, lifecycle state, and a monotonic revision covering MLS epoch plus
+  caller membership for cheap membership-screen change detection. Existing
+  `groupDetails`, `groupMlsState`, and `groupMembers` remain available for
+  compatibility.
   
 - MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
   kind:0 profile `picture` URLs (HTTPS-only, proxy-disabled pinned public

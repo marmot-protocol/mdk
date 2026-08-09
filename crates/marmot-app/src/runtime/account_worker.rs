@@ -595,7 +595,20 @@ async fn run_app_runtime_account_worker(
                         Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
                             match &read_snapshot {
                                 Some(snapshot) => {
-                                    let _ = respond.send(snapshot.group_roster(&group_id));
+                                    let result = snapshot.group_roster(&group_id).and_then(
+                                        |mut session| {
+                                            if let Some(membership) = app
+                                                .stored_group_self_membership(
+                                                    &account_label,
+                                                    &session.group_record.group_id_hex,
+                                                )?
+                                            {
+                                                session.group_record.self_membership = membership;
+                                            }
+                                            Ok(session)
+                                        },
+                                    );
+                                    let _ = respond.send(result);
                                 }
                                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
                                     AccountWorkerCommand::GroupRoster { group_id, respond },
@@ -1476,11 +1489,7 @@ async fn handle_startup_hydration_command(
             let _ = respond.send(client.group_mls_state(&group_id));
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
-            let _ = respond.send(client.group_roster_session(&group_id));
+            let _ = respond.send(group_roster_after_hydration(client, &group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
@@ -1645,7 +1654,7 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
-            let result = client.group_roster_session(&group_id);
+            let result = group_roster_after_hydration(client, &group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
@@ -2314,6 +2323,18 @@ async fn handle_account_worker_command(
     // every command path covered; the summary is empty for commands that
     // applied nothing.
     publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+}
+
+pub(super) fn group_roster_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.reconcile_group_self_membership(group_id)?;
+    client.group_roster_session(group_id)
 }
 
 #[derive(Debug, Clone)]
