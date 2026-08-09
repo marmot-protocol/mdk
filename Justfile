@@ -308,6 +308,7 @@ adversarial-reliability-ci:
 # Independent convergence model, lifecycle/fairness, mutation adequacy, and
 # protocol decision gates.
 convergence-verification-ci:
+    cargo nextest run -p cgka-conformance-simulator --test route_assurance --locked
     cargo nextest run -p cgka-conformance-simulator --test independent_reference_model --locked
     cargo nextest run -p cgka-conformance-simulator --test lifecycle_model --locked
     cargo nextest run -p cgka-conformance-simulator --test mutation_adequacy --locked
