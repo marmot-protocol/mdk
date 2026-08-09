@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
-    SessionEffects,
+    SessionEffects, SessionError,
 };
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
@@ -24,11 +24,13 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome, Timestamp,
-    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome,
+    StorageError, Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
 };
@@ -45,6 +47,7 @@ use crate::time::{
 };
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
+const FOUNDING_WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
 const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
@@ -54,6 +57,27 @@ const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// Run independent async work with fixed fan-out while returning results in
+/// input order. Completion order therefore cannot reorder reports or select a
+/// different caller-visible error.
+#[cfg(test)]
+async fn collect_bounded_ordered<I, F, T, E>(work: I, limit: usize) -> Result<Vec<T>, E>
+where
+    I: IntoIterator<Item = F>,
+    I::IntoIter: Send,
+    F: std::future::Future<Output = Result<T, E>> + Send,
+    T: Send,
+    E: Send,
+{
+    let mut results = futures::stream::iter(work.into_iter().enumerate())
+        .map(|(index, future)| async move { (index, future.await) })
+        .buffer_unordered(limit.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
 
 fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -67,6 +91,36 @@ struct PublishStatus {
     retry_deferred: bool,
 }
 
+enum PreparedLegacyPublish {
+    Complete(PublishStatus),
+    Network(Box<PreparedLegacyPublishAttempt>),
+}
+
+enum LegacyPublishCompletion {
+    Complete(PublishStatus),
+    Network(
+        Box<PreparedLegacyPublishAttempt>,
+        Result<TransportPublishReport, TransportAdapterError>,
+    ),
+}
+
+struct PreparedLegacyPublishAttempt {
+    message_id: cgka_traits::MessageId,
+    msg_id_hex: String,
+    wire: AuditTransportWire,
+    artifact_kind: Option<MessageArtifactKind>,
+    publish_context: AuditEventContext,
+    fanout: DurableTransportFanout,
+    retry_endpoints: Vec<TransportEndpoint>,
+    accepted_before: usize,
+    required_acks: usize,
+    target_kind: String,
+    relay_urls: Vec<String>,
+    target_group_id: Option<GroupId>,
+    defers_remaining_fanout_until_confirmation: bool,
+    request: TransportPublishRequest,
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -77,6 +131,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Test-only fault injection: while armed, the finish stage of a prepared
+    /// legacy publish for this message id fails with a transient storage
+    /// error. Never set by production code.
+    finish_stage_failure: Option<cgka_traits::MessageId>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -96,7 +154,16 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
+            finish_stage_failure: None,
         }
+    }
+
+    /// Test-only hook: arm a one-message finish-stage failure so tests can
+    /// exercise reconciliation of already-exposed publishes. Not a production
+    /// entry point; hidden from the public API docs.
+    #[doc(hidden)]
+    pub fn arm_finish_stage_failure(&mut self, message_id: cgka_traits::MessageId) {
+        self.finish_stage_failure = Some(message_id);
     }
 
     pub fn with_maintenance_sources(
@@ -2197,33 +2264,95 @@ where
         &mut self,
         welcomes: Vec<TransportMessage>,
         output: &mut AccountDeviceEffects,
-        queue: &mut VecDeque<PublishWork>,
+        _queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         let group_id = output.events.iter().find_map(|event| match event {
             GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
             _ => None,
         });
-        for welcome in welcomes {
+        let mut metadata = Vec::with_capacity(welcomes.len());
+        let mut completions = Vec::with_capacity(welcomes.len());
+        completions.resize_with(welcomes.len(), || None);
+        let mut pending = VecDeque::new();
+        for (index, welcome) in welcomes.into_iter().enumerate() {
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
-            let failures_before = output.failures.len();
-            let status = self
-                .publish_one(welcome, None, output, queue, context.clone())
-                .await?;
-            if status.met_required_acks {
-                self.mark_welcome_delivered_best_effort(&welcome_id);
-            } else if let Some(recipient) = recipient {
-                output.welcome_failures.push(self.welcome_delivery_failure(
-                    welcome_id,
-                    recipient,
-                    group_id.clone(),
-                    output,
-                    failures_before,
-                ));
+            let mut effects = AccountDeviceEffects::default();
+            match self.prepare_legacy_publish(welcome, &mut effects, context.clone(), false)? {
+                PreparedLegacyPublish::Complete(status) => {
+                    completions[index] = Some(LegacyPublishCompletion::Complete(status));
+                }
+                PreparedLegacyPublish::Network(attempt) => pending.push_back((index, attempt)),
+            }
+            metadata.push((recipient, welcome_id, effects));
+        }
+
+        let adapter = &self.adapter;
+        let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            let result = adapter.publish(attempt.request.clone()).await;
+            (index, attempt, result)
+        };
+        let mut in_flight = FuturesUnordered::new();
+        while in_flight.len() < FOUNDING_WELCOME_PUBLISH_CONCURRENCY {
+            let Some((index, attempt)) = pending.pop_front() else {
+                break;
+            };
+            in_flight.push(publish(index, attempt));
+        }
+        while let Some((index, attempt, result)) = in_flight.next().await {
+            completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
+            if let Some((next_index, next_attempt)) = pending.pop_front() {
+                in_flight.push(publish(next_index, next_attempt));
             }
         }
-        Ok(())
+
+        // Every network attempt above has already been exposed to relays, so a
+        // finish-stage failure for one recipient must not skip completion
+        // bookkeeping for the rest: reconcile every completion in input order
+        // and surface the first error only after all exposed publishes have
+        // been durably finished. Otherwise later recipients' fanout state
+        // would stay `Unattempted` and a restart could republish Welcomes that
+        // were already delivered.
+        let mut first_error = None;
+        for ((recipient, welcome_id, mut effects), completion) in
+            metadata.into_iter().zip(completions)
+        {
+            let status = match completion.expect("every Welcome publish completed") {
+                LegacyPublishCompletion::Complete(status) => Ok(status),
+                LegacyPublishCompletion::Network(attempt, result) => {
+                    self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
+                        .await
+                }
+            };
+            let status = match status {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    None
+                }
+            };
+            if let Some(status) = status {
+                if status.met_required_acks {
+                    self.mark_welcome_delivered_best_effort(&welcome_id);
+                } else if let Some(recipient) = recipient {
+                    effects.welcome_failures.push(self.welcome_delivery_failure(
+                        welcome_id,
+                        recipient,
+                        group_id.clone(),
+                        &effects,
+                        0,
+                    ));
+                }
+            }
+            output.extend(effects);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn publish_group_evolution(
@@ -2718,6 +2847,23 @@ where
         context: Option<AuditEventContext>,
         retry_immediately: bool,
     ) -> AccountResult<PublishStatus> {
+        match self.prepare_legacy_publish(message, output, context, retry_immediately)? {
+            PreparedLegacyPublish::Complete(status) => Ok(status),
+            PreparedLegacyPublish::Network(attempt) => {
+                let result = self.adapter.publish(attempt.request.clone()).await;
+                self.finish_prepared_legacy_publish(*attempt, result, output)
+                    .await
+            }
+        }
+    }
+
+    fn prepare_legacy_publish(
+        &self,
+        message: TransportMessage,
+        output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
+        retry_immediately: bool,
+    ) -> AccountResult<PreparedLegacyPublish> {
         let message_id = message.id.clone();
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
@@ -2769,7 +2915,7 @@ where
                         message_id,
                         reason: e.to_string(),
                     });
-                    return Ok(PublishStatus::default());
+                    return Ok(PreparedLegacyPublish::Complete(PublishStatus::default()));
                 }
             }
         };
@@ -2793,7 +2939,7 @@ where
                 transport: Some(wire.clone()),
             },
         );
-        let mut fanout = if let Some(fanout) = existing_fanout {
+        let fanout = if let Some(fanout) = existing_fanout {
             fanout
         } else {
             DurableTransportFanout {
@@ -2870,12 +3016,12 @@ where
                             | TransportFanoutAttemptState::AttemptedFailed
                     )
                 });
-            return Ok(PublishStatus {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 met_required_acks: accepted_before >= required_acks.max(1),
                 accepted_by_any_endpoint: accepted_before > 0,
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
-            });
+            }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
         let attempt_required_acks = required_acks
@@ -2884,18 +3030,63 @@ where
             .max(1)
             .min(retry_endpoints.len());
 
-        let report = match self
-            .adapter
-            .publish(TransportPublishRequest {
-                account_id: self.session.self_id(),
-                message: message.clone(),
-                target: attempt_target,
-                required_acks: attempt_required_acks,
-            })
-            .await
-        {
+        Ok(PreparedLegacyPublish::Network(Box::new(
+            PreparedLegacyPublishAttempt {
+                message_id,
+                msg_id_hex,
+                wire,
+                artifact_kind,
+                publish_context,
+                fanout,
+                retry_endpoints,
+                accepted_before,
+                required_acks,
+                target_kind,
+                relay_urls,
+                target_group_id,
+                defers_remaining_fanout_until_confirmation,
+                request: TransportPublishRequest {
+                    account_id: self.session.self_id(),
+                    message,
+                    target: attempt_target,
+                    required_acks: attempt_required_acks,
+                },
+            },
+        )))
+    }
+
+    async fn finish_prepared_legacy_publish(
+        &self,
+        attempt: PreparedLegacyPublishAttempt,
+        result: Result<TransportPublishReport, TransportAdapterError>,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<PublishStatus> {
+        let PreparedLegacyPublishAttempt {
+            message_id,
+            msg_id_hex,
+            wire,
+            artifact_kind,
+            publish_context,
+            mut fanout,
+            retry_endpoints,
+            accepted_before,
+            required_acks,
+            target_kind,
+            relay_urls,
+            target_group_id,
+            defers_remaining_fanout_until_confirmation,
+            request: _,
+        } = attempt;
+        // Test-only fault injection (`arm_finish_stage_failure`): behaves like
+        // the durable fanout persist below failing with transient contention.
+        if self.finish_stage_failure.as_ref() == Some(&message_id) {
+            return Err(AccountError::Session(SessionError::Storage(
+                StorageError::Busy("injected finish-stage failure".into()),
+            )));
+        }
+        let report = match result {
             Ok(report) => report,
-            Err(e) => {
+            Err(error) => {
                 fanout.possible_exposure = true;
                 for target in &mut fanout.targets {
                     if retry_endpoints.contains(&target.endpoint)
@@ -2919,14 +3110,14 @@ where
                         relay_url: None,
                         relay_urls,
                         required_acks: Some(required_acks as u64),
-                        reason: e.to_string(),
+                        reason: error.to_string(),
                         detail: None,
                         transport: Some(wire),
                     },
                 );
                 output.failures.push(PublishFailure {
                     message_id,
-                    reason: e.to_string(),
+                    reason: error.to_string(),
                 });
                 return Ok(PublishStatus {
                     met_required_acks: accepted_before >= required_acks.max(1),
@@ -3419,5 +3610,55 @@ mod tests {
         });
 
         assert_eq!(combined.published_app_messages, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn founding_welcome_work_is_bounded_concurrent_and_ordered() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+        use tokio::time::{Duration, timeout};
+
+        for item_count in [1, 5, 20] {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let work_active = active.clone();
+            let work_max_active = max_active.clone();
+            let work_release = release.clone();
+            let work = (0..item_count).map(move |index| {
+                let active = work_active.clone();
+                let max_active = work_max_active.clone();
+                let release = work_release.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    let permit = release.acquire().await.unwrap();
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, &'static str>(index)
+                }
+            });
+
+            let expected_parallelism = item_count.min(FOUNDING_WELCOME_PUBLISH_CONCURRENCY);
+            let task = tokio::spawn(collect_bounded_ordered(
+                work,
+                FOUNDING_WELCOME_PUBLISH_CONCURRENCY,
+            ));
+            timeout(Duration::from_secs(1), async {
+                while max_active.load(Ordering::SeqCst) < expected_parallelism {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded collector should start the available parallel work");
+            assert_eq!(max_active.load(Ordering::SeqCst), expected_parallelism);
+            release.add_permits(item_count);
+
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                (0..item_count).collect::<Vec<_>>()
+            );
+        }
     }
 }

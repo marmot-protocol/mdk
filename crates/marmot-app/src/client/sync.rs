@@ -590,6 +590,15 @@ impl AppClient {
                 Some(outer_transport_at),
             )
             .await?;
+        if routes_dirty {
+            // The engine join/leave is already durable; persist the matching
+            // app-state projection (a fresh join's pending invite row) before
+            // the callers' route-refresh network awaits. A process exit in
+            // that window would otherwise tear the durable membership change
+            // from its app-state row, and the consumed welcome is never
+            // re-emitted to repair it.
+            self.app.save_state(&self.state)?;
+        }
 
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,

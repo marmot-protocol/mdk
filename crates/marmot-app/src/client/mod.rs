@@ -22,6 +22,7 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, SecretBytes};
+use futures::StreamExt;
 use marmot_forensics::AuditEventContext;
 
 use crate::app_telemetry::AppPerformanceOperation;
@@ -63,6 +64,25 @@ use push::notification_trigger_for_intent;
 pub(crate) use sync::ConvergenceScheduleState;
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
+
+const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+
+/// Run independent async work with fixed fan-out while returning results in
+/// input order. All started work finishes before deterministic error selection,
+/// so completion timing cannot change which member error the caller observes.
+async fn collect_bounded_ordered<I, F, T, E>(work: I, limit: usize) -> Result<Vec<T>, E>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let mut results = futures::stream::iter(work.into_iter().enumerate())
+        .map(|(index, future)| async move { (index, future.await) })
+        .buffer_unordered(limit.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
 
 pub struct AppClient {
     pub(crate) app: MarmotApp,
@@ -572,11 +592,75 @@ impl AppClient {
         member_refs: &[&str],
         initial_image: Option<AppInitialGroupImage>,
     ) -> Result<GroupId, AppError> {
-        validate_group_profile(name, "")?;
-        let mut members = Vec::with_capacity(member_refs.len());
-        for member in member_refs {
-            members.push(self.app.member_key_package(member).await?);
+        let group_id = self
+            .create_group_with_initial_profile_and_optional_telemetry(
+                name,
+                "",
+                member_refs,
+                initial_image,
+                None,
+            )
+            .await?;
+        // Direct `AppClient` callers do not have the managed account worker to
+        // refresh subscriptions after its response. Preserve that API's
+        // historical readiness guarantee; the managed runtime uses the
+        // telemetry-aware entry point below and performs this step after
+        // replying so it stays off the user-visible latency boundary.
+        if let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "confirmed group creation could not refresh subscriptions immediately"
+            );
         }
+        Ok(group_id)
+    }
+
+    pub(crate) async fn create_group_with_initial_profile_and_telemetry(
+        &mut self,
+        name: &str,
+        description: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<GroupId, AppError> {
+        self.create_group_with_initial_profile_and_optional_telemetry(
+            name,
+            description,
+            member_refs,
+            initial_image,
+            Some(telemetry),
+        )
+        .await
+    }
+
+    async fn create_group_with_initial_profile_and_optional_telemetry(
+        &mut self,
+        name: &str,
+        description: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<GroupId, AppError> {
+        validate_group_profile(name, description)?;
+        let key_package_started_at = Instant::now();
+        let lookups = member_refs
+            .iter()
+            .map(|member| {
+                let app = self.app.clone();
+                let member = (*member).to_owned();
+                async move { app.member_key_package(&member).await }
+            })
+            .collect::<Vec<_>>();
+        let key_packages = collect_bounded_ordered(lookups, CREATE_GROUP_LOOKUP_CONCURRENCY).await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            key_package_started_at.elapsed(),
+            key_packages.is_ok(),
+        );
+        let members = key_packages?;
         self.refresh_routing()?;
         let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
@@ -594,32 +678,47 @@ impl AppClient {
         let encrypted_media_component_id = encrypted_media.component_id;
         app_components.push(encrypted_media);
         let constructable = self.runtime.constructable_capabilities(&members)?;
-        let mut optional_app_components = Vec::new();
-        if let Some(image) = initial_image {
-            match preferred_initial_group_image_component(
-                &constructable,
-                image.source_url.is_some(),
-            ) {
-                Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
-                    let upload =
-                        upload_group_image(&image.plaintext, &image.media_type, None).await?;
-                    let input = AppGroupImageInput::from(upload);
-                    optional_app_components.push(AppComponentData {
-                        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-                        data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
-                    });
-                }
-                Some(GROUP_AVATAR_URL_COMPONENT_ID) => {
-                    if let Some(url) = image.source_url {
-                        optional_app_components.push(
-                            AppGroupAvatarUrlComponent::new(url, image.dim, image.thumbhash)?
-                                .to_app_component_data()?,
-                        );
+        let has_initial_image = initial_image.is_some();
+        let image_started_at = Instant::now();
+        let optional_app_components = async {
+            let mut optional_app_components = Vec::new();
+            if let Some(image) = initial_image {
+                match preferred_initial_group_image_component(
+                    &constructable,
+                    image.source_url.is_some(),
+                ) {
+                    Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
+                        let upload =
+                            upload_group_image(&image.plaintext, &image.media_type, None).await?;
+                        let input = AppGroupImageInput::from(upload);
+                        optional_app_components.push(AppComponentData {
+                            component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                            data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
+                        });
                     }
+                    Some(GROUP_AVATAR_URL_COMPONENT_ID) => {
+                        if let Some(url) = image.source_url {
+                            optional_app_components.push(
+                                AppGroupAvatarUrlComponent::new(url, image.dim, image.thumbhash)?
+                                    .to_app_component_data()?,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Ok::<_, AppError>(optional_app_components)
         }
+        .await;
+        if has_initial_image {
+            record_app_performance(
+                telemetry,
+                AppPerformanceOperation::GroupCreateImageUpload,
+                image_started_at.elapsed(),
+                optional_app_components.is_ok(),
+            );
+        }
+        let optional_app_components = optional_app_components?;
         let mut touched_components = vec![
             NOSTR_ROUTING_COMPONENT_ID,
             AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
@@ -630,11 +729,13 @@ impl AppClient {
                 .iter()
                 .map(|component| component.component_id),
         );
-        let changed_fields = if optional_app_components.is_empty() {
-            vec!["name", "members"]
-        } else {
-            vec!["name", "members", "image"]
-        };
+        let mut changed_fields = vec!["name", "members"];
+        if !description.is_empty() {
+            changed_fields.push("description");
+        }
+        if !optional_app_components.is_empty() {
+            changed_fields.push("image");
+        }
         let audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
@@ -642,12 +743,13 @@ impl AppClient {
             Some(member_refs.len() as u64),
         );
 
+        let mls_started_at = Instant::now();
         let prepared = self
             .runtime
             .prepare_create_group_with_optional_app_components_and_audit_context(
                 CreateGroupRequest {
                     name: name.to_owned(),
-                    description: String::new(),
+                    description: description.to_owned(),
                     members,
                     required_features: Vec::new(),
                     app_components,
@@ -656,7 +758,14 @@ impl AppClient {
                 optional_app_components,
                 audit_context.clone(),
             )
-            .await?;
+            .await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateMlsPreparePersist,
+            mls_started_at.elapsed(),
+            prepared.is_ok(),
+        );
+        let prepared = prepared?;
         let group_id = prepared.group_id;
         // Current-profile founding creation is already canonical before
         // transport delivery. Persist every exact Welcome obligation before
@@ -666,16 +775,23 @@ impl AppClient {
             "record_founding_welcome_delivery_intents",
             self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
         );
-        let effects = recover_post_canonical_result(
-            "publish_prepared_founding_group",
-            self.runtime
-                .publish_prepared_session_effects_with_audit_context(
-                    prepared.effects,
-                    audit_context.clone(),
-                )
-                .await
-                .map_err(AppError::from),
+        let welcome_publish_started_at = Instant::now();
+        let publish_result = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context(
+                prepared.effects,
+                audit_context.clone(),
+            )
+            .await
+            .map_err(AppError::from);
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateWelcomePublish,
+            welcome_publish_started_at.elapsed(),
+            publish_result.is_ok(),
         );
+        let effects =
+            recover_post_canonical_result("publish_prepared_founding_group", publish_result);
         recover_post_canonical_result(
             "clear_delivered_founding_welcome_intents",
             self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
@@ -694,17 +810,20 @@ impl AppClient {
         // state persistence, and subscription refresh are downstream repairable
         // work; none can roll the group back, so none may turn this operation
         // into a false failure that invites the caller to create a duplicate.
-        match self.add_group(&group_id) {
-            Ok(()) => {
-                if let Err(error) = self.app.save_state(&self.state) {
+        let local_projection_started_at = Instant::now();
+        let local_projection_saved = match self.add_group(&group_id) {
+            Ok(()) => match self.app.save_state(&self.state) {
+                Ok(()) => true,
+                Err(error) => {
                     tracing::warn!(
                         target: "marmot_app::client",
                         method = "create_group",
                         error_kind = error.privacy_safe_kind(),
                         "confirmed group creation outpaced projection persistence; account open will reconcile it"
                     );
+                    false
                 }
-            }
+            },
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
@@ -712,17 +831,16 @@ impl AppClient {
                     error_kind = error.privacy_safe_kind(),
                     "confirmed group creation could not be projected immediately; account open will reconcile it"
                 );
+                false
             }
-        }
-        if let Err(error) = self.sync_runtime_groups().await {
-            tracing::warn!(
-                target: "marmot_app::client",
-                method = "create_group",
-                error_kind = error.privacy_safe_kind(),
-                "confirmed group creation could not refresh subscriptions immediately"
-            );
-        }
+        };
         self.queue_own_group_system_projection_updates(&effects);
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateLocalProjectionSave,
+            local_projection_started_at.elapsed(),
+            local_projection_saved,
+        );
         Ok(group_id)
     }
 
@@ -3237,7 +3355,10 @@ fn local_account_removed_from_roster(
 
 #[cfg(test)]
 mod post_canonical_create_tests {
-    use super::{preferred_initial_group_image_component, recover_post_canonical_result};
+    use super::{
+        CREATE_GROUP_LOOKUP_CONCURRENCY, collect_bounded_ordered,
+        preferred_initial_group_image_component, recover_post_canonical_result,
+    };
     use crate::AppError;
     use cgka_traits::app_components::{
         GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
@@ -3282,6 +3403,78 @@ mod post_canonical_create_tests {
 
         let successful: u8 = recover_post_canonical_result("test_post_canonical_success", Ok(7));
         assert_eq!(successful, 7);
+    }
+
+    #[tokio::test]
+    async fn bounded_create_group_lookups_scale_for_cached_and_delayed_sources() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+        use tokio::time::{Duration, timeout};
+
+        for item_count in [1, 5, 20] {
+            let cached = collect_bounded_ordered(
+                (0..item_count).map(|index| std::future::ready(Ok::<_, &'static str>(index))),
+                CREATE_GROUP_LOOKUP_CONCURRENCY,
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached, (0..item_count).collect::<Vec<_>>());
+
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let work_active = active.clone();
+            let work_max_active = max_active.clone();
+            let work_release = release.clone();
+            let work = (0..item_count).map(move |index| {
+                let active = work_active.clone();
+                let max_active = work_max_active.clone();
+                let release = work_release.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    let permit = release.acquire().await.unwrap();
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, &'static str>(index)
+                }
+            });
+
+            let expected_parallelism = item_count.min(CREATE_GROUP_LOOKUP_CONCURRENCY);
+            let task = tokio::spawn(collect_bounded_ordered(
+                work,
+                CREATE_GROUP_LOOKUP_CONCURRENCY,
+            ));
+            timeout(Duration::from_secs(1), async {
+                while max_active.load(Ordering::SeqCst) < expected_parallelism {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded collector should start the available parallel work");
+            assert_eq!(max_active.load(Ordering::SeqCst), expected_parallelism);
+            release.add_permits(item_count);
+
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                (0..item_count).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_create_group_work_reports_errors_in_input_order() {
+        use tokio::time::{Duration, sleep};
+
+        let work = (0..2).map(|index| async move {
+            if index == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err::<usize, _>(if index == 0 { "first" } else { "second" })
+        });
+
+        assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
     }
 }
 

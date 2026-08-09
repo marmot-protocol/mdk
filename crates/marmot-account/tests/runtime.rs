@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -341,9 +341,32 @@ struct RecordingAdapterInner {
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     timeout_pattern: Mutex<VecDeque<bool>>,
+    welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
+}
+
+struct WelcomePublishGate {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for WelcomePublishGate {
+    fn default() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 impl RecordingAdapter {
+    fn gate_welcome_publishes(&self) -> Arc<WelcomePublishGate> {
+        let gate = Arc::new(WelcomePublishGate::default());
+        *self.inner.welcome_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
     fn accept_only_next(&self, accepted_count: usize) {
         self.accept_next(accepted_count);
     }
@@ -411,6 +434,19 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        let welcome_gate = if matches!(&request.message.envelope, TransportEnvelope::Welcome { .. })
+        {
+            self.inner.welcome_gate.lock().unwrap().clone()
+        } else {
+            None
+        };
+        if let Some(gate) = welcome_gate {
+            let active = gate.active.fetch_add(1, Ordering::SeqCst) + 1;
+            gate.max_active.fetch_max(active, Ordering::SeqCst);
+            let permit = gate.release.acquire().await.unwrap();
+            permit.forget();
+            gate.active.fetch_sub(1, Ordering::SeqCst);
+        }
         let timed_out = self
             .inner
             .timeout_pattern
@@ -2639,6 +2675,74 @@ async fn create_group_stops_welcome_publish_after_unexposed_failure() {
 }
 
 #[tokio::test]
+async fn current_founding_welcomes_publish_with_bounded_concurrency() {
+    for recipient_count in [1usize, 5, 20] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new(format!("bounded Welcome key {recipient_count}")).unwrap();
+        let mut members = Vec::with_capacity(recipient_count);
+        let mut policy = StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://alice-inbox.example".into(),
+        )]);
+        for index in 0..recipient_count {
+            let identity = format!("recipient-{recipient_count}-{index}");
+            let mut recipient = current_session(
+                dir.path().join(format!("recipient-{index}.sqlite")),
+                &key,
+                identity.as_bytes(),
+            );
+            members.push(recipient.fresh_key_package().await.unwrap());
+            policy = policy.with_inbox_route(
+                recipient.self_id(),
+                vec![TransportEndpoint(format!(
+                    "wss://recipient-{index}.example"
+                ))],
+            );
+        }
+        let adapter = RecordingAdapter::default();
+        let gate = adapter.gate_welcome_publishes();
+        let session = current_session(
+            dir.path().join("alice.sqlite"),
+            &key,
+            format!("alice-{recipient_count}").as_bytes(),
+        );
+        let mut runtime = AccountDeviceRuntime::new(
+            session,
+            adapter.clone(),
+            policy,
+            RecordingKeyPackages::default(),
+        );
+        let create = tokio::spawn(async move {
+            runtime
+                .create_group(CreateGroupRequest {
+                    name: format!("bounded {recipient_count}"),
+                    description: String::new(),
+                    members,
+                    required_features: Vec::new(),
+                    app_components: Vec::new(),
+                    initial_admins: Vec::new(),
+                })
+                .await
+        });
+
+        let expected_parallelism = recipient_count.min(8);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.max_active.load(Ordering::SeqCst) < expected_parallelism {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Welcome publishes should fill the bounded worker set");
+        assert_eq!(gate.max_active.load(Ordering::SeqCst), expected_parallelism);
+        gate.release.add_permits(recipient_count);
+
+        let (_, effects) = create.await.unwrap().unwrap();
+        assert_eq!(effects.reports.len(), recipient_count);
+        assert_eq!(adapter.publishes().len(), recipient_count);
+        assert!(gate.max_active.load(Ordering::SeqCst) <= 8);
+    }
+}
+
+#[tokio::test]
 async fn current_founding_welcomes_survive_restart_before_publication() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot current founding prepare crash key").unwrap();
@@ -2844,6 +2948,135 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
         effects.welcome_failures[1].message_id
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn current_founding_welcome_finish_failure_still_reconciles_later_recipients() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot current founding finish failure key").unwrap();
+    let mut bob_session =
+        current_session(dir.path().join("bob-finish.sqlite"), &key, b"bob-finish");
+    let mut carol_session = current_session(
+        dir.path().join("carol-finish.sqlite"),
+        &key,
+        b"carol-finish",
+    );
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let carol_id = carol_session.self_id();
+    let alice_path = dir.path().join("alice-finish.sqlite");
+    let session = current_session(&alice_path, &key, b"alice-finish");
+    let adapter = RecordingAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id.clone(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
+
+    // Prepare the founding create without transport side effects so the
+    // finish-stage failure can be armed for exactly one exposed Welcome.
+    let prepared = runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "founding finish failure".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match &prepared.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
+        other => panic!("expected founding Welcome work, got {other:?}"),
+    };
+    assert_eq!(welcomes.len(), 2);
+    let welcome_id_for = |recipient: &MemberId| {
+        welcomes
+            .iter()
+            .find(|welcome| {
+                matches!(
+                    &welcome.envelope,
+                    TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+                )
+            })
+            .map(|welcome| welcome.id.clone())
+            .expect("welcome addressed to recipient")
+    };
+    let bob_welcome_id = welcome_id_for(&bob_id);
+    let carol_welcome_id = welcome_id_for(&carol_id);
+
+    // Bob's Welcome is published to the network, but its completion
+    // bookkeeping fails as if the durable fanout persist lost the database
+    // lock. Carol's identical work must still be reconciled.
+    runtime.arm_finish_stage_failure(bob_welcome_id.clone());
+    let error = runtime
+        .publish_session_effects(prepared.effects)
+        .await
+        .expect_err("the armed finish-stage failure must surface");
+    assert!(
+        matches!(error, AccountError::Session(_)),
+        "expected the injected session failure, got {error:?}"
+    );
+    assert_eq!(
+        adapter.publishes().len(),
+        2,
+        "both Welcomes were exposed to the network before the failure"
+    );
+
+    // Carol's completion bookkeeping still ran: her fanout record carries the
+    // delivered acknowledgement instead of the pre-publication snapshot.
+    let carol_fanout = runtime
+        .session()
+        .transport_fanout(&carol_welcome_id)
+        .unwrap()
+        .expect("carol fanout persisted");
+    assert!(
+        carol_fanout.targets.iter().all(|target| matches!(
+            target.state,
+            cgka_traits::maintenance::TransportFanoutAttemptState::Accepted
+        )),
+        "carol's exposed Welcome retained its delivered fanout state"
+    );
+    let bob_fanout = runtime
+        .session()
+        .transport_fanout(&bob_welcome_id)
+        .unwrap()
+        .expect("bob fanout persisted");
+    assert!(
+        bob_fanout.targets.iter().all(|target| matches!(
+            target.state,
+            cgka_traits::maintenance::TransportFanoutAttemptState::Unattempted
+        )),
+        "bob's failed finish leaves the pre-publication fanout snapshot retryable"
+    );
+
+    // Across a restart only bob's Welcome remains an outstanding delivery
+    // obligation; carol's already-delivered Welcome is not republished.
+    drop(runtime);
+    let restarted = AccountDeviceRuntime::new(
+        current_session(&alice_path, &key, b"alice-finish"),
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let outstanding = restarted.outstanding_welcome_deliveries().unwrap();
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].0, prepared.group_id);
+    assert_eq!(outstanding[0].1.id, bob_welcome_id);
 }
 
 #[tokio::test]

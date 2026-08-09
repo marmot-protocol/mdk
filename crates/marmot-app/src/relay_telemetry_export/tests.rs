@@ -305,6 +305,22 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
         point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(2)
     }));
+    for metric_name in [
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
+    ] {
+        assert!(
+            batch.points.iter().any(|point| point.name == metric_name),
+            "missing create-group telemetry export {metric_name}",
+        );
+    }
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(1)

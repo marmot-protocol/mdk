@@ -32,6 +32,15 @@ pub(crate) enum AppPerformanceOperation {
     AccountSync,
     AccountSetupAdvisoryStep,
     OutboundMessageSend,
+    GroupCreateQueueWait,
+    GroupCreateKeyPackageLookup,
+    GroupCreateImageUpload,
+    GroupCreateMlsPreparePersist,
+    GroupCreateWelcomePublish,
+    GroupCreateLocalProjectionSave,
+    GroupCreateSubscriptionRefresh,
+    GroupCreatePostMutationCatchUp,
+    GroupCreateTotalCallerLatency,
     GroupInviteMembers,
     GroupInviteKeyPackageLookup,
     GroupInviteRoutingRefresh,
@@ -102,6 +111,24 @@ pub struct AppPerformanceSnapshot {
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub group_create_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_key_package_lookup: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_image_upload: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_mls_prepare_persist: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_welcome_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_local_projection_save: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_subscription_refresh: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_post_mutation_catch_up: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_create_total_caller_latency: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub group_invite_members: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_invite_key_package_lookup: AppPerformanceOperationSnapshot,
@@ -154,6 +181,15 @@ struct AppPerformanceTelemetryInner {
     account_sync: AppPerformanceOperationTelemetry,
     account_setup_advisory_step: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    group_create_queue_wait: AppPerformanceOperationTelemetry,
+    group_create_key_package_lookup: AppPerformanceOperationTelemetry,
+    group_create_image_upload: AppPerformanceOperationTelemetry,
+    group_create_mls_prepare_persist: AppPerformanceOperationTelemetry,
+    group_create_welcome_publish: AppPerformanceOperationTelemetry,
+    group_create_local_projection_save: AppPerformanceOperationTelemetry,
+    group_create_subscription_refresh: AppPerformanceOperationTelemetry,
+    group_create_post_mutation_catch_up: AppPerformanceOperationTelemetry,
+    group_create_total_caller_latency: AppPerformanceOperationTelemetry,
     group_invite_members: AppPerformanceOperationTelemetry,
     group_invite_key_package_lookup: AppPerformanceOperationTelemetry,
     group_invite_routing_refresh: AppPerformanceOperationTelemetry,
@@ -297,6 +333,45 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
             }
+            AppPerformanceOperation::GroupCreateQueueWait => {
+                inner.group_create_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateKeyPackageLookup => {
+                inner
+                    .group_create_key_package_lookup
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateImageUpload => {
+                inner.group_create_image_upload.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateMlsPreparePersist => {
+                inner
+                    .group_create_mls_prepare_persist
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateWelcomePublish => {
+                inner.group_create_welcome_publish.record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateLocalProjectionSave => {
+                inner
+                    .group_create_local_projection_save
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateSubscriptionRefresh => {
+                inner
+                    .group_create_subscription_refresh
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreatePostMutationCatchUp => {
+                inner
+                    .group_create_post_mutation_catch_up
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupCreateTotalCallerLatency => {
+                inner
+                    .group_create_total_caller_latency
+                    .record(duration, success);
+            }
             AppPerformanceOperation::GroupInviteMembers => {
                 inner.group_invite_members.record(duration, success);
             }
@@ -393,6 +468,17 @@ impl AppPerformanceTelemetry {
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
+            group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
+            group_create_image_upload: inner.group_create_image_upload.snapshot(),
+            group_create_mls_prepare_persist: inner.group_create_mls_prepare_persist.snapshot(),
+            group_create_welcome_publish: inner.group_create_welcome_publish.snapshot(),
+            group_create_local_projection_save: inner.group_create_local_projection_save.snapshot(),
+            group_create_subscription_refresh: inner.group_create_subscription_refresh.snapshot(),
+            group_create_post_mutation_catch_up: inner
+                .group_create_post_mutation_catch_up
+                .snapshot(),
+            group_create_total_caller_latency: inner.group_create_total_caller_latency.snapshot(),
             group_invite_members: inner.group_invite_members.snapshot(),
             group_invite_key_package_lookup: inner.group_invite_key_package_lookup.snapshot(),
             group_invite_routing_refresh: inner.group_invite_routing_refresh.snapshot(),
@@ -545,6 +631,42 @@ mod tests {
         assert_eq!(snapshot.account_profile_load.duration_ms.sum_ms, 15);
         assert_eq!(snapshot.account_group_read_snapshot.successes, 1);
         assert_eq!(snapshot.account_group_read_snapshot.duration_ms.sum_ms, 40);
+    }
+
+    #[test]
+    fn records_each_group_create_stage() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let operations = [
+            AppPerformanceOperation::GroupCreateQueueWait,
+            AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            AppPerformanceOperation::GroupCreateImageUpload,
+            AppPerformanceOperation::GroupCreateMlsPreparePersist,
+            AppPerformanceOperation::GroupCreateWelcomePublish,
+            AppPerformanceOperation::GroupCreateLocalProjectionSave,
+            AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+            AppPerformanceOperation::GroupCreatePostMutationCatchUp,
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            telemetry.record(operation, Duration::from_millis(index as u64 + 1), true);
+        }
+
+        let snapshot = telemetry.snapshot();
+        for stage in [
+            snapshot.group_create_queue_wait,
+            snapshot.group_create_key_package_lookup,
+            snapshot.group_create_image_upload,
+            snapshot.group_create_mls_prepare_persist,
+            snapshot.group_create_welcome_publish,
+            snapshot.group_create_local_projection_save,
+            snapshot.group_create_subscription_refresh,
+            snapshot.group_create_post_mutation_catch_up,
+            snapshot.group_create_total_caller_latency,
+        ] {
+            assert_eq!(stage.attempts, 1);
+            assert_eq!(stage.successes, 1);
+            assert_eq!(stage.duration_ms.sample_count(), 1);
+        }
     }
 
     #[test]

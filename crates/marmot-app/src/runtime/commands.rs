@@ -76,6 +76,47 @@ impl AccountManager {
         }
     }
 
+    async fn schedule_create_group_post_mutation_catch_up(&self) {
+        // Snapshot only workers that already exist when create returns. Calling
+        // the broad `catch_up_accounts()` from the detached task can discover an
+        // account while its setup flow still owns a one-shot AppClient, then
+        // race that setup by trying to start a managed worker for the same
+        // account. Accounts created after this snapshot perform their own
+        // startup catch-up and do not need this repair pass.
+        let commands = self.running_account_commands().await;
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Test-only barrier (`test-policy-overrides`): lets integration
+            // tests prove the caller returned while this catch-up was still
+            // blocked, instead of depending on scheduler timing.
+            if cfg!(feature = "test-policy-overrides")
+                && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
+            {
+                barrier.notified().await;
+            }
+            let started_at = Instant::now();
+            let result = manager.catch_up_account_commands(commands).await;
+            manager.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountCatchUp,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            manager.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupCreatePostMutationCatchUp,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "create_group_post_mutation_catch_up",
+                    error_kind = error.privacy_safe_kind(),
+                    "committed group creation outpaced post-mutation catch-up; state will refresh on the next cycle"
+                );
+            }
+        });
+    }
+
     /// Force one complete relay-history query for a local account and project
     /// every returned event through the ordinary runtime path.
     pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
@@ -113,20 +154,31 @@ impl AccountManager {
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
     ) -> Result<GroupId, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::CreateGroup {
-                name: name.to_owned(),
-                members: members.to_vec(),
-                description,
-                initial_image,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let group_id = account_worker_response(response).await?;
-        self.catch_up_after_committed_mutation("create_group").await;
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CreateGroup {
+                    queued_at: Instant::now(),
+                    name: name.to_owned(),
+                    members: members.to_vec(),
+                    description,
+                    initial_image,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupCreateTotalCallerLatency,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        let group_id = result?;
+        self.schedule_create_group_post_mutation_catch_up().await;
         self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
     }

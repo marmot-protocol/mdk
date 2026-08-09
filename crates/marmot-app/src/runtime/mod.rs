@@ -144,6 +144,11 @@ pub struct RuntimeSharedServices {
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
+    /// Test-only barrier the detached post-create-group catch-up waits on, so
+    /// integration tests can observe the caller boundary without depending on
+    /// scheduler timing. Consulted only with the `test-policy-overrides`
+    /// feature; always `None` in production.
+    create_group_catch_up_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
@@ -221,6 +226,7 @@ impl Default for RuntimeSharedServices {
             audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
+            create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -246,6 +252,7 @@ impl RuntimeSharedServices {
             audit_log_tracker_config,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
+            create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -259,6 +266,19 @@ impl RuntimeSharedServices {
 
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
         self.agent_streams.clone()
+    }
+
+    /// Test-only hook: install the barrier the detached post-create-group
+    /// catch-up waits on before touching account workers. Honored only with
+    /// the `test-policy-overrides` feature. Not a production entry point;
+    /// hidden from the public API docs.
+    #[doc(hidden)]
+    pub fn set_create_group_catch_up_barrier(&self, barrier: Option<Arc<tokio::sync::Notify>>) {
+        *self.create_group_catch_up_barrier.lock().unwrap() = barrier;
+    }
+
+    fn create_group_catch_up_barrier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.create_group_catch_up_barrier.lock().unwrap().clone()
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
@@ -3801,35 +3821,8 @@ impl AccountManager {
         let result = async {
             self.shared.lifecycle().ensure_running()?;
             self.reconcile().await?;
-            let commands = {
-                let workers = self.workers.lock().await;
-                workers
-                    .values()
-                    .map(|worker| worker.commands.clone())
-                    .collect::<Vec<_>>()
-            };
-            let mut responses = Vec::with_capacity(commands.len());
-            for command in commands {
-                let (respond, response) = oneshot::channel();
-                command
-                    .send(AccountWorkerCommand::CatchUp { respond })
-                    .await
-                    .map_err(|_| AppError::TransportClosed)?;
-                responses.push(response);
-            }
-            for response in responses {
-                match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
-                    Ok(Err(_)) => return Err(AppError::TransportClosed),
-                    Err(_) => {
-                        return Err(AppError::AccountCatchUp(
-                            "account worker catch-up timed out".into(),
-                        ));
-                    }
-                }
-            }
-            Ok(())
+            let commands = self.running_account_commands().await;
+            self.catch_up_account_commands(commands).await
         }
         .await;
         self.shared.app_performance_telemetry().record(
@@ -3838,6 +3831,44 @@ impl AccountManager {
             result.is_ok(),
         );
         result
+    }
+
+    async fn running_account_commands(&self) -> Vec<mpsc::Sender<AccountWorkerCommand>> {
+        self.workers
+            .lock()
+            .await
+            .values()
+            .map(|worker| worker.commands.clone())
+            .collect()
+    }
+
+    async fn catch_up_account_commands(
+        &self,
+        commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let mut responses = Vec::with_capacity(commands.len());
+        for command in commands {
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::CatchUp { respond })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
+        }
+        for response in responses {
+            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
+                Ok(Err(_)) => return Err(AppError::TransportClosed),
+                Err(_) => {
+                    return Err(AppError::AccountCatchUp(
+                        "account worker catch-up timed out".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Delete one local JSONL audit log file.

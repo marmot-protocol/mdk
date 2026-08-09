@@ -75,6 +75,19 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Group creation now performs member KeyPackage lookup and founding Welcome
+  publication with bounded concurrency, includes the initial description in the
+  founding MLS state, and returns once the founder projection is locally usable.
+  Repairable subscription refresh and broad catch-up continue in the background,
+  while privacy-safe stage histograms expose the remaining latency budget. A
+  completion-bookkeeping failure for one published Welcome no longer skips the
+  remaining recipients: every exposed publish is durably reconciled before the
+  first error surfaces, so a restart cannot republish an already-delivered
+  Welcome. Inbound membership changes now persist their app-state projection
+  (including a fresh join's pending invite) before any route-refresh network
+  work, closing a torn-write window where a fast-exiting process could strand
+  the durable engine join without its app-state row.
+
 - Existing-group invite commands now return after the required relay
   acknowledgement and durable local refresh instead of waiting for an
   all-account read-side catch-up. Account workers serve group projection reads
