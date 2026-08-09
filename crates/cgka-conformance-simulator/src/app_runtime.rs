@@ -1054,6 +1054,7 @@ fn app_error(error: AppError) -> SubjectError {
         AppError::Json(_)
         | AppError::Hex(_)
         | AppError::InvalidChatPin(_)
+        | AppError::InvalidGroupMembershipPage(_)
         | AppError::InvalidMessageDraft(_)
         | AppError::InvalidPublicKey
         | AppError::UnexpectedPrivateKey

@@ -551,6 +551,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Hex(_) => "read_marker_failed:hex",
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+        AppError::InvalidGroupMembershipPage(_) => {
+            "read_marker_failed:invalid_group_membership_page"
+        }
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",

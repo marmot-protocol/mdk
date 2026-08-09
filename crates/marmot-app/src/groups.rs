@@ -39,6 +39,13 @@ use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary
 /// protocol's retained-epoch windows.
 const MAX_PRIOR_NOSTR_ROUTES: usize = 32;
 
+/// Maximum number of group rosters returned by one local membership read.
+///
+/// Host chat-list consumers should page larger accounts rather than issuing
+/// one worker command per group. Keeping the page bounded also prevents an
+/// untrusted host input from monopolizing the per-account worker.
+pub const MAX_GROUP_MEMBER_IDS_PAGE_SIZE: usize = 100;
+
 /// Initial group-image input for encrypted-Blossom-first creation.
 ///
 /// The host owns discovery and download. MDK receives the decoded image bytes,
@@ -175,6 +182,16 @@ pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+}
+
+/// Lightweight local roster projection for one group.
+///
+/// This deliberately contains identifiers only: profile/display-name
+/// enrichment remains on the group-detail path.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMemberIds {
+    pub group_id_hex: String,
+    pub member_ids_hex: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

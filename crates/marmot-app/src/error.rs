@@ -27,6 +27,8 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group")]
     UnknownGroup(String),
+    #[error("invalid group membership page: {0}")]
+    InvalidGroupMembershipPage(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
     #[error("group is disbanding or disbanded; outbound work is blocked")]
@@ -182,6 +184,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
+            Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",

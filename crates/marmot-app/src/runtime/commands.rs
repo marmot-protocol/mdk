@@ -170,6 +170,34 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// Read identifier-only rosters for a bounded page of groups in one
+    /// account-worker round trip.
+    ///
+    /// The response preserves input order and fails as a whole if any group is
+    /// unknown or hydration-quarantined; it never returns a partial page.
+    pub async fn group_member_ids_page(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        if group_ids.len() > crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE {
+            return Err(AppError::InvalidGroupMembershipPage(format!(
+                "at most {} groups are allowed",
+                crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE
+            )));
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::MemberIdsPage {
+                group_ids: group_ids.to_vec(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn group_mls_state(
         &self,
         account_ref: &str,

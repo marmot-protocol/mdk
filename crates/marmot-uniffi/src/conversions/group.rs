@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use marmot_app::{
     AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
     AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupLifecycleState,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
     AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
@@ -204,6 +204,21 @@ pub struct AppGroupMemberRecordFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AppGroupMemberIdsFfi {
+    pub group_id_hex: String,
+    pub member_ids_hex: Vec<String>,
+}
+
+impl From<AppGroupMemberIds> for AppGroupMemberIdsFfi {
+    fn from(value: AppGroupMemberIds) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            member_ids_hex: value.member_ids_hex,
+        }
+    }
 }
 
 impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
@@ -735,5 +750,15 @@ mod group_roster_tests {
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn member_ids_page_row_preserves_group_and_member_identifiers() {
+        let ffi = AppGroupMemberIdsFfi::from(AppGroupMemberIds {
+            group_id_hex: "01".repeat(16),
+            member_ids_hex: vec!["02".repeat(32), "03".repeat(32)],
+        });
+        assert_eq!(ffi.group_id_hex, "01".repeat(16));
+        assert_eq!(ffi.member_ids_hex, vec!["02".repeat(32), "03".repeat(32)]);
     }
 }

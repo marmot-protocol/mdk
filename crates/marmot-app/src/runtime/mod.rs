@@ -1197,6 +1197,18 @@ impl MarmotAppRuntime {
         self.accounts.group_members(account_ref, group_id).await
     }
 
+    /// Identifier-only membership for a bounded page of groups, served in one
+    /// per-account worker command without profile enrichment.
+    pub async fn group_member_ids_page(
+        &self,
+        account_ref: &str,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        self.accounts
+            .group_member_ids_page(account_ref, group_ids)
+            .await
+    }
+
     pub async fn group_mls_state(
         &self,
         account_ref: &str,

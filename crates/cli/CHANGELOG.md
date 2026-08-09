@@ -56,6 +56,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   caller membership for cheap membership-screen change detection. Existing
   `groupDetails`, `groupMlsState`, and `groupMembers` remain available for
   compatibility.
+
+- MarmotKit exposes `groupMemberIdsPage`, a bounded identifier-only companion
+  read for chat-list consumers. A host can fetch membership for up to 100
+  groups in one account-worker command instead of issuing one `groupMembers`
+  or `groupRoster` command per chat. The page preserves input order, performs
+  no profile enrichment, and fails as a whole when any requested group is
+  unknown or quarantined.
   
 - MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
   kind:0 profile `picture` URLs (HTTPS-only, proxy-disabled pinned public

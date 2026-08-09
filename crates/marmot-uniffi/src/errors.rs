@@ -10,6 +10,8 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    #[error("group membership page exceeds the maximum of {max_groups} groups")]
+    InvalidGroupMembershipPage { max_groups: u64 },
     /// The group exists but its full hydration has not completed yet
     /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
     /// group shortly after account readiness, and worker-routed reads wait
@@ -236,6 +238,9 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
+                max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
+            },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
             AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
@@ -369,6 +374,16 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::{AccountError, AccountHomeError};
     use marmot_app::AppError;
+
+    #[test]
+    fn oversized_membership_page_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidGroupMembershipPage("too many groups".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
 
     // #484: a transient SQLITE_BUSY surfaced from a send must cross the UniFFI
     // boundary as the typed `StorageBusy` variant — never the untyped `Runtime`
