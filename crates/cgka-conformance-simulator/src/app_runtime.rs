@@ -1065,6 +1065,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
+        | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
         | AppError::InvalidPushToken(_)
         | AppError::InvalidPushServer(_)

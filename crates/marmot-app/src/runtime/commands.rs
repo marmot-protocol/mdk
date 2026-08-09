@@ -27,6 +27,39 @@ use crate::{
 };
 
 impl AccountManager {
+    pub(super) fn spawn_invite_catch_up(&self) {
+        let mut tasks = self
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.handles.retain(|task| !task.is_finished());
+        if !tasks.accepting {
+            return;
+        }
+        let post_mutation = self.clone();
+        let handle = tokio::spawn(async move {
+            let catch_up_started_at = Instant::now();
+            // Once started, catch-up must run to a normal result. Cancelling
+            // reconcile mid-await could abandon stale workers that it already
+            // removed from the manager map but has not finished reaping.
+            let catch_up = post_mutation.catch_up_accounts().await;
+            post_mutation.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
+                catch_up_started_at.elapsed(),
+                catch_up.is_ok(),
+            );
+            if let Err(error) = catch_up {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "invite_members",
+                    error_kind = error.privacy_safe_kind(),
+                    "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+                );
+            }
+        });
+        tasks.handles.push(handle);
+    }
+
     /// Refresh other account workers after an irreversible mutation without
     /// changing the mutation's result. Once the command worker has confirmed
     /// a publish, a read-side catch-up fault cannot roll it back; surfacing
@@ -421,22 +454,7 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-
-            let catch_up_started_at = Instant::now();
-            let catch_up = self.catch_up_accounts().await;
-            self.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
-                catch_up_started_at.elapsed(),
-                catch_up.is_ok(),
-            );
-            if let Err(error) = catch_up {
-                tracing::warn!(
-                    target: "marmot_app::runtime",
-                    method = "invite_members",
-                    error_kind = error.privacy_safe_kind(),
-                    "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
-                );
-            }
+            self.spawn_invite_catch_up();
 
             self.schedule_audit_log_tracker_update("invite_members");
             Ok(summary)

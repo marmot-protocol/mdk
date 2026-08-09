@@ -94,6 +94,9 @@ pub enum AppError {
     InvalidEncryptedMedia(String),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
+    /// Pre-dial rejection for untrusted profile/media fetch URLs (SSRF boundary).
+    #[error("unsafe media fetch: {0}")]
+    UnsafeMediaFetch(String),
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
     #[error("invalid push token")]
@@ -208,6 +211,7 @@ impl AppError {
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
             Self::BlobStore(_) => "blob_store",
+            Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",
             Self::InvalidPushServer(_) => "invalid_push_server",
@@ -290,6 +294,7 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::AlreadyExists => "storage_already_exists",
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
         StorageError::Busy(_) => "storage_busy",
+        StorageError::Closed(_) => "storage_closed",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
     }

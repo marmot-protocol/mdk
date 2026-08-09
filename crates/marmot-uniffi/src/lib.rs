@@ -194,11 +194,19 @@ impl Marmot {
 
     /// Bring the runtime to local readiness.
     ///
-    /// On success, persisted account state is hydrated and worker-routed local
-    /// reads are available. Relay activation, group-subscription registration,
-    /// shared-directory synchronization, and initial catch-up continue
+    /// On success, persisted account state is seeded and worker-routed local
+    /// reads are available: group reads issued before a group's background
+    /// hydration completes wait for exactly that group. Relay activation,
+    /// group-subscription registration, shared-directory synchronization,
+    /// remaining group hydration, and initial catch-up continue
     /// asynchronously. Hosts should render local projections immediately and
     /// represent network progress separately.
+    ///
+    /// Ready is NOT "safe to send without waiting" (mdk#1161): mutations
+    /// issued before the initial catch-up completes are queued and replayed
+    /// in arrival order after it, so first-send latency can still cover
+    /// remaining hydration plus catch-up even when the target group is
+    /// already readable.
     ///
     /// The binding signature and result type are unchanged; this local-ready
     /// completion point is the behavioral contract for this implementation.
@@ -210,8 +218,51 @@ impl Marmot {
     /// Tear the runtime down. Drops all subscriptions; long-lived
     /// [`EventsSubscription`] / [`ChatsSubscription`] / etc. instances on the
     /// host side will see their `next()` return `None` shortly after.
+    ///
+    /// This stops work but does **not** release the store's file locks — the
+    /// SQLite connections stay open. Hosts whose process can be suspended
+    /// should call [`Marmot::shutdown_and_close`] instead.
     pub async fn shutdown(&self) {
         self.runtime.shutdown().await;
+    }
+
+    /// [`Marmot::shutdown`], then close every SQLite database and release the
+    /// Marmot root's runtime lease.
+    ///
+    /// Await this before letting the process be suspended. When it returns,
+    /// nothing this process owns holds a file lock inside the Marmot root —
+    /// which is the fact iOS actually checks: a process suspended while holding
+    /// a lock in a shared App Group container is killed with `0xdead10cc`, and
+    /// a WAL connection holds one on its `-shm` sidecar for its entire
+    /// lifetime. [`Marmot::shutdown`] cannot deliver that on its own; it stops
+    /// workers, but the databases are shared behind `Arc`s that no host can
+    /// observe or await going away.
+    ///
+    /// **Terminal: this handle is finished.** Every subsequent call that
+    /// touches storage fails with [`MarmotKitError::StorageClosed`] rather than
+    /// reopening the databases, because reopening would re-lock the container
+    /// this method just cleared. Construct a new `Marmot` on resume — which is
+    /// what a foregrounding app does anyway.
+    ///
+    /// Safe to call twice, and safe to call with or without a preceding
+    /// [`Marmot::shutdown`]. Bounded: worker drain has a fixed budget and the
+    /// close itself waits only for the SQLite statement currently executing.
+    /// An error means at least one database reported a problem while closing;
+    /// every database is still attempted and left closed, so a failure is not
+    /// a reason to retry or to keep the process alive.
+    // Object-method and error-variant addition: binding regeneration and the
+    // workspace version bump ride the release per this crate's lockstep
+    // invariant — do not bump versions here.
+    pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError> {
+        self.runtime.shutdown_and_close().await?;
+        Ok(())
+    }
+
+    /// True once [`Marmot::shutdown_and_close`] has closed the store. A host
+    /// can check this to confirm it is safe to be suspended, or to notice it is
+    /// holding a spent handle and needs a fresh one.
+    pub fn storage_is_closed(&self) -> bool {
+        self.runtime.storage_is_closed()
     }
 
     /// True once shutdown has started. Host apps can use this to avoid

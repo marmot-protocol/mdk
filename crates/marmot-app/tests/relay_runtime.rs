@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
@@ -60,6 +60,21 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
         MarmotAppConfig::default()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
+    );
+    (relay, app, url)
+}
+
+async fn group_message_blocking_app(
+    dir: &tempfile::TempDir,
+    gate: BlockNextGroupMessages,
+) -> (LocalRelay, MarmotApp, String) {
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -142,6 +157,67 @@ struct BlockKeyPackagesWhileArmed {
     armed: Arc<AtomicBool>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockNextGroupMessages {
+    remaining: Arc<AtomicUsize>,
+    blocked: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl BlockNextGroupMessages {
+    fn new() -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(0)),
+            blocked: Arc::new(AtomicUsize::new(0)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    fn arm(&self, count: usize) {
+        self.blocked.store(0, Ordering::SeqCst);
+        self.remaining.store(count, Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked(&self, count: usize) {
+        while self.blocked.load(Ordering::SeqCst) < count {
+            self.entered.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+impl WritePolicy for BlockNextGroupMessages {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            let should_block = event.kind == Kind::MlsGroupMessage
+                && self
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+            if should_block {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.blocked.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                released.await;
+            }
+            PolicyResult::Accept
+        })
+    }
 }
 
 impl WritePolicy for BlockKeyPackagesWhileArmed {
@@ -3130,6 +3206,167 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
         .unwrap();
     assert_eq!(summary.published, 1);
     assert_eq!(summary.message_ids.len(), 1);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGroupMessages::new();
+    let (_relay, app, url) = group_message_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup()).await.unwrap();
+    let bob = runtime.create_identity(setup()).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let alice_group = runtime
+        .create_group(&alice_id, "alice reciprocal invite", &[], None)
+        .await
+        .unwrap();
+    let bob_group = runtime
+        .create_group(&bob_id, "bob reciprocal invite", &[], None)
+        .await
+        .unwrap();
+    let mut alice_events = runtime.subscribe();
+    let mut bob_events = runtime.subscribe();
+
+    gate.arm(2);
+    let alice_runtime = runtime.clone();
+    let alice_group_for_invite = alice_group.clone();
+    let bob_id_for_invite = bob_id.clone();
+    let alice_invite = tokio::spawn(async move {
+        alice_runtime
+            .invite_members(
+                &alice_id,
+                &alice_group_for_invite,
+                std::slice::from_ref(&bob_id_for_invite),
+            )
+            .await
+    });
+    let bob_runtime = runtime.clone();
+    let bob_group_for_invite = bob_group.clone();
+    let alice_id_for_invite = alice.account.account_id_hex.clone();
+    let bob_invite = tokio::spawn(async move {
+        bob_runtime
+            .invite_members(
+                &bob_id,
+                &bob_group_for_invite,
+                std::slice::from_ref(&alice_id_for_invite),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(10), gate.wait_for_blocked(2))
+        .await
+        .expect("both reciprocal invites should overlap at commit publication");
+    gate.release();
+    alice_invite
+        .await
+        .expect("alice invite task should not panic")
+        .expect("alice invite should succeed");
+    bob_invite
+        .await
+        .expect("bob invite task should not panic")
+        .expect("bob invite should succeed");
+
+    wait_for_event(&mut alice_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+                if account_id_hex == &alice.account.account_id_hex && group_id == &bob_group
+        )
+    })
+    .await;
+    wait_for_event(&mut bob_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+                if account_id_hex == &bob.account.account_id_hex && group_id == &alice_group
+        )
+    })
+    .await;
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_invite_delivers_while_overlapping_invite_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGroupMessages::new();
+    let (_relay, app, url) = group_message_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime
+        .create_identity(setup().relay_options_only())
+        .await
+        .unwrap();
+    let bob = runtime.create_identity(setup()).await.unwrap();
+    let missing_key_package_member = nostr::Keys::generate().public_key().to_hex();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let alice_group = runtime
+        .create_group(&alice_id, "successful overlap", &[], None)
+        .await
+        .unwrap();
+    let bob_group = runtime
+        .create_group(&bob_id, "failed overlap", &[], None)
+        .await
+        .unwrap();
+    let mut bob_events = runtime.subscribe();
+
+    gate.arm(1);
+    let alice_runtime = runtime.clone();
+    let alice_group_for_invite = alice_group.clone();
+    let bob_id_for_invite = bob_id.clone();
+    let successful_invite = tokio::spawn(async move {
+        alice_runtime
+            .invite_members(
+                &alice_id,
+                &alice_group_for_invite,
+                std::slice::from_ref(&bob_id_for_invite),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(10), gate.wait_for_blocked(1))
+        .await
+        .expect("successful invite should remain in flight at commit publication");
+
+    let failed = runtime
+        .invite_members(
+            &bob_id,
+            &bob_group,
+            std::slice::from_ref(&missing_key_package_member),
+        )
+        .await;
+    assert!(
+        failed.is_err(),
+        "invite without a published KeyPackage must fail"
+    );
+    gate.release();
+    successful_invite
+        .await
+        .expect("successful invite task should not panic")
+        .expect("alice invite should succeed");
+
+    wait_for_event(&mut bob_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+                if account_id_hex == &bob.account.account_id_hex && group_id == &alice_group
+        )
+    })
+    .await;
 
     runtime.shutdown().await;
 }

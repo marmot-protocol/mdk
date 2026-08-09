@@ -162,6 +162,11 @@ the property-test registry. This file is the agent-facing model.
     work, queue depth, replay probes, and database footprint. Fields that require an OS process boundary are explicitly
     unavailable in an in-process report.
 
+- **Module:** `src/route_assurance.rs`
+  - **Role:** Machine-readable ownership for every current production convergence decision route plus stable,
+    reopenable assurance-claim records. Source-marker and Markdown-matrix drift tests force review when a production
+    route changes. This module records evidence only and never participates in engine selection.
+
 - **Module:** `src/policy_sweep.rs`
   - **Role:** Feature-gated, one-variable-at-a-time sweeps over a fixed canonicalization input and fixed eligibility
     horizons. Curves record rejected boundary values and explicitly prohibit production auto-tuning.

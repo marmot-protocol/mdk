@@ -1,7 +1,7 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -452,26 +452,16 @@ async fn run_app_runtime_account_worker(
     );
     let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
-    // The session is hydrated. Capture a read snapshot and signal
-    // command-readiness *now*, before the initial relay catch-up. "Ready"
-    // means "hydrated + serving commands", not "caught up": the
-    // conversation's group-detail reads (`Members` / `GroupMlsState` /
-    // `QuarantinedGroups`) route through this worker, and blocking them on
-    // the catch-up made the first conversation opened after a foreground
-    // resume take seconds. The catch-up still runs (below) and its results
-    // flow to subscribers via the normal event mechanism; it is only removed
-    // from the readiness/blocking path. See `GroupReadSnapshot`.
-    // `AccountOpen` (recorded by `reconcile` as the ready-wait) measures
-    // local hydration and snapshot readiness; the mdk#1161 stage telemetry
-    // attributes it (`AccountSessionOpen` / `AccountGroupHydration` for the
-    // open the worker just awaited, `AccountProfileLoad` /
-    // `AccountGroupReadSnapshot` for the capture below).
-    //
-    // Snapshot capture is part of local readiness and stays fail-closed: its
-    // only failure is the shared profile load, and acknowledging readiness
-    // without it would leave `start()` successful with a dead worker — the
-    // failure must surface through the ready/reconcile path, not only the
-    // event stream.
+    // The session's cheap open pass has seeded every stored group. Signal
+    // command-readiness *now*: the hydration pipeline right below enters its
+    // command-serving loop immediately, so "ready" genuinely means "serving
+    // commands" — group reads issued from this point hydrate exactly the
+    // group they name and answer live, and everything else joins the startup
+    // deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
+    // measures the seeded open; the mdk#1161 stage telemetry attributes it
+    // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
+    // worker just awaited, with the pipeline and snapshot capture measured
+    // separately below).
     {
         let open_timings = client.runtime.session().open_timings();
         let telemetry = shared.app_performance_telemetry();
@@ -486,6 +476,43 @@ async fn run_app_runtime_account_worker(
             true,
         );
     }
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
+
+    // Background hydration pipeline (mdk#1161): the deferred open above only
+    // seeded stored groups, so fully hydrate them now — chat-list recency
+    // first — while serving commands. Group reads for a not-yet-hydrated
+    // group hydrate that one group and answer live ("waits for that group
+    // only"); mutations and catch-ups join the same startup deferral the
+    // catch-up window has always used and replay in arrival order after it.
+    let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
+    match run_startup_hydration_pipeline(
+        &app,
+        &mut client,
+        &mut commands,
+        &mut deferred,
+        &events,
+        &account_id_hex,
+        &account_label,
+        &shared,
+        &mut shutdown,
+        &lifecycle,
+    )
+    .await
+    {
+        StartupHydrationOutcome::Completed => {}
+        StartupHydrationOutcome::Shutdown => return,
+    }
+
+    // The snapshot answers read commands while the initial sync holds
+    // `&mut client`; its only failure is the shared profile load. Readiness
+    // was already acknowledged (the pipeline above served commands), so a
+    // capture failure must NOT kill the worker — a dead worker behind a
+    // successful `start()` is the failure mode mdk#1306 review flagged.
+    // Degrade instead: publish the error and run the catch-up window without
+    // a snapshot, deferring read commands alongside mutations so they replay
+    // on live state after catch-up.
     let snapshot_started = Instant::now();
     let read_snapshot = {
         let capture =
@@ -496,7 +523,7 @@ async fn run_app_runtime_account_worker(
             capture.is_ok(),
         );
         match capture {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => Some(snapshot),
             Err(err) => {
                 let message =
                     account_error_message("runtime startup snapshot capture failed", &err);
@@ -506,16 +533,10 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                     message,
                 );
-                if let Some(ready) = ready.take() {
-                    let _ = ready.send(Err(err));
-                }
-                return;
+                None
             }
         }
     };
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(Ok(()));
-    }
 
     // Start signer installation, transport activation, group-subscription
     // registration, and initial catch-up only after local readiness has been
@@ -525,7 +546,6 @@ async fn run_app_runtime_account_worker(
     // is deferred and replayed on live state once catch-up lands, in arrival
     // order. `CatchUp` requests that arrive during the initial sync are
     // coalesced onto it.
-    let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
@@ -546,13 +566,36 @@ async fn run_app_runtime_account_worker(
                     match command {
                         None => return,
                         Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                            let _ = respond.send(read_snapshot.members(&group_id));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.members(&group_id));
+                                }
+                                // Degraded (capture failed): answer from live
+                                // state after catch-up instead of guessing.
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::Members { group_id, respond },
+                                ))),
+                            }
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                            let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::GroupMlsState { group_id, respond },
+                                ))),
+                            }
                         }
                         Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                            let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::QuarantinedGroups { respond },
+                                ))),
+                            }
                         }
                         Some(AccountWorkerCommand::CatchUp { respond }) => {
                             // Coalesce onto the in-flight initial catch-up rather
@@ -681,7 +724,29 @@ async fn run_app_runtime_account_worker(
                 let groups = scheduled_convergence.take_ready();
                 match client.sync_runtime_groups().await {
                     Ok(()) => {
+                        let mut remaining = groups.len();
                         for group_id in groups {
+                            // Each group's convergence pass is a long blocking
+                            // stretch of synchronous engine + SQLite work with
+                            // no await inside it, so `JoinHandle::abort` cannot
+                            // land there: without this check the shutdown budget
+                            // is spent running the whole batch to completion.
+                            // The group boundary is the only cut point where no
+                            // snapshot guard is live, so it is also the only one
+                            // that cannot leave a group half-rolled-back.
+                            // Undispatched groups need no hand-off — their
+                            // convergence inputs are durable, so the next
+                            // runtime rediscovers them at catch-up.
+                            if lifecycle.is_stopping() {
+                                tracing::debug!(
+                                    target: "marmot_app::runtime",
+                                    method = "scheduled_convergence",
+                                    skipped_groups = remaining,
+                                    "shutdown requested; leaving remaining convergence passes for the next runtime",
+                                );
+                                break;
+                            }
+                            remaining -= 1;
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
@@ -760,26 +825,48 @@ async fn run_app_runtime_account_worker(
             command = commands.recv() => {
                 match command {
                     Some(command) => {
-                        let may_change_push_registration_work =
-                            command.may_change_push_registration_work();
-                        handle_account_worker_command(
-                            &mut client,
-                            command,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            &shared,
-                        )
-                        .await;
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                        if may_change_push_registration_work {
-                            scheduled_push_retry.observe_pending(
-                                client.has_pending_push_registration_work(),
-                                &command_tx,
+                        let mut pending = VecDeque::from([command]);
+                        while let Some(command) = pending.pop_front() {
+                            let may_change_push_registration_work =
+                                command.may_change_push_registration_work();
+                            match command {
+                                AccountWorkerCommand::CatchUp { respond } => {
+                                    handle_account_worker_catch_up(
+                                        &mut client,
+                                        respond,
+                                        &mut commands,
+                                        &mut pending,
+                                        AccountWorkerCatchUpContext {
+                                            events: &events,
+                                            account_id_hex: &account_id_hex,
+                                            account_label: &account_label,
+                                            shared: &shared,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                command => {
+                                    handle_account_worker_command(
+                                        &mut client,
+                                        command,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                    )
+                                    .await;
+                                }
+                            }
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
                             );
+                            if may_change_push_registration_work {
+                                scheduled_push_retry.observe_pending(
+                                    client.has_pending_push_registration_work(),
+                                    &command_tx,
+                                );
+                            }
                         }
                     }
                     None => return,
@@ -868,6 +955,26 @@ async fn run_app_runtime_account_worker(
                                 result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                             } {
                                 Ok(mut reopened) => {
+                                    // A reconnect open is deferred like the
+                                    // startup open; drain the hydration
+                                    // eagerly here — the steady-state loop
+                                    // below answers reads live and must not
+                                    // hand out not-hydrated errors after a
+                                    // mid-session reconnect (mdk#1161).
+                                    if let Err(err) = drain_deferred_hydration(&mut reopened).await
+                                    {
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message(
+                                                "runtime restart hydration failed",
+                                                &err,
+                                            ),
+                                        );
+                                        drop(reopened);
+                                        continue;
+                                    }
                                     // Reconnect restores transport activation
                                     // and subscriptions, then resumes the live
                                     // receive tail. Do not block the command
@@ -947,6 +1054,13 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = maintenance_tick.tick() => {
+                // Periodic maintenance is never urgent, and its catch-up leg is
+                // capped at 15s — three times the whole shutdown budget. Skip
+                // the tick outright once shutdown is requested rather than
+                // starting work the drain would then have to wait out.
+                if lifecycle.is_stopping() {
+                    continue 'worker;
+                }
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(Duration::from_secs(15), client.sync()).await {
                         Ok(Ok(summary)) => {
@@ -1029,14 +1143,341 @@ async fn run_app_runtime_account_worker(
     }
 }
 
+/// Run a steady-state catch-up while preserving prompt read-only projection
+/// access. The sync future exclusively borrows the live client, so reads that
+/// arrive before another state-changing command are answered from a snapshot
+/// captured immediately before the sync. Once a non-read command is deferred,
+/// later reads remain behind it to preserve worker FIFO semantics.
+/// Additional catch-up requests received before such a command coalesce onto
+/// the in-flight sync.
+struct AccountWorkerCatchUpContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
+}
+
+async fn handle_account_worker_catch_up(
+    client: &mut AppClient,
+    respond: oneshot::Sender<Result<(), String>>,
+    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    pending: &mut VecDeque<AccountWorkerCommand>,
+    context: AccountWorkerCatchUpContext<'_>,
+) {
+    let read_snapshot = match client.group_read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let message = account_error_message("runtime catch-up snapshot failed", &err);
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                message.clone(),
+            );
+            let _ = respond.send(Err(message));
+            return;
+        }
+    };
+    let mut catch_up_responders = vec![respond];
+    let mut deferred = VecDeque::new();
+    let mut commands_open = true;
+    let sync_started_at = Instant::now();
+    let sync_result = {
+        let mut sync = std::pin::pin!(client.sync());
+        loop {
+            let command = if let Some(command) = pending.pop_front() {
+                Some(command)
+            } else {
+                tokio::select! {
+                    biased;
+                    result = &mut sync => break result,
+                    command = commands.recv(), if commands_open => {
+                        if command.is_none() {
+                            commands_open = false;
+                        }
+                        command
+                    }
+                }
+            };
+            let Some(command) = command else {
+                continue;
+            };
+            match command {
+                AccountWorkerCommand::Members { group_id, respond } if deferred.is_empty() => {
+                    let _ = respond.send(read_snapshot.members(&group_id));
+                }
+                AccountWorkerCommand::GroupMlsState { group_id, respond }
+                    if deferred.is_empty() =>
+                {
+                    let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                }
+                AccountWorkerCommand::QuarantinedGroups { respond } if deferred.is_empty() => {
+                    let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                }
+                AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
+                    catch_up_responders.push(respond);
+                }
+                command => deferred.push_back(command),
+            }
+        }
+    };
+    let result = match sync_result {
+        Ok(summary) => {
+            publish_app_runtime_summary(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                &summary,
+            );
+            if client.has_pending_epoch_backfill() {
+                context
+                    .shared
+                    .schedule_audit_log_tracker_update("epoch_backfill_armed");
+            }
+            if sync_summary_triggers_audit_tracker_update(&summary) {
+                context.shared.schedule_audit_log_tracker_update("catch_up");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let message = account_error_message("runtime catch-up failed", &err);
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                message.clone(),
+            );
+            Err(message)
+        }
+    };
+    context.shared.app_performance_telemetry().record(
+        AppPerformanceOperation::AccountSync,
+        sync_started_at.elapsed(),
+        result.is_ok(),
+    );
+    let retry_after_response = result.is_ok();
+    for respond in catch_up_responders {
+        let _ = respond.send(result.clone());
+    }
+    pending.append(&mut deferred);
+    if retry_after_response {
+        client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+    }
+}
+
+/// Groups fully hydrated per background-pipeline batch (mdk#1161). Small so
+/// a command queued mid-pipeline waits at most one batch of MLS loads plus
+/// its own group's hydration.
+const STARTUP_HYDRATION_BATCH_SIZE: usize = 4;
+
+/// Commands served between hydration batches. Bounded so sustained
+/// account-worker traffic cannot starve the pipeline: without a budget, an
+/// unbounded drain-until-empty could defer hydration (and the mutation
+/// replay behind it) indefinitely while the `deferred` vec grows. The
+/// command channel itself holds 8, so under continuous producers each batch
+/// interleaves one channel's worth of commands with one batch of hydration.
+const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
+
+enum StartupHydrationOutcome {
+    Completed,
+    Shutdown,
+}
+
+/// Fully hydrate every group the deferred session open only seeded, in
+/// chat-list recency order, while serving commands between batches
+/// (mdk#1161). Group reads hydrate their one group and answer live;
+/// mutations and catch-ups join `deferred` and replay in arrival order after
+/// the initial catch-up, exactly like the catch-up window's own deferral.
+/// Recovery events surface incrementally after each batch. A storage-level
+/// pipeline failure stops the pipeline but not the worker: remaining groups
+/// stay gated with the retryable not-hydrated state and still promote on
+/// demand from send/ingest paths.
+#[allow(clippy::too_many_arguments)]
+async fn run_startup_hydration_pipeline(
+    app: &MarmotApp,
+    client: &mut AppClient,
+    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    deferred: &mut Vec<DeferredStartupCommand>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    shutdown: &mut oneshot::Receiver<()>,
+    lifecycle: &RuntimeLifecycle,
+) -> StartupHydrationOutcome {
+    if client.runtime.session().unhydrated_group_ids().is_empty() {
+        finish_deferred_hydration_reconciliation(client);
+        return StartupHydrationOutcome::Completed;
+    }
+    let pipeline_started = Instant::now();
+    // Chat-list recency order from the durable projection: the groups the
+    // user sees first hydrate first. The session appends any stored group
+    // the projection does not know about.
+    let hydration_order: Vec<GroupId> = app
+        .chat_list(account_label, true)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| hex::decode(&row.group_id_hex).ok().map(GroupId::new))
+                .collect()
+        })
+        .unwrap_or_default();
+    let batch_delay = startup_hydration_batch_test_delay(app);
+    let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+    let mut pipeline_ok = true;
+    loop {
+        // Test-only pre-batch hold (`test-policy-overrides` builds): keeps
+        // groups in the seeded state so integration tests can assert the
+        // persisted chat projection and per-group read behavior. Commands are
+        // still served while holding, and shutdown interrupts the hold so
+        // teardown exercises the graceful exit rather than the abort timeout.
+        if !batch_delay.is_zero() {
+            let hold_until = TokioInstant::now() + batch_delay;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(hold_until) => break,
+                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                        return StartupHydrationOutcome::Shutdown;
+                    }
+                    _ = &mut *shutdown => return StartupHydrationOutcome::Shutdown,
+                    command = commands.recv() => match command {
+                        Some(command) => {
+                            handle_startup_hydration_command(client, command, deferred).await;
+                        }
+                        None => return StartupHydrationOutcome::Shutdown,
+                    },
+                }
+            }
+        }
+        let mut commands_served = 0usize;
+        while commands_served < STARTUP_HYDRATION_COMMAND_BUDGET {
+            match commands.try_recv() {
+                Ok(command) => {
+                    commands_served += 1;
+                    handle_startup_hydration_command(client, command, deferred).await;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return StartupHydrationOutcome::Shutdown;
+                }
+            }
+        }
+        if !matches!(
+            shutdown.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ) || lifecycle.ensure_running().is_err()
+        {
+            return StartupHydrationOutcome::Shutdown;
+        }
+        let progress = match client
+            .runtime
+            .session_mut()
+            .hydrate_next_groups(&hydration_order, STARTUP_HYDRATION_BATCH_SIZE)
+        {
+            Ok(progress) => progress,
+            Err(err) => {
+                let message =
+                    account_error_message("startup group hydration failed", &AppError::from(err));
+                publish_app_runtime_account_error(events, account_id_hex, account_label, message);
+                // Remaining groups stay gated retryable; the stage sample
+                // below must not report this aborted pipeline as a success.
+                pipeline_ok = false;
+                break;
+            }
+        };
+        // Surface this batch's recovery events (PendingCommitRecovered,
+        // hydration quarantines, restored leave requests) exactly as a live
+        // drain would, so the projection updates incrementally.
+        if let Ok(summary) = client.drain_pending_session_events().await {
+            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+        }
+        if progress.remaining == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::AccountGroupHydration,
+        pipeline_started.elapsed(),
+        pipeline_ok,
+    );
+    // Live group state is readable now; finish the projection repairs that
+    // the deferred open deliberately skipped.
+    finish_deferred_hydration_reconciliation(client);
+    StartupHydrationOutcome::Completed
+}
+
+fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    if let Err(err) = client.reconcile_hydrated_account_state() {
+        tracing::warn!(
+            target: "marmot_app::runtime",
+            method = "run_startup_hydration_pipeline",
+            error_kind = err.privacy_safe_kind(),
+            "post-hydration account reconciliation failed; retrying next open"
+        );
+    }
+}
+
+/// Eagerly drain a deferred open's hydration without serving commands, for
+/// paths (reconnect) whose callers previously relied on the fully-eager open.
+async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError> {
+    loop {
+        let progress = client
+            .runtime
+            .session_mut()
+            .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
+        if progress.remaining == 0 {
+            return client.reconcile_hydrated_account_state();
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Serve one command that arrived while the startup hydration pipeline was
+/// running. The three local reads answer live — hydrating exactly the group
+/// they name first, so a read "waits for that group only". The quarantine
+/// list answers the incrementally-growing set; later additions reach
+/// subscribers through their `GroupHydrationQuarantined` events. Everything
+/// else joins the startup deferral in arrival order.
+async fn handle_startup_hydration_command(
+    client: &mut AppClient,
+    command: AccountWorkerCommand,
+    deferred: &mut Vec<DeferredStartupCommand>,
+) {
+    match command {
+        AccountWorkerCommand::Members { group_id, respond } => {
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.members(&group_id));
+        }
+        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.group_mls_state(&group_id));
+        }
+        AccountWorkerCommand::QuarantinedGroups { respond } => {
+            let _ = respond.send(Ok(client.quarantined_groups()));
+        }
+        AccountWorkerCommand::CatchUp { respond } => {
+            deferred.push(DeferredStartupCommand::CatchUp(respond));
+        }
+        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
+    }
+}
+
 /// Process a single account-worker command against the live session.
 ///
 /// Extracted so the worker can drive commands from two places: the steady-state
-/// command loop, and the deferred-command replay that runs after the initial
-/// catch-up completes (commands that arrived while the catch-up held
-/// `&mut client`). Read commands (`Members` / `GroupMlsState` /
-/// `QuarantinedGroups`) are also intercepted inline during the initial catch-up
-/// and answered from a `GroupReadSnapshot`; here they read the live session.
+/// command loop, and the deferred-command replay that runs after catch-up
+/// completes (commands that arrived while catch-up held `&mut client`). Read
+/// commands (`Members` / `GroupMlsState` / `QuarantinedGroups`) are also
+/// intercepted inline during catch-up and answered from a `GroupReadSnapshot`;
+/// here they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
@@ -1179,10 +1620,24 @@ async fn handle_account_worker_command(
             }
         }
         AccountWorkerCommand::Members { group_id, respond } => {
+            // On-demand promotion (mdk#1161): normally a no-op (the startup
+            // pipeline hydrated everything), but if the pipeline aborted on a
+            // storage error the leftover groups must still promote on first
+            // read instead of surfacing GroupHydrationPending forever.
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client
+                .runtime
+                .session_mut()
+                .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
             let _ = respond.send(result);
         }
@@ -2234,6 +2689,18 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
         cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
     };
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
+}
+
+fn startup_hydration_batch_test_delay(app: &MarmotApp) -> Duration {
+    if cfg!(feature = "test-policy-overrides") {
+        Duration::from_millis(
+            app.config
+                .dev_startup_hydration_batch_delay_ms
+                .unwrap_or_default(),
+        )
+    } else {
+        Duration::ZERO
+    }
 }
 
 fn scheduled_convergence_test_delay(app: &MarmotApp) -> Duration {

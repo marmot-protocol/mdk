@@ -86,6 +86,13 @@ pub struct MarmotAppConfig {
     /// lets integration tests hold the precise post-cutoff/pre-scheduler state
     /// without changing protocol timing in normal builds.
     pub dev_scheduled_convergence_delay_ms: Option<u64>,
+    /// Dev/test-only delay applied before each startup hydration-pipeline
+    /// batch (mdk#1161). `None` (the default) adds no delay. Honored only
+    /// with `test-policy-overrides`; this lets integration tests hold groups
+    /// in the seeded not-yet-hydrated state while asserting the persisted
+    /// chat projection and per-group read behavior, without changing startup
+    /// timing in normal builds. Commands are still served during the delay.
+    pub dev_startup_hydration_batch_delay_ms: Option<u64>,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -137,6 +144,7 @@ impl Default for MarmotAppConfig {
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
             dev_scheduled_convergence_delay_ms: None,
+            dev_startup_hydration_batch_delay_ms: None,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -214,6 +222,13 @@ impl MarmotAppConfig {
     /// worker's scheduled convergence pass. Normal builds ignore this field.
     pub fn with_dev_scheduled_convergence_delay_ms(mut self, ms: u64) -> Self {
         self.dev_scheduled_convergence_delay_ms = Some(ms);
+        self
+    }
+
+    /// Add a test-only delay before each startup hydration-pipeline batch
+    /// (mdk#1161). Normal builds ignore this field.
+    pub fn with_dev_startup_hydration_batch_delay_ms(mut self, ms: u64) -> Self {
+        self.dev_startup_hydration_batch_delay_ms = Some(ms);
         self
     }
 }

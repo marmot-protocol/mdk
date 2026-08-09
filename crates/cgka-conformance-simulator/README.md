@@ -70,13 +70,17 @@ welcomes use NIP-59 gift wraps before the bus delivers them.
   revision, exercises unequal histories, freeze/settle, crash/restart, temporary resource failure, administrative
   progress, and losing-branch joiner repair, and emits a minimal assumption-labeled starvation trace whose projected
   action kinds are drift-checked against committed Scenario IR.
-- `mutation_adequacy` — ten simulator-only single-rule mutants with minimal deterministic witnesses. The generated
+- `mutation_adequacy` — eleven simulator-only single-rule mutants with minimal deterministic witnesses. The generated
   catalog kills selector order, witness dedup/admission, cutoff, frozen-state, scheduler re-arm, invalidation,
-  publication-ack, retention-boundary, and group-profile-projection mutations without compiling mutation switches
-  into production. Lifecycle
+  publication-ack, retention-boundary, group-profile-projection, and pairwise-loser terminalization mutations without
+  compiling mutation switches into production. Lifecycle
   mutants run through the shared Rust transition model; publication acknowledgement runs through a real independent
   reference subject and its structural pending-work observation; the profile mutant runs the production-shaped engine
   vector and then changes only its app-facing projection before applying the portable expected-value oracle.
+- `route_assurance` — a machine-readable inventory of every current production decision route and its independent
+  model, mutation, and campaign ownership. Partial coverage and gaps stay explicit, and a green campaign cannot
+  silently close a previously recorded counterexample. The human mirror is
+  [`CONVERGENCE_ROUTE_MATRIX.md`](CONVERGENCE_ROUTE_MATRIX.md).
 
 ## Testing layers
 

@@ -1535,12 +1535,11 @@ impl<S: StorageProvider> Engine<S> {
                 &self.crypto,
                 self.storage.mls_storage(),
             );
-            openmls::group::MlsGroup::load(
-                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-                &mls_gid,
-            )
-            .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
-            .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
+            let provider_storage =
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider);
+            openmls::group::MlsGroup::load(provider_storage, &mls_gid)
+                .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
+                .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
         };
 
         // Record the transport routing id as soon as the MLS state loads —
@@ -1605,6 +1604,27 @@ impl<S: StorageProvider> Engine<S> {
 
         if group.protocol_profile != wire_protocol_profile {
             return Err(GroupHydrationQuarantineReason::MemberValidationFailed);
+        }
+
+        // OpenMLS persists sender-ratchet policy per group. Groups created
+        // while MDK accidentally inherited OpenMLS's 5-message default would
+        // therefore remain fragile after merely changing the creation/join
+        // presets. Validate the profile and member invariants before mutating
+        // the group, then write the pinned engine config through in place
+        // before any new traffic can be processed. The migration is
+        // intentionally triggered only by sender-ratchet drift:
+        // `set_configuration` does not resize the live past-epoch secret store.
+        // Construction tests separately assert that create and Welcome paths
+        // persist the same full join config. This cannot restore secrets
+        // already pruned, but it protects all future within-epoch application
+        // traffic.
+        let required_config = crate::wire_format::join_config(self.max_past_epochs);
+        if mls_group.configuration().sender_ratchet_configuration()
+            != required_config.sender_ratchet_configuration()
+        {
+            mls_group
+                .set_configuration(self.storage.mls_storage(), &required_config)
+                .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?;
         }
 
         let durable_pending_fanout = self

@@ -1413,6 +1413,95 @@ async fn lifecycle_waits_for_account_opens_to_drain() {
     assert!(waiter.await.expect("drain waiter should complete"));
 }
 
+#[tokio::test]
+async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let manager = runtime.accounts.clone();
+    let release_insertion = Arc::new(Notify::new());
+    let release_for_catch_up = release_insertion.clone();
+    let (catch_up_waiting_tx, catch_up_waiting_rx) = oneshot::channel();
+    let workers = manager.workers.clone();
+    let (worker_exited_tx, worker_exited_rx) = oneshot::channel();
+
+    let catch_up = tokio::spawn(async move {
+        let insertion_released = release_for_catch_up.notified();
+        tokio::pin!(insertion_released);
+        insertion_released.as_mut().enable();
+        let _ = catch_up_waiting_tx.send(());
+        insertion_released.await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            let _ = worker_exited_tx.send(());
+        });
+        workers.lock().await.insert(
+            "replacement".to_owned(),
+            ManagedAccountWorker {
+                handle,
+                commands,
+                shutdown: shutdown_tx,
+            },
+        );
+    });
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .handles
+        .push(catch_up);
+    catch_up_waiting_rx
+        .await
+        .expect("catch-up should register its release waiter");
+
+    let shutdown_manager = manager.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_manager.shutdown().await;
+    });
+    loop {
+        let accepting = manager
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepting;
+        if !accepting {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    release_insertion.notify_waiters();
+
+    shutdown.await.expect("manager shutdown should complete");
+    worker_exited_rx
+        .await
+        .expect("replacement worker should be shut down");
+    assert!(manager.workers.lock().await.is_empty());
+}
+
+#[test]
+fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let manager = runtime.accounts.clone();
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accepting = false;
+
+    manager.spawn_invite_catch_up();
+
+    assert!(
+        manager
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handles
+            .is_empty()
+    );
+}
+
 // Sender-controlled broker candidates must clear the shared dial-safety gate
 // at resolve time: literal-IP authorities resolve without DNS, so these cover
 // the canonical non-public classes end to end (issue #331).

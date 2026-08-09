@@ -1872,6 +1872,30 @@ async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message()
 }
 
 #[tokio::test]
+async fn sender_ratchet_policy_preserves_reordered_rollback_floods_past_openmls_default() {
+    // Seed 2001 places generation 5 ahead of generation 0 in both instances
+    // of the rollback-fault family. OpenMLS's unconfigured tolerance of 5
+    // irreversibly dropped generation 0 when it arrived sixth; Marmot's pinned
+    // tolerance must retain all six application messages.
+    let cases = generate_convergence_chaos_family(2001, 14);
+    for case_index in [2, 13] {
+        let report = run_generated_case_report(&cases[case_index], None)
+            .await
+            .expect("sender-ratchet regression case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {case_index} failed expectations: {:?}",
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "case {case_index} failed invariants: {:?}",
+            report.invariant_failures
+        );
+    }
+}
+
+#[tokio::test]
 async fn strict_chaos_boundary_retires_pre_join_opaque_resource_work() {
     let cases = generate_convergence_chaos_family(123, 5);
 

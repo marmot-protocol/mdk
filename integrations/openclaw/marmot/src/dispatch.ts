@@ -14,10 +14,7 @@ import {
   runChannelInboundEvent,
   type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
-import {
-  deliverInboundReplyWithMessageSendContext,
-  type DurableInboundReplyDeliveryResult,
-} from "openclaw/plugin-sdk/channel-outbound";
+import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 
@@ -101,6 +98,16 @@ export interface MarmotDispatchDeps {
   /** Override OpenClaw durable delivery in focused tests. */
   deliverInboundReply?: typeof deliverInboundReplyWithMessageSendContext;
 }
+
+/**
+ * Derived from the delivery function rather than imported by name: the
+ * `DurableInboundReplyDeliveryResult` alias is not re-exported from
+ * `plugin-sdk/channel-outbound` on the beta channel, but the function's return
+ * type is identical on both.
+ */
+type DurableInboundReplyDeliveryResult = Awaited<
+  ReturnType<typeof deliverInboundReplyWithMessageSendContext>
+>;
 
 function assertDurableReplyHandled(result: DurableInboundReplyDeliveryResult): void {
   if (result.status === "handled_visible" || result.status === "handled_no_send") {

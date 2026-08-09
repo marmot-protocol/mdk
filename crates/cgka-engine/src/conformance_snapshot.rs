@@ -71,6 +71,14 @@ pub fn conformance_constant_snapshot() -> ConformanceConstantSnapshot {
         crate::convergence::V1_MAX_WITNESS_OVERRIDE_DEPTH,
     );
     values.insert(
+        "P9.sender_ratchet_out_of_order_tolerance".into(),
+        crate::wire_format::DEFAULT_OUT_OF_ORDER_TOLERANCE as u64,
+    );
+    values.insert(
+        "P10.sender_ratchet_maximum_forward_distance".into(),
+        crate::wire_format::DEFAULT_MAXIMUM_FORWARD_DISTANCE as u64,
+    );
+    values.insert(
         "E1.max_convergence_reprocessing_passes".into(),
         crate::message_processor::MAX_CONVERGENCE_REPROCESSING_PASSES as u64,
     );
@@ -798,7 +806,7 @@ mod tests {
     fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
         let snapshot = conformance_constant_snapshot();
         assert_eq!(snapshot.schema_version, "1");
-        assert_eq!(snapshot.values.len(), 18);
+        assert_eq!(snapshot.values.len(), 20);
         for key in [
             "P1.max_rewind_commits",
             "P2.app_message_past_epoch_limit",
@@ -808,6 +816,8 @@ mod tests {
             "P6.witness_quorum_senders_per_epoch",
             "P7.witness_quorum_epochs",
             "P8.max_witness_override_depth",
+            "P9.sender_ratchet_out_of_order_tolerance",
+            "P10.sender_ratchet_maximum_forward_distance",
             "E1.max_convergence_reprocessing_passes",
             "E2.max_deferred_peel_attempts",
             "E3.max_peel_deferred_rows_per_group",
