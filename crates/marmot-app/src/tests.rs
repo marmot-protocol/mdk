@@ -5468,12 +5468,20 @@ fn close_storage_waits_for_an_open_that_is_already_in_flight() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let closing_app = app.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (closed_tx, closed_rx) = std::sync::mpsc::channel();
     let closer = std::thread::spawn(move || {
+        // Signal from inside the thread, immediately before the call. Without
+        // this the timeout assertion below would also pass if the thread had
+        // simply not been scheduled yet, which proves nothing about blocking.
+        let _ = started_tx.send(());
         let result = closing_app.close_storage();
         let _ = closed_tx.send(());
         result
     });
+    started_rx
+        .recv()
+        .expect("the closing thread should reach close_storage");
 
     // While the open is in flight the close must make no observable progress:
     // it has not returned, and the root lease is still held.
@@ -5547,12 +5555,21 @@ fn close_storage_waits_for_legacy_projection_import() {
     entered.wait();
 
     let closing_app = app.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (closed_tx, closed_rx) = std::sync::mpsc::channel();
     let closer = std::thread::spawn(move || {
+        // Signal from inside the thread, immediately before the call. Without
+        // this the timeout assertion below would also pass if the thread had
+        // simply not been scheduled yet, which proves nothing about the import
+        // window holding the close off.
+        started_tx.send(()).unwrap();
         let result = closing_app.close_storage();
         closed_tx.send(()).unwrap();
         result
     });
+    started_rx
+        .recv()
+        .expect("the closing thread should reach close_storage");
     assert!(
         closed_rx
             .recv_timeout(std::time::Duration::from_millis(250))
