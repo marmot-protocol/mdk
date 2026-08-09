@@ -105,7 +105,8 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/cross-route-own-commit-recovery.v1.json`
 - Setup: Zeta and Alpha author simultaneous privileged profile commits from epoch 1. Alpha's lower authenticated
   ordering key first displaces Zeta's own branch through pairwise fork recovery. Yankee has already applied Zeta's
-  root and extends it, while Observer retains the complete competing input set without authoring either root.
+  root and extends it, while Observer retains the complete competing input set without authoring either root. The
+  pairwise choice follows authenticated committer bytes from deterministic scenario identities, not lexical labels.
 - Pressure: the pairwise winner and stored-convergence winner deliberately disagree once Zeta's branch becomes deeper.
   Zeta restarts after losing its own root and before the deeper child arrives, forcing commit-addressed checkpoint
   recovery rather than in-memory or epoch-addressed rollback.

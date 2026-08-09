@@ -202,6 +202,55 @@
       "resolution": "confirmed"
     },
     {
+      "type": "client_state",
+      "client": "zeta",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "alpha",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "yankee",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "observer",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_epoch_changes",
+      "client": "zeta",
+      "changes": [
+        {
+          "from": 2,
+          "to": 3
+        }
+      ]
+    },
+    {
+      "type": "client_recoveries",
+      "client": "alpha",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
       "type": "clients_exactly_equivalent",
       "clients": [
         "zeta",

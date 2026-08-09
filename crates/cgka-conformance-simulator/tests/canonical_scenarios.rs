@@ -3149,30 +3149,12 @@ async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement()
         "cross-route invariants must pass: {:#?}",
         report.invariant_failures
     );
-    assert_eq!(
-        report.recovery_observations.len(),
-        1,
-        "the ordering-key winner must first displace zeta's own branch pairwise"
-    );
-    assert_eq!(report.recovery_observations[0].source_epoch, 1);
-    assert_eq!(report.recovery_observations[0].recovered_epoch, 2);
-    assert!(
-        report
-            .epoch_change_observations
-            .iter()
-            .any(|change| { change.client == "zeta" && change.from == 2 && change.to == 3 })
-    );
 
     let trace = report.observed_trace.expect("cross-route trace");
-    assert_eq!(trace.decryptability_probes.len(), 1);
-    assert!(trace.decryptability_probes[0].succeeded());
+    // Portable expectations cover recovery, restart progression, exact state,
+    // and decryptability. Keep only this semantic ledger subset harness-local:
+    // a complete portable ledger would also pin unrelated probe ids/counters.
     for observation in &trace.observations {
-        assert_eq!(observation.epoch, 3, "{} epoch", observation.client);
-        assert_eq!(
-            observation.group_name, "zeta-branch-depth-two",
-            "{} must select the deeper branch after the restart",
-            observation.client
-        );
         for (scenario_id, disposition) in [
             (
                 "step-5:update_group_data",
@@ -3203,18 +3185,6 @@ async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement()
                 observation.client
             );
         }
-        assert!(
-            observation
-                .scenario_input_ledger
-                .iter()
-                .filter(|entry| entry.kind == ScenarioInputKind::Application)
-                .all(|entry| matches!(
-                    entry.disposition,
-                    ScenarioInputDisposition::Accepted | ScenarioInputDisposition::Delivered
-                )),
-            "{} must retain a terminal disposition for every decryptability probe",
-            observation.client
-        );
     }
 }
 

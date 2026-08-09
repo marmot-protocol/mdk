@@ -273,7 +273,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "The sibling-model mutant proves the witness distinguishes two abstract rules, not that production takes the adopted transition.",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1 plus the focused reconsiderable-loser engine regressions",
+            "cross-route-own-commit-recovery/v1, pairwise_incumbent_defers_to_deeper_convergence_branch, and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
             "The four-party engine scenario covers pairwise displacement followed by deeper-branch reconsideration; retained-history and external-adapter permutations remain open.",
         ),
     },
@@ -347,7 +347,7 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
         mutation_sentinel: AssuranceOwnerV1::covered("output_invalidation"),
         campaign: AssuranceOwnerV1::partial(
-            "cross-route-own-commit-recovery/v1 scenario-input ledgers and bidirectional decryptability probes",
+            "scenario-input ledgers and bidirectional decryptability probes, including cross-route-own-commit-recovery/v1",
             "Selected and losing commits plus post-settlement probe traffic are accounted for; sender-visible application invalidation during branch replacement remains open.",
         ),
     },
