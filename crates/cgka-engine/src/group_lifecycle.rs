@@ -15,7 +15,9 @@ use crate::capabilities::{
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
-use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
+use crate::wire_format::{
+    PURE_PLAINTEXT_WIRE_FORMAT_POLICY, default_sender_ratchet_configuration, join_config,
+};
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
@@ -422,6 +424,7 @@ impl<S: StorageProvider> Engine<S> {
             .max_past_epochs(self.max_past_epochs)
             .with_group_context_extensions(gc_exts)
             .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(default_sender_ratchet_configuration())
             .build();
 
         // `MlsGroup::new` persists the OpenMLS group as a sequence of value

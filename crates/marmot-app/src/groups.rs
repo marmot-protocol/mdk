@@ -319,7 +319,9 @@ fn non_empty_group_system_data(event: &GroupSystemEvent, key: &str) -> Option<St
 /// carry no group/member ids, payloads, or key material.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AppGroupHydrationQuarantineReason {
-    /// OpenMLS returned an error while loading the stored group state.
+    /// OpenMLS returned an error while loading the stored group state or while
+    /// persisting mandatory runtime-configuration normalization after the
+    /// loaded group passed validation.
     OpenMlsLoadFailed,
     /// Marmot metadata referenced a group whose OpenMLS state was missing.
     OpenMlsGroupMissing,
