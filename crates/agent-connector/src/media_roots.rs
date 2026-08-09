@@ -57,14 +57,32 @@ impl MediaAllowedRoots {
         })
     }
 
-    pub(crate) async fn read_regular_file(&self, path: PathBuf) -> Result<Vec<u8>, ConnectorError> {
-        let roots = self.clone();
-        tokio::task::spawn_blocking(move || roots.read_regular_file_blocking(&path))
+    #[cfg(test)]
+    async fn read_regular_file(&self, path: PathBuf) -> Result<Vec<u8>, ConnectorError> {
+        self.read_regular_file_limited(path, u64::MAX, "attachment_bytes")
             .await
-            .map_err(|_| ConnectorError::MediaPathDenied("media file read task failed"))?
     }
 
-    fn read_regular_file_blocking(&self, path: &Path) -> Result<Vec<u8>, ConnectorError> {
+    pub(crate) async fn read_regular_file_limited(
+        &self,
+        path: PathBuf,
+        max_bytes: u64,
+        limit_reason: &'static str,
+    ) -> Result<Vec<u8>, ConnectorError> {
+        let roots = self.clone();
+        tokio::task::spawn_blocking(move || {
+            roots.read_regular_file_blocking(&path, max_bytes, limit_reason)
+        })
+        .await
+        .map_err(|_| ConnectorError::MediaPathDenied("media file read task failed"))?
+    }
+
+    fn read_regular_file_blocking(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+        limit_reason: &'static str,
+    ) -> Result<Vec<u8>, ConnectorError> {
         if self.roots.is_empty() || !path.is_absolute() {
             return Err(ConnectorError::MediaPathDenied(
                 "media path is outside configured roots",
@@ -81,12 +99,19 @@ impl MediaAllowedRoots {
             if relative.as_os_str().is_empty() {
                 continue;
             }
-            let Ok(mut file) = open_regular_beneath(&root.directory, relative) else {
+            let Ok(file) = open_regular_beneath(&root.directory, relative) else {
                 continue;
             };
+            if file.metadata()?.len() > max_bytes {
+                return Err(ConnectorError::MediaLimitsExceeded(limit_reason));
+            }
             let mut plaintext = Vec::new();
-            file.read_to_end(&mut plaintext)
+            file.take(max_bytes.saturating_add(1))
+                .read_to_end(&mut plaintext)
                 .map_err(|_| ConnectorError::MediaPathDenied("media file could not be read"))?;
+            if plaintext.len() as u64 > max_bytes {
+                return Err(ConnectorError::MediaLimitsExceeded(limit_reason));
+            }
             return Ok(plaintext);
         }
         Err(ConnectorError::MediaPathDenied(

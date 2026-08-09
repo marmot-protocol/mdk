@@ -53,8 +53,22 @@ TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # is reused across these attempts so a retry after a post-write timeout dedups at
 # the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
 SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
+SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
+# Ten sequential uploads may each consume the connector's 60-second media
+# operation budget. Leave headroom for publication while bounding staged-file
+# and descriptor retention if the connector never reaches a terminal result.
+SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
+# Hermes albums and the native Telegram/Discord/Slack batch APIs share a
+# ten-item ceiling. Keeping one Marmot album within that bound also limits the
+# encrypted blobs an all-or-error upload can orphan before publication fails.
+MAX_OUTBOUND_MEDIA_ATTACHMENTS = 10
+# Marmot receivers cap encrypted Blossom blobs at 64 MiB. ChaCha20-Poly1305 adds
+# a 16-byte tag, so cap plaintext below that wire limit. The aggregate cap keeps
+# the connector's pre-upload in-memory batch bounded as well.
+MAX_OUTBOUND_MEDIA_FILE_BYTES = 64 * 1024 * 1024 - 16
+MAX_OUTBOUND_MEDIA_BATCH_BYTES = 128 * 1024 * 1024
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
@@ -736,49 +750,121 @@ def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
     return _split_config_list(configured) if configured else []
 
 
-def path_is_under_root(path: Path, root: Path) -> bool:
+def open_directory_without_symlinks(path: Path) -> int:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fd = os.open("/", directory_flags)
     try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
+        for component in path.parts[1:]:
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
 
 
-def assert_local_media_allowed(path: Path, allowed_roots: list[Path]) -> None:
-    resolved = path.expanduser().resolve()
+def pin_allowed_media_roots(allowed_roots: list[Path]) -> list[tuple[Path, int]]:
+    pinned: list[tuple[Path, int]] = []
+    try:
+        for root in allowed_roots:
+            resolved = root.expanduser().resolve()
+            try:
+                directory_fd = open_directory_without_symlinks(resolved)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                os.close(directory_fd)
+                raise AgentControlError("Marmot media root is not a readable directory")
+            pinned.append((resolved, directory_fd))
+        return pinned
+    except Exception:
+        for _, directory_fd in pinned:
+            os.close(directory_fd)
+        raise
+
+
+def open_outbound_media_source(
+    source: Path,
+    pinned_roots: list[tuple[Path, int]],
+) -> tuple[Path, int, os.stat_result]:
+    """Open one approved source and pin the inode used by later staging."""
+    resolved = source.expanduser().resolve()
     if not resolved.is_file():
         raise AgentControlError("Marmot media path is not a readable file")
-    if not allowed_roots:
+    approved_root = next(
+        ((root, directory_fd) for root, directory_fd in pinned_roots if resolved.is_relative_to(root)),
+        None,
+    )
+    if approved_root is None:
         raise AgentControlError("Marmot media path is outside allowed local roots")
-    if any(path_is_under_root(resolved, root) for root in allowed_roots):
-        return
-    raise AgentControlError("Marmot media path is outside allowed local roots")
+    allowed_root, root_fd = approved_root
+    relative = resolved.relative_to(allowed_root)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_fd = os.dup(root_fd)
+    try:
+        for component in relative.parts[:-1]:
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        source_fd = os.open(relative.name, source_flags, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        opened = os.fstat(source_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AgentControlError("Marmot media path is not a readable file")
+        return resolved, source_fd, opened
+    except Exception:
+        os.close(source_fd)
+        raise
 
 
-def stage_outbound_media_file(source: Path, staging_root: Path, *, file_name: str) -> Path:
+def stage_outbound_media_file(
+    source: Path,
+    staging_root: Path,
+    *,
+    file_name: str,
+    source_fd: int,
+    max_bytes: Optional[int] = None,
+    limit_error: str = "Marmot media file exceeds the encrypted blob size limit",
+) -> Path:
     staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     safe_name = Path(str(file_name or source.name or "attachment")).name or "attachment"
     destination = staging_root / f"{uuid.uuid4().hex}-{safe_name}"
-    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    source_fd = os.open(source, source_flags)
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise AgentControlError("Marmot media path is not a readable file")
+    destination_fd = os.open(destination, destination_flags, 0o640)
     try:
-        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-            raise AgentControlError("Marmot media path is not a readable file")
-        destination_fd = os.open(destination, destination_flags, 0o640)
-        try:
-            os.fchmod(destination_fd, 0o640)
-            with os.fdopen(os.dup(source_fd), "rb") as source_file, os.fdopen(
-                os.dup(destination_fd), "wb"
-            ) as destination_file:
-                shutil.copyfileobj(source_file, destination_file)
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
-        finally:
-            os.close(destination_fd)
+        os.fchmod(destination_fd, 0o640)
+        with os.fdopen(os.dup(source_fd), "rb") as source_file, os.fdopen(
+            os.dup(destination_fd), "wb"
+        ) as destination_file:
+            copied = 0
+            while chunk := source_file.read(1024 * 1024):
+                copied += len(chunk)
+                if max_bytes is not None and copied > max_bytes:
+                    raise AgentControlError(limit_error)
+                destination_file.write(chunk)
+            if copied == 0:
+                raise AgentControlError("Marmot media path is empty")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
     finally:
-        os.close(source_fd)
+        os.close(destination_fd)
     return destination
 
 
@@ -1055,13 +1141,17 @@ class MarmotAgentControlClient:
         *,
         request_id: Optional[str] = None,
         timeout: Optional[float] = None,
+        response_timeout: Any = _DEFAULT_READ_TIMEOUT,
     ) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
         effective_timeout = self.request_timeout if timeout is None else float(timeout)
+        effective_response_timeout = (
+            effective_timeout if response_timeout is _DEFAULT_READ_TIMEOUT else response_timeout
+        )
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         try:
             await self._write_envelope(writer, payload, request_id=request_id, timeout=effective_timeout)
-            response = await self._read_envelope(reader, timeout=effective_timeout)
+            response = await self._read_envelope(reader, timeout=effective_response_timeout)
             self._validate_response_id(response, request_id)
             self._raise_if_error(response)
             return response
@@ -1209,16 +1299,30 @@ class MarmotAgentControlClient:
         attachments: Iterable[Dict[str, Any]],
         *,
         caption: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        response_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "send_media",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
-                "attachments": list(attachments),
-                "caption": str(caption) if caption is not None else None,
-            }
+        payload: Dict[str, Any] = {
+            "type": "send_media",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            "attachments": list(attachments),
+            "caption": str(caption) if caption is not None else None,
+        }
+        key = str(idempotency_key or "").strip()
+        if key:
+            payload["idempotency_key"] = key
+        # Media upload duration is bounded by connector attachment/byte limits
+        # and per-endpoint HTTP deadlines, not by the generic 30-second control
+        # timeout. Keep the response wait attached to the one durable operation,
+        # but retain a finite ceiling for a connector that never answers. Socket
+        # writes remain timed; transport failures retry with the same key.
+        completion_timeout = (
+            SEND_MEDIA_COMPLETION_TIMEOUT_S
+            if response_timeout is None
+            else max(0.0, float(response_timeout))
         )
+        return await self.request(payload, response_timeout=completion_timeout)
 
     async def download_media(
         self,
@@ -1553,9 +1657,11 @@ class MarmotAgentControlClient:
     @staticmethod
     def _raise_if_error(envelope: Dict[str, Any]) -> None:
         if envelope.get("type") == "error":
+            code = str(envelope.get("code") or "agent_control_error")
             raise AgentControlError(
                 str(envelope.get("message") or "agent control error"),
-                code=str(envelope.get("code") or "agent_control_error"),
+                code=code,
+                retryable=code == "send_in_progress",
             )
 
 
@@ -2234,6 +2340,206 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             retryable=is_retryable(last_exc) if last_exc else False,
         )
 
+    async def _send_media_batch(
+        self,
+        chat_id: str,
+        attachments: Iterable[Dict[str, Any]],
+        *,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        if reply_to:
+            return SendResult(
+                success=False,
+                error="Marmot media sends do not support reply threading yet",
+            )
+
+        requested = list(attachments)
+        if not requested:
+            return SendResult(success=False, error="Marmot media send requires at least one attachment")
+        if len(requested) > MAX_OUTBOUND_MEDIA_ATTACHMENTS:
+            return SendResult(
+                success=False,
+                error=f"Marmot media send supports at most {MAX_OUTBOUND_MEDIA_ATTACHMENTS} attachments",
+            )
+
+        validated: list[Dict[str, Any]] = []
+        staged_paths: list[Path] = []
+        pinned_roots: list[tuple[Path, int]] = []
+        try:
+            total_preflight_bytes = 0
+            try:
+                pinned_roots = pin_allowed_media_roots(self._allowed_media_roots)
+                for item in requested:
+                    local_path = Path(str(item["path"])).expanduser()
+                    resolved, source_fd, opened = open_outbound_media_source(
+                        local_path,
+                        pinned_roots,
+                    )
+                    validated.append(
+                        {
+                            "source_path": resolved,
+                            "source_fd": source_fd,
+                            "media_type": str(item.get("media_type") or "application/octet-stream"),
+                            "file_name": str(item.get("file_name") or local_path.name or "attachment"),
+                        }
+                    )
+                    size_bytes = opened.st_size
+                    if size_bytes <= 0:
+                        raise AgentControlError("Marmot media path is empty")
+                    if size_bytes > MAX_OUTBOUND_MEDIA_FILE_BYTES:
+                        raise AgentControlError("Marmot media file exceeds the encrypted blob size limit")
+                    total_preflight_bytes += size_bytes
+                    if total_preflight_bytes > MAX_OUTBOUND_MEDIA_BATCH_BYTES:
+                        raise AgentControlError("Marmot media batch exceeds the total size limit")
+            except AgentControlError as exc:
+                return SendResult(success=False, error=str(exc), retryable=False)
+            except (KeyError, OSError) as exc:
+                logger.debug("Marmot media preflight failed (%s)", type(exc).__name__)
+                return SendResult(success=False, error="Marmot media preflight failed", retryable=False)
+
+            wire_attachments: list[Dict[str, Any]] = []
+            total_staged_bytes = 0
+            for item in validated:
+                remaining_batch_bytes = MAX_OUTBOUND_MEDIA_BATCH_BYTES - total_staged_bytes
+                max_copy_bytes = min(MAX_OUTBOUND_MEDIA_FILE_BYTES, remaining_batch_bytes)
+                limit_error = (
+                    "Marmot media batch exceeds the total size limit"
+                    if remaining_batch_bytes < MAX_OUTBOUND_MEDIA_FILE_BYTES
+                    else "Marmot media file exceeds the encrypted blob size limit"
+                )
+                staged_path = stage_outbound_media_file(
+                    item["source_path"],
+                    self._outbound_media_dir,
+                    file_name=item["file_name"],
+                    source_fd=item["source_fd"],
+                    max_bytes=max_copy_bytes,
+                    limit_error=limit_error,
+                )
+                staged_paths.append(staged_path)
+                total_staged_bytes += staged_path.stat().st_size
+                wire_attachments.append(
+                    {
+                        "path": str(staged_path),
+                        "media_type": item["media_type"],
+                        "file_name": item["file_name"],
+                    }
+                )
+
+            account_id = await self._ensure_account_id()
+            normalized_chat_id = _normalize_hex(chat_id, "chat_id")
+            idempotency_key = uuid.uuid4().hex
+            retry_attempt = 0
+            in_progress_attempt = 0
+            completion_deadline = time.monotonic() + SEND_MEDIA_COMPLETION_TIMEOUT_S
+            while True:
+                remaining = completion_deadline - time.monotonic()
+                if remaining <= 0:
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send timed out",
+                        retryable=True,
+                    )
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.send_media(
+                            account_id,
+                            normalized_chat_id,
+                            wire_attachments,
+                            caption=caption,
+                            idempotency_key=idempotency_key,
+                            response_timeout=remaining,
+                        ),
+                        timeout=remaining,
+                    )
+                    message_ids = tuple(response.get("message_ids_hex") or ())
+                    if response.get("type") != "final_sent" or not message_ids:
+                        raise AgentControlError(
+                            "Marmot media send returned no message ids",
+                            code="unexpected_media_send_response",
+                            retryable=True,
+                        )
+                    self._sent_targets.record_all(
+                        message_ids,
+                        account_id_hex=account_id,
+                        group_id_hex=normalized_chat_id,
+                    )
+                    audit_response = dict(response)
+                    audit_response["attachment_outcomes"] = [
+                        {
+                            "file_name": item["file_name"],
+                            "media_type": item["media_type"],
+                            "status": "sent",
+                        }
+                        for item in validated
+                    ]
+                    return SendResult(
+                        success=True,
+                        message_id=message_ids[-1],
+                        raw_response=audit_response,
+                        continuation_message_ids=message_ids[:-1],
+                    )
+                except asyncio.TimeoutError:
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send timed out",
+                        retryable=True,
+                    )
+                except Exception as exc:
+                    if isinstance(exc, AgentControlError) and exc.code == "send_in_progress":
+                        logger.debug(
+                            "Marmot send_media remains in progress; retrying (%s)",
+                            type(exc).__name__,
+                        )
+                        backoff_index = min(
+                            in_progress_attempt,
+                            len(SEND_MEDIA_RETRY_BACKOFF_S) - 1,
+                        )
+                        await asyncio.sleep(
+                            min(
+                                SEND_MEDIA_RETRY_BACKOFF_S[backoff_index],
+                                max(0.0, completion_deadline - time.monotonic()),
+                            )
+                        )
+                        in_progress_attempt += 1
+                        continue
+                    if retry_attempt < len(SEND_MEDIA_RETRY_BACKOFF_S) and is_retryable(exc):
+                        logger.debug(
+                            "Marmot send_media failed; retrying (attempt %d, %s)",
+                            retry_attempt + 1,
+                            type(exc).__name__,
+                        )
+                        await asyncio.sleep(
+                            min(
+                                SEND_MEDIA_RETRY_BACKOFF_S[retry_attempt],
+                                max(0.0, completion_deadline - time.monotonic()),
+                            )
+                        )
+                        retry_attempt += 1
+                        continue
+                    logger.debug("Marmot send_media failed (%s)", type(exc).__name__)
+                    return SendResult(
+                        success=False,
+                        error="Marmot media send failed",
+                        retryable=is_retryable(exc),
+                    )
+        except AgentControlError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        except Exception as exc:
+            logger.debug("Marmot outbound media staging failed (%s)", type(exc).__name__)
+            return SendResult(
+                success=False,
+                error="Marmot outbound media staging failed",
+                retryable=is_retryable(exc),
+            )
+        finally:
+            for item in validated:
+                os.close(item["source_fd"])
+            for _, directory_fd in pinned_roots:
+                os.close(directory_fd)
+            for staged_path in staged_paths:
+                staged_path.unlink(missing_ok=True)
+
     async def _send_media_upload(
         self,
         chat_id: str,
@@ -2244,63 +2550,73 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
     ) -> SendResult:
-        if reply_to:
-            return SendResult(
-                success=False,
-                error="Marmot media sends do not support reply threading yet",
+        return await self._send_media_batch(
+            chat_id,
+            [
+                {
+                    "path": path,
+                    "media_type": media_type,
+                    "file_name": file_name,
+                }
+            ],
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: list[tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        if not images:
+            return
+
+        from urllib.parse import unquote, urlsplit
+
+        attachments = []
+        captions = []
+        for image_url, alt_text in images:
+            parsed = urlsplit(str(image_url))
+            if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+                raise AgentControlError("Marmot multi-image sends require local file URLs")
+            local_path = Path(unquote(parsed.path)).expanduser()
+            attachments.append(
+                {
+                    "path": str(local_path),
+                    "media_type": mimetypes.guess_type(local_path.name)[0] or "image/jpeg",
+                    "file_name": local_path.name,
+                }
             )
+            if str(alt_text or "").strip():
+                captions.append(str(alt_text))
 
-        local_path = Path(str(path)).expanduser()
-        try:
-            assert_local_media_allowed(local_path, self._allowed_media_roots)
-        except AgentControlError as exc:
-            return SendResult(success=False, error=str(exc))
-
-        try:
-            staged_path = stage_outbound_media_file(
-                local_path.resolve(),
-                self._outbound_media_dir,
-                file_name=file_name,
-            )
-        except Exception as exc:
-            logger.debug("Marmot outbound media staging failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=False)
-
-        account_id = await self._ensure_account_id()
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        try:
-            try:
-                response = await self.client.send_media(
-                    account_id,
-                    chat_id,
-                    [
-                        {
-                            "path": str(staged_path),
-                            "media_type": str(media_type or "application/octet-stream"),
-                            "file_name": str(file_name or local_path.name or "attachment"),
-                        }
-                    ],
-                    caption=caption,
+        metadata = metadata or {}
+        reply_to = next(
+            (
+                str(metadata[key])
+                for key in (
+                    "reply_to_message_id_hex",
+                    "reply_to_message_id",
+                    "reply_to",
+                    "parent_message_id_hex",
                 )
-            except Exception as exc:
-                logger.debug("Marmot send_media failed: %s", exc)
-                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-        finally:
-            staged_path.unlink(missing_ok=True)
-
-        message_ids = tuple(response.get("message_ids_hex") or ())
-        message_id = message_ids[-1] if message_ids else None
-        self._sent_targets.record_all(
-            message_ids,
-            account_id_hex=account_id,
-            group_id_hex=chat_id,
+                if metadata.get(key)
+            ),
+            None,
         )
-        return SendResult(
-            success=True,
-            message_id=message_id,
-            raw_response=response,
-            continuation_message_ids=message_ids[:-1],
+        result = await self._send_media_batch(
+            chat_id,
+            attachments,
+            caption=captions[0] if captions else None,
+            reply_to=reply_to,
         )
+        if not result.success:
+            raise AgentControlError(
+                result.error or "Marmot media send failed",
+                retryable=result.retryable,
+            )
 
     async def send_image_file(
         self,
@@ -3398,22 +3714,34 @@ async def _standalone_send(
 ):
     adapter = MarmotPlatformAdapter(pconfig)
     if media_files:
-        results = []
-        caption = str(message or "")
-        for index, media_path in enumerate(media_files):
+        attachments = []
+        for media_path in media_files:
             path = Path(str(media_path)).expanduser()
-            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            result = await adapter._send_media_upload(
-                str(chat_id),
-                path=str(path),
-                media_type=media_type,
-                file_name=path.name,
-                caption=caption if index == 0 else None,
+            attachments.append(
+                {
+                    "path": str(path),
+                    "media_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    "file_name": path.name,
+                }
             )
-            if not result.success:
-                return {"error": result.error or "Marmot media send failed"}
-            results.append(result.message_id)
-        return {"success": True, "message_id": results[-1] if results else None}
+        caption = str(message or "")
+        result = await adapter._send_media_batch(
+            str(chat_id),
+            attachments,
+            caption=caption if caption.strip() else None,
+        )
+        if not result.success:
+            return {"error": result.error or "Marmot media send failed"}
+        message_ids = [*result.continuation_message_ids]
+        if result.message_id:
+            message_ids.append(result.message_id)
+        raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+        return {
+            "success": True,
+            "message_id": result.message_id,
+            "message_ids": message_ids,
+            "attachment_outcomes": list(raw_response.get("attachment_outcomes") or ()),
+        }
     result = await adapter.send(str(chat_id), str(message or ""))
     if result.success:
         return {"success": True, "message_id": result.message_id}

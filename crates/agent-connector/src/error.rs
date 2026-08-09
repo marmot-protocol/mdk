@@ -34,6 +34,8 @@ pub enum ConnectorError {
     SendInProgress,
     #[error("outbound media path denied: {0}")]
     MediaPathDenied(&'static str),
+    #[error("outbound media exceeds connector limits: {0}")]
+    MediaLimitsExceeded(&'static str),
     #[error("stream id is already reserved")]
     StreamIdInUse,
     #[error("stream capability denied")]
@@ -61,6 +63,7 @@ impl ConnectorError {
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
+            Self::MediaLimitsExceeded(_) => "media_limits_exceeded",
             Self::StreamIdInUse => "stream_id_in_use",
             Self::StreamCapabilityDenied => "stream_capability_denied",
             Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
@@ -82,6 +85,7 @@ impl ConnectorError {
                 "matching send is still in progress; retry with the same idempotency key"
             }
             Self::MediaPathDenied(_) => "media path is not allowed",
+            Self::MediaLimitsExceeded(_) => "outbound media exceeds connector limits",
             Self::StreamIdInUse => "stream id is already in use",
             Self::StreamCapabilityDenied => "stream capability is not authorized",
             Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",

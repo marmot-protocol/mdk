@@ -270,6 +270,10 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        /// Optional client-supplied dedup key. Matching retries return the
+        /// original durable message ids without re-uploading or re-publishing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// Fetch + decrypt an inbound media reference and write the plaintext to a
     /// temp file on the connector host. The content key stays in the connector;
@@ -824,7 +828,7 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlMediaUpload,
         AgentControlProfileLookupStatus, AgentControlRequest, AgentControlResponse,
         AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
         MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
@@ -955,6 +959,38 @@ mod tests {
         };
         let value = serde_json::to_value(&with).unwrap();
         assert_eq!(value["idempotency_key"], "key-1");
+        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn send_media_idempotency_key_is_omitted_when_absent_and_present_when_set() {
+        let upload = || AgentControlMediaUpload {
+            path: "/tmp/a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            file_name: "a.png".to_owned(),
+            dim: None,
+            thumbhash: None,
+        };
+        let without = AgentControlRequest::SendMedia {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            attachments: vec![upload()],
+            caption: Some("look".to_owned()),
+            idempotency_key: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(value.get("idempotency_key").is_none());
+
+        let with = AgentControlRequest::SendMedia {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            attachments: vec![upload()],
+            caption: Some("look".to_owned()),
+            idempotency_key: Some("media-key-1".to_owned()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["idempotency_key"], "media-key-1");
         let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, with);
     }
@@ -1453,6 +1489,7 @@ mod tests {
                         thumbhash: None,
                     }],
                     caption: Some("look".to_owned()),
+                    idempotency_key: None,
                 },
                 "send_media",
             ),
