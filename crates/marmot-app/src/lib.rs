@@ -84,6 +84,8 @@ mod external_signer;
 mod groups;
 mod ids;
 mod key_package_records;
+#[cfg(test)]
+mod local_open_test_gate;
 mod media;
 mod messages;
 mod nostr_secret;
@@ -465,6 +467,8 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    local_open_gates: local_open_test_gate::LocalOpenGates,
     #[cfg(test)]
     legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
@@ -1182,6 +1186,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
@@ -1247,6 +1253,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
@@ -1292,6 +1300,18 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(label)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_local_open_gate(
+        &self,
+        account_ref: &str,
+        reached: std::sync::mpsc::Sender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), AppError> {
+        let label = self.account_home().account(account_ref)?.label;
+        self.local_open_gates.install(label, reached, proceed);
+        Ok(())
     }
 
     /// Open the account's exclusive in-memory engine session.
@@ -1379,7 +1399,10 @@ impl MarmotApp {
         let open = blocking_app_task(move || {
             let _permit = permit;
             app.ensure_account_state(&label)?;
-            app.open_account(&label, &relay_plane_for_open, defer_group_hydration)
+            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+            #[cfg(test)]
+            app.local_open_gates.wait(&label);
+            open
         })
         .await?;
         if let Some(lifecycle) = &lifecycle {
