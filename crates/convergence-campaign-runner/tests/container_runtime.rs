@@ -89,7 +89,10 @@ fn smoke_scenario() -> ScenarioSpec {
             ScenarioStep::Tick {
                 clients: clients.clone(),
             },
-            in_group(ScenarioStep::ObserveExact { clients }),
+            // The marmot_app_process adapter deliberately omits
+            // ExactConformanceObservation; a plain Observe records the
+            // per-node projections this smoke campaign asserts on.
+            in_group(ScenarioStep::Observe { clients }),
         ],
     }
 }
