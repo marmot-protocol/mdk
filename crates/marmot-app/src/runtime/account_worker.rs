@@ -595,18 +595,11 @@ async fn run_app_runtime_account_worker(
                         Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
                             match &read_snapshot {
                                 Some(snapshot) => {
-                                    let result = snapshot.group_roster(&group_id).and_then(
-                                        |mut session| {
-                                            if let Some(membership) = app
-                                                .stored_group_self_membership(
-                                                    &account_label,
-                                                    &session.group_record.group_id_hex,
-                                                )?
-                                            {
-                                                session.group_record.self_membership = membership;
-                                            }
-                                            Ok(session)
-                                        },
+                                    let result = group_roster_from_snapshot(
+                                        &app,
+                                        &account_label,
+                                        snapshot,
+                                        &group_id,
                                     );
                                     let _ = respond.send(result);
                                 }
@@ -865,6 +858,7 @@ async fn run_app_runtime_account_worker(
                                         &mut commands,
                                         &mut pending,
                                         AccountWorkerCatchUpContext {
+                                            app: &app,
                                             events: &events,
                                             account_id_hex: &account_id_hex,
                                             account_label: &account_label,
@@ -1179,6 +1173,7 @@ async fn run_app_runtime_account_worker(
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
 struct AccountWorkerCatchUpContext<'a> {
+    app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
     account_label: &'a str,
@@ -1238,6 +1233,14 @@ async fn handle_account_worker_catch_up(
                     if deferred.is_empty() =>
                 {
                     let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                }
+                AccountWorkerCommand::GroupRoster { group_id, respond } if deferred.is_empty() => {
+                    let _ = respond.send(group_roster_from_snapshot(
+                        context.app,
+                        context.account_label,
+                        &read_snapshot,
+                        &group_id,
+                    ));
                 }
                 AccountWorkerCommand::QuarantinedGroups { respond } if deferred.is_empty() => {
                     let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
@@ -2335,6 +2338,21 @@ pub(super) fn group_roster_after_hydration(
         .ensure_group_hydrated(group_id)?;
     client.reconcile_group_self_membership(group_id)?;
     client.group_roster_session(group_id)
+}
+
+fn group_roster_from_snapshot(
+    app: &MarmotApp,
+    account_label: &str,
+    snapshot: &crate::client::GroupReadSnapshot,
+    group_id: &GroupId,
+) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+    let mut session = snapshot.group_roster(group_id)?;
+    if let Some(membership) =
+        app.stored_group_self_membership(account_label, &session.group_record.group_id_hex)?
+    {
+        session.group_record.self_membership = membership;
+    }
+    Ok(session)
 }
 
 #[derive(Debug, Clone)]
