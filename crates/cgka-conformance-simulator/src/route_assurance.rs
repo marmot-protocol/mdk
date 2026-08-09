@@ -256,8 +256,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "cutoff_boundary_admission and output_invalidation",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "convergence-committer-selected/v1 and convergence-witness-selected/v1",
-            "The fixed vectors cover observer ingest but not equivalence with every other decision route.",
+            "convergence-committer-selected/v1, convergence-witness-selected/v1, and cross-route-own-commit-recovery/v1",
+            "The fixed vectors cover observer ingest and engine-level committer/observer equivalence, but not every external adapter.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -273,8 +273,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "The sibling-model mutant proves the witness distinguishes two abstract rules, not that production takes the adopted transition.",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "pairwise_incumbent_defers_to_deeper_convergence_branch and pairwise_candidate_win_leaves_old_incumbent_reconsiderable",
-            "Engine regressions cover reconsideration, but the cross-adapter #1236 topology remains open.",
+            "cross-route-own-commit-recovery/v1 plus the focused reconsiderable-loser engine regressions",
+            "The four-party engine scenario covers pairwise displacement followed by deeper-branch reconsideration; retained-history and external-adapter permutations remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -289,8 +289,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "selector_comparison_order and frozen_member_persistence",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "stored convergence restart properties and convergence-chaos/v1",
-            "The route is exercised without the complete committer-versus-observer cross-route matrix.",
+            "cross-route-own-commit-recovery/v1, stored convergence restart properties, and convergence-chaos/v1",
+            "The engine route now participates in a four-party committer-versus-observer comparison; external-adapter equivalence remains open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -305,8 +305,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "retained_history_expiration_boundary and frozen_member_persistence",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "openmls_replay_probe and replay-budget repair tests",
-            "Byte replay is covered, but equality with live pairwise routing remains open.",
+            "cross-route-own-commit-recovery/v1, openmls_replay_probe, and replay-budget repair tests",
+            "Commit-addressed own-branch materialization now agrees with live pairwise routing in one engine topology; retained-history and external-adapter equivalence remain open.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -334,8 +334,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
             "frozen_member_persistence and scheduler_deadline_rearm",
         ),
         campaign: AssuranceOwnerV1::partial(
-            "durable-phase kill matrix and stored convergence restart properties",
-            "Restart coverage has not yet been crossed with every #1236 route transition.",
+            "cross-route-own-commit-recovery/v1, durable-phase kill matrix, and stored convergence restart properties",
+            "Encrypted-SQLite restart after pairwise displacement is covered, but every route transition and external adapter has not yet been crossed.",
         ),
     },
     DecisionRouteInventoryEntryV1 {
@@ -347,8 +347,8 @@ pub const DECISION_ROUTE_INVENTORY: &[DecisionRouteInventoryEntryV1] = &[
         ),
         mutation_sentinel: AssuranceOwnerV1::covered("output_invalidation"),
         campaign: AssuranceOwnerV1::partial(
-            "scenario-input ledgers and bidirectional decryptability probes",
-            "Complete sender-visible disposition coverage across branch replacement remains open.",
+            "cross-route-own-commit-recovery/v1 scenario-input ledgers and bidirectional decryptability probes",
+            "Selected and losing commits plus post-settlement probe traffic are accounted for; sender-visible application invalidation during branch replacement remains open.",
         ),
     },
 ];

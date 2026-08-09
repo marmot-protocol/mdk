@@ -6,14 +6,15 @@
 
 use cgka_conformance_simulator::{
     ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
-    GeneratedScenarioCase, HarnessClient, PendingResolutionObservation, ScenarioInputDisposition,
-    ScenarioInputKind, ScenarioInputLedgerEntry, ScenarioMessageSelectorV2, ScenarioReport,
-    ScenarioSpec, ScenarioStep, ScenarioTrace, ScenarioTransportClass, SubjectOutboundOutcome,
-    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
-    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, observe_client_exact, run_generated_case_report,
-    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
-    run_vector_fixture_report,
+    GeneratedScenarioCase, HarnessClient, HarnessStorageMode, PendingResolutionObservation,
+    ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
+    ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
+    ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
+    compare_trace_expectations, generate_convergence_chaos_family,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    observe_client_exact, run_generated_case_report, run_scenario_report,
+    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
+    run_vector_fixture_report_with_storage_mode,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -3120,6 +3121,101 @@ async fn harness_captures_and_asserts_convergence_decision() {
         failures.is_empty(),
         "carol should observe the committer-decided convergence decision: {failures:#?}"
     );
+}
+
+#[tokio::test]
+async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("vectors/cross-route-own-commit-recovery.v1.json");
+    let fixture: VectorFixture = serde_json::from_str(
+        &std::fs::read_to_string(&fixture_path).expect("cross-route fixture contents"),
+    )
+    .expect("cross-route fixture parses");
+
+    let report = run_vector_fixture_report_with_storage_mode(
+        &fixture,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .expect("cross-route fixture executes");
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "cross-route expectations must pass: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "cross-route invariants must pass: {:#?}",
+        report.invariant_failures
+    );
+    assert_eq!(
+        report.recovery_observations.len(),
+        1,
+        "the ordering-key winner must first displace zeta's own branch pairwise"
+    );
+    assert_eq!(report.recovery_observations[0].source_epoch, 1);
+    assert_eq!(report.recovery_observations[0].recovered_epoch, 2);
+    assert!(
+        report
+            .epoch_change_observations
+            .iter()
+            .any(|change| { change.client == "zeta" && change.from == 2 && change.to == 3 })
+    );
+
+    let trace = report.observed_trace.expect("cross-route trace");
+    assert_eq!(trace.decryptability_probes.len(), 1);
+    assert!(trace.decryptability_probes[0].succeeded());
+    for observation in &trace.observations {
+        assert_eq!(observation.epoch, 3, "{} epoch", observation.client);
+        assert_eq!(
+            observation.group_name, "zeta-branch-depth-two",
+            "{} must select the deeper branch after the restart",
+            observation.client
+        );
+        for (scenario_id, disposition) in [
+            (
+                "step-5:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+            (
+                "step-6:update_group_data",
+                ScenarioInputDisposition::Invalidated,
+            ),
+            (
+                "step-12:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+        ] {
+            let entry = observation
+                .scenario_input_ledger
+                .iter()
+                .find(|entry| entry.scenario_id == scenario_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing durable disposition for {scenario_id}",
+                        observation.client
+                    )
+                });
+            assert_eq!(
+                entry.disposition, disposition,
+                "{} disposition for {scenario_id}",
+                observation.client
+            );
+        }
+        assert!(
+            observation
+                .scenario_input_ledger
+                .iter()
+                .filter(|entry| entry.kind == ScenarioInputKind::Application)
+                .all(|entry| matches!(
+                    entry.disposition,
+                    ScenarioInputDisposition::Accepted | ScenarioInputDisposition::Delivered
+                )),
+            "{} must retain a terminal disposition for every decryptability probe",
+            observation.client
+        );
+    }
 }
 
 #[tokio::test]
