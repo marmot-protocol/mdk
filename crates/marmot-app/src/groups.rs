@@ -198,6 +198,84 @@ pub struct AppGroupMlsState {
     pub disband_request: Option<AppDisbandRequest>,
 }
 
+/// Session-consistent group record, members, and MLS state captured in one live read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppGroupRosterSession {
+    pub group_record: AppGroupRecord,
+    pub members: Vec<AppGroupMemberRecord>,
+    pub mls_state: AppGroupMlsState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRosterMember {
+    pub member_id_hex: String,
+    pub account: Option<String>,
+    pub local: bool,
+    pub is_admin: bool,
+    pub is_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Lightweight membership projection for roster screens and change detection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRoster {
+    pub group_id_hex: String,
+    pub members: Vec<AppGroupRosterMember>,
+    pub epoch: u64,
+    /// Monotonic change token for MLS roster state plus caller membership.
+    /// Non-roster MLS commits may bump this revision; directory-only
+    /// display-name changes do not.
+    pub roster_revision: u64,
+    pub self_membership: SelfMembership,
+    pub member_count: usize,
+    pub lifecycle_state: AppGroupLifecycleState,
+}
+
+pub(crate) fn app_group_roster_from_session(
+    session: AppGroupRosterSession,
+    my_account_id_hex: &str,
+    display_names: std::collections::HashMap<String, String>,
+) -> AppGroupRoster {
+    use std::collections::HashSet;
+
+    let AppGroupRosterSession {
+        group_record,
+        members,
+        mls_state,
+    } = session;
+    let admin_ids: HashSet<String> = group_record.admin_policy.admins.iter().cloned().collect();
+    let members = members
+        .into_iter()
+        .map(|member| {
+            let member_id_hex = member.member_id_hex.clone();
+            AppGroupRosterMember {
+                member_id_hex,
+                account: member.account,
+                local: member.local,
+                is_admin: admin_ids.contains(&member.member_id_hex),
+                is_self: member.member_id_hex == my_account_id_hex,
+                display_name: display_names.get(&member.member_id_hex).cloned(),
+            }
+        })
+        .collect();
+    let epoch = mls_state.epoch;
+    let membership_revision = match group_record.self_membership {
+        SelfMembership::Member => 0,
+        SelfMembership::Left => 1,
+        SelfMembership::Removed => 2,
+    };
+    AppGroupRoster {
+        group_id_hex: group_record.group_id_hex,
+        members,
+        epoch,
+        roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
+        self_membership: group_record.self_membership,
+        member_count: mls_state.member_count,
+        lifecycle_state: mls_state.lifecycle_state,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppGroupLifecycleState {
@@ -2449,5 +2527,78 @@ mod fail_if_publish_failed_tests {
             AppError::Publish(msg) => assert_eq!(msg, "reason-a; reason-b"),
             other => panic!("expected AppError::Publish, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod group_roster_api_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use cgka_traits::NostrRoutingV1;
+
+    fn test_record() -> AppGroupRecord {
+        let routing = AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [0u8; 32],
+            relays: vec!["wss://relay.example.com".to_owned()],
+        })
+        .expect("routing component");
+        AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing,
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    #[test]
+    fn app_group_roster_carries_self_membership_and_epoch_revision() {
+        let mut record = test_record();
+        record.self_membership = SelfMembership::Removed;
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let self_id_bytes = hex::decode(self_id)
+            .expect("self id hex")
+            .try_into()
+            .expect("32-byte self id");
+        record.admin_policy = AppGroupAdminPolicyComponent::new(vec![self_id_bytes]);
+        let members = vec![AppGroupMemberRecord {
+            member_id_hex: self_id.to_owned(),
+            account: Some("alice".to_owned()),
+            local: true,
+        }];
+        let mls_state = AppGroupMlsState {
+            group_id_hex: record.group_id_hex.clone(),
+            protocol_profile: AppProtocolProfile::Current,
+            lifecycle_state: AppGroupLifecycleState::Stable,
+            epoch: 7,
+            member_count: 1,
+            unrecoverable: false,
+            required_app_components: Vec::new(),
+            disbanding_enabled: false,
+            disbanding: false,
+            disbanding_blockers: Vec::new(),
+            disband_request: None,
+        };
+        let roster = app_group_roster_from_session(
+            AppGroupRosterSession {
+                group_record: record,
+                members,
+                mls_state,
+            },
+            self_id,
+            HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
+        );
+        assert_eq!(roster.epoch, 7);
+        assert_eq!(roster.roster_revision, 23);
+        assert_eq!(roster.self_membership, SelfMembership::Removed);
+        assert_eq!(roster.member_count, 1);
+        assert_eq!(roster.lifecycle_state, AppGroupLifecycleState::Stable);
+        assert_eq!(roster.members.len(), 1);
+        assert!(roster.members[0].is_admin);
+        assert!(roster.members[0].is_self);
+        assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
     }
 }

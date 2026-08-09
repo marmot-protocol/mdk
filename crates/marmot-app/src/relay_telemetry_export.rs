@@ -390,6 +390,14 @@ pub mod metric_names {
     pub const APP_GROUP_MLS_STATE_READ_SUCCESSES: &str = "app_group_mls_state_read_successes";
     /// Failed group MLS state reads.
     pub const APP_GROUP_MLS_STATE_READ_FAILURES: &str = "app_group_mls_state_read_failures";
+    /// Group roster read duration histogram.
+    pub const APP_GROUP_ROSTER_READ_DURATION: &str = "app_group_roster_read_duration_ms";
+    /// Group roster read attempts.
+    pub const APP_GROUP_ROSTER_READ_ATTEMPTS: &str = "app_group_roster_read_attempts";
+    /// Successful group roster reads.
+    pub const APP_GROUP_ROSTER_READ_SUCCESSES: &str = "app_group_roster_read_successes";
+    /// Failed group roster reads.
+    pub const APP_GROUP_ROSTER_READ_FAILURES: &str = "app_group_roster_read_failures";
     /// Media upload duration histogram.
     pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
     /// Media upload attempts.
@@ -952,6 +960,14 @@ fn append_app_performance_points(
         metric_names::APP_GROUP_MLS_STATE_READ_ATTEMPTS,
         metric_names::APP_GROUP_MLS_STATE_READ_SUCCESSES,
         metric_names::APP_GROUP_MLS_STATE_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_roster_read,
+        metric_names::APP_GROUP_ROSTER_READ_DURATION,
+        metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS,
+        metric_names::APP_GROUP_ROSTER_READ_SUCCESSES,
+        metric_names::APP_GROUP_ROSTER_READ_FAILURES,
     );
     append_app_operation_points(
         points,

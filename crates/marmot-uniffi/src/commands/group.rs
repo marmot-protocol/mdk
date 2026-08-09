@@ -13,9 +13,10 @@ use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
     AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
     GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMutationResultFfi, KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
-    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
-    group_management_state_ffi, normalize_member_ref_ffi,
+    GroupMutationResultFfi, GroupRosterFfi, KeyPackageMaintenanceStatusFfi,
+    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
+    group_details_ffi, group_id_from_hex, group_management_state_ffi, group_roster_ffi,
+    normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -331,6 +332,17 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         group_details_for(self, &account_ref, &group_id, &group_id_hex).await
+    }
+
+    /// Lightweight membership roster projection for membership screens.
+    pub async fn group_roster(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupRosterFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let roster = self.runtime.group_roster(&account_ref, &group_id).await?;
+        group_roster_ffi(roster)
     }
 
     /// Current caller permissions plus per-member action availability.

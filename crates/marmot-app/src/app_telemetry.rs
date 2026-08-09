@@ -52,6 +52,7 @@ pub(crate) enum AppPerformanceOperation {
     GroupPromoteAdmin,
     GroupDetailsRead,
     GroupMlsStateRead,
+    GroupRosterRead,
     MediaUpload,
     MediaDownload,
     HostSplashReady,
@@ -149,6 +150,8 @@ pub struct AppPerformanceSnapshot {
     pub group_details_read: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_mls_state_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_roster_read: AppPerformanceOperationSnapshot,
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -198,6 +201,7 @@ struct AppPerformanceTelemetryInner {
     group_promote_admin: AppPerformanceOperationTelemetry,
     group_details_read: AppPerformanceOperationTelemetry,
     group_mls_state_read: AppPerformanceOperationTelemetry,
+    group_roster_read: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
     host_splash_ready: AppPerformanceOperationTelemetry,
@@ -407,6 +411,9 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupMlsStateRead => {
                 inner.group_mls_state_read.record(duration, success);
             }
+            AppPerformanceOperation::GroupRosterRead => {
+                inner.group_roster_read.record(duration, success);
+            }
             AppPerformanceOperation::MediaUpload => inner.media_upload.record(duration, success),
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
@@ -485,6 +492,7 @@ impl AppPerformanceTelemetry {
             group_promote_admin: inner.group_promote_admin.snapshot(),
             group_details_read: inner.group_details_read.snapshot(),
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
+            group_roster_read: inner.group_roster_read.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
             host_splash_ready: inner.host_splash_ready.snapshot(),

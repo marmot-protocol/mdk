@@ -112,6 +112,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    GroupRoster {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::groups::AppGroupRosterSession, AppError>>,
+    },
     EnableGroupDisbanding {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -455,13 +459,15 @@ async fn run_app_runtime_account_worker(
     // The session's cheap open pass has seeded every stored group. Signal
     // command-readiness *now*: the hydration pipeline right below enters its
     // command-serving loop immediately, so "ready" genuinely means "serving
-    // commands" — group reads issued from this point hydrate exactly the
-    // group they name and answer live, and everything else joins the startup
+    // commands" — group reads (`Members` / `GroupMlsState` / `GroupRoster` /
+    // `QuarantinedGroups`) issued from this point hydrate exactly the group
+    // they name and answer live, and everything else joins the startup
     // deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
     // measures the seeded open; the mdk#1161 stage telemetry attributes it
     // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
     // worker just awaited, with the pipeline and snapshot capture measured
     // separately below).
+
     {
         let open_timings = client.runtime.session().open_timings();
         let telemetry = shared.app_performance_telemetry();
@@ -584,6 +590,22 @@ async fn run_app_runtime_account_worker(
                                 }
                                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
                                     AccountWorkerCommand::GroupMlsState { group_id, respond },
+                                ))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let result = group_roster_from_snapshot(
+                                        &app,
+                                        &account_label,
+                                        snapshot,
+                                        &group_id,
+                                    );
+                                    let _ = respond.send(result);
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::GroupRoster { group_id, respond },
                                 ))),
                             }
                         }
@@ -837,6 +859,7 @@ async fn run_app_runtime_account_worker(
                                         &mut commands,
                                         &mut pending,
                                         AccountWorkerCatchUpContext {
+                                            app: &app,
                                             events: &events,
                                             account_id_hex: &account_id_hex,
                                             account_label: &account_label,
@@ -1151,6 +1174,7 @@ async fn run_app_runtime_account_worker(
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
 struct AccountWorkerCatchUpContext<'a> {
+    app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
     account_label: &'a str,
@@ -1165,17 +1189,20 @@ async fn handle_account_worker_catch_up(
     context: AccountWorkerCatchUpContext<'_>,
 ) {
     let read_snapshot = match client.group_read_snapshot() {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => Some(snapshot),
         Err(err) => {
             let message = account_error_message("runtime catch-up snapshot failed", &err);
             publish_app_runtime_account_error(
                 context.events,
                 context.account_id_hex,
                 context.account_label,
-                message.clone(),
+                message,
             );
-            let _ = respond.send(Err(message));
-            return;
+            // Snapshot availability controls whether reads can run concurrently
+            // with sync; it must not prevent the explicit catch-up itself from
+            // retrieving updates that may advance or repair degraded state.
+            // Defer reads to live state until sync releases `&mut client`.
+            None
         }
     };
     let mut catch_up_responders = vec![respond];
@@ -1202,17 +1229,40 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
+            let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
             match command {
-                AccountWorkerCommand::Members { group_id, respond } if deferred.is_empty() => {
-                    let _ = respond.send(read_snapshot.members(&group_id));
+                AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(snapshot.members(&group_id));
                 }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
-                    if deferred.is_empty() =>
+                    if snapshot_reads_available =>
                 {
-                    let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(snapshot.group_mls_state(&group_id));
                 }
-                AccountWorkerCommand::QuarantinedGroups { respond } if deferred.is_empty() => {
-                    let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                AccountWorkerCommand::GroupRoster { group_id, respond }
+                    if snapshot_reads_available =>
+                {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(group_roster_from_snapshot(
+                        context.app,
+                        context.account_label,
+                        snapshot,
+                        &group_id,
+                    ));
+                }
+                AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
                 }
                 AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
                     catch_up_responders.push(respond);
@@ -1435,7 +1485,7 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
 }
 
 /// Serve one command that arrived while the startup hydration pipeline was
-/// running. The three local reads answer live — hydrating exactly the group
+/// running. Group-local reads answer live — hydrating exactly the group
 /// they name first, so a read "waits for that group only". The quarantine
 /// list answers the incrementally-growing set; later additions reach
 /// subscribers through their `GroupHydrationQuarantined` events. Everything
@@ -1459,6 +1509,9 @@ async fn handle_startup_hydration_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let _ = respond.send(group_roster_after_hydration(client, &group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
@@ -1639,6 +1692,10 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let result = group_roster_after_hydration(client, &group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
@@ -2307,6 +2364,33 @@ async fn handle_account_worker_command(
     // every command path covered; the summary is empty for commands that
     // applied nothing.
     publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+}
+
+pub(super) fn group_roster_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.reconcile_group_self_membership(group_id)?;
+    client.group_roster_session(group_id)
+}
+
+fn group_roster_from_snapshot(
+    app: &MarmotApp,
+    account_label: &str,
+    snapshot: &crate::client::GroupReadSnapshot,
+    group_id: &GroupId,
+) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+    let mut session = snapshot.group_roster(group_id)?;
+    if let Some(membership) =
+        app.stored_group_self_membership(account_label, &session.group_record.group_id_hex)?
+    {
+        session.group_record.self_membership = membership;
+    }
+    Ok(session)
 }
 
 #[derive(Debug, Clone)]

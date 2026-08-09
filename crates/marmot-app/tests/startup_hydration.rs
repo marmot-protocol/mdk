@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::types::GroupId;
 use marmot_account::AccountHome;
-use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime};
+use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime, SelfMembership};
 use nostr_relay_builder::MockRelay;
 
 const BENCH_ACCOUNT: &str = "held";
@@ -212,6 +212,16 @@ async fn held_hydration_body() {
         read_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
         "group read must not wait out the pipeline hold"
     );
+    let roster = tokio::time::timeout(
+        Duration::from_millis(BATCH_HOLD_MS / 2),
+        runtime.group_roster(BENCH_ACCOUNT, probed),
+    )
+    .await
+    .expect("roster read during the hold must wait for its group only")
+    .unwrap();
+    assert_eq!(roster.self_membership, SelfMembership::Member);
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.members.len(), members.len());
 
     // The pipeline itself is still held: only the session-open stage sample
     // exists (the pipeline records its own AccountGroupHydration sample when
