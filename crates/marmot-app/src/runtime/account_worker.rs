@@ -1188,17 +1188,20 @@ async fn handle_account_worker_catch_up(
     context: AccountWorkerCatchUpContext<'_>,
 ) {
     let read_snapshot = match client.group_read_snapshot() {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => Some(snapshot),
         Err(err) => {
             let message = account_error_message("runtime catch-up snapshot failed", &err);
             publish_app_runtime_account_error(
                 context.events,
                 context.account_id_hex,
                 context.account_label,
-                message.clone(),
+                message,
             );
-            let _ = respond.send(Err(message));
-            return;
+            // Snapshot availability controls whether reads can run concurrently
+            // with sync; it must not prevent the explicit catch-up itself from
+            // retrieving updates that may advance or repair degraded state.
+            // Defer reads to live state until sync releases `&mut client`.
+            None
         }
     };
     let mut catch_up_responders = vec![respond];
@@ -1225,25 +1228,40 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
+            let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
             match command {
-                AccountWorkerCommand::Members { group_id, respond } if deferred.is_empty() => {
-                    let _ = respond.send(read_snapshot.members(&group_id));
+                AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(snapshot.members(&group_id));
                 }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
-                    if deferred.is_empty() =>
+                    if snapshot_reads_available =>
                 {
-                    let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(snapshot.group_mls_state(&group_id));
                 }
-                AccountWorkerCommand::GroupRoster { group_id, respond } if deferred.is_empty() => {
+                AccountWorkerCommand::GroupRoster { group_id, respond }
+                    if snapshot_reads_available =>
+                {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
                     let _ = respond.send(group_roster_from_snapshot(
                         context.app,
                         context.account_label,
-                        &read_snapshot,
+                        snapshot,
                         &group_id,
                     ));
                 }
-                AccountWorkerCommand::QuarantinedGroups { respond } if deferred.is_empty() => {
-                    let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
                 }
                 AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
                     catch_up_responders.push(respond);

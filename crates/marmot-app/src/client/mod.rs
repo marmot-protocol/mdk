@@ -942,6 +942,14 @@ impl AppClient {
         &self,
         telemetry: Option<&crate::app_telemetry::AppPerformanceTelemetry>,
     ) -> Result<GroupReadSnapshot, AppError> {
+        if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_force_group_read_snapshot_failure
+        {
+            return Err(cgka_traits::StorageError::Backend(
+                "injected group-read snapshot failure".to_owned(),
+            )
+            .into());
+        }
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single
         // storage read to the worker readiness path regardless of group count.
