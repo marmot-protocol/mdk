@@ -27,10 +27,21 @@ use crate::{
 };
 
 impl AccountManager {
-    fn spawn_invite_catch_up(&self) {
+    pub(super) fn spawn_invite_catch_up(&self) {
+        let mut tasks = self
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.handles.retain(|task| !task.is_finished());
+        if !tasks.accepting {
+            return;
+        }
         let post_mutation = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let catch_up_started_at = Instant::now();
+            // Once started, catch-up must run to a normal result. Cancelling
+            // reconcile mid-await could abandon stale workers that it already
+            // removed from the manager map but has not finished reaping.
             let catch_up = post_mutation.catch_up_accounts().await;
             post_mutation.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupInvitePostMutationCatchUp,
@@ -46,6 +57,7 @@ impl AccountManager {
                 );
             }
         });
+        tasks.handles.push(handle);
     }
 
     /// Refresh other account workers after an irreversible mutation without

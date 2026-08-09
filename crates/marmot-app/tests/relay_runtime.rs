@@ -208,9 +208,12 @@ impl WritePolicy for BlockNextGroupMessages {
                     })
                     .is_ok();
             if should_block {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 self.blocked.fetch_add(1, Ordering::SeqCst);
                 self.entered.notify_one();
-                self.release.notified().await;
+                released.await;
             }
             PolicyResult::Accept
         })

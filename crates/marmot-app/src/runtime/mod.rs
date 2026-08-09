@@ -122,6 +122,12 @@ pub struct AccountManager {
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
     tearing_down: Arc<StdMutex<HashSet<String>>>,
+    invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
+}
+
+struct InviteCatchUpTasks {
+    accepting: bool,
+    handles: Vec<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -3348,6 +3354,10 @@ impl AccountManager {
             shared,
             workers: Arc::new(Mutex::new(HashMap::new())),
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
+            invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
+                accepting: true,
+                handles: Vec::new(),
+            })),
         }
     }
 
@@ -4676,6 +4686,21 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        let invite_catch_up_tasks = {
+            let mut tasks = self
+                .invite_catch_up_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.accepting = false;
+            std::mem::take(&mut tasks.handles)
+        };
+        // A catch-up may already have passed reconcile's lifecycle check and
+        // still be replacing a stale worker. Reap every tracked catch-up
+        // before the final worker-map drain so no replacement can escape
+        // shutdown.
+        for task in invite_catch_up_tasks {
+            let _ = task.await;
+        }
         let workers = {
             let mut workers = self.workers.lock().await;
             workers
