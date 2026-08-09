@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Test-only fault-injection surface for integration tests; never enabled for
+# production builds.
+[features]
+test-policy-overrides = []
+
 [dependencies]
 async-trait.workspace = true
 cgka-session.workspace = true

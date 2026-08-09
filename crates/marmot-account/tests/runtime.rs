@@ -2950,6 +2950,7 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
 }
 
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn current_founding_welcome_finish_failure_still_reconciles_later_recipients() {
     let dir = tempfile::tempdir().unwrap();

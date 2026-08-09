@@ -89,9 +89,8 @@ impl AccountManager {
             // Test-only barrier (`test-policy-overrides`): lets integration
             // tests prove the caller returned while this catch-up was still
             // blocked, instead of depending on scheduler timing.
-            if cfg!(feature = "test-policy-overrides")
-                && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
-            {
+            #[cfg(feature = "test-policy-overrides")]
+            if let Some(barrier) = manager.shared.create_group_catch_up_barrier() {
                 barrier.notified().await;
             }
             let started_at = Instant::now();

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
-    SessionEffects, SessionError,
+    SessionEffects,
 };
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
@@ -24,10 +24,10 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome,
-    StorageError, Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome, Timestamp,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -133,7 +133,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
-    /// error. Never set by production code.
+    /// error. Compiled only with the `test-policy-overrides` feature, so the
+    /// capability is physically absent from production builds.
+    #[cfg(feature = "test-policy-overrides")]
     finish_stage_failure: Option<cgka_traits::MessageId>,
 }
 
@@ -154,13 +156,16 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
+            #[cfg(feature = "test-policy-overrides")]
             finish_stage_failure: None,
         }
     }
 
     /// Test-only hook: arm a one-message finish-stage failure so tests can
-    /// exercise reconciliation of already-exposed publishes. Not a production
-    /// entry point; hidden from the public API docs.
+    /// exercise reconciliation of already-exposed publishes. Available only
+    /// with the `test-policy-overrides` feature; hidden from the public API
+    /// docs.
+    #[cfg(feature = "test-policy-overrides")]
     #[doc(hidden)]
     pub fn arm_finish_stage_failure(&mut self, message_id: cgka_traits::MessageId) {
         self.finish_stage_failure = Some(message_id);
@@ -3079,9 +3084,10 @@ where
         } = attempt;
         // Test-only fault injection (`arm_finish_stage_failure`): behaves like
         // the durable fanout persist below failing with transient contention.
+        #[cfg(feature = "test-policy-overrides")]
         if self.finish_stage_failure.as_ref() == Some(&message_id) {
-            return Err(AccountError::Session(SessionError::Storage(
-                StorageError::Busy("injected finish-stage failure".into()),
+            return Err(AccountError::Session(cgka_session::SessionError::Storage(
+                cgka_traits::StorageError::Busy("injected finish-stage failure".into()),
             )));
         }
         let report = match result {

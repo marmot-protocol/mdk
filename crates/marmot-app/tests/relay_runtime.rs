@@ -2026,10 +2026,14 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     };
     let sync_attempts_before_create = account_sync_attempts();
 
-    // Gate the detached post-create catch-up behind a deterministic barrier:
-    // the caller boundary must hold no matter how fast the worker is
-    // scheduled, so the assertions below cannot race the catch-up.
+    // Gate the detached post-create catch-up behind a deterministic barrier
+    // (compiled with `test-policy-overrides`, which the serial CI job for this
+    // test binary always enables): the caller boundary must hold no matter how
+    // fast the worker is scheduled, so the assertions below cannot race the
+    // catch-up.
+    #[cfg(feature = "test-policy-overrides")]
     let catch_up_barrier = Arc::new(tokio::sync::Notify::new());
+    #[cfg(feature = "test-policy-overrides")]
     runtime
         .shared_services()
         .set_create_group_catch_up_barrier(Some(catch_up_barrier.clone()));
@@ -2064,11 +2068,13 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         1,
         "one invited member should require only the founding epoch transition"
     );
+    #[cfg(feature = "test-policy-overrides")]
     assert_eq!(
         account_sync_attempts(),
         sync_attempts_before_create,
         "the blocked catch-up must not touch account workers while the caller proceeds",
     );
+    #[cfg(feature = "test-policy-overrides")]
     catch_up_barrier.notify_one();
     let catch_up_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
