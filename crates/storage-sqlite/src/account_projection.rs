@@ -965,6 +965,47 @@ impl SqliteAccountStorage {
         Ok(ids)
     }
 
+    /// Authoritative `account_groups.self_membership` for one group row.
+    pub fn group_self_membership(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Option<SelfMembership>> {
+        let conn = self.lock()?;
+        let value = conn
+            .query_row(
+                "SELECT self_membership FROM account_groups WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .storage()?;
+        Ok(value.map(|stored| SelfMembership::from_storage(&stored)))
+    }
+
+    /// Authoritative `account_groups.self_membership` for every group row.
+    pub fn account_group_self_memberships(
+        &self,
+    ) -> StorageResult<std::collections::HashMap<String, SelfMembership>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT group_id_hex, self_membership FROM account_groups")
+            .storage()?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SelfMembership::from_storage(&row.get::<_, String>(1)?),
+                ))
+            })
+            .storage()?;
+        let mut memberships = std::collections::HashMap::new();
+        for row in rows {
+            let (group_id_hex, membership) = row.storage()?;
+            memberships.insert(group_id_hex, membership);
+        }
+        Ok(memberships)
+    }
+
     pub fn app_messages(
         &self,
         query: StoredAppMessageQuery,

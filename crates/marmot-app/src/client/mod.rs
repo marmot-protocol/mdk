@@ -141,22 +141,24 @@ fn recover_post_canonical_result<T: Default>(
 }
 
 /// A point-in-time copy of the live session's read-only group projections
-/// (`members`, `group_mls_state`, `quarantined_groups`).
+/// (`groups`, `members`, `group_mls_state`, `quarantined_groups`).
 ///
 /// The account worker captures this from the live session and uses it to answer
 /// read commands while a relay catch-up runs in the background. The catch-up
 /// future holds `&mut AppClient`, so concurrent reads cannot touch the live
 /// session and are served from this snapshot instead.
-/// Membership/epoch only change on a committed group operation, which the
+/// MLS membership/epoch only change on a committed group operation, which the
 /// catch-up surfaces via `GroupStateUpdated` so subscribers re-read once it
-/// lands; the snapshot is therefore a brief, self-healing stand-in, only used
-/// until the catch-up completes (after which reads go live again).
+/// lands. Storage-owned self-membership is refreshed separately when a roster
+/// is served, so an observed departure during catch-up is not hidden by this
+/// snapshot. The snapshot is only used until catch-up completes.
 ///
-/// Groups whose live read errored at capture time (e.g. quarantined / not yet
-/// live) are simply absent; a read for an absent group returns `UnknownGroup`,
-/// the same shape the live path returns for a group the session does not hold.
+/// Capture is atomic: if any known group's member or MLS projection cannot be
+/// read, the whole snapshot fails and the worker defers reads to live state
+/// after catch-up instead of misreporting a degraded known group as unknown.
 #[derive(Default)]
 pub(crate) struct GroupReadSnapshot {
+    groups: HashMap<GroupId, AppGroupRecord>,
     members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
     mls_state: HashMap<GroupId, AppGroupMlsState>,
     quarantined: Vec<AppQuarantinedGroup>,
@@ -178,6 +180,21 @@ impl GroupReadSnapshot {
             .get(group_id)
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub(crate) fn group_roster(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record: self
+                .groups
+                .get(group_id)
+                .cloned()
+                .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            members: self.members(group_id)?,
+            mls_state: self.group_mls_state(group_id)?,
+        })
     }
 
     pub(crate) fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
@@ -756,6 +773,74 @@ impl AppClient {
         self.group_mls_state_unchecked(group_id)
     }
 
+    pub(crate) fn group_roster_session(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let mut group_record = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+        self.overlay_storage_self_membership(&mut group_record)?;
+        let profiles = self.app.profiles_by_id()?;
+        let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        Ok(crate::groups::AppGroupRosterSession {
+            group_record,
+            members,
+            mls_state,
+        })
+    }
+
+    fn overlay_storage_self_membership(
+        &self,
+        group_record: &mut AppGroupRecord,
+    ) -> Result<(), AppError> {
+        if let Some(membership) = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
+        {
+            group_record.self_membership = membership;
+        }
+        Ok(())
+    }
+
+    /// Reconcile a storage row still carrying the preserving `Member` default
+    /// against one hydrated engine roster. Used by on-demand startup reads so
+    /// they cannot expose a legacy migration default before the full hydration
+    /// pipeline finishes its once-only backfill.
+    pub(crate) fn reconcile_group_self_membership(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !matches!(
+            self.app
+                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
+            Some(SelfMembership::Member)
+        ) {
+            return Ok(());
+        }
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        let members = self.runtime.members(group_id)?;
+        if local_account_removed_from_roster(&members, &local_account_id_hex) {
+            self.app.set_group_self_membership(
+                &self.state.label,
+                &group_id_hex,
+                SelfMembership::Removed,
+            )?;
+        }
+        Ok(())
+    }
+
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
         let lifecycle_state = self
@@ -828,10 +913,10 @@ impl AppClient {
     /// projections from the live (hydrated) session.
     ///
     /// Used by the account worker to answer read commands during relay catch-up
-    /// without blocking on it; see [`GroupReadSnapshot`]. Reads
-    /// that error for a given group (quarantined / not yet live) are omitted —
-    /// the snapshot accessor reports those as `UnknownGroup`, matching the live
-    /// path for a group the session does not hold.
+    /// without blocking on it; see [`GroupReadSnapshot`]. If a known group's
+    /// member or MLS projection fails, snapshot capture
+    /// fails atomically. The worker then defers reads until it can answer them
+    /// from live state and preserve the underlying error classification.
     ///
     /// Returns the storage error if the one shared profile load fails, rather
     /// than masking it as empty profiles (which would make every member read
@@ -857,6 +942,14 @@ impl AppClient {
         &self,
         telemetry: Option<&crate::app_telemetry::AppPerformanceTelemetry>,
     ) -> Result<GroupReadSnapshot, AppError> {
+        if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_force_group_read_snapshot_failure
+        {
+            return Err(cgka_traits::StorageError::Backend(
+                "injected group-read snapshot failure".to_owned(),
+            )
+            .into());
+        }
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single
         // storage read to the worker readiness path regardless of group count.
@@ -870,6 +963,8 @@ impl AppClient {
             );
         }
         let profiles = profiles?;
+        let stored_self_memberships = self.app.account_group_self_memberships(&self.state.label)?;
+        let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         let mut skipped_malformed_group_records = 0usize;
@@ -879,12 +974,15 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(bytes);
-            if let Ok(records) = self.members_with_profiles_unchecked(&group_id, &profiles) {
-                members.insert(group_id.clone(), records);
+            let mut group_record = group.clone();
+            if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
+                group_record.self_membership = *membership;
             }
-            if let Ok(state) = self.group_mls_state_unchecked(&group_id) {
-                mls_state.insert(group_id, state);
-            }
+            let records = self.members_with_profiles_unchecked(&group_id, &profiles)?;
+            let state = self.group_mls_state_unchecked(&group_id)?;
+            groups.insert(group_id.clone(), group_record);
+            members.insert(group_id.clone(), records);
+            mls_state.insert(group_id, state);
         }
         if skipped_malformed_group_records > 0 {
             tracing::warn!(
@@ -895,6 +993,7 @@ impl AppClient {
             );
         }
         Ok(GroupReadSnapshot {
+            groups,
             members,
             mls_state,
             quarantined: self.quarantined_groups(),

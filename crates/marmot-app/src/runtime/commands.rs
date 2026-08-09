@@ -19,11 +19,12 @@ use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppDisbandRequest,
-    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
+    AppQuarantinedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -194,6 +195,40 @@ impl AccountManager {
             result.is_ok(),
         );
         result
+    }
+
+    pub async fn group_roster(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupRoster, AppError> {
+        let account = self.resolve(account_ref)?;
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupRoster {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let session = account_worker_response(response).await?;
+        let member_ids = session
+            .members
+            .iter()
+            .map(|member| member.member_id_hex.clone())
+            .collect::<Vec<_>>();
+        // Display names are optional directory enrichment; preserve the
+        // authoritative roster if that cache is unavailable.
+        let display_names = self
+            .app
+            .display_names_for_account_ids(&member_ids)
+            .unwrap_or_default();
+        Ok(crate::groups::app_group_roster_from_session(
+            session,
+            &account.account_id_hex,
+            display_names,
+        ))
     }
 
     pub async fn enable_group_disbanding(

@@ -636,16 +636,20 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
         .expect("invite task should not panic")
         .expect("invite should succeed");
 
-    let (members, mls_state) = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-        let members = runtime.group_members("alice", &group_id).await?;
-        let mls_state = runtime.group_mls_state("alice", &group_id).await?;
-        Ok::<_, AppError>((members, mls_state))
-    })
-    .await
-    .expect("same-account post-invite projection reads must not queue behind catch-up")
-    .expect("same-account post-invite projection reads should succeed");
+    let (members, mls_state, roster) =
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            let members = runtime.group_members("alice", &group_id).await?;
+            let mls_state = runtime.group_mls_state("alice", &group_id).await?;
+            let roster = runtime.group_roster("alice", &group_id).await?;
+            Ok::<_, AppError>((members, mls_state, roster))
+        })
+        .await
+        .expect("same-account post-invite projection reads must not queue behind catch-up")
+        .expect("same-account post-invite projection reads should succeed");
     assert_eq!(members.len(), 2);
     assert_eq!(mls_state.member_count, 2);
+    assert_eq!(roster.members.len(), 2);
+    assert_eq!(roster.epoch, mls_state.epoch);
 
     let before_release = runtime
         .shared_services()

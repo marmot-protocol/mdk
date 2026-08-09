@@ -154,8 +154,9 @@ pub use groups::{
     AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
-    AppGroupRecord, AppGroupSystemEvent, AppInitialGroupImage, AppPriorNostrRoute,
-    AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
+    AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
+    AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
+    group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -2568,6 +2569,30 @@ impl MarmotApp {
         self.account_storage(&account.label)?
             .set_group_self_membership(group_id_hex, membership)?;
         Ok(())
+    }
+
+    /// Storage-owned `account_groups.self_membership` for roster and chat-list
+    /// reads. In-memory `AppClient.state.groups` may lag after a local leave or
+    /// observed self-eviction because those paths write storage directly.
+    pub(crate) fn stored_group_self_membership(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .group_self_membership(group_id_hex)?)
+    }
+
+    pub(crate) fn account_group_self_memberships(
+        &self,
+        label: &str,
+    ) -> Result<std::collections::HashMap<String, SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .account_group_self_memberships()?)
     }
 
     /// `group_id_hex` of every `account_groups` row still carrying the migration

@@ -93,6 +93,10 @@ pub struct MarmotAppConfig {
     /// chat projection and per-group read behavior, without changing startup
     /// timing in normal builds. Commands are still served during the delay.
     pub dev_startup_hydration_batch_delay_ms: Option<u64>,
+    /// Dev/test-only override that forces group-read snapshot capture to fail.
+    /// Honored only with `test-policy-overrides`; this exercises the account
+    /// worker's degraded catch-up path without corrupting a real database.
+    pub dev_force_group_read_snapshot_failure: bool,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -145,6 +149,7 @@ impl Default for MarmotAppConfig {
             dev_settlement_quiescence_ms: None,
             dev_scheduled_convergence_delay_ms: None,
             dev_startup_hydration_batch_delay_ms: None,
+            dev_force_group_read_snapshot_failure: false,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -229,6 +234,13 @@ impl MarmotAppConfig {
     /// (mdk#1161). Normal builds ignore this field.
     pub fn with_dev_startup_hydration_batch_delay_ms(mut self, ms: u64) -> Self {
         self.dev_startup_hydration_batch_delay_ms = Some(ms);
+        self
+    }
+
+    /// Force group-read snapshot capture to fail in test-policy builds.
+    /// Normal builds ignore this field.
+    pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
+        self.dev_force_group_read_snapshot_failure = enabled;
         self
     }
 }
