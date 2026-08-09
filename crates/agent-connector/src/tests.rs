@@ -4835,6 +4835,68 @@ fn send_media_fingerprint_is_content_bound() {
 }
 
 #[tokio::test]
+async fn media_upload_reader_enforces_connector_count_and_byte_limits() {
+    use crate::media_roots::MediaAllowedRoots;
+    use crate::messaging::{MediaUploadLimits, read_media_upload_attachments_with_limits};
+    use agent_control::AgentControlMediaUpload;
+
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.bin");
+    let second = root.path().join("second.bin");
+    let third = root.path().join("third.bin");
+    let oversize = root.path().join("oversize.bin");
+    std::fs::write(&first, b"1234").unwrap();
+    std::fs::write(&second, b"12").unwrap();
+    std::fs::write(&third, b"123").unwrap();
+    std::fs::write(&oversize, b"12345").unwrap();
+    let roots = MediaAllowedRoots::prepare(&[root.path().to_owned()]).unwrap();
+    let limits = MediaUploadLimits {
+        max_attachments: 2,
+        max_attachment_bytes: 4,
+        max_batch_bytes: 6,
+    };
+    let attachment = |path: &std::path::Path| AgentControlMediaUpload {
+        path: path.to_string_lossy().into_owned(),
+        media_type: "application/octet-stream".to_owned(),
+        file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+        dim: None,
+        thumbhash: None,
+    };
+
+    let accepted = read_media_upload_attachments_with_limits(
+        &roots,
+        vec![attachment(&first), attachment(&second)],
+        limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted
+            .iter()
+            .map(|item| item.plaintext.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"1234".as_slice(), b"12".as_slice()]
+    );
+
+    for (attachments, reason) in [
+        (
+            vec![attachment(&first), attachment(&second), attachment(&third)],
+            "attachment_count",
+        ),
+        (vec![attachment(&oversize)], "attachment_bytes"),
+        (
+            vec![attachment(&first), attachment(&third)],
+            "aggregate_bytes",
+        ),
+    ] {
+        assert!(matches!(
+            read_media_upload_attachments_with_limits(&roots, attachments, limits).await,
+            Err(crate::ConnectorError::MediaLimitsExceeded(actual)) if actual == reason
+        ));
+    }
+}
+
+#[tokio::test]
 async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
     use std::time::{Duration, SystemTime};
 

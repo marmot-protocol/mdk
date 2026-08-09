@@ -295,6 +295,52 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_send_media_waits_for_terminal_response_beyond_generic_timeout(self):
+        publishes = 0
+
+        async def handler(reader, writer):
+            nonlocal publishes
+            request = await read_json_line(reader)
+            self.assertEqual(request["type"], "send_media")
+            await asyncio.sleep(0.05)
+            publishes += 1
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+
+        response = await client.send_media(
+            "11" * 32,
+            "22" * 32,
+            [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}],
+            idempotency_key="media-key-1",
+        )
+
+        self.assertEqual(response["message_ids_hex"], ["44" * 32])
+        self.assertEqual(publishes, 1)
+
+    def test_send_in_progress_error_remains_retryable(self):
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            self.adapter.MarmotAgentControlClient._raise_if_error(
+                {
+                    "type": "error",
+                    "code": "send_in_progress",
+                    "message": "matching send is still in progress",
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "send_in_progress")
+        self.assertTrue(raised.exception.retryable)
+
     async def test_timeline_reads_write_exact_message_and_cursor_requests(self):
         requests = []
 
@@ -4023,7 +4069,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         seen = []
 
         class TimeoutRecordingClient(self.adapter_module.MarmotAgentControlClient):
-            async def request(self, payload, *, request_id=None, timeout=None):
+            async def request(
+                self,
+                payload,
+                *,
+                request_id=None,
+                timeout=None,
+                response_timeout=self.adapter_module._DEFAULT_READ_TIMEOUT,
+            ):
                 seen.append((payload.get("type"), timeout))
                 return {"type": "ack", "message_ids_hex": ["77" * 32], "stream_id_hex": "55" * 32, "start_message_id_hex": "66" * 32, "quic_candidates": []}
 
@@ -4417,6 +4470,33 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fake_client.calls, 0)
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
+    async def test_multiple_images_preflight_oserror_redacts_local_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "private.png"
+            image.write_bytes(b"private")
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=unittest.mock.AsyncMock(),
+            )
+            private_error = OSError(f"stat failed for {image}")
+
+            with (
+                unittest.mock.patch.object(self.adapter_module.Path, "stat", side_effect=private_error),
+                unittest.mock.patch.object(self.adapter_module.logger, "debug") as debug_log,
+                self.assertRaises(self.adapter_module.AgentControlError) as raised,
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            self.assertEqual(str(raised.exception), "Marmot media preflight failed")
+            self.assertNotIn(str(image), str(raised.exception))
+            self.assertNotIn(str(image), repr(debug_log.call_args_list))
+
     async def test_multiple_images_preserves_duplicate_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4508,6 +4588,115 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                         )
 
             self.assertEqual(len(fake_client.calls), 1)
+
+    async def test_multiple_images_pins_open_source_across_ancestor_symlink_replacement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            allowed = base / "allowed"
+            album = allowed / "album"
+            album.mkdir(parents=True)
+            image = album / "image.png"
+            image.write_bytes(b"approved")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "image.png").write_bytes(b"private")
+
+            class FakeClient:
+                staged_bytes = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.staged_bytes = [Path(item["path"]).read_bytes() for item in attachments]
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(allowed)],
+                    }
+                ),
+                client=fake_client,
+            )
+            real_stage = self.adapter_module.stage_outbound_media_file
+            replaced = False
+
+            def replace_parent_then_stage(source, staging_root, **kwargs):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    album.rename(allowed / "album-original")
+                    album.symlink_to(outside, target_is_directory=True)
+                return real_stage(source, staging_root, **kwargs)
+
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "stage_outbound_media_file",
+                side_effect=replace_parent_then_stage,
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            self.assertEqual(fake_client.staged_bytes, [b"approved"])
+
+    async def test_pinned_media_root_rejects_root_path_replaced_by_outside_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            image = allowed / "image.png"
+            image.write_bytes(b"approved")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "image.png").write_bytes(b"private")
+            pinned_roots = self.adapter_module.pin_allowed_media_roots([allowed])
+            allowed.rename(base / "allowed-original")
+            allowed.symlink_to(outside, target_is_directory=True)
+
+            try:
+                with self.assertRaisesRegex(
+                    self.adapter_module.AgentControlError,
+                    "outside allowed local roots",
+                ):
+                    self.adapter_module.open_outbound_media_source(image, pinned_roots)
+            finally:
+                for _, directory_fd in pinned_roots:
+                    self.adapter_module.os.close(directory_fd)
+
+    async def test_multiple_images_enforces_limit_against_bytes_copied_after_growth(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "growing.png"
+            image.write_bytes(b"1234")
+            client = unittest.mock.AsyncMock()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=client,
+            )
+            real_stage = self.adapter_module.stage_outbound_media_file
+
+            def grow_then_stage(source, staging_root, **kwargs):
+                source.write_bytes(b"12345")
+                return real_stage(source, staging_root, **kwargs)
+
+            with (
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_FILE_BYTES", 4),
+                unittest.mock.patch.object(self.adapter_module, "MAX_OUTBOUND_MEDIA_BATCH_BYTES", 8),
+                unittest.mock.patch.object(
+                    self.adapter_module,
+                    "stage_outbound_media_file",
+                    side_effect=grow_then_stage,
+                ),
+                self.assertRaisesRegex(self.adapter_module.AgentControlError, "blob size limit"),
+            ):
+                await adapter.send_multiple_images("22" * 32, [(image.as_uri(), "caption")])
+
+            client.send_media.assert_not_awaited()
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
     async def test_multiple_images_partial_upload_failure_is_all_error_and_cleans_staging(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4633,6 +4822,51 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(fake_client.calls), 2)
             self.assertEqual(fake_client.calls[0], fake_client.calls[1])
+            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+
+    async def test_multiple_images_waits_past_retry_budget_for_in_progress_send(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "image.png"
+            image.write_bytes(b"image")
+
+            class FakeClient:
+                def __init__(self):
+                    self.idempotency_keys = []
+
+                async def send_media(self, account, group, attachments, **kwargs):
+                    self.idempotency_keys.append(kwargs["idempotency_key"])
+                    if len(self.idempotency_keys) <= 4:
+                        raise self_error(
+                            "send remains in progress",
+                            code="send_in_progress",
+                            retryable=True,
+                        )
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            self_error = self.adapter_module.AgentControlError
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(root)],
+                    }
+                ),
+                client=fake_client,
+            )
+            with unittest.mock.patch.object(
+                self.adapter_module,
+                "SEND_MEDIA_RETRY_BACKOFF_S",
+                (0.0,),
+            ):
+                await adapter.send_multiple_images(
+                    "22" * 32,
+                    [(image.as_uri(), "caption")],
+                )
+
+            self.assertEqual(len(fake_client.idempotency_keys), 5)
+            self.assertEqual(len(set(fake_client.idempotency_keys)), 1)
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
     async def test_multiple_images_cancellation_cleans_staged_files(self):

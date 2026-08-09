@@ -746,49 +746,121 @@ def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
     return _split_config_list(configured) if configured else []
 
 
-def path_is_under_root(path: Path, root: Path) -> bool:
+def open_directory_without_symlinks(path: Path) -> int:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fd = os.open("/", directory_flags)
     try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
+        for component in path.parts[1:]:
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
 
 
-def assert_local_media_allowed(path: Path, allowed_roots: list[Path]) -> None:
-    resolved = path.expanduser().resolve()
+def pin_allowed_media_roots(allowed_roots: list[Path]) -> list[tuple[Path, int]]:
+    pinned: list[tuple[Path, int]] = []
+    try:
+        for root in allowed_roots:
+            resolved = root.expanduser().resolve()
+            try:
+                directory_fd = open_directory_without_symlinks(resolved)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                os.close(directory_fd)
+                raise AgentControlError("Marmot media root is not a readable directory")
+            pinned.append((resolved, directory_fd))
+        return pinned
+    except Exception:
+        for _, directory_fd in pinned:
+            os.close(directory_fd)
+        raise
+
+
+def open_outbound_media_source(
+    source: Path,
+    pinned_roots: list[tuple[Path, int]],
+) -> tuple[Path, int, os.stat_result]:
+    """Open one approved source and pin the inode used by later staging."""
+    resolved = source.expanduser().resolve()
     if not resolved.is_file():
         raise AgentControlError("Marmot media path is not a readable file")
-    if not allowed_roots:
+    approved_root = next(
+        ((root, directory_fd) for root, directory_fd in pinned_roots if resolved.is_relative_to(root)),
+        None,
+    )
+    if approved_root is None:
         raise AgentControlError("Marmot media path is outside allowed local roots")
-    if any(path_is_under_root(resolved, root) for root in allowed_roots):
-        return
-    raise AgentControlError("Marmot media path is outside allowed local roots")
+    allowed_root, root_fd = approved_root
+    relative = resolved.relative_to(allowed_root)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_fd = os.dup(root_fd)
+    try:
+        for component in relative.parts[:-1]:
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        source_fd = os.open(relative.name, source_flags, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        opened = os.fstat(source_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AgentControlError("Marmot media path is not a readable file")
+        return resolved, source_fd, opened
+    except Exception:
+        os.close(source_fd)
+        raise
 
 
-def stage_outbound_media_file(source: Path, staging_root: Path, *, file_name: str) -> Path:
+def stage_outbound_media_file(
+    source: Path,
+    staging_root: Path,
+    *,
+    file_name: str,
+    source_fd: int,
+    max_bytes: Optional[int] = None,
+    limit_error: str = "Marmot media file exceeds the encrypted blob size limit",
+) -> Path:
     staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     safe_name = Path(str(file_name or source.name or "attachment")).name or "attachment"
     destination = staging_root / f"{uuid.uuid4().hex}-{safe_name}"
-    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    source_fd = os.open(source, source_flags)
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise AgentControlError("Marmot media path is not a readable file")
+    destination_fd = os.open(destination, destination_flags, 0o640)
     try:
-        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-            raise AgentControlError("Marmot media path is not a readable file")
-        destination_fd = os.open(destination, destination_flags, 0o640)
-        try:
-            os.fchmod(destination_fd, 0o640)
-            with os.fdopen(os.dup(source_fd), "rb") as source_file, os.fdopen(
-                os.dup(destination_fd), "wb"
-            ) as destination_file:
-                shutil.copyfileobj(source_file, destination_file)
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
-        finally:
-            os.close(destination_fd)
+        os.fchmod(destination_fd, 0o640)
+        with os.fdopen(os.dup(source_fd), "rb") as source_file, os.fdopen(
+            os.dup(destination_fd), "wb"
+        ) as destination_file:
+            copied = 0
+            while chunk := source_file.read(1024 * 1024):
+                copied += len(chunk)
+                if max_bytes is not None and copied > max_bytes:
+                    raise AgentControlError(limit_error)
+                destination_file.write(chunk)
+            if copied == 0:
+                raise AgentControlError("Marmot media path is empty")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
     finally:
-        os.close(source_fd)
+        os.close(destination_fd)
     return destination
 
 
@@ -1065,13 +1137,17 @@ class MarmotAgentControlClient:
         *,
         request_id: Optional[str] = None,
         timeout: Optional[float] = None,
+        response_timeout: Any = _DEFAULT_READ_TIMEOUT,
     ) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
         effective_timeout = self.request_timeout if timeout is None else float(timeout)
+        effective_response_timeout = (
+            effective_timeout if response_timeout is _DEFAULT_READ_TIMEOUT else response_timeout
+        )
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         try:
             await self._write_envelope(writer, payload, request_id=request_id, timeout=effective_timeout)
-            response = await self._read_envelope(reader, timeout=effective_timeout)
+            response = await self._read_envelope(reader, timeout=effective_response_timeout)
             self._validate_response_id(response, request_id)
             self._raise_if_error(response)
             return response
@@ -1231,7 +1307,12 @@ class MarmotAgentControlClient:
         key = str(idempotency_key or "").strip()
         if key:
             payload["idempotency_key"] = key
-        return await self.request(payload)
+        # Media upload duration is bounded by connector attachment/byte limits
+        # and per-endpoint HTTP deadlines, not by the generic 30-second control
+        # timeout. Keep the response wait attached to the one durable operation
+        # instead of reporting a timeout while it can still publish. Socket
+        # writes remain timed; transport failures retry with the same key.
+        return await self.request(payload, response_timeout=None)
 
     async def download_media(
         self,
@@ -1566,9 +1647,11 @@ class MarmotAgentControlClient:
     @staticmethod
     def _raise_if_error(envelope: Dict[str, Any]) -> None:
         if envelope.get("type") == "error":
+            code = str(envelope.get("code") or "agent_control_error")
             raise AgentControlError(
                 str(envelope.get("message") or "agent control error"),
-                code=str(envelope.get("code") or "agent_control_error"),
+                code=code,
+                retryable=code == "send_in_progress",
             )
 
 
@@ -2271,40 +2354,60 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             )
 
         validated: list[Dict[str, Any]] = []
-        total_bytes = 0
-        try:
-            for item in requested:
-                local_path = Path(str(item["path"])).expanduser()
-                assert_local_media_allowed(local_path, self._allowed_media_roots)
-                resolved = local_path.resolve()
-                size_bytes = resolved.stat().st_size
-                if size_bytes <= 0:
-                    raise AgentControlError("Marmot media path is empty")
-                if size_bytes > MAX_OUTBOUND_MEDIA_FILE_BYTES:
-                    raise AgentControlError("Marmot media file exceeds the encrypted blob size limit")
-                total_bytes += size_bytes
-                if total_bytes > MAX_OUTBOUND_MEDIA_BATCH_BYTES:
-                    raise AgentControlError("Marmot media batch exceeds the total size limit")
-                validated.append(
-                    {
-                        "source_path": resolved,
-                        "media_type": str(item.get("media_type") or "application/octet-stream"),
-                        "file_name": str(item.get("file_name") or local_path.name or "attachment"),
-                    }
-                )
-        except (AgentControlError, KeyError, OSError) as exc:
-            return SendResult(success=False, error=str(exc), retryable=False)
-
         staged_paths: list[Path] = []
+        pinned_roots: list[tuple[Path, int]] = []
         try:
+            total_preflight_bytes = 0
+            try:
+                pinned_roots = pin_allowed_media_roots(self._allowed_media_roots)
+                for item in requested:
+                    local_path = Path(str(item["path"])).expanduser()
+                    resolved, source_fd, opened = open_outbound_media_source(
+                        local_path,
+                        pinned_roots,
+                    )
+                    validated.append(
+                        {
+                            "source_path": resolved,
+                            "source_fd": source_fd,
+                            "media_type": str(item.get("media_type") or "application/octet-stream"),
+                            "file_name": str(item.get("file_name") or local_path.name or "attachment"),
+                        }
+                    )
+                    size_bytes = opened.st_size
+                    if size_bytes <= 0:
+                        raise AgentControlError("Marmot media path is empty")
+                    if size_bytes > MAX_OUTBOUND_MEDIA_FILE_BYTES:
+                        raise AgentControlError("Marmot media file exceeds the encrypted blob size limit")
+                    total_preflight_bytes += size_bytes
+                    if total_preflight_bytes > MAX_OUTBOUND_MEDIA_BATCH_BYTES:
+                        raise AgentControlError("Marmot media batch exceeds the total size limit")
+            except AgentControlError as exc:
+                return SendResult(success=False, error=str(exc), retryable=False)
+            except (KeyError, OSError) as exc:
+                logger.debug("Marmot media preflight failed (%s)", type(exc).__name__)
+                return SendResult(success=False, error="Marmot media preflight failed", retryable=False)
+
             wire_attachments: list[Dict[str, Any]] = []
+            total_staged_bytes = 0
             for item in validated:
+                remaining_batch_bytes = MAX_OUTBOUND_MEDIA_BATCH_BYTES - total_staged_bytes
+                max_copy_bytes = min(MAX_OUTBOUND_MEDIA_FILE_BYTES, remaining_batch_bytes)
+                limit_error = (
+                    "Marmot media batch exceeds the total size limit"
+                    if remaining_batch_bytes < MAX_OUTBOUND_MEDIA_FILE_BYTES
+                    else "Marmot media file exceeds the encrypted blob size limit"
+                )
                 staged_path = stage_outbound_media_file(
                     item["source_path"],
                     self._outbound_media_dir,
                     file_name=item["file_name"],
+                    source_fd=item["source_fd"],
+                    max_bytes=max_copy_bytes,
+                    limit_error=limit_error,
                 )
                 staged_paths.append(staged_path)
+                total_staged_bytes += staged_path.stat().st_size
                 wire_attachments.append(
                     {
                         "path": str(staged_path),
@@ -2316,8 +2419,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             account_id = await self._ensure_account_id()
             normalized_chat_id = _normalize_hex(chat_id, "chat_id")
             idempotency_key = uuid.uuid4().hex
-            last_exc: BaseException | None = None
-            for attempt in range(len(SEND_MEDIA_RETRY_BACKOFF_S) + 1):
+            retry_attempt = 0
+            in_progress_attempt = 0
+            while True:
                 try:
                     response = await self.client.send_media(
                         account_id,
@@ -2354,14 +2458,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                         continuation_message_ids=message_ids[:-1],
                     )
                 except Exception as exc:
-                    last_exc = exc
-                    if attempt < len(SEND_MEDIA_RETRY_BACKOFF_S) and is_retryable(exc):
+                    if isinstance(exc, AgentControlError) and exc.code == "send_in_progress":
                         logger.debug(
-                            "Marmot send_media failed; retrying (attempt %d, %s)",
-                            attempt + 1,
+                            "Marmot send_media remains in progress; retrying (%s)",
                             type(exc).__name__,
                         )
-                        await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[attempt])
+                        backoff_index = min(
+                            in_progress_attempt,
+                            len(SEND_MEDIA_RETRY_BACKOFF_S) - 1,
+                        )
+                        await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[backoff_index])
+                        in_progress_attempt += 1
+                        continue
+                    if retry_attempt < len(SEND_MEDIA_RETRY_BACKOFF_S) and is_retryable(exc):
+                        logger.debug(
+                            "Marmot send_media failed; retrying (attempt %d, %s)",
+                            retry_attempt + 1,
+                            type(exc).__name__,
+                        )
+                        await asyncio.sleep(SEND_MEDIA_RETRY_BACKOFF_S[retry_attempt])
+                        retry_attempt += 1
                         continue
                     logger.debug("Marmot send_media failed (%s)", type(exc).__name__)
                     return SendResult(
@@ -2369,11 +2485,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                         error="Marmot media send failed",
                         retryable=is_retryable(exc),
                     )
-            return SendResult(
-                success=False,
-                error="Marmot media send failed",
-                retryable=is_retryable(last_exc) if last_exc else False,
-            )
+        except AgentControlError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             logger.debug("Marmot outbound media staging failed (%s)", type(exc).__name__)
             return SendResult(
@@ -2382,6 +2495,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 retryable=is_retryable(exc),
             )
         finally:
+            for item in validated:
+                os.close(item["source_fd"])
+            for _, directory_fd in pinned_roots:
+                os.close(directory_fd)
             for staged_path in staged_paths:
                 staged_path.unlink(missing_ok=True)
 

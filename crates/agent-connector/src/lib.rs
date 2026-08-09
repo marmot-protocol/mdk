@@ -92,6 +92,13 @@ pub(crate) const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(3
 pub(crate) const MEDIA_TEMP_MAX_AGE: Duration = Duration::from_secs(3600);
 /// How often the background sweeper scans for stale inbound media temp dirs.
 pub(crate) const MEDIA_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Maximum attachments accepted by one connector `send_media` request.
+pub(crate) const MAX_MEDIA_UPLOAD_ATTACHMENTS: usize = 10;
+/// Largest plaintext whose 16-byte AEAD tag still fits the 64 MiB encrypted
+/// Blossom blob limit enforced by `marmot-app`.
+pub(crate) const MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024 - 16;
+/// Maximum aggregate plaintext buffered by one connector `send_media` request.
+pub(crate) const MAX_MEDIA_UPLOAD_BATCH_BYTES: u64 = 128 * 1024 * 1024;
 /// Capacity of the per-subscription delivered-inbound-id cursor used to dedup storage-backed
 /// replay after broadcast lag. Comfortably larger than the runtime broadcast channel depth
 /// (1024) so every message that could be re-queried after a single overflow is still tracked.

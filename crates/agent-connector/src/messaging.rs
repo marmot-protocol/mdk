@@ -11,16 +11,64 @@ use marmot_app::{
     MediaUploadAttachmentRequest, MediaUploadRequest,
 };
 
-use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::maintenance::agent_maintenance_disposition;
+use crate::media_roots::MediaAllowedRoots;
 use crate::stream_session::SendIdempotencyAcquisition;
 use crate::validation::normalize_hex;
+use crate::{
+    AgentConnector, MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS,
+    MAX_MEDIA_UPLOAD_BATCH_BYTES,
+};
 
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
 /// Current schema version for persisted `send_media` request fingerprints.
 pub(crate) const SEND_MEDIA_FINGERPRINT_VERSION: u8 = 1;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MediaUploadLimits {
+    pub(crate) max_attachments: usize,
+    pub(crate) max_attachment_bytes: u64,
+    pub(crate) max_batch_bytes: u64,
+}
+
+pub(crate) async fn read_media_upload_attachments_with_limits(
+    media_allowed_roots: &MediaAllowedRoots,
+    attachments: Vec<AgentControlMediaUpload>,
+    limits: MediaUploadLimits,
+) -> Result<Vec<MediaUploadAttachmentRequest>, ConnectorError> {
+    if attachments.len() > limits.max_attachments {
+        return Err(ConnectorError::MediaLimitsExceeded("attachment_count"));
+    }
+
+    let mut upload_attachments = Vec::with_capacity(attachments.len());
+    let mut total_bytes = 0_u64;
+    for attachment in attachments {
+        let remaining_batch_bytes = limits.max_batch_bytes.saturating_sub(total_bytes);
+        let max_read_bytes = limits.max_attachment_bytes.min(remaining_batch_bytes);
+        let limit_reason = if remaining_batch_bytes < limits.max_attachment_bytes {
+            "aggregate_bytes"
+        } else {
+            "attachment_bytes"
+        };
+        let plaintext = media_allowed_roots
+            .read_regular_file_limited(attachment.path.into(), max_read_bytes, limit_reason)
+            .await?;
+        if plaintext.is_empty() {
+            return Err(ConnectorError::MediaLimitsExceeded("empty_attachment"));
+        }
+        total_bytes += plaintext.len() as u64;
+        upload_attachments.push(MediaUploadAttachmentRequest {
+            file_name: attachment.file_name,
+            media_type: attachment.media_type,
+            plaintext,
+            dim: attachment.dim,
+            thumbhash: attachment.thumbhash,
+        });
+    }
+    Ok(upload_attachments)
+}
 
 /// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
 /// over the destination (account + group), message text, and optional reply target.
@@ -459,20 +507,16 @@ impl AgentConnector {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let mut upload_attachments = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
-            let plaintext = self
-                .media_allowed_roots
-                .read_regular_file(attachment.path.into())
-                .await?;
-            upload_attachments.push(MediaUploadAttachmentRequest {
-                file_name: attachment.file_name,
-                media_type: attachment.media_type,
-                plaintext,
-                dim: attachment.dim,
-                thumbhash: attachment.thumbhash,
-            });
-        }
+        let upload_attachments = read_media_upload_attachments_with_limits(
+            &self.media_allowed_roots,
+            attachments,
+            MediaUploadLimits {
+                max_attachments: MAX_MEDIA_UPLOAD_ATTACHMENTS,
+                max_attachment_bytes: MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES,
+                max_batch_bytes: MAX_MEDIA_UPLOAD_BATCH_BYTES,
+            },
+        )
+        .await?;
         let idempotency = if let Some(key) = idempotency_key {
             let fingerprint = send_media_fingerprint(
                 account_id_hex,
