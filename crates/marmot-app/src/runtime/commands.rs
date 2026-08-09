@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 use super::{
     AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
-    publish_app_runtime_group_state_updated, wait_for_runtime_shutdown,
+    publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
@@ -27,9 +27,7 @@ use crate::{
 };
 
 impl AccountManager {
-    fn spawn_invite_catch_up(&self) {
-        let post_mutation = self.clone();
-        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+    pub(super) fn spawn_invite_catch_up(&self) {
         let mut tasks = self
             .invite_catch_up_tasks
             .lock()
@@ -38,12 +36,13 @@ impl AccountManager {
         if !tasks.accepting {
             return;
         }
+        let post_mutation = self.clone();
         let handle = tokio::spawn(async move {
             let catch_up_started_at = Instant::now();
-            let catch_up = tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                catch_up = post_mutation.catch_up_accounts() => catch_up,
-            };
+            // Once started, catch-up must run to a normal result. Cancelling
+            // reconcile mid-await could abandon stale workers that it already
+            // removed from the manager map but has not finished reaping.
+            let catch_up = post_mutation.catch_up_accounts().await;
             post_mutation.shared.app_performance_telemetry().record(
                 AppPerformanceOperation::GroupInvitePostMutationCatchUp,
                 catch_up_started_at.elapsed(),
