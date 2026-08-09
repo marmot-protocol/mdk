@@ -2306,6 +2306,24 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         "restart must become command-ready before the initial catch-up completes",
     );
 
+    // The bounded chat-list companion read uses the same snapshot during the
+    // detached catch-up, so batching does not reintroduce a readiness wait.
+    let member_ids_page = timeout(
+        Duration::from_secs(2),
+        runtime.group_member_ids_page(&bob_id, std::slice::from_ref(&group_id)),
+    )
+    .await
+    .expect("member-id page must not block on the initial catch-up")
+    .unwrap();
+    assert_eq!(member_ids_page.len(), 1);
+    assert!(member_ids_page[0].member_ids_hex.contains(&alice_id));
+    assert!(member_ids_page[0].member_ids_hex.contains(&bob_id));
+    assert_eq!(
+        account_sync_attempts(),
+        before_restart,
+        "member-id page must complete before the initial catch-up finishes",
+    );
+
     // The combined roster read is answered with a session-consistent group
     // record, member list, and MLS state while (or right after) catch-up runs.
     // During the catch-up window it comes from the post-hydration snapshot;
@@ -2328,19 +2346,6 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         roster_member_ids.contains(&alice_id) && roster_member_ids.contains(&bob_id),
         "snapshot/live roster read must report the full roster",
     );
-
-    // The bounded chat-list companion read uses the same snapshot during the
-    // detached catch-up, so batching does not reintroduce a readiness wait.
-    let member_ids_page = timeout(
-        Duration::from_secs(2),
-        runtime.group_member_ids_page(&bob_id, std::slice::from_ref(&group_id)),
-    )
-    .await
-    .expect("member-id page must not block on the initial catch-up")
-    .unwrap();
-    assert_eq!(member_ids_page.len(), 1);
-    assert!(member_ids_page[0].member_ids_hex.contains(&alice_id));
-    assert!(member_ids_page[0].member_ids_hex.contains(&bob_id));
 
     // The existing member-only read remains command-ready as well.
     let members = timeout(

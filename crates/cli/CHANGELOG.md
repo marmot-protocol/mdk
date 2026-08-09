@@ -62,7 +62,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   groups in one account-worker command instead of issuing one `groupMembers`
   or `groupRoster` command per chat. The page preserves input order, performs
   no profile enrichment, and fails as a whole when any requested group is
-  unknown or quarantined.
+  unknown or quarantined
+  ([#1342](https://github.com/marmot-protocol/mdk/pull/1342)).
   
 - MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
   kind:0 profile `picture` URLs (HTTPS-only, proxy-disabled pinned public
