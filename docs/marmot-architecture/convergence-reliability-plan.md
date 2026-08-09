@@ -1004,6 +1004,11 @@ engine repair or scaling the existing corpus is sufficient.
   into a permanent synthetic regression family with at least four participants, simultaneous same-source-epoch
   committers, committer-versus-observer routing, ordering-key-versus-depth disagreement, branch growth, application
   traffic, delivery permutations, and restarts around every durable transition.
+  - [x] Promote the core four-party engine topology as `cross-route-own-commit-recovery/v1`: pairwise displacement,
+    deeper-branch reconsideration, commit-addressed recovery after encrypted-SQLite restart, exact canonical equality,
+    durable selected/invalidated commit dispositions, no pending work, and twelve-direction active decryptability.
+  - [ ] Expand the core vector into retained-history, app-runtime, process, container, and VM executions, with delivery
+    permutations and restarts around each durable transition rather than the single post-displacement restart.
 - [x] Add a bounded abstract route-choice lifecycle and mutation sentinel for reconsiderable versus terminal loser
   disposition, volatile routing history, and restart; record that exhaustive shared-model and production-route
   comparison remains part of the open route-equivalence work above.
@@ -1182,9 +1187,11 @@ residual gap.
    evidence source.
 2. [ ] Finish scenario-catalog consolidation. #1292 and #1294 are merged; the simulator-only seeded admin-churn family
    remains open in [MDK #1295](https://github.com/marmot-protocol/mdk/pull/1295).
-3. [ ] Complete the #1285 cross-route regression, then require exact cryptographic, decryptability, disposition, and
-   projection agreement across every capable adapter. The decision-route inventory is now machine checked; keep its
-   remaining assurance artifacts independent of the production behavior under review in #1329/#1293.
+3. [ ] Complete the #1285 cross-route regression across every capable adapter. The engine checkpoint is now permanent
+   as `cross-route-own-commit-recovery/v1` and pins exact cryptographic, decryptability, commit-disposition, pending-work,
+   and projection agreement after restart; retained-history, app-runtime, process, container, and VM evidence remains.
+   The decision-route inventory is machine checked; keep the remaining assurance artifacts independent of the
+   production behavior under review in #1329/#1293.
 4. [ ] Feed real workflow observations into the lane budgets and produce a reviewed evidence bundle.
 5. [ ] Accumulate container soak evidence, then use the external VM driver only for the remaining
    host/kernel/block-device dimensions.
@@ -1328,6 +1335,7 @@ incorrect result.
 | 2026-08-09 | Sender-ratchet reorder policy restoration | Restored the historical 100-message out-of-order tolerance and 1,000-message maximum forward distance for new/joined groups, normalized persisted groups during hydration before new traffic, and pinned the seed-2001 rollback-flood regressions that exposed OpenMLS's inherited five-message default; already-pruned secrets remain unrecoverable | `wire_format`; encrypted-SQLite hydration migration/restart; convergence-chaos cases 2 and 13 |
 | 2026-08-09 | 6.1 decision-route inventory, abstract model, and claim lifecycle | Registered every current production decision route with specific source markers, adopted rule, evidence owner, mutation sentinel, campaign owner, and explicit partial/gap limitations; modeled route choice and restart as a bounded abstract witness without treating it as production route-equivalence proof; added a pairwise-loser terminalization mutant and stable assurance claims whose recurring falsifications reopen cleanly and require explicit reviewed resolution | `route_assurance`; `pairwise_losing_branch_terminalization`; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md); focused source-drift, abstract lifecycle, mutation, matrix, serialization, and claim-lifecycle tests |
 | 2026-08-09 | Campaign follow-up: strict clock oracle and fixture fidelity | Accepted exact no-pending evidence as temporal closure after an explicit virtual-time advance, while retaining fixed-point quiescence as the stronger option; kept semantic minimizers diagnostic and made fixture candidates preserve the original executed scenario so broad failure identity cannot silently replace a five-of-six delivery failure with a zero-delivery case | Oracle coverage unit tests; fixture-candidate fidelity unit test; strict seed-2001 convergence-chaos replay |
+| 2026-08-09 | 6.1 four-party engine cross-route checkpoint | Promoted the #1285 topology into a portable vector with two simultaneous source-epoch committers, pairwise committer displacement, observer-side stored convergence, ordering-key-versus-depth disagreement, branch growth by a third member, encrypted-SQLite restart of the displaced own-commit author, exact cryptographic equality, durable selected/invalidated commit dispositions, no pending work, and active application decryptability in all twelve directions; retained external-adapter and transition-permutation work explicitly open | `cross-route-own-commit-recovery/v1`; strict file-backed report; focused canonical-scenario regression; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md) |
 
 ## Capability Naming Cleanup
 

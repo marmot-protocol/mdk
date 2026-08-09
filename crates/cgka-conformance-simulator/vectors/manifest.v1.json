@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-08-07",
+  "updated": "2026-08-09",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -134,6 +134,22 @@
         "post-recovery member count"
       ],
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
+    },
+    {
+      "id": "cross-route-own-commit-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "cross-route-own-commit-recovery.v1.json",
+      "coverage": [
+        "four-participant same-source-epoch commit race",
+        "pairwise committer recovery versus observer-side stored convergence",
+        "ordering-key winner displaced by deeper branch growth",
+        "commit-addressed own-branch recovery after encrypted SQLite restart",
+        "exact canonical cryptographic agreement",
+        "active all-pairs application decryptability",
+        "durable accepted and invalidated commit dispositions"
+      ],
+      "next": "Run the same logical topology through retained-history, app-runtime, process, container, and VM adapters with restart and delivery permutations."
     },
     {
       "id": "convergence-committer-selected/v1",

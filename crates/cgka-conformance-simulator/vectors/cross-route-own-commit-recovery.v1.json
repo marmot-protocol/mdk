@@ -1,0 +1,287 @@
+{
+  "scenario_name": "cross-route-own-commit-recovery/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.10",
+  "seed": null,
+  "scenario": {
+    "name": "cross-route-own-commit-recovery/v1",
+    "spec_version": "2",
+    "clients": [
+      "zeta",
+      "alpha",
+      "yankee",
+      "observer"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "zeta",
+        "name": "cross-route",
+        "invitees": [
+          "alpha",
+          "yankee",
+          "observer"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "alpha",
+          "yankee"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "zeta",
+        "publication": "create",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alpha",
+          "yankee",
+          "observer"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "zeta",
+          "alpha",
+          "yankee",
+          "observer"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "zeta",
+        "name": "zeta-root",
+        "pending": "zeta-root"
+      },
+      {
+        "type": "update_group_data",
+        "client": "alpha",
+        "name": "alpha-root",
+        "pending": "alpha-root"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "zeta",
+        "publication": "zeta-root",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alpha",
+        "publication": "alpha-root",
+        "outcome": "accepted"
+      },
+      {
+        "type": "withhold_message",
+        "selector": {
+          "publication": "alpha-root",
+          "class": "commit"
+        },
+        "label": "ordering-winner-root"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "yankee"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "yankee",
+        "name": "zeta-branch-depth-two",
+        "pending": "zeta-child"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "yankee",
+        "publication": "zeta-child",
+        "outcome": "accepted"
+      },
+      {
+        "type": "withhold_message",
+        "selector": {
+          "publication": "zeta-child",
+          "class": "commit"
+        },
+        "label": "depth-winner-child"
+      },
+      {
+        "type": "release_withheld",
+        "label": "ordering-winner-root"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "zeta"
+        ]
+      },
+      {
+        "type": "restart_client",
+        "client": "zeta"
+      },
+      {
+        "type": "release_withheld",
+        "label": "depth-winner-child"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "zeta",
+          "alpha",
+          "yankee",
+          "observer"
+        ]
+      },
+      {
+        "type": "await_quiescence"
+      },
+      {
+        "type": "probe_bidirectional_decryptability",
+        "clients": [
+          "zeta",
+          "alpha",
+          "yankee",
+          "observer"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "zeta",
+          "alpha",
+          "yankee",
+          "observer"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "zeta",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 7,
+      "client": "zeta",
+      "pending": "zeta-root",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "alpha",
+      "pending": "alpha-root",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 13,
+      "client": "yankee",
+      "pending": "zeta-child",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "zeta",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "alpha",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "yankee",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_state",
+      "client": "observer",
+      "epoch": 3,
+      "member_count": 4
+    },
+    {
+      "type": "client_epoch_changes",
+      "client": "zeta",
+      "changes": [
+        {
+          "from": 2,
+          "to": 3
+        }
+      ]
+    },
+    {
+      "type": "client_recoveries",
+      "client": "alpha",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "zeta",
+        "alpha",
+        "yankee",
+        "observer"
+      ]
+    },
+    {
+      "type": "group_profile",
+      "client": "zeta",
+      "name": "zeta-branch-depth-two",
+      "description": ""
+    },
+    {
+      "type": "clients_bidirectionally_decryptable",
+      "clients": [
+        "zeta",
+        "alpha",
+        "yankee",
+        "observer"
+      ]
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "zeta",
+        "alpha",
+        "yankee",
+        "observer"
+      ]
+    }
+  ]
+}
