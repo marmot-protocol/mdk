@@ -217,6 +217,17 @@ impl AppClient {
         Ok(changed)
     }
 
+    /// Finish the projection repairs that require fully hydrated group state.
+    /// Deferred runtime opens call this after their background hydration
+    /// pipeline; eager clients call it before returning from open.
+    pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
+        if self.reconcile_live_engine_groups()? {
+            self.app.save_state(&self.state)?;
+        }
+        self.reconcile_disband_drafts();
+        self.backfill_self_membership_once()
+    }
+
     /// Finish the app-local half of durable disband acceptance after a crash
     /// or a transient projection write failure. The engine request/tombstone is
     /// the source of truth, so composer drafts must not reappear on reopen.

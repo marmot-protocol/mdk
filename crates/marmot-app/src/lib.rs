@@ -1373,16 +1373,11 @@ impl MarmotApp {
             epoch_backfill_pending: false,
             post_join_maintenance_subscriptions: HashMap::new(),
         };
-        if client.reconcile_live_engine_groups()? {
-            // Persist repaired local state before returning command-readiness.
-            // The first asynchronous transport preparation observes the
-            // reconciled group set when it registers subscriptions.
-            client.app.save_state(&client.state)?;
+        if !defer_group_hydration {
+            // These repairs read live group state. Deferred runtime opens run
+            // them after the account worker's hydration pipeline instead.
+            client.reconcile_hydrated_account_state()?;
         }
-        client.reconcile_disband_drafts();
-        // This once-only projection migration is local SQL work and must land
-        // before the host renders its first chat-list snapshot.
-        client.backfill_self_membership_once()?;
         Ok(client)
     }
 

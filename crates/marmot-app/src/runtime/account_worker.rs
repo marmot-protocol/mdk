@@ -1278,6 +1278,7 @@ async fn run_startup_hydration_pipeline(
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
     if client.runtime.session().unhydrated_group_ids().is_empty() {
+        finish_deferred_hydration_reconciliation(client);
         return StartupHydrationOutcome::Completed;
     }
     let pipeline_started = Instant::now();
@@ -1371,17 +1372,21 @@ async fn run_startup_hydration_pipeline(
         pipeline_started.elapsed(),
         pipeline_ok,
     );
-    // Rosters are readable now; finish the once-only self-membership
-    // backfill the deferred open had to leave pending.
-    if let Err(err) = client.backfill_self_membership_once() {
+    // Live group state is readable now; finish the projection repairs that
+    // the deferred open deliberately skipped.
+    finish_deferred_hydration_reconciliation(client);
+    StartupHydrationOutcome::Completed
+}
+
+fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    if let Err(err) = client.reconcile_hydrated_account_state() {
         tracing::warn!(
             target: "marmot_app::runtime",
             method = "run_startup_hydration_pipeline",
             error_kind = err.privacy_safe_kind(),
-            "post-hydration self-membership backfill failed; retrying next open"
+            "post-hydration account reconciliation failed; retrying next open"
         );
     }
-    StartupHydrationOutcome::Completed
 }
 
 /// Eagerly drain a deferred open's hydration without serving commands, for
@@ -1393,7 +1398,7 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
             .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
-            return Ok(());
+            return client.reconcile_hydrated_account_state();
         }
         tokio::task::yield_now().await;
     }
