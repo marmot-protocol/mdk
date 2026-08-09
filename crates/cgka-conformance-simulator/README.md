@@ -516,8 +516,10 @@ kind) still reproduces. The complete fingerprint, including the state digest, re
 Generated report runs on the generator-recorded subject also write a sibling `*-fixture.v1.json` candidate. Adapter
 override runs deliberately do not, because their observed trace is an A/B result rather than an adapter-neutral source
 of truth. Cases with semantic expectations keep those expectations; cases without them use the observed trace as an
-exact expected trace in the candidate. When a failing generated case has a minimized reproducer, the fixture candidate
-uses that minimized scenario.
+exact expected trace in the candidate. Fixture candidates always preserve the original executed scenario. A failing
+report may additionally carry a smaller semantic reproducer in `metadata.generated.minimized_case`, but that reducer
+permits the terminal state digest to change and is therefore diagnostic evidence rather than a faithful fixture for the
+original observation.
 
 To run the current generated family and write JSON reports:
 

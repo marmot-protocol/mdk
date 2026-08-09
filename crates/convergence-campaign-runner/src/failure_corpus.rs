@@ -563,6 +563,9 @@ pub fn observation_from_capsule(
         }
         _ => FailureClassificationV1::ProductDefect,
     };
+    // Corpus indexing deliberately prefers the reducer's semantic-identity
+    // candidate. This is diagnostic/reduction provenance, not an assertion
+    // that the candidate preserves the capsule's full state fingerprint.
     let scenario = capsule
         .minimized_reproducer
         .clone()

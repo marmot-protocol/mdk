@@ -402,6 +402,12 @@ pub fn read_failure_capsule(path: &Path) -> Result<FailureCapsuleV1, FailureCaps
 
 /// Convert a reviewed synthetic failure into a portable regression-vector
 /// candidate. Sensitive incident capsules are intentionally ineligible.
+///
+/// A minimized reproducer is eligible here only as a human-reviewed,
+/// semantic-identity-preserving reduction. Promotion does not attest that it
+/// preserves the capsule's full fingerprint or terminal state digest; callers
+/// must rerun the candidate against its portable expectation before accepting
+/// it into the vector corpus.
 pub fn promote_failure_capsule_to_vector(
     capsule: &FailureCapsuleV1,
     conformance_version: impl Into<String>,

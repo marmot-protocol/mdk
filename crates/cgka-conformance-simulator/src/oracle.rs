@@ -799,7 +799,16 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::ReplayDeduplication,
         ],
         ScenarioStimulus::PublishLifecycle => vec![OracleBehavior::PublishLifecycleChecked],
-        ScenarioStimulus::VirtualTimeAdvance => vec![OracleBehavior::QuiescenceState],
+        // Advancing the controlled clock must be paired with evidence that the
+        // resulting timed work was observed. A fixed-point quiescence result is
+        // the strongest form; an exact no-pending observation is the appropriate
+        // equivalent for explicitly stepped scenarios. Coverage is set-based and
+        // does not prove that the no-pending expectation follows the advance;
+        // generated families rely on `add_strict_reliability_oracle` appending it.
+        ScenarioStimulus::VirtualTimeAdvance => vec![
+            OracleBehavior::QuiescenceState,
+            OracleBehavior::NoPendingWorkObserved,
+        ],
     }
 }
 
@@ -942,5 +951,35 @@ mod tests {
 
         assert!(behaviors.contains(&OracleBehavior::BidirectionalDecryptabilityObserved));
         assert!(behaviors.contains(&OracleBehavior::DeliveredPayload));
+    }
+
+    #[test]
+    fn virtual_time_accepts_fixed_point_or_exact_no_pending_evidence() {
+        assert!(
+            weak_oracle_warnings(
+                &[ScenarioStimulus::VirtualTimeAdvance],
+                &[OracleBehavior::QuiescenceState],
+            )
+            .is_empty()
+        );
+        assert!(
+            weak_oracle_warnings(
+                &[ScenarioStimulus::VirtualTimeAdvance],
+                &[OracleBehavior::NoPendingWorkObserved],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            weak_oracle_warnings(&[ScenarioStimulus::VirtualTimeAdvance], &[])
+                .first()
+                .map(|warning| warning.expected_any_of.as_slice()),
+            Some(
+                [
+                    OracleBehavior::QuiescenceState,
+                    OracleBehavior::NoPendingWorkObserved,
+                ]
+                .as_slice()
+            )
+        );
     }
 }

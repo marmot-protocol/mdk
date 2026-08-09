@@ -538,8 +538,10 @@ snapshots intentionally do not rewind pass scheduling; only this replay envelope
 checkpoint contains key material, and the writer creates directories/files with owner-only modes. The report CLI
 accepts `--replay-capsule FILE` and verifies the captured engine fingerprint. `promote_failure_capsule_to_vector` accepts only
 `synthetic_shareable` capsules, preserves the intended exact or semantic expectation rather than the buggy observed
-trace, and uses the fingerprint-preserving minimized scenario when present. It refuses capsules without a portable
-expectation.
+trace, and may use a semantic-identity-preserving minimized scenario only through this explicit reviewed-promotion
+path. That is not a full-fingerprint or terminal-state-digest attestation: the reviewer must rerun the promoted
+candidate and validate that its portable expectation still expresses the intended regression. Automatic generated
+fixture candidates do not take this exception. Promotion refuses capsules without a portable expectation.
 
 ### Milestone 1 Exit Gate
 
@@ -1094,7 +1096,11 @@ copying raw error text.
 The reducer now treats paired transport, partition, lifecycle, and storage actions as dependency units before removing
 independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
 the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
-restricted to synthetic shareable capsules with portable expectations.
+restricted to synthetic shareable capsules with portable expectations. Semantic minimization may change the terminal
+state digest, so automatic generated fixture candidates retain the original executed scenario. Two intentional corpus
+consumers use the smaller case under a narrower contract: corpus indexing records it as a semantic-identity reduction
+candidate, and explicit human-reviewed vector promotion may select it only after rerunning and validating the portable
+expectation. Neither path labels the reduced case as full-fingerprint-equivalent to the original execution.
 
 ### 6.5 Stateful canonical journeys
 
@@ -1321,6 +1327,7 @@ incorrect result.
 | 2026-08-07 | Planned shared legality model and workload profiles | Recorded the follow-up architecture: one canonical product-action legality model, separately typed composable faults, thin workload profiles, explicit size controls, and corpus-level operation/interaction coverage rather than independent family semantics or overloaded case counts | Section 6.6; planned verification and migration gates |
 | 2026-08-09 | Sender-ratchet reorder policy restoration | Restored the historical 100-message out-of-order tolerance and 1,000-message maximum forward distance for new/joined groups, normalized persisted groups during hydration before new traffic, and pinned the seed-2001 rollback-flood regressions that exposed OpenMLS's inherited five-message default; already-pruned secrets remain unrecoverable | `wire_format`; encrypted-SQLite hydration migration/restart; convergence-chaos cases 2 and 13 |
 | 2026-08-09 | 6.1 decision-route inventory, abstract model, and claim lifecycle | Registered every current production decision route with specific source markers, adopted rule, evidence owner, mutation sentinel, campaign owner, and explicit partial/gap limitations; modeled route choice and restart as a bounded abstract witness without treating it as production route-equivalence proof; added a pairwise-loser terminalization mutant and stable assurance claims whose recurring falsifications reopen cleanly and require explicit reviewed resolution | `route_assurance`; `pairwise_losing_branch_terminalization`; [`CONVERGENCE_ROUTE_MATRIX.md`](../../crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md); focused source-drift, abstract lifecycle, mutation, matrix, serialization, and claim-lifecycle tests |
+| 2026-08-09 | Campaign follow-up: strict clock oracle and fixture fidelity | Accepted exact no-pending evidence as temporal closure after an explicit virtual-time advance, while retaining fixed-point quiescence as the stronger option; kept semantic minimizers diagnostic and made fixture candidates preserve the original executed scenario so broad failure identity cannot silently replace a five-of-six delivery failure with a zero-delivery case | Oracle coverage unit tests; fixture-candidate fidelity unit test; strict seed-2001 convergence-chaos replay |
 
 ## Capability Naming Cleanup
 

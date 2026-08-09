@@ -418,17 +418,12 @@ fn generated_fixture_candidate(
         .is_empty()
         .then(|| report.observed_trace.clone())
         .flatten();
-    let mut fixture = case.to_vector_fixture(env!("CARGO_PKG_VERSION"), expected_trace);
-    if let Some(minimized) = report
-        .metadata
-        .generated
-        .as_ref()
-        .and_then(|generated| generated.minimized_case.as_ref())
-    {
-        fixture.scenario_name = minimized.name.clone();
-        fixture.scenario = minimized.clone();
-    }
-    fixture
+    // The semantic minimizer preserves the failure class/action/kind while it
+    // deliberately permits the terminal state digest to change. Keep that
+    // smaller case as diagnostic metadata, but never present it as the fixture
+    // for the original observation. A fixture candidate must retain the exact
+    // scenario whose report and expectations it accompanies.
+    case.to_vector_fixture(env!("CARGO_PKG_VERSION"), expected_trace)
 }
 
 async fn run_vector_fixture_reports(
@@ -729,8 +724,9 @@ pub fn report_usage() -> &'static str {
 mod tests {
     use super::*;
     use crate::{
-        BehaviorEvidenceSummary, OracleBehavior, OracleCoverageWarning, ScenarioOracleReport,
-        ScenarioReportMetadata, ScenarioSpec, ScenarioStimulus,
+        BehaviorEvidenceSummary, GeneratedScenarioMetadata, GeneratedSubjectKind, OracleBehavior,
+        OracleCoverageWarning, ScenarioOracleReport, ScenarioReportMetadata, ScenarioSpec,
+        ScenarioStep, ScenarioStimulus,
     };
 
     fn report_with_oracle(oracle: ScenarioOracleReport) -> ScenarioReport {
@@ -850,5 +846,57 @@ mod tests {
                 .as_deref()
                 .is_some_and(|resource| resource.contains("replay budget exceeded"))
         );
+    }
+
+    #[test]
+    fn fixture_candidates_keep_original_scenario_when_a_semantic_reducer_exists() {
+        let original = ScenarioSpec {
+            name: "fixture-original".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["alice".into()],
+                },
+            ],
+        };
+        let minimized = ScenarioSpec {
+            name: "fixture-original".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::DeliverAll],
+        };
+        let case = GeneratedScenarioCase {
+            family_name: "fixture-fidelity/v1".into(),
+            generator_version: "1".into(),
+            seed: 7,
+            case_index: 0,
+            subject: GeneratedSubjectKind::Engine,
+            scenario: original.clone(),
+            expected_outcomes: Vec::new(),
+        };
+        let mut report = report_with_oracle(ScenarioOracleReport {
+            stimuli: Vec::new(),
+            oracle_behaviors: Vec::new(),
+            observed_behaviors: Vec::new(),
+            missing_observed_behaviors: Vec::new(),
+            evidence: BehaviorEvidenceSummary::default(),
+            weak_oracle_warnings: Vec::new(),
+        });
+        report.metadata.generated = Some(GeneratedScenarioMetadata {
+            family_name: case.family_name.clone(),
+            generator_version: case.generator_version.clone(),
+            seed: case.seed,
+            case_index: case.case_index,
+            minimized_case: Some(minimized.clone()),
+        });
+
+        let fixture = generated_fixture_candidate(&case, &report);
+
+        assert_eq!(fixture.scenario, original);
+        assert_ne!(fixture.scenario, minimized);
     }
 }
