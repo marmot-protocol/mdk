@@ -77,6 +77,7 @@ pub struct SessionConfig {
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
     maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
+    defer_group_hydration: bool,
 }
 
 impl SessionConfig {
@@ -100,7 +101,20 @@ impl SessionConfig {
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
             maintenance_sources: None,
+            defer_group_hydration: false,
         }
+    }
+
+    /// Open with the cheap seed pass only (mdk#1161): every stored group is
+    /// listed but gated `GroupNotHydrated` until the caller drives per-group
+    /// hydration ([`AccountDeviceSession::hydrate_next_groups`] /
+    /// [`AccountDeviceSession::ensure_group_hydrated`]) or a send/ingest
+    /// promotes a group on demand. Default is the eager open, which fully
+    /// hydrates (or quarantines) every group before returning — embedders
+    /// without a background pipeline should keep the default.
+    pub fn defer_group_hydration(mut self) -> Self {
+        self.defer_group_hydration = true;
+        self
     }
 
     /// Install a forensic audit-log recorder. Without this call the engine
@@ -177,6 +191,18 @@ impl SessionConfig {
 pub struct AccountDeviceSession {
     engine: Engine<SqliteAccountStorage>,
     open_timings: SessionOpenTimings,
+}
+
+/// Aggregate progress of one background hydration batch (mdk#1161).
+/// Counts only — no identifiers — so it can feed telemetry directly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HydrationProgress {
+    /// Groups promoted to live by this batch.
+    pub hydrated: usize,
+    /// Groups whose hydration failed and moved to the quarantine surface.
+    pub quarantined: usize,
+    /// Groups still awaiting hydration after this batch.
+    pub remaining: usize,
 }
 
 /// Privacy-safe stage timings captured during [`AccountDeviceSession::open`].
@@ -349,10 +375,11 @@ impl AccountDeviceSession {
         }
         let engine_build = build_started.elapsed();
         let hydration_started = std::time::Instant::now();
-        // Eager for now: the app-layer background hydration pipeline
-        // (mdk#1161 layer 3) switches this to the cheap seed pass once hosts
-        // drive per-group hydration after readiness.
-        engine.hydrate_all_stored_groups()?;
+        if config.defer_group_hydration {
+            engine.hydrate_stable_groups_from_storage()?;
+        } else {
+            engine.hydrate_all_stored_groups()?;
+        }
         let group_hydration = hydration_started.elapsed();
         engine
             .set_convergence_policy(config.convergence_policy)
@@ -613,6 +640,66 @@ impl AccountDeviceSession {
     /// never discards local history.
     pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.retry_hydrate_quarantined_group(group_id)?)
+    }
+
+    /// Group ids the session-open cheap pass seeded whose full hydration has
+    /// not run yet (mdk#1161), route-backfill-pending groups first. Empty
+    /// once the background hydration pipeline (or eager open) has drained.
+    pub fn unhydrated_group_ids(&self) -> Vec<GroupId> {
+        self.engine.unhydrated_group_ids()
+    }
+
+    /// Fully hydrate one seeded group now. Returns `Ok(true)` when the group
+    /// is live after the call (hydrated now, or it already was), `Ok(false)`
+    /// when hydration failed and the group moved to the quarantine surface —
+    /// the same terminal state an open-time hydration failure produces.
+    pub fn ensure_group_hydrated(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        match self.engine.ensure_hydrated(group_id) {
+            Ok(()) => Ok(true),
+            Err(EngineError::UnknownGroup(_)) => Ok(false),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// One bounded background-pipeline step (mdk#1161): fully hydrate up to
+    /// `budget` still-unhydrated groups, preferring the caller-supplied order
+    /// (the app passes chat-list recency); groups not named in `order` drain
+    /// afterwards. Per-group failures quarantine that group and continue.
+    /// Aggregate counts only — safe for telemetry.
+    pub fn hydrate_next_groups(
+        &mut self,
+        order: &[GroupId],
+        budget: usize,
+    ) -> SessionResult<HydrationProgress> {
+        let unhydrated: std::collections::HashSet<GroupId> =
+            self.engine.unhydrated_group_ids().into_iter().collect();
+        let mut batch: Vec<GroupId> = order
+            .iter()
+            .filter(|group_id| unhydrated.contains(*group_id))
+            .take(budget)
+            .cloned()
+            .collect();
+        if batch.len() < budget {
+            let named: std::collections::HashSet<GroupId> = batch.iter().cloned().collect();
+            let fill = budget - batch.len();
+            batch.extend(
+                self.engine
+                    .unhydrated_group_ids()
+                    .into_iter()
+                    .filter(|group_id| !named.contains(group_id))
+                    .take(fill),
+            );
+        }
+        let mut progress = HydrationProgress::default();
+        for group_id in batch {
+            match self.engine.ensure_hydrated(&group_id) {
+                Ok(()) => progress.hydrated += 1,
+                Err(EngineError::UnknownGroup(_)) => progress.quarantined += 1,
+                Err(other) => return Err(other.into()),
+            }
+        }
+        progress.remaining = self.engine.unhydrated_group_ids().len();
+        Ok(progress)
     }
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {

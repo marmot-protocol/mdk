@@ -28,6 +28,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   hydration report a new retryable "not hydrated yet" state instead of
   partial data.
 
+- Runtime account opens now defer full group hydration to a background
+  pipeline that runs after local readiness in chat-list recency order, so
+  cold-start readiness no longer scales with stored group count. Group reads
+  issued before a group hydrates wait for exactly that group; mutations and
+  catch-ups keep their existing startup deferral order — `start()` returning
+  therefore does NOT mean a subsequent send is unblocked: sends issued
+  before the initial catch-up completes are queued and replayed in arrival
+  order after it, covering any remaining hydration plus catch-up latency.
+  MarmotKit surfaces a new retryable `GroupHydrationPending` error, distinct
+  from `UnknownGroup`, for the remaining direct-read window.
+
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
   explicit `Www` autolink kind so renderers can synthesize `https://`
@@ -39,6 +50,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   extensions can return bounded fallback content instead of creating a second
   stateful writer.
   
+- MarmotKit exposes `downloadProfileImage` for dial-safe fetching of untrusted
+  kind:0 profile `picture` URLs (HTTPS-only, proxy-disabled pinned public
+  resolution, bounded redirects, and streaming limits) so Android and Swift
+  hosts do not maintain a separate SSRF stack for public avatars
+  ([#1288](https://github.com/marmot-protocol/mdk/pull/1288)).
+
 - Outbound messages waiting in a group's durable queue are now bounded at 256
   per group. The bound covers every reason a message waits: a group resolving a
   stalled publication, convergence input that has not settled, and messages
@@ -50,6 +67,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   message is accepted by a relay.
   
 ### Fixed
+
+- Existing-group invite commands now return after the required relay
+  acknowledgement and durable local refresh instead of waiting for an
+  all-account read-side catch-up. Account workers serve group projection reads
+  from a fresh local snapshot while detached catch-up runs, so overlapping
+  invites keep their immediate reads responsive without suppressing another
+  local account's incoming Welcome. Deferred account opens now finish
+  live-state projection repair after group hydration, preventing a committed
+  overlapping invite from failing worker readiness as not-yet-hydrated. The
+  work remains visible in the existing invite-stage telemetry
+  ([#1309](https://github.com/marmot-protocol/mdk/pull/1309)).
 
 - Account setup interruptions now have stable JSON recovery codes and repair
   hints instead of falling through to the generic `command_failed` bucket.

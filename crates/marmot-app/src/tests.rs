@@ -43,6 +43,10 @@ struct ScriptedPushRelayClient {
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
+    block_publish_count: std::sync::atomic::AtomicUsize,
+    blocked_publish_count: std::sync::atomic::AtomicUsize,
+    block_account_subscribe_after_next_publish: std::sync::Mutex<Option<Vec<u8>>>,
+    block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -70,6 +74,13 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn block_account_subscribe_after_next_publish(&self, account_id: Vec<u8>) {
+        *self
+            .block_account_subscribe_after_next_publish
+            .lock()
+            .unwrap() = Some(account_id);
+    }
+
     fn block_next_subscribe(&self) {
         self.block_next_subscribe
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -94,7 +105,7 @@ impl ScriptedPushRelayClient {
     }
 
     fn release_subscribe(&self) {
-        self.subscribe_release.notify_one();
+        self.subscribe_release.notify_waiters();
     }
 
     fn zero_ack_next_publish(&self) {
@@ -106,8 +117,23 @@ impl ScriptedPushRelayClient {
         self.publish_started.notified().await;
     }
 
+    fn block_next_publishes(&self, count: usize) {
+        self.block_publish_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_publishes(&self, count: usize) {
+        while self
+            .blocked_publish_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < count
+        {
+            self.publish_started.notified().await;
+        }
+    }
+
     fn release_publish(&self) {
-        self.publish_release.notify_one();
+        self.publish_release.notify_waiters();
     }
 }
 
@@ -115,7 +141,7 @@ impl ScriptedPushRelayClient {
 impl NostrRelayClient for ScriptedPushRelayClient {
     async fn subscribe(
         &self,
-        _subscription: NostrSubscription,
+        subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         if self
             .fail_next_subscribe
@@ -125,9 +151,19 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 "injected subscribe failure".to_owned(),
             ));
         }
-        let blocked = self
-            .block_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let block_for_account = {
+            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
+            if blocked_account.as_deref() == Some(subscription.account_id().as_slice()) {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let blocked = block_for_account
+            || self
+                .block_next_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
         if blocked {
             self.subscribe_started.notify_one();
             self.subscribe_release.notified().await;
@@ -163,10 +199,21 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         event: &NostrTransportEvent,
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
-        if self
-            .block_next_publish
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        let block_counted_publish = self
+            .block_publish_count
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if block_counted_publish
+            || self
+                .block_next_publish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            self.blocked_publish_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
             self.publish_release.notified().await;
         }
@@ -184,6 +231,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
+            if let Some(account_id) = self
+                .block_account_subscribe_after_next_publish
+                .lock()
+                .unwrap()
+                .take()
+            {
+                *self.block_account_subscribe.lock().unwrap() = Some(account_id);
+            }
             Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
@@ -315,6 +370,22 @@ fn account_reconcile_returns_local_readiness_before_relay_subscription_registrat
     run_composed_app_runtime_test(
         "account-local-ready-before-subscribe",
         account_local_ready_before_subscribe_body,
+    );
+}
+
+#[test]
+fn invite_members_keeps_same_account_projection_reads_off_detached_catch_up() {
+    run_composed_app_runtime_test(
+        "invite-members-detaches-post-mutation-catch-up",
+        invite_members_detaches_post_mutation_catch_up_body,
+    );
+}
+
+#[test]
+fn concurrent_invites_keep_both_accounts_readable_during_catch_up() {
+    run_composed_app_runtime_test(
+        "concurrent-invites-keep-projections-readable",
+        concurrent_invites_keep_projections_readable_body,
     );
 }
 
@@ -519,6 +590,209 @@ async fn account_local_ready_before_subscribe_body() {
         .snapshot();
     assert_eq!(telemetry.account_transport_activation.successes, 1);
     assert_eq!(telemetry.account_subscription_registration.successes, 1);
+    runtime.shutdown().await;
+}
+
+async fn invite_members_detaches_post_mutation_catch_up_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "invite latency", &[], None)
+        .await
+        .unwrap();
+
+    relay.block_account_subscribe_after_next_publish(
+        hex::decode(home.account("alice").unwrap().account_id_hex).unwrap(),
+    );
+    let inviting_runtime = runtime.clone();
+    let invite_group_id = group_id.clone();
+    let bob_account_id = bob.account_id_hex.clone();
+    let invite = tokio::spawn(async move {
+        inviting_runtime
+            .invite_members(
+                "alice",
+                &invite_group_id,
+                std::slice::from_ref(&bob_account_id),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_subscribe(),
+    )
+    .await
+    .expect("inviting-account catch-up should remain blocked after publication");
+    tokio::time::timeout(std::time::Duration::from_millis(250), invite)
+        .await
+        .expect("confirmed invite must return before read-side catch-up finishes")
+        .expect("invite task should not panic")
+        .expect("invite should succeed");
+
+    let (members, mls_state) = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        let members = runtime.group_members("alice", &group_id).await?;
+        let mls_state = runtime.group_mls_state("alice", &group_id).await?;
+        Ok::<_, AppError>((members, mls_state))
+    })
+    .await
+    .expect("same-account post-invite projection reads must not queue behind catch-up")
+    .expect("same-account post-invite projection reads should succeed");
+    assert_eq!(members.len(), 2);
+    assert_eq!(mls_state.member_count, 2);
+
+    let before_release = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(before_release.group_invite_members.successes, 1);
+    assert_eq!(
+        before_release.group_invite_post_mutation_catch_up.successes, 0,
+        "inviting-account catch-up must remain unfinished while its subscription is blocked"
+    );
+
+    relay.release_subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .group_invite_post_mutation_catch_up
+                .successes
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached post-mutation catch-up should finish after the relay unblocks");
+    runtime.shutdown().await;
+}
+
+async fn concurrent_invites_keep_projections_readable_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let alice_group = runtime
+        .create_group("alice", "alice invite", &[], None)
+        .await
+        .unwrap();
+    let bob_group = runtime
+        .create_group("bob", "bob invite", &[], None)
+        .await
+        .unwrap();
+    // Hold each invite at its first publication so both mutations overlap
+    // before either detached catch-up can start.
+    relay.block_next_publishes(2);
+    let alice_runtime = runtime.clone();
+    let alice_group_for_invite = alice_group.clone();
+    let bob_account_id = bob.account_id_hex.clone();
+    let alice_invite = tokio::spawn(async move {
+        alice_runtime
+            .invite_members(
+                "alice",
+                &alice_group_for_invite,
+                std::slice::from_ref(&bob_account_id),
+            )
+            .await
+    });
+    let bob_runtime = runtime.clone();
+    let bob_group_for_invite = bob_group.clone();
+    let alice_account_id = alice.account_id_hex.clone();
+    let bob_invite = tokio::spawn(async move {
+        bob_runtime
+            .invite_members(
+                "bob",
+                &bob_group_for_invite,
+                std::slice::from_ref(&alice_account_id),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publishes(2),
+    )
+    .await
+    .expect("both concurrent invites should reach publication");
+    relay.release_publish();
+    let (alice_result, bob_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(alice_invite, bob_invite)
+        })
+        .await
+        .expect("both confirmed invites should return while detached catch-up is coordinated");
+    alice_result
+        .expect("alice invite task should not panic")
+        .expect("alice invite should succeed");
+    bob_result
+        .expect("bob invite task should not panic")
+        .expect("bob invite should succeed");
+
+    let alice_members = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_members("alice", &alice_group),
+    )
+    .await
+    .expect("alice members must not queue behind concurrent invite catch-up")
+    .expect("alice members should succeed");
+    let alice_state = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_mls_state("alice", &alice_group),
+    )
+    .await
+    .expect("alice MLS state must not queue behind concurrent invite catch-up")
+    .expect("alice MLS state should succeed");
+    let bob_members = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_members("bob", &bob_group),
+    )
+    .await
+    .expect("bob members must not queue behind concurrent invite catch-up")
+    .expect("bob members should succeed");
+    let bob_state = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.group_mls_state("bob", &bob_group),
+    )
+    .await
+    .expect("bob MLS state must not queue behind concurrent invite catch-up")
+    .expect("bob MLS state should succeed");
+    assert_eq!(alice_members.len(), 2);
+    assert_eq!(alice_state.member_count, 2);
+    assert_eq!(bob_members.len(), 2);
+    assert_eq!(bob_state.member_count, 2);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .shared_services()
+                .app_performance_telemetry()
+                .snapshot()
+                .group_invite_post_mutation_catch_up
+                .successes
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both detached catch-ups should complete after the relay unblocks");
     runtime.shutdown().await;
 }
 
@@ -1954,7 +2228,8 @@ async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     assert!(!app.key_package_record_path(&account.label).exists());
 
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
-    app.open_account(&account.label, &relay_plane).unwrap();
+    app.open_account(&account.label, &relay_plane, false)
+        .unwrap();
     assert!(app.key_package_cutover_replacement_pending(&account.label));
     assert!(
         app.reusable_key_package_slot_id(&account.label, &account.account_id_hex)
@@ -5341,4 +5616,334 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
         vec![(group_id, 9, 4)],
         "the receive seam must publish the escalation recorded during its ingest"
     );
+}
+
+/// Every SQLite database this app can open, plus the root runtime lease, must
+/// be released by one `close_storage` call — that is the whole contract iOS
+/// depends on before it suspends the process (`0xdead10cc` is raised for *any*
+/// lock held in the shared App Group container, not just the session database).
+#[test]
+fn close_storage_releases_every_database_and_the_root_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = AccountHome::open(root).create_account("closing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    // Open, and dirty, all three database families. Keep the handles: they are
+    // the only way to prove the *connections* were closed rather than merely
+    // dropped from the app's caches.
+    let session_storage = app.account_storage(&account.label).unwrap();
+    session_storage.app_message_count().unwrap();
+    let shared_storage = app.shared_storage().unwrap();
+    shared_storage
+        .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        })
+        .unwrap();
+    let directory_cache = app.directory_cache_for_account(&account).unwrap();
+    directory_cache.entries().unwrap();
+
+    let session_db = app.account_storage_path(&account.label);
+    let shared_db = app.shared_storage_path();
+    let sidecars = |db: &std::path::Path| {
+        [
+            PathBuf::from(format!("{}-wal", db.display())),
+            PathBuf::from(format!("{}-shm", db.display())),
+        ]
+    };
+    assert!(
+        sidecars(&shared_db).iter().all(|p| p.exists()),
+        "the shared database should hold WAL sidecars while open",
+    );
+    // The lease is held for as long as the app is alive.
+    assert!(matches!(
+        MarmotRootRuntimeLease::try_acquire(root),
+        Err(AppError::RuntimeBusy)
+    ));
+
+    app.close_storage().expect("close_storage should succeed");
+
+    assert!(app.storage_is_closed());
+    for db in [&session_db, &shared_db] {
+        for sidecar in sidecars(db) {
+            assert!(
+                !sidecar.exists(),
+                "{} must be gone once the last connection closes",
+                sidecar.display(),
+            );
+        }
+    }
+    // The directory cache is opened in rollback-journal mode, so it has no WAL
+    // sidecars to check. Its connection still has to be closed, and the handle
+    // taken before the close is what proves it: a cache that was merely evicted
+    // from the app's map would keep answering.
+    assert!(
+        matches!(
+            directory_cache.entries(),
+            Err(AppError::Storage(err)) if err.is_closed()
+        ),
+        "the directory cache connection must be closed, not just uncached",
+    );
+    // Same for the two WAL databases, via the handles rather than the caches.
+    assert!(session_storage.is_closed());
+    assert!(shared_storage.is_closed());
+
+    // The lease is an advisory lock on a file in the same container, so it has
+    // to go too; a second acquirer proves it did.
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+
+    // Nothing reopens: a late read must report the close instead of re-locking
+    // the container the host was just told is clear.
+    for error in [
+        app.account_storage(&account.label).err(),
+        app.shared_storage().err(),
+        app.directory_cache_for_account(&account).err(),
+        app.projection_status(&account.label).err(),
+    ]
+    .into_iter()
+    .map(|error| error.expect("a closed app must not hand out a database"))
+    {
+        assert!(
+            matches!(&error, AppError::Storage(err) if err.is_closed()),
+            "expected a closed-storage error, got {error:?}",
+        );
+    }
+}
+
+/// `close_storage` must not return — or release the root lease — while a
+/// database open is still in flight. Otherwise a host that awaited it, or
+/// another process that saw the lease free, would proceed while a freshly
+/// created SQLite connection still held locks in the container.
+///
+/// The read side of `storage_lifecycle` is exactly what an in-flight open
+/// holds, so taking it here stands in for one deterministically.
+#[test]
+fn close_storage_waits_for_an_open_that_is_already_in_flight() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    AccountHome::open(root).create_account("racing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    let in_flight_open = app
+        .storage_lifecycle
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let closing_app = app.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        // Signal from inside the thread, immediately before the call. Without
+        // this the timeout assertion below would also pass if the thread had
+        // simply not been scheduled yet, which proves nothing about blocking.
+        let _ = started_tx.send(());
+        let result = closing_app.close_storage();
+        let _ = closed_tx.send(());
+        result
+    });
+    started_rx
+        .recv()
+        .expect("the closing thread should reach close_storage");
+
+    // While the open is in flight the close must make no observable progress:
+    // it has not returned, and the root lease is still held.
+    assert!(
+        closed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "close_storage must not return while an open is in flight",
+    );
+    assert!(
+        matches!(
+            MarmotRootRuntimeLease::try_acquire(root),
+            Err(AppError::RuntimeBusy)
+        ),
+        "the root lease must not be released while an open is in flight",
+    );
+
+    drop(in_flight_open);
+    closer
+        .join()
+        .unwrap()
+        .expect("close_storage should succeed once the open finishes");
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+}
+
+/// Legacy account projection import opens a short-lived raw SQLite connection
+/// after the cached account storage has already been returned. That entire
+/// window must count as an in-flight storage open; otherwise terminal close can
+/// return and release the root lease immediately before the migration reopens
+/// the legacy database in the shared container.
+#[test]
+fn close_storage_waits_for_legacy_projection_import() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let home = AccountHome::open(root);
+    home.create_account("legacy-racing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+
+    let keys = app
+        .account_home()
+        .load_signing_keys("legacy-racing")
+        .unwrap();
+    let legacy_path = app.legacy_account_projection_path("legacy-racing");
+    let legacy_key = app
+        .sqlcipher_key(
+            "legacy-racing",
+            &keys,
+            &legacy_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        )
+        .unwrap();
+    drop(LegacyAccountProjectionDb::open(legacy_path, &legacy_key).unwrap());
+
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let hook_entered = std::sync::Arc::clone(&entered);
+    let hook_release = std::sync::Arc::clone(&release);
+    app.set_legacy_projection_open_hook_for_test(std::sync::Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+
+    let migrating_app = app.clone();
+    let migration = std::thread::spawn(move || migrating_app.ensure_account_state("legacy-racing"));
+    entered.wait();
+
+    let closing_app = app.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        // Signal from inside the thread, immediately before the call. Without
+        // this the timeout assertion below would also pass if the thread had
+        // simply not been scheduled yet, which proves nothing about the import
+        // window holding the close off.
+        started_tx.send(()).unwrap();
+        let result = closing_app.close_storage();
+        closed_tx.send(()).unwrap();
+        result
+    });
+    started_rx
+        .recv()
+        .expect("the closing thread should reach close_storage");
+    assert!(
+        closed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "terminal close must wait for the legacy database import window",
+    );
+    assert!(matches!(
+        MarmotRootRuntimeLease::try_acquire(root),
+        Err(AppError::RuntimeBusy)
+    ));
+
+    release.wait();
+    migration.join().unwrap().unwrap();
+    closer.join().unwrap().unwrap();
+    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+}
+
+/// Concurrent `close_storage` callers must serialize: no caller may return
+/// while another is still closing connections, or the host gets a lock-free
+/// answer that is not yet true.
+#[test]
+fn concurrent_close_storage_callers_serialize() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = AccountHome::open(root).create_account("closing").unwrap();
+    let app = MarmotApp::try_with_relays_and_account_home_and_config(
+        root,
+        Vec::new(),
+        AccountHome::open(root),
+        MarmotAppConfig::default(),
+    )
+    .unwrap();
+    let session_storage = app.account_storage(&account.label).unwrap();
+    app.shared_storage().unwrap();
+    app.directory_cache_for_account(&account).unwrap();
+
+    let closers = (0..4)
+        .map(|_| {
+            let app = app.clone();
+            std::thread::spawn(move || app.close_storage())
+        })
+        .collect::<Vec<_>>();
+    for closer in closers {
+        // Every caller returns only after the teardown is complete, so every
+        // caller's return is a truthful "nothing is locked any more".
+        closer
+            .join()
+            .unwrap()
+            .expect("close_storage should succeed");
+        assert!(session_storage.is_closed());
+        drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+    }
+}
+
+#[test]
+fn close_storage_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("closing-twice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    app.account_storage(&account.label).unwrap();
+
+    app.close_storage().expect("first close should succeed");
+    app.close_storage().expect("second close should be a no-op");
+    // Closing a never-opened app is fine too.
+    let untouched = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    untouched
+        .close_storage()
+        .expect("closing an app that opened nothing should succeed");
+}
+
+/// `shutdown_and_close` must work as the host's single call, with or without a
+/// preceding `shutdown`, and must stay safe when repeated.
+#[tokio::test]
+async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        directory.path(),
+        Vec::new(),
+        AccountHome::open(directory.path()),
+    );
+    let runtime = app.runtime();
+    assert!(!runtime.storage_is_closed());
+
+    // No preceding `shutdown`: the method performs its own.
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(runtime.storage_is_closed());
+
+    // Repeat, and repeat after an explicit `shutdown`, without panicking.
+    runtime.shutdown_and_close().await.unwrap();
+    runtime.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
 }

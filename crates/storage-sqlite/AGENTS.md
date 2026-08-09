@@ -30,6 +30,9 @@ not "fix" it into the per-account database.
 - Accept raw SQLCipher keys only. Key derivation and recovery live above this crate.
 - Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`.
 - Keep invalidated message records. Applications decide whether to show them.
+- Build every long-lived connection on `CloseableConnection` so a host can release the database's file locks at a known
+  instant. Closing is terminal: surviving clones return `StorageError::Closed`, and nothing reopens implicitly. See
+  `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Retained-anchor policy is engine/group policy. SQLite stores snapshots and policy bytes; the engine decides when to
   prune.
 - Migration file names use padded numeric prefixes, for example `0001_initial_schema.rs`.

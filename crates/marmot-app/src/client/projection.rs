@@ -217,6 +217,17 @@ impl AppClient {
         Ok(changed)
     }
 
+    /// Finish the projection repairs that require fully hydrated group state.
+    /// Deferred runtime opens call this after their background hydration
+    /// pipeline; eager clients call it before returning from open.
+    pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
+        if self.reconcile_live_engine_groups()? {
+            self.app.save_state(&self.state)?;
+        }
+        self.reconcile_disband_drafts();
+        self.backfill_self_membership_once()
+    }
+
     /// Finish the app-local half of durable disband acceptance after a crash
     /// or a transient projection write failure. The engine request/tombstone is
     /// the source of truth, so composer drafts must not reappear on reopen.
@@ -579,6 +590,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
+        AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",

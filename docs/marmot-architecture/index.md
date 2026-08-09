@@ -86,7 +86,8 @@ Written to be readable in 5 minutes each, shareable as a package.
 
 - **Doc:** [`overview/local-artifact-safety.md`](./overview/local-artifact-safety.md)
   - **What it covers:** Restrictive-by-construction creation of local files, sockets, and databases: the
-    `fs-private` helpers, the one octal-mode parser, and the DB sidecar/PRAGMA-at-open rules.
+    `fs-private` helpers, the one octal-mode parser, the DB sidecar/PRAGMA-at-open rules, and the close-before-host-
+    suspension rules that release WAL and root-lease file locks.
 
 - **Doc:** [`overview/multi-step-state-changes.md`](./overview/multi-step-state-changes.md)
   - **What it covers:** The no-torn-writes convention for multi-step operations: validate-before-mutate, full

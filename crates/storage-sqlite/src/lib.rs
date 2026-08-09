@@ -34,8 +34,8 @@ pub use chat_list::{
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
-    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteJournalMode,
-    SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
+    CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
+    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
     StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,

@@ -3295,6 +3295,48 @@ impl MarmotAppRuntime {
             "runtime shutdown completed",
         );
     }
+
+    /// [`Self::shutdown`], then close every SQLite database and release the
+    /// root runtime lease — so when this returns, nothing this process owns
+    /// holds a file lock inside the Marmot root.
+    ///
+    /// This is the operation a host needs before its process can be suspended.
+    /// [`Self::shutdown`] alone is not enough: it stops workers but takes
+    /// `&self`, so it cannot drop anything, and the databases live behind
+    /// `Arc`s shared by the engine, the OpenMLS adapter, and app projections.
+    /// A WAL connection holds a lock on its `-shm` sidecar for its entire
+    /// lifetime, so "the workers stopped" and "the store is unlocked" are
+    /// different facts, and only the second one keeps an iOS app alive across
+    /// suspension (`0xdead10cc`, raised for holding a lock in a shared App
+    /// Group container).
+    ///
+    /// Ordering is the point of this method: workers drain first, so the
+    /// databases close under quiesced state rather than out from under live
+    /// engine work.
+    ///
+    /// **Terminal.** This runtime and the [`MarmotApp`] it came from are done:
+    /// every later database access fails with
+    /// [`StorageError::Closed`][cgka_traits::storage::StorageError::Closed]
+    /// rather than reopening, because reopening would re-lock the container the
+    /// host has just been told is clear. Build a fresh `MarmotApp` and runtime
+    /// to use the root again — which is what a foregrounding app does anyway.
+    ///
+    /// Safe to call twice, and safe to call with or without a preceding
+    /// [`Self::shutdown`]. Worker drain is bounded by
+    /// `APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT`; the close itself waits only for
+    /// whatever SQLite statement is executing.
+    pub async fn shutdown_and_close(&self) -> Result<(), AppError> {
+        self.shutdown().await;
+        let app = self.accounts.app.clone();
+        blocking_app_task(move || app.close_storage()).await
+    }
+
+    /// Whether this runtime's storage has been closed by
+    /// [`Self::shutdown_and_close`].
+    #[must_use]
+    pub fn storage_is_closed(&self) -> bool {
+        self.accounts.app.storage_is_closed()
+    }
 }
 
 impl AccountManager {
