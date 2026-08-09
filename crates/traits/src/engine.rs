@@ -378,7 +378,8 @@ pub enum GroupStateChange {
 /// surface per-group recovery while keeping healthy groups available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupHydrationQuarantineReason {
-    /// OpenMLS returned an error while loading the stored group state.
+    /// OpenMLS returned an error while loading the stored group state or while
+    /// persisting mandatory configuration normalization during hydration.
     OpenMlsLoadFailed,
     /// Marmot metadata referenced a group whose OpenMLS state was missing.
     OpenMlsGroupMissing,

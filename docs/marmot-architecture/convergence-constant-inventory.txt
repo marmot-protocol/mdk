@@ -12,6 +12,8 @@ P5|crates/cgka-engine/src/canonicalization.rs|V1_MAX_CONVERGENCE_PASS_MS
 P6|crates/cgka-engine/src/convergence.rs|V1_WITNESS_QUORUM_SENDERS_PER_EPOCH
 P7|crates/cgka-engine/src/convergence.rs|V1_WITNESS_QUORUM_EPOCHS
 P8|crates/cgka-engine/src/convergence.rs|V1_MAX_WITNESS_OVERRIDE_DEPTH
+P9|crates/cgka-engine/src/wire_format.rs|DEFAULT_OUT_OF_ORDER_TOLERANCE
+P10|crates/cgka-engine/src/wire_format.rs|DEFAULT_MAXIMUM_FORWARD_DISTANCE
 E1|crates/cgka-engine/src/message_processor/mod.rs|MAX_CONVERGENCE_REPROCESSING_PASSES
 E2|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_PEEL_ATTEMPTS
 E3|crates/cgka-engine/src/message_processor/mod.rs|MAX_PEEL_DEFERRED_ROWS_PER_GROUP

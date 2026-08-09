@@ -237,6 +237,8 @@ Categories:
 | P6 | `V1_WITNESS_QUORUM_SENDERS_PER_EPOCH` | 2 senders | semantic | Defines per-epoch corroboration | Too low lets one identity dominate; too high makes evidence unavailable in small/offline groups | yes, by policy version | Group-size/device-topology sweep and Sybil/account dedupe model |
 | P7 | `V1_WITNESS_QUORUM_EPOCHS` | 1 epoch | semantic | Defines how many branch epochs require quorum | Too low gives brief activity more weight; too high suppresses witnesses on short branches | yes, by policy version | Branch-length and traffic-duration sweep |
 | P8 | `V1_MAX_WITNESS_OVERRIDE_DEPTH` | 1 commit | semantic | Caps witness-derived effective-depth boost | Too low makes witnesses irrelevant; too high lets traffic outrank much longer commit history | yes, by policy version | Bound proof, depth-difference matrix, adversarial witness flood |
+| P9 | `DEFAULT_OUT_OF_ORDER_TOLERANCE` | 100 messages | semantic, security-retention | Retains within-epoch application-message keys across realistic relay reordering and offline floods | Too low drops otherwise valid application messages and potential branch witnesses; too high retains more within-epoch secrets | yes, by policy version | OpenMLS-default regression seeds, exact value pin, persisted-group migration/restart |
+| P10 | `DEFAULT_MAXIMUM_FORWARD_DISTANCE` | 1,000 messages | semantic, resource | Bounds how far a receiver advances a sender ratchet across missing application messages | Too low rejects realistic loss/offline gaps; too high increases one-message catch-up work and admits a larger application/witness gap | yes, by policy version | Exact value pin, forward-gap boundary and resource campaign |
 
 #### Engine resource and retry bounds
 
@@ -289,6 +291,7 @@ future inventory revision should encode machine-checked expected values where th
 | P4 | `canonicalization.rs`; `prop_quiescence_gate_controls_settlement`; `engine_duplicate_convergence_input_does_not_reset_quiescence`; `app_witness_beside_competing_commits_resets_convergence_quiescence` | M3.2 quiescence sweep; relay-spread/reorg telemetry |
 | P5 | `canonicalization.rs`; `convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input`; `input_at_effective_cutoff_is_retained_for_the_next_generation`; collecting-pass restart test | M3.1 sustained flood; M3.2 eventual fixed-point comparison |
 | P6, P7, P8 | `convergence.rs`; generated policy cases; Tamarin score/bound lemmas; multi-device witness-deduplication replay probe | M3.1 group-size/device/Sybil sweeps; M4.1 independent reference |
+| P9, P10 | `wire_format.rs`; seed-2001 rollback-flood regression; encrypted-SQLite hydration migration/restart | Sustained within-epoch reorder/loss sweeps and resource measurements |
 | E1 | `message_processor/mod.rs`; existing multi-pass integration flows | M3.1 force exhaustion, verify durable continuation and no partial settle |
 | E2, E3, E4, E8 | `message_processor/mod.rs`; `deferred_peel_retry_budget_refuses_without_terminal_dedup`; `deferred_peel_residence_survives_restart_and_backward_clock`; `peel_deferred_rows_capped_per_group_under_flood`; `resource_refusal_signals_immediately_once_per_epoch`; strict first-join chaos case; deferred retry/context tests | M3.1 fairness/restart/redelivery campaign |
 | E5, E6 | `openmls_projection.rs`; `for_pass_scales_with_commits_and_rewind_and_keeps_a_floor`; `for_pass_saturates_instead_of_overflowing`; `consume_fails_closed_when_exhausted` | M3.1 branch-explosion end-to-end recovery; M4.3 mutation |
@@ -824,13 +827,13 @@ preparation opportunity, the non-guarantee under unbounded valid self-updates, t
 pass-partition invariance, the mandatory implicit v1 values, and the rule that any future behavior-changing policy
 ships as a new required app component/capability. No additional protocol PR is needed for Milestone 4.
 
-`policy_contract::CONSTANT_DECISIONS` classifies every P/E/A ledger id exactly once. P1/P2/P6/P7/P8 directly affect
-selected state; P4/P5 affect the bounded-pass lifecycle; P3 is coupled security-retention implementation of P2. All
+`policy_contract::CONSTANT_DECISIONS` classifies every P/E/A ledger id exactly once. P1/P2/P6/P7/P8/P9/P10 directly
+affect selected state; P4/P5 affect the bounded-pass lifecycle; P3 is coupled security-retention implementation of P2. All
 remain mandatory implicit v1 and any change requires the future required component. No component is allocated merely
 to re-encode the only valid v1 choice. E/A constants remain local only under operational non-interference: exhaustion
 is visible and fail-closed, retained work can retry, and equal closed input reaches the same settled result.
 
-The protocol decision gate pins all eight P values, checks the 26-id ledger/classification bijection, enforces the
+The protocol decision gate pins all ten P values, checks the 28-id ledger/classification bijection, enforces the
 future-component decision, and varies batch width, wake delay, and a temporary resource refusal over one closed
 witness-sensitive input set. Intermediate pass histories differ while the settled winner remains equal; the resource
 failure never produces a partial settled result. Production coverage remains the same-horizon pass-partition
@@ -1300,6 +1303,7 @@ incorrect result.
 | 2026-08-07 | Capability naming cleanup | Renamed long-lived simulator/process artifacts around their owned capability and added a fast-CI gate rejecting any tracked filename whose basename contains `milestone`, case-insensitively | [MDK #1273](https://github.com/marmot-protocol/mdk/pull/1273); `just naming-gate`; required GitHub CI |
 | 2026-08-07 | 6.5 stateful canonical journeys | Added deterministic legality-aware Scenario IR v3 journeys with modeled membership, admin, profile, connectivity, epoch, and delivery outcomes; separated late-membership from founding-member offline history so pre-admission retry state is not mislabeled; and saved owner-only, subject-preserving inputs before execution | [MDK #1302](https://github.com/marmot-protocol/mdk/pull/1302); `stateful_generator`; `chat-journey/v1`; strict eight-case/two-profile rotation plus retained-input replay |
 | 2026-08-07 | Planned shared legality model and workload profiles | Recorded the follow-up architecture: one canonical product-action legality model, separately typed composable faults, thin workload profiles, explicit size controls, and corpus-level operation/interaction coverage rather than independent family semantics or overloaded case counts | Section 6.6; planned verification and migration gates |
+| 2026-08-09 | Sender-ratchet reorder policy restoration | Restored the historical 100-message out-of-order tolerance and 1,000-message maximum forward distance for new/joined groups, normalized persisted groups during hydration before new traffic, and pinned the seed-2001 rollback-flood regressions that exposed OpenMLS's inherited five-message default; already-pruned secrets remain unrecoverable | `wire_format`; encrypted-SQLite hydration migration/restart; convergence-chaos cases 2 and 13 |
 
 ## Capability Naming Cleanup
 

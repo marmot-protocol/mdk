@@ -1535,12 +1535,28 @@ impl<S: StorageProvider> Engine<S> {
                 &self.crypto,
                 self.storage.mls_storage(),
             );
-            openmls::group::MlsGroup::load(
-                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-                &mls_gid,
-            )
-            .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
-            .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
+            let provider_storage =
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider);
+            let mut mls_group = openmls::group::MlsGroup::load(provider_storage, &mls_gid)
+                .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
+                .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
+
+            // OpenMLS persists sender-ratchet policy per group. Groups created
+            // while MDK accidentally inherited OpenMLS's 5-message default
+            // would therefore remain fragile after merely changing the
+            // creation/join presets. Normalize the complete engine-owned join
+            // config before any new traffic can be processed and write it
+            // through in place. This cannot restore secrets already pruned,
+            // but it protects all future within-epoch application traffic.
+            let required_config = crate::wire_format::join_config(self.max_past_epochs);
+            if mls_group.configuration().sender_ratchet_configuration()
+                != required_config.sender_ratchet_configuration()
+            {
+                mls_group
+                    .set_configuration(provider_storage, &required_config)
+                    .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?;
+            }
+            mls_group
         };
 
         // Record the transport routing id as soon as the MLS state loads —

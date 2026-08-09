@@ -31,6 +31,8 @@ fn adopted_v1_policy_identity_and_values_are_pinned() {
         ("P6.witness_quorum_senders_per_epoch", 2),
         ("P7.witness_quorum_epochs", 1),
         ("P8.max_witness_override_depth", 1),
+        ("P9.sender_ratchet_out_of_order_tolerance", 100),
+        ("P10.sender_ratchet_maximum_forward_distance", 1_000),
     ];
     for (id, value) in expected {
         assert_eq!(snapshot.values[id], value, "{id}");
@@ -59,7 +61,7 @@ fn every_ledger_id_has_one_versioning_decision() {
 
 #[test]
 fn semantic_or_coupled_change_requires_a_new_required_component() {
-    for id in ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"] {
+    for id in ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"] {
         assert!(
             future_policy_change_requires_new_required_app_component(&[id]),
             "{id}"
