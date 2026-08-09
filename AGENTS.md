@@ -86,6 +86,9 @@ The canonical protocol specification lives in
 - Keep multi-step state changes torn-write-free: validate before mutating, compensate every applied step on the error
   path, record intent before external side effects, and never confirm work that reached no one. See
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+- Treat workspace and conformance-fixture version bumps as manual release operations. Never change the root workspace
+  version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
+  binding, or review-feedback work unless the user explicitly requests that version bump.
 - Title GitHub Releases with the version first so release lists group by cohort: whole-workspace `v<version> - MDK`,
   WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
 - Prefer `just release-all <version>` for a full MDK/WN Agent/MarmotKit cohort release, or
