@@ -4652,6 +4652,13 @@ impl AccountManager {
             tasks.accepting = false;
             std::mem::take(&mut tasks.handles)
         };
+        // A catch-up may already have passed reconcile's lifecycle check and
+        // still be replacing a stale worker. Reap every tracked catch-up
+        // before the final worker-map drain so no replacement can escape
+        // shutdown.
+        for task in invite_catch_up_tasks {
+            let _ = task.await;
+        }
         let workers = {
             let mut workers = self.workers.lock().await;
             workers
@@ -4663,11 +4670,6 @@ impl AccountManager {
         for worker in workers {
             shutdowns.spawn(async move {
                 worker.shutdown().await;
-            });
-        }
-        for task in invite_catch_up_tasks {
-            shutdowns.spawn(async move {
-                let _ = task.await;
             });
         }
         while shutdowns.join_next().await.is_some() {}
