@@ -44,6 +44,7 @@ pub mod reference_convergence;
 mod reference_subject;
 pub mod report;
 mod retained_relay;
+pub mod route_assurance;
 pub mod scenario;
 mod scenario_assertions;
 mod scenario_authoring;
