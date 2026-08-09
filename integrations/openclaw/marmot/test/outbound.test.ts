@@ -347,6 +347,36 @@ describe("createMarmotMessageAdapter", () => {
     }
   });
 
+  it("fails closed when an in-root media path does not exist", async () => {
+    // `readLocalFileFromRoots` returns null for an allowlist miss *and* for a
+    // read failure under an allowed root. Both must fail the send rather than
+    // reaching wn-agent, and the message must not claim the path escaped the
+    // allowlist when it did not.
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "missing",
+        mediaUrl: join(tmpRoot, "absent.png"),
+        mediaLocalRoots: [tmpRoot],
+      } as unknown as ChannelMessageSendMediaContext;
+
+      await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+        name: "LocalMediaAccessError",
+      });
+      await expect(adapter.send!.media!(ctx)).rejects.toThrow(/not readable/);
+      expect(calls.sendMedia).toHaveLength(0);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it("honors ctx.mediaAccess.localRoots when mediaLocalRoots is absent", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
     try {

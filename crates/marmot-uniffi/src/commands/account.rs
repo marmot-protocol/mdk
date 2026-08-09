@@ -529,6 +529,16 @@ impl Marmot {
             .upload_profile_image(&account_ref, data, &media_type, blossom_server.as_deref())
             .await?)
     }
+
+    /// Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe
+    /// HTTPS policy, address pinning, and bounded streaming.
+    pub async fn download_profile_image(
+        &self,
+        url: String,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, MarmotKitError> {
+        Ok(marmot_app::download_profile_image(url, max_bytes).await?)
+    }
 }
 
 fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {

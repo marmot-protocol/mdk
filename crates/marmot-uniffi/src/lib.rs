@@ -194,11 +194,19 @@ impl Marmot {
 
     /// Bring the runtime to local readiness.
     ///
-    /// On success, persisted account state is hydrated and worker-routed local
-    /// reads are available. Relay activation, group-subscription registration,
-    /// shared-directory synchronization, and initial catch-up continue
+    /// On success, persisted account state is seeded and worker-routed local
+    /// reads are available: group reads issued before a group's background
+    /// hydration completes wait for exactly that group. Relay activation,
+    /// group-subscription registration, shared-directory synchronization,
+    /// remaining group hydration, and initial catch-up continue
     /// asynchronously. Hosts should render local projections immediately and
     /// represent network progress separately.
+    ///
+    /// Ready is NOT "safe to send without waiting" (mdk#1161): mutations
+    /// issued before the initial catch-up completes are queued and replayed
+    /// in arrival order after it, so first-send latency can still cover
+    /// remaining hydration plus catch-up even when the target group is
+    /// already readable.
     ///
     /// The binding signature and result type are unchanged; this local-ready
     /// completion point is the behavioral contract for this implementation.
