@@ -538,8 +538,10 @@ snapshots intentionally do not rewind pass scheduling; only this replay envelope
 checkpoint contains key material, and the writer creates directories/files with owner-only modes. The report CLI
 accepts `--replay-capsule FILE` and verifies the captured engine fingerprint. `promote_failure_capsule_to_vector` accepts only
 `synthetic_shareable` capsules, preserves the intended exact or semantic expectation rather than the buggy observed
-trace, and uses the fingerprint-preserving minimized scenario when present. It refuses capsules without a portable
-expectation.
+trace, and may use a semantic-identity-preserving minimized scenario only through this explicit reviewed-promotion
+path. That is not a full-fingerprint or terminal-state-digest attestation: the reviewer must rerun the promoted
+candidate and validate that its portable expectation still expresses the intended regression. Automatic generated
+fixture candidates do not take this exception. Promotion refuses capsules without a portable expectation.
 
 ### Milestone 1 Exit Gate
 
@@ -1095,8 +1097,10 @@ The reducer now treats paired transport, partition, lifecycle, and storage actio
 independent noise. Non-layer-specific failures receive a canonical Scenario IR candidate for the next smaller adapter;
 the semantic identity must reproduce there before concluding that the larger layer is uninvolved. Promotion remains
 restricted to synthetic shareable capsules with portable expectations. Semantic minimization may change the terminal
-state digest, so generated fixture candidates retain the original executed scenario; the smaller case is labeled only
-as diagnostic report metadata unless a separate replay contract proves stronger fidelity.
+state digest, so automatic generated fixture candidates retain the original executed scenario. Two intentional corpus
+consumers use the smaller case under a narrower contract: corpus indexing records it as a semantic-identity reduction
+candidate, and explicit human-reviewed vector promotion may select it only after rerunning and validating the portable
+expectation. Neither path labels the reduced case as full-fingerprint-equivalent to the original execution.
 
 ### 6.5 Stateful canonical journeys
 
