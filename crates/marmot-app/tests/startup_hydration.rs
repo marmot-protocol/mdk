@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::types::GroupId;
 use marmot_account::AccountHome;
-use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime, SelfMembership};
+use marmot_app::{
+    AppError, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
+    SelfMembership,
+};
 use nostr_relay_builder::MockRelay;
 
 const BENCH_ACCOUNT: &str = "held";
@@ -192,6 +195,50 @@ async fn held_hydration_body() {
         GROUP_COUNT,
         "persisted chat list must hold every group while hydration is held"
     );
+
+    // The identifier-only roster page is the bounded companion read for that
+    // chat projection (mdk#1314). One worker command promotes only the named
+    // groups from durable state and returns every roster without waiting for
+    // the held background pipeline or doing profile enrichment.
+    let page_started = Instant::now();
+    let member_ids_page = tokio::time::timeout(
+        Duration::from_millis(BATCH_HOLD_MS / 2),
+        runtime.group_member_ids_page(BENCH_ACCOUNT, &group_ids),
+    )
+    .await
+    .expect("bounded membership read must not wait out the hydration hold")
+    .unwrap();
+    assert_eq!(member_ids_page.len(), GROUP_COUNT);
+    for (row, group_id) in member_ids_page.iter().zip(&group_ids) {
+        assert_eq!(row.group_id_hex, hex::encode(group_id.as_slice()));
+        assert_eq!(row.member_ids_hex.len(), 2);
+        assert!(row.member_ids_hex.contains(&donor_id));
+    }
+    assert!(
+        page_started.elapsed() < Duration::from_millis(BATCH_HOLD_MS / 2),
+        "bounded membership read must not wait out the pipeline hold"
+    );
+
+    // A page is all-or-error: an unknown (including quarantine-hidden) group
+    // cannot produce a partial response containing the preceding safe row.
+    let unknown = GroupId::new(vec![0xff; 16]);
+    assert!(matches!(
+        runtime
+            .group_member_ids_page(BENCH_ACCOUNT, &[group_ids[0].clone(), unknown])
+            .await,
+        Err(AppError::UnknownGroup(_))
+            | Err(AppError::Session(cgka_session::SessionError::Engine(
+                cgka_traits::error::EngineError::UnknownGroup(_)
+            )))
+    ));
+
+    let oversized = vec![group_ids[0].clone(); MAX_GROUP_MEMBER_IDS_PAGE_SIZE + 1];
+    assert!(matches!(
+        runtime
+            .group_member_ids_page(BENCH_ACCOUNT, &oversized)
+            .await,
+        Err(AppError::InvalidGroupMembershipPage(_))
+    ));
 
     // A group read issued during the hold hydrates exactly the group it
     // names and answers from live state — it must not wait out the hold.

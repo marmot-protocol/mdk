@@ -44,7 +44,7 @@ uniffi::setup_scaffolding!();
 
 pub use commands::{InitialGroupImageFfi, parse_media_imeta_tag};
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditDataModeFfi,
+    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi, AuditDataModeFfi,
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
     AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
     BackgroundNotificationCollectionFfi, ChatConversationKindFfi, ChatListAttachmentKindFfi,

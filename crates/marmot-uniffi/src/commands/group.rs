@@ -10,13 +10,13 @@ use cgka_traits::GroupId;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
-    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMutationResultFfi, GroupRosterFfi, KeyPackageMaintenanceStatusFfi,
-    MaintenanceRunSummaryFfi, MemberRefFfi, PeriodicMaintenancePolicyFfi, SendSummaryFfi,
-    group_details_ffi, group_id_from_hex, group_management_state_ffi, group_roster_ffi,
-    normalize_member_ref_ffi,
+    AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
+    AppGroupRecordFfi, AppQuarantinedGroupFfi, DisbandRequestFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
+    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
+    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
+    group_management_state_ffi, group_roster_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -321,6 +321,34 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let members = self.runtime.group_members(&account_ref, &group_id).await?;
         Ok(members.into_iter().map(Into::into).collect())
+    }
+
+    /// Identifier-only rosters for a bounded page of groups.
+    ///
+    /// This is the chat-projection companion read: it is one worker command,
+    /// performs no profile enrichment, and fails the whole page if any group
+    /// is unknown or quarantined.
+    pub async fn group_member_ids_page(
+        &self,
+        account_ref: String,
+        group_ids_hex: Vec<String>,
+    ) -> Result<Vec<AppGroupMemberIdsFfi>, MarmotKitError> {
+        if group_ids_hex.len() > marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE {
+            return Err(MarmotKitError::InvalidGroupMembershipPage {
+                max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
+            });
+        }
+        let group_ids = group_ids_hex
+            .iter()
+            .map(|group_id_hex| group_id_from_hex(group_id_hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .runtime
+            .group_member_ids_page(&account_ref, &group_ids)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     /// Group plus enriched member rows for detail screens.

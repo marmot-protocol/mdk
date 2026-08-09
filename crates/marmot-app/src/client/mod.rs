@@ -195,6 +195,25 @@ impl GroupReadSnapshot {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
+    pub(crate) fn member_ids_page(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        group_ids
+            .iter()
+            .map(|group_id| {
+                let members = self.members(group_id)?;
+                Ok(crate::AppGroupMemberIds {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex: members
+                        .into_iter()
+                        .map(|member| member.member_id_hex)
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         self.mls_state
             .get(group_id)
@@ -847,6 +866,28 @@ impl AppClient {
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<AppGroupMemberRecord>, AppError> {
         let profiles = self.app.profiles_by_id()?;
         self.members_with_profiles(group_id, &profiles)
+    }
+
+    pub(crate) fn member_ids_page(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+        group_ids
+            .iter()
+            .map(|group_id| {
+                self.ensure_group(group_id)?;
+                let member_ids_hex = self
+                    .runtime
+                    .members(group_id)?
+                    .into_iter()
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                Ok(crate::AppGroupMemberIds {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    member_ids_hex,
+                })
+            })
+            .collect()
     }
 
     /// Build a group's member records against a caller-provided account-profile

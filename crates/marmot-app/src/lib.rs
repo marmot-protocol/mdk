@@ -154,11 +154,11 @@ pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
     AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
-    group_system_event_from_message,
+    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,

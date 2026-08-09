@@ -108,6 +108,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<Vec<AppGroupMemberRecord>, AppError>>,
     },
+    MemberIdsPage {
+        group_ids: Vec<GroupId>,
+        respond: oneshot::Sender<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
+    },
     GroupMlsState {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
@@ -463,10 +467,10 @@ async fn run_app_runtime_account_worker(
     // The session's cheap open pass has seeded every stored group. Signal
     // command-readiness *now*: the hydration pipeline right below enters its
     // command-serving loop immediately, so "ready" genuinely means "serving
-    // commands" — group reads (`Members` / `GroupMlsState` / `GroupRoster` /
-    // `QuarantinedGroups`) issued from this point hydrate exactly the group
-    // they name and answer live, and everything else joins the startup
-    // deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
+    // commands" — group reads (`Members` / `MemberIdsPage` / `GroupMlsState` /
+    // `GroupRoster` / `QuarantinedGroups`) issued from this point hydrate the
+    // group(s) they name and answer live. Everything else
+    // joins the startup deferral. `AccountOpen` (recorded by `reconcile` as the ready-wait)
     // measures the seeded open; the mdk#1161 stage telemetry attributes it
     // (`AccountSessionOpen` / `AccountGroupHydration` for the open the
     // worker just awaited, with the pipeline and snapshot capture measured
@@ -584,6 +588,16 @@ async fn run_app_runtime_account_worker(
                                 // state after catch-up instead of guessing.
                                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
                                     AccountWorkerCommand::Members { group_id, respond },
+                                ))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::MemberIdsPage { group_ids, respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.member_ids_page(&group_ids));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(
+                                    AccountWorkerCommand::MemberIdsPage { group_ids, respond },
                                 ))),
                             }
                         }
@@ -1241,6 +1255,14 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(snapshot.members(&group_id));
                 }
+                AccountWorkerCommand::MemberIdsPage { group_ids, respond }
+                    if snapshot_reads_available =>
+                {
+                    let snapshot = read_snapshot
+                        .as_ref()
+                        .expect("snapshot availability checked above");
+                    let _ = respond.send(snapshot.member_ids_page(&group_ids));
+                }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
                     if snapshot_reads_available =>
                 {
@@ -1507,6 +1529,9 @@ async fn handle_startup_hydration_command(
                 .ensure_group_hydrated(&group_id);
             let _ = respond.send(client.members(&group_id));
         }
+        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+            let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
+        }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let _ = client
                 .runtime
@@ -1532,7 +1557,8 @@ async fn handle_startup_hydration_command(
 /// Extracted so the worker can drive commands from two places: the steady-state
 /// command loop, and the deferred-command replay that runs after catch-up
 /// completes (commands that arrived while catch-up held `&mut client`). Read
-/// commands (`Members` / `GroupMlsState` / `QuarantinedGroups`) are also
+/// commands (`Members` / `MemberIdsPage` / `GroupMlsState` /
+/// `QuarantinedGroups`) are also
 /// intercepted inline during catch-up and answered from a `GroupReadSnapshot`;
 /// here they read the live session.
 async fn handle_account_worker_command(
@@ -1687,6 +1713,11 @@ async fn handle_account_worker_command(
                 .ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
             let _ = respond.send(result);
+        }
+        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+            // The page is one worker command, but each requested group keeps
+            // the same on-demand promotion and quarantine gate as `Members`.
+            let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             // See the Members arm: on-demand promotion for pipeline-abort
@@ -2380,6 +2411,23 @@ pub(super) fn group_roster_after_hydration(
         .ensure_group_hydrated(group_id)?;
     client.reconcile_group_self_membership(group_id)?;
     client.group_roster_session(group_id)
+}
+
+fn member_ids_page_after_hydration(
+    client: &mut AppClient,
+    group_ids: &[GroupId],
+) -> Result<Vec<crate::AppGroupMemberIds>, AppError> {
+    // Match every existing worker-routed group read: a seeded group promotes
+    // on demand, while a failed promotion enters quarantine and is exposed as
+    // UnknownGroup. Build the response only after all requested rosters pass
+    // that gate so callers never receive a partial page.
+    for group_id in group_ids {
+        let _live = client
+            .runtime
+            .session_mut()
+            .ensure_group_hydrated(group_id)?;
+    }
+    client.member_ids_page(group_ids)
 }
 
 fn group_roster_from_snapshot(
