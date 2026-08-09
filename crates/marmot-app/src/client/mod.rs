@@ -143,14 +143,14 @@ fn recover_post_canonical_result<T: Default>(
 /// A point-in-time copy of the live session's read-only group projections
 /// (`members`, `group_mls_state`, `quarantined_groups`).
 ///
-/// The account worker captures this from the freshly hydrated session and uses
-/// it to answer read commands *while the initial relay catch-up runs in the
-/// background* — the catch-up future holds `&mut AppClient`, so concurrent reads
-/// cannot touch the live session and are served from this snapshot instead.
+/// The account worker captures this from the live session and uses it to answer
+/// read commands while a relay catch-up runs in the background. The catch-up
+/// future holds `&mut AppClient`, so concurrent reads cannot touch the live
+/// session and are served from this snapshot instead.
 /// Membership/epoch only change on a committed group operation, which the
 /// catch-up surfaces via `GroupStateUpdated` so subscribers re-read once it
 /// lands; the snapshot is therefore a brief, self-healing stand-in, only used
-/// until the initial catch-up completes (after which reads go live again).
+/// until the catch-up completes (after which reads go live again).
 ///
 /// Groups whose live read errored at capture time (e.g. quarantined / not yet
 /// live) are simply absent; a read for an absent group returns `UnknownGroup`,
@@ -827,8 +827,8 @@ impl AppClient {
     /// Capture a [`GroupReadSnapshot`] of every known group's read-only
     /// projections from the live (hydrated) session.
     ///
-    /// Used by the account worker to answer read commands during the initial
-    /// relay catch-up without blocking on it; see [`GroupReadSnapshot`]. Reads
+    /// Used by the account worker to answer read commands during relay catch-up
+    /// without blocking on it; see [`GroupReadSnapshot`]. Reads
     /// that error for a given group (quarantined / not yet live) are omitted —
     /// the snapshot accessor reports those as `UnknownGroup`, matching the live
     /// path for a group the session does not hold.
@@ -847,6 +847,10 @@ impl AppClient {
         telemetry: &crate::app_telemetry::AppPerformanceTelemetry,
     ) -> Result<GroupReadSnapshot, AppError> {
         self.group_read_snapshot_inner(Some(telemetry))
+    }
+
+    pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
+        self.group_read_snapshot_inner(None)
     }
 
     fn group_read_snapshot_inner(

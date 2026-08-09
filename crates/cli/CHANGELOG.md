@@ -68,6 +68,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   
 ### Fixed
 
+- Existing-group invite commands now return after the required relay
+  acknowledgement and durable local refresh instead of waiting for an
+  all-account read-side catch-up. Account workers serve group projection reads
+  from a fresh local snapshot while detached catch-up runs, so overlapping
+  invites keep their immediate reads responsive without suppressing another
+  local account's incoming Welcome. Deferred account opens now finish
+  live-state projection repair after group hydration, preventing a committed
+  overlapping invite from failing worker readiness as not-yet-hydrated. The
+  work remains visible in the existing invite-stage telemetry
+  ([#1309](https://github.com/marmot-protocol/mdk/pull/1309)).
+
 - Account setup interruptions now have stable JSON recovery codes and repair
   hints instead of falling through to the generic `command_failed` bucket.
 

@@ -1,7 +1,7 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -802,26 +802,48 @@ async fn run_app_runtime_account_worker(
             command = commands.recv() => {
                 match command {
                     Some(command) => {
-                        let may_change_push_registration_work =
-                            command.may_change_push_registration_work();
-                        handle_account_worker_command(
-                            &mut client,
-                            command,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            &shared,
-                        )
-                        .await;
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                        if may_change_push_registration_work {
-                            scheduled_push_retry.observe_pending(
-                                client.has_pending_push_registration_work(),
-                                &command_tx,
+                        let mut pending = VecDeque::from([command]);
+                        while let Some(command) = pending.pop_front() {
+                            let may_change_push_registration_work =
+                                command.may_change_push_registration_work();
+                            match command {
+                                AccountWorkerCommand::CatchUp { respond } => {
+                                    handle_account_worker_catch_up(
+                                        &mut client,
+                                        respond,
+                                        &mut commands,
+                                        &mut pending,
+                                        AccountWorkerCatchUpContext {
+                                            events: &events,
+                                            account_id_hex: &account_id_hex,
+                                            account_label: &account_label,
+                                            shared: &shared,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                command => {
+                                    handle_account_worker_command(
+                                        &mut client,
+                                        command,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                    )
+                                    .await;
+                                }
+                            }
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
                             );
+                            if may_change_push_registration_work {
+                                scheduled_push_retry.observe_pending(
+                                    client.has_pending_push_registration_work(),
+                                    &command_tx,
+                                );
+                            }
                         }
                     }
                     None => return,
@@ -1091,14 +1113,130 @@ async fn run_app_runtime_account_worker(
     }
 }
 
-/// Process a single account-worker command against the live session.
-///
-/// Extracted so the worker can drive commands from two places: the steady-state
-/// command loop, and the deferred-command replay that runs after the initial
-/// catch-up completes (commands that arrived while the catch-up held
-/// `&mut client`). Read commands (`Members` / `GroupMlsState` /
-/// `QuarantinedGroups`) are also intercepted inline during the initial catch-up
-/// and answered from a `GroupReadSnapshot`; here they read the live session.
+/// Run a steady-state catch-up while preserving prompt read-only projection
+/// access. The sync future exclusively borrows the live client, so reads that
+/// arrive before another state-changing command are answered from a snapshot
+/// captured immediately before the sync. Once a non-read command is deferred,
+/// later reads remain behind it to preserve worker FIFO semantics.
+/// Additional catch-up requests received before such a command coalesce onto
+/// the in-flight sync.
+struct AccountWorkerCatchUpContext<'a> {
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
+}
+
+async fn handle_account_worker_catch_up(
+    client: &mut AppClient,
+    respond: oneshot::Sender<Result<(), String>>,
+    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    pending: &mut VecDeque<AccountWorkerCommand>,
+    context: AccountWorkerCatchUpContext<'_>,
+) {
+    let read_snapshot = match client.group_read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let message = account_error_message("runtime catch-up snapshot failed", &err);
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                message.clone(),
+            );
+            let _ = respond.send(Err(message));
+            return;
+        }
+    };
+    let mut catch_up_responders = vec![respond];
+    let mut deferred = VecDeque::new();
+    let mut commands_open = true;
+    let sync_started_at = Instant::now();
+    let sync_result = {
+        let mut sync = std::pin::pin!(client.sync());
+        loop {
+            let command = if let Some(command) = pending.pop_front() {
+                Some(command)
+            } else {
+                tokio::select! {
+                    biased;
+                    result = &mut sync => break result,
+                    command = commands.recv(), if commands_open => {
+                        if command.is_none() {
+                            commands_open = false;
+                        }
+                        command
+                    }
+                }
+            };
+            let Some(command) = command else {
+                continue;
+            };
+            match command {
+                AccountWorkerCommand::Members { group_id, respond } if deferred.is_empty() => {
+                    let _ = respond.send(read_snapshot.members(&group_id));
+                }
+                AccountWorkerCommand::GroupMlsState { group_id, respond }
+                    if deferred.is_empty() =>
+                {
+                    let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                }
+                AccountWorkerCommand::QuarantinedGroups { respond } if deferred.is_empty() => {
+                    let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                }
+                AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
+                    catch_up_responders.push(respond);
+                }
+                command => deferred.push_back(command),
+            }
+        }
+    };
+    let result = match sync_result {
+        Ok(summary) => {
+            publish_app_runtime_summary(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                &summary,
+            );
+            if client.has_pending_epoch_backfill() {
+                context
+                    .shared
+                    .schedule_audit_log_tracker_update("epoch_backfill_armed");
+            }
+            if sync_summary_triggers_audit_tracker_update(&summary) {
+                context.shared.schedule_audit_log_tracker_update("catch_up");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let message = account_error_message("runtime catch-up failed", &err);
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                message.clone(),
+            );
+            Err(message)
+        }
+    };
+    context.shared.app_performance_telemetry().record(
+        AppPerformanceOperation::AccountSync,
+        sync_started_at.elapsed(),
+        result.is_ok(),
+    );
+    let retry_after_response = result.is_ok();
+    for respond in catch_up_responders {
+        let _ = respond.send(result.clone());
+    }
+    pending.append(&mut deferred);
+    if retry_after_response {
+        client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+    }
+}
+
 /// Groups fully hydrated per background-pipeline batch (mdk#1161). Small so
 /// a command queued mid-pipeline waits at most one batch of MLS loads plus
 /// its own group's hydration.
@@ -1140,6 +1278,7 @@ async fn run_startup_hydration_pipeline(
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
     if client.runtime.session().unhydrated_group_ids().is_empty() {
+        finish_deferred_hydration_reconciliation(client);
         return StartupHydrationOutcome::Completed;
     }
     let pipeline_started = Instant::now();
@@ -1233,17 +1372,21 @@ async fn run_startup_hydration_pipeline(
         pipeline_started.elapsed(),
         pipeline_ok,
     );
-    // Rosters are readable now; finish the once-only self-membership
-    // backfill the deferred open had to leave pending.
-    if let Err(err) = client.backfill_self_membership_once() {
+    // Live group state is readable now; finish the projection repairs that
+    // the deferred open deliberately skipped.
+    finish_deferred_hydration_reconciliation(client);
+    StartupHydrationOutcome::Completed
+}
+
+fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
+    if let Err(err) = client.reconcile_hydrated_account_state() {
         tracing::warn!(
             target: "marmot_app::runtime",
             method = "run_startup_hydration_pipeline",
             error_kind = err.privacy_safe_kind(),
-            "post-hydration self-membership backfill failed; retrying next open"
+            "post-hydration account reconciliation failed; retrying next open"
         );
     }
-    StartupHydrationOutcome::Completed
 }
 
 /// Eagerly drain a deferred open's hydration without serving commands, for
@@ -1255,7 +1398,7 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
             .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
-            return Ok(());
+            return client.reconcile_hydrated_account_state();
         }
         tokio::task::yield_now().await;
     }
@@ -1297,6 +1440,14 @@ async fn handle_startup_hydration_command(
     }
 }
 
+/// Process a single account-worker command against the live session.
+///
+/// Extracted so the worker can drive commands from two places: the steady-state
+/// command loop, and the deferred-command replay that runs after catch-up
+/// completes (commands that arrived while catch-up held `&mut client`). Read
+/// commands (`Members` / `GroupMlsState` / `QuarantinedGroups`) are also
+/// intercepted inline during catch-up and answered from a `GroupReadSnapshot`;
+/// here they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
