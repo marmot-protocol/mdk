@@ -3,7 +3,10 @@
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 use url::Url;
 
-use super::blossom::{read_limited_blossom_body, vet_profile_fetch_resolved_addresses};
+use super::blossom::{
+    build_pinned_media_http_client_with_proxy_for_test, read_limited_blossom_body,
+    vet_profile_fetch_resolved_addresses,
+};
 use super::host_safety::{parse_profile_image_fetch_url, validate_profile_image_fetch_url};
 use super::tests::{
     http_ok_response, http_redirect_response, spawn_http_response, spawn_http_responses,
@@ -223,6 +226,34 @@ async fn download_profile_image_follows_redirect_to_local_listener() {
         .expect("profile fetch should follow one redirect to the final body");
 
     assert_eq!(bytes, b"avatar-bytes");
+}
+
+#[tokio::test]
+async fn pinned_media_client_ignores_configured_proxy() {
+    let origin_url = spawn_http_response(http_ok_response(b"direct-origin"));
+    let origin = Url::parse(&origin_url).expect("origin listener URL");
+    let origin_addr = std::net::SocketAddr::new(
+        origin.host_str().unwrap().parse().unwrap(),
+        origin.port().unwrap(),
+    );
+    let proxy_url = spawn_http_response(http_ok_response(b"proxy-used"));
+    let client = build_pinned_media_http_client_with_proxy_for_test(
+        Some(("profile-image.test".into(), vec![origin_addr])),
+        &proxy_url,
+    )
+    .expect("build pinned client with a configured proxy");
+
+    let response = client
+        .get(format!(
+            "http://profile-image.test:{}/avatar.png",
+            origin_addr.port()
+        ))
+        .send()
+        .await
+        .expect("pinned client must dial the vetted origin directly");
+    let body = response.bytes().await.expect("read origin response");
+
+    assert_eq!(body.as_ref(), b"direct-origin");
 }
 
 #[tokio::test]

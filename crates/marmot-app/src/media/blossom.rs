@@ -445,7 +445,14 @@ async fn media_http_client_for_url(
 fn build_pinned_media_http_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
-    let mut builder = reqwest::Client::builder()
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin)
+}
+
+fn build_pinned_media_http_client_from_builder(
+    builder: reqwest::ClientBuilder,
+    pin: Option<(String, Vec<SocketAddr>)>,
+) -> Result<reqwest::Client, AppError> {
+    let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
         .read_timeout(MEDIA_HTTP_READ_TIMEOUT)
@@ -461,6 +468,16 @@ fn build_pinned_media_http_client(
     builder
         .build()
         .map_err(|_| AppError::BlobStore("failed to build HTTP client".into()))
+}
+
+#[cfg(test)]
+pub(super) fn build_pinned_media_http_client_with_proxy_for_test(
+    pin: Option<(String, Vec<SocketAddr>)>,
+    proxy_url: &str,
+) -> Result<reqwest::Client, AppError> {
+    let proxy = reqwest::Proxy::all(proxy_url)
+        .map_err(|_| AppError::BlobStore("failed to configure test HTTP proxy".into()))?;
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder().proxy(proxy), pin)
 }
 
 async fn resolve_media_host(
