@@ -732,6 +732,16 @@ impl MarmotRelayPlane {
             .handle_relay_event(relay_event)
             .await
     }
+
+    /// Drive the managed account worker through its receive-error reconnect path
+    /// by closing inbound delivery, matching relay-notification recovery.
+    #[cfg(test)]
+    pub(crate) fn simulate_notification_recovery_for_test(&self, skipped_notifications: u64) {
+        recover_relay_notification_forwarder(
+            &self.inner.transport,
+            RelayNotificationConsumerExit::Lagged(skipped_notifications),
+        );
+    }
 }
 
 impl RelayPlaneHealth {

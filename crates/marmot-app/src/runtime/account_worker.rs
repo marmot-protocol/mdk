@@ -360,6 +360,12 @@ pub(crate) enum AccountWorkerCommand {
         reason: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    /// Count seeded groups the session has not fully hydrated yet, without
+    /// promoting them on demand (mdk#1337 regression probe).
+    #[cfg(test)]
+    UnhydratedGroupCount {
+        respond: oneshot::Sender<usize>,
+    },
 }
 
 impl AccountWorkerCommand {
@@ -1348,6 +1354,9 @@ async fn handle_account_worker_catch_up(
 /// its own group's hydration.
 const STARTUP_HYDRATION_BATCH_SIZE: usize = 4;
 
+#[cfg(test)]
+pub(crate) const STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST: usize = STARTUP_HYDRATION_BATCH_SIZE;
+
 /// Commands served between hydration batches. Bounded so sustained
 /// account-worker traffic cannot starve the pipeline: without a budget, an
 /// unbounded drain-until-empty could defer hydration (and the mutation
@@ -1545,6 +1554,11 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
         }
+        #[cfg(test)]
+        AccountWorkerCommand::UnhydratedGroupCount { respond } => {
+            let count = client.runtime.session().unhydrated_group_ids().len();
+            let _ = respond.send(count);
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
@@ -1572,6 +1586,11 @@ async fn handle_account_worker_command(
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
             let _ = respond.send(());
+        }
+        #[cfg(test)]
+        AccountWorkerCommand::UnhydratedGroupCount { respond } => {
+            let count = client.runtime.session().unhydrated_group_ids().len();
+            let _ = respond.send(count);
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();

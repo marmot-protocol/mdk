@@ -28,6 +28,26 @@ use crate::{
 };
 
 impl AccountManager {
+    #[cfg(test)]
+    pub(super) async fn unhydrated_group_count_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<usize, AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::UnhydratedGroupCount { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        match tokio::time::timeout(super::APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+            Ok(Ok(count)) => Ok(count),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::BlockingTask(
+                "account worker unhydrated-group probe timed out".into(),
+            )),
+        }
+    }
+
     pub(super) fn spawn_invite_catch_up(&self) {
         let mut tasks = self
             .invite_catch_up_tasks
