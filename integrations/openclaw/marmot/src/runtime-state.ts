@@ -69,11 +69,15 @@ export function markMarmotOutboundSent(
   sentAt: number = Date.now(),
 ): void {
   const nextAccountId = accountIdOrDefault(accountId);
-  const base = inboundRuntime.accountId === nextAccountId
-    ? inboundRuntime
-    : stoppedSnapshot(nextAccountId);
+  // This compatibility slot describes one active inbound account. An outbound
+  // send for another configured account must not replace that live status with
+  // a synthetic stopped snapshot; the host-owned per-account runtime remains
+  // authoritative for the other account.
+  if (inboundRuntime.accountId !== nextAccountId) {
+    return;
+  }
   inboundRuntime = {
-    ...base,
+    ...inboundRuntime,
     lastOutboundAt: sentAt,
   };
 }

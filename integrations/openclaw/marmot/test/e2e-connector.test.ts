@@ -109,7 +109,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
       // non-writable by other users, and Unix sockets have a short path limit.
       // A direct /tmp child fails the first invariant while a deep worktree path
       // can fail the second, so use the user's short, owned cache root.
-      const cacheRoot = join(homedir(), ".cache");
+      const cacheRoot = process.env.XDG_CACHE_HOME?.trim() || join(homedir(), ".cache");
       await mkdir(cacheRoot, { recursive: true, mode: 0o700 });
       const tempRoot = await mkdtemp(join(cacheRoot, "openclaw-e2e-"));
       const marmotHome = join(tempRoot, "marmot-home");

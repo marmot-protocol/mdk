@@ -5,6 +5,8 @@ import { KeyedAsyncQueue } from "openclaw/plugin-sdk/core";
 
 export const DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32;
 
+// Copied from the OpenClaw host assertion. This classification is best-effort:
+// an upstream wording change safely degrades to the generic `error` bucket.
 const OPENCLAW_DISPATCH_LIFECYCLE_ERROR =
   "runChannelInboundEvent prepared turns must declare runDispatchLifecycle when creating runDispatch";
 
@@ -16,9 +18,6 @@ const OPENCLAW_DISPATCH_LIFECYCLE_ERROR =
 export function classifyInboundDispatchFailure(error: unknown): string {
   if (error instanceof Error && error.message === OPENCLAW_DISPATCH_LIFECYCLE_ERROR) {
     return "openclaw_dispatch_lifecycle_contract";
-  }
-  if (error instanceof TypeError) {
-    return "type_error";
   }
   if (error instanceof Error) {
     return "error";

@@ -3,14 +3,23 @@ set -euo pipefail
 
 plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 beta_version="2026.7.2-beta.7"
+update_lock=false
+case "${1:-}" in
+  "") ;;
+  --update-lock) update_lock=true ;;
+  *)
+    echo "usage: $0 [--update-lock]" >&2
+    exit 2
+    ;;
+esac
 compat_root="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-host-compat.XXXXXX")"
 trap 'rm -rf "$compat_root"' EXIT
 
 # Fail with a direct diagnostic if the pinned beta has disappeared instead of
 # letting dependency installation fail later with a less useful resolver error.
-published_version="$(npm view "openclaw@$beta_version" version)"
+published_version="$(npm view "openclaw@$beta_version" version 2>/dev/null || true)"
 if [ "$published_version" != "$beta_version" ]; then
-  echo "error: expected OpenClaw beta $beta_version, got $published_version" >&2
+  echo "error: OpenClaw beta $beta_version is not available from npm" >&2
   exit 1
 fi
 
@@ -27,6 +36,12 @@ cp -R "$plugin_dir/test" "$compat_root/"
 
 cd "$compat_root"
 npm pkg set "devDependencies.openclaw=$beta_version" >/dev/null
+if [ "$update_lock" = true ]; then
+  pnpm install --ignore-scripts --lockfile-only
+  cp pnpm-lock.yaml "$plugin_dir/test/pnpm-lock.openclaw-beta.yaml"
+  echo "updated $plugin_dir/test/pnpm-lock.openclaw-beta.yaml"
+  exit 0
+fi
 # This dedicated lock fixes the complete beta dependency graph while the
 # compatibility lane exercises the deliberately different host SDK contract.
 pnpm install --ignore-scripts --frozen-lockfile

@@ -19,6 +19,8 @@ import {
   SentMessageTargetCache,
 } from "../src/outbound.js";
 import {
+  markMarmotInboundReady,
+  markMarmotInboundStarting,
   marmotInboundRuntimeSnapshot,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
@@ -142,6 +144,32 @@ describe("createMarmotMessageAdapter", () => {
     });
     expect(adapter.durableFinal?.capabilities).toMatchObject(required);
     expect(Object.prototype.hasOwnProperty.call(adapter, "live")).toBe(false);
+  });
+
+  it("does not evict another account's active inbound status after a send", async () => {
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    const adapter = createMarmotMessageAdapter({
+      resolveTarget: () => ({
+        client: stubClient(emptyClientCalls()),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+      nowMs: () => 2468,
+    });
+
+    await adapter.send!.text!({
+      cfg: {},
+      accountId: "personal",
+      to: HEX32("cc"),
+      text: "cross-account send",
+    } as unknown as ChannelMessageSendTextContext);
+
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      accountId: "work",
+      running: true,
+      connected: true,
+    });
+    expect(marmotInboundRuntimeSnapshot("personal").lastOutboundAt).toBeUndefined();
   });
 
   it("routes a media send with a local path to send_media with the caption", async () => {
