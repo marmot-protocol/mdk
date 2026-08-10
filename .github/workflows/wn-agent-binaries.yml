@@ -305,6 +305,9 @@ jobs:
             pnpm test
             pnpm build
           )
+          # Rebuild and exercise the SDK-coupled messaging seams against the
+          # beta host contract that differs from the pinned stable SDK.
+          integrations/openclaw/marmot/test/openclaw-host-compat.sh
           # Provenance manifest (release.md requires one in each artifact); ships
           # via package.json#files alongside the built plugin.
           cat > integrations/openclaw/marmot/manifest.json <<EOF

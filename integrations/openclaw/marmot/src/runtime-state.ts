@@ -63,6 +63,21 @@ export function markMarmotInboundReceived(accountId?: string | null): void {
   };
 }
 
+/** Record a durable outbound receipt for channel status/probe reporting. */
+export function markMarmotOutboundSent(
+  accountId?: string | null,
+  sentAt: number = Date.now(),
+): void {
+  const nextAccountId = accountIdOrDefault(accountId);
+  const base = inboundRuntime.accountId === nextAccountId
+    ? inboundRuntime
+    : stoppedSnapshot(nextAccountId);
+  inboundRuntime = {
+    ...base,
+    lastOutboundAt: sentAt,
+  };
+}
+
 export function markMarmotInboundReconnect(accountId?: string | null): void {
   inboundRuntime = {
     ...inboundRuntime,

@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   deriveDurableFinalDeliveryRequirements,
   type ChannelMessageSendMediaContext,
@@ -18,8 +18,16 @@ import {
   receiptFromMessageIds,
   SentMessageTargetCache,
 } from "../src/outbound.js";
+import {
+  marmotInboundRuntimeSnapshot,
+  resetMarmotInboundRuntimeForTests,
+} from "../src/runtime-state.js";
 
 const HEX32 = (b: string) => b.repeat(32);
+
+afterEach(() => {
+  resetMarmotInboundRuntimeForTests();
+});
 
 interface SendFinalCall {
   accountIdHex: string;
@@ -110,6 +118,7 @@ describe("createMarmotMessageAdapter", () => {
     expect(result.receipt.platformMessageIds).toEqual([HEX32("ab")]);
     expect(result.receipt.parts[0]).toMatchObject({ kind: "text", index: 0 });
     expect(result.receipt.sentAt).toBe(1234);
+    expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(1234);
   });
 
   it("declares the capabilities required by OpenClaw durable inbound delivery", () => {
