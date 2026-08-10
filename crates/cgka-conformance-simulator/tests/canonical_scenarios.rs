@@ -6,15 +6,16 @@
 
 use cgka_conformance_simulator::{
     ClientBuilder, ConformanceCanonicalStateSnapshot, EpochChangeObservation,
-    GeneratedScenarioCase, HarnessClient, HarnessStorageMode, PendingResolutionObservation,
+    GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedSubjectKind, HarnessClient,
+    HarnessStorageMode, PendingResolutionObservation, RelayHistoryCompletenessClaimV2,
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
     ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
     ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
     compare_trace_expectations, generate_admin_churn_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
-    observe_client_exact, run_generated_case_report, run_scenario_report,
-    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
-    run_vector_fixture_report_with_storage_mode,
+    observe_client_exact, run_generated_case_report, run_generated_case_report_with_storage_mode,
+    run_scenario_report, run_scenario_report_with_outcomes, run_scenario_spec,
+    run_vector_fixture_report, run_vector_fixture_report_with_storage_mode,
 };
 use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -3259,6 +3260,102 @@ async fn cross_route_own_commit_recovery_survives_restart_with_exact_agreement()
                 .unwrap_or_else(|| {
                     panic!(
                         "{} missing durable disposition for {scenario_id}",
+                        observation.client
+                    )
+                });
+            assert_eq!(
+                entry.disposition, disposition,
+                "{} disposition for {scenario_id}",
+                observation.client
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cross_route_recovery_uses_retained_history_after_restart() {
+    let input_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "vectors/generated-inputs/cross-route-retained-history-recovery.generated-input.json",
+    );
+    let input: GeneratedScenarioInputV1 = serde_json::from_str(
+        &std::fs::read_to_string(&input_path).expect("retained cross-route input contents"),
+    )
+    .expect("retained cross-route input parses");
+    input
+        .validate()
+        .expect("generated input version is supported");
+    assert_eq!(input.case.subject, GeneratedSubjectKind::RetainedRelay);
+
+    let report = run_generated_case_report_with_storage_mode(
+        &input.case,
+        None,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .expect("retained cross-route scenario executes");
+    assert!(
+        report.expectation_failures.is_empty(),
+        "retained cross-route expectations must pass: {:#?}",
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "retained cross-route invariants must pass: {:#?}",
+        report.invariant_failures
+    );
+
+    let full_history = report
+        .relay_sync_observations
+        .iter()
+        .filter(|observation| {
+            observation.completeness == RelayHistoryCompletenessClaimV2::FullHistoryQueried
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        full_history.len(),
+        4,
+        "every participant queries full history"
+    );
+    assert!(
+        full_history
+            .iter()
+            .all(|observation| observation.injected_objects > 0),
+        "the final settlement must consume retained relay objects: {full_history:#?}"
+    );
+    for client in ["yankee", "zeta"] {
+        assert!(
+            report.relay_sync_observations.iter().any(|observation| {
+                observation.client == client
+                    && observation.completeness == RelayHistoryCompletenessClaimV2::RelayEoseOnly
+                    && observation.injected_objects == 1
+            }),
+            "{client} must consume its deliberately partial retained-history view"
+        );
+    }
+
+    let trace = report.observed_trace.expect("retained cross-route trace");
+    for observation in &trace.observations {
+        for (scenario_id, disposition) in [
+            (
+                "step-5:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+            (
+                "step-6:update_group_data",
+                ScenarioInputDisposition::Invalidated,
+            ),
+            (
+                "step-12:update_group_data",
+                ScenarioInputDisposition::Accepted,
+            ),
+        ] {
+            let entry = observation
+                .scenario_input_ledger
+                .iter()
+                .find(|entry| entry.scenario_id == scenario_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing retained-route disposition for {scenario_id}",
                         observation.client
                     )
                 });

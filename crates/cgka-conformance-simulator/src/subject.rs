@@ -1753,7 +1753,17 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 let recipient_ledger = recipient_ledgers[recipient]
                     .iter()
                     .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref())
-                    .cloned();
+                    .cloned()
+                    .map(|mut entry| {
+                        // Received ledgers preserve the authenticated account
+                        // identity, which can differ from the scenario's
+                        // device/client label under an explicit topology. The
+                        // logical application id already correlates this entry
+                        // to the probe send above, so expose the stable scenario
+                        // label in this scenario-owned observation.
+                        entry.sender = sender.clone();
+                        entry
+                    });
                 probes.push(DirectionalDecryptabilityProbe {
                     sender: sender.clone(),
                     recipient: recipient.clone(),
