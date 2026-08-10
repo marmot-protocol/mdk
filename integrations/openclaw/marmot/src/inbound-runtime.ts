@@ -12,37 +12,8 @@
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
-/**
- * OpenClaw stable awaits an onFlush Promise directly. 2026.7.2-beta instead
- * supplies a createFlush factory and expects admission + completion promises.
- * Keep the adapter structural so the packaged stable build can run on either
- * host without importing a beta-only type or branching on a version string.
- */
-interface CompatibleInboundDebounceFlush {
-  admission: Promise<void>;
-  completion: Promise<void>;
-}
-
-type CompatibleInboundDebounceFlushFactory = (params: {
-  dispatch: (lifecycle: unknown) => Promise<void>;
-}) => CompatibleInboundDebounceFlush;
-
-type CompatibleInboundDebouncerFactory = <T>(params: {
-  debounceMs: number;
-  buildKey: (item: T) => string | null | undefined;
-  onFlush: (
-    items: T[],
-    createFlush?: CompatibleInboundDebounceFlushFactory,
-  ) => Promise<void> | CompatibleInboundDebounceFlush;
-}) => {
-  enqueue: (item: T) => Promise<void>;
-};
-
-const createCompatibleInboundDebouncer =
-  createInboundDebouncer as unknown as CompatibleInboundDebouncerFactory;
-
-import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveSingleAccount } from "./account.js";
+import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
@@ -65,6 +36,54 @@ import {
   markMarmotInboundStopped,
 } from "./runtime-state.js";
 import { syncAllowlist } from "./security.js";
+
+/**
+ * OpenClaw stable awaits an onFlush Promise directly. 2026.7.2-beta instead
+ * supplies a createFlush factory and expects admission + completion promises.
+ * Keep the adapter structural so the packaged stable build can run on either
+ * host without importing a beta-only type or branching on a version string.
+ */
+export interface CompatibleInboundDebounceFlush {
+  admission: Promise<void>;
+  completion: Promise<void>;
+}
+
+export type CompatibleInboundDebounceFlushFactory = (params: {
+  dispatch: (lifecycle: unknown) => Promise<void>;
+}) => CompatibleInboundDebounceFlush;
+
+type CompatibleInboundDebouncerFactory = <T>(params: {
+  debounceMs: number;
+  buildKey: (item: T) => string | null | undefined;
+  onFlush: (
+    items: T[],
+    createFlush?: CompatibleInboundDebounceFlushFactory,
+  ) => Promise<void> | CompatibleInboundDebounceFlush;
+}) => {
+  enqueue: (item: T) => Promise<void>;
+  flushKey: (key: string) => Promise<void>;
+};
+
+export const createCompatibleInboundDebouncer =
+  createInboundDebouncer as unknown as CompatibleInboundDebouncerFactory;
+
+/**
+ * Adapt one coalesced batch to stable's Promise contract or beta's lifecycle
+ * pair. The beta completion deliberately means "admitted to Marmot's bounded
+ * per-group queue", not "the agent turn settled": the outer queue owns turn
+ * serialization and failure logging, matching stable's fire-and-forget seam.
+ * The factory-provided lifecycle argument is therefore intentionally ignored.
+ */
+export function createCompatibleInboundDebounceFlush<T>(
+  items: T[],
+  dispatchItems: (items: T[]) => Promise<void>,
+  createFlush?: CompatibleInboundDebounceFlushFactory,
+): Promise<void> | CompatibleInboundDebounceFlush {
+  const dispatch = async (): Promise<void> => dispatchItems(items);
+  return createFlush
+    ? createFlush({ dispatch: async (_lifecycle) => dispatch() })
+    : dispatch();
+}
 
 /** Minimal logger surface (subset of OpenClaw's PluginLogger). */
 interface InboundLogger {
@@ -361,16 +380,16 @@ export function startMarmotInbound(
             debounceMs: resolved.debounceMs,
             buildKey: (message) =>
               `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
-            onFlush: (items, createFlush) => {
-              const dispatchFlush = async (): Promise<void> => {
-                if (items.length > 0) {
-                  runQueued(coalesceInboundMessages(items));
-                }
-              };
-              return createFlush
-                ? createFlush({ dispatch: async () => dispatchFlush() })
-                : dispatchFlush();
-            },
+            onFlush: (items, createFlush) =>
+              createCompatibleInboundDebounceFlush(
+                items,
+                async (flushedItems): Promise<void> => {
+                  if (flushedItems.length > 0) {
+                    runQueued(coalesceInboundMessages(flushedItems));
+                  }
+                },
+                createFlush,
+              ),
           })
         : null;
     const submitInbound = (message: MarmotInboundMessage): void => {

@@ -180,6 +180,7 @@ describe("createMarmotMessageAdapter", () => {
       expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
       expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
       expect(result.receipt.sentAt).toBe(5678);
+      expect(marmotInboundRuntimeSnapshot("default").lastOutboundAt).toBe(5678);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
