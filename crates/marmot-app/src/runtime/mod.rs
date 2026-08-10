@@ -11,6 +11,7 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
+use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
 use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
@@ -38,16 +39,17 @@ use crate::{
     AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
     AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
     AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
-    ChatPinState, GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionTarget,
-    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
-    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
-    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
-    ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
-    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    ChatPinState, GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
+    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
+    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 mod account_worker;
@@ -716,10 +718,16 @@ pub struct SignOutOutcome {
 fn wipe_failure_reason(err: &AppError) -> String {
     let category = match err {
         AppError::RuntimeStopping => "runtime is shutting down",
-        AppError::Transport(TransportAdapterError::PublishEndpoints(failure)) => {
-            return failure.summary.clone();
+        AppError::Transport(transport) => {
+            if let Some(reason) = transport_publish_endpoint_failures_app_reason(transport) {
+                return reason;
+            }
+            if matches!(transport, TransportAdapterError::PublishEndpoints(_)) {
+                return "relay publish failed".to_owned();
+            }
+            return "transport error".to_owned();
         }
-        AppError::Transport(_) | AppError::TransportClosed => "transport error",
+        AppError::TransportClosed => "transport error",
         AppError::Publish(_) => "relay publish failed",
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "local storage error"
@@ -732,6 +740,53 @@ fn wipe_failure_reason(err: &AppError) -> String {
         _ => "operation failed",
     };
     category.to_owned()
+}
+
+fn transport_rejection_category_app_reason(
+    category: Option<TransportEndpointRejectionCategory>,
+) -> String {
+    match category {
+        Some(category) => format!("relay rejected event ({})", category.as_str()),
+        None => "relay publish failed".to_owned(),
+    }
+}
+
+fn transport_publish_endpoint_failures_app_reason(
+    transport: &TransportAdapterError,
+) -> Option<String> {
+    let failures = transport.publish_endpoint_failures();
+    if failures.is_empty() {
+        return None;
+    }
+    let mut unique = Vec::new();
+    for failure in failures {
+        let reason = transport_rejection_category_app_reason(failure.rejection_category);
+        if !unique.contains(&reason) {
+            unique.push(reason);
+        }
+    }
+    Some(unique.join("; "))
+}
+
+fn relay_failures_from_key_package_deletion_results(
+    results: Vec<KeyPackageDeletionResult>,
+) -> (u32, Vec<RelayFailure>) {
+    let mut deleted = 0;
+    let mut failures = Vec::new();
+    for result in results {
+        match result.result {
+            Ok(accepted) if accepted > 0 => deleted += 1,
+            Ok(_) => failures.push(RelayFailure {
+                event_id_hex: result.event_id_hex,
+                reason: "relay publish failed".to_owned(),
+            }),
+            Err(error) => failures.push(RelayFailure {
+                event_id_hex: result.event_id_hex,
+                reason: wipe_failure_reason(&error),
+            }),
+        }
+    }
+    (deleted, failures)
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -2363,37 +2418,7 @@ impl MarmotAppRuntime {
             }
         };
 
-        let mut deleted = 0;
-        let mut failures = Vec::new();
-        for result in results {
-            match result.result {
-                Ok(accepted) if accepted > 0 => deleted += 1,
-                Ok(_) => failures.push(RelayFailure {
-                    event_id_hex: result.event_id_hex,
-                    reason: "relay publish failed".to_owned(),
-                }),
-                Err(error) => {
-                    let endpoint_failures = match &error {
-                        AppError::Transport(error) => error.publish_endpoint_failures(),
-                        _ => &[],
-                    };
-                    if endpoint_failures.is_empty() {
-                        failures.push(RelayFailure {
-                            event_id_hex: result.event_id_hex,
-                            reason: wipe_failure_reason(&error),
-                        });
-                    } else {
-                        for endpoint_failure in endpoint_failures {
-                            failures.push(RelayFailure {
-                                event_id_hex: result.event_id_hex.clone(),
-                                reason: endpoint_failure.reason.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        (deleted, failures)
+        relay_failures_from_key_package_deletion_results(results)
     }
 
     /// Non-destructive sign-out: deactivate the account on this device and

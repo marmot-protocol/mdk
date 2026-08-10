@@ -1,3 +1,9 @@
+use cgka_traits::TransportAdapterError;
+use cgka_traits::transport_adapter::{
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointRejectionCategory,
+    TransportPublishFailure,
+};
+
 use super::subscriptions::chat_list_mute_expiries;
 use super::*;
 
@@ -1915,4 +1921,45 @@ async fn concurrent_reconcile_cannot_lose_workers_to_failed_rollback() {
         "successful reconcile B must retain both running workers"
     );
     runtime.shutdown().await;
+}
+
+#[test]
+fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
+    use crate::KeyPackageDeletionResult;
+
+    let hostile_summary = "publish failed: https://evil.example/nip42";
+    let hostile_reason = "blocked: attacker-controlled suffix at wss://leak.example";
+    let transport_error =
+        TransportAdapterError::PublishEndpoints(TransportPublishFailure::with_endpoint_failures(
+            hostile_summary,
+            vec![
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://relay-a.example".into()),
+                    reason: hostile_reason.to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://relay-b.example".into()),
+                    reason: hostile_reason.to_owned(),
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+            ],
+        ));
+    let err = AppError::Transport(transport_error);
+
+    let wipe_reason = wipe_failure_reason(&err);
+    assert_eq!(wipe_reason, "relay rejected event (blocked)");
+    assert!(!wipe_reason.contains("evil.example"));
+
+    let (deleted, failures) =
+        relay_failures_from_key_package_deletion_results(vec![KeyPackageDeletionResult {
+            event_id_hex: "11".repeat(32),
+            result: Err(err),
+        }]);
+    assert_eq!(deleted, 0);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].reason, "relay rejected event (blocked)");
+    assert!(!failures[0].reason.contains("evil.example"));
+    assert!(!failures[0].reason.contains("leak.example"));
+    assert!(!failures[0].reason.contains("attacker-controlled"));
 }

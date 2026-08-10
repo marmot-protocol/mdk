@@ -1312,7 +1312,10 @@ mod tests {
     }
 
     #[test]
-    fn finish_publish_outcome_success_retains_rejected_endpoint_diagnostics() {
+    fn finish_publish_outcome_success_retains_failures_supplied_to_helper() {
+        // Exercises `finish_publish_outcome` directly. Production fan-out stops
+        // once quorum is met and does not append failures from aborted tasks;
+        // see `publish_event_does_not_wait_for_silent_relays_once_required_acks_are_met`.
         let message_id = cgka_traits::MessageId::new(vec![0xD7; 32]);
         let accepted = vec![TransportEndpointReceipt {
             endpoint: TransportEndpoint("wss://good.example".into()),
@@ -1816,6 +1819,10 @@ mod tests {
 
         assert_eq!(outcome.accepted.len(), 1);
         assert_eq!(outcome.accepted[0].endpoint, reachable);
+        assert!(
+            outcome.failed.is_empty(),
+            "aborted fan-out tasks must not add failures after quorum"
+        );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
@@ -1839,6 +1846,10 @@ mod tests {
 
         assert_eq!(outcome.accepted.len(), 1);
         assert_eq!(outcome.accepted[0].endpoint, reachable);
+        assert!(
+            outcome.failed.is_empty(),
+            "aborted fan-out tasks must not add failures after quorum"
+        );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
@@ -2199,6 +2210,39 @@ mod tests {
                 )
             })
         }
+    }
+
+    #[tokio::test]
+    async fn publish_event_nip42_write_relay_authenticates_kind5_key_package_deletion() {
+        use crate::KIND_MARMOT_KEY_PACKAGE;
+        use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Write,
+        }));
+        relay.run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys.clone()).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let deletion = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            5,
+            vec![
+                vec!["e".into(), "11".repeat(32)],
+                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+            ],
+            String::new(),
+        );
+
+        let outcome = sdk
+            .publish_event(&[endpoint], &deletion, 1)
+            .await
+            .expect("signer-backed SDK client must complete NIP-42 auth and publish");
+
+        assert_eq!(outcome.accepted.len(), 1);
+        assert!(outcome.failed.is_empty());
     }
 
     #[tokio::test]
