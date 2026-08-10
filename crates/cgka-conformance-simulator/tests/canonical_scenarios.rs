@@ -1536,7 +1536,7 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-e2e-delivery/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 99);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -1544,15 +1544,17 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
             .await
             .expect("generated convergence variant reports");
         assert!(report.invariant_failures.is_empty());
-        assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
         assert!(
-            matches!(report.epoch_change_observations.len(), 2 | 4),
-            "case {case_index} produced {} epoch-change observations; steps={:?}; expectations={:?}",
-            report.epoch_change_observations.len(),
-            report.step_log,
+            report.expectation_failures.is_empty(),
+            "case {case_index} failed generated expectations: {:?}",
             report.expectation_failures
         );
-        assert!(report.app_invalidation_observations.is_empty());
+        assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
+        assert!(
+            !report.epoch_change_observations.is_empty(),
+            "case {case_index} produced no epoch-change observations; steps={:?}",
+            report.step_log,
+        );
     }
 }
 
@@ -3004,7 +3006,26 @@ fn assert_canonical_application_event(
 }
 
 fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
+    // The settle tail observes the founders with `observe_client_exact` after
+    // canonical branch selection; those snapshots must agree with each other,
+    // and the family's own `clients_exactly_equivalent` expectation carries
+    // the exact claim. The branch-shape match below applies to the
+    // mid-schedule legacy observations only.
+    let settled = trace
+        .observations
+        .iter()
+        .filter(|observation| observation.canonical_state.is_some())
+        .collect::<Vec<_>>();
+    if let Some(first) = settled.first() {
+        for observation in &settled {
+            assert_eq!(observation.epoch, first.epoch);
+            assert_eq!(observation.member_count, first.member_count);
+        }
+    }
     for observation in &trace.observations {
+        if observation.canonical_state.is_some() {
+            continue;
+        }
         match observation.received_payloads.as_slice() {
             [payload] if payload == "alice canonical payload" => {
                 assert_eq!(observation.epoch, 3);

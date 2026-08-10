@@ -416,11 +416,25 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
         fs::remove_dir_all(&out_dir).expect("remove stale output dir");
     }
 
+    // Every built-in family now carries strict oracle coverage, so the
+    // weak-oracle failure path is pinned through a generated input whose
+    // expectations were deliberately stripped.
+    let mut case = cgka_conformance_simulator::generate_convergence_e2e_delivery_family(42, 1)
+        .pop()
+        .expect("family generates one case");
+    case.expected_outcomes.clear();
+    fs::create_dir_all(&out_dir).expect("create output dir");
+    let input_path = out_dir.join("stripped-weak-oracle-input.json");
+    fs::write(
+        &input_path,
+        serde_json::to_string(&GeneratedScenarioInputV1::new(case)).expect("serialize input"),
+    )
+    .expect("write stripped generated input");
+
     let summary = run_report(&ReportArgs {
-        input: ReportInput::GeneratedFamily {
-            family: "convergence-e2e-delivery/v1".into(),
-            seed: 42,
-            cases: 1,
+        input: ReportInput::GeneratedInputs {
+            paths: vec![input_path],
+            adapter: None,
         },
         out: out_dir.clone(),
         strict_oracle: true,
@@ -494,16 +508,17 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         "convergence-e2e-delivery/v1"
     );
     assert_eq!(
-        report["app_invalidation_observations"]
-            .as_array()
-            .map(Vec::len),
+        report["expectation_failures"].as_array().map(Vec::len),
         Some(0)
     );
+    // The settle tail makes late-branch flips (and therefore invalidation and
+    // per-client epoch-change counts) delivery-schedule dependent; the exact
+    // convergence claims live in the family's generated expectations.
     let epoch_change_count = report["epoch_change_observations"]
         .as_array()
         .map(Vec::len)
         .expect("epoch changes array");
-    assert!(matches!(epoch_change_count, 2 | 4));
+    assert!(epoch_change_count >= 2);
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }

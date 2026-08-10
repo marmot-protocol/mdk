@@ -163,6 +163,38 @@ pub fn build_scenario_oracle_report(
         observed_behaviors.push(OracleBehavior::ExactStateNonEquivalence);
         observed_behaviors.sort();
     }
+    // The global heuristics in `trace_behaviors` compare every observation in
+    // the trace, so they cannot see subset agreement when a scenario also
+    // observes intentionally divergent branch devices or earlier mid-schedule
+    // states. A passing equivalence/convergence expectation is direct observed
+    // evidence for exactly that subset; both expectations fail on missing
+    // observations, so they cannot pass vacuously.
+    if expected_outcomes.iter().any(|expectation| {
+        matches!(
+            expectation,
+            TraceExpectation::ClientsExactlyEquivalent { .. }
+        ) && compare_trace_expectations(None, std::slice::from_ref(expectation), observed_trace)
+            .is_empty()
+    }) {
+        for behavior in [
+            OracleBehavior::ExactStateEquivalence,
+            OracleBehavior::ClientConvergence,
+        ] {
+            if !observed_behaviors.contains(&behavior) {
+                observed_behaviors.push(behavior);
+            }
+        }
+        observed_behaviors.sort();
+    }
+    if expected_outcomes.iter().any(|expectation| {
+        matches!(expectation, TraceExpectation::ClientsConverged { .. })
+            && compare_trace_expectations(None, std::slice::from_ref(expectation), observed_trace)
+                .is_empty()
+    }) && !observed_behaviors.contains(&OracleBehavior::ClientConvergence)
+    {
+        observed_behaviors.push(OracleBehavior::ClientConvergence);
+        observed_behaviors.sort();
+    }
     if quiescence_observations
         .iter()
         .any(|observation| observation.status.is_quiescent())
@@ -937,6 +969,53 @@ mod tests {
             report
                 .observed_behaviors
                 .contains(&OracleBehavior::ExactStateNonEquivalence)
+        );
+        assert!(report.missing_observed_behaviors.is_empty());
+    }
+
+    #[test]
+    fn strict_oracle_records_subset_exact_equivalence_beside_divergent_branch_devices() {
+        // alice and bob share one exact snapshot; david stays on a divergent
+        // branch. The global all-observations heuristic cannot see the
+        // alice/bob agreement, so the passing subset expectation must carry
+        // the observed-equivalence evidence.
+        let mut alice = observation("alice", 2, 3, "winner");
+        alice.canonical_state = Some(ConformanceCanonicalStateSnapshot::Live(Box::default()));
+        let mut bob = observation("bob", 2, 3, "winner");
+        bob.canonical_state = alice.canonical_state.clone();
+        let mut david = observation("david", 2, 3, "loser");
+        let mut david_state =
+            Box::<cgka_engine::conformance_snapshot::ConformanceGroupSnapshot>::default();
+        david_state.epoch = 9;
+        david.canonical_state = Some(ConformanceCanonicalStateSnapshot::Live(david_state));
+        let expectation = TraceExpectation::ClientsExactlyEquivalent {
+            clients: vec!["alice".into(), "bob".into()],
+        };
+        let spec = ScenarioSpec {
+            name: "oracle/subset-equivalence".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into(), "bob".into(), "david".into()],
+            topology: Default::default(),
+            steps: Vec::new(),
+        };
+
+        let report = build_scenario_oracle_report(
+            &spec,
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![alice, bob, david]),
+            &[],
+        );
+
+        assert!(
+            report
+                .observed_behaviors
+                .contains(&OracleBehavior::ExactStateEquivalence)
+        );
+        assert!(
+            report
+                .observed_behaviors
+                .contains(&OracleBehavior::ClientConvergence)
         );
         assert!(report.missing_observed_behaviors.is_empty());
     }
