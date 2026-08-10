@@ -1,17 +1,14 @@
-//! Group-record write atomicity under an injected storage fault (mdk#333).
+//! Storage transaction atomicity under injected faults (mdk#333, mdk#1354).
 //!
-//! Every seam that advances durable group state projects the Marmot record as
-//! part of the same logical step. If the record write fails after other durable
-//! state has advanced, the record must not be left torn — an epoch or roster
-//! disagreeing with the MLS group and the epoch state machine strands replay
-//! (which bails on any epoch mismatch), forks the rendered member list from
-//! reality, and survives into the next session because hydration reads the
-//! record.
+//! Group-projection tests prove that every seam advancing durable group state
+//! projects the Marmot record as part of the same logical step. Leave-proposal
+//! tests prove that the sent message, pending leave request, and distinct
+//! content marker commit together. In either case, an injected storage failure
+//! must not leave durable or in-memory state torn across a session restart.
 //!
-//! Each test here arms a one-shot `put_group` failure at exactly one seam's
-//! projection — auto-commit staging, Welcome join, group-profile staging,
-//! inbound commit apply — and asserts nothing is torn and the group stays
-//! usable.
+//! Tests arm one-shot `put_group`, `put_message`, or `put_leave_request`
+//! failures at the relevant write seam and assert that nothing is torn, retries
+//! remain possible, and the group stays usable.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
