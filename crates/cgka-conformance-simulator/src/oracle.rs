@@ -649,7 +649,8 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 behaviors.insert(OracleBehavior::AppInvalidated);
             }
         }
-        TraceExpectation::NoPendingWork { .. } => {
+        TraceExpectation::NoPendingWork { .. }
+        | TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { .. } => {
             behaviors.insert(OracleBehavior::NoPendingWorkObserved);
         }
         TraceExpectation::ClientsBidirectionallyDecryptable { .. } => {

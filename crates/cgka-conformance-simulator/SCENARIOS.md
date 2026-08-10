@@ -487,6 +487,55 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Pressure: duplicate, delay, release, and reorder before observer clients tick.
 - Expected: observers converge on one selected branch and emit only the selected branch payload.
 
+### `admin-churn/v1`
+
+- Generator: `generate_admin_churn_family` (generator version `1`).
+- Provenance: ported from the external multi-VM harness scenario catalog (`cheeky.rb`, `committy.rb`, `crashy.rb`
+  essences, without their wall-clock scheduling).
+- Setup: the family rotates through four arms.
+- Expected: each arm carries semantic expectations for convergence, exact transcripts, and pending work, then performs
+  the final drain with exact-state assertions.
+
+#### Admin-Churn Arm `0`: Seeded Sequential Churn
+
+- Setup: four members, all promoted to admin. Four rounds where a seeded admin either renames or toggles a non-founder
+  in or out of the admin set, with a full message round after each commit.
+- Pressure: sustained admin-set and metadata churn with traffic between commits.
+- Expected: all clients converge at the deterministic final epoch with exact per-client transcripts.
+
+#### Admin-Churn Arm `1`: Competing Admin-Policy Commits
+
+- Setup: two admins race admin-policy commits from the same epoch; the delivery order of the two commits is drawn from
+  the seed. After the race settles, an admin retained under both candidate outcomes pins the admin set with a
+  follow-up policy commit.
+- Pressure: same-epoch admin-authority race, the admin-set analog of the chaos group-data fork.
+- Expected: the race winner stays schedule-dependent and unasserted, but authority is enforced afterward: the
+  retained admin's pinning commit must succeed, both non-admins' privileged updates must be rejected in place
+  (`not_group_admin`), and every client observes the pinned admin set. All clients converge two epochs past the race
+  with exact post-race probe transcripts.
+
+#### Admin-Churn Arm `2`: Restart Between Publish and Delivery
+
+- Setup: a seeded admin publishes a rename commit and restarts before delivery; every member then sends into the
+  recovered group.
+- Pressure: crash-shaped interruption between commit publish and delivery.
+- Expected: the restarted client hydrates the stable group, its post-restart send lands everywhere, and all clients
+  converge with exact transcripts.
+
+#### Admin-Churn Arm `3`: Latecomer Under Commit Pressure
+
+- Setup: the founder keeps rename pressure up, then invites a fourth member and publishes another rename before the
+  delivery round that completes the join, so the welcome and the next commit travel in the same flight; all four then
+  exchange traffic. Pre-join traffic is partitioned away from the latecomer's process (ciphertext-exposure forward
+  secrecy is the `latecomer-forward-secrecy/v1` vector's job).
+- Pressure: a join genuinely racing sustained commit pressure.
+- Expected: the latecomer never observes pre-join plaintext (zero-count assertions), every member holds its exact
+  transcript (founders carry pre-join and post-join traffic), and every client converges. The strict pending-work
+  assertion is scoped to the founders, and the joiner carries a
+  `no_pending_work_except_retained_join_commit` assertion: a welcome-joined member currently retains exactly its own
+  join commit as a permanently deferred transport input, and any other pending work still fails the case. The
+  retained join commit itself is tracked as a harness coverage gap.
+
 ### `convergence-chaos/v1`
 
 - Generator: `generate_convergence_chaos_family` (generator version `6`).

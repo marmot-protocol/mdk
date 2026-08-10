@@ -10,7 +10,7 @@ use cgka_conformance_simulator::{
     ScenarioInputDisposition, ScenarioInputKind, ScenarioInputLedgerEntry,
     ScenarioMessageSelectorV2, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
     ScenarioTransportClass, SubjectOutboundOutcome, TraceExpectation, TransportBus, VectorFixture,
-    compare_trace_expectations, generate_convergence_chaos_family,
+    compare_trace_expectations, generate_admin_churn_family, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
     observe_client_exact, run_generated_case_report, run_scenario_report,
     run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
@@ -1600,6 +1600,89 @@ fn without_strict_reliability_outcomes(mut case: GeneratedScenarioCase) -> Gener
         )
     });
     case
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_churn_family_generates_deterministic_arms_that_pass() {
+    let cases = generate_admin_churn_family(123, 4);
+
+    assert_eq!(cases, generate_admin_churn_family(123, 4));
+    assert_eq!(cases.len(), 4);
+    assert!(
+        cases.iter().all(|case| !case.expected_outcomes.is_empty()),
+        "admin-churn cases should carry semantic expectations"
+    );
+    assert!(cases[..3].iter().all(|case| {
+        case.scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::UpdateAdminPolicy { .. }))
+    }));
+    assert!(
+        cases[2]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::RestartClient { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::InviteMembers { .. }))
+    );
+    assert!(
+        cases[3]
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::Assert { .. })),
+        "the latecomer arm carries pre-join mailbox-isolation zero-count assertions"
+    );
+    let pending_scope = |case: &GeneratedScenarioCase| {
+        case.expected_outcomes
+            .iter()
+            .find_map(|expectation| match expectation {
+                TraceExpectation::NoPendingWork { clients } => Some(clients.clone()),
+                _ => None,
+            })
+            .expect("every admin-churn case carries a no-pending-work expectation")
+    };
+    for case in &cases[..3] {
+        let mut expected_clients = case.scenario.clients.clone();
+        expected_clients.sort();
+        let mut scoped_clients = pending_scope(case);
+        scoped_clients.sort();
+        assert_eq!(
+            scoped_clients, expected_clients,
+            "non-latecomer arms keep the whole-roster pending-work oracle"
+        );
+    }
+    assert_eq!(
+        pending_scope(&cases[3]),
+        vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
+        "the latecomer arm scopes strict pending work to the founders"
+    );
+    assert!(
+        cases[3].expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } if client == "dave"
+        )),
+        "the latecomer arm pins the joiner to exactly its retained join commit"
+    );
+
+    for case in &cases {
+        let report = run_generated_case_report(case, None)
+            .await
+            .expect("admin-churn case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {} failed: {:?}",
+            case.case_index,
+            report.expectation_failures
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

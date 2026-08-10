@@ -166,6 +166,17 @@ pub enum TraceExpectation {
     NoPendingWork {
         clients: Vec<String>,
     },
+    /// Like [`Self::NoPendingWork`] for one client, but permit exactly the
+    /// documented latecomer wart: a welcome-joined member retains its own join
+    /// commit as one permanently deferred transport input (mirrored as one
+    /// pending scenario input). Every other pending-work category must be
+    /// empty, and the sole unresolved ledger input must be identified as the
+    /// joiner's own transport-deferred `invite_members` commit, so unrelated
+    /// deferred commits, messages, or outbound work still fail the
+    /// expectation even when their aggregate counts coincide.
+    NoPendingWorkExceptRetainedJoinCommit {
+        client: String,
+    },
     /// Require a completed active application-message probe in every direction
     /// between the named clients.
     ClientsBidirectionallyDecryptable {
@@ -592,6 +603,71 @@ impl TraceExpectation {
                             actual: json!(pending_work),
                         });
                     }
+                }
+            }
+            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } => {
+                let Some(latest_observation) = client_observation(observed, client) else {
+                    missing_client(client, self, mismatches);
+                    return;
+                };
+                let Some(observation) = client_pending_work_observation(observed, client) else {
+                    mismatches.push(ExpectationFailure {
+                        kind: "missing_pending_work_observation".into(),
+                        message: format!(
+                            "client {client} was not observed with observe_client_exact"
+                        ),
+                        expected: json!(self),
+                        actual: json!(latest_observation),
+                    });
+                    return;
+                };
+                let pending_work = observation
+                    .pending_work
+                    .as_ref()
+                    .expect("pending-work observation carries pending work");
+                let mut allowed = PendingWorkObservation::default();
+                allowed.engine.stored_transport_deferred_messages = 1;
+                allowed.scenario_inputs_pending = 1;
+                if pending_work != &allowed {
+                    mismatches.push(ExpectationFailure {
+                        kind: "pending_work_beyond_retained_join_commit".into(),
+                        message: format!(
+                            "client {client} pending work is not exactly the retained join \
+                             commit; blocking subsystems {:?}",
+                            pending_work.blocking_subsystems()
+                        ),
+                        expected: json!({
+                            "client": client,
+                            "pending_work": allowed,
+                        }),
+                        actual: json!(pending_work),
+                    });
+                    return;
+                }
+                // Aggregate counts alone cannot identify the artifact: pin the
+                // sole unresolved ledger input to the joiner's own join commit
+                // (the invite_members commit, retained as one transport-deferred
+                // ingest).
+                let unresolved = observation
+                    .scenario_input_ledger
+                    .iter()
+                    .filter(|entry| entry.pending)
+                    .collect::<Vec<_>>();
+                let is_retained_join_commit = |entry: &ScenarioInputLedgerEntry| {
+                    entry.kind == crate::ScenarioInputKind::Commit
+                        && entry.scenario_id.ends_with(":invite_members")
+                        && entry.transport_deferred == 1
+                };
+                if unresolved.len() != 1 || !is_retained_join_commit(unresolved[0]) {
+                    mismatches.push(ExpectationFailure {
+                        kind: "retained_pending_input_is_not_the_join_commit".into(),
+                        message: format!(
+                            "client {client} must retain exactly one unresolved input: its own \
+                             transport-deferred invite_members join commit"
+                        ),
+                        expected: json!(self),
+                        actual: json!(unresolved),
+                    });
                 }
             }
             TraceExpectation::ClientsBidirectionallyDecryptable { clients } => {
@@ -1639,6 +1715,63 @@ mod tests {
             failures[0].message.contains("bus_delayed"),
             "failure should name the blocking subsystem: {failures:#?}"
         );
+    }
+
+    #[test]
+    fn retained_join_commit_exception_accepts_exactly_the_join_commit() {
+        let mut dave = observation("dave", 5, 4);
+        let mut pending = PendingWorkObservation::default();
+        pending.engine.stored_transport_deferred_messages = 1;
+        pending.scenario_inputs_pending = 1;
+        dave.pending_work = Some(pending);
+        dave.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-19:invite_members".into(),
+            kind: crate::ScenarioInputKind::Commit,
+            sender: "alice".into(),
+            transport_deferred: 1,
+            pending: true,
+            ..Default::default()
+        }];
+        let expectation = TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
+            client: "dave".into(),
+        };
+
+        let failures = compare_trace_expectations(
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![dave.clone()]),
+        );
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+
+        // Same aggregate counts, but the unresolved input is an unrelated
+        // deferred application message, not the joiner's own join commit.
+        dave.scenario_input_ledger = vec![ScenarioInputLedgerEntry {
+            scenario_id: "step-19:send_app_message".into(),
+            kind: crate::ScenarioInputKind::Application,
+            sender: "alice".into(),
+            transport_deferred: 1,
+            pending: true,
+            ..Default::default()
+        }];
+        let failures = compare_trace_expectations(
+            None,
+            std::slice::from_ref(&expectation),
+            &trace(vec![dave.clone()]),
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].kind,
+            "retained_pending_input_is_not_the_join_commit"
+        );
+
+        // Any category beyond the retained join commit still fails.
+        dave.pending_work
+            .as_mut()
+            .expect("pending snapshot")
+            .bus_mailbox_messages = 1;
+        let failures = compare_trace_expectations(None, &[expectation], &trace(vec![dave]));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, "pending_work_beyond_retained_join_commit");
     }
 
     #[test]
