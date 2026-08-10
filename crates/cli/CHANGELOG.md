@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-08-09
+
 ### Added
 
 - Hermes Marmot delivery now batches up to 10 ordered local images into one
@@ -20,6 +22,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   retryable timeout while cleaning staged files if the connector never finishes.
   Transport retries reuse connector-persisted idempotency so they cannot
   duplicate the album.
+
+- WN Agent releases now include the `wn-pi` terminal-harness connector and
+  installer for Linux and macOS. Pi runs in isolated JSON-mode sessions with
+  bounded working-directory access, persisted conversation state, streamed
+  assistant output, and the same hardened shared connector runtime now used by
+  `wn-opencode`.
 
 - Account-open startup is now stage-attributed in app telemetry: engine
   session open, stored-group hydration, the shared startup profile load, and
@@ -49,10 +57,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   MarmotKit surfaces a new retryable `GroupHydrationPending` error, distinct
   from `UnknownGroup`, for the remaining direct-read window.
 
-- Regression coverage (mdk#1337): after a receive-error transport reconnect,
-  the managed account worker eagerly drains every deferred stored group (more
-  than one hydration batch) before resuming steady-state commands, so groups
-  are not left gated until a later read or send promotes them individually.
+- After a receive-error transport reconnect, the managed account worker eagerly
+  drains every deferred stored group (including more than one hydration batch)
+  before resuming steady-state commands, so groups are not left gated until a
+  later read or send promotes them individually.
+
+- Repeated epoch-gap backfill stalls now emit a one-time typed escalation event
+  and durable forensic record with aggregate attempt and epoch information.
+  Successful progress resets the escalation state so a later independent stall
+  can be diagnosed separately.
 
 - `marmot-markdown` now recognizes bare `www.example.com/path` text as web
   autolinks. The AST preserves the displayed `www.` source while exposing an
@@ -95,6 +108,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   the user the message was not accepted and offer to resend once the group is
   sending again. Nothing already queued is discarded; a slot frees only once its
   message is accepted by a relay.
+
+- Freshly created local identities now publish an explicit empty Nostr contact
+  list, giving the first follow update a safe relay-visible baseline without
+  weakening anti-clobber handling for imported identities with a missing list.
+
+- The conformance suite now includes a permanent four-participant cross-route
+  recovery vector covering simultaneous privileged commits, pairwise and
+  observer-side resolution, branch-depth reversal, encrypted-SQLite restart,
+  exact canonical agreement, durable input dispositions, and all twelve
+  directed application-decryptability probes.
   
 ### Fixed
 
@@ -122,8 +145,31 @@ versioning through the workspace version in the root `Cargo.toml`.
   work remains visible in the existing invite-stage telemetry
   ([#1309](https://github.com/marmot-protocol/mdk/pull/1309)).
 
-- Account setup interruptions now have stable JSON recovery codes and repair
-  hints instead of falling through to the generic `command_failed` bucket.
+- Account imports now journal setup progress and resume the exact persisted
+  KeyPackage publication after relay failure, cancellation, or restart instead
+  of minting a new stable slot. Ambiguous pre-journal state returns the typed,
+  consent-gated `AccountSetupRecoveryRequired` flow; setup interruptions also
+  have stable JSON recovery codes and repair hints instead of falling through
+  to the generic `command_failed` bucket.
+
+- Published NIP-65 and inbox lists containing retired relays no longer prevent
+  account activation or remote KeyPackage lookup. The original lists remain
+  cached and visible for settings UI, while unsafe endpoints are filtered only
+  from runtime routes and configured directory relays provide operational
+  fallback without rewriting or republishing the account's list.
+
+- MarmotKit root preparation now works in physical iOS App Group and Android
+  application sandboxes while retaining descriptor-relative creation and
+  symlink rejection for app-controlled paths. New iOS account secrets use the
+  device-only after-first-unlock Keychain policy, and legacy entries migrate
+  crash-safely after the next unlocked access so notification extensions and
+  background refresh can operate while the device is locked.
+
+- Hermes and OpenClaw now bound automatically attached timeline context to the
+  newest eight records and 16 KiB, dropping oldest or individually oversized
+  records first. The Hermes one-line installer no longer lets an interactive
+  child consume the remainder of `curl | bash`, and its guided sender allowlist
+  is collected in one explicit step.
 
 - Account projection storage types now redact encrypted group-image decryption
   and Blossom upload keys from `Debug` output, including nested group
@@ -177,6 +223,34 @@ versioning through the workspace version in the root `Cargo.toml`.
   interrupted resolution can no longer drop it without a trace.
   ([#1285](https://github.com/marmot-protocol/mdk/pull/1285))
 
+- Locally authored messages now retain authenticated send-time branch
+  provenance through stored convergence and restart, preventing an accepted
+  own message from being misclassified as undecryptable merely because OpenMLS
+  cannot decrypt a sender's own private-message ciphertext during replay.
+
+- Inbound MLS commits now apply the epoch, roster, and capability projections
+  atomically with the OpenMLS merge. SQLite transaction boundaries retry
+  transient contention without rerunning application closures, pruning scales
+  without unbounded bind lists and preserves draft-owning groups, and secure
+  deletion retains a durable WAL-truncation intent until physical erasure can
+  complete.
+
+- Opaque transport objects that remain unpeelable now have a restart-safe,
+  bounded 30-day local residence. Expiry releases local resources without a
+  terminal protocol verdict and preserves exact-ID redelivery eligibility if
+  missing history later arrives.
+
+- Stored convergence passes whose durable base no longer matches the live tip
+  are discarded and reopened at the current epoch instead of halting the group
+  as unrecoverable. Eligible non-selected branches and missing-parent inputs
+  remain explicitly deferred for reconsideration rather than being
+  terminally invalidated.
+
+- The full-cohort release coordinator now fetches only immutable MDK,
+  WN Agent, and MarmotKit version tags, so an older local copy of the
+  intentionally moving `wn-agent-latest` installer alias no longer blocks a
+  release preflight with a tag-clobber error.
+
 - `MarmotApp` now permits only one live in-memory engine session per account
   across direct clients and managed workers. Concurrent opens return the typed
   `AccountSessionBusy` error, and worker reconnect drops the failed session
@@ -206,6 +280,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   success and error paths.
 
 ### Changed
+
+- Generated simulator failure fixtures now preserve the complete executed
+  scenario instead of substituting a diagnostic semantic reduction that may
+  reproduce only the failure class. Strict virtual-time coverage also accepts
+  either fixed-point quiescence or an exact no-pending-work observation after
+  an explicit time advance.
+
+- UniFFI was upgraded from 0.28.3 to 0.29.4. Generated Swift keeps the existing
+  Marmot-facing declarations while gaining the generator's current
+  `Sendable`/`Error` conformances; the dependency refresh also removes the
+  audited `bincode`, `paste`, and `proc-macro-error2` paths and incorporates the
+  `nostr` fix for RUSTSEC-2026-0219.
 
 - The bundled SQLCipher stack now uses rusqlite 0.40.1/libsqlite3-sys 0.38.1,
   providing SQLCipher 4.14.0 and SQLite 3.51.3 with SQLite's WAL-reset
@@ -1258,7 +1344,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/marmot-protocol/mdk/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/marmot-protocol/mdk/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/marmot-protocol/mdk/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/marmot-protocol/mdk/compare/v0.9.7...v0.9.8

@@ -119,7 +119,14 @@ if [ -n "$(git status --porcelain)" ]; then
     fi
 fi
 
-run git fetch origin master --tags
+# Fetch only the immutable release-track tags used below. The
+# `wn-agent-latest` installer alias intentionally moves after publication, and
+# a blanket `--tags` fetch rejects that normal movement as a clobber when a
+# caller has an older local copy.
+run git fetch --no-tags origin master \
+    'refs/tags/v*:refs/tags/v*' \
+    'refs/tags/wn-agent-v*:refs/tags/wn-agent-v*' \
+    'refs/tags/marmotkit-v*:refs/tags/marmotkit-v*'
 
 head_sha="$(git rev-parse HEAD)"
 origin_master_sha="$(git rev-parse origin/master)"
