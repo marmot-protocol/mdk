@@ -10,8 +10,9 @@ use crate::{
     BidirectionalDecryptabilityObservation, CapturedTransportArtifactV1, CapturedTransportWindowV1,
     ClientBuilder, ClientObservation, DecryptabilityProbeSendStatus,
     DirectionalDecryptabilityProbe, EngineByteReplayV1, HarnessClient, HarnessStorageMode,
-    ScenarioAdminPolicyObservation, ScenarioStep, SubjectProgressSnapshot, SubjectTerminalBlocker,
-    TransportBus, observe_client, observe_client_exact,
+    ScenarioAdminPolicyObservation, ScenarioInputLedgerEntry, ScenarioStep,
+    SubjectProgressSnapshot, SubjectTerminalBlocker, TransportBus, observe_client,
+    observe_client_exact,
 };
 use async_trait::async_trait;
 use cgka_engine::engine_metrics::EngineMetricsSnapshot;
@@ -668,6 +669,7 @@ pub struct EngineHarnessSubject {
     bus: TransportBus,
     clients: BTreeMap<String, HarnessClient>,
     identity_seeds: BTreeMap<String, Vec<u8>>,
+    authenticated_identity_by_client: BTreeMap<String, String>,
     active_scenario_group: Option<String>,
     scenario_groups: BTreeMap<String, GroupId>,
     pending_refs: HashMap<String, EngineSubjectPendingRef>,
@@ -789,6 +791,7 @@ impl EngineHarnessSubject {
             .collect::<HashMap<_, _>>();
         let mut attached = BTreeMap::new();
         let mut identity_seeds = BTreeMap::new();
+        let mut authenticated_identity_by_client = BTreeMap::new();
         for label in clients {
             if attached.contains_key(label) {
                 return Err(SubjectError::new(
@@ -821,6 +824,7 @@ impl EngineHarnessSubject {
             let client = builder.attach(&bus);
             attached.insert(label.clone(), client);
             identity_seeds.insert(label.clone(), identity_seed);
+            authenticated_identity_by_client.insert(label.clone(), identity_label.to_owned());
         }
         let capabilities = BTreeSet::from([
             SubjectCapability::GroupMutation,
@@ -853,6 +857,7 @@ impl EngineHarnessSubject {
             bus,
             clients: attached,
             identity_seeds,
+            authenticated_identity_by_client,
             active_scenario_group: None,
             scenario_groups: BTreeMap::new(),
             pending_refs: HashMap::new(),
@@ -869,6 +874,24 @@ impl EngineHarnessSubject {
         self.clients
             .get(label)
             .ok_or_else(|| SubjectError::new("unknown_client", format!("unknown client {label}")))
+    }
+
+    fn attributed_probe_ledger(
+        &self,
+        expected_client: &str,
+        logical_id: &Option<String>,
+        entries: &[ScenarioInputLedgerEntry],
+    ) -> Option<ScenarioInputLedgerEntry> {
+        let authenticated_identity = self.authenticated_identity_by_client.get(expected_client)?;
+        let mut entry = entries
+            .iter()
+            .find(|entry| {
+                entry.logical_id.as_ref() == logical_id.as_ref()
+                    && entry.sender == authenticated_identity.as_str()
+            })?
+            .clone();
+        entry.sender = expected_client.to_owned();
+        Some(entry)
     }
 
     /// Bounded tail of exact transport artifacts emitted during this subject
@@ -1750,20 +1773,8 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 if recipient == sender {
                     continue;
                 }
-                let recipient_ledger = recipient_ledgers[recipient]
-                    .iter()
-                    .find(|entry| entry.logical_id.as_ref() == logical_id.as_ref())
-                    .cloned()
-                    .map(|mut entry| {
-                        // Received ledgers preserve the authenticated account
-                        // identity, which can differ from the scenario's
-                        // device/client label under an explicit topology. The
-                        // logical application id already correlates this entry
-                        // to the probe send above, so expose the stable scenario
-                        // label in this scenario-owned observation.
-                        entry.sender = sender.clone();
-                        entry
-                    });
+                let recipient_ledger =
+                    self.attributed_probe_ledger(sender, logical_id, &recipient_ledgers[recipient]);
                 probes.push(DirectionalDecryptabilityProbe {
                     sender: sender.clone(),
                     recipient: recipient.clone(),
@@ -2263,6 +2274,68 @@ mod tests {
         assert_eq!(
             subject.identity_seeds["alice-phone"],
             pad32(b"account:alice")
+        );
+    }
+
+    #[test]
+    fn decryptability_probe_rejects_matching_logical_id_from_wrong_account() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let topology = crate::ScenarioTopologyV2 {
+            accounts: labels
+                .iter()
+                .map(|client| crate::ScenarioAccountV2 {
+                    id: format!("account:{client}"),
+                    roles: vec!["member".into()],
+                })
+                .collect(),
+            devices: labels
+                .iter()
+                .map(|client| crate::ScenarioDeviceV2 {
+                    id: format!("device:{client}"),
+                    account: format!("account:{client}"),
+                    process: format!("process:{client}"),
+                    client: client.clone(),
+                })
+                .collect(),
+            processes: labels
+                .iter()
+                .map(|client| crate::ScenarioProcessV2 {
+                    id: format!("process:{client}"),
+                    binary_version: "mdk-test".into(),
+                    policy_version: "marmot-convergence-v1".into(),
+                    relays: vec![],
+                })
+                .collect(),
+            groups: vec![],
+            relays: vec![],
+        };
+        let subject = EngineHarnessSubject::new_with_topology(
+            &labels,
+            &topology,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .expect("engine subject constructs");
+        let logical_id = Some("shared-logical-id".into());
+        let matching = ScenarioInputLedgerEntry {
+            logical_id: logical_id.clone(),
+            sender: "account:alice".into(),
+            ..Default::default()
+        };
+        let normalized = subject
+            .attributed_probe_ledger("alice", &logical_id, std::slice::from_ref(&matching))
+            .expect("authenticated account matches expected client");
+        assert_eq!(normalized.sender, "alice");
+
+        let wrong_account = ScenarioInputLedgerEntry {
+            sender: "account:bob".into(),
+            ..matching
+        };
+        assert!(
+            subject
+                .attributed_probe_ledger("alice", &logical_id, &[wrong_account])
+                .is_none(),
+            "a matching logical id cannot hide the wrong authenticated account"
         );
     }
 

@@ -3322,14 +3322,19 @@ async fn cross_route_recovery_uses_retained_history_after_restart() {
             .all(|observation| observation.injected_objects > 0),
         "the final settlement must consume retained relay objects: {full_history:#?}"
     );
-    for client in ["yankee", "zeta"] {
-        assert!(
-            report.relay_sync_observations.iter().any(|observation| {
+    for (client, events_returned) in [("yankee", 1), ("zeta", 2)] {
+        let partial_view = report
+            .relay_sync_observations
+            .iter()
+            .rfind(|observation| {
                 observation.client == client
                     && observation.completeness == RelayHistoryCompletenessClaimV2::RelayEoseOnly
-                    && observation.injected_objects == 1
-            }),
-            "{client} must consume its deliberately partial retained-history view"
+            })
+            .unwrap_or_else(|| panic!("{client} is missing its partial retained-history view"));
+        assert_eq!(
+            (partial_view.events_returned, partial_view.injected_objects),
+            (events_returned, 1),
+            "{client}'s last pre-full-history sync must be the deliberate partial view"
         );
     }
 

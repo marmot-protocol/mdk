@@ -128,7 +128,9 @@ These are the scenarios another implementation should be able to load from JSON 
 - Expected: the retained-history path reaches the same epoch-3 Zeta branch with exact canonical cryptographic equality,
   accepted/invalidated/accepted commit dispositions, no pending work, and active decryptability in all twelve
   directions. The regression also requires all four final full-history queries to inject retained objects, so a passing
-  result cannot be explained by the packet bus healing the delivery schedule.
+  result cannot be explained by the packet bus healing the delivery schedule. The saved input's portable outcomes own
+  the state, profile, recovery, pending-work, and decryptability contract; the focused Rust regression owns the
+  retained-injection observations and stable commit-disposition subset.
 
 ### `convergence-committer-selected/v1`
 

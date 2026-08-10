@@ -484,6 +484,12 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cross-route-retained-history --storage file --strict-oracle
 ```
 
+That command enforces the saved input's portable state, recovery, profile, pending-work, and decryptability outcomes.
+The focused `cross_route_recovery_uses_retained_history_after_restart` Rust regression additionally owns the stable
+accepted/invalidated/accepted commit-disposition subset and exact retained-sync injection observations. Those checks
+remain harness-local because there is no portable relay-sync expectation and a complete ledger expectation would also
+pin unrelated probe ids and counters.
+
 The process adapter accepts the same saved input in place of a raw Scenario IR file:
 
 ```sh
