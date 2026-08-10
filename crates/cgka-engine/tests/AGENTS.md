@@ -74,10 +74,11 @@ backend on the same rail.
     stored convergence so it is eventually applied
 
 - **File:** `fail_closed_halt_atomicity.rs`
-  - **Owns:** Durability of the missing-anchor fail-closed halt under injected `put_group` / `put_message` faults. The
-    durable `unrecoverable` marker and the `ConvergenceDeferred` park of the rival are one transaction, so a failure
-    never leaves the group unhalted with its rival demoted out of a pass-opening state; covers the direct-ingest and
-    replay seams
+  - **Owns:** Durability of the missing-anchor fail-closed halt under injected `put_group` / `put_message` faults
+    (transient `Busy` and terminal `Backend`). The durable `unrecoverable` marker and the `ConvergenceDeferred` park of
+    the rival are one transaction, so a failure never leaves the group unhalted with its rival demoted out of a
+    pass-opening state; covers the direct-ingest and replay seams. A failed halt also hands the group back to
+    `drain_pending_convergence_groups`, so the retained rival reaches the pass that re-derives the halt
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open

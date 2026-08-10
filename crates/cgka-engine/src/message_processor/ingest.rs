@@ -2327,6 +2327,15 @@ impl<S: StorageProvider> Engine<S> {
         msg_epoch: EpochId,
         current: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
+        // Schedule before the write, because both of its exits owe the group a
+        // pass. On commit, `Buffered` promises the parked rival a later replay;
+        // the post-repair convergence drain seeds it (see
+        // `IngestOutcome::Buffered` docs). On rollback the rival keeps the
+        // pass-opening `Created` row persisted outside this transaction, and the
+        // schedule is the only thing that tells the app to open the pass that
+        // re-derives this halt. The insert is idempotent and in-memory, so
+        // hoisting it costs the success path nothing.
+        self.schedule_pending_convergence_group(&group_id);
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 // Durable marker first: a crash after the commit still halts
@@ -2384,10 +2393,6 @@ impl<S: StorageProvider> Engine<S> {
         self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
             group_id: group_id.clone(),
         });
-        // `Buffered` promises the retained row a later replay; keep that
-        // promise by scheduling the group so the post-repair convergence
-        // drain seeds the parked rival (see `IngestOutcome::Buffered` docs).
-        self.schedule_pending_convergence_group(&group_id);
         Ok(IngestOutcome::Buffered {
             group_id,
             epoch: current,

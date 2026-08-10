@@ -14,7 +14,12 @@
 //! The invariant these tests pin, at the widest fault window: after the halt
 //! path fails, EITHER the group is durably unrecoverable, OR the rival still
 //! holds a pass-opening state so a follow-up convergence run reaches the halt.
-//! Never neither.
+//! Never neither. Retention alone does not discharge that second branch —
+//! applications schedule convergence off `drain_pending_convergence_groups`, so
+//! the failing seam must also hand the group back to that drain or the retained
+//! rival sits where nothing looks for it. The marker fault is injected in both
+//! classes: transient `Busy`, which a caller may retry, and terminal `Backend`,
+//! where the seam's own error path is the whole recovery route.
 
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
@@ -48,7 +53,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -187,7 +192,10 @@ fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, Sqlite
 /// Predicate-keyed rather than call-counted so it fires at exactly the write
 /// under test — hydration and commit-apply record writes pass through.
 #[derive(Clone, Default)]
-struct HaltMarkerFault(Arc<AtomicUsize>);
+struct HaltMarkerFault {
+    remaining: Arc<AtomicUsize>,
+    terminal: Arc<AtomicBool>,
+}
 
 /// One-shot fault that fails the `put_message` that parks the rival
 /// `ConvergenceDeferred`.
@@ -195,16 +203,33 @@ struct HaltMarkerFault(Arc<AtomicUsize>);
 struct ParkWriteFault(Arc<AtomicUsize>);
 
 impl HaltMarkerFault {
+    /// Arm a transient `Busy` — the class a caller is free to retry.
     fn arm(&self) {
-        self.0.store(1, Ordering::SeqCst);
+        self.terminal.store(false, Ordering::SeqCst);
+        self.remaining.store(1, Ordering::SeqCst);
     }
 
-    fn should_fail(&self, group: &Group) -> bool {
-        group.unrecoverable && self.consume()
+    /// Arm a terminal `Backend` failure. Nothing retries it, so whatever the
+    /// seam's own error path leaves behind is the entire recovery route.
+    fn arm_terminal(&self) {
+        self.terminal.store(true, Ordering::SeqCst);
+        self.remaining.store(1, Ordering::SeqCst);
+    }
+
+    /// The error to inject for this write, or `None` to let it through.
+    fn injected(&self, group: &Group) -> Option<StorageError> {
+        if !(group.unrecoverable && self.consume()) {
+            return None;
+        }
+        Some(if self.terminal.load(Ordering::SeqCst) {
+            StorageError::Backend("injected terminal halt-marker failure".into())
+        } else {
+            StorageError::Busy("injected halt-marker failure".into())
+        })
     }
 
     fn consume(&self) -> bool {
-        self.0
+        self.remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
@@ -230,8 +255,10 @@ impl ParkWriteFault {
     }
 }
 
-/// `SqliteAccountStorage` wrapper that injects a transient `Busy` on the two
-/// writes the halt performs. Every other call delegates unchanged.
+/// `SqliteAccountStorage` wrapper that injects a fault on either of the two
+/// writes the halt performs — transient `Busy` by default, terminal `Backend`
+/// when the marker fault is armed that way. Every other call delegates
+/// unchanged.
 struct FaultStorage {
     inner: SqliteAccountStorage,
     halt_marker_fault: HaltMarkerFault,
@@ -240,8 +267,8 @@ struct FaultStorage {
 
 impl GroupStorage for FaultStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()> {
-        if self.halt_marker_fault.should_fail(group) {
-            return Err(StorageError::Busy("injected halt-marker failure".into()));
+        if let Some(error) = self.halt_marker_fault.injected(group) {
+            return Err(error);
         }
         self.inner.put_group(group)
     }
@@ -878,6 +905,64 @@ async fn replayed_raw_wrapper_is_not_retired_when_the_halt_write_fails() {
         )),
         "the halt must reach the app so it can surface repair"
     );
+}
+
+#[tokio::test]
+async fn terminal_halt_write_failure_still_schedules_the_group_for_a_pass() {
+    // The sibling tests drive recovery by calling convergence themselves, which
+    // proves the retained rival is *usable* but never that anything tells the
+    // app to use it. Applications schedule convergence off
+    // `drain_pending_convergence_groups`; a seam that returns `Err` holding a
+    // retained, unapplied row and leaves that set empty has parked the group
+    // where no drain will ever look. Under a terminal fault there is no retry
+    // behind the seam either, so this edge is the whole recovery route.
+    let f = stranded_rival_fixture("terminal-marker").await;
+    let halt_marker_fault = HaltMarkerFault::default();
+    let mut local = reopen_over_fault_storage(
+        &f,
+        FaultStorage {
+            inner: f.local_storage.clone(),
+            halt_marker_fault: halt_marker_fault.clone(),
+            park_fault: ParkWriteFault::default(),
+        },
+    );
+
+    // Hydration schedules groups of its own; drain them first, or the
+    // assertion below passes without the halt having scheduled anything.
+    let _ = local.drain_pending_convergence_groups();
+
+    halt_marker_fault.arm_terminal();
+    let result = local.ingest(f.competing.clone()).await;
+    assert!(
+        result.is_err(),
+        "the failed halt-marker write must propagate, got {result:?}"
+    );
+
+    let scheduled = local.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&f.group_id),
+        "a failed halt must hand the group holding the retained rival back to \
+         the convergence drain; scheduled: {scheduled:?}"
+    );
+
+    // And the scheduled edge must be sufficient, not merely present: driving
+    // only what the drain handed back re-derives the identical halt.
+    for group_id in &scheduled {
+        let _ = local.converge_stored_openmls_messages_at(group_id, 0);
+        let _ = local.converge_stored_openmls_messages_at(group_id, 60_000);
+    }
+    assert!(
+        is_halted(&f),
+        "the scheduled pass must re-derive the durable halt"
+    );
+    assert!(
+        local.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id } if group_id == &f.group_id
+        )),
+        "the halt must reach the app so it can surface repair"
+    );
+    assert!(still_on_own_branch(&local, &f));
 }
 
 #[tokio::test]
