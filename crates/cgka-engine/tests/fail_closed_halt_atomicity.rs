@@ -709,7 +709,10 @@ fn is_halted(f: &StrandedRivalFixture) -> bool {
 fn rival_state(f: &StrandedRivalFixture) -> MessageState {
     f.local_storage
         .get_message(&content_id(&f.competing))
-        .unwrap()
+        .expect(
+            "ingest persists the rival's content row `Created` before the halt it may trigger, \
+             and outside the halt's transaction, so a missing row is itself an invariant break",
+        )
         .state
 }
 

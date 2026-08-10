@@ -859,15 +859,19 @@ Emitted when a stored message is inserted or changes `MessageState`.
 | `epoch` | Message epoch when known. |
 | `reason` | Stable call-site reason. |
 
-`new_state` values:
+`new_state` values — the `MessageState` strings, plus one non-state release marker:
 
 - `sent`
 - `created`
 - `processed`
 - `failed`
 - `retryable`
+- `convergence_deferred` — a completed convergence pass gave the input no terminal disposition. It stays graph input
+  for a later pass without reopening convergence itself; evidence that later selects it moves it to `processed`.
 - `peel_deferred`
 - `epoch_invalidated`
+- `released` — not a stored state: the deferred-peel row was deleted under a resource refusal
+  (`resource_refused_retry_budget` below), and same-id redelivery stays eligible.
 
 Current `reason` values found in production call sites:
 

@@ -2339,8 +2339,10 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 // Park the rival keyed by its source epoch, as replay requires,
                 // so a verified repair path can still reconsider it. This
-                // writes through `self.storage`, which IS the handle the
-                // transaction is running on, so it joins the same unit.
+                // writes through `self.storage` rather than the passed handle
+                // because the helper needs engine state (the convergence clock,
+                // the audit sink); the `StorageProvider::with_transaction`
+                // contract makes those writes join this unit regardless.
                 self.persist_openmls_wire_message(
                     openmls_msg,
                     &group_id,
