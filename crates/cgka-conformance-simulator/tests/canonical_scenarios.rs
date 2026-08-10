@@ -2448,7 +2448,7 @@ async fn add_then_self_remove_via_harness() {
     carol.tick().await;
 
     // Bob (non-admin) leaves.
-    bob.leave().await;
+    bob.leave().await.expect("leave");
     bus.deliver_all();
     let alice_proposal_outcomes = alice.tick().await; // ingests proposal + auto-commits
     let carol_proposal_outcomes = carol.tick().await; // same: no deterministic election

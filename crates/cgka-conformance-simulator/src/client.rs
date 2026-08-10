@@ -1361,20 +1361,22 @@ impl HarnessClient {
     }
 
     /// Send a SelfRemove proposal (Leave intent).
-    pub async fn leave(&mut self) {
-        self.leave_capture().await;
+    pub async fn leave(&mut self) -> Result<(), EngineError> {
+        self.leave_capture().await.map(|_| ())
     }
 
     /// Send a SelfRemove proposal and return the wrapped transport message.
-    pub async fn leave_capture(&mut self) -> TransportMessage {
-        let gid = self.default_group.clone().expect("group");
+    pub async fn leave_capture(&mut self) -> Result<TransportMessage, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(|| EngineError::Other("leave without a default group".into()))?;
         let res = self
             .engine_mut()
             .send(SendIntent::Leave {
                 group_id: gid.clone(),
             })
-            .await
-            .expect("send leave");
+            .await?;
         if let SendResult::Proposal { msg } = res {
             let scenario_input =
                 self.next_scenario_input_metadata(ScenarioInputKind::Proposal, None, None);
@@ -1386,9 +1388,11 @@ impl HarnessClient {
             self.register_published_scenario_input(&routed, scenario_input)
                 .await;
             self.bus.send(self.bus_id, routed.clone());
-            routed
+            Ok(routed)
         } else {
-            panic!("expected Proposal");
+            Err(EngineError::Other(format!(
+                "expected Proposal, got {res:?}"
+            )))
         }
     }
 
