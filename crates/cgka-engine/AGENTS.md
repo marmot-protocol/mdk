@@ -362,6 +362,17 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   *inputs*: a stored row keyed by an unverified claimed epoch steers a later pass just as effectively as a flag. If a
   hard stop is ever wanted for a genuine local anchor gap, evaluate that gap on a seam that reads no inbound bytes —
   session open / per-group full hydration — not here.
+- **The retained rival stays pass-opening, so the verified repair must retire it.** The corollary of the rule above:
+  because ingest leaves the rival in `Created` for the coordinator to adjudicate, and the pass seeder re-derives every
+  retained commit's source epoch from its own wire bytes, an anchor-less rival keeps steering
+  `openmls_projection::historical_replay_start_epoch` (the `min` over unresolved rows) back into
+  `MissingRetainedAnchor`. Exiting the halt without evicting that input just re-halts the group on the next drain. The
+  eviction belongs to the authenticated Welcome join, which already discards this device's live MLS copy: alongside
+  `delete_convergence_pass`, `do_join_welcome` calls
+  `openmls_projection::retire_commits_superseded_by_replacement_welcome` in the same transaction, terminalizing
+  unresolved *commits* below the new copy's own `MlsGroup::epoch()`. Bound that retirement by locally derived
+  authenticated epochs only, keep it to commits (application messages from the prior interval may still decrypt, which
+  is why a replacement Welcome records `join_epoch = 0`), and do not move it to a seam that reads inbound claims.
 - **Commit-derived group records and capability caches are atomic with the MLS apply.** Every durable projection of
   an accepted commit must share the transaction that mutates OpenMLS state, and every projection read/write error
   must propagate. This includes the Marmot group record, capabilities extracted from added KeyPackages, and the

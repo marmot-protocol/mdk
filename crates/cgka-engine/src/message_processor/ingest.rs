@@ -2330,6 +2330,20 @@ impl<S: StorageProvider> Engine<S> {
     /// `current_epoch`: still retained, still pass-opening, but never a
     /// historical rewind target chosen by an unauthenticated claim.
     ///
+    /// # Retiring that row is the repair path's job, not this seam's
+    ///
+    /// Leaving it pass-opening is what keeps the coordinator's verdict
+    /// reachable, and the pass seeder re-derives each retained commit's source
+    /// epoch from its own wire bytes regardless of the column this seam wrote —
+    /// so for a genuine anchor gap the row keeps re-deriving the halt until
+    /// something evicts it. That eviction belongs to a seam holding
+    /// authenticated material: `group_lifecycle::do_join_welcome` retires
+    /// unresolved commits below the replacement Welcome's own `MlsGroup::epoch()`
+    /// (`openmls_projection::retire_commits_superseded_by_replacement_welcome`),
+    /// in the same transaction that discards this device's superseded MLS copy.
+    /// Without it a verified repair does not stick: the group exits the halt and
+    /// the next convergence drain walks it straight back in.
+    ///
     /// # The local half is not lost
     ///
     /// "Our anchor set has a gap inside the rewind horizon" is a LOCAL fact with

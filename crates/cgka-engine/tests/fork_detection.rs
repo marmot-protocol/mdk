@@ -2285,6 +2285,20 @@ struct RouterFlipFixture {
 /// sorts FIRST — which makes the inbound sibling commit the ordering winner for
 /// every `tag`, so control and restart runs are directly comparable.
 async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAccountStorage>) {
+    let (fixture, joiner, _creator) = router_flip_fixture_with_creator(tag).await;
+    (fixture, joiner)
+}
+
+/// [`router_flip_fixture`], additionally returning the creator engine — the
+/// sibling author, live on the branch the device under test cannot adjudicate.
+/// Repair-path tests need it to keep driving the group from that side.
+async fn router_flip_fixture_with_creator(
+    tag: &str,
+) -> (
+    RouterFlipFixture,
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+) {
     let a = format!("rf-a-{tag}").into_bytes();
     let b = format!("rf-b-{tag}").into_bytes();
     let (creator_seed, joiner_seed) = if pad32(&a) < pad32(&b) {
@@ -2380,7 +2394,7 @@ async fn router_flip_fixture(tag: &str) -> (RouterFlipFixture, Engine<SqliteAcco
         sibling_invitee: MemberId::new(pad32(&sibling_seed)),
         sibling_wins: sibling_key < own_key,
     };
-    (fixture, joiner)
+    (fixture, joiner, creator)
 }
 
 fn settled_branch(engine: &Engine<SqliteAccountStorage>, f: &RouterFlipFixture) -> Branch {
@@ -2818,4 +2832,177 @@ async fn unauthenticated_past_epoch_rival_never_halts_the_group_at_ingest() {
         forged,
     )
     .await;
+}
+
+/// A verified repair must STICK. `repair_to_stable`'s only production caller is
+/// the authenticated-Welcome join path (mdk#971, `join_welcome_repair`), and
+/// exiting the halt is worthless if the very next convergence drain walks the
+/// group straight back into it.
+///
+/// The residue that makes this sharp is the rival ingest retained. Ingest
+/// deliberately keeps it in the pass-opening `Created` state and writes no
+/// terminal verdict — its claimed epoch is unauthenticated at that seam (see
+/// `unauthenticated_past_epoch_rival_never_halts_the_group_at_ingest`), and the
+/// pass it schedules is what lets the convergence coordinator own the
+/// `MissingRetainedAnchor` halt (see
+/// `restarted_committer_without_source_anchor_halts_through_convergence`). The
+/// convergence seeder then re-derives that rival's source epoch from its own
+/// wire bytes — an epoch this device holds no anchor for — so without a repair
+/// that disposes of it, the repaired group re-halts at the repaired tip.
+///
+/// An authenticated Welcome is exactly the seam that can dispose of it
+/// honestly: it re-anchors the device at a join epoch derived from
+/// authenticated material, and everything below that epoch is material this
+/// device is not a party to and can never adjudicate.
+#[tokio::test]
+async fn verified_welcome_repair_survives_the_next_convergence_drain() {
+    let (f, local, mut creator) = router_flip_fixture_with_creator("repair-sticks").await;
+    assert!(f.sibling_wins);
+    let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    drop(local);
+    f.local_storage
+        .release_group_snapshot(&f.group_id, "openmls-retained-anchor-1")
+        .expect("release the source-epoch anchor");
+    let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
+
+    // (1) The halt, exactly as pinned by
+    // `restarted_committer_without_source_anchor_halts_through_convergence`.
+    let outcome = local.ingest(f.competing.clone()).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    let scheduled = local.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&f.group_id),
+        "ingest must hand the group holding the retained rival to the drain; got {scheduled:?}"
+    );
+    for group_id in &scheduled {
+        let _ = local.converge_stored_openmls_messages_at(group_id, 0);
+        let _ = local.converge_stored_openmls_messages_at(group_id, 60_000);
+    }
+    assert!(
+        f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Created,
+        "ingest and the coordinator both leave the rival pass-opening, awaiting a verdict"
+    );
+    local.drain_events();
+
+    // A halted group refuses new work — the wedge is real before the repair.
+    assert!(
+        local
+            .send(SendIntent::SelfUpdate {
+                group_id: f.group_id.clone(),
+            })
+            .await
+            .is_err(),
+        "an unrecoverable group must refuse sends"
+    );
+
+    // (2) The verified repair: the sibling author removes the wedged device
+    // from the fleet's branch and re-invites it with a fresh key package.
+    let device_id = MemberId::new(pad32(&f.local_seed));
+    match creator
+        .send(SendIntent::RemoveMembers {
+            group_id: f.group_id.clone(),
+            members: vec![device_id],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => {
+            creator.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+    let fresh_kp = local.fresh_key_package().await.unwrap();
+    let welcome = match creator
+        .send(SendIntent::Invite {
+            group_id: f.group_id.clone(),
+            key_packages: vec![fresh_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => {
+            creator.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let joined = local.join_welcome(welcome).await.unwrap();
+    assert_eq!(joined, f.group_id, "the Welcome repairs the SAME group");
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "an authenticated Welcome is a verified repair path out of the halt"
+    );
+    assert_eq!(
+        local.epoch(&f.group_id).unwrap(),
+        EpochId(4),
+        "the repaired device joins the fleet's branch at the re-invite epoch"
+    );
+    assert_eq!(
+        settled_branch(&local, &f),
+        Branch::Sibling,
+        "the repair lands the device on the branch it could not adjudicate"
+    );
+
+    // (3) The property under test: the repair STICKS. The rival ingest retained
+    // is below the authenticated join epoch, so the repair disposed of it as
+    // input; the next drain has nothing left to re-derive the halt from.
+    let result = local
+        .converge_stored_openmls_messages_at(&f.group_id, u64::MAX)
+        .expect("the repaired group's convergence drain must run");
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|error| matches!(error, CanonicalizationError::MissingRetainedAnchor)),
+        "the repair must evict the input that re-derives the halt: {:?}",
+        result.errors
+    );
+    assert_ne!(
+        result.convergence_status,
+        ConvergenceStatus::Blocked,
+        "a repaired group must not re-block on residue the repair superseded"
+    );
+    assert!(
+        !f.local_storage
+            .get_group(&f.group_id)
+            .unwrap()
+            .unrecoverable,
+        "the drain must not re-halt the group the repair just cleared"
+    );
+    assert_eq!(
+        local.epoch(&f.group_id).unwrap(),
+        EpochId(4),
+        "the drain must not move the repaired tip"
+    );
+    assert_ne!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Created,
+        "the below-join rival must leave the pass-opening set"
+    );
+
+    // Usability is the point of the repair, and it must outlive the drain.
+    let probe = local
+        .send(SendIntent::SelfUpdate {
+            group_id: f.group_id.clone(),
+        })
+        .await
+        .expect("the repaired group must still accept new work after a drain");
+    assert!(matches!(
+        probe,
+        SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
+    ));
 }

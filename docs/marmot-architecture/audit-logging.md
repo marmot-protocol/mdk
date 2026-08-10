@@ -620,7 +620,12 @@ Metadata notes:
   runs upstream of every signature and membership-tag check, so the rival's claimed source epoch is unauthenticated
   there and no terminal state may be derived from it. Ingest instead records a `rejection` row with
   `reason = "fork_rival_missing_retained_anchor"`, keeps the rival's retained content row, and schedules the group, so
-  the coordinator issues the halt from its own verdict.
+  the coordinator issues the halt from its own verdict. The retained row stays pass-opening precisely so that verdict
+  keeps being reachable; the `join_welcome_repair` exit is what clears it, retiring unresolved commits below the
+  replacement Welcome's own epoch with `message_state_changed`
+  `reason = "superseded_by_replacement_welcome"`. Without that retirement a repaired group re-halts on its next drain,
+  so an analyzer seeing `join_welcome_repair` with no following halt should expect those retirement rows in the same
+  join.
 
 ### `group_state_changed`
 
@@ -889,6 +894,7 @@ Current `reason` values found in production call sites:
 | `resource_refused_retry_budget` | A retained transport-deferred row exhausted its changed-context retry budget; the row is deleted and the audit transition's `new_state` is `released`. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
 | `app_payload_retention_expired` | A message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained app-payload window; state becomes `failed`. |
+| `superseded_by_replacement_welcome` | A verified replacement Welcome discarded this device's live MLS copy, so an unresolved commit retained below the new copy's epoch can never be applied; state becomes `epoch_invalidated`. |
 
 Metadata notes:
 
