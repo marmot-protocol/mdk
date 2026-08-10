@@ -1650,9 +1650,12 @@ async fn admin_churn_family_generates_deterministic_arms_that_pass() {
             .expect("every admin-churn case carries a no-pending-work expectation")
     };
     for case in &cases[..3] {
-        assert!(
-            pending_scope(case).contains(&"dave".to_owned())
-                || !case.scenario.clients.contains(&"dave".to_owned()),
+        let mut expected_clients = case.scenario.clients.clone();
+        expected_clients.sort();
+        let mut scoped_clients = pending_scope(case);
+        scoped_clients.sort();
+        assert_eq!(
+            scoped_clients, expected_clients,
             "non-latecomer arms keep the whole-roster pending-work oracle"
         );
     }
