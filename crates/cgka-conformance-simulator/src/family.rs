@@ -194,8 +194,13 @@ pub fn generate_admin_churn_family(seed: u64, cases: usize) -> Vec<GeneratedScen
             add_scoped_reliability_oracle(
                 &mut scenario,
                 &mut expected_outcomes,
-                labels(["alice", "bob", "carol"]),
+                admin_churn_core_labels(),
             );
+            // The joiner is not exempt from pending-work coverage: it must
+            // retain exactly its own deferred join commit and nothing else.
+            expected_outcomes.push(TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
+                client: "dave".into(),
+            });
         } else {
             add_strict_reliability_oracle(&mut scenario, &mut expected_outcomes);
         }
@@ -1440,6 +1445,13 @@ fn admin_churn_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Tra
     }
 }
 
+/// Founders shared by the admin-churn latecomer arm and its scoped
+/// pending-work oracle. Keeping one source prevents the oracle scope from
+/// silently diverging if the arm's core roster changes.
+fn admin_churn_core_labels() -> Vec<String> {
+    labels(["alice", "bob", "carol"])
+}
+
 fn admin_policy_step(client: &str, admins: Vec<String>, pending: &str) -> ScenarioStep {
     ScenarioStep::UpdateAdminPolicy {
         client: client.into(),
@@ -1616,6 +1628,33 @@ fn admin_churn_competing_admin_commits(
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(clients.clone()));
 
+    // The same-epoch race winner is schedule-dependent, so pin the admin set
+    // deterministically before asserting authority: bob is an admin under both
+    // candidate outcomes, so his follow-up policy commit must succeed and
+    // reconverge everyone on a known set.
+    steps.push(admin_policy_step(
+        "bob",
+        labels(["alice", "bob"]),
+        "pin-core",
+    ));
+    push_confirmed(&mut steps, &mut expected, "bob", "pin-core");
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick_vec(clients.clone()));
+
+    // Authority enforcement: under the pinned set, carol and dave are
+    // non-admins regardless of which racer won, so their privileged updates
+    // must be rejected in place.
+    steps.push(ScenarioStep::ExpectUpdateAdminPolicyError {
+        client: "carol".into(),
+        admins: labels(["alice", "bob", "carol"]),
+        error: "not_group_admin".into(),
+    });
+    steps.push(ScenarioStep::ExpectUpdateAdminPolicyError {
+        client: "dave".into(),
+        admins: labels(["alice", "bob", "dave"]),
+        error: "not_group_admin".into(),
+    });
+
     for sender in &clients {
         steps.push(ScenarioStep::SendAppMessage {
             sender: sender.clone(),
@@ -1624,20 +1663,27 @@ fn admin_churn_competing_admin_commits(
     }
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(clients.clone()));
+    steps.push(ScenarioStep::ObserveAdminPolicy {
+        clients: clients.clone(),
+    });
     steps.push(observe_vec(clients.clone()));
 
     expected.push(clients_converged_vec(
         clients.clone(),
-        Some(3),
+        Some(4),
         Some(clients.len()),
     ));
     for client in &clients {
+        expected.push(TraceExpectation::AdminPolicy {
+            client: client.clone(),
+            admins: labels(["alice", "bob"]),
+        });
         let received = clients
             .iter()
             .filter(|sender| *sender != client)
             .map(|sender| format!("admin-churn:{case_index}:probe:{sender}"))
             .collect();
-        expected.push(client_state(client, 3, clients.len(), received));
+        expected.push(client_state(client, 4, clients.len(), received));
     }
 
     let scenario = ScenarioSpec {
@@ -1734,7 +1780,7 @@ fn admin_churn_restart_recovery(
 /// must never observe pre-join plaintext (committy essence).
 fn admin_churn_latecomer_under_pressure(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = labels(["alice", "bob", "carol", "dave"]);
-    let core = labels(["alice", "bob", "carol"]);
+    let core = admin_churn_core_labels();
     let pre_payloads = [
         format!("admin-churn:{case_index}:pre:bob"),
         format!("admin-churn:{case_index}:pre:carol"),
@@ -1783,9 +1829,9 @@ fn admin_churn_latecomer_under_pressure(case_index: u64) -> (ScenarioSpec, Vec<T
     steps.push(ScenarioStep::ClearPartition);
     steps.push(invite("alice", ["dave"], "invite-late"));
     push_confirmed(&mut steps, &mut expected, "alice", "invite-late");
-    steps.push(ScenarioStep::DeliverAll);
-    steps.push(tick_vec(clients[1..].to_vec()));
-
+    // Publish the rename before the delivery round that completes Dave's
+    // join: his welcome and the founder's next commit travel in the same
+    // flight, so the join genuinely races the ongoing commit pressure.
     steps.push(ScenarioStep::UpdateGroupData {
         client: "alice".into(),
         name: format!("admin-late-{case_index}-post"),
@@ -1838,6 +1884,19 @@ fn admin_churn_latecomer_under_pressure(case_index: u64) -> (ScenarioSpec, Vec<T
         clients.len(),
         alice_received,
     ));
+    // Bob and Carol carry both pre-join and post-join traffic; exact
+    // transcripts for them catch missing, duplicated, or unexpected payloads
+    // that canonical-state equivalence alone cannot.
+    for (member, other_pre) in [("bob", &pre_payloads[1]), ("carol", &pre_payloads[0])] {
+        let mut received = vec![other_pre.clone()];
+        received.extend(
+            clients
+                .iter()
+                .filter(|sender| *sender != member)
+                .map(|sender| format!("admin-churn:{case_index}:post:{sender}")),
+        );
+        expected.push(client_state(member, final_epoch, clients.len(), received));
+    }
 
     let scenario = ScenarioSpec {
         name: format!("admin-churn/v1/case-{case_index}"),
@@ -3310,6 +3369,31 @@ fn add_strict_reliability_oracle(
     scenario: &mut ScenarioSpec,
     expected: &mut Vec<TraceExpectation>,
 ) {
+    add_reliability_oracle(scenario, expected, None);
+}
+
+/// Strict-oracle variant with an explicit pending-work scope. Appends the same
+/// drain / acknowledge / exact-observation tail as
+/// [`add_strict_reliability_oracle`], asserts exact equivalence across every
+/// expectation-derived client, but limits the no-pending-work assertion to
+/// `pending_scope`. Use only when a client is known to retain a documented
+/// terminal input (for example a welcome-joined member's own join commit).
+fn add_scoped_reliability_oracle(
+    scenario: &mut ScenarioSpec,
+    expected: &mut Vec<TraceExpectation>,
+    pending_scope: Vec<String>,
+) {
+    add_reliability_oracle(scenario, expected, Some(pending_scope));
+}
+
+/// Shared oracle tail: drain, acknowledge, exact-observe, and assert. The
+/// no-pending-work assertion covers every expectation-derived client unless an
+/// explicit `pending_scope` narrows it.
+fn add_reliability_oracle(
+    scenario: &mut ScenarioSpec,
+    expected: &mut Vec<TraceExpectation>,
+    pending_scope: Option<Vec<String>>,
+) {
     let exact_clients = expected
         .iter()
         .flat_map(|expectation| match expectation {
@@ -3368,57 +3452,7 @@ fn add_strict_reliability_oracle(
         });
     }
     expected.push(TraceExpectation::NoPendingWork {
-        clients: exact_clients,
-    });
-}
-
-/// Strict-oracle variant with an explicit pending-work scope. Appends the same
-/// drain / acknowledge / exact-observation tail as
-/// [`add_strict_reliability_oracle`], asserts exact equivalence across every
-/// expectation-derived client, but limits the no-pending-work assertion to
-/// `pending_scope`. Use only when a client is known to retain a documented
-/// terminal input (for example a welcome-joined member's own join commit).
-fn add_scoped_reliability_oracle(
-    scenario: &mut ScenarioSpec,
-    expected: &mut Vec<TraceExpectation>,
-    pending_scope: Vec<String>,
-) {
-    let exact_clients = expected
-        .iter()
-        .flat_map(|expectation| match expectation {
-            TraceExpectation::ClientsConverged { clients, .. } => clients.clone(),
-            TraceExpectation::ClientState { client, .. } => vec![client.clone()],
-            _ => Vec::new(),
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if exact_clients.is_empty() {
-        return;
-    }
-
-    scenario.steps.push(ScenarioStep::DeliverAll);
-    scenario.steps.push(ScenarioStep::Tick {
-        clients: scenario.clients.clone(),
-    });
-    for client in &scenario.clients {
-        scenario.steps.push(accept_all_outbound(client));
-    }
-    scenario.steps.push(ScenarioStep::DeliverAll);
-    scenario.steps.push(ScenarioStep::Tick {
-        clients: scenario.clients.clone(),
-    });
-    scenario.steps.push(ScenarioStep::ObserveExact {
-        clients: exact_clients.clone(),
-    });
-
-    if exact_clients.len() >= 2 {
-        expected.push(TraceExpectation::ClientsExactlyEquivalent {
-            clients: exact_clients,
-        });
-    }
-    expected.push(TraceExpectation::NoPendingWork {
-        clients: pending_scope,
+        clients: pending_scope.unwrap_or(exact_clients),
     });
 }
 

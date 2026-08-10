@@ -506,10 +506,13 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 #### Admin-Churn Arm `1`: Competing Admin-Policy Commits
 
 - Setup: two admins race admin-policy commits from the same epoch; the delivery order of the two commits is drawn from
-  the seed.
+  the seed. After the race settles, an admin retained under both candidate outcomes pins the admin set with a
+  follow-up policy commit.
 - Pressure: same-epoch admin-authority race, the admin-set analog of the chaos group-data fork.
-- Expected: all clients converge one epoch past the race and the group stays usable (exact post-race probe
-  transcripts). The winning admin set is deliberately not asserted; it is schedule-dependent.
+- Expected: the race winner stays schedule-dependent and unasserted, but authority is enforced afterward: the
+  retained admin's pinning commit must succeed, both non-admins' privileged updates must be rejected in place
+  (`not_group_admin`), and every client observes the pinned admin set. All clients converge two epochs past the race
+  with exact post-race probe transcripts.
 
 #### Admin-Churn Arm `2`: Restart Between Publish and Delivery
 
@@ -521,14 +524,17 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 #### Admin-Churn Arm `3`: Latecomer Under Commit Pressure
 
-- Setup: the founder keeps rename pressure up, then invites a fourth member and immediately renames again; all four
-  then exchange traffic. Pre-join traffic is partitioned away from the latecomer's process (ciphertext-exposure
-  forward secrecy is the `latecomer-forward-secrecy/v1` vector's job).
-- Pressure: a join racing sustained commit pressure.
-- Expected: the latecomer never observes pre-join plaintext (zero-count assertions), holds the exact post-join
-  transcript, and every client converges. The pending-work assertion is scoped to the founders: a welcome-joined
-  member currently retains its own join commit as a permanently deferred transport input, which is tracked as a
-  harness coverage gap.
+- Setup: the founder keeps rename pressure up, then invites a fourth member and publishes another rename before the
+  delivery round that completes the join, so the welcome and the next commit travel in the same flight; all four then
+  exchange traffic. Pre-join traffic is partitioned away from the latecomer's process (ciphertext-exposure forward
+  secrecy is the `latecomer-forward-secrecy/v1` vector's job).
+- Pressure: a join genuinely racing sustained commit pressure.
+- Expected: the latecomer never observes pre-join plaintext (zero-count assertions), every member holds its exact
+  transcript (founders carry pre-join and post-join traffic), and every client converges. The strict pending-work
+  assertion is scoped to the founders, and the joiner carries a
+  `no_pending_work_except_retained_join_commit` assertion: a welcome-joined member currently retains exactly its own
+  join commit as a permanently deferred transport input, and any other pending work still fails the case. The
+  retained join commit itself is tracked as a harness coverage gap.
 
 ### `convergence-chaos/v1`
 

@@ -551,6 +551,17 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cgka-conformance-simulator-reports
 ```
 
+To drill the admin-churn catalog (sequential churn, competing admin-policy commits, restart recovery, and latecomer
+joins under commit pressure):
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --family admin-churn/v1 \
+  --seed 42 \
+  --cases 8 \
+  --out target/cgka-conformance-simulator-reports
+```
+
 Reports are written as one file per case, for example
 `target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`. Generated family runs also write fixture
 candidates such as `target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.

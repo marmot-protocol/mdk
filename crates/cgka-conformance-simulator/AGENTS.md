@@ -330,7 +330,8 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   storms, mixed message/commit storms, and restart plus duplicate delivery. `admin-churn/v1` covers seeded admin-set
   churn, competing same-epoch admin-policy commits, restart between publish and delivery, and latecomer joins under
   commit pressure. Storage-loss families are still future work. A welcome-joined member retains its own join commit as
-  a permanently deferred transport input; latecomer arms scope their pending-work oracle to the founders until that is
+  a permanently deferred transport input; latecomer arms scope their strict pending-work oracle to the founders and
+  pin the joiner to exactly that retained artifact (`no_pending_work_except_retained_join_commit`) until that is
   resolved.
 - **Stateful chat journeys serialize commits by construction.** Each commit is acknowledged and delivered before the
   next state-changing action, and restart is a terminal checkpoint. Mutation-after-reopen plus concurrent and racing

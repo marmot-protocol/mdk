@@ -1640,6 +1640,34 @@ async fn admin_churn_family_generates_deterministic_arms_that_pass() {
             .any(|step| matches!(step, ScenarioStep::Assert { .. })),
         "the latecomer arm carries pre-join mailbox-isolation zero-count assertions"
     );
+    let pending_scope = |case: &GeneratedScenarioCase| {
+        case.expected_outcomes
+            .iter()
+            .find_map(|expectation| match expectation {
+                TraceExpectation::NoPendingWork { clients } => Some(clients.clone()),
+                _ => None,
+            })
+            .expect("every admin-churn case carries a no-pending-work expectation")
+    };
+    for case in &cases[..3] {
+        assert!(
+            pending_scope(case).contains(&"dave".to_owned())
+                || !case.scenario.clients.contains(&"dave".to_owned()),
+            "non-latecomer arms keep the whole-roster pending-work oracle"
+        );
+    }
+    assert_eq!(
+        pending_scope(&cases[3]),
+        vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
+        "the latecomer arm scopes strict pending work to the founders"
+    );
+    assert!(
+        cases[3].expected_outcomes.iter().any(|expectation| matches!(
+            expectation,
+            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } if client == "dave"
+        )),
+        "the latecomer arm pins the joiner to exactly its retained join commit"
+    );
 
     for case in &cases {
         let report = run_generated_case_report(case, None)

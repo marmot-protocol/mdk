@@ -166,6 +166,15 @@ pub enum TraceExpectation {
     NoPendingWork {
         clients: Vec<String>,
     },
+    /// Like [`Self::NoPendingWork`] for one client, but permit exactly the
+    /// documented latecomer wart: a welcome-joined member retains its own join
+    /// commit as one permanently deferred transport input (mirrored as one
+    /// pending scenario input). Every other pending-work category must be
+    /// empty, so unrelated deferred commits, messages, or outbound work still
+    /// fail the expectation.
+    NoPendingWorkExceptRetainedJoinCommit {
+        client: String,
+    },
     /// Require a completed active application-message probe in every direction
     /// between the named clients.
     ClientsBidirectionallyDecryptable {
@@ -592,6 +601,45 @@ impl TraceExpectation {
                             actual: json!(pending_work),
                         });
                     }
+                }
+            }
+            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { client } => {
+                let Some(latest_observation) = client_observation(observed, client) else {
+                    missing_client(client, self, mismatches);
+                    return;
+                };
+                let Some(observation) = client_pending_work_observation(observed, client) else {
+                    mismatches.push(ExpectationFailure {
+                        kind: "missing_pending_work_observation".into(),
+                        message: format!(
+                            "client {client} was not observed with observe_client_exact"
+                        ),
+                        expected: json!(self),
+                        actual: json!(latest_observation),
+                    });
+                    return;
+                };
+                let pending_work = observation
+                    .pending_work
+                    .as_ref()
+                    .expect("pending-work observation carries pending work");
+                let mut allowed = PendingWorkObservation::default();
+                allowed.engine.stored_transport_deferred_messages = 1;
+                allowed.scenario_inputs_pending = 1;
+                if pending_work != &allowed {
+                    mismatches.push(ExpectationFailure {
+                        kind: "pending_work_beyond_retained_join_commit".into(),
+                        message: format!(
+                            "client {client} pending work is not exactly the retained join \
+                             commit; blocking subsystems {:?}",
+                            pending_work.blocking_subsystems()
+                        ),
+                        expected: json!({
+                            "client": client,
+                            "pending_work": allowed,
+                        }),
+                        actual: json!(pending_work),
+                    });
                 }
             }
             TraceExpectation::ClientsBidirectionallyDecryptable { clients } => {
