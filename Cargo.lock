@@ -3484,8 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.44.6"
-source = "git+https://github.com/agent-p1p/nostr.git?rev=c209c22aab4883a01b1d6017752b23245afce9b3#c209c22aab4883a01b1d6017752b23245afce9b3"
+version = "0.44.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40ff7b77ef428b40aa2834a6acbae38a0e104c98b306208ca4b87a420d579a4b"
 dependencies = [
  "base64",
  "bech32",
@@ -3545,9 +3546,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.44.0"
+version = "0.44.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1073ccfbaea5549fb914a9d52c68dab2aecda61535e5143dd73e95445a804b"
+checksum = "c85c54d6ca9aae4ae2bf19a7663ba9db5f45f783f1d24aff55f006386b8b99a1"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -6107,6 +6108,7 @@ version = "0.9.11"
 dependencies = [
  "async-trait",
  "cgka-traits",
+ "futures",
  "hex",
  "nostr",
  "nostr-relay-builder",
